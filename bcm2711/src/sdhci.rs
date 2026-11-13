@@ -20,6 +20,21 @@ pub trait Disk {
     fn overlay(&self) -> Vec<(u64, Vec<u8>)> { Vec::new() }
 }
 
+/// An SDIO card (functions 0..7) behind the host instead of a memory card.
+pub trait SdioCard {
+    /// number of I/O functions besides function 0
+    fn num_functions(&self) -> u8;
+    /// CMD52: one register; returns the byte read (or the byte now in the register after a write)
+    fn rw_direct(&mut self, write: bool, func: u8, addr: u32, data: u8, raw: bool) -> u8;
+    /// CMD53 read/write of `out.len()` bytes (incrementing or fixed address)
+    fn read_ext(&mut self, func: u8, addr: u32, incr: bool, out: &mut [u8]);
+    fn write_ext(&mut self, func: u8, addr: u32, incr: bool, data: &[u8]);
+    /// the card's interrupt line (DAT[1])
+    fn irq(&self) -> bool;
+    /// time passes (ns): firmware timers, delayed events
+    fn tick(&mut self, _now_ns: u64) {}
+}
+
 /// A RAM disk (tests, small images).
 pub struct MemDisk(pub Vec<u8>);
 impl Disk for MemDisk {
@@ -84,6 +99,10 @@ pub struct Sdhci {
     pub writes: u64,
     /// log commands to stderr
     pub trace: bool,
+    /// an SDIO card instead of a memory card
+    pub sdio: Option<Box<dyn SdioCard>>,
+    /// pending CMD53 write: (function, address, incrementing)
+    sdio_write: Option<(u8, u32, bool)>,
 }
 
 const BLKSIZE: usize = 1; // 0x04
@@ -107,7 +126,7 @@ impl Default for Sdhci {
 impl Sdhci {
     pub fn new(disk: Option<Box<dyn Disk>>) -> Self {
         let mut s = Sdhci { regs: [0; 64], disk, state: State::Idle, rca: 0, app: false, xfer: Xfer::None, buf: Vec::new(), pos: 0,
-                            lba: 0, left: None, special: None, pre_count: None, reads: 0, writes: 0, trace: false };
+                            lba: 0, left: None, special: None, pre_count: None, reads: 0, writes: 0, trace: false, sdio: None, sdio_write: None };
         s.reset_all();
         s
     }
@@ -120,11 +139,11 @@ impl Sdhci {
         self.regs[CAPS + 1] = 0;
         self.regs[VERSION] = 0x9902_0000; // vendor 0x99, SD host spec 3.00
         self.xfer = Xfer::None;
-        if self.disk.is_some() { self.regs[INTSTAT] |= INT_CARD_IN; }
+        if self.disk.is_some() || self.sdio.is_some() { self.regs[INTSTAT] |= INT_CARD_IN; }
     }
 
     fn present(&self) -> u32 {
-        let card = if self.disk.is_some() { PS_CARD } else { (1 << 18) | (1 << 19) | (0xf << 20) | (1 << 24) };
+        let card = if self.disk.is_some() || self.sdio.is_some() { PS_CARD } else { (1 << 18) | (1 << 19) | (0xf << 20) | (1 << 24) };
         let mut p = card;
         match self.xfer {
             Xfer::Read => p |= PS_DAT_INHIBIT | PS_DAT_ACTIVE | PS_RD_ACTIVE | if self.pos < self.buf.len() { PS_BUF_RD } else { 0 },
@@ -141,7 +160,9 @@ impl Sdhci {
     }
 
     fn status(&self) -> u32 {
-        let st = self.regs[INTSTAT];
+        // the SDIO card interrupt (bit 8) is a level, visible while enabled in the status-enable register
+        let card_int = if self.sdio.as_ref().is_some_and(|c| c.irq()) && self.regs[INTEN] & (1 << 8) != 0 { 1 << 8 } else { 0 };
+        let st = self.regs[INTSTAT] | card_int;
         if st & 0xffff_0000 != 0 { st | INT_ERROR } else { st & !INT_ERROR }
     }
 
@@ -202,6 +223,7 @@ impl Sdhci {
         let arg = self.regs[ARG];
         let app = std::mem::take(&mut self.app);
         if self.trace { eprintln!("[sd] {}CMD{idx} arg={arg:#010x} mode={xfer_mode:#06x} blk={:#010x} state={:?}", if app { "A" } else { "" }, self.regs[BLKSIZE], self.state); }
+        if self.sdio.is_some() { return self.sdio_command(idx, arg, data, xfer_mode); }
         if self.disk.is_none() { return self.timeout(); }
         let r1 = |s: &Self| -> u32 {
             let st = match s.state { State::Idle => 0, State::Ready => 1, State::Ident => 2, State::Standby => 3, State::Transfer => 4 };
@@ -252,6 +274,61 @@ impl Sdhci {
         if data { self.start_data(idx, arg, xfer_mode); }
         self.raise(INT_CMD_DONE);
         let _ = resp_ty;
+    }
+
+    /// Commands to an SDIO card (SD Specifications Part E1: CMD5, CMD52, CMD53).
+    fn sdio_command(&mut self, idx: u32, arg: u32, data: bool, mode: u32) {
+        let selected = self.state == State::Transfer;
+        let r5 = |sel: bool, d: u8| -> u32 { ((if sel { 0x20 } else { 0x10 }) << 8) | d as u32 };
+        let resp = match idx {
+            0 => { self.state = State::Idle; return self.raise(INT_CMD_DONE); }
+            5 => {
+                let n = self.sdio.as_ref().map(|c| c.num_functions()).unwrap_or(0) as u32;
+                if arg & 0x00ff_ffff != 0 { self.state = State::Ready; }
+                // R4: ready, I/O functions, no memory, 2.7-3.6 V
+                (1 << 31) | ((n & 7) << 28) | 0x00ff_8000
+            }
+            3 => { self.state = State::Standby; self.rca = 0x0001; (self.rca as u32) << 16 }
+            7 => { self.state = if (arg >> 16) as u16 == self.rca { State::Transfer } else { State::Standby }; 0x0000_0700 }
+            52 => {
+                let write = arg >> 31 != 0;
+                let func = ((arg >> 28) & 7) as u8;
+                let raw = arg & (1 << 27) != 0;
+                let addr = (arg >> 9) & 0x1_ffff;
+                let card = self.sdio.as_mut().unwrap();
+                let d = card.rw_direct(write, func, addr, arg as u8, raw);
+                if self.trace { eprintln!("[sdio] CMD52 {} f{func} {addr:#07x} {} {d:#04x}", if write { "W" } else { "R" }, if write { format!("{:#04x} ->", arg as u8) } else { "->".into() }); }
+                r5(selected, d)
+            }
+            53 => {
+                let write = arg >> 31 != 0;
+                let func = ((arg >> 28) & 7) as u8;
+                let incr = arg & (1 << 26) != 0;
+                let addr = (arg >> 9) & 0x1_ffff;
+                let blksz = (self.regs[BLKSIZE] & 0xfff) as usize;
+                let blkcnt = (self.regs[BLKSIZE] >> 16) as usize;
+                let len = if mode & (1 << 5) != 0 { blksz * blkcnt.max(1) } else { blksz.max(1) };
+                if self.trace { eprintln!("[sdio] CMD53 {} f{func} {addr:#07x} len {len} {}", if write { "W" } else { "R" }, if incr { "incr" } else { "fixed" }); }
+                if data {
+                    self.buf = vec![0; len];
+                    self.pos = 0;
+                    self.left = Some(0);
+                    if write {
+                        self.sdio_write = Some((func, addr, incr));
+                        self.xfer = Xfer::Write;
+                        self.raise(INT_BUF_WR);
+                    } else {
+                        self.sdio.as_mut().unwrap().read_ext(func, addr, incr, &mut self.buf);
+                        self.xfer = Xfer::Read;
+                        self.raise(INT_BUF_RD);
+                    }
+                }
+                r5(selected, 0)
+            }
+            _ => return self.timeout(),
+        };
+        self.regs[RESP0] = resp;
+        self.raise(INT_CMD_DONE);
     }
 
     fn timeout(&mut self) {
@@ -332,6 +409,13 @@ impl Sdhci {
             if self.pos < self.buf.len() { self.buf[self.pos] = (v >> (8 * k)) as u8; self.pos += 1; }
         }
         if self.pos >= self.buf.len() {
+            if let Some((func, addr, incr)) = self.sdio_write.take() {
+                if let Some(c) = self.sdio.as_mut() { c.write_ext(func, addr, incr, &self.buf); }
+                self.regs[INTSTAT] &= !INT_BUF_WR;
+                self.xfer = Xfer::None;
+                self.raise(INT_XFER_DONE);
+                return;
+            }
             let lba = self.lba;
             if let Some(d) = self.disk.as_mut() { if lba < d.sectors() { d.write(lba, &self.buf); } }
             self.writes += 1;
