@@ -88,6 +88,32 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     0
 }
 
+/// Turn the block JIT on (1) or off (0); returns whether it is active.
+#[no_mangle]
+pub extern "C" fn sbc_jit(on: u32) -> u32 {
+    with(|s| { if on != 0 { s.m.cpu.enable_jit() as u32 } else { s.m.cpu.jit = None; 0 } }).unwrap_or(0)
+}
+
+/// JIT verify mode (every block re-run in the interpreter): 1 on.
+#[no_mangle]
+pub extern "C" fn sbc_jit_verify(on: u32) { with(|s| { if let Some(j) = s.m.cpu.jit.as_mut() { j.verify = on != 0; } }); }
+
+/// The first JIT/interpreter mismatch found in verify mode (length; text via sbc_uart_ptr-style buffer).
+#[no_mangle]
+pub extern "C" fn sbc_jit_report(out: *mut u8, cap: usize) -> usize {
+    with(|s| {
+        let r = s.m.cpu.jit.as_ref().and_then(|j| j.report.clone()).unwrap_or_default();
+        let n = r.len().min(cap);
+        // SAFETY: the caller provides `cap` writable bytes
+        unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), out, n) };
+        n
+    }).unwrap_or(0)
+}
+
+/// JIT counters: compiled blocks.
+#[no_mangle]
+pub extern "C" fn sbc_jit_blocks() -> f64 { with(|s| s.m.cpu.jit.as_ref().map(|j| j.compiled as f64).unwrap_or(0.0)).unwrap_or(0.0) }
+
 /// USB keyboard: press (down=1) or release (down=0) a key by HID usage code.
 #[no_mangle]
 pub extern "C" fn sbc_key(usage: u32, down: u32) { with(|s| s.m.soc.usb.kbd.key(usage as u8, down != 0)); }
@@ -212,3 +238,33 @@ pub extern "C" fn sbc_set_sensor(kind: u32, v: f64) {
 /// MCP3008 channel input voltage.
 #[no_mangle]
 pub extern "C" fn sbc_set_adc(ch: u32, volts: f64) { with(|s| { if ch < 8 { s.m.soc.spi.adc.volts[ch as usize] = volts; } }); }
+
+/// Self-test for the JIT: run `len` bytes of A64 code at 0x1000 in a 1 MiB RAM (x1 = 0x80000
+/// as a data pointer) until `brk`, with the JIT compiling on first use (`jit` = 1) or not.
+/// Returns a pointer to 32 u64: x0..x30 and NZCV.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_selftest(code: *const u8, len: usize, jit: u32) -> *const u64 {
+    use emu_core::{Core, FlatRam, Trap};
+    static mut OUT: [u64; 32] = [0; 32];
+    let mut ram = FlatRam::new(0, 1 << 20);
+    let _ = ram.load(0x1000, std::slice::from_raw_parts(code, len));
+    for k in 0..0x1000u64 { let _ = emu_core::Bus::write64(&mut ram, 0x80000 + 8 * k, 0x0123_4567_89ab_cdef ^ (k * 0x9e37_79b9)); }
+    let mut cpu = arm_a64::Cpu::new();
+    cpu.brk_to_host = true;
+    cpu.el = 1;
+    cpu.pc = 0x1000;
+    cpu.sp[1] = 0xf_0000;
+    cpu.x[1] = 0x80000;
+    cpu.x[2] = 0x80100;
+    cpu.sys.cpacr_el1 = 3 << 20;
+    cpu.ram = ram.mem.as_mut_ptr();
+    cpu.ram_len = ram.mem.len() as u64;
+    if jit != 0 { cpu.jit = arm_a64::jit::Jit::with(1 << 16, 1); }
+    for _ in 0..100_000 {
+        match cpu.step(&mut ram) { Err(Trap::Brk(_)) => break, Err(Trap::Unimplemented(..)) => break, _ => {} }
+    }
+    let out = &mut *std::ptr::addr_of_mut!(OUT);
+    for k in 0..31 { out[k] = cpu.x[k]; }
+    out[31] = cpu.nzcv as u64;
+    out.as_ptr()
+}

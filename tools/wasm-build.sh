@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 RUSTC="$(rustup which rustc)"; export RUSTC
 CARGO="$(rustup which cargo)"
 DYLD_FALLBACK_LIBRARY_PATH="$(dirname "$(dirname "$RUSTC")")/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"; export DYLD_FALLBACK_LIBRARY_PATH
-RUSTFLAGS="-C target-feature=+bulk-memory,+simd128 -C link-arg=--max-memory=4294967296" \
+RUSTFLAGS="-C target-feature=+bulk-memory,+simd128 -C link-arg=--max-memory=4294967296 -C link-arg=--export-table -C link-arg=--growable-table" \
   "$CARGO" build --profile wasm --target wasm32-unknown-unknown -p sbc-emu-wasm
 mkdir -p web/wasm web/assets
 cp target/wasm32-unknown-unknown/wasm/sbc_emu_wasm.wasm web/wasm/sbc-emu.wasm

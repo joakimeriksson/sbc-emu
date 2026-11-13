@@ -48,9 +48,28 @@ async function fetchBytes(url, gz) {
 }
 function copyIn(bytes) { const p = ex.sbc_alloc(bytes.length); mem8().set(bytes, p); return p; }
 
-async function start(os, ramMb) {
+// ---- JIT: each compiled block is a small module installed in the emulator's function table
+let jitFree = [], jitUsed = [];
+function jitCompile(ptr, len) {
+  try {
+    const mod = new WebAssembly.Module(mem8().slice(ptr, ptr + len));
+    const t = ex.__indirect_function_table;
+    const inst = new WebAssembly.Instance(mod, { env: { memory: ex.memory, table: t } });
+    const idx = jitFree.length ? jitFree.pop() : t.grow(1);
+    t.set(idx, inst.exports.f);
+    jitUsed.push(idx);
+    return idx;
+  } catch (e) { console.warn('jit', e); return -1; }
+}
+function jitReset() {
+  const t = ex.__indirect_function_table;
+  for (const idx of jitUsed) { t.set(idx, null); jitFree.push(idx); }
+  jitUsed = [];
+}
+
+async function start(os, ramMb, jit) {
   postMessage({ type: 'status', text: 'loading emulator…' });
-  const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead } });
+  const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead, sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset } });
   ex = instance.exports;
   if (os === 'raspios' || os === 'raspios-snap') {
     imageUrl = 'assets/raspios-lite.img';
@@ -62,6 +81,7 @@ async function start(os, ramMb) {
       const snap = await fetchBytes('assets/raspios-lite.snap', false);
       const r = ex.sbc_restore(ramMb, size / 512, copyIn(snap), snap.length);
       if (r !== 0) throw new Error(`snapshot restore failed (${r})`);
+      if (jit) ex.sbc_jit(1);
       postMessage({ type: 'status', text: 'resumed' });
       loop();
       return;
@@ -75,6 +95,7 @@ async function start(os, ramMb) {
     const initrd = await fetchBytes('assets/initramfs.cpio.gz', true);
     if (ex.sbc_boot(ramMb, copyIn(kernel), kernel.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
   }
+  if (jit) ex.sbc_jit(1);
   postMessage({ type: 'status', text: 'booting…' });
   loop();
 }
@@ -106,7 +127,7 @@ function loop() {
   if (led !== lastLed) { lastLed = led; postMessage({ type: 'gpio', pin: 17, level: led }); }
   if (now - lastStats > 500) {
     const insns = ex.sbc_insns();
-    postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20 });
+    postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20, jit: ex.sbc_jit_blocks() });
     lastInsns = insns; lastStatsT = now; lastStats = now;
   }
   if (r === 2) {
@@ -125,7 +146,7 @@ function loop() {
 
 onmessage = (e) => {
   const m = e.data;
-  if (m.type === 'start') start(m.os, m.ramMb).catch((err) => postMessage({ type: 'status', text: String(err) }));
+  if (m.type === 'start') start(m.os, m.ramMb, m.jit).catch((err) => postMessage({ type: 'status', text: String(err) }));
   else if (m.type === 'key' && ex) ex.sbc_key(m.usage, m.down ? 1 : 0);
   else if (m.type === 'serial') serialQueue.push(...m.bytes);
   else if (m.type === 'button' && ex) ex.sbc_gpio_input(27, m.pressed ? 1 : -1);

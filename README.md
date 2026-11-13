@@ -19,7 +19,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
-| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s → 135 s; all CPU tests pass with and without it |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s → 135 s; all CPU tests pass with and without it. Browser: WebAssembly block JIT, opt-in (`?jit=1`), verified against the interpreter |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~7 min, ~200 MiB of the image read |
 
@@ -121,8 +121,8 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 Single core; Wi-Fi has no radio model (emulated firmware host interface, WPA2-PSK only); no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
 modes, flush-to-zero and FP exception flags are not modelled by the interpreter (JIT-native FP uses
 the host's default FPCR); no LSE atomics, crypto or CRC32 instructions (the ID registers say so, so
-software does not use them); the JIT runs on AArch64 hosts only (the browser build interprets), and
-is still well below a real Pi 4 core.
+software does not use them); the native JIT needs an AArch64 host and is still well below a real
+Pi 4 core; the browser JIT is opt-in (`?jit=1`) because it does not yet pay off on a full OS boot.
 
 ## The JIT
 
@@ -135,3 +135,21 @@ after the interpreter has proven it implements them (so extensions the emulated 
 stay undefined). Blocks are keyed by virtual and physical PC, EL, SPSel and FP enable, and are
 discarded on `IC IVAU`/`IC IALLU` (CTR_EL0.DIC = 0 obliges software to issue them). Every CPU test
 runs with it too: `SBC_JIT=1 cargo test -p arm-a64`. `--no-jit` turns it off.
+
+### In the browser
+
+`arm-a64/src/jit_wasm.rs` compiles a hot block into its own small WebAssembly module (imports the
+emulator's memory and function table, exports one function) which the worker instantiates and
+installs in the table; the block then runs through `call_indirect`. Integer data processing,
+flags, conditional select, branches and integer loads/stores (inline micro-TLB probe, direct RAM
+access) are translated; everything else calls the interpreter for one instruction.
+
+It is opt-in, `index.html?jit=1`: the kernel phase gets faster (initramfs reached after 13 s
+instead of 17 s), but on a Raspberry Pi OS cold boot the per-block module compile and instantiate
+cost on short-lived userland code still loses (`login:` after 407 s with the JIT, 364 s without,
+Node 26). Checks:
+
+- `node tools/wasm-jit-selftest.mjs` runs A64 snippets through the wasm build with the JIT off and
+  on and compares registers and flags;
+- `SBC_JIT=1 SBC_JIT_VERIFY=1 node tools/wasm-smoke.mjs 30` re-runs every compiled block in the
+  interpreter (stores are rolled back) and prints the first mismatch, with the block's code.

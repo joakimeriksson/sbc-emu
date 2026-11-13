@@ -88,7 +88,7 @@ worker.onmessage = (e) => {
     document.getElementById('led').classList.toggle('on', m.level === 1);
   } else if (m.type === 'stats') {
     if (state === 'booting…' || state === 'resumed' || state === 'running') state = 'running';
-    status.textContent = `${state} · ${m.mips.toFixed(1)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '');
+    status.textContent = `${state} · ${m.mips.toFixed(1)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '') + (m.jit ? ` · JIT ${m.jit} blocks` : '');
   }
 };
 document.getElementById('clear').onclick = (e) => { e.preventDefault(); term.textContent = ''; };
@@ -130,7 +130,7 @@ slider('adc0', 'adcv', (v) => `${v.toFixed(2)} V`, (v) => worker.postMessage({ t
 const params = new URLSearchParams(location.search);
 const boot = (os) => {
   document.getElementById('chooser').hidden = true;
-  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512 });
+  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512, jit: params.get('jit') === '1' }); // the browser JIT is opt-in: it is not yet a net win on a full OS boot
   screen.focus();
 };
 document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));

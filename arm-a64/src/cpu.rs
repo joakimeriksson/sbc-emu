@@ -66,6 +66,8 @@ pub struct Cpu {
     pub jit: Option<Box<crate::jit::Jit>>,
     pub(crate) jit_bus: Option<*mut dyn emu_core::Bus>,
     pub(crate) jit_trap: Option<Trap>,
+    /// JIT verify mode: (RAM offset, previous bytes) of every store, for rollback
+    pub(crate) store_log: Option<Vec<(usize, Vec<u8>)>>,
 }
 
 // SAFETY: `ram` is only dereferenced by the core that owns it; see the field documentation.
@@ -106,7 +108,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [(0, 0); 3], jit: None, jit_bus: None, jit_trap: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [(0, 0); 3], jit: None, jit_bus: None, jit_trap: None, store_log: None,
         }
     }
 

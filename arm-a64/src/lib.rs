@@ -4,6 +4,7 @@
 mod cpu;
 mod exec;
 pub mod jit;
+mod jit_wasm;
 pub mod mmu;
 mod neon;
 mod simd;

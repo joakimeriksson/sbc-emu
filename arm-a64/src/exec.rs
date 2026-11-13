@@ -264,7 +264,13 @@ impl Cpu {
                 }
             }
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
-            let p = unsafe { self.ram.add((self.utlb[2].1 | (va & 0xfff)) as usize) };
+            let off = (self.utlb[2].1 | (va & 0xfff)) as usize;
+            let p = unsafe { self.ram.add(off) };
+            if let Some(log) = self.store_log.as_mut() {
+                // JIT verify mode: remember the bytes this store overwrites
+                let old = unsafe { std::slice::from_raw_parts(p, size as usize) }.to_vec();
+                log.push((off, old));
+            }
             unsafe {
                 match size {
                     1 => *p = v as u8,
@@ -287,6 +293,7 @@ impl Cpu {
         v: u128,
         unpriv: bool,
     ) -> Result<(), Trap> {
+        if let Some(log) = self.store_log.as_mut() { log.push((usize::MAX, Vec::new())); } // not undoable
         let acc = if unpriv {
             Access::WriteUnpriv
         } else {

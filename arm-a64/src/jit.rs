@@ -73,17 +73,18 @@ mod host {
 
 #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
 mod host {
+    /// No native code buffer: the wasm32 build compiles through `jit_wasm` instead.
     pub struct CodeCache;
     impl CodeCache {
-        pub fn new(_size: usize) -> Option<CodeCache> { None }
+        pub fn new(_size: usize) -> Option<CodeCache> { if AVAILABLE { Some(CodeCache) } else { None } }
         pub fn reset(&mut self) {}
         pub fn write(&mut self, _w: &[u32]) -> Option<*const u8> { None }
     }
-    pub const AVAILABLE: bool = false;
+    pub const AVAILABLE: bool = cfg!(target_arch = "wasm32");
 }
 
 /// Compiled block entry: `fn(cpu) -> status` (0 = continue at cpu.pc, 1 = trap in cpu.jit_trap).
-type BlockFn = unsafe extern "C" fn(*mut Cpu) -> u32;
+pub(crate) type BlockFn = unsafe extern "C" fn(*mut Cpu) -> u32;
 
 const HOT: u32 = 8;
 const MAX_INSNS: usize = 64;
@@ -106,17 +107,24 @@ pub struct Jit {
     pub native: u64,
     /// executions before a block is compiled
     pub hot: u32,
+    /// debugging: re-run every block in the interpreter and compare (see `jit_step`)
+    pub verify: bool,
+    /// the first mismatch found in verify mode
+    pub report: Option<String>,
 }
 
 const FRONT: usize = 1 << 14;
+/// wasm32: live compiled blocks before the cache is flushed (each is a module in the engine)
+#[cfg(target_arch = "wasm32")]
+const WASM_MAX_BLOCKS: usize = 32768;
 
 impl Jit {
-    pub fn new() -> Option<Box<Jit>> { Self::with(CODE_BYTES, HOT) }
+    pub fn new() -> Option<Box<Jit>> { Self::with(CODE_BYTES, if cfg!(target_arch = "wasm32") { 1024 } else { HOT }) }
 
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
         if !host::AVAILABLE { return None; }
         Some(Box::new(Jit { code: host::CodeCache::new(code_bytes)?, blocks: Map::default(), front: vec![(u64::MAX, u64::MAX, 0); FRONT].into_boxed_slice(),
-                            counts: Map::default(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot }))
+                            counts: Map::default(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None }))
     }
 
     pub fn flush(&mut self) {
@@ -126,6 +134,8 @@ impl Jit {
         self.front.fill((u64::MAX, u64::MAX, 0));
         self.code.reset();
         self.flushes += 1;
+        #[cfg(target_arch = "wasm32")]
+        crate::jit_wasm::reset();
     }
 
     /// Drop blocks compiled from physical page `page` (4 KiB).
@@ -447,14 +457,62 @@ impl Cpu {
             jit.compiled += 1;
             f
         };
+        let verify = self.jit.as_ref().is_some_and(|j| j.verify && j.report.is_none());
+        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl));
+        if verify { self.store_log = Some(Vec::new()); }
         // SAFETY: the bus outlives the call; generated code only reaches it through h_step
         self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
         let r = unsafe { f(self as *mut Cpu) };
         self.jit_bus = None;
+        let log = self.store_log.take();
+        if let (Some(b), 0, Some(log)) = (before, r, log) {
+            if log.iter().any(|e| e.0 == usize::MAX) { return Some(Ok(())); } // a store we cannot undo
+            // undo the block's stores (newest first), keeping what it wrote for the comparison
+            let wrote: Vec<(usize, Vec<u8>)> = log.iter().map(|(off, old)| {
+                // SAFETY: logged offsets are inside guest RAM
+                (*off, unsafe { std::slice::from_raw_parts(self.ram.add(*off), old.len()) }.to_vec())
+            }).collect();
+            for (off, old) in log.iter().rev() { unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), self.ram.add(*off), old.len()) }; }
+            // re-run the same instructions in the interpreter from the same registers
+            let after = (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl);
+            let n = after.4 - b.4;
+            (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v) = (b.0, b.1, b.2, b.3, b.4, b.5);
+            self.set_excl(b.6);
+            let start_pc = self.pc;
+            for _ in 0..n { if self.exec_one(bus).is_err() { break; } }
+            let mut diffs = Vec::new();
+            for k in 0..31 { if self.x[k] != after.0[k] { diffs.push(format!("x{k}: jit {:#x} interp {:#x}", after.0[k], self.x[k])); } }
+            for k in 0..4 { if self.sp[k] != after.1[k] { diffs.push(format!("sp{k}: jit {:#x} interp {:#x}", after.1[k], self.sp[k])); } }
+            if self.pc != after.2 { diffs.push(format!("pc: jit {:#x} interp {:#x}", after.2, self.pc)); }
+            if self.nzcv != after.3 { diffs.push(format!("nzcv: jit {:#x} interp {:#x}", after.3, self.nzcv)); }
+            for k in 0..32 { if self.v[k] != after.5[k] { diffs.push(format!("v{k} differs")); } }
+            for (off, bytes) in &wrote {
+                // SAFETY: inside guest RAM
+                let now = unsafe { std::slice::from_raw_parts(self.ram.add(*off), bytes.len()) };
+                if now != &bytes[..] { diffs.push(format!("memory at RAM+{off:#x}: jit {bytes:02x?} interp {now:02x?}")); }
+            }
+            if !diffs.is_empty() {
+                let words: Vec<String> = (0..n.min(64)).map(|k| {
+                    let a = (pa + 4 * k) as usize;
+                    // SAFETY: inside guest RAM (the block was compiled from it)
+                    format!("{:08x}", unsafe { (self.ram.add(a) as *const u32).read_unaligned() })
+                }).collect();
+                let rep = format!("block at pc {start_pc:#x} (pa {pa:#x}), {n} instructions: {}\n  {}", words.join(" "), diffs.join("\n  "));
+                if let Some(j) = self.jit.as_mut() { j.report = Some(rep); }
+            }
+            return Some(Ok(()));
+        }
         Some(if r == 0 { Ok(()) } else { Err(self.jit_trap.take().unwrap_or(Trap::Wait)) })
     }
 
     fn compile(&mut self, pa: u64) -> Option<BlockFn> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // browser: one small wasm module per block; keep the live set bounded
+            if self.jit.as_ref().is_some_and(|j| j.blocks.len() >= WASM_MAX_BLOCKS) { self.jit.as_mut()?.flush(); }
+            return self.compile_wasm(pa);
+        }
+        #[allow(unreachable_code)]
         let c = ctx();
         let sp_slot = c.off_sp + 8 * if self.spsel { self.el as usize } else { 0 };
         // does this block (up to the page end or the length limit) contain native FP/SIMD?
@@ -669,7 +727,7 @@ impl Cpu {
         let rn = (i >> 5) & 31;
         let (size, load, signed_to, pair, rt2, addr, mode): (u32, bool, u32, bool, u32, Addr, u8);
         // mode: 0 = offset, 1 = post-index, 2 = pre-index
-        if bits(i, 29, 27) == 0b111 && !bit(i, 26) {
+        if bits(i, 29, 27) == 0b111 && !bit(i, 26) && !bit(i, 25) {
             let sz = bits(i, 31, 30);
             let opc = bits(i, 23, 22);
             let (ld, st) = match (sz, opc) { (_, 0) => (false, 0), (_, 1) => (true, 0), (3, _) => return false, (2, 3) => return false, (_, 2) => (true, 64), (_, _) => (true, 32) };
@@ -683,7 +741,7 @@ impl Cpu {
                 let imm = ((bits(i, 20, 12) as i64) << 55) >> 55;
                 match bits(i, 11, 10) { 0 => { addr = Addr::Imm(imm); mode = 0; } 1 => { addr = Addr::Imm(imm); mode = 1; } 3 => { addr = Addr::Imm(imm); mode = 2; } _ => return false }
             }
-        } else if bits(i, 29, 27) == 0b101 && !bit(i, 26) && bits(i, 24, 23) != 0 {
+        } else if bits(i, 29, 27) == 0b101 && !bit(i, 26) && !bit(i, 25) && bits(i, 24, 23) != 0 {
             let opc = bits(i, 31, 30);
             let ld = bit(i, 22);
             let (sz, st) = match (opc, ld) { (0, _) => (2, 0), (1, true) => (2, 64), (2, _) => (3, 0), _ => return false };
@@ -798,7 +856,7 @@ fn e_skip_len() -> u32 { 11 }
 
 /// Interpreted instructions after which the block must end (they can change the translation
 /// regime, the exception level, the code itself or interrupt masking).
-fn is_block_end(i: u32) -> bool {
+pub(crate) fn is_block_end(i: u32) -> bool {
     bits(i, 31, 22) == 0b11_0101_0100 // system: MSR/MRS/SYS/hints/barriers
         || bits(i, 31, 24) == 0b1101_0100 // exception generation
         || (bits(i, 31, 25) == 0b110_1011) // branch-register class incl. ERET

@@ -3,12 +3,22 @@
 //   node tools/wasm-smoke-sd.mjs IMAGE SECONDS [out.png]
 import fs from 'node:fs';
 import zlib from 'node:zlib';
+// the page's JIT hooks (web/worker.js), for headless runs; SBC_JIT=0 disables the JIT
+let jitEx, jitFree = [], jitUsed = [];
+function jitCompile(ptr, len) {
+  const t = jitEx.__indirect_function_table;
+  const mod = new WebAssembly.Module(new Uint8Array(jitEx.memory.buffer).slice(ptr, ptr + len));
+  const inst = new WebAssembly.Instance(mod, { env: { memory: jitEx.memory, table: t } });
+  const idx = jitFree.length ? jitFree.pop() : t.grow(1);
+  t.set(idx, inst.exports.f); jitUsed.push(idx); return idx;
+}
+function jitReset() { const t = jitEx.__indirect_function_table; for (const i of jitUsed) { t.set(i, null); jitFree.push(i); } jitUsed = []; }
 const [img, secs = '600', out] = process.argv.slice(2);
 const fd = fs.openSync(img, 'r');
 const size = fs.fstatSync(fd).size;
 let ex;
 let readBytes = 0;
-const env = { sbc_disk_read: (lba, count, ptr) => {
+const env = { sbc_jit_compile: (p, l) => jitCompile(p, l), sbc_jit_reset: () => jitReset(), sbc_disk_read: (lba, count, ptr) => {
   const buf = Buffer.from(ex.memory.buffer, ptr, count * 512);
   const n = fs.readSync(fd, buf, 0, count * 512, lba * 512);
   if (n < count * 512) buf.fill(0, n);
@@ -16,8 +26,10 @@ const env = { sbc_disk_read: (lba, count, ptr) => {
 } };
 const { instance } = await WebAssembly.instantiate(fs.readFileSync('web/wasm/sbc-emu.wasm'), { env });
 ex = instance.exports;
+jitEx = ex;
 const r = ex.sbc_boot_sd(1024, size / 512);
 if (r !== 0) throw new Error(`sbc_boot_sd: ${r}`);
+if (process.env.SBC_JIT !== '0') console.log('jit', ex.sbc_jit(1) ? 'on' : 'unavailable');
 const t0 = performance.now(), wall = () => (performance.now() - t0) * 1e6;
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 let uart = '', marks = {};
