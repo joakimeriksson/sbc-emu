@@ -18,9 +18,18 @@
 use crate::sdhci::SdioCard;
 use std::collections::VecDeque;
 
-pub const SSID: &str = "sbc-emu";
-const BSSID: [u8; 6] = [0x02, 0x5b, 0xc0, 0xa9, 0x00, 0x01];
+/// The virtual access points: (SSID, BSSID, WPA2-PSK passphrase or open).
+pub const NETWORKS: [(&str, [u8; 6], Option<&str>); 2] = [
+    ("sbc-emu", [0x02, 0x5b, 0xc0, 0xa9, 0x00, 0x01], None),
+    ("sbc-emu-wpa2", [0x02, 0x5b, 0xc0, 0xa9, 0x00, 0x02], Some("raspberry-pi")),
+];
+pub const SSID: &str = NETWORKS[0].0;
 const CHANNEL: u8 = 6;
+/// RSN IE: WPA2, CCMP group and pairwise, PSK authentication
+const RSN_IE: [u8; 22] = [48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wpa { Open, AwaitM2, AwaitM4, Installed }
 
 const RAM_BASE: u32 = 0x198000;
 const RAM_SIZE: u32 = 0xC8000;
@@ -94,6 +103,14 @@ pub struct Cyw43455 {
     pub mac: [u8; 6],
     event_mask: Vec<u8>,
     associated: bool,
+    /// index into NETWORKS of the current association
+    net: usize,
+    /// iovars set by the host, returned by later gets (as the firmware stores them)
+    vars: std::collections::HashMap<String, Vec<u8>>,
+    wpa: Wpa,
+    pmk: [u8; 32],
+    anonce: [u8; 32],
+    replay: u64,
     /// Ethernet frames from the host over the data channel (for the network)
     pub tx_out: Vec<Vec<u8>>,
     pub trace: bool,
@@ -111,7 +128,7 @@ impl Cyw43455 {
             window: 0, watermark: 0, devctl: 0, clkcsr: 0, pullup: 0, mesbusy: 0, sleepcsr: 0x03,
             ram: vec![0; RAM_SIZE as usize], regs: Default::default(), ram_written: false, running: false,
             intstatus: 0, hostintmask: 0, tx_buf: Vec::new(), rx: VecDeque::new(), rx_cur: None, rx_seq: 0, host_seq: 255,
-            mac: [0x02, 0x5b, 0xc0, 0x00, 0x00, 0x02], event_mask: Vec::new(), associated: false,
+            mac: [0x02, 0x5b, 0xc0, 0x00, 0x00, 0x02], event_mask: Vec::new(), associated: false, net: 0, vars: Default::default(), wpa: Wpa::Open, pmk: [0; 32], anonce: [0; 32], replay: 0,
             tx_out: Vec::new(), trace: false, ioctls: 0,
         }
     }
@@ -359,12 +376,14 @@ impl Cyw43455 {
         if p.len() < 4 { return; }
         let off = 4 + 4 * p[3] as usize;
         if off > p.len() { return; }
-        if self.associated { self.tx_out.push(p[off..].to_vec()); }
+        let eth = &p[off..];
+        if eth.len() >= 14 && eth[12] == 0x88 && eth[13] == 0x8e { let b = eth[14..].to_vec(); self.on_eapol(&b); return; }
+        if self.data_ok() { self.tx_out.push(eth.to_vec()); }
     }
 
     /// A frame for the host from the network (Ethernet, delivered on the data channel).
     pub fn deliver(&mut self, eth: &[u8]) {
-        if !self.associated || !self.running { return; }
+        if !self.data_ok() || !self.running { return; }
         let mut p = vec![0x20, 0, 0, 0];
         p.extend_from_slice(eth);
         self.queue_rx(2, &p);
@@ -410,18 +429,18 @@ impl Cyw43455 {
             (C_SET_SSID, true) => {
                 // join: struct brcmf_ssid_le { u32 len; u8 ssid[32] } (possibly followed by params)
                 let n = data.get(0..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).unwrap_or(0).min(32);
-                let ssid = data.get(4..4 + n).unwrap_or(&[]);
-                if ssid == SSID.as_bytes() { self.join(); } else { self.event(E_SET_SSID, 3, 0, &[]); } // 3 = no networks
+                let ssid = data.get(4..4 + n).unwrap_or(&[]).to_vec();
+                self.join_ssid(&ssid);
                 Ok(Vec::new())
             }
-            (C_DISASSOC, true) => { if self.associated { self.associated = false; self.event(E_LINK, 0, 0, &[]); } Ok(Vec::new()) }
-            (C_GET_BSSID, false) => if self.associated { Ok(BSSID.to_vec()) } else { Err(BCME_UNSUPPORTED) },
-            (C_GET_SSID, false) => { let mut v = u32v(SSID.len() as u32); v.extend_from_slice(SSID.as_bytes()); v.resize(36, 0); Ok(v) }
+            (C_DISASSOC, true) => { if self.associated { self.associated = false; self.wpa = Wpa::Open; self.event(E_LINK, 0, 0, &[]); } Ok(Vec::new()) }
+            (C_GET_BSSID, false) => if self.associated { Ok(NETWORKS[self.net].1.to_vec()) } else { Err(BCME_UNSUPPORTED) },
+            (C_GET_SSID, false) => { let ss = NETWORKS[self.net].0; let mut v = u32v(ss.len() as u32); v.extend_from_slice(ss.as_bytes()); v.resize(36, 0); Ok(v) }
             (C_GET_CHANNEL, false) => Ok([u32v(CHANNEL as u32), u32v(CHANNEL as u32), u32v(0)].concat()),
             (C_GET_RSSI, false) => Ok(u32v((-45i32) as u32)),
             (C_GET_BSS_INFO, false) => {
                 // u32 buffer length, then the BSS record of the current association
-                let bss = self.bss_info();
+                let bss = self.bss_info(self.net);
                 let mut v = u32v(len as u32);
                 v.extend_from_slice(&bss);
                 Ok(v)
@@ -450,7 +469,7 @@ impl Cyw43455 {
             "chanspec" => u32v(0x1000 | CHANNEL as u32),
             "assoc_info" => vec![0u8; 8], // no association request/response IEs recorded
             "bw_cap" | "mimo_bw_cap" | "rxchain" | "txstreams" => u32v(1),
-            _ => return Err(BCME_UNSUPPORTED),
+            _ => match self.vars.get(&name) { Some(v) => v.clone(), None => return Err(BCME_UNSUPPORTED) },
         })
     }
 
@@ -458,6 +477,8 @@ impl Cyw43455 {
         let name_end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         let name = String::from_utf8_lossy(&data[..name_end]).into_owned();
         let val = data.get(name_end + 1..).unwrap_or(&[]);
+        // remember the value (bus:/tlv probes excluded: they must keep failing)
+        if !matches!(name.as_str(), "bus:rxglom" | "tlv" | "escan" | "join") { self.vars.insert(name.clone(), val.to_vec()); }
         match name.as_str() {
             // keep host-side glomming and flow-control TLVs off (they change the framing)
             "bus:rxglom" | "tlv" => return Err(BCME_UNSUPPORTED),
@@ -466,7 +487,7 @@ impl Cyw43455 {
                 // brcmf_ext_join_params_le: starts with brcmf_ssid_le { u32 len; u8 ssid[32] }
                 let n = val.get(0..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).unwrap_or(0).min(32);
                 let ssid = val.get(4..4 + n).unwrap_or(&[]).to_vec();
-                if ssid == SSID.as_bytes() { self.join(); } else { self.event(E_SET_SSID, 3, 0, &[]); }
+                self.join_ssid(&ssid);
             }
             "escan" => {
                 let sync = val.get(6..8).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
@@ -501,7 +522,7 @@ impl Cyw43455 {
         p.extend_from_slice(&0u32.to_be_bytes()); // reason
         p.extend_from_slice(&0u32.to_be_bytes()); // auth type
         p.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        p.extend_from_slice(&BSSID);
+        p.extend_from_slice(&NETWORKS[self.net].1);
         let mut ifname = [0u8; 16];
         ifname[..5].copy_from_slice(b"wlan0");
         p.extend_from_slice(&ifname);
@@ -511,21 +532,23 @@ impl Cyw43455 {
         self.queue_rx(1, &p);
     }
 
-    fn bss_info(&self) -> Vec<u8> {
-        let mut ies = vec![0u8, SSID.len() as u8];
-        ies.extend_from_slice(SSID.as_bytes());
+    fn bss_info(&self, idx: usize) -> Vec<u8> {
+        let (ssid, bssid, psk) = NETWORKS[idx];
+        let mut ies = vec![0u8, ssid.len() as u8];
+        ies.extend_from_slice(ssid.as_bytes());
         ies.extend_from_slice(&[1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]); // rates
         ies.extend_from_slice(&[3, 1, CHANNEL]); // DS parameter set
+        if psk.is_some() { ies.extend_from_slice(&RSN_IE); }
         let mut b = vec![0u8; 128];
         let put16 = |b: &mut Vec<u8>, o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
         let put32 = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
         put32(&mut b, 0, 109); // version
         put32(&mut b, 4, (128 + ies.len()) as u32);
-        b[8..14].copy_from_slice(&BSSID);
+        b[8..14].copy_from_slice(&bssid);
         put16(&mut b, 14, 100); // beacon period
-        put16(&mut b, 16, 0x0401); // capability: ESS, short slot
-        b[18] = SSID.len() as u8;
-        b[19..19 + SSID.len()].copy_from_slice(SSID.as_bytes());
+        put16(&mut b, 16, if psk.is_some() { 0x0411 } else { 0x0401 }); // ESS, short slot (+ privacy)
+        b[18] = ssid.len() as u8;
+        b[19..19 + ssid.len()].copy_from_slice(ssid.as_bytes());
         put32(&mut b, 52, 8);
         b[56..64].copy_from_slice(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]);
         put16(&mut b, 72, 0x1000 | CHANNEL as u16); // chanspec: 2.4 GHz, 20 MHz
@@ -541,14 +564,16 @@ impl Cyw43455 {
     }
 
     fn scan_results(&mut self, sync: u16) {
-        let bss = self.bss_info();
-        let mut partial = Vec::new();
-        partial.extend_from_slice(&((12 + bss.len()) as u32).to_le_bytes());
-        partial.extend_from_slice(&109u32.to_le_bytes());
-        partial.extend_from_slice(&sync.to_le_bytes());
-        partial.extend_from_slice(&1u16.to_le_bytes());
-        partial.extend_from_slice(&bss);
-        self.event(E_ESCAN_RESULT, 8, 0, &partial); // partial result
+        for idx in 0..NETWORKS.len() {
+            let bss = self.bss_info(idx);
+            let mut partial = Vec::new();
+            partial.extend_from_slice(&((12 + bss.len()) as u32).to_le_bytes());
+            partial.extend_from_slice(&109u32.to_le_bytes());
+            partial.extend_from_slice(&sync.to_le_bytes());
+            partial.extend_from_slice(&1u16.to_le_bytes());
+            partial.extend_from_slice(&bss);
+            self.event(E_ESCAN_RESULT, 8, 0, &partial); // partial result: one BSS each
+        }
         let mut done = Vec::new();
         done.extend_from_slice(&12u32.to_le_bytes());
         done.extend_from_slice(&109u32.to_le_bytes());
@@ -557,11 +582,107 @@ impl Cyw43455 {
         self.event(E_ESCAN_RESULT, 0, 0, &done); // scan complete
     }
 
-    fn join(&mut self) {
+    fn join_ssid(&mut self, ssid: &[u8]) {
+        match NETWORKS.iter().position(|n| n.0.as_bytes() == ssid) {
+            Some(i) => self.join(i),
+            None => self.event(E_SET_SSID, 3, 0, &[]), // 3 = no networks
+        }
+    }
+
+    fn join(&mut self, idx: usize) {
+        self.net = idx;
         self.associated = true;
-        if self.trace { eprintln!("[wifi] associated with '{SSID}'"); }
+        if self.trace { eprintln!("[wifi] associated with '{}'", NETWORKS[idx].0); }
         self.event(E_LINK, 0, 1, &[]); // flags bit 0: link up
         self.event(E_SET_SSID, 0, 0, &[]);
+        match NETWORKS[idx].2 {
+            None => self.wpa = Wpa::Open,
+            Some(pass) => {
+                // WPA2-PSK: the AP starts the four-way handshake (message 1)
+                self.pmk.copy_from_slice(&sbc_net::crypto::pbkdf2_sha1(pass.as_bytes(), NETWORKS[idx].0.as_bytes(), 4096, 32));
+                let seed = sbc_net::crypto::sha1(&[&self.pmk[..], &self.mac[..], &self.replay.to_le_bytes()[..]].concat());
+                for i in 0..32 { self.anonce[i] = seed[i % 20] ^ (i as u8); }
+                self.replay += 1;
+                let m1 = self.eapol_key(0x008a, self.anonce, &[], None);
+                self.wpa = Wpa::AwaitM2;
+                self.send_eapol(m1);
+            }
+        }
+    }
+
+    /// Data may flow: associated, and either open or the handshake has installed the keys.
+    fn data_ok(&self) -> bool { self.associated && matches!(self.wpa, Wpa::Open | Wpa::Installed | Wpa::AwaitM4) }
+
+    /// An EAPOL-Key frame (802.1X-2004, RSN key descriptor, HMAC-SHA1 MIC).
+    fn eapol_key(&self, key_info: u16, nonce: [u8; 32], key_data: &[u8], kck: Option<&[u8]>) -> Vec<u8> {
+        let mut b = vec![2u8, 3];
+        b.extend_from_slice(&((95 + key_data.len()) as u16).to_be_bytes());
+        b.push(2);
+        b.extend_from_slice(&key_info.to_be_bytes());
+        b.extend_from_slice(&16u16.to_be_bytes());
+        b.extend_from_slice(&self.replay.to_be_bytes());
+        b.extend_from_slice(&nonce);
+        b.extend_from_slice(&[0u8; 32]); // IV, RSC, ID
+        let mic_at = b.len();
+        b.extend_from_slice(&[0u8; 16]);
+        b.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
+        b.extend_from_slice(key_data);
+        if let Some(k) = kck { let m = sbc_net::crypto::hmac_sha1(k, &b); b[mic_at..mic_at + 16].copy_from_slice(&m[..16]); }
+        b
+    }
+
+    fn send_eapol(&mut self, body: Vec<u8>) {
+        let mut eth = self.mac.to_vec();
+        eth.extend_from_slice(&NETWORKS[self.net].1);
+        eth.extend_from_slice(&0x888eu16.to_be_bytes());
+        eth.extend_from_slice(&body);
+        let mut p = vec![0x20, 0, 0, 0];
+        p.extend_from_slice(&eth);
+        self.queue_rx(2, &p);
+    }
+
+    /// EAPOL from the station: message 2 (verify the MIC, send message 3) and message 4.
+    fn on_eapol(&mut self, body: &[u8]) {
+        if body.len() < 99 || body[1] != 3 { return; }
+        let n = (4 + u16::from_be_bytes([body[2], body[3]]) as usize).min(body.len());
+        let body = &body[..n];
+        let key_info = u16::from_be_bytes([body[5], body[6]]);
+        if key_info & 0x0100 == 0 { return; } // no MIC
+        let secure = key_info & 0x0200 != 0;
+        if !secure && self.wpa == Wpa::AwaitM2 {
+            let mut snonce = [0u8; 32];
+            snonce.copy_from_slice(&body[17..49]);
+            let (aa, spa) = (NETWORKS[self.net].1, self.mac);
+            let (lo_mac, hi_mac) = if aa <= spa { (aa, spa) } else { (spa, aa) };
+            let (lo_n, hi_n) = if self.anonce <= snonce { (self.anonce, snonce) } else { (snonce, self.anonce) };
+            let data = [&lo_mac[..], &hi_mac[..], &lo_n[..], &hi_n[..]].concat();
+            let ptk = sbc_net::crypto::prf(&self.pmk, "Pairwise key expansion", &data, 384);
+            let mut probe = body.to_vec();
+            let recv = probe[81..97].to_vec();
+            probe[81..97].fill(0);
+            let calc = sbc_net::crypto::hmac_sha1(&ptk[0..16], &probe);
+            if calc[..16] != recv[..] {
+                // wrong passphrase: no message 3, the station's handshake times out
+                if self.trace { eprintln!("[wifi] WPA2 message 2 MIC mismatch: wrong passphrase"); }
+                return;
+            }
+            let gtk: Vec<u8> = sbc_net::crypto::sha1(&[&self.pmk[..], b"gtk"].concat())[..16].to_vec();
+            let mut kd = RSN_IE.to_vec();
+            kd.extend_from_slice(&[0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]); // GTK KDE, key id 1
+            kd.extend_from_slice(&gtk);
+            if kd.len() % 8 != 0 { kd.push(0xdd); while kd.len() % 8 != 0 { kd.push(0); } }
+            let mut kek = [0u8; 16];
+            kek.copy_from_slice(&ptk[16..32]);
+            let wrapped = sbc_net::crypto::aes_key_wrap(&kek, &kd);
+            self.replay += 1;
+            let m3 = self.eapol_key(0x13ca, self.anonce, &wrapped, Some(&ptk[..16]));
+            self.wpa = Wpa::AwaitM4;
+            if self.trace { eprintln!("[wifi] WPA2 message 2 verified, sending message 3"); }
+            self.send_eapol(m3);
+        } else if secure && self.wpa == Wpa::AwaitM4 {
+            self.wpa = Wpa::Installed;
+            if self.trace { eprintln!("[wifi] WPA2 four-way handshake complete"); }
+        }
     }
 }
 
@@ -609,7 +730,7 @@ impl SdioCard for Cyw43455 {
     fn set_trace(&mut self, on: bool) { self.trace = on; }
 
     fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("cyw43455-v1");
+        w.tag("cyw43455-v2");
         for v in [self.ioe, self.ien, self.bus_if, self.bus_speed, self.brcm_cardctrl, self.watermark, self.devctl, self.clkcsr, self.pullup, self.mesbusy, self.sleepcsr, self.rx_seq, self.host_seq] { w.u8(v); }
         for v in self.fn_blksize { w.u16(v); }
         w.u32(self.window);
@@ -622,11 +743,16 @@ impl SdioCard for Cyw43455 {
         for (k, v) in regs { w.u32(k); w.u32(v); }
         w.u64(self.rx.len() as u64);
         for f in &self.rx { w.bytes(f); }
+        w.u64(self.net as u64);
+        w.u8(match self.wpa { Wpa::Open => 0, Wpa::AwaitM2 => 1, Wpa::AwaitM4 => 2, Wpa::Installed => 3 });
+        w.bytes(&self.pmk); w.bytes(&self.anonce); w.u64(self.replay);
         // the firmware image in RAM is not needed once running (the emulated firmware replaces it)
     }
 
     fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        r.tag("cyw43455-v1")?;
+        let tag = r.bytes()?;
+        let v2 = tag == b"cyw43455-v2";
+        if !v2 && tag != b"cyw43455-v1" { return Err(emu_core::snap::SnapError("snapshot layout mismatch: Wi-Fi chip".into())); }
         for v in [&mut self.ioe, &mut self.ien, &mut self.bus_if, &mut self.bus_speed, &mut self.brcm_cardctrl, &mut self.watermark, &mut self.devctl,
                   &mut self.clkcsr, &mut self.pullup, &mut self.mesbusy, &mut self.sleepcsr, &mut self.rx_seq, &mut self.host_seq] { *v = r.u8()?; }
         for v in self.fn_blksize.iter_mut() { *v = r.u16()?; }
@@ -639,6 +765,13 @@ impl SdioCard for Cyw43455 {
         for _ in 0..r.u64()? { let k = r.u32()?; let v = r.u32()?; self.regs.insert(k, v); }
         self.rx.clear();
         for _ in 0..r.u64()? { self.rx.push_back(r.bytes()?.to_vec()); }
+        if v2 {
+            self.net = (r.u64()? as usize).min(NETWORKS.len() - 1);
+            self.wpa = match r.u8()? { 1 => Wpa::AwaitM2, 2 => Wpa::AwaitM4, 3 => Wpa::Installed, _ => Wpa::Open };
+            self.pmk.copy_from_slice(&r.bytes()?[..32]);
+            self.anonce.copy_from_slice(&r.bytes()?[..32]);
+            self.replay = r.u64()?;
+        }
         self.rx_cur = None;
         self.tx_buf.clear();
         Ok(())

@@ -340,7 +340,7 @@ impl Keyboard {
 
     /// Queue a key press or release (HID usage; 0xe0..0xe7 are the modifiers).
     pub fn key(&mut self, usage: u8, down: bool) {
-        if self.events.len() < 256 { self.events.push_back((usage, down)); }
+        if self.events.len() < 16384 { self.events.push_back((usage, down)); }
     }
 
     /// Press and release a key with modifier bits (HID left-ctrl 0x01, left-shift 0x02, ...).
