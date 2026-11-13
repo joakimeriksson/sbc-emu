@@ -1,5 +1,6 @@
 //! A64 decode + execute, one instruction per call. Encodings follow the Arm ARM (DDI 0487)
 //! "A64 instruction set encoding" tables; group comments name the table.
+use crate::cpu::UT;
 use crate::cpu::{Cpu, Exc};
 use crate::mmu::Access;
 use emu_core::{Bus, Trap};
@@ -181,15 +182,16 @@ impl Cpu {
     ) -> Result<u128, Trap> {
         if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
-            if self.utlb[1].0 != tag {
+            let ti = (va >> 12) as usize & (UT - 1);
+            if self.utlb[1][ti].0 != tag {
                 let pa = self.pa(bus, va, Access::Read)?;
                 if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
                     return self.load_slow(bus, va, size, unpriv);
                 }
-                self.utlb[1] = (tag, pa & !0xfff);
+                self.utlb[1][ti] = (tag, pa & !0xfff);
             }
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
-            let p = unsafe { self.ram.add((self.utlb[1].1 | (va & 0xfff)) as usize) };
+            let p = unsafe { self.ram.add((self.utlb[1][ti].1 | (va & 0xfff)) as usize) };
             let v = unsafe {
                 match size {
                     1 => *p as u64,
@@ -211,6 +213,9 @@ impl Cpu {
         size: u32,
         unpriv: bool,
     ) -> Result<u128, Trap> {
+        // JIT verify mode: a device read may have side effects, the block must not be re-run
+        if let Some(log) = self.store_log.as_mut() { log.push((usize::MAX, Vec::new())); }
+        self.chain_stop = true;
         let acc = if unpriv {
             Access::ReadUnpriv
         } else {
@@ -251,12 +256,13 @@ impl Cpu {
     ) -> Result<(), Trap> {
         if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
-            if self.utlb[2].0 != tag {
+            let ti = (va >> 12) as usize & (UT - 1);
+            if self.utlb[2][ti].0 != tag {
                 let pa = self.pa(bus, va, Access::Write)?;
                 if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
                     return self.store_slow(bus, va, size, v, unpriv);
                 }
-                self.utlb[2] = (tag, pa & !0xfff);
+                self.utlb[2][ti] = (tag, pa & !0xfff);
             }
             if let Some(m) = self.excl {
                 if m & !63 == va & !63 {
@@ -264,7 +270,7 @@ impl Cpu {
                 }
             }
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
-            let off = (self.utlb[2].1 | (va & 0xfff)) as usize;
+            let off = (self.utlb[2][ti].1 | (va & 0xfff)) as usize;
             let p = unsafe { self.ram.add(off) };
             if let Some(log) = self.store_log.as_mut() {
                 // JIT verify mode: remember the bytes this store overwrites
@@ -294,6 +300,7 @@ impl Cpu {
         unpriv: bool,
     ) -> Result<(), Trap> {
         if let Some(log) = self.store_log.as_mut() { log.push((usize::MAX, Vec::new())); } // not undoable
+        self.chain_stop = true;
         let acc = if unpriv {
             Access::WriteUnpriv
         } else {
@@ -349,13 +356,14 @@ impl Cpu {
             return Err(self.sync_exception(Exc::PC_ALIGN, 0, pc, Some(pc)));
         }
         let tag = ((pc >> 12) + 1) | ((self.el as u64) << 60);
-        let insn = if self.utlb[0].0 == tag {
+        let ti = (pc >> 12) as usize & (UT - 1);
+        let insn = if self.utlb[0][ti].0 == tag {
             // SAFETY: the page was checked to lie inside guest RAM when the entry was filled
-            unsafe { (self.ram.add((self.utlb[0].1 | (pc & 0xfff)) as usize) as *const u32).read_unaligned() }
+            unsafe { (self.ram.add((self.utlb[0][ti].1 | (pc & 0xfff)) as usize) as *const u32).read_unaligned() }
         } else {
             let pa = self.pa(bus, pc, Access::Exec)?;
             if !self.ram.is_null() && (pa | 0xfff) < self.ram_len {
-                self.utlb[0] = (tag, pa & !0xfff);
+                self.utlb[0][ti] = (tag, pa & !0xfff);
             }
             bus.fetch(pa).map_err(|_| self.abort(pc, false, 0x10, true))?
         };

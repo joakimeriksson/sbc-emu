@@ -1,6 +1,9 @@
 # Raspberry Pi OS first boot, then GPIO (LED on 17, button on 27), BME280 over I2C and MCP3008 over SPI
-# through the stock kernel drivers (IIO sysfs, libgpiod).
+# through the stock kernel drivers (IIO sysfs, libgpiod). IIO device numbers follow probe order,
+# which varies: the devices are found by name ($B = BME280, $A = MCP3008).
 wait-serial raspberrypi login:
+# the first-boot wizard's blue screen (it starts a while after the serial login prompt)
+wait-pixel 10 700 0000aa
 wait-idle 5
 shot out/01-keyboard-layout.png
 type \n
@@ -27,17 +30,17 @@ wait-idle 4
 type raspberry\n
 sleep 3
 wait-idle 6
-type clear; ls /sys/bus/iio/devices; cat /sys/bus/iio/devices/iio:device*/name\n
+type clear; ls /sys/bus/iio/devices; cat /sys/bus/iio/devices/iio:device*/name; for d in /sys/bus/iio/devices/iio:device*; do grep -qx bme280 $d/name && B=$d; grep -qx mcp3008 $d/name && A=$d; done; echo bme280=$B mcp3008=$A\n
 sleep 3
 wait-idle 6
-type cd /sys/bus/iio/devices/iio:device0; cat in_temp_input in_pressure_input in_humidityrelative_input; cd\n
+type cat $B/in_temp_input $B/in_pressure_input $B/in_humidityrelative_input\n
 sleep 3
 wait-idle 6
 sensor temp 30.5
 sensor pressure 990.0
 sensor humidity 70
 adc 0 1.0
-type cat /sys/bus/iio/devices/iio:device0/in_temp_input /sys/bus/iio/devices/iio:device1/in_voltage0_raw /sys/bus/iio/devices/iio:device1/in_voltage4_raw\n
+type cat $B/in_temp_input $A/in_voltage0_raw $A/in_voltage4_raw\n
 sleep 3
 wait-idle 6
 type which gpioset gpioget; gpioset -t0 GPIO17_LED=1; gpioset -t0 GPIO17_LED=0; gpioget GPIO27_BUTTON\n

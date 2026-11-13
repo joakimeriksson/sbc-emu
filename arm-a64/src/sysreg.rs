@@ -27,6 +27,7 @@ regs! {
     ESR_EL1 = 3,0,5,2,0; ESR_EL2 = 3,4,5,2,0; ESR_EL3 = 3,6,5,2,0;
     FAR_EL1 = 3,0,6,0,0; FAR_EL2 = 3,4,6,0,0; FAR_EL3 = 3,6,6,0,0; PAR_EL1 = 3,0,7,4,0;
     MAIR_EL1 = 3,0,10,2,0;
+    TPIDR_EL0 = 3,3,13,0,2; TPIDRRO_EL0 = 3,3,13,0,3; TPIDR_EL1 = 3,0,13,0,4;
     VBAR_EL1 = 3,0,12,0,0; VBAR_EL2 = 3,4,12,0,0; VBAR_EL3 = 3,6,12,0,0;
     CNTFRQ_EL0 = 3,3,14,0,0; CNTPCT_EL0 = 3,3,14,0,1; CNTVCT_EL0 = 3,3,14,0,2;
     CNTP_TVAL_EL0 = 3,3,14,2,0; CNTP_CTL_EL0 = 3,3,14,2,1; CNTP_CVAL_EL0 = 3,3,14,2,2;
@@ -69,6 +70,8 @@ pub struct SysRegs {
     pub cntvoff: u64,
     pub ptimer: Timer,
     pub vtimer: Timer,
+    /// TPIDR_EL0, TPIDRRO_EL0, TPIDR_EL1 (thread pointers: hot, read natively by the JIT)
+    pub tpidr: [u64; 3],
     pub other: BTreeMap<u32, u64>,
     /// registers read or written that have no model (first access order), for diagnostics
     pub unknown: Vec<u32>,
@@ -125,6 +128,9 @@ impl Cpu {
             ELR_EL2 => self.elr[2],
             ELR_EL3 => self.elr[3],
             SP_EL0 => self.sp[0],
+            TPIDR_EL0 => s.tpidr[0],
+            TPIDRRO_EL0 => s.tpidr[1],
+            TPIDR_EL1 => s.tpidr[2],
             SP_EL1 => self.sp[1],
             SP_EL2 => self.sp[2],
             SPSEL => self.spsel as u64,
@@ -204,6 +210,9 @@ impl Cpu {
             ELR_EL2 => self.elr[2] = v,
             ELR_EL3 => self.elr[3] = v,
             SP_EL0 => self.sp[0] = v,
+            TPIDR_EL0 => s.tpidr[0] = v,
+            TPIDRRO_EL0 => s.tpidr[1] = v,
+            TPIDR_EL1 => s.tpidr[2] = v,
             SP_EL1 => self.sp[1] = v,
             SP_EL2 => self.sp[2] = v,
             SPSEL => self.spsel = v & 1 != 0,

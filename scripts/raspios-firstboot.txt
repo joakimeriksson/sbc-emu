@@ -2,7 +2,10 @@
 # keyboard and HDMI console, ending with the browser's resume snapshot and a network check.
 #   sbc-emu run --sd cache/os/raspios-lite.img --script scripts/raspios-firstboot.txt
 # Dialogs flush pending input when they open, so every keystroke waits for the guest to go idle.
+# The first-boot wizard starts a while after the serial login prompt (in guest time): wait for its
+# blue screen rather than for host time to pass (that depends on how fast the emulator runs).
 wait-serial raspberrypi login:
+wait-pixel 10 700 0000aa
 wait-idle 5
 shot out/01-keyboard-layout.png
 type \n

@@ -44,9 +44,11 @@ fn permission_fault(level: u32) -> u32 {
 }
 const SEA_ON_WALK: u32 = 0b010100;
 
+use crate::cpu::UT;
+
 impl Cpu {
     pub fn tlb_flush(&mut self) {
-        self.utlb = [(0, 0); 3];
+        self.utlb = [[(0, 0); UT]; 3];
         if let Some(t) = self.tlb.as_mut() {
             t.iter_mut().for_each(|e| e.tag = 0);
         }

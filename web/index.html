@@ -130,7 +130,7 @@ slider('adc0', 'adcv', (v) => `${v.toFixed(2)} V`, (v) => worker.postMessage({ t
 const params = new URLSearchParams(location.search);
 const boot = (os) => {
   document.getElementById('chooser').hidden = true;
-  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512, jit: params.get('jit') === '1' }); // the browser JIT is opt-in: it is not yet a net win on a full OS boot
+  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512, jit: params.get('jit') !== '0' }); // ?jit=0: interpreter only
   screen.focus();
 };
 document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));

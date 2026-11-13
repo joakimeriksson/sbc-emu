@@ -280,6 +280,8 @@ impl Machine {
             if self.cpu.instret >= end || steps == 0 { break Stop::Budget; }
             steps -= 1;
             if self.soc.dirty || self.cpu.sys.timers_changed || self.cpu.instret >= self.next_check { self.update_irqs(); }
+            // compiled code may chain blocks until the budget ends or a device needs a look
+            self.cpu.chain_until = end.min(self.next_check);
             match self.cpu.step(&mut self.soc) {
                 Ok(()) => storm = 0,
                 Err(Trap::Exception(_, el)) => {

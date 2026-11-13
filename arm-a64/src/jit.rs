@@ -12,6 +12,7 @@
 //! page. They are discarded by `IC IALLU[IS]` / `IC IVAU` — the cache maintenance software must
 //! perform after writing code, since CTR_EL0.DIC/IDC are 0 — and when the code buffer fills.
 //! The interpreter stays the reference: `jit_enabled = false` gives identical results.
+use crate::cpu::UT;
 use crate::cpu::Cpu;
 use emu_core::{Bus, Trap};
 use std::collections::HashMap;
@@ -67,6 +68,18 @@ mod host {
             self.used += bytes;
             Some(self.base.wrapping_add(off))
         }
+        /// Replace one instruction word of already written code.
+        pub fn patch(&mut self, at: usize, word: u32) {
+            debug_assert!(at >= self.base as usize && at + 4 <= self.base as usize + self.used);
+            // SAFETY: `at` is a word of code written earlier into the mapping
+            unsafe {
+                #[cfg(target_os = "macos")] pthread_jit_write_protect_np(0);
+                (at as *mut u32).write(word);
+                #[cfg(target_os = "macos")] pthread_jit_write_protect_np(1);
+                #[cfg(target_os = "macos")] sys_icache_invalidate(at as *mut c_void, 4);
+                #[cfg(target_os = "linux")] __clear_cache(at as *mut c_void, (at + 4) as *mut c_void);
+            }
+        }
     }
     pub const AVAILABLE: bool = true;
 }
@@ -79,6 +92,7 @@ mod host {
         pub fn new(_size: usize) -> Option<CodeCache> { if AVAILABLE { Some(CodeCache) } else { None } }
         pub fn reset(&mut self) {}
         pub fn write(&mut self, _w: &[u32]) -> Option<*const u8> { None }
+        pub fn patch(&mut self, _at: usize, _word: u32) {}
     }
     pub const AVAILABLE: bool = cfg!(target_arch = "wasm32");
 }
@@ -111,6 +125,20 @@ pub struct Jit {
     pub verify: bool,
     /// the first mismatch found in verify mode
     pub report: Option<String>,
+    /// verify mode: hash of the code each block was compiled from (stale blocks are legal until IC)
+    code_hash: Map<(u64, u64), u64>,
+    /// verify mode: blocks skipped because their code changed since compilation
+    pub stale_skips: u64,
+    /// compiled blocks entered, and guest instructions retired inside them
+    pub execs: u64,
+    /// the block dispatcher in the code cache (emitted after each reset)
+    disp: Option<u64>,
+    /// direct links: target block key -> branch sites (code addresses) waiting for it
+    links: Map<(u64, u64), Vec<usize>>,
+    /// link sites of the block just compiled: (code address, target virtual pc)
+    new_sites: Vec<(usize, u64)>,
+    pub linked: u64,
+    pub exec_insns: u64,
 }
 
 const FRONT: usize = 1 << 14;
@@ -124,18 +152,44 @@ impl Jit {
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
         if !host::AVAILABLE { return None; }
         Some(Box::new(Jit { code: host::CodeCache::new(code_bytes)?, blocks: Map::default(), front: vec![(u64::MAX, u64::MAX, 0); FRONT].into_boxed_slice(),
-                            counts: Map::default(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None }))
+                            counts: Map::default(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None, code_hash: Map::default(), stale_skips: 0, execs: 0, exec_insns: 0, disp: None, links: Map::default(), new_sites: Vec::new(), linked: 0 }))
     }
 
     pub fn flush(&mut self) {
+        if watch_page().is_some() { eprintln!("[jit-watch] flush all"); }
         self.blocks.clear();
         self.counts.clear();
         self.pages.clear();
         self.front.fill((u64::MAX, u64::MAX, 0));
         self.code.reset();
+        self.disp = None;
+        self.links.clear();
+        self.new_sites.clear();
         self.flushes += 1;
         #[cfg(target_arch = "wasm32")]
         crate::jit_wasm::reset();
+    }
+
+    /// Resolve direct branches after block `k` (code at `f`) was added: its own exits to blocks
+    /// that exist, and exits of earlier blocks that were waiting for it. A linked branch enters
+    /// past the prologue (the frame is already set up).
+    fn link(&mut self, k: (u64, u64), f: usize) {
+        const BODY: usize = 16;
+        let branch = |site: usize, to: usize| 0x1400_0000 | ((((to as i64 - site as i64) >> 2) as u32) & 0x3ff_ffff);
+        let mode = k.1 & !((1u64 << 48) - 1);
+        let page_pa = k.1 & ((1u64 << 48) - 1) & !0xfff;
+        for (site, t) in std::mem::take(&mut self.new_sites) {
+            let tk = (t, page_pa | (t & 0xfff) | mode);
+            if let Some(&tf) = self.blocks.get(&tk) {
+                self.code.patch(site, branch(site, tf as usize + BODY));
+                self.linked += 1;
+            } else {
+                self.links.entry(tk).or_default().push(site);
+            }
+        }
+        if let Some(waiting) = self.links.remove(&k) {
+            for site in waiting { self.code.patch(site, branch(site, f + BODY)); self.linked += 1; }
+        }
     }
 
     /// Drop blocks compiled from physical page `page` (4 KiB).
@@ -154,6 +208,7 @@ impl Jit {
     }
 
     pub fn invalidate_page(&mut self, page: u64) {
+        if watch_page() == Some(page) { eprintln!("[jit-watch] invalidate page {page:#x} ({} blocks)", self.pages.get(&page).map_or(0, |v| v.len())); }
         let Some(keys) = self.pages.remove(&page) else { return };
         for k in keys {
             self.blocks.remove(&k);
@@ -161,6 +216,32 @@ impl Jit {
             if self.front[slot].0 == k.0 && self.front[slot].1 == k.1 { self.front[slot] = (u64::MAX, u64::MAX, 0); }
         }
     }
+}
+
+/// debugging: `SBC_JIT_CHAIN=0` turns block chaining and linking off
+fn chain_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("SBC_JIT_CHAIN").map_or(true, |v| v != "0"))
+}
+
+/// debugging: `SBC_JIT_WATCH=<physical page number, hex>` traces compiles/invalidations there
+fn watch_page() -> Option<u64> {
+    static W: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("SBC_JIT_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+}
+
+/// Hash of the instruction words a block at `pa` may span (to the end of its page).
+fn code_hash(cpu: &Cpu, pa: u64) -> u64 {
+    let end = ((pa | 0xfff) + 1).min(pa + 4 * MAX_INSNS as u64).min(cpu.ram_len);
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut a = pa;
+    while a + 4 <= end {
+        // SAFETY: inside guest RAM (bounded by ram_len)
+        let w = unsafe { (cpu.ram.add(a as usize) as *const u32).read_unaligned() };
+        h = (h ^ w as u64).wrapping_mul(0x100_0000_01b3);
+        a += 4;
+    }
+    h
 }
 
 fn key(pa: u64, el: u8, spsel: bool, fpen: u64) -> u64 { pa | ((el as u64) << 56) | ((spsel as u64) << 58) | ((fpen & 3) << 59) }
@@ -348,21 +429,50 @@ fn map_simd(i: u32, ops: &[VOp]) -> Option<(u32, Vec<(u32, u32)>)> {
 
 /// The interpreter for one instruction, called from generated code.
 /// Returns 0 = continue with the next instruction, 1 = leave the block (pc set), 2 = trap.
+/// `SBC_JIT_PROFILE=1`: count the instruction words that compiled blocks hand to the interpreter.
+pub static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static FALLBACKS: std::cell::RefCell<std::collections::HashMap<u32, u64>> = Default::default(); }
+
+/// The interpreter fallbacks counted so far, most frequent first.
+pub fn profile_fallbacks() -> Vec<(u32, u64)> {
+    let mut v: Vec<(u32, u64)> = FALLBACKS.with(|f| f.borrow().iter().map(|(k, v)| (*k, *v)).collect());
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
+}
+
+#[cold]
+fn profile_fallback(cpu: &Cpu) {
+    let e = cpu.utlb[0][(cpu.pc >> 12) as usize & (UT - 1)];
+    let pa = if e.0 == ((cpu.pc >> 12) + 1) | ((cpu.el as u64) << 60) { e.1 | (cpu.pc & 0xfff) } else { return };
+    if pa + 4 > cpu.ram_len { return; }
+    // SAFETY: inside guest RAM
+    let i = unsafe { (cpu.ram.add(pa as usize) as *const u32).read_unaligned() };
+    FALLBACKS.with(|f| *f.borrow_mut().entry(i).or_insert(0) += 1);
+}
+
 unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
     let cpu = &mut *cpu;
+    if PROFILE.load(std::sync::atomic::Ordering::Relaxed) { profile_fallback(cpu); }
     let bus = &mut *cpu.jit_bus.expect("bus");
-    match cpu.exec_one(bus) {
-        Ok(()) => if cpu.pc == expect_next { 0 } else { 1 },
+    let r = cpu.exec_one(bus);
+    if is_block_end(cpu.cur_insn) { cpu.chain_stop = true; }
+    match r {
+        // leaving on chain_stop keeps it clear at every native exit (linked exits rely on that)
+        Ok(()) => if cpu.pc == expect_next && !cpu.chain_stop { 0 } else { 1 },
         Err(t) => { cpu.jit_trap = Some(t); 2 }
     }
 }
 
-struct Ctx { off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_v: usize, off_fpsr: usize }
+struct Ctx { off_tpidr: usize, off_chain_until: usize, off_chain_stop: usize, off_disp: usize, off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_v: usize, off_fpsr: usize }
 
 fn v_off(c: &Ctx, r: u32) -> u32 { (c.off_v + 16 * r as usize) as u32 }
 
 fn ctx() -> Ctx {
     Ctx {
+        off_tpidr: std::mem::offset_of!(Cpu, sys) + std::mem::offset_of!(crate::sysreg::SysRegs, tpidr),
+        off_chain_until: std::mem::offset_of!(Cpu, chain_until),
+        off_chain_stop: std::mem::offset_of!(Cpu, chain_stop),
+        off_disp: std::mem::offset_of!(Cpu, jit_disp),
         off_x: std::mem::offset_of!(Cpu, x),
         off_sp: std::mem::offset_of!(Cpu, sp),
         off_pc: std::mem::offset_of!(Cpu, pc),
@@ -376,7 +486,10 @@ fn ctx() -> Ctx {
     }
 }
 
-struct Emit<'a> { out: Vec<u32>, c: &'a Ctx, sp_slot: usize, pending_native: u64, /** block runs native FP/SIMD: carry FPSR */ fpsr: bool }
+struct Emit<'a> { out: Vec<u32>, c: &'a Ctx, sp_slot: usize, pending_native: u64, /** block runs native FP/SIMD: carry FPSR */ fpsr: bool,
+                  /** chain to the next block: its key's mode bits (bits 48.. of `key`), None = plain return */ chain: Option<u32>,
+                  /** virtual page of the block (targets there can be linked directly) */ page: u64,
+                  /** patchable direct branches: (word index, target pc) */ links: Vec<(usize, u64)> }
 
 impl Emit<'_> {
     fn reg_off(&self, r: u32) -> usize { self.c.off_x + 8 * r as usize }
@@ -414,10 +527,32 @@ impl Emit<'_> {
     }
     /// epilogue: return `status` in w0
     fn ret(&mut self, status: u32) {
+        if let (0, Some(kb)) = (status, self.chain) {
+            // continue at cpu.pc: the dispatcher (4 instructions, like the plain return)
+            self.out.push(0xd2e0_0000 | (kb << 5) | 14); // movz x14, #kb, lsl #48
+            self.out.push(ldr_x(16, X_CPU, self.c.off_disp));
+            self.out.push(0xd61f_0200); // br x16
+            self.out.push(0xd503_201f); // nop
+            return;
+        }
         self.out.push(0x5280_0000 | (status << 5)); // movz w0, #status
         self.out.push(0xa941_53f3); // ldp x19, x20, [sp, #16]
         self.out.push(0xa8c2_7bfd); // ldp x29, x30, [sp], #32
         self.out.push(0xd65f_03c0); // ret
+    }
+    /// Leave the block for constant `target` (instret flushed, flags saved). A target on the
+    /// same page gets a patchable direct branch into its block, taken while the budget lasts.
+    fn exit_const(&mut self, target: u64) {
+        if self.chain.is_some() && target >> 12 == self.page {
+            self.out.push(ldr_x(9, X_CPU, self.c.off_instret));
+            self.out.push(ldr_x(10, X_CPU, self.c.off_chain_until));
+            self.out.push(0xeb0a_013f); // cmp x9, x10
+            self.out.push(0x5400_0042); // b.hs +2
+            self.links.push((self.out.len(), target));
+            self.out.push(0x1400_0001); // b +1, patched to the target block's body
+        }
+        self.set_pc_const(target);
+        self.ret(0);
     }
     fn set_pc_const(&mut self, pc: u64) { mov64(&mut self.out, X_SCRATCH, pc); self.out.push(str_x(X_SCRATCH, X_CPU, self.c.off_pc)); }
     fn load_guest(&mut self, host: u32, r: u32, how: R) {
@@ -435,7 +570,8 @@ impl Cpu {
         if self.pc & 3 != 0 { return None; }
         // physical address of pc through the fetch micro-TLB (no fault taken here)
         let tag = ((self.pc >> 12) + 1) | ((self.el as u64) << 60);
-        let pa = if self.utlb[0].0 == tag { self.utlb[0].1 | (self.pc & 0xfff) } else { return None };
+        let e = self.utlb[0][(self.pc >> 12) as usize & (UT - 1)];
+        let pa = if e.0 == tag { e.1 | (self.pc & 0xfff) } else { return None };
         let k = (self.pc, key(pa, self.el, self.spsel, (self.sys.cpacr_el1 >> 20) & 3));
         let jit = self.jit.as_mut()?;
         let slot = ((self.pc ^ (self.pc >> 14)) as usize >> 2) & (FRONT - 1);
@@ -453,12 +589,37 @@ impl Cpu {
             let jit = self.jit.as_mut()?;
             jit.blocks.insert(k, f);
             jit.pages.entry(pa >> 12).or_default().push(k);
+            if watch_page() == Some(pa >> 12) { eprintln!("[jit-watch] compiled pc {:#x} pa {pa:#x} instret {}", self.pc, self.instret); }
             jit.front[slot] = (k.0, k.1, f as usize);
             jit.compiled += 1;
+            jit.link(k, f as usize);
+            if jit.verify { let h = code_hash(self, pa); if let Some(j) = self.jit.as_mut() { j.code_hash.insert(k, h); } }
             f
         };
-        let verify = self.jit.as_ref().is_some_and(|j| j.verify && j.report.is_none());
-        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl));
+        if self.jit.as_ref().is_some_and(|j| j.verify) { return Some(self.jit_verify_block(f, pa, k, bus)); }
+        // SAFETY: the bus outlives the call; generated code only reaches it through h_step
+        self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
+        let i0 = self.instret;
+        self.chain_stop = false;
+        if !chain_enabled() { self.chain_until = 0; }
+        let r = unsafe { f(self as *mut Cpu) };
+        self.jit_bus = None;
+        if let Some(j) = self.jit.as_mut() { j.execs += 1; j.exec_insns += self.instret - i0; }
+        Some(if r == 0 { Ok(()) } else { Err(self.jit_trap.take().unwrap_or(Trap::Wait)) })
+    }
+
+    /// JIT verify mode: run block `f`, then re-run the same instructions in the interpreter from
+    /// the same state (stores rolled back) and record the first mismatch. Kept out of `jit_step`.
+    #[cold]
+    #[inline(never)]
+    fn jit_verify_block(&mut self, f: BlockFn, pa: u64, k: (u64, u64), bus: &mut dyn Bus) -> Result<(), Trap> {
+        let mut verify = self.jit.as_ref().is_some_and(|j| j.verify && j.report.is_none());
+        if verify && self.jit.as_ref().and_then(|j| j.code_hash.get(&k)) != Some(&code_hash(self, pa)) {
+            // the code changed after compilation (no IC yet): running the old code is legal
+            verify = false;
+            if let Some(j) = self.jit.as_mut() { j.stale_skips += 1; }
+        }
+        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl, (self.el, self.spsel, self.daif), (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed)));
         if verify { self.store_log = Some(Vec::new()); }
         // SAFETY: the bus outlives the call; generated code only reaches it through h_step
         self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
@@ -466,7 +627,7 @@ impl Cpu {
         self.jit_bus = None;
         let log = self.store_log.take();
         if let (Some(b), 0, Some(log)) = (before, r, log) {
-            if log.iter().any(|e| e.0 == usize::MAX) { return Some(Ok(())); } // a store we cannot undo
+            if log.iter().any(|e| e.0 == usize::MAX) { return Ok(()); } // a store we cannot undo
             // undo the block's stores (newest first), keeping what it wrote for the comparison
             let wrote: Vec<(usize, Vec<u8>)> = log.iter().map(|(off, old)| {
                 // SAFETY: logged offsets are inside guest RAM
@@ -474,16 +635,20 @@ impl Cpu {
             }).collect();
             for (off, old) in log.iter().rev() { unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), self.ram.add(*off), old.len()) }; }
             // re-run the same instructions in the interpreter from the same registers
-            let after = (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl);
+            let after = (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl, (self.el, self.spsel, self.daif));
+            // the timers are restored too (MSR to them may end the block); compared via the registers
+            (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed) = b.8;
             let n = after.4 - b.4;
             (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v) = (b.0, b.1, b.2, b.3, b.4, b.5);
             self.set_excl(b.6);
+            (self.el, self.spsel, self.daif) = b.7;
             let start_pc = self.pc;
             for _ in 0..n { if self.exec_one(bus).is_err() { break; } }
             let mut diffs = Vec::new();
             for k in 0..31 { if self.x[k] != after.0[k] { diffs.push(format!("x{k}: jit {:#x} interp {:#x}", after.0[k], self.x[k])); } }
             for k in 0..4 { if self.sp[k] != after.1[k] { diffs.push(format!("sp{k}: jit {:#x} interp {:#x}", after.1[k], self.sp[k])); } }
             if self.pc != after.2 { diffs.push(format!("pc: jit {:#x} interp {:#x}", after.2, self.pc)); }
+            if (self.el, self.spsel, self.daif) != after.7 { diffs.push(format!("el/spsel/daif: jit {:?} interp {:?}", after.7, (self.el, self.spsel, self.daif))); }
             if self.nzcv != after.3 { diffs.push(format!("nzcv: jit {:#x} interp {:#x}", after.3, self.nzcv)); }
             for k in 0..32 { if self.v[k] != after.5[k] { diffs.push(format!("v{k} differs")); } }
             for (off, bytes) in &wrote {
@@ -500,9 +665,9 @@ impl Cpu {
                 let rep = format!("block at pc {start_pc:#x} (pa {pa:#x}), {n} instructions: {}\n  {}", words.join(" "), diffs.join("\n  "));
                 if let Some(j) = self.jit.as_mut() { j.report = Some(rep); }
             }
-            return Some(Ok(()));
+            return Ok(());
         }
-        Some(if r == 0 { Ok(()) } else { Err(self.jit_trap.take().unwrap_or(Trap::Wait)) })
+        if r == 0 { Ok(()) } else { Err(self.jit_trap.take().unwrap_or(Trap::Wait)) }
     }
 
     fn compile(&mut self, pa: u64) -> Option<BlockFn> {
@@ -528,7 +693,8 @@ impl Cpu {
                 if a2 & 0xfff == 0 { break; }
             }
         }
-        let mut e = Emit { out: Vec::with_capacity(512), c: &c, sp_slot, pending_native: 0, fpsr };
+        let chain = self.jit.as_ref().is_some_and(|j| !j.verify).then(|| (key(0, self.el, self.spsel, (self.sys.cpacr_el1 >> 20) & 3) >> 48) as u32);
+        let mut e = Emit { out: Vec::with_capacity(512), c: &c, sp_slot, pending_native: 0, fpsr, chain, page: self.pc >> 12, links: Vec::new() };
         // prologue: save x19/x20 and the frame, x19 = cpu, guest flags into host NZCV
         e.out.push(0xa9be_7bfd); // stp x29, x30, [sp, #-32]!
         e.out.push(0xa901_53f3); // stp x19, x20, [sp, #16]
@@ -577,8 +743,33 @@ impl Cpu {
                 if rd != 31 { mov64(&mut e.out, T[0], sx); e.out.push(str_x(T[0], X_CPU, e.reg_off(rd))); }
                 natives += 1;
                 e.pending_native += 1;
-            } else if i == 0xd503_201f {
-                natives += 1; // NOP
+            } else if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
+                || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6))
+            {
+                // NOP and the hints that are NOPs here (YIELD, SEV, PAC, BTI, ...), DSB/DMB/ISB
+                natives += 1;
+                e.pending_native += 1;
+            } else if i & 0xffc0_0000 == 0xf980_0000 || i & 0xffe0_0c00 == 0xf880_0000 || i & 0xffe0_0c00 == 0xf8a0_0800 {
+                // PRFM / PRFUM: no caches are modelled
+                natives += 1;
+                e.pending_native += 1;
+            } else if let Some(n) = match i & 0xffff_ffe0 { 0xd53b_d040 => Some(0), 0xd53b_d060 => Some(1), 0xd538_d080 if self.el >= 1 => Some(2), _ => None } {
+                // MRS Xt, TPIDR_EL0 / TPIDRRO_EL0 / TPIDR_EL1 (thread pointers)
+                let rt = i & 31;
+                if rt != 31 {
+                    e.out.push(ldr_x(T[0], X_CPU, c.off_tpidr + 8 * n));
+                    e.out.push(str_x(T[0], X_CPU, e.reg_off(rt)));
+                }
+                natives += 1;
+                e.pending_native += 1;
+            } else if i & 0xffff_ffe0 == 0xd538_4100 && self.el >= 1 {
+                // MRS Xt, SP_EL0 (Linux keeps `current` there)
+                let rt = i & 31;
+                if rt != 31 {
+                    e.out.push(ldr_x(T[0], X_CPU, c.off_sp));
+                    e.out.push(str_x(T[0], X_CPU, e.reg_off(rt)));
+                }
+                natives += 1;
                 e.pending_native += 1;
             } else if let Some(done) = if mask & 2 != 0 { self.emit_branch(&mut e, i, pc) } else { None } {
                 if done { natives += 1; ended = true; break; }
@@ -610,14 +801,23 @@ impl Cpu {
             // fell off the end of the block: continue at pc
             e.flush_instret();
             e.save_flags();
-            e.set_pc_const(pc);
-            e.ret(0);
+            e.exit_const(pc);
         }
+        if e.chain.is_some() && self.jit.as_ref()?.disp.is_none() {
+            let words = dispatcher(&c, self.jit.as_ref()?.front.as_ptr() as u64);
+            match self.jit.as_mut()?.code.write(&words) {
+                Some(d) => self.jit.as_mut()?.disp = Some(d as u64),
+                None => { self.jit.as_mut()?.flush(); return None; }
+            }
+        }
+        if let Some(d) = self.jit.as_ref()?.disp { self.jit_disp = d; }
         let f = self.jit.as_mut()?.code.write(&e.out);
         let f = match f {
             Some(p) => p,
             None => { self.jit.as_mut()?.flush(); return None; }
         };
+        let sites: Vec<(usize, u64)> = e.links.iter().map(|&(ix, t)| (f as usize + 4 * ix, t)).collect();
+        self.jit.as_mut()?.new_sites = sites;
         // SAFETY: the buffer now holds a complete function with the BlockFn ABI
         Some(unsafe { std::mem::transmute::<*const u8, BlockFn>(f) })
     }
@@ -633,21 +833,21 @@ impl Cpu {
             e.pending_native += 1;
             e.flush_instret();
             e.save_flags();
-            e.set_pc_const(target);
-            e.ret(0);
+            e.exit_const(target);
             return Some(true);
         }
         // B.cond: select with the guest flags still in the host NZCV
         if bits(i, 31, 24) == 0b0101_0100 && !bit(i, 4) {
             let target = pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21));
-            mov64(&mut e.out, T[0], pc + 4);
-            mov64(&mut e.out, T[1], target);
-            e.out.push(0x9a80_0000 | (T[0] << 16) | (bits(i, 3, 0) << 12) | (T[1] << 5) | T[0]); // csel x9, x10, x9, cond
-            e.out.push(str_x(T[0], X_CPU, e.c.off_pc));
             e.pending_native += 1;
             e.flush_instret();
-            e.save_flags();
-            e.ret(0);
+            e.save_flags(); // keeps the host NZCV
+            let at = e.out.len();
+            e.out.push(0x5400_0000 | bits(i, 3, 0)); // b.cond taken (patched below)
+            e.exit_const(pc + 4);
+            let taken = e.out.len();
+            e.out[at] |= (((taken - at) as u32) & 0x7ffff) << 5;
+            e.exit_const(target);
             return Some(true);
         }
         // CBZ/CBNZ, TBZ/TBNZ: test with a host cbz/tbz (flags untouched)
@@ -657,18 +857,16 @@ impl Cpu {
             let rt = i & 31;
             let target = if cb { pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21)) } else { pc.wrapping_add(sx((bits(i, 18, 5) as u64) << 2, 16)) };
             if rt == 31 { e.out.push(0xaa1f_03e0 | T[2]); } else { e.out.push(ldr_x(T[2], X_CPU, e.reg_off(rt))); }
-            // x9 = target, x14 = fall-through; the host branch (same test, Rt = x11) skips the
-            // single "mov x9, x14" when taken
-            mov64(&mut e.out, T[0], target);
-            mov64(&mut e.out, 14, pc + 4);
-            let host = if cb { (i & !(31 | (0x7ffff << 5))) | T[2] | (2 << 5) } else { (i & !(31 | (0x3fff << 5))) | T[2] | (2 << 5) };
-            e.out.push(host);
-            e.out.push(0xaa0e_03e0 | T[0]); // mov x9, x14
-            e.out.push(str_x(T[0], X_CPU, e.c.off_pc));
             e.pending_native += 1;
-            e.flush_instret();
-            e.save_flags();
-            e.ret(0);
+            e.flush_instret(); // x13, x20: x11 survives
+            e.save_flags(); // x9
+            // the host branch (same test on x11) jumps to the taken exit
+            let at = e.out.len();
+            e.out.push(if cb { i & !(31 | (0x7ffff << 5)) } else { i & !(31 | (0x3fff << 5)) } | T[2]);
+            e.exit_const(pc + 4);
+            let off = (e.out.len() - at) as u32;
+            e.out[at] |= if cb { (off & 0x7ffff) << 5 } else { (off & 0x3fff) << 5 };
+            e.exit_const(target);
             return Some(true);
         }
         // BR / BLR / RET
@@ -727,7 +925,31 @@ impl Cpu {
         let rn = (i >> 5) & 31;
         let (size, load, signed_to, pair, rt2, addr, mode): (u32, bool, u32, bool, u32, Addr, u8);
         // mode: 0 = offset, 1 = post-index, 2 = pre-index
-        if bits(i, 29, 27) == 0b111 && !bit(i, 26) && !bit(i, 25) {
+        // SIMD&FP registers (B/H/S/D/Q, LDP/STP S/D/Q) need FP enabled at this EL
+        let vec = bit(i, 26);
+        if vec && (self.sys.cpacr_el1 >> 20) & 3 != 3 { return false; }
+        if vec && bits(i, 29, 27) == 0b111 && !bit(i, 25) {
+            let sz = ((bit(i, 23) as u32) << 2) | bits(i, 31, 30);
+            if sz > 4 { return false; }
+            size = 1 << sz; load = bit(i, 22); signed_to = 0; pair = false; rt2 = 0;
+            if bit(i, 24) {
+                addr = Addr::Imm((bits(i, 21, 10) as i64) << sz); mode = 0;
+            } else if bit(i, 21) {
+                if bits(i, 11, 10) != 0b10 || bits(i, 15, 13) & 2 == 0 { return false; }
+                addr = Addr::Reg(bits(i, 20, 16), bits(i, 15, 13), if bit(i, 12) { sz } else { 0 }); mode = 0;
+            } else {
+                let imm = ((bits(i, 20, 12) as i64) << 55) >> 55;
+                match bits(i, 11, 10) { 0 => { addr = Addr::Imm(imm); mode = 0; } 1 => { addr = Addr::Imm(imm); mode = 1; } 3 => { addr = Addr::Imm(imm); mode = 2; } _ => return false }
+            }
+        } else if vec && bits(i, 29, 27) == 0b101 && !bit(i, 25) && bits(i, 24, 23) != 0 {
+            let sz = match bits(i, 31, 30) { 0 => 2, 1 => 3, 2 => 4, _ => return false };
+            size = 1 << sz; load = bit(i, 22); signed_to = 0; pair = true; rt2 = bits(i, 14, 10);
+            addr = Addr::Imm((((bits(i, 21, 15) as i64) << 57) >> 57) << sz);
+            mode = match bits(i, 24, 23) { 1 => 1, 3 => 2, _ => 0 };
+            if load && rt == rt2 { return false; }
+        } else if vec {
+            return false;
+        } else if bits(i, 29, 27) == 0b111 && !bit(i, 26) && !bit(i, 25) {
             let sz = bits(i, 31, 30);
             let opc = bits(i, 23, 22);
             let (ld, st) = match (sz, opc) { (_, 0) => (false, 0), (_, 1) => (true, 0), (3, _) => return false, (2, 3) => return false, (_, 2) => (true, 64), (_, _) => (true, 32) };
@@ -754,6 +976,7 @@ impl Cpu {
             return false;
         }
         if mode != 0 && rn != 31 && (rn == rt || (pair && rn == rt2)) { return false; }
+        if !load && self.jit.as_ref().is_some_and(|j| j.verify) { return false; } // verify mode logs stores in the interpreter
         let span = if pair { 2 * size } else { size };
         let c = e.c;
         let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
@@ -780,10 +1003,15 @@ impl Cpu {
         // ---- micro-TLB check (no flags touched): tag = (va >> 12) + 1 | el << 60
         let k = if load { 1 } else { 2 };
         let mut slow: Vec<usize> = Vec::new();
+        // x17 = &utlb[k][(va >> 12) % UT] (x17 is free here: only used for large offsets above)
+        let ent = c.off_utlb + 16 * UT * k;
+        assert!(ent + 16 * UT < 32768);
         e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
+        e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
+        e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
         e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
         if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
-        e.out.push(ldr_x(tmp2, X_CPU, c.off_utlb + 16 * k));
+        e.out.push(ldr_x(tmp2, 17, ent));
         e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
         slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow
         e.out.push(0x9240_2c00 | (vreg << 5) | tmp2); // and x15, x13, #0xfff
@@ -793,7 +1021,7 @@ impl Cpu {
             e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
             slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow (reservation held)
         }
-        e.out.push(ldr_x(tmp, X_CPU, c.off_utlb + 16 * k + 8)); // physical page
+        e.out.push(ldr_x(tmp, 17, ent + 8)); // physical page
         e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // add x14, x14, x15
         e.out.push(ldr_x(tmp2, X_CPU, c.off_ram));
         e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // x14 = host address
@@ -805,7 +1033,24 @@ impl Cpu {
             0x3900_0000 | (sz << 30) | (opc << 22) | ((off >> sz) << 10) | (tmp << 5) | rt
         };
         let regs = if pair { vec![(rt, 0u32, 9u32), (rt2, size, 10u32)] } else { vec![(rt, 0, 9)] };
-        if load {
+        let ldq = |v: u32, r: u32| 0x3dc0_0000 | ((v_off(c, r) / 16) << 10) | (X_CPU << 5) | v; // ldr qV, [cpu.v[r]]
+        let stq = |v: u32, r: u32| 0x3d80_0000 | ((v_off(c, r) / 16) << 10) | (X_CPU << 5) | v; // str qV, [cpu.v[r]]
+        if vec {
+            // through host v0/v1 (free between instructions); scalar loads zero the upper bits
+            let opc_q = if sz == 4 { 2 } else { 0 };
+            let s_bits = if sz == 4 { 0 } else { sz };
+            if load {
+                if pair { e.out.push([0x2d40_0000u32, 0x6d40_0000, 0xad40_0000][sz as usize - 2] | (1 << 10) | (tmp << 5)); } // ldp v0, v1, [x14]
+                else { e.out.push(0x3d40_0000 | (s_bits << 30) | (opc_q << 22) | (tmp << 5)); } // ldr b/h/s/d/q0, [x14]
+                e.out.push(stq(0, rt));
+                if pair { e.out.push(stq(1, rt2)); }
+            } else {
+                e.out.push(ldq(0, rt));
+                if pair { e.out.push(ldq(1, rt2)); }
+                if pair { e.out.push([0x2d00_0000u32, 0x6d00_0000, 0xad00_0000][sz as usize - 2] | (1 << 10) | (tmp << 5)); } // stp v0, v1, [x14]
+                else { e.out.push(0x3d00_0000 | (s_bits << 30) | (opc_q << 22) | (tmp << 5)); } // str b/h/s/d/q0, [x14]
+            }
+        } else if load {
             if pair && signed_to == 64 {
                 e.out.push(0x6940_0000 | (10 << 10) | (tmp << 5) | 9); // ldpsw x9, x10, [x14]
             } else if pair {
@@ -851,14 +1096,88 @@ impl Emit<'_> {
     }
 }
 
+/// The shared block dispatcher, entered from a block's exit with its frame still pushed, the
+/// guest state stored (pc, instret, flags) and x14 = the mode bits of the block key. Jumps into
+/// the next compiled block (a tail call) or returns 0 to `jit_step`.
+fn dispatcher(c: &Ctx, front: u64) -> Vec<u32> {
+    let probe = (u64::MAX, u64::MAX, 0usize);
+    let base = &probe as *const _ as usize;
+    let (o_pc, o_key, o_f) = (&probe.0 as *const _ as usize - base, &probe.1 as *const _ as usize - base, &probe.2 as *const _ as usize - base);
+    assert_eq!(std::mem::size_of::<(u64, u64, usize)>(), 24);
+    assert!(c.off_chain_stop < 65536 && c.off_utlb + 16 * UT < 32768, "offsets: chain_stop {} utlb {} until {} disp {} pc {} instret {}", c.off_chain_stop, c.off_utlb, c.off_chain_until, c.off_disp, c.off_pc, c.off_instret);
+    let mut o: Vec<u32> = Vec::new();
+    let mut to_out: Vec<(usize, bool)> = Vec::new(); // (index, is cbnz)
+    let cmp = |a: u32, b: u32| 0xeb00_001f | (b << 16) | (a << 5);
+    o.push(ldr_x(9, X_CPU, c.off_instret));
+    o.push(ldr_x(10, X_CPU, c.off_chain_until));
+    o.push(cmp(9, 10));
+    to_out.push((o.len(), false)); o.push(0x5400_0002); // b.hs out
+    o.push(0xd280_0000 | ((c.off_chain_stop as u32) << 5) | 9); // movz x9, #off(chain_stop)
+    o.push(0x3860_6800 | (9 << 16) | (X_CPU << 5) | 9); // ldrb w9, [x19, x9]
+    to_out.push((o.len(), true)); o.push(0x3500_0009); // cbnz w9, out
+    o.push(ldr_x(9, X_CPU, c.off_pc));
+    o.push(0xf240_0400 | (9 << 5) | 31); // tst x9, #3
+    to_out.push((o.len(), false)); o.push(0x5400_0001); // b.ne out
+    // fetch micro-TLB: x11 = &utlb[0][(pc >> 12) % UT], tag = (pc >> 12) + 1 | el << 60
+    o.push(0xd34c_fc00 | (9 << 5) | 10); // lsr x10, x9, #12
+    o.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (10 << 5) | 11); // and x11, x10, #(UT-1)
+    o.push(0x8b00_0000 | (11 << 16) | (4 << 10) | (X_CPU << 5) | 11); // add x11, x19, x11, lsl #4
+    o.push(ldr_x(12, 11, c.off_utlb));
+    o.push(0x9100_0400 | (10 << 5) | 10); // add x10, x10, #1
+    o.push(0xd340_0000 | (56 << 16) | (57 << 10) | (14 << 5) | 13); // ubfx x13, x14, #56, #2 (el)
+    o.push(0xaa00_0000 | (13 << 16) | (60 << 10) | (10 << 5) | 10); // orr x10, x10, x13, lsl #60
+    o.push(cmp(12, 10));
+    to_out.push((o.len(), false)); o.push(0x5400_0001); // b.ne out
+    // key = physical pc | mode bits
+    o.push(ldr_x(12, 11, c.off_utlb + 8));
+    o.push(0x9240_0000 | (62 << 16) | (9 << 10) | (9 << 5) | 10); // and x10, x9, #0xffc
+    o.push(0xaa00_0000 | (10 << 16) | (12 << 5) | 12); // orr x12, x12, x10
+    o.push(0xaa00_0000 | (14 << 16) | (12 << 5) | 12); // orr x12, x12, x14
+    // front slot = ((pc ^ pc >> 14) >> 2) % FRONT
+    o.push(0xca40_0000 | (9 << 16) | (14 << 10) | (9 << 5) | 10); // eor x10, x9, x9, lsr #14
+    o.push(0xd340_0000 | (2 << 16) | ((1 + FRONT.trailing_zeros()) << 10) | (10 << 5) | 10); // ubfx x10, x10, #2, #log2(FRONT)
+    mov64(&mut o, 11, front);
+    o.push(0xd280_0000 | (24 << 5) | 13); // movz x13, #24
+    o.push(0x9b00_0000 | (13 << 16) | (11 << 10) | (10 << 5) | 11); // madd x11, x10, x13, x11
+    o.push(ldr_x(13, 11, o_pc));
+    o.push(cmp(13, 9));
+    to_out.push((o.len(), false)); o.push(0x5400_0001); // b.ne out
+    o.push(ldr_x(13, 11, o_key));
+    o.push(cmp(13, 12));
+    to_out.push((o.len(), false)); o.push(0x5400_0001); // b.ne out
+    o.push(ldr_x(16, 11, o_f));
+    o.push(0xaa13_03e0); // mov x0, x19
+    o.push(0xa941_53f3); // ldp x19, x20, [sp, #16]
+    o.push(0xa8c2_7bfd); // ldp x29, x30, [sp], #32
+    o.push(0xd61f_0200); // br x16
+    let out = o.len();
+    o.push(0x5280_0000); // movz w0, #0
+    o.push(0xa941_53f3);
+    o.push(0xa8c2_7bfd);
+    o.push(0xd65f_03c0); // ret
+    for (k, cb) in to_out {
+        let d = (out - k) as u32;
+        o[k] |= d << 5;
+        let _ = cb;
+    }
+    o
+}
+
 /// cbz w0 skip length: over "cmp; b.ne; ret_inline(4); ret(4)" = 10 instructions, +1
 fn e_skip_len() -> u32 { 11 }
 
 /// Interpreted instructions after which the block must end (they can change the translation
 /// regime, the exception level, the code itself or interrupt masking).
 pub(crate) fn is_block_end(i: u32) -> bool {
-    bits(i, 31, 22) == 0b11_0101_0100 // system: MSR/MRS/SYS/hints/barriers
-        || bits(i, 31, 24) == 0b1101_0100 // exception generation
+    if bits(i, 31, 22) == 0b11_0101_0100 {
+        // system: reads (MRS, SYSL) change nothing; of the SYS instructions only TLB and
+        // instruction-cache maintenance and AT matter (data-cache operations are not modelled)
+        let (l, op0, crn, crm) = (bit(i, 21), bits(i, 20, 19), bits(i, 15, 12), bits(i, 11, 8));
+        if l { return false; }
+        if op0 == 1 { return crn == 8 || (crn == 7 && matches!(crm, 1 | 5 | 8 | 9)); }
+        return true; // MSR, hints (WFI/WFE), barriers, PSTATE
+    }
+    bits(i, 31, 24) == 0b1101_0100 // exception generation
         || (bits(i, 31, 25) == 0b110_1011) // branch-register class incl. ERET
 }
 

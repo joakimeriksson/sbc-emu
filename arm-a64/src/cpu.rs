@@ -20,6 +20,9 @@ impl Exc {
     pub const BRK: u32 = 0x3c;
 }
 
+/// Entries per micro-TLB (a power of two).
+pub(crate) const UT: usize = 64;
+
 pub struct Cpu {
     pub x: [u64; 31],
     /// SP_EL0..SP_EL3
@@ -61,13 +64,23 @@ pub struct Cpu {
     pub ram: *mut u8,
     pub ram_len: u64,
     /// micro-TLBs for the RAM fast path: [fetch, read, write] = (tag, physical page)
-    pub(crate) utlb: [(u64, u64); 3],
+    /// micro-TLBs for fetch, read and write: direct-mapped on the VA page, (tag, physical page)
+    pub(crate) utlb: [[(u64, u64); UT]; 3],
     /// block JIT (AArch64 hosts); None = interpreter only
     pub jit: Option<Box<crate::jit::Jit>>,
     pub(crate) jit_bus: Option<*mut dyn emu_core::Bus>,
     pub(crate) jit_trap: Option<Trap>,
     /// JIT verify mode: (RAM offset, previous bytes) of every store, for rollback
     pub(crate) store_log: Option<Vec<(usize, Vec<u8>)>>,
+    /// Block chaining (native JIT): compiled blocks jump straight into their successors while
+    /// `instret < chain_until` (0, the default, never chains); the caller sets it to the next
+    /// instant it must look at the machine (budget end, device deadline).
+    pub chain_until: u64,
+    /// set when an instruction run inside a block may need the machine's attention (device
+    /// access, system register, exception level change, ...): the chain stops after the block
+    pub(crate) chain_stop: bool,
+    /// the native JIT's block dispatcher (code address)
+    pub(crate) jit_disp: u64,
 }
 
 // SAFETY: `ram` is only dereferenced by the core that owns it; see the field documentation.
@@ -108,7 +121,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [(0, 0); 3], jit: None, jit_bus: None, jit_trap: None, store_log: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0,
         }
     }
 
@@ -289,8 +302,10 @@ impl Cpu {
                   s.ptimer.ctl, s.ptimer.cval, s.vtimer.ctl, s.vtimer.cval] { w.u64(v); }
         for v in s.ttbr0 { w.u64(v); }
         for v in s.tcr { w.u64(v); }
-        w.u64(s.other.len() as u64);
-        for (k, v) in &s.other { w.u32(*k); w.u64(*v); }
+        let mut other = s.other.clone();
+        for (k, v) in [crate::sysreg::TPIDR_EL0, crate::sysreg::TPIDRRO_EL0, crate::sysreg::TPIDR_EL1].into_iter().zip(s.tpidr) { other.insert(k, v); }
+        w.u64(other.len() as u64);
+        for (k, v) in &other { w.u32(*k); w.u64(*v); }
     }
 
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
@@ -310,6 +325,7 @@ impl Cpu {
         for v in s.tcr.iter_mut() { *v = r.u64()?; }
         s.other.clear();
         for _ in 0..r.u64()? { let k = r.u32()?; let v = r.u64()?; s.other.insert(k, v); }
+        for (n, k) in [crate::sysreg::TPIDR_EL0, crate::sysreg::TPIDRRO_EL0, crate::sysreg::TPIDR_EL1].into_iter().enumerate() { s.tpidr[n] = s.other.remove(&k).unwrap_or(0); }
         s.timers_changed = true;
         self.tlb_flush();
         if let Some(j) = self.jit.as_mut() { j.flush(); }
@@ -326,7 +342,7 @@ impl Cpu {
 
     /// Tests: a small code buffer and compile-on-first-use, when `SBC_JIT=1` is set.
     pub fn enable_test_jit_from_env(&mut self) {
-        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); }
+        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); self.chain_until = u64::MAX; }
     }
 }
 

@@ -136,6 +136,8 @@ fn run(args: &[String]) -> ExitCode {
         m.soc.sd = bcm2711::sdhci::Sdhci::new(disk);
         m.soc.sd.trace = trace_sd;
         if use_jit { m.cpu.enable_jit(); }
+        if std::env::var("SBC_JIT_VERIFY").is_ok_and(|v| v == "1") { if let Some(j) = m.cpu.jit.as_mut() { j.verify = true; } }
+        if std::env::var("SBC_JIT_PROFILE").is_ok_and(|v| v == "1") { arm_a64::jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
         match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
         m.soc.genet.trace = trace_net;
         m.soc.wifi.trace = args.iter().any(|a| a == "--trace-sdio");
@@ -202,6 +204,20 @@ fn run(args: &[String]) -> ExitCode {
                 match cmd {
                     "wait-serial" => done = serial_log.contains(rest),
                     "wait-idle" => done = last_busy.elapsed().as_secs_f64() >= rest.parse().unwrap_or(5.0),
+                    "wait-pixel" => {
+                        // wait-pixel X Y RRGGBB: the framebuffer shows that colour at (X, Y)
+                        let a: Vec<&str> = rest.split_whitespace().collect();
+                        let (x, y, rgb) = (a.first().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0), a.get(1).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+                                           a.get(2).and_then(|v| u32::from_str_radix(v, 16).ok()).unwrap_or(0));
+                        let mut rgba = Vec::new();
+                        done = match m.soc.mbox.render(&m.soc.ram, &mut rgba) {
+                            Some((w, h)) if x < w && y < h => {
+                                let o = ((y * w + x) * 4) as usize;
+                                ((rgba[o] as u32) << 16 | (rgba[o + 1] as u32) << 8 | rgba[o + 2] as u32) == rgb
+                            }
+                            _ => false,
+                        };
+                    }
                     "sleep" => { script_wait_until = Some(Instant::now() + Duration::from_secs_f64(rest.parse().unwrap_or(1.0))); }
                     "type" => for b in unescape(rest).bytes() { m.soc.usb.kbd.type_byte(b); },
                     "serial" => pending.extend(unescape(rest).bytes()),
@@ -292,7 +308,17 @@ fn run(args: &[String]) -> ExitCode {
     if !m.soc.mbox.unknown.is_empty() { eprintln!("[sbc-emu] unanswered mailbox tags: {:x?}", m.soc.mbox.unknown); }
     eprintln!("\n[sbc-emu] stopped: {:?} pc={:#x} insns={} sim={:.3}s wall={:.1}s exceptions={} irqs={}",
         result, m.cpu.pc, m.cpu.instret, m.now as f64 / 1e9, started.elapsed().as_secs_f64(), m.exceptions, m.irqs);
-    if let Some(j) = m.cpu.jit.as_ref() { eprintln!("[sbc-emu] jit: {} blocks compiled, {} flushes", j.compiled, j.flushes); }
+    if let Some(j) = m.cpu.jit.as_ref() {
+        eprintln!("[sbc-emu] jit: {} blocks compiled, {} links, {} flushes; {} block runs, {:.1} instructions per run, {:.0}% of instructions in blocks",
+            j.compiled, j.linked, j.flushes, j.execs, j.exec_insns as f64 / j.execs.max(1) as f64, 100.0 * j.exec_insns as f64 / m.cpu.instret.max(1) as f64);
+        if j.verify { eprintln!("[sbc-emu] jit verify ({} stale blocks skipped): {}", j.stale_skips, j.report.as_deref().unwrap_or("no mismatch")); }
+    }
+    if arm_a64::jit::PROFILE.load(std::sync::atomic::Ordering::Relaxed) {
+        let f = arm_a64::jit::profile_fallbacks();
+        let total: u64 = f.iter().map(|e| e.1).sum();
+        eprintln!("[sbc-emu] jit interpreter fallbacks: {total} (instret {}); most frequent words:", m.cpu.instret);
+        for (i, n) in f.iter().take(60) { eprintln!("  {i:08x} {n}"); }
+    }
     if !m.cpu.sys.unknown.is_empty() {
         let names: Vec<String> = m.cpu.sys.unknown.iter().map(|k| format!("S{}_{}_C{}_C{}_{}", k >> 14, (k >> 11) & 7, (k >> 7) & 15, (k >> 3) & 15, k & 7)).collect();
         eprintln!("[sbc-emu] unmodelled system registers: {}", names.join(" "));

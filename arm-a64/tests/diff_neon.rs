@@ -58,6 +58,8 @@ const SNIPPETS: &[&str] = &[
     "fcvtzs w0, s1\n fcvtzu x1, d2\n fcvtms w2, d3\n fcvtps x3, s4\n fcvtas w4, d5\n fcvtns x5, s6\n scvtf d6, x7\n ucvtf s7, w1",
     "frintm s0, s1\n frintp d2, d3\n frintz s4, s5\n frinta d6, d7\n frintn s1, s2\n fabs d3, d4\n fneg s5, s6\n fmax d7, d1, d2\n fminnm s3, s4, s5",
     "ucvtf d0, x3, #10\n scvtf s1, w4, #3\n scvtf d2, x5, #64\n ucvtf s3, x6, #17\n fcvtzs x1, d4, #10\n fcvtzu w2, s5, #5\n fcvtzs w3, d6, #31",
+    // SIMD&FP loads/stores: every size, pairs, pre/post-index, unscaled and register offsets
+    "sub sp, sp, #128\n stp q0, q1, [sp]\n stp d2, d3, [sp, #32]\n stp s4, s5, [sp, #48]\n str q6, [sp, #64]!\n ldr q7, [sp, #-64]\n ldr d0, [sp, #-32]\n ldr s1, [sp, #-12]\n ldr h2, [sp, #-16]\n ldr b3, [sp], #-16\n ldp q4, q5, [sp, #-48]\n mov x1, #-1\n str d7, [sp, x1, lsl #3]\n ldr d6, [sp, #-8]\n mov x0, #-3\n ldr q3, [sp, x0, lsl #4]\n str h5, [sp, #-2]\n ldr s2, [sp, #-4]\n add sp, sp, #80",
     "movi v0.16b, #0x5a\n movi v1.4s, #0x12, lsl #16\n mvni v2.8h, #0x34, lsl #8\n movi v3.2d, #0xff00ff0000ffff00\n orr v4.4s, #0x7, lsl #8\n bic v5.8h, #0x81\n fmov v6.4s, #1.5\n fmov d7, #-2.25",
 ];
 
