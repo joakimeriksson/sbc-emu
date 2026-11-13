@@ -95,6 +95,7 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.begin("aliases");
     f.str("serial0", "/serial@fe201000");
     f.str("mmc0", "/soc/mmc@fe340000");
+    f.str("mmc1", "/soc/mmc@fe300000");
     f.end();
 
     f.begin("chosen");
@@ -223,6 +224,23 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("#address-cells", &[1]);
     f.cells("#size-cells", &[0]);
     f.str("status", "okay");
+    f.end();
+
+    // the second SD host ("mmcnr") with the CYW43455 Wi-Fi chip on SDIO function 1/2
+    f.begin("mmc@fe300000");
+    f.str("compatible", "brcm,bcm2835-sdhci");
+    f.cells("reg", &[0, 0xfe30_0000, 0x100]);
+    f.cells("interrupts", &[GIC_SPI, 126, LEVEL_HIGH]);
+    f.cells("clocks", &[clk100]);
+    f.cells("bus-width", &[4]);
+    f.empty("non-removable");
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.str("status", "okay");
+    f.begin("wifi@1");
+    f.cells("reg", &[1]);
+    f.str("compatible", "brcm,bcm4329-fmac");
+    f.end();
     f.end();
 
     f.begin("mmc@fe340000");

@@ -33,6 +33,13 @@ pub trait SdioCard {
     fn irq(&self) -> bool;
     /// time passes (ns): firmware timers, delayed events
     fn tick(&mut self, _now_ns: u64) {}
+    /// network frames the card transmitted (Ethernet II)
+    fn take_tx(&mut self) -> Vec<Vec<u8>> { Vec::new() }
+    /// a network frame for the card
+    fn deliver(&mut self, _eth: &[u8]) {}
+    fn set_trace(&mut self, _on: bool) {}
+    fn save_state(&self, _w: &mut emu_core::snap::W) {}
+    fn load_state(&mut self, _r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> { Ok(()) }
 }
 
 /// A RAM disk (tests, small images).
@@ -470,6 +477,7 @@ impl Sdhci {
         w.bytes(&self.buf); w.u64(self.pos as u64); w.u64(self.lba); w.opt_u32(self.left);
         w.bool(self.special.is_some()); w.bytes(self.special.as_deref().unwrap_or(&[]));
         w.opt_u32(self.pre_count);
+        if let Some(c) = self.sdio.as_ref() { c.save_state(w); }
         let ov = self.disk.as_ref().map(|d| d.overlay()).unwrap_or_default();
         w.u64(ov.len() as u64);
         for (lba, data) in ov { w.u64(lba); w.bytes(&data); }
@@ -483,6 +491,7 @@ impl Sdhci {
         self.buf = r.bytes()?.to_vec(); self.pos = r.u64()? as usize; self.lba = r.u64()?; self.left = r.opt_u32()?;
         let has = r.bool()?; let sp = r.bytes()?.to_vec(); self.special = has.then_some(sp);
         self.pre_count = r.opt_u32()?;
+        if let Some(c) = self.sdio.as_mut() { c.load_state(r)?; }
         let n = r.u64()?;
         for _ in 0..n {
             let lba = r.u64()?;

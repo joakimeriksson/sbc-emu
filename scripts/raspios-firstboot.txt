@@ -29,12 +29,19 @@ wait-idle 4
 type raspberry\n
 sleep 3
 wait-idle 6
-type clear; uname -a; cat /proc/device-tree/model; echo; free -m; ip -4 addr show end0 eth0 2>/dev/null | grep inet; ping -c 2 10.0.2.2 | tail -1\n
+type clear; sudo rfkill unblock wifi; ip -br link\n
 sleep 3
-wait-idle 6
-shot out/04-logged-in.png
-type curl -sI https://www.raspberrypi.com | head -1; sudo apt-get update 2>&1 | tail -2\n
+wait-idle 4
+type raspberry\n
+sleep 3
+wait-idle 8
+shot out/04-links.png
+type nmcli -f SSID,CHAN,SIGNAL,SECURITY dev wifi list\n
 sleep 5
+wait-idle 10
+shot out/05-wifi-scan.png
+type sudo nmcli dev disconnect eth0; sudo nmcli dev wifi connect sbc-emu; ip -br -4 addr; ping -c 2 10.0.2.2\n
+sleep 10
 wait-idle 15
-shot out/05-network.png
+shot out/06-wifi-connected.png
 quit

@@ -11,6 +11,7 @@ pub mod gic;
 pub mod mailbox;
 pub mod png;
 pub mod sdhci;
+pub mod wifi;
 pub mod machine;
 pub mod pl011;
 

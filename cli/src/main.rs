@@ -137,6 +137,8 @@ fn run(args: &[String]) -> ExitCode {
         if use_jit { m.cpu.enable_jit(); }
         match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
         m.soc.genet.trace = trace_net;
+        m.soc.wifi.trace = args.iter().any(|a| a == "--trace-sdio");
+        if let Some(c) = m.soc.wifi.sdio.as_mut() { c.set_trace(args.iter().any(|a| a == "--trace-wifi")); }
         bcm2711::boot::boot_linux(&mut m, &k, i.as_deref(), &c, display)?;
         Ok(m)
     };

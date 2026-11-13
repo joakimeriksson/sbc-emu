@@ -18,6 +18,8 @@ pub const GICC: u64 = 0xff84_2000;
 pub const PERIPH: u64 = 0xfc00_0000;
 pub const MBOX: u64 = 0xfe00_b880;
 pub const EMMC2: u64 = 0xfe34_0000;
+/// the second SD host, wired to the Wi-Fi chip (\"mmcnr\" in the vendor tree)
+pub const SDHOST_WIFI: u64 = 0xfe30_0000;
 pub const USB: u64 = 0xfe98_0000;
 pub const GENET: u64 = 0xfd58_0000;
 /// GPU memory carve-out at the top of RAM (firmware `gpu_mem=64`), holding the framebuffer
@@ -37,6 +39,10 @@ pub struct Soc {
     pub uart: Pl011,
     pub mbox: Mailbox,
     pub sd: Sdhci,
+    /// SDIO host with the CYW43455 Wi-Fi chip
+    pub wifi: Sdhci,
+    /// the network behind the Wi-Fi access point
+    pub wifi_net: Option<sbc_net::net::VirtualNet>,
     pub usb: Dwc2,
     pub genet: Genet,
     /// the network behind the Ethernet port (None = cable unplugged)
@@ -53,6 +59,7 @@ impl Soc {
             UART0..=0xfe20_1fff => self.uart.read(a - UART0),
             MBOX..=0xfe00_b8bf => self.mbox.read(a - MBOX),
             EMMC2..=0xfe34_00ff => self.sd.read(a - EMMC2),
+            SDHOST_WIFI..=0xfe30_00ff => self.wifi.read(a - SDHOST_WIFI),
             USB..=0xfe98_ffff => self.usb.read(a - USB),
             GENET..=0xfd58_ffff => self.genet.read(a - GENET),
             GICD..=0xff84_1fff => self.gic.dist_read(a - GICD),
@@ -65,6 +72,7 @@ impl Soc {
     fn mmio_write(&mut self, a: u64, v: u32, size: u32) -> Result<(), Fault> {
         self.dirty = true;
         if (EMMC2..=0xfe34_00ff).contains(&a) { self.sd.write(a - EMMC2, v, size); return Ok(()); }
+        if (SDHOST_WIFI..=0xfe30_00ff).contains(&a) { self.wifi.write(a - SDHOST_WIFI, v, size); return Ok(()); }
         let a = a & !3;
         match a {
             UART0..=0xfe20_1fff => self.uart.write(a - UART0, v),
@@ -159,7 +167,7 @@ impl Machine {
         cpu.sys.cntfrq = CNTFRQ;
         cpu.firmware_calls_to_host = true;
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], gic: Gic::new(), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), usb: Dwc2::new(), genet: Genet::new(), net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], gic: Gic::new(), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpu, soc, now: 0, exceptions: 0, irqs: 0, next_check: 0 };
         m.cpu.ram = m.soc.ram.as_mut_ptr();
         m.cpu.ram_len = m.soc.ram.len() as u64;
@@ -208,7 +216,8 @@ impl Machine {
         self.soc.usb.tick(self.now);
         let usb = self.soc.usb.irq();
         self.soc.gic.set_level(SPI_USB, usb);
-        let sd = self.soc.sd.irq();
+        // EMMC2 and the Wi-Fi SD host share SPI 126, as on the Pi 4
+        let sd = self.soc.sd.irq() || self.soc.wifi.irq();
         self.soc.gic.set_level(SPI_EMMC2, sd);
         let mb = self.soc.mbox.irq();
         self.soc.gic.set_level(SPI_MBOX, mb);
@@ -277,14 +286,23 @@ impl Machine {
     /// Exchange frames between the Ethernet MAC and the virtual network.
     fn pump_network(&mut self) {
         let soc = &mut self.soc;
-        let Some(net) = soc.net.as_mut() else { soc.genet.tx_out.clear(); return };
         let now_us = self.now / 1000;
-        for f in std::mem::take(&mut soc.genet.tx_out) {
-            soc.genet.rx_queue.extend(net.handle(&f, now_us));
+        match soc.net.as_mut() {
+            Some(net) => {
+                for f in std::mem::take(&mut soc.genet.tx_out) { soc.genet.rx_queue.extend(net.handle(&f, now_us)); }
+                soc.genet.rx_queue.extend(net.poll(now_us));
+            }
+            None => soc.genet.tx_out.clear(),
         }
-        soc.genet.rx_queue.extend(net.poll(now_us));
         if soc.genet.rx_queue.len() > 512 { soc.genet.rx_queue.drain(..soc.genet.rx_queue.len() - 512); }
         soc.genet.deliver(&mut soc.ram);
+        // Wi-Fi: the associated interface's frames go to the network behind the access point
+        if let (Some(card), Some(wnet)) = (soc.wifi.sdio.as_mut(), soc.wifi_net.as_mut()) {
+            let mut replies = Vec::new();
+            for f in card.take_tx() { replies.extend(wnet.handle(&f, now_us)); }
+            replies.extend(wnet.poll(now_us));
+            for r in replies { card.deliver(&r); }
+        }
     }
 
     /// Plug the Ethernet port into the virtual 10.0.2.0/24 network; `nat` also relays guest
@@ -295,6 +313,8 @@ impl Machine {
         if nat { net.nat = Some(sbc_net::nat::Nat::new(log)); }
         let _ = nat;
         self.soc.net = Some(net);
+        // the Wi-Fi access point's network (isolated: DHCP, DNS and local services)
+        self.soc.wifi_net = Some(sbc_net::net::VirtualNet::new(log));
     }
 
     /// PSCI 1.1 as the Pi 4's firmware (Trusted Firmware-A) provides it, for one CPU.
@@ -334,7 +354,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v2");
+        w.tag("machine-v3");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         self.cpu.save_state(&mut w);
@@ -344,6 +364,7 @@ impl Machine {
         self.soc.sd.save_state(&mut w);
         self.soc.usb.save_state(&mut w);
         self.soc.genet.save_state(&mut w);
+        self.soc.wifi.save_state(&mut w);
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -359,7 +380,7 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        r.tag("machine-v2").map_err(e)?;
+        r.tag("machine-v3").map_err(e)?;
         let ram = r.u64().map_err(e)? as usize;
         if ram != self.soc.ram.len() { return Err(format!("snapshot RAM is {} MiB, machine has {} MiB", ram >> 20, self.soc.ram.len() >> 20)); }
         self.now = r.u64().map_err(e)?; self.exceptions = r.u64().map_err(e)?; self.irqs = r.u64().map_err(e)?;
@@ -370,6 +391,7 @@ impl Machine {
         self.soc.sd.load_state(&mut r).map_err(e)?;
         self.soc.usb.load_state(&mut r).map_err(e)?;
         self.soc.genet.load_state(&mut r).map_err(e)?;
+        self.soc.wifi.load_state(&mut r).map_err(e)?;
         self.soc.ram.fill(0);
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;
