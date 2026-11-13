@@ -81,6 +81,9 @@ pub fn run_at(src: &str, el: u8) -> Run {
     ram.load(LOAD, &code).unwrap();
     let mut cpu = Cpu::new();
     cpu.brk_to_host = true;
+    cpu.enable_test_jit_from_env();
+    cpu.ram = ram.mem.as_mut_ptr();
+    cpu.ram_len = ram.mem.len() as u64;
     cpu.el = el;
     cpu.pc = LOAD;
     cpu.sp = [0x40_0000, 0x50_0000, 0x60_0000, 0x70_0000];

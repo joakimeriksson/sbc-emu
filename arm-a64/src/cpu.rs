@@ -47,6 +47,8 @@ pub struct Cpu {
     pub instret: u64,
     /// exclusive monitor: Some(address) after LDXR
     pub excl: Option<u64>,
+    /// 1 while `excl` holds a reservation (read by JIT-generated stores)
+    pub excl_armed: u64,
     /// `brk` returns Trap::Brk instead of taking an exception (bare-metal tests)
     pub brk_to_host: bool,
     /// `smc` (and `hvc`) go to the host as firmware calls instead of EL3/EL2 vectors
@@ -60,6 +62,10 @@ pub struct Cpu {
     pub ram_len: u64,
     /// micro-TLBs for the RAM fast path: [fetch, read, write] = (tag, physical page)
     pub(crate) utlb: [(u64, u64); 3],
+    /// block JIT (AArch64 hosts); None = interpreter only
+    pub jit: Option<Box<crate::jit::Jit>>,
+    pub(crate) jit_bus: Option<*mut dyn emu_core::Bus>,
+    pub(crate) jit_trap: Option<Trap>,
 }
 
 // SAFETY: `ram` is only dereferenced by the core that owns it; see the field documentation.
@@ -96,10 +102,11 @@ impl Cpu {
             fiq: false,
             instret: 0,
             excl: None,
+            excl_armed: 0,
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [(0, 0); 3],
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [(0, 0); 3], jit: None, jit_bus: None, jit_trap: None,
         }
     }
 
@@ -184,7 +191,7 @@ impl Cpu {
         self.el = target;
         self.spsel = true;
         self.daif = 0xf << 6;
-        self.excl = None;
+        self.set_excl(None);
         self.pc = self.vbar[t].wrapping_add(group + vec);
     }
 
@@ -244,6 +251,11 @@ impl Core for Cpu {
                 return Err(t);
             }
         }
+        if self.jit.is_some() {
+            if let Some(r) = self.jit_step(bus) {
+                return r;
+            }
+        }
         self.exec_one(bus)
     }
     fn pc(&self) -> u64 {
@@ -287,7 +299,7 @@ impl Cpu {
         for a in [&mut self.elr, &mut self.spsr, &mut self.esr, &mut self.far, &mut self.vbar, &mut self.sctlr] { for v in a.iter_mut() { *v = r.u64()?; } }
         for v in self.v.iter_mut() { *v = r.u128()?; }
         self.fpcr = r.u64()?; self.fpsr = r.u64()?;
-        self.irq = r.bool()?; self.fiq = r.bool()?; self.instret = r.u64()?; self.excl = r.opt_u64()?;
+        self.irq = r.bool()?; self.fiq = r.bool()?; self.instret = r.u64()?; { let e = r.opt_u64()?; self.set_excl(e); }
         self.brk_to_host = r.bool()?; self.firmware_calls_to_host = r.bool()?;
         let s = &mut self.sys;
         for v in [&mut s.mpidr, &mut s.cpacr_el1, &mut s.hcr_el2, &mut s.scr_el3, &mut s.ttbr1_el1, &mut s.par_el1, &mut s.cntfrq, &mut s.cnt,
@@ -298,6 +310,25 @@ impl Cpu {
         for _ in 0..r.u64()? { let k = r.u32()?; let v = r.u64()?; s.other.insert(k, v); }
         s.timers_changed = true;
         self.tlb_flush();
+        if let Some(j) = self.jit.as_mut() { j.flush(); }
         Ok(())
     }
+}
+
+impl Cpu {
+    /// Turn on the block JIT where the host supports it; returns whether it is active.
+    pub fn enable_jit(&mut self) -> bool {
+        if self.jit.is_none() { self.jit = crate::jit::Jit::new(); }
+        self.jit.is_some()
+    }
+
+    /// Tests: a small code buffer and compile-on-first-use, when `SBC_JIT=1` is set.
+    pub fn enable_test_jit_from_env(&mut self) {
+        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); }
+    }
+}
+
+impl Cpu {
+    #[inline]
+    pub(crate) fn set_excl(&mut self, e: Option<u64>) { self.excl = e; self.excl_armed = e.is_some() as u64; }
 }

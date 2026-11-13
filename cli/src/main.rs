@@ -62,7 +62,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -104,6 +104,7 @@ fn run(args: &[String]) -> ExitCode {
     let display = !args.iter().any(|a| a == "--no-display");
     let trace_sd = args.iter().any(|a| a == "--trace-sd");
     let trace_net = args.iter().any(|a| a == "--trace-net");
+    let use_jit = !args.iter().any(|a| a == "--no-jit");
     let net_mode = arg(args, "--net").unwrap_or("nat");
     let usb_input = arg(args, "--input") == Some("usb");
     let mut script: std::collections::VecDeque<String> = match arg(args, "--script") {
@@ -133,6 +134,7 @@ fn run(args: &[String]) -> ExitCode {
         };
         m.soc.sd = bcm2711::sdhci::Sdhci::new(disk);
         m.soc.sd.trace = trace_sd;
+        if use_jit { m.cpu.enable_jit(); }
         match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
         m.soc.genet.trace = trace_net;
         bcm2711::boot::boot_linux(&mut m, &k, i.as_deref(), &c, display)?;
@@ -260,6 +262,7 @@ fn run(args: &[String]) -> ExitCode {
     if !m.soc.mbox.unknown.is_empty() { eprintln!("[sbc-emu] unanswered mailbox tags: {:x?}", m.soc.mbox.unknown); }
     eprintln!("\n[sbc-emu] stopped: {:?} pc={:#x} insns={} sim={:.3}s wall={:.1}s exceptions={} irqs={}",
         result, m.cpu.pc, m.cpu.instret, m.now as f64 / 1e9, started.elapsed().as_secs_f64(), m.exceptions, m.irqs);
+    if let Some(j) = m.cpu.jit.as_ref() { eprintln!("[sbc-emu] jit: {} blocks compiled, {} flushes", j.compiled, j.flushes); }
     if !m.cpu.sys.unknown.is_empty() {
         let names: Vec<String> = m.cpu.sys.unknown.iter().map(|k| format!("S{}_{}_C{}_C{}_{}", k >> 14, (k >> 11) & 7, (k >> 7) & 15, (k >> 3) & 15, k & 7)).collect();
         eprintln!("[sbc-emu] unmodelled system registers: {}", names.join(" "));

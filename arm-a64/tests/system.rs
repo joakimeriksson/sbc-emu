@@ -282,6 +282,9 @@ fn generic_timer_compare_and_irq_delivery() {
     ram.load(LOAD, &code).unwrap();
     let mut cpu = Cpu::new();
     cpu.brk_to_host = true;
+    cpu.enable_test_jit_from_env();
+    cpu.ram = ram.mem.as_mut_ptr();
+    cpu.ram_len = ram.mem.len() as u64;
     cpu.el = 1;
     cpu.pc = LOAD;
     cpu.sys.cntfrq = 1_000_000_000; // one count per ns of virtual time

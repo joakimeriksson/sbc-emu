@@ -18,6 +18,8 @@ pub struct Gic {
     target: [u8; NIRQ],
     /// stack of acknowledged interrupts' running priorities
     running: Vec<(u32, u8)>,
+    /// lines that may be pending (a superset): the priority scan only looks at these
+    hot: [std::cell::Cell<u64>; NIRQ / 64],
 }
 
 impl Default for Gic {
@@ -29,21 +31,32 @@ impl Gic {
         let mut edge = [false; NIRQ];
         edge[..16].iter_mut().for_each(|e| *e = true);
         Gic { dctlr: 0, cctlr: 0, pmr: 0, bpr: 0, enabled: [false; NIRQ], pending: [false; NIRQ], active: [false; NIRQ],
-              level: [false; NIRQ], edge, prio: [0; NIRQ], target: [1; NIRQ], running: Vec::new() }
+              level: [false; NIRQ], edge, prio: [0; NIRQ], target: [1; NIRQ], running: Vec::new(), hot: Default::default() }
     }
+
+    #[inline]
+    fn mark(&self, i: usize) { let w = &self.hot[i / 64]; w.set(w.get() | (1 << (i % 64))); }
 
     pub fn set_level(&mut self, irq: usize, high: bool) {
         if self.edge[irq] && high && !self.level[irq] { self.pending[irq] = true; }
         self.level[irq] = high;
+        if high { self.mark(irq); }
     }
 
     fn is_pending(&self, i: usize) -> bool { self.pending[i] || (!self.edge[i] && self.level[i]) }
 
     fn best(&self) -> Option<(usize, u8)> {
         let mut best: Option<(usize, u8)> = None;
-        for i in 0..NIRQ {
-            if self.enabled[i] && !self.active[i] && self.is_pending(i) && (self.prio[i] as u32) < self.pmr {
-                if best.is_none_or(|(_, p)| self.prio[i] < p) { best = Some((i, self.prio[i])); }
+        for (wi, w) in self.hot.iter().enumerate() {
+            let mut bits = w.get();
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let i = wi * 64 + b;
+                if !self.is_pending(i) { w.set(w.get() & !(1 << b)); continue; }
+                if self.enabled[i] && !self.active[i] && (self.prio[i] as u32) < self.pmr && best.is_none_or(|(_, p)| self.prio[i] < p) {
+                    best = Some((i, self.prio[i]));
+                }
             }
         }
         best
@@ -122,7 +135,7 @@ impl Gic {
             0x000 => self.dctlr = v & 1,
             0x100..=0x17c => each(&mut self.enabled, (o - 0x100) * 8, true),
             0x180..=0x1fc => each(&mut self.enabled, (o - 0x180) * 8, false),
-            0x200..=0x27c => each(&mut self.pending, (o - 0x200) * 8, true),
+            0x200..=0x27c => { each(&mut self.pending, (o - 0x200) * 8, true); for b in 0..32 { if v & (1 << b) != 0 && (o - 0x200) * 8 + b < NIRQ { self.mark((o - 0x200) * 8 + b); } } }
             0x280..=0x2fc => each(&mut self.pending, (o - 0x280) * 8, false),
             0x300..=0x37c => each(&mut self.active, (o - 0x300) * 8, true),
             0x380..=0x3fc => each(&mut self.active, (o - 0x380) * 8, false),
@@ -136,7 +149,7 @@ impl Gic {
                 // SGIR: one CPU, so any target list that is non-empty (or "self") reaches us
                 let filter = (v >> 24) & 3;
                 let list = (v >> 16) & 0xff;
-                if filter == 2 || list & 1 != 0 || filter == 1 { self.pending[(v & 15) as usize] = true; }
+                if filter == 2 || list & 1 != 0 || filter == 1 { self.pending[(v & 15) as usize] = true; self.mark((v & 15) as usize); }
             }
             _ => {}
         }
@@ -187,6 +200,7 @@ impl Gic {
         }
         self.running.clear();
         for _ in 0..r.u64()? { let i = r.u32()?; let p = r.u8()?; self.running.push((i, p)); }
+        for w in &self.hot { w.set(u64::MAX); }
         Ok(())
     }
 }

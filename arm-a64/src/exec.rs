@@ -58,7 +58,7 @@ pub(crate) fn add_with_carry(sf: bool, x: u64, y: u64, carry: bool) -> (u64, u32
 }
 
 /// DecodeBitMasks for logical immediates: returns wmask, or None if reserved.
-pub(crate) fn decode_bitmask(sf: bool, n: u32, imms: u32, immr: u32) -> Option<u64> {
+pub fn decode_bitmask(sf: bool, n: u32, imms: u32, immr: u32) -> Option<u64> {
     let combined = (n << 6) | (!imms & 0x3f);
     if combined == 0 {
         return None;
@@ -179,7 +179,7 @@ impl Cpu {
         size: u32,
         unpriv: bool,
     ) -> Result<u128, Trap> {
-        if !unpriv && size <= 8 && (va & 0xfff) + size as u64 <= 0x1000 {
+        if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
             if self.utlb[1].0 != tag {
                 let pa = self.pa(bus, va, Access::Read)?;
@@ -195,7 +195,8 @@ impl Cpu {
                     1 => *p as u64,
                     2 => (p as *const u16).read_unaligned() as u64,
                     4 => (p as *const u32).read_unaligned() as u64,
-                    _ => (p as *const u64).read_unaligned(),
+                    8 => (p as *const u64).read_unaligned(),
+                    _ => return Ok((p as *const u128).read_unaligned()),
                 }
             };
             return Ok(v as u128);
@@ -248,7 +249,7 @@ impl Cpu {
         v: u128,
         unpriv: bool,
     ) -> Result<(), Trap> {
-        if !unpriv && size <= 8 && (va & 0xfff) + size as u64 <= 0x1000 {
+        if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
             if self.utlb[2].0 != tag {
                 let pa = self.pa(bus, va, Access::Write)?;
@@ -259,7 +260,7 @@ impl Cpu {
             }
             if let Some(m) = self.excl {
                 if m & !63 == va & !63 {
-                    self.excl = None;
+                    self.set_excl(None);
                 }
             }
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
@@ -269,7 +270,8 @@ impl Cpu {
                     1 => *p = v as u8,
                     2 => (p as *mut u16).write_unaligned(v as u16),
                     4 => (p as *mut u32).write_unaligned(v as u32),
-                    _ => (p as *mut u64).write_unaligned(v as u64),
+                    8 => (p as *mut u64).write_unaligned(v as u64),
+                    _ => (p as *mut u128).write_unaligned(v),
                 }
             }
             return Ok(());
@@ -293,7 +295,7 @@ impl Cpu {
         let crosses = (va & 0xfff) + size as u64 > 0x1000;
         if let Some(m) = self.excl {
             if m & !63 == va & !63 {
-                self.excl = None;
+                self.set_excl(None);
             }
         }
         if !crosses && size <= 8 && va % size as u64 == 0 {
@@ -596,7 +598,7 @@ impl Cpu {
                         return Err(self.sync_exception(Exc::ILLEGAL, 0, pc, None));
                     }
                     self.set_pstate(spsr);
-                    self.excl = None;
+                    self.set_excl(None);
                     Ok(Some(elr))
                 }
                 _ => Err(self.undefined()),
@@ -656,7 +658,7 @@ impl Cpu {
                     }
                     0b0011 => {
                         if op2 == 0b010 {
-                            self.excl = None;
+                            self.set_excl(None);
                         } // CLREX; barriers are no-ops
                         return Ok(());
                     }
@@ -757,6 +759,18 @@ impl Cpu {
                         Err(fsc) => 1 | ((fsc as u64) << 1),
                     };
                     return Ok(());
+                }
+                // IC IALLU / IC IALLUIS / IC IVAU: drop compiled code (the only instruction cache)
+                if op1 == 0 && (crm == 5 || crm == 1) && op2 == 0 {
+                    if let Some(j) = self.jit.as_mut() { j.flush(); }
+                } else if op1 == 3 && crm == 5 && op2 == 1 {
+                    let va = self.xr(rt);
+                    if self.jit.is_some() {
+                        match self.translate(bus, va, Access::Read) {
+                            Ok(pa) => { if let Some(j) = self.jit.as_mut() { j.invalidate_page(pa >> 12); } }
+                            Err(_) => { if let Some(j) = self.jit.as_mut() { j.flush(); } }
+                        }
+                    }
                 }
                 // DC / IC maintenance: caches are not modelled
                 if self.el == 0 && op1 != 3 {
@@ -1112,7 +1126,7 @@ impl Cpu {
         if !o1 {
             if l {
                 let v = self.load(bus, addr, size, false)?;
-                self.excl = Some(addr);
+                self.set_excl(Some(addr));
                 self.set_x(rt, v as u64);
             } else {
                 let ok = self.excl.is_some_and(|m| m & !63 == addr & !63);
@@ -1120,7 +1134,7 @@ impl Cpu {
                     let v = self.xr(rt) as u128;
                     self.store(bus, addr, size, v, false)?;
                 }
-                self.excl = None;
+                self.set_excl(None);
                 self.set_x(rs, (!ok) as u64);
             }
         } else {
@@ -1131,7 +1145,7 @@ impl Cpu {
             if l {
                 let a = self.load(bus, addr, size, false)?;
                 let b = self.load(bus, addr + size as u64, size, false)?;
-                self.excl = Some(addr);
+                self.set_excl(Some(addr));
                 self.set_x(rt, a as u64);
                 self.set_x(rt2, b as u64);
             } else {
@@ -1141,7 +1155,7 @@ impl Cpu {
                     let v = a | (b << (8 * size));
                     self.store(bus, addr, 2 * size, v, false)?;
                 }
-                self.excl = None;
+                self.set_excl(None);
                 self.set_x(rs, (!ok) as u64);
             }
         }

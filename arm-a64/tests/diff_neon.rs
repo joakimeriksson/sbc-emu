@@ -140,6 +140,14 @@ fn neon_snippets_match_host() {
             for (i, v) in s.iter().enumerate() { ram.write64(state + 8 * i as u64, *v).unwrap(); }
             let mut cpu = Cpu::new();
             cpu.brk_to_host = true;
+            cpu.enable_test_jit_from_env();
+            cpu.ram = ram.mem.as_mut_ptr();
+            cpu.ram_len = ram.mem.len() as u64;
+    cpu.ram = ram.mem.as_mut_ptr();
+    cpu.ram_len = ram.mem.len() as u64;
+    cpu.enable_test_jit_from_env();
+    cpu.ram = ram.mem.as_mut_ptr();
+    cpu.ram_len = ram.mem.len() as u64;
             cpu.el = 0;
             cpu.pc = common::LOAD;
             cpu.sp[0] = 0x30_0000;
