@@ -82,6 +82,7 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     let b = match bcm2711::boot::read_sd_boot(disk.as_mut()) { Ok(b) => b, Err(_) => return -2 };
     let mut m = Machine::new((ram_mb as usize) << 20);
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
+    m.connect_network(false, false);
     if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
     0
@@ -147,6 +148,7 @@ pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8,
     let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: HashMap::new() });
     let mut m = Machine::new((ram_mb as usize) << 20);
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
+    m.connect_network(false, false);
     if m.restore(std::slice::from_raw_parts(snap, len)).is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: None }));
     0

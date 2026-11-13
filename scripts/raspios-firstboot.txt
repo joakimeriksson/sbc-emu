@@ -1,5 +1,5 @@
 # Raspberry Pi OS Lite (trixie, 2026-10-06) first boot on the emulated Pi 4, driven on the USB
-# keyboard and HDMI console, ending with the browser's resume snapshot.
+# keyboard and HDMI console, ending with the browser's resume snapshot and a network check.
 #   sbc-emu run --sd cache/os/raspios-lite.img --script scripts/raspios-firstboot.txt
 # Dialogs flush pending input when they open, so every keystroke waits for the guest to go idle.
 wait-serial raspberrypi login:
@@ -29,8 +29,12 @@ wait-idle 4
 type raspberry\n
 sleep 3
 wait-idle 6
-type uname -a; cat /proc/device-tree/model; echo; head -3 /etc/os-release; free -m; df -h /\n
+type clear; uname -a; cat /proc/device-tree/model; echo; free -m; ip -4 addr show end0 eth0 2>/dev/null | grep inet; ping -c 2 10.0.2.2 | tail -1\n
 sleep 3
 wait-idle 6
 shot out/04-logged-in.png
+type curl -sI https://www.raspberrypi.com | head -1; sudo apt-get update 2>&1 | tail -2\n
+sleep 5
+wait-idle 15
+shot out/05-network.png
 quit

@@ -16,6 +16,8 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Raspberry Pi kernel 6.18 (firmware 1.20260915 `kernel8.img`) | boots to userspace | busybox initramfs shell on serial and HDMI |
 | Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | boots: firmware-style SD boot → initramfs → ext4 root → systemd 257 → `raspberrypi login:` and the first-boot setup wizard on HDMI | `scripts/raspios-firstboot.txt`; ~27 G instructions to the login prompt |
 | Keyboard | emulated USB keyboard on the DWC2 OTG port (host mode) | Linux enumerates it, `hid-generic` binds, typing works on tty1 |
+| Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s → 135 s; all CPU tests pass with and without it |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~7 min, ~200 MiB of the image read |
 
@@ -27,7 +29,8 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
   not the vendor `bcm2711-rpi-4-b.dtb`; `dtoverlay`/`dtparam` lines are reported and ignored.
 - **vendor_image_compatibility**: the stock Raspberry Pi OS Lite image boots unmodified (writes go
   to a copy-on-write overlay; the image file is never changed).
-- **network**: none yet (W0 not started). **wifi_tier**: none. **clock_mode**: T0 real-time pacing
+- **network**: W0 — the Pi 4's own Ethernet MAC (GENET) and PHY, behind a virtual network with
+  user-mode NAT (native) or an isolated network (browser). **wifi_tier**: none yet (W2 in progress). **clock_mode**: T0 real-time pacing
   (virtual time is deterministic per run; wall-clock pacing only governs idle time).
 - **tested_cpu_count**: 1 (the Pi 4 has 4).
 
@@ -42,6 +45,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | EMMC2 | SDHCI v3 (PIO) + SDHC card on an image file | `sdhci-iproc` |
 | USB | DWC2 OTG core, host mode (buffer DMA) + HID boot keyboard | `dwc2`, `usbhid` |
 | Display | `simple-framebuffer` in the GPU memory carve-out | `simplefb`, fbcon |
+| Ethernet | GENET v5 (DMA rings, status blocks, INTRL2), UniMAC MDIO, BCM54213PE PHY | `bcmgenet`, `unimac-mdio`, Broadcom PHY |
 
 ## Running it
 
@@ -91,7 +95,8 @@ cargo test --release --workspace
 ```
 emu-core/   Bus / Core / Trap and the snapshot serializer
 arm-a64/    the ARMv8-A core: decode+execute, system registers, MMU, FP/NEON
-bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2+keyboard, device tree, boot, FAT
+bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2+keyboard, GENET, device tree, boot, FAT
+sbc-net/    virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP (from esp32sim)
 cli/        the sbc-emu command
 wasm/       C ABI for the browser; web/ is the page and worker
 scripts/    action scripts (first boot of Raspberry Pi OS)
@@ -99,7 +104,20 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 
 ## Known gaps
 
-Single core; no networking; no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
-modes, flush-to-zero and FP exception flags are not modelled; no LSE atomics, crypto or CRC32
-instructions (the ID registers say so, so software does not use them); interpreter only (no JIT
-yet), roughly 7× slower than a real Pi 4 core natively.
+Single core; no Wi-Fi yet; no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
+modes, flush-to-zero and FP exception flags are not modelled by the interpreter (JIT-native FP uses
+the host's default FPCR); no LSE atomics, crypto or CRC32 instructions (the ID registers say so, so
+software does not use them); the JIT runs on AArch64 hosts only (the browser build interprets), and
+is still well below a real Pi 4 core.
+
+## The JIT
+
+`arm-a64/src/jit.rs`. Guest and host share the A64 instruction set, so integer and FP/SIMD
+data-processing instructions are emitted as themselves with guest registers renamed to host
+temporaries — the host computes exactly the architected result, flags included. Loads and stores
+probe the core's micro-TLB inline and fall back to the interpreter; system instructions, exception
+generation and ERET call the interpreter and end the block. FP/SIMD instructions run natively only
+after the interpreter has proven it implements them (so extensions the emulated Cortex-A72 lacks
+stay undefined). Blocks are keyed by virtual and physical PC, EL, SPSel and FP enable, and are
+discarded on `IC IVAU`/`IC IALLU` (CTR_EL0.DIC = 0 obliges software to issue them). Every CPU test
+runs with it too: `SBC_JIT=1 cargo test -p arm-a64`. `--no-jit` turns it off.

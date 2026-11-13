@@ -8,6 +8,19 @@
 pub mod net;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod nat;
+
+/// The browser has no host sockets: the network stays isolated (no NAT is ever attached).
+#[cfg(target_arch = "wasm32")]
+pub mod nat {
+    pub struct Nat { pub resolver: [u8; 4], pub log: bool }
+    impl Nat {
+        pub fn new(log: bool) -> Self { Nat { resolver: [0; 4], log } }
+        #[allow(clippy::too_many_arguments)]
+        pub fn udp_out(&mut self, _gmac: &[u8; 6], _gip: &[u8; 4], _sport: u16, _dip: &[u8; 4], _reply_src: &[u8; 4], _dport: u16, _payload: &[u8], _now_us: u64) {}
+        pub fn tcp_in(&mut self, _gmac: &[u8; 6], _gip: &[u8; 4], _dip: &[u8; 4], _seg: &[u8], _now_us: u64) -> Vec<Vec<u8>> { Vec::new() }
+        pub fn poll(&mut self, _now_us: u64) -> Vec<Vec<u8>> { Vec::new() }
+    }
+}
 pub mod crypto;
 pub mod wifi;
 
