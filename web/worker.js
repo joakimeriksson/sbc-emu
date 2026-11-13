@@ -79,6 +79,7 @@ async function start(os, ramMb) {
   loop();
 }
 
+let lastLed = -1;
 let lastFrame = 0, lastStats = 0, lastInsns = 0, lastStatsT = performance.now();
 function loop() {
   const sliceEnd = performance.now() + 40;
@@ -100,6 +101,9 @@ function loop() {
       postMessage({ type: 'frame', w, h, data }, [data.buffer]);
     }
   }
+  // the LED on GPIO17 (sampled every slice; brief pulses shorter than a slice may be missed)
+  const led = ex.sbc_gpio_level(17);
+  if (led !== lastLed) { lastLed = led; postMessage({ type: 'gpio', pin: 17, level: led }); }
   if (now - lastStats > 500) {
     const insns = ex.sbc_insns();
     postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20 });
@@ -124,4 +128,7 @@ onmessage = (e) => {
   if (m.type === 'start') start(m.os, m.ramMb).catch((err) => postMessage({ type: 'status', text: String(err) }));
   else if (m.type === 'key' && ex) ex.sbc_key(m.usage, m.down ? 1 : 0);
   else if (m.type === 'serial') serialQueue.push(...m.bytes);
+  else if (m.type === 'button' && ex) ex.sbc_gpio_input(27, m.pressed ? 1 : -1);
+  else if (m.type === 'sensor' && ex) ex.sbc_set_sensor(m.kind, m.value);
+  else if (m.type === 'adc' && ex) ex.sbc_set_adc(m.ch, m.volts);
 };

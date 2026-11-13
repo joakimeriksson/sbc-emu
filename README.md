@@ -18,6 +18,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Keyboard | emulated USB keyboard on the DWC2 OTG port (host mode) | Linux enumerates it, `hid-generic` binds, typing works on tty1 |
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
+| GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
 | Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s → 135 s; all CPU tests pass with and without it |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~7 min, ~200 MiB of the image read |
@@ -49,7 +50,10 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | USB | DWC2 OTG core, host mode (buffer DMA) + HID boot keyboard | `dwc2`, `usbhid` |
 | Display | `simple-framebuffer` in the GPU memory carve-out | `simplefb`, fbcon |
 | Ethernet | GENET v5 (DMA rings, status blocks, INTRL2), UniMAC MDIO, BCM54213PE PHY | `bcmgenet`, `unimac-mdio`, Broadcom PHY |
-| Wi-Fi | second SD host (SDIO) + CYW43455: CCCR/FBR/CIS, backplane, EROM, SDIO core, emulated FullMAC | `sdhci-iproc`, `brcmfmac`, `brcmfmac-wcc` |
+| Wi-Fi | second SD host (SDIO) + CYW43455: CCCR/FBR/CIS, backplane, EROM, SDIO core, emulated FullMAC; open `sbc-emu` and WPA2-PSK `sbc-emu-wpa2` (passphrase `raspberry-pi`) | `sdhci-iproc`, `brcmfmac`, `brcmfmac-wcc` |
+| GPIO | function select, set/clear/level, edge/level detect, 2711 pulls, bank IRQs | `pinctrl-bcm2835` |
+| I²C1 + BME280 | BSC FIFO controller; BME280 with datasheet compensation (host sets physical values) | `i2c-bcm2835`, `bmp280` (IIO) |
+| SPI0 + MCP3008 | FIFO controller, GPIO chip select; bit-serial 10-bit ADC | `spi-bcm2835`, `mcp320x` (IIO) |
 
 ## Running it
 
@@ -66,6 +70,10 @@ gunzip -c kernel8.img > Image
 ./target/release/sbc-emu mkinitramfs --busybox busybox.static -o initramfs.cpio
 ./target/release/sbc-emu run --kernel Image --initrd initramfs.cpio --shell fb --input usb
 ```
+
+Script steps for the board: `gpio PIN 0|1|float`, `sensor temp|pressure|humidity VALUE`,
+`adc CHANNEL VOLTS`; `--gpio-log` prints output edges (the LED). Examples:
+`scripts/raspios-firstboot.txt` (setup, Wi-Fi) and `scripts/raspios-peripherals.txt`.
 
 Snapshots: a script step `save FILE` writes the whole machine (CPU, devices, RAM, disk overlay);
 `--restore FILE` resumes it (the same SD image must be attached).
@@ -91,6 +99,8 @@ cargo test --release --workspace
 - `arm-a64/tests/diff_host.rs`, `diff_neon.rs`: **differential tests against the host CPU**
   (Apple silicon is AArch64): integer, FP and NEON snippets run natively and on the emulator from
   the same random states; registers, flags, NaN payloads and FPSR.QC must match bit for bit.
+- `bcm2711` unit tests: GPIO edges, BME280 compensation against the Linux driver's formula, MCP3008
+  framing against `mcp320x`'s decode.
 - `arm-a64/tests/system.rs`: exceptions, EL changes, MMU faults, timer interrupts.
 - `tools/wasm-smoke.mjs`, `tools/wasm-smoke-sd.mjs`: headless boots of the WebAssembly build.
 
@@ -108,7 +118,7 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 
 ## Known gaps
 
-Single core; Wi-Fi offers one open network (no WPA2 yet) with no radio model; no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
+Single core; Wi-Fi has no radio model (emulated firmware host interface, WPA2-PSK only); no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
 modes, flush-to-zero and FP exception flags are not modelled by the interpreter (JIT-native FP uses
 the host's default FPCR); no LSE atomics, crypto or CRC32 instructions (the ID registers say so, so
 software does not use them); the JIT runs on AArch64 hosts only (the browser build interprets), and

@@ -27,6 +27,12 @@
   .chooser button { text-align: left; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
   .chooser button span { color: var(--muted); font-size: 13px; }
   .chooser button:hover { border-color: var(--accent); }
+  .board { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 4px 0 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
+  .board label { display: flex; align-items: center; gap: 6px; }
+  .board input[type=range] { width: 120px; }
+  .ledbox { display: flex; align-items: center; gap: 8px; }
+  .led { width: 16px; height: 16px; border-radius: 50%; background: #3a1a1a; border: 1px solid var(--line); }
+  .led.on { background: #ff3b3b; box-shadow: 0 0 10px #ff3b3b; }
   .serialform { display: flex; gap: 8px; padding: 8px 12px; }
   .serialform input { flex: 1; min-width: 0; font: 13px ui-monospace, Menlo, monospace; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--fg); }
   button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; }
@@ -46,6 +52,14 @@
   <p id="status" class="muted">choose a system to boot</p>
   <div class="screen" id="screen" tabindex="0"><canvas id="fb" width="1024" height="768"></canvas></div>
   <p class="hint muted">Click the screen to type on the Pi's USB keyboard (emulated DWC2 USB host + HID keyboard). The screen is the firmware framebuffer (simplefb, fbcon). Try <code>cat /proc/cpuinfo</code> or <code>cat /dev/urandom &gt; /dev/fb0</code>.</p>
+  <section class="board" aria-label="Board peripherals">
+    <div class="ledbox"><span id="led" class="led" aria-label="GPIO17 LED"></span><span>LED · GPIO17</span></div>
+    <button id="btn" type="button" title="GPIO27, active high while held">Button · GPIO27</button>
+    <label>BME280 temperature <input id="temp" type="range" min="-10" max="45" step="0.5" value="21.5"> <output id="tempv">21.5 °C</output></label>
+    <label>BME280 humidity <input id="hum" type="range" min="0" max="100" step="1" value="45"> <output id="humv">45 %</output></label>
+    <label>MCP3008 CH0 <input id="adc0" type="range" min="0" max="3.3" step="0.05" value="0"> <output id="adcv">0.00 V</output></label>
+  </section>
+  <p class="hint muted">In the guest: <code>gpioset -t0 GPIO17_LED=1</code>, <code>gpioget GPIO27_BUTTON</code>, <code>cat /sys/bus/iio/devices/iio:device0/in_temp_input</code>, <code>…/iio:device1/in_voltage0_raw</code>.</p>
   <details open>
     <summary>Serial console (UART0) <button id="clear" type="button">clear</button></summary>
     <pre id="term"></pre>
@@ -70,6 +84,8 @@ worker.onmessage = (e) => {
   } else if (m.type === 'frame') {
     if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
     ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
+  } else if (m.type === 'gpio' && m.pin === 17) {
+    document.getElementById('led').classList.toggle('on', m.level === 1);
   } else if (m.type === 'stats') {
     if (state === 'booting…' || state === 'resumed' || state === 'running') state = 'running';
     status.textContent = `${state} · ${m.mips.toFixed(1)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '');
@@ -102,6 +118,15 @@ document.getElementById('serialform').onsubmit = (e) => {
   worker.postMessage({ type: 'serial', bytes: [...new TextEncoder().encode(inp.value + '\r')] });
   inp.value = '';
 };
+const btn = document.getElementById('btn');
+const press = (p) => worker.postMessage({ type: 'button', pressed: p });
+btn.addEventListener('pointerdown', () => press(true));
+btn.addEventListener('pointerup', () => press(false));
+btn.addEventListener('pointerleave', () => press(false));
+const slider = (id, out, fmt, send) => { const el = document.getElementById(id); el.oninput = () => { document.getElementById(out).textContent = fmt(+el.value); send(+el.value); }; };
+slider('temp', 'tempv', (v) => `${v} °C`, (v) => worker.postMessage({ type: 'sensor', kind: 0, value: v }));
+slider('hum', 'humv', (v) => `${v} %`, (v) => worker.postMessage({ type: 'sensor', kind: 2, value: v }));
+slider('adc0', 'adcv', (v) => `${v.toFixed(2)} V`, (v) => worker.postMessage({ type: 'adc', ch: 0, volts: v }));
 const params = new URLSearchParams(location.search);
 const boot = (os) => {
   document.getElementById('chooser').hidden = true;

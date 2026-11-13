@@ -62,7 +62,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -105,6 +105,7 @@ fn run(args: &[String]) -> ExitCode {
     let trace_sd = args.iter().any(|a| a == "--trace-sd");
     let trace_net = args.iter().any(|a| a == "--trace-net");
     let use_jit = !args.iter().any(|a| a == "--no-jit");
+    let gpio_log = args.iter().any(|a| a == "--gpio-log");
     let net_mode = arg(args, "--net").unwrap_or("nat");
     let usb_input = arg(args, "--input") == Some("usb");
     let mut script: std::collections::VecDeque<String> = match arg(args, "--script") {
@@ -209,6 +210,28 @@ fn run(args: &[String]) -> ExitCode {
                         if let Some((w, h)) = m.soc.mbox.render(&m.soc.ram, &mut rgba) { let _ = std::fs::write(rest, bcm2711::png::encode_rgba(w, h, &rgba)); }
                     }
                     "quit" => { script.pop_front(); break Stop::Budget; }
+                    "gpio" => {
+                        // gpio PIN 0|1|float
+                        let mut it = rest.split_whitespace();
+                        if let (Some(p), Some(v)) = (it.next().and_then(|p| p.parse::<usize>().ok()), it.next()) {
+                            m.soc.gpio.set_input(p, match v { "1" | "high" => Some(true), "0" | "low" => Some(false), _ => None });
+                            m.soc.dirty = true;
+                        }
+                    }
+                    "sensor" => {
+                        // sensor temp|pressure|humidity VALUE (degC, hPa, %RH)
+                        let mut it = rest.split_whitespace();
+                        if let (Some(k), Some(v)) = (it.next(), it.next().and_then(|v| v.parse::<f64>().ok())) {
+                            m.set_sensor(k, v);
+                        }
+                    }
+                    "adc" => {
+                        // adc CHANNEL VOLTS
+                        let mut it = rest.split_whitespace();
+                        if let (Some(c), Some(v)) = (it.next().and_then(|c| c.parse::<usize>().ok()), it.next().and_then(|v| v.parse::<f64>().ok())) {
+                            if c < 8 { m.soc.spi.adc.volts[c] = v; }
+                        }
+                    }
                     "save" => { let snap = m.save(); eprintln!("\r[script] snapshot {} MiB -> {rest}\r", snap.len() >> 20); let _ = std::fs::write(rest, snap); }
                     _ => eprintln!("[script] unknown command: {line}"),
                 }
@@ -222,6 +245,11 @@ fn run(args: &[String]) -> ExitCode {
         let budget = 2_000_000u64.min(max.saturating_sub(m.cpu.instret));
         if budget == 0 { break Stop::Budget; }
         let stop = m.run(budget);
+        if gpio_log {
+            for ev in std::mem::take(&mut m.soc.gpio.events) {
+                eprintln!("\r[gpio] GPIO{} -> {} at t={:.6}s\r", ev.pin, ev.level as u8, ev.time_ns as f64 / 1e9);
+            }
+        } else { m.soc.gpio.events.clear(); }
         if !script.is_empty() {
             serial_log.push_str(&String::from_utf8_lossy(&m.soc.uart.out));
             if serial_log.len() > 1 << 20 { serial_log.drain(..serial_log.len() - (1 << 19)); }

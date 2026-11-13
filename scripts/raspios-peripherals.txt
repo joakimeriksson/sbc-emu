@@ -1,0 +1,51 @@
+# Raspberry Pi OS first boot, then GPIO (LED on 17, button on 27), BME280 over I2C and MCP3008 over SPI
+# through the stock kernel drivers (IIO sysfs, libgpiod).
+wait-serial raspberrypi login:
+wait-idle 5
+shot out/01-keyboard-layout.png
+type \n
+sleep 2
+wait-idle 5
+shot out/02-username.png
+type pi\n
+sleep 2
+wait-idle 5
+type raspberry\n
+sleep 2
+wait-idle 5
+type raspberry\n
+sleep 2
+wait-idle 8
+type \n
+sleep 2
+wait-idle 4
+shot out/03-login-prompt.png
+save out/raspios-lite.snap
+type pi\n
+sleep 2
+wait-idle 4
+type raspberry\n
+sleep 3
+wait-idle 6
+type clear; ls /sys/bus/iio/devices; cat /sys/bus/iio/devices/iio:device*/name\n
+sleep 3
+wait-idle 6
+type cd /sys/bus/iio/devices/iio:device0; cat in_temp_input in_pressure_input in_humidityrelative_input; cd\n
+sleep 3
+wait-idle 6
+sensor temp 30.5
+sensor pressure 990.0
+sensor humidity 70
+adc 0 1.0
+type cat /sys/bus/iio/devices/iio:device0/in_temp_input /sys/bus/iio/devices/iio:device1/in_voltage0_raw /sys/bus/iio/devices/iio:device1/in_voltage4_raw\n
+sleep 3
+wait-idle 6
+type which gpioset gpioget; gpioset -t0 GPIO17_LED=1; gpioset -t0 GPIO17_LED=0; gpioget GPIO27_BUTTON\n
+sleep 3
+wait-idle 6
+gpio 27 1
+type gpioget GPIO27_BUTTON\n
+sleep 3
+wait-idle 6
+shot out/10-peripherals.png
+quit

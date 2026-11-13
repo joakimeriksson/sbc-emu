@@ -22,6 +22,9 @@ pub const EMMC2: u64 = 0xfe34_0000;
 pub const SDHOST_WIFI: u64 = 0xfe30_0000;
 pub const USB: u64 = 0xfe98_0000;
 pub const GENET: u64 = 0xfd58_0000;
+pub const GPIO: u64 = 0xfe20_0000;
+pub const SPI0: u64 = 0xfe20_4000;
+pub const I2C1: u64 = 0xfe80_4000;
 /// GPU memory carve-out at the top of RAM (firmware `gpu_mem=64`), holding the framebuffer
 pub const GPU_MEM: u64 = 64 << 20;
 const PPI_VTIMER: usize = 27;
@@ -31,6 +34,9 @@ const SPI_MBOX: usize = 32 + 33;
 const SPI_EMMC2: usize = 32 + 126;
 const SPI_USB: usize = 32 + 73;
 const SPI_GENET0: usize = 32 + 157;
+const SPI_GPIO0: usize = 32 + 113;
+const SPI_I2C: usize = 32 + 117;
+const SPI_SPI: usize = 32 + 118;
 const SPI_GENET1: usize = 32 + 158;
 
 pub struct Soc {
@@ -45,6 +51,9 @@ pub struct Soc {
     pub wifi_net: Option<sbc_net::net::VirtualNet>,
     pub usb: Dwc2,
     pub genet: Genet,
+    pub gpio: crate::gpio::Gpio,
+    pub i2c: crate::i2c::I2c,
+    pub spi: crate::spi::Spi,
     /// the network behind the Ethernet port (None = cable unplugged)
     pub net: Option<sbc_net::net::VirtualNet>,
     pub unknown: Vec<u64>,
@@ -62,6 +71,9 @@ impl Soc {
             SDHOST_WIFI..=0xfe30_00ff => self.wifi.read(a - SDHOST_WIFI),
             USB..=0xfe98_ffff => self.usb.read(a - USB),
             GENET..=0xfd58_ffff => self.genet.read(a - GENET),
+            GPIO..=0xfe20_00ff => self.gpio.read(a - GPIO),
+            SPI0..=0xfe20_41ff => self.spi.read(a - SPI0),
+            I2C1..=0xfe80_4fff => self.i2c.read(a - I2C1),
             GICD..=0xff84_1fff => self.gic.dist_read(a - GICD),
             GICC..=0xff84_3fff => self.gic.cpu_read(a - GICC),
             PERIPH..=0xffff_ffff => { self.note(a); 0 }
@@ -79,6 +91,13 @@ impl Soc {
             MBOX..=0xfe00_b8bf => self.mbox.write(a - MBOX, v, &mut self.ram),
             USB..=0xfe98_ffff => self.usb.write(a - USB, v, &mut self.ram),
             GENET..=0xfd58_ffff => self.genet.write(a - GENET, v, &mut self.ram),
+            GPIO..=0xfe20_00ff => {
+                let ce0_before = self.gpio.level(8);
+                self.gpio.write(a - GPIO, v);
+                if self.gpio.level(8) && !ce0_before { self.spi.deselect(); } // CE0 released
+            }
+            SPI0..=0xfe20_41ff => { let ce0 = !self.gpio.level(8); self.spi.write(a - SPI0, v, ce0); }
+            I2C1..=0xfe80_4fff => self.i2c.write(a - I2C1, v),
             GICD..=0xff84_1fff => self.gic.dist_write(a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(a - GICC, v),
             PERIPH..=0xffff_ffff => self.note(a),
@@ -167,7 +186,7 @@ impl Machine {
         cpu.sys.cntfrq = CNTFRQ;
         cpu.firmware_calls_to_host = true;
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], gic: Gic::new(), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], gic: Gic::new(), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpu, soc, now: 0, exceptions: 0, irqs: 0, next_check: 0 };
         m.cpu.ram = m.soc.ram.as_mut_ptr();
         m.cpu.ram_len = m.soc.ram.len() as u64;
@@ -210,6 +229,14 @@ impl Machine {
         let u = self.soc.uart.irq();
         self.soc.gic.set_level(SPI_UART0, u);
         self.pump_network();
+        self.soc.gpio.now_ns = self.now;
+        let banks = self.soc.gpio.irq();
+        for (k, b) in banks.iter().enumerate() { self.soc.gic.set_level(SPI_GPIO0 + k, *b); }
+        self.soc.gic.set_level(SPI_GPIO0 + 3, banks.iter().any(|b| *b));
+        let i2c = self.soc.i2c.irq();
+        self.soc.gic.set_level(SPI_I2C, i2c);
+        let spi = self.soc.spi.irq();
+        self.soc.gic.set_level(SPI_SPI, spi);
         let (g0, g1) = (self.soc.genet.irq0(), self.soc.genet.irq1());
         self.soc.gic.set_level(SPI_GENET0, g0);
         self.soc.gic.set_level(SPI_GENET1, g1);
@@ -317,6 +344,17 @@ impl Machine {
         self.soc.wifi_net = Some(sbc_net::net::VirtualNet::new(log));
     }
 
+    /// Physical inputs of the emulated board's sensors: temp (degC), pressure (hPa), humidity (%RH).
+    pub fn set_sensor(&mut self, what: &str, v: f64) {
+        let b = &mut self.soc.i2c.bme280;
+        match what {
+            "temp" | "temperature" => b.temp_c = v,
+            "pressure" => b.pressure_pa = v * 100.0,
+            "humidity" => b.humidity = v,
+            _ => {}
+        }
+    }
+
     /// PSCI 1.1 as the Pi 4's firmware (Trusted Firmware-A) provides it, for one CPU.
     fn psci(&mut self) -> Option<Stop> {
         const NOT_SUPPORTED: u64 = -1i64 as u64;
@@ -354,7 +392,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v3");
+        w.tag("machine-v4");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         self.cpu.save_state(&mut w);
@@ -365,6 +403,7 @@ impl Machine {
         self.soc.usb.save_state(&mut w);
         self.soc.genet.save_state(&mut w);
         self.soc.wifi.save_state(&mut w);
+        self.soc.gpio.save_state(&mut w);
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -380,7 +419,7 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        r.tag("machine-v3").map_err(e)?;
+        r.tag("machine-v4").map_err(e)?;
         let ram = r.u64().map_err(e)? as usize;
         if ram != self.soc.ram.len() { return Err(format!("snapshot RAM is {} MiB, machine has {} MiB", ram >> 20, self.soc.ram.len() >> 20)); }
         self.now = r.u64().map_err(e)?; self.exceptions = r.u64().map_err(e)?; self.irqs = r.u64().map_err(e)?;
@@ -392,6 +431,7 @@ impl Machine {
         self.soc.usb.load_state(&mut r).map_err(e)?;
         self.soc.genet.load_state(&mut r).map_err(e)?;
         self.soc.wifi.load_state(&mut r).map_err(e)?;
+        self.soc.gpio.load_state(&mut r).map_err(e)?;
         self.soc.ram.fill(0);
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;

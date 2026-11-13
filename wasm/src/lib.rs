@@ -192,3 +192,23 @@ pub extern "C" fn sbc_stop_kind() -> i32 { with(|s| match s.stop { None => 0, So
 pub extern "C" fn sbc_stop_pc() -> f64 { with(|s| match s.stop { Some(Stop::Unimplemented(pc, _)) => pc as f64, _ => s.m.cpu.pc as f64 }).unwrap_or(0.0) }
 #[no_mangle]
 pub extern "C" fn sbc_stop_insn() -> u32 { with(|s| match s.stop { Some(Stop::Unimplemented(_, i)) => i, _ => 0 }).unwrap_or(0) }
+
+/// GPIO line level as the pins see it (0/1).
+#[no_mangle]
+pub extern "C" fn sbc_gpio_level(pin: u32) -> u32 { with(|s| s.m.soc.gpio.level(pin as usize) as u32).unwrap_or(0) }
+
+/// Drive a GPIO input from the page: 1 high, 0 low, -1 released (pull decides).
+#[no_mangle]
+pub extern "C" fn sbc_gpio_input(pin: u32, v: i32) {
+    with(|s| { s.m.soc.gpio.set_input(pin as usize, match v { 1 => Some(true), 0 => Some(false), _ => None }); s.m.soc.dirty = true; });
+}
+
+/// Sensor inputs: kind 0 temperature (degC), 1 pressure (hPa), 2 humidity (%RH).
+#[no_mangle]
+pub extern "C" fn sbc_set_sensor(kind: u32, v: f64) {
+    with(|s| s.m.set_sensor(match kind { 0 => "temp", 1 => "pressure", _ => "humidity" }, v));
+}
+
+/// MCP3008 channel input voltage.
+#[no_mangle]
+pub extern "C" fn sbc_set_adc(ch: u32, volts: f64) { with(|s| { if ch < 8 { s.m.soc.spi.adc.volts[ch as usize] = volts; } }); }

@@ -83,7 +83,7 @@ const LEVEL_HIGH: u32 = 4;
 const PPI_LEVEL_LOW_ALL: u32 = 0xf08;
 
 pub fn pi4b(b: &BootInfo) -> Vec<u8> {
-    let (gic, clk48, mbox, clk100, phy1) = (1u32, 2u32, 3u32, 4u32, 5u32);
+    let (gic, clk48, mbox, clk100, phy1, gpio, clkvpu, vref) = (1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32);
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
@@ -96,6 +96,8 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.str("serial0", "/serial@fe201000");
     f.str("mmc0", "/soc/mmc@fe340000");
     f.str("mmc1", "/soc/mmc@fe300000");
+    f.str("i2c1", "/soc/i2c@fe804000");
+    f.str("spi0", "/soc/spi@fe204000");
     f.end();
 
     f.begin("chosen");
@@ -136,6 +138,23 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("phandle", &[clk100]);
     f.end();
 
+    f.begin("clk-vpu");
+    f.str("compatible", "fixed-clock");
+    f.cells("#clock-cells", &[0]);
+    f.cells("clock-frequency", &[500_000_000]);
+    f.str("clock-output-names", "vpu");
+    f.cells("phandle", &[clkvpu]);
+    f.end();
+
+    f.begin("regulator-3v3");
+    f.str("compatible", "regulator-fixed");
+    f.str("regulator-name", "3v3");
+    f.cells("regulator-min-microvolt", &[3_300_000]);
+    f.cells("regulator-max-microvolt", &[3_300_000]);
+    f.empty("regulator-always-on");
+    f.cells("phandle", &[vref]);
+    f.end();
+
     f.begin("timer");
     f.str("compatible", "arm,armv8-timer");
     f.cells("interrupts", &[GIC_PPI, 13, PPI_LEVEL_LOW_ALL, GIC_PPI, 14, PPI_LEVEL_LOW_ALL, GIC_PPI, 11, PPI_LEVEL_LOW_ALL, GIC_PPI, 10, PPI_LEVEL_LOW_ALL]);
@@ -173,6 +192,55 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("#size-cells", &[1]);
     f.empty("ranges");
     f.empty("dma-ranges");
+
+    f.begin("gpio@fe200000");
+    f.str("compatible", "brcm,bcm2711-gpio");
+    f.cells("reg", &[0, 0xfe20_0000, 0xb4]);
+    f.cells("interrupts", &[GIC_SPI, 113, LEVEL_HIGH, GIC_SPI, 114, LEVEL_HIGH, GIC_SPI, 115, LEVEL_HIGH, GIC_SPI, 116, LEVEL_HIGH]);
+    f.empty("gpio-controller");
+    f.cells("#gpio-cells", &[2]);
+    f.empty("interrupt-controller");
+    f.cells("#interrupt-cells", &[2]);
+    // header names as on the Pi 4, with the emulated board's LED (GPIO17) and button (GPIO27)
+    let mut names: Vec<String> = (0..58).map(|n| format!("GPIO{n}")).collect();
+    names[17] = "GPIO17_LED".into();
+    names[27] = "GPIO27_BUTTON".into();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    f.strs("gpio-line-names", &refs);
+    f.cells("phandle", &[gpio]);
+    f.end();
+
+    f.begin("spi@fe204000");
+    f.str("compatible", "brcm,bcm2835-spi");
+    f.cells("reg", &[0, 0xfe20_4000, 0x200]);
+    f.cells("interrupts", &[GIC_SPI, 118, LEVEL_HIGH]);
+    f.cells("clocks", &[clkvpu]);
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.cells("cs-gpios", &[gpio, 8, 1, gpio, 7, 1]);
+    f.str("status", "okay");
+    f.begin("adc@0");
+    f.str("compatible", "microchip,mcp3008");
+    f.cells("reg", &[0]);
+    f.cells("spi-max-frequency", &[1_000_000]);
+    f.cells("vref-supply", &[vref]);
+    f.end();
+    f.end();
+
+    f.begin("i2c@fe804000");
+    f.strs("compatible", &["brcm,bcm2711-i2c", "brcm,bcm2835-i2c"]);
+    f.cells("reg", &[0, 0xfe80_4000, 0x1000]);
+    f.cells("interrupts", &[GIC_SPI, 117, LEVEL_HIGH]);
+    f.cells("clocks", &[clkvpu]);
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.cells("clock-frequency", &[100_000]);
+    f.str("status", "okay");
+    f.begin("sensor@76");
+    f.str("compatible", "bosch,bme280");
+    f.cells("reg", &[0x76]);
+    f.end();
+    f.end();
 
     f.begin("mailbox@fe00b880");
     f.str("compatible", "brcm,bcm2835-mbox");
