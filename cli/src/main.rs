@@ -62,7 +62,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -103,6 +103,8 @@ fn run(args: &[String]) -> ExitCode {
     let ram_mb = arg(args, "--ram-mb").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1024);
     let display = !args.iter().any(|a| a == "--no-display");
     let trace_sd = args.iter().any(|a| a == "--trace-sd");
+    let trace_net = args.iter().any(|a| a == "--trace-net");
+    let net_mode = arg(args, "--net").unwrap_or("nat");
     let usb_input = arg(args, "--input") == Some("usb");
     let mut script: std::collections::VecDeque<String> = match arg(args, "--script") {
         Some(p) => match std::fs::read_to_string(p) { Ok(t) => t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect(), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
@@ -131,6 +133,8 @@ fn run(args: &[String]) -> ExitCode {
         };
         m.soc.sd = bcm2711::sdhci::Sdhci::new(disk);
         m.soc.sd.trace = trace_sd;
+        match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
+        m.soc.genet.trace = trace_net;
         bcm2711::boot::boot_linux(&mut m, &k, i.as_deref(), &c, display)?;
         Ok(m)
     };

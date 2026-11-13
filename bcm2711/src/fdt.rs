@@ -83,7 +83,7 @@ const LEVEL_HIGH: u32 = 4;
 const PPI_LEVEL_LOW_ALL: u32 = 0xf08;
 
 pub fn pi4b(b: &BootInfo) -> Vec<u8> {
-    let (gic, clk48, mbox, clk100) = (1u32, 2u32, 3u32, 4u32);
+    let (gic, clk48, mbox, clk100, phy1) = (1u32, 2u32, 3u32, 4u32, 5u32);
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
@@ -185,6 +185,32 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.strs("compatible", &["raspberrypi,bcm2835-firmware", "simple-mfd"]);
     f.cells("mboxes", &[mbox]);
     f.end();
+    // Gigabit Ethernet: GENET v5 with the BCM54213PE PHY at MDIO address 1
+    f.begin("ethernet@fd580000");
+    f.str("compatible", "brcm,bcm2711-genet-v5");
+    f.cells("reg", &[0, 0xfd58_0000, 0x10000]);
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[1]);
+    f.cells("interrupts", &[GIC_SPI, 157, LEVEL_HIGH, GIC_SPI, 158, LEVEL_HIGH]);
+    f.cells("phy-handle", &[phy1]);
+    f.str("phy-mode", "rgmii-rxid");
+    // locally administered address (the firmware would copy the board's OTP MAC here)
+    f.prop("local-mac-address", &[0x02, 0x5b, 0xc0, 0x00, 0x00, 0x01]);
+    f.str("status", "okay");
+    f.begin("mdio@e14");
+    f.str("compatible", "brcm,genet-mdio-v5");
+    f.cells("reg", &[0xe14, 0x8]);
+    f.str("reg-names", "mdio");
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.cells("clock-frequency", &[1_950_000]);
+    f.begin("ethernet-phy@1");
+    f.cells("reg", &[1]);
+    f.cells("phandle", &[phy1]);
+    f.end();
+    f.end();
+    f.end();
+
     // the USB-C OTG port in host mode, as with `dtoverlay=dwc2,dr_mode=host`
     f.begin("usb@fe980000");
     f.str("compatible", "brcm,bcm2835-usb");

@@ -22,6 +22,7 @@ dependencies = [
  "arm-a64",
  "emu-core",
  "miniz_oxide",
+ "sbc-net",
 ]
 
 [[package]]
@@ -52,3 +53,7 @@ version = "0.0.1"
 dependencies = [
  "bcm2711",
 ]
+
+[[package]]
+name = "sbc-net"
+version = "0.0.1"

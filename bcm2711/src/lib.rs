@@ -6,6 +6,7 @@ pub mod boot;
 pub mod dwc2;
 pub mod fat;
 pub mod fdt;
+pub mod genet;
 pub mod gic;
 pub mod mailbox;
 pub mod png;

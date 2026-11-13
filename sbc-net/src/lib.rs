@@ -1,0 +1,26 @@
+//! The virtual network behind an emulated board's Ethernet or Wi-Fi. Ported from esp32sim
+//! (`esp-soc/src/{net,nat,wifi}.rs`, commit 2d6fcafe, MIT) so both emulators share one design:
+//!
+//! - `net::VirtualNet`: a 10.0.2.0/24 subnet with gateway, DHCP, ARP, ICMP echo, DNS and SNTP,
+//!   exchanging Ethernet II frames;
+//! - `nat::Nat`: user-mode NAT relaying guest TCP/UDP through host sockets (native only);
+//! - `wifi`: a virtual 802.11 access point (beacons, probe/auth/assoc, WPA2 handshake).
+pub mod net;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod nat;
+pub mod crypto;
+pub mod wifi;
+
+/// Host clock for SNTP answers.
+pub mod host {
+    /// Milliseconds since the Unix epoch (0 where no host clock exists).
+    pub fn unix_time_ms() -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+        #[cfg(target_arch = "wasm32")]
+        { WASM_TIME_MS.load(std::sync::atomic::Ordering::Relaxed) }
+    }
+    /// The page sets the wall clock (ms since the epoch) for SNTP answers in the browser.
+    #[cfg(target_arch = "wasm32")]
+    pub static WASM_TIME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+}

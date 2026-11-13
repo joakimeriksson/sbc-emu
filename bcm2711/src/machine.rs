@@ -6,6 +6,7 @@ use crate::gic::Gic;
 use crate::mailbox::Mailbox;
 use crate::sdhci::Sdhci;
 use crate::dwc2::Dwc2;
+use crate::genet::Genet;
 use crate::pl011::Pl011;
 use arm_a64::Cpu;
 use emu_core::{Bus, Core, Fault, Trap};
@@ -18,6 +19,7 @@ pub const PERIPH: u64 = 0xfc00_0000;
 pub const MBOX: u64 = 0xfe00_b880;
 pub const EMMC2: u64 = 0xfe34_0000;
 pub const USB: u64 = 0xfe98_0000;
+pub const GENET: u64 = 0xfd58_0000;
 /// GPU memory carve-out at the top of RAM (firmware `gpu_mem=64`), holding the framebuffer
 pub const GPU_MEM: u64 = 64 << 20;
 const PPI_VTIMER: usize = 27;
@@ -26,6 +28,8 @@ const SPI_UART0: usize = 32 + 121;
 const SPI_MBOX: usize = 32 + 33;
 const SPI_EMMC2: usize = 32 + 126;
 const SPI_USB: usize = 32 + 73;
+const SPI_GENET0: usize = 32 + 157;
+const SPI_GENET1: usize = 32 + 158;
 
 pub struct Soc {
     pub ram: Vec<u8>,
@@ -34,6 +38,9 @@ pub struct Soc {
     pub mbox: Mailbox,
     pub sd: Sdhci,
     pub usb: Dwc2,
+    pub genet: Genet,
+    /// the network behind the Ethernet port (None = cable unplugged)
+    pub net: Option<sbc_net::net::VirtualNet>,
     pub unknown: Vec<u64>,
     /// a device register was touched: interrupt lines must be re-derived
     pub dirty: bool,
@@ -47,6 +54,7 @@ impl Soc {
             MBOX..=0xfe00_b8bf => self.mbox.read(a - MBOX),
             EMMC2..=0xfe34_00ff => self.sd.read(a - EMMC2),
             USB..=0xfe98_ffff => self.usb.read(a - USB),
+            GENET..=0xfd58_ffff => self.genet.read(a - GENET),
             GICD..=0xff84_1fff => self.gic.dist_read(a - GICD),
             GICC..=0xff84_3fff => self.gic.cpu_read(a - GICC),
             PERIPH..=0xffff_ffff => { self.note(a); 0 }
@@ -62,6 +70,7 @@ impl Soc {
             UART0..=0xfe20_1fff => self.uart.write(a - UART0, v),
             MBOX..=0xfe00_b8bf => self.mbox.write(a - MBOX, v, &mut self.ram),
             USB..=0xfe98_ffff => self.usb.write(a - USB, v, &mut self.ram),
+            GENET..=0xfd58_ffff => self.genet.write(a - GENET, v, &mut self.ram),
             GICD..=0xff84_1fff => self.gic.dist_write(a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(a - GICC, v),
             PERIPH..=0xffff_ffff => self.note(a),
@@ -150,7 +159,7 @@ impl Machine {
         cpu.sys.cntfrq = CNTFRQ;
         cpu.firmware_calls_to_host = true;
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], gic: Gic::new(), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), usb: Dwc2::new(), unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], gic: Gic::new(), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), usb: Dwc2::new(), genet: Genet::new(), net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpu, soc, now: 0, exceptions: 0, irqs: 0, next_check: 0 };
         m.cpu.ram = m.soc.ram.as_mut_ptr();
         m.cpu.ram_len = m.soc.ram.len() as u64;
@@ -192,6 +201,10 @@ impl Machine {
         self.soc.gic.set_level(PPI_PTIMER, p);
         let u = self.soc.uart.irq();
         self.soc.gic.set_level(SPI_UART0, u);
+        self.pump_network();
+        let (g0, g1) = (self.soc.genet.irq0(), self.soc.genet.irq1());
+        self.soc.gic.set_level(SPI_GENET0, g0);
+        self.soc.gic.set_level(SPI_GENET1, g1);
         self.soc.usb.tick(self.now);
         let usb = self.soc.usb.irq();
         self.soc.gic.set_level(SPI_USB, usb);
@@ -261,6 +274,29 @@ impl Machine {
         stop
     }
 
+    /// Exchange frames between the Ethernet MAC and the virtual network.
+    fn pump_network(&mut self) {
+        let soc = &mut self.soc;
+        let Some(net) = soc.net.as_mut() else { soc.genet.tx_out.clear(); return };
+        let now_us = self.now / 1000;
+        for f in std::mem::take(&mut soc.genet.tx_out) {
+            soc.genet.rx_queue.extend(net.handle(&f, now_us));
+        }
+        soc.genet.rx_queue.extend(net.poll(now_us));
+        if soc.genet.rx_queue.len() > 512 { soc.genet.rx_queue.drain(..soc.genet.rx_queue.len() - 512); }
+        soc.genet.deliver(&mut soc.ram);
+    }
+
+    /// Plug the Ethernet port into the virtual 10.0.2.0/24 network; `nat` also relays guest
+    /// TCP/UDP to the host's network (native builds only).
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat { net.nat = Some(sbc_net::nat::Nat::new(log)); }
+        let _ = nat;
+        self.soc.net = Some(net);
+    }
+
     /// PSCI 1.1 as the Pi 4's firmware (Trusted Firmware-A) provides it, for one CPU.
     fn psci(&mut self) -> Option<Stop> {
         const NOT_SUPPORTED: u64 = -1i64 as u64;
@@ -298,7 +334,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v1");
+        w.tag("machine-v2");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         self.cpu.save_state(&mut w);
@@ -307,6 +343,7 @@ impl Machine {
         self.soc.mbox.save_state(&mut w);
         self.soc.sd.save_state(&mut w);
         self.soc.usb.save_state(&mut w);
+        self.soc.genet.save_state(&mut w);
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -322,7 +359,7 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        r.tag("machine-v1").map_err(e)?;
+        r.tag("machine-v2").map_err(e)?;
         let ram = r.u64().map_err(e)? as usize;
         if ram != self.soc.ram.len() { return Err(format!("snapshot RAM is {} MiB, machine has {} MiB", ram >> 20, self.soc.ram.len() >> 20)); }
         self.now = r.u64().map_err(e)?; self.exceptions = r.u64().map_err(e)?; self.irqs = r.u64().map_err(e)?;
@@ -332,6 +369,7 @@ impl Machine {
         self.soc.mbox.load_state(&mut r).map_err(e)?;
         self.soc.sd.load_state(&mut r).map_err(e)?;
         self.soc.usb.load_state(&mut r).map_err(e)?;
+        self.soc.genet.load_state(&mut r).map_err(e)?;
         self.soc.ram.fill(0);
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;
