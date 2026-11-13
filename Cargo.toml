@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["emu-core", "arm-a64", "bcm2711", "cli", "wasm"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+debug = 1
+
+[profile.wasm]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = 0
+panic = "abort"

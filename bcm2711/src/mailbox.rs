@@ -1,0 +1,262 @@
+//! VideoCore mailbox (ARM_0 mailbox 0/1 at 0xfe00_b880) with the firmware property channel
+//! (channel 8): the subset of tags the Linux firmware/clock/framebuffer drivers ask for, answered
+//! the way the Pi 4 firmware answers them. The framebuffer lives in the GPU memory carve-out at
+//! the top of RAM (not given to Linux), exactly where firmware puts it after `gpu_mem`.
+use std::collections::VecDeque;
+
+pub const BOARD_REVISION: u32 = 0x00a0_3111; // Pi 4B 1 GiB, rev 1.1
+pub const FW_REVISION: u32 = 0x6900_0000;
+pub const SERIAL: u64 = 0x5bc0_e000_0000_0001;
+
+#[derive(Clone, Debug)]
+pub struct Framebuffer {
+    pub base: u64,
+    pub max_size: u64,
+    pub allocated: bool,
+    pub width: u32,
+    pub height: u32,
+    pub vwidth: u32,
+    pub vheight: u32,
+    pub depth: u32,
+    /// 0 = BGR, 1 = RGB (as the firmware's "pixel order")
+    pub rgb: bool,
+    pub xoff: u32,
+    pub yoff: u32,
+    pub palette: [u32; 256],
+    pub blank: bool,
+}
+
+impl Framebuffer {
+    pub fn pitch(&self) -> u32 { (self.vwidth * self.depth.div_ceil(8) + 15) & !15 }
+    pub fn size(&self) -> u32 { self.pitch() * self.vheight }
+}
+
+pub struct Mailbox {
+    rd: VecDeque<u32>,
+    pub cfg: u32,
+    pub fb: Framebuffer,
+    /// tags we answered with "unknown" (diagnostics)
+    pub unknown: Vec<u32>,
+}
+
+impl Mailbox {
+    pub fn new(fb_base: u64, fb_max: u64, width: u32, height: u32) -> Self {
+        Mailbox {
+            rd: VecDeque::new(),
+            cfg: 0,
+            fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
+                              depth: 32, rgb: false, xoff: 0, yoff: 0, palette: [0; 256], blank: false },
+            unknown: Vec::new(),
+        }
+    }
+
+    pub fn irq(&self) -> bool { self.cfg & 1 != 0 && !self.rd.is_empty() }
+
+    pub fn read(&mut self, off: u64) -> u32 {
+        match off {
+            0x00 => self.rd.pop_front().unwrap_or(0),
+            0x10 => self.rd.front().copied().unwrap_or(0),
+            0x18 => if self.rd.is_empty() { 1 << 30 } else { 0 },
+            0x1c => self.cfg,
+            0x38 => 0, // mailbox 1 never full
+            _ => 0,
+        }
+    }
+
+    /// A write to a mailbox register; property requests are processed immediately in `ram`.
+    pub fn write(&mut self, off: u64, v: u32, ram: &mut [u8]) {
+        match off {
+            0x1c => self.cfg = v,
+            0x20 => {
+                let ch = v & 0xf;
+                let addr = (v & !0xf & 0x3fff_ffff) as usize;
+                if ch == 8 { self.property(ram, addr); }
+                self.rd.push_back(v);
+            }
+            _ => {}
+        }
+    }
+
+    /// Allocate the framebuffer as the firmware does before Linux starts.
+    pub fn firmware_alloc(&mut self) { self.fb.allocated = true; }
+
+    fn property(&mut self, ram: &mut [u8], addr: usize) {
+        let rd = |ram: &[u8], a: usize| ram.get(a..a + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+        let wr = |ram: &mut [u8], a: usize, v: u32| { if let Some(b) = ram.get_mut(a..a + 4) { b.copy_from_slice(&v.to_le_bytes()); } };
+        let size = rd(ram, addr) as usize;
+        if size < 12 || addr + size > ram.len() { return; }
+        let end = addr + size;
+        let mut p = addr + 8;
+        while p + 12 <= end {
+            let tag = rd(ram, p);
+            if tag == 0 { break; }
+            let buflen = rd(ram, p + 4) as usize;
+            let vals = p + 12;
+            let mut v: Vec<u32> = (0..buflen / 4).map(|k| rd(ram, vals + 4 * k)).collect();
+            let resp = self.tag(tag, &mut v);
+            match resp {
+                Some(n) => {
+                    for (k, x) in v.iter().enumerate().take(buflen / 4) { wr(ram, vals + 4 * k, *x); }
+                    wr(ram, p + 8, 0x8000_0000 | n as u32);
+                }
+                None => {
+                    if !self.unknown.contains(&tag) { self.unknown.push(tag); }
+                    wr(ram, p + 8, 0x8000_0000);
+                }
+            }
+            p = vals + ((buflen + 3) & !3);
+        }
+        wr(ram, addr + 4, 0x8000_0000);
+    }
+
+    /// Answer one tag in place; returns the response length in bytes, or None if unknown.
+    fn tag(&mut self, tag: u32, v: &mut Vec<u32>) -> Option<usize> {
+        let set = |v: &mut Vec<u32>, vals: &[u32]| { if v.len() < vals.len() { v.resize(vals.len(), 0); } v[..vals.len()].copy_from_slice(vals); vals.len() * 4 };
+        let arg = |v: &Vec<u32>, k: usize| v.get(k).copied().unwrap_or(0);
+        let fb = &mut self.fb;
+        Some(match tag {
+            0x0000_0001 => set(v, &[FW_REVISION]),
+            0x0000_0002 => set(v, &[0]), // firmware variant: none
+            0x0000_0003 => set(v, &[0x5bc0_e000, 0, 0, 0, 0]), // firmware git hash (20 bytes)
+            0x0001_0007 => set(v, &[0, 1, 0, 2, 0, 3, 0, 4]), // clocks: (parent, id) pairs
+            0x0001_0001 => set(v, &[0]),
+            0x0001_0002 => set(v, &[BOARD_REVISION]),
+            0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)
+            0x0001_0004 => set(v, &[SERIAL as u32, (SERIAL >> 32) as u32]),
+            0x0001_0005 => set(v, &[0, fb.base as u32]),
+            0x0001_0006 => set(v, &[fb.base as u32, fb.max_size as u32]),
+            0x0002_0001 | 0x0002_0002 => { let id = arg(v, 0); set(v, &[id, 1]) }
+            0x0002_8001 => { let id = arg(v, 0); let st = arg(v, 1) & 1; set(v, &[id, st]) }
+            0x0003_0001 => { let id = arg(v, 0); set(v, &[id, 1]) }
+            0x0003_0002 | 0x0003_0004 | 0x0003_0007 | 0x0003_0047 => { let id = arg(v, 0); set(v, &[id, clock_rate(id)]) }
+            0x0003_8001 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
+            0x0003_8002 => { let id = arg(v, 0); let r = arg(v, 1); set(v, &[id, r]) }
+            0x0003_0006 => { let id = arg(v, 0); set(v, &[id, 45_000]) }
+            0x0003_000a => { let id = arg(v, 0); set(v, &[id, 85_000]) }
+            0x0003_0003 => { let id = arg(v, 0); set(v, &[id, 1_200_000]) } // voltage (uV)
+            0x0003_0046 => set(v, &[0]), // throttled: none
+            0x0003_0030 => { let id = arg(v, 0); set(v, &[id, 1]) } // domain state
+            0x0003_8030 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
+            0x0003_0058 | 0x0003_8058 => set(v, &[0, 0]), // POE / misc: nothing attached
+            // ---- framebuffer
+            0x0004_0001 => {
+                if fb.size() as u64 > fb.max_size { set(v, &[0, 0]) } else {
+                    fb.allocated = true;
+                    set(v, &[0xc000_0000 | fb.base as u32, fb.size()])
+                }
+            }
+            0x0004_8001 => { fb.allocated = false; 0 }
+            0x0004_0002 => { fb.blank = arg(v, 0) & 1 != 0; set(v, &[arg(v, 0) & 1]) }
+            0x0004_0003 => set(v, &[fb.width, fb.height]),
+            0x0004_4003 => set(v, &[arg(v, 0), arg(v, 1)]),
+            0x0004_8003 => { fb.width = arg(v, 0).clamp(16, 1920); fb.height = arg(v, 1).clamp(16, 1080); set(v, &[fb.width, fb.height]) }
+            0x0004_0004 => set(v, &[fb.vwidth, fb.vheight]),
+            0x0004_4004 => set(v, &[arg(v, 0), arg(v, 1)]),
+            0x0004_8004 => { fb.vwidth = arg(v, 0).clamp(16, 1920); fb.vheight = arg(v, 1).clamp(16, 2160); set(v, &[fb.vwidth, fb.vheight]) }
+            0x0004_0005 => set(v, &[fb.depth]),
+            0x0004_4005 => set(v, &[arg(v, 0)]),
+            0x0004_8005 => { let d = arg(v, 0); if matches!(d, 8 | 16 | 24 | 32) { fb.depth = d; } set(v, &[fb.depth]) }
+            0x0004_0006 => set(v, &[fb.rgb as u32]),
+            0x0004_4006 => set(v, &[arg(v, 0)]),
+            0x0004_8006 => { fb.rgb = arg(v, 0) == 1; set(v, &[fb.rgb as u32]) }
+            0x0004_0007 => set(v, &[2]), // alpha ignored
+            0x0004_4007 | 0x0004_8007 => set(v, &[arg(v, 0)]),
+            0x0004_0008 => set(v, &[fb.pitch()]),
+            0x0004_0009 => set(v, &[fb.xoff, fb.yoff]),
+            0x0004_4009 => set(v, &[arg(v, 0), arg(v, 1)]),
+            0x0004_8009 => { fb.xoff = arg(v, 0); fb.yoff = arg(v, 1); set(v, &[fb.xoff, fb.yoff]) }
+            0x0004_000a => set(v, &[0, 0, 0, 0]),
+            0x0004_400a | 0x0004_800a => set(v, &[0, 0, 0, 0]),
+            0x0004_000b => { let n = v.len().min(256); for k in 0..n { v[k] = fb.palette[k]; } n * 4 }
+            0x0004_400b => set(v, &[0]),
+            0x0004_800b => {
+                let (off, len) = (arg(v, 0) as usize, arg(v, 1) as usize);
+                if off + len > 256 { set(v, &[1]) } else {
+                    for k in 0..len { fb.palette[off + k] = arg(v, 2 + k); }
+                    set(v, &[0])
+                }
+            }
+            0x0004_0013 => set(v, &[1]), // number of displays
+            0x0004_8013 => set(v, &[arg(v, 0)]),
+            0x0000_8010 | 0x0000_8011 => set(v, &[0]), // cursor info/state: accepted
+            0x0004_000f => set(v, &[0]), // vsync / wait: immediate
+            0x0003_0020 => set(v, &[arg(v, 0), 0]), // GET_DMA? -> none
+            0x0006_0001 => set(v, &[0x7f35]), // DMA channel mask (firmware default)
+            _ => return None,
+        })
+    }
+
+    /// Render the visible part of the framebuffer as RGBA bytes (`out` resized to w*h*4).
+    pub fn render(&self, ram: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let fb = &self.fb;
+        if !fb.allocated { return None; }
+        let (w, h) = (fb.width, fb.height);
+        out.resize((w * h * 4) as usize, 0);
+        if fb.blank { out.fill(0); return Some((w, h)); }
+        let bpp = fb.depth.div_ceil(8) as usize;
+        let pitch = fb.pitch() as usize;
+        for y in 0..h as usize {
+            let row = fb.base as usize + (y + fb.yoff as usize) * pitch + fb.xoff as usize * bpp;
+            let Some(src) = ram.get(row..row + w as usize * bpp) else { break };
+            let dst = &mut out[y * w as usize * 4..(y + 1) * w as usize * 4];
+            for x in 0..w as usize {
+                let (r, g, b) = match fb.depth {
+                    32 | 24 => { let p = &src[x * bpp..]; (p[2], p[1], p[0]) }
+                    16 => {
+                        let p = u16::from_le_bytes([src[2 * x], src[2 * x + 1]]);
+                        let (r5, g6, b5) = ((p >> 11) & 31, (p >> 5) & 63, p & 31);
+                        (((r5 << 3) | (r5 >> 2)) as u8, ((g6 << 2) | (g6 >> 4)) as u8, ((b5 << 3) | (b5 >> 2)) as u8)
+                    }
+                    _ => { let c = fb.palette[src[x] as usize]; (c as u8, (c >> 8) as u8, (c >> 16) as u8) }
+                };
+                let (r, b) = if fb.rgb && fb.depth != 8 { (b, r) } else { (r, b) };
+                dst[4 * x..4 * x + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+        Some((w, h))
+    }
+}
+
+/// Clock rates the Pi 4 firmware reports (Hz) by firmware clock id.
+fn clock_rate(id: u32) -> u32 {
+    match id {
+        1 => 250_000_000,   // EMMC
+        2 => 48_000_000,    // UART
+        3 => 1_500_000_000, // ARM
+        4 => 500_000_000,   // CORE
+        5 => 500_000_000,   // V3D
+        6 => 500_000_000,   // H264
+        7 => 500_000_000,   // ISP
+        8 => 400_000_000,   // SDRAM
+        9 => 250_000_000,   // PIXEL
+        10 => 750_000_000,  // PWM
+        12 => 100_000_000,  // EMMC2
+        _ => 0,
+    }
+}
+
+impl Mailbox {
+    pub fn save_state(&self, w: &mut emu_core::snap::W) {
+        w.tag("mbox-v1");
+        w.u64(self.rd.len() as u64);
+        for &v in &self.rd { w.u32(v); }
+        w.u32(self.cfg);
+        let f = &self.fb;
+        w.u64(f.base); w.u64(f.max_size); w.bool(f.allocated);
+        for v in [f.width, f.height, f.vwidth, f.vheight, f.depth, f.xoff, f.yoff] { w.u32(v); }
+        w.bool(f.rgb); w.bool(f.blank);
+        for v in f.palette { w.u32(v); }
+    }
+    pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        r.tag("mbox-v1")?;
+        self.rd.clear();
+        for _ in 0..r.u64()? { self.rd.push_back(r.u32()?); }
+        self.cfg = r.u32()?;
+        let f = &mut self.fb;
+        f.base = r.u64()?; f.max_size = r.u64()?; f.allocated = r.bool()?;
+        for v in [&mut f.width, &mut f.height, &mut f.vwidth, &mut f.vheight, &mut f.depth, &mut f.xoff, &mut f.yoff] { *v = r.u32()?; }
+        f.rgb = r.bool()?; f.blank = r.bool()?;
+        for v in f.palette.iter_mut() { *v = r.u32()?; }
+        Ok(())
+    }
+}

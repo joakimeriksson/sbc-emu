@@ -1,0 +1,227 @@
+//! Flattened device tree writer, and the reduced Pi 4B tree this machine describes.
+//!
+//! The tree is a *reduced* BCM2711 description, not the vendor `bcm2711-rpi-4-b.dtb`: it lists
+//! only the devices that are modelled (one Cortex-A72, RAM, GIC-400, the generic timer, PL011
+//! UART0 with a fixed 48 MHz clock instead of the firmware mailbox clock). Compatible strings
+//! and addresses follow the vendor tree.
+
+#[derive(Default)]
+pub struct Fdt { st: Vec<u8>, strings: Vec<u8> }
+
+const BEGIN_NODE: u32 = 1;
+const END_NODE: u32 = 2;
+const PROP: u32 = 3;
+const END: u32 = 9;
+
+impl Fdt {
+    fn u32(&mut self, v: u32) { self.st.extend_from_slice(&v.to_be_bytes()); }
+    fn pad(&mut self) { while self.st.len() % 4 != 0 { self.st.push(0); } }
+    pub fn begin(&mut self, name: &str) { self.u32(BEGIN_NODE); self.st.extend_from_slice(name.as_bytes()); self.st.push(0); self.pad(); }
+    pub fn end(&mut self) { self.u32(END_NODE); }
+    pub fn prop(&mut self, name: &str, val: &[u8]) {
+        let off = match find(&self.strings, name) {
+            Some(o) => o,
+            None => { let o = self.strings.len(); self.strings.extend_from_slice(name.as_bytes()); self.strings.push(0); o }
+        };
+        self.u32(PROP);
+        self.u32(val.len() as u32);
+        self.u32(off as u32);
+        self.st.extend_from_slice(val);
+        self.pad();
+    }
+    pub fn cells(&mut self, name: &str, v: &[u32]) {
+        let b: Vec<u8> = v.iter().flat_map(|c| c.to_be_bytes()).collect();
+        self.prop(name, &b);
+    }
+    pub fn str(&mut self, name: &str, v: &str) { self.strs(name, &[v]); }
+    pub fn strs(&mut self, name: &str, v: &[&str]) {
+        let mut b = Vec::new();
+        for s in v { b.extend_from_slice(s.as_bytes()); b.push(0); }
+        self.prop(name, &b);
+    }
+    pub fn empty(&mut self, name: &str) { self.prop(name, &[]); }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        self.u32(END);
+        let rsv_off = 40u32;
+        let st_off = rsv_off + 16;
+        let str_off = st_off + self.st.len() as u32;
+        let total = str_off + self.strings.len() as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        for v in [0xd00d_feedu32, total, st_off, str_off, rsv_off, 17, 16, 0, self.strings.len() as u32, self.st.len() as u32] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&self.st);
+        out.extend_from_slice(&self.strings);
+        out
+    }
+}
+
+fn find(strings: &[u8], name: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < strings.len() {
+        let end = i + strings[i..].iter().position(|&c| c == 0)?;
+        if &strings[i..end] == name.as_bytes() { return Some(i); }
+        i = end + 1;
+    }
+    None
+}
+
+pub struct BootInfo<'a> {
+    /// RAM given to Linux (below the GPU carve-out)
+    pub ram: u64,
+    pub bootargs: &'a str,
+    pub initrd: Option<(u64, u64)>,
+    /// firmware-allocated framebuffer: (base, width, height, stride)
+    pub fb: Option<(u64, u32, u32, u32)>,
+}
+
+const GIC_SPI: u32 = 0;
+const GIC_PPI: u32 = 1;
+const LEVEL_HIGH: u32 = 4;
+const PPI_LEVEL_LOW_ALL: u32 = 0xf08;
+
+pub fn pi4b(b: &BootInfo) -> Vec<u8> {
+    let (gic, clk48, mbox, clk100) = (1u32, 2u32, 3u32, 4u32);
+    let mut f = Fdt::default();
+    f.begin("");
+    f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
+    f.str("model", "Raspberry Pi 4 Model B (sbc-emu reduced DT)");
+    f.cells("#address-cells", &[2]);
+    f.cells("#size-cells", &[1]);
+    f.cells("interrupt-parent", &[gic]);
+
+    f.begin("aliases");
+    f.str("serial0", "/serial@fe201000");
+    f.str("mmc0", "/soc/mmc@fe340000");
+    f.end();
+
+    f.begin("chosen");
+    f.str("bootargs", b.bootargs);
+    f.str("stdout-path", "serial0:115200n8");
+    if let Some((s, e)) = b.initrd {
+        f.cells("linux,initrd-start", &[(s >> 32) as u32, s as u32]);
+        f.cells("linux,initrd-end", &[(e >> 32) as u32, e as u32]);
+    }
+    f.end();
+
+    f.begin("memory@0");
+    f.str("device_type", "memory");
+    // RAM below the 0xfc00_0000 peripheral window, as the 32-bit-addressable part of a Pi 4
+    f.cells("reg", &[0, 0, b.ram as u32]);
+    f.end();
+
+    f.begin("cpus");
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.begin("cpu@0");
+    f.str("device_type", "cpu");
+    f.str("compatible", "arm,cortex-a72");
+    f.cells("reg", &[0]);
+    f.end();
+    f.end();
+
+    f.begin("psci");
+    f.strs("compatible", &["arm,psci-1.0", "arm,psci-0.2"]);
+    f.str("method", "smc");
+    f.end();
+
+    f.begin("clk-emmc2");
+    f.str("compatible", "fixed-clock");
+    f.cells("#clock-cells", &[0]);
+    f.cells("clock-frequency", &[100_000_000]);
+    f.str("clock-output-names", "emmc2");
+    f.cells("phandle", &[clk100]);
+    f.end();
+
+    f.begin("timer");
+    f.str("compatible", "arm,armv8-timer");
+    f.cells("interrupts", &[GIC_PPI, 13, PPI_LEVEL_LOW_ALL, GIC_PPI, 14, PPI_LEVEL_LOW_ALL, GIC_PPI, 11, PPI_LEVEL_LOW_ALL, GIC_PPI, 10, PPI_LEVEL_LOW_ALL]);
+    f.empty("always-on");
+    f.end();
+
+    f.begin("interrupt-controller@ff841000");
+    f.str("compatible", "arm,gic-400");
+    f.empty("interrupt-controller");
+    f.cells("#interrupt-cells", &[3]);
+    f.cells("reg", &[0, 0xff84_1000, 0x1000, 0, 0xff84_2000, 0x2000]);
+    f.cells("phandle", &[gic]);
+    f.end();
+
+    f.begin("clk48");
+    f.str("compatible", "fixed-clock");
+    f.cells("#clock-cells", &[0]);
+    f.cells("clock-frequency", &[48_000_000]);
+    f.str("clock-output-names", "uart0_pclk");
+    f.cells("phandle", &[clk48]);
+    f.end();
+
+    f.begin("serial@fe201000");
+    f.strs("compatible", &["arm,pl011", "arm,primecell"]);
+    f.cells("reg", &[0, 0xfe20_1000, 0x200]);
+    f.cells("interrupts", &[GIC_SPI, 121, LEVEL_HIGH]);
+    f.cells("clocks", &[clk48, clk48]);
+    f.strs("clock-names", &["uartclk", "apb_pclk"]);
+    f.cells("arm,primecell-periphid", &[0x0024_1011]);
+    f.end();
+
+    f.begin("soc");
+    f.str("compatible", "simple-bus");
+    f.cells("#address-cells", &[2]);
+    f.cells("#size-cells", &[1]);
+    f.empty("ranges");
+    f.empty("dma-ranges");
+
+    f.begin("mailbox@fe00b880");
+    f.str("compatible", "brcm,bcm2835-mbox");
+    f.cells("reg", &[0, 0xfe00_b880, 0x40]);
+    f.cells("interrupts", &[GIC_SPI, 33, LEVEL_HIGH]);
+    f.cells("#mbox-cells", &[0]);
+    f.cells("phandle", &[mbox]);
+    f.end();
+
+    f.begin("firmware");
+    f.strs("compatible", &["raspberrypi,bcm2835-firmware", "simple-mfd"]);
+    f.cells("mboxes", &[mbox]);
+    f.end();
+    // the USB-C OTG port in host mode, as with `dtoverlay=dwc2,dr_mode=host`
+    f.begin("usb@fe980000");
+    f.str("compatible", "brcm,bcm2835-usb");
+    f.cells("reg", &[0, 0xfe98_0000, 0x10000]);
+    f.cells("interrupts", &[GIC_SPI, 73, LEVEL_HIGH]);
+    f.str("dr_mode", "host");
+    f.cells("g-np-tx-fifo-size", &[32]);
+    f.cells("g-rx-fifo-size", &[558]);
+    f.cells("g-tx-fifo-size", &[512, 512, 512, 512, 512, 256, 256]);
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.str("status", "okay");
+    f.end();
+
+    f.begin("mmc@fe340000");
+    f.str("compatible", "brcm,bcm2711-emmc2");
+    f.cells("reg", &[0, 0xfe34_0000, 0x100]);
+    f.cells("interrupts", &[GIC_SPI, 126, LEVEL_HIGH]);
+    f.cells("clocks", &[clk100]);
+    f.cells("bus-width", &[4]);
+    f.empty("non-removable");
+    f.str("status", "okay");
+    f.end();
+    f.end(); // soc
+
+    if let Some((base, w, h, stride)) = b.fb {
+        f.begin(&format!("framebuffer@{base:x}"));
+        f.str("compatible", "simple-framebuffer");
+        f.cells("reg", &[(base >> 32) as u32, base as u32, stride * h]);
+        f.cells("width", &[w]);
+        f.cells("height", &[h]);
+        f.cells("stride", &[stride]);
+        f.str("format", "a8r8g8b8");
+        f.str("status", "okay");
+        f.end();
+    }
+
+    f.end();
+    f.finish()
+}

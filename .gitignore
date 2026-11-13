@@ -1,0 +1,8 @@
+/target
+/build
+/cache
+/runs
+/artifacts
+web/wasm/
+web/assets/
+out/

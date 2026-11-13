@@ -1,0 +1,12 @@
+[package]
+name = "sbc-emu-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sbc-emu in the browser: C ABI over the Pi 4B Machine, driven by web/worker.js"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcm2711 = { path = "../bcm2711" }
