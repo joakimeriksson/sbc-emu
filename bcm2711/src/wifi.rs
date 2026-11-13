@@ -52,6 +52,7 @@ const C_GET_REVINFO: u32 = 98;
 const C_GET_VAR: u32 = 262;
 const C_SET_VAR: u32 = 263;
 const C_DISASSOC: u32 = 52;
+const C_GET_BSS_INFO: u32 = 136;
 
 // events
 const E_SET_SSID: u32 = 0;
@@ -418,6 +419,13 @@ impl Cyw43455 {
             (C_GET_SSID, false) => { let mut v = u32v(SSID.len() as u32); v.extend_from_slice(SSID.as_bytes()); v.resize(36, 0); Ok(v) }
             (C_GET_CHANNEL, false) => Ok([u32v(CHANNEL as u32), u32v(CHANNEL as u32), u32v(0)].concat()),
             (C_GET_RSSI, false) => Ok(u32v((-45i32) as u32)),
+            (C_GET_BSS_INFO, false) => {
+                // u32 buffer length, then the BSS record of the current association
+                let bss = self.bss_info();
+                let mut v = u32v(len as u32);
+                v.extend_from_slice(&bss);
+                Ok(v)
+            }
             (C_UP, _) => Ok(Vec::new()),
             (_, true) => Ok(Vec::new()), // other sets are accepted (scan times, PM, roam, infra, fakefrag...)
             _ => Err(BCME_UNSUPPORTED),
@@ -439,6 +447,8 @@ impl Cyw43455 {
                 v
             }
             "per_chan_info" | "nmode" | "vhtmode" | "mpc" => u32v(0),
+            "chanspec" => u32v(0x1000 | CHANNEL as u32),
+            "assoc_info" => vec![0u8; 8], // no association request/response IEs recorded
             "bw_cap" | "mimo_bw_cap" | "rxchain" | "txstreams" => u32v(1),
             _ => return Err(BCME_UNSUPPORTED),
         })
@@ -452,6 +462,12 @@ impl Cyw43455 {
             // keep host-side glomming and flow-control TLVs off (they change the framing)
             "bus:rxglom" | "tlv" => return Err(BCME_UNSUPPORTED),
             "event_msgs" => self.event_mask = val.to_vec(),
+            "join" => {
+                // brcmf_ext_join_params_le: starts with brcmf_ssid_le { u32 len; u8 ssid[32] }
+                let n = val.get(0..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).unwrap_or(0).min(32);
+                let ssid = val.get(4..4 + n).unwrap_or(&[]).to_vec();
+                if ssid == SSID.as_bytes() { self.join(); } else { self.event(E_SET_SSID, 3, 0, &[]); }
+            }
             "escan" => {
                 let sync = val.get(6..8).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
                 self.scan_results(sync);

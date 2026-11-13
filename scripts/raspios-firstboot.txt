@@ -29,19 +29,19 @@ wait-idle 4
 type raspberry\n
 sleep 3
 wait-idle 6
-type clear; sudo rfkill unblock wifi; ip -br link\n
+type clear; sudo rfkill unblock wifi; sudo nmcli radio wifi on; sleep 8; sudo nmcli dev disconnect eth0\n
 sleep 3
 wait-idle 4
 type raspberry\n
-sleep 3
+sleep 12
 wait-idle 8
 shot out/04-links.png
-type nmcli -f SSID,CHAN,SIGNAL,SECURITY dev wifi list\n
-sleep 5
+type nmcli dev wifi rescan; sleep 3; nmcli -f SSID,CHAN,SIGNAL,SECURITY dev wifi list\n
+sleep 8
 wait-idle 10
 shot out/05-wifi-scan.png
-type sudo nmcli dev disconnect eth0; sudo nmcli dev wifi connect sbc-emu; ip -br -4 addr; ping -c 2 10.0.2.2\n
-sleep 10
+type sudo nmcli dev wifi connect sbc-emu; sleep 5; ip -br -4 addr; ping -c 2 10.0.2.2; nmcli dev\n
+sleep 15
 wait-idle 15
 shot out/06-wifi-connected.png
 quit

@@ -17,6 +17,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | boots: firmware-style SD boot → initramfs → ext4 root → systemd 257 → `raspberrypi login:` and the first-boot setup wizard on HDMI | `scripts/raspios-firstboot.txt`; ~27 G instructions to the login prompt |
 | Keyboard | emulated USB keyboard on the DWC2 OTG port (host mode) | Linux enumerates it, `hid-generic` binds, typing works on tty1 |
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
+| Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s → 135 s; all CPU tests pass with and without it |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~7 min, ~200 MiB of the image read |
@@ -30,7 +31,9 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 - **vendor_image_compatibility**: the stock Raspberry Pi OS Lite image boots unmodified (writes go
   to a copy-on-write overlay; the image file is never changed).
 - **network**: W0 — the Pi 4's own Ethernet MAC (GENET) and PHY, behind a virtual network with
-  user-mode NAT (native) or an isolated network (browser). **wifi_tier**: none yet (W2 in progress). **clock_mode**: T0 real-time pacing
+  user-mode NAT (native) or an isolated network (browser). **wifi_tier**: W2 — original driver
+  (`brcmfmac`) against an emulated CYW43455 host interface (firmware download real, firmware
+  behaviour emulated, open network only, no radio model; see docs/decisions.md D5). **clock_mode**: T0 real-time pacing
   (virtual time is deterministic per run; wall-clock pacing only governs idle time).
 - **tested_cpu_count**: 1 (the Pi 4 has 4).
 
@@ -46,6 +49,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | USB | DWC2 OTG core, host mode (buffer DMA) + HID boot keyboard | `dwc2`, `usbhid` |
 | Display | `simple-framebuffer` in the GPU memory carve-out | `simplefb`, fbcon |
 | Ethernet | GENET v5 (DMA rings, status blocks, INTRL2), UniMAC MDIO, BCM54213PE PHY | `bcmgenet`, `unimac-mdio`, Broadcom PHY |
+| Wi-Fi | second SD host (SDIO) + CYW43455: CCCR/FBR/CIS, backplane, EROM, SDIO core, emulated FullMAC | `sdhci-iproc`, `brcmfmac`, `brcmfmac-wcc` |
 
 ## Running it
 
@@ -104,7 +108,7 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 
 ## Known gaps
 
-Single core; no Wi-Fi yet; no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
+Single core; Wi-Fi offers one open network (no WPA2 yet) with no radio model; no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
 modes, flush-to-zero and FP exception flags are not modelled by the interpreter (JIT-native FP uses
 the host's default FPCR); no LSE atomics, crypto or CRC32 instructions (the ID registers say so, so
 software does not use them); the JIT runs on AArch64 hosts only (the browser build interprets), and

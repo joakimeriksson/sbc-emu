@@ -41,3 +41,14 @@ A snapshot holds CPU state, all device state, virtual time, the SD overlay and n
 (deflate). It exists so a slow cold boot (≈27 G instructions to the Raspberry Pi OS login) can be
 demonstrated in the browser in seconds; a restored run is labelled as such. Wall-clock pacing is
 re-anchored on restore so guest time continues monotonically.
+
+## D5 (2026-11-13): Wi-Fi as W2 with an emulated FullMAC firmware
+
+The CYW43455 is modelled at the SDIO/backplane level so Linux's unmodified `brcmfmac` drives
+it: enumeration, chip/core discovery (EROM), the real firmware and NVRAM download into chip RAM
+and the CR4 release all happen as on hardware (spec: docs/wifi-brcmfmac-spec.md). The
+proprietary firmware is **not executed**: when the CR4 is released, an emulated FullMAC answers
+on SDIO function 2 (SDPCM framing, BCDC ioctls/iovars, events, escan, join). Reports therefore
+say `wifi_tier = W2 (original driver, emulated firmware host interface)`; the radio and 802.11
+MAC are not modelled (no W3), and only an open network is offered so far. The access point's
+network is a separate virtual 10.0.2.0/24 (isolated in the browser).
