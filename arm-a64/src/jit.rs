@@ -87,7 +87,7 @@ type BlockFn = unsafe extern "C" fn(*mut Cpu) -> u32;
 
 const HOT: u32 = 8;
 const MAX_INSNS: usize = 64;
-const CODE_BYTES: usize = 64 << 20;
+const CODE_BYTES: usize = 128 << 20;
 
 pub struct Jit {
     code: host::CodeCache,
@@ -96,6 +96,9 @@ pub struct Jit {
     /// direct-mapped front cache over `blocks`
     front: Box<[(u64, u64, usize)]>,
     counts: Map<(u64, u64), u32>,
+    /// FP/SIMD instruction words the interpreter implements (see `interp_supports`)
+    probe: Map<u32, bool>,
+    scratch: Option<Box<(Cpu, emu_core::FlatRam)>>,
     /// physical page -> blocks compiled from it (for IC IVAU)
     pages: Map<u64, Vec<(u64, u64)>>,
     pub compiled: u64,
@@ -113,7 +116,7 @@ impl Jit {
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
         if !host::AVAILABLE { return None; }
         Some(Box::new(Jit { code: host::CodeCache::new(code_bytes)?, blocks: Map::default(), front: vec![(u64::MAX, u64::MAX, 0); FRONT].into_boxed_slice(),
-                            counts: Map::default(), pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot }))
+                            counts: Map::default(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot }))
     }
 
     pub fn flush(&mut self) {
@@ -126,6 +129,20 @@ impl Jit {
     }
 
     /// Drop blocks compiled from physical page `page` (4 KiB).
+    /// Does the interpreter implement instruction `i` (FP/SIMD)? Runs it once on a scratch core.
+    fn interp_supports(&mut self, i: u32) -> bool {
+        if let Some(&r) = self.probe.get(&i) { return r; }
+        let (c, ram) = &mut **self.scratch.get_or_insert_with(|| Box::new((Cpu::new(), emu_core::FlatRam::new(0, 16))));
+        let _ = ram.load(0, &i.to_le_bytes());
+        c.el = 1;
+        c.pc = 0;
+        c.sys.cpacr_el1 = 3 << 20;
+        c.vbar[1] = 0x800; // an exception lands elsewhere; detected by the pc
+        let r = matches!(c.exec_one(ram), Ok(())) && c.pc == 4;
+        if self.probe.len() < 1 << 16 { self.probe.insert(i, r); }
+        r
+    }
+
     pub fn invalidate_page(&mut self, page: u64) {
         let Some(keys) = self.pages.remove(&page) else { return };
         for k in keys {
@@ -136,7 +153,7 @@ impl Jit {
     }
 }
 
-fn key(pa: u64, el: u8, spsel: bool) -> u64 { pa | ((el as u64) << 56) | ((spsel as u64) << 58) }
+fn key(pa: u64, el: u8, spsel: bool, fpen: u64) -> u64 { pa | ((el as u64) << 56) | ((spsel as u64) << 58) | ((fpen & 3) << 59) }
 
 // ---------------------------------------------------------------------- host encodings
 const X_CPU: u32 = 19; // callee-saved: the Cpu pointer
@@ -234,6 +251,91 @@ fn native_operands(i: u32) -> Option<Vec<(u32, R)>> {
     None
 }
 
+/// A V-register operand: bit position of its field, field width (5, or 4 for a by-element
+/// halfword Rm whose bit 20 is an index bit), and how many consecutive registers (TBL tables).
+#[derive(Clone, Copy)]
+struct VOp { shift: u32, width: u32, count: u32 }
+
+/// Pure V-register FP/SIMD instructions: (operands, writes Rd). None = not handled natively
+/// (mixed general/vector register instructions, loads/stores, anything else).
+fn simd_operands(i: u32) -> Option<(Vec<VOp>, bool)> {
+    let v = |shift| VOp { shift, width: 5, count: 1 };
+    let (d, n, m, a) = (v(0), v(5), v(16), v(10));
+    // scalar floating point (single/double only)
+    if !bit(i, 31) && !bit(i, 30) && !bit(i, 29) && bits(i, 28, 24) == 0b11110 {
+        if bits(i, 23, 22) > 1 || !bit(i, 21) { return None; }
+        if bits(i, 15, 10) == 0 { return None; } // conversions with general registers
+        if bits(i, 14, 10) == 0b10000 { return Some((vec![d, n], true)); }
+        if bits(i, 13, 10) == 0b1000 && bits(i, 15, 14) == 0 { return Some((if bit(i, 3) { vec![n] } else { vec![n, m] }, false)); } // FCMP
+        if bits(i, 12, 10) == 0b100 { return Some((vec![d], true)); } // FMOV imm
+        return match bits(i, 11, 10) { 0b01 => Some((vec![n, m], false)), 0b10 | 0b11 => Some((vec![d, n, m], true)), _ => None };
+    }
+    if !bit(i, 31) && !bit(i, 30) && !bit(i, 29) && bits(i, 28, 24) == 0b11111 {
+        if bits(i, 23, 22) > 1 { return None; }
+        return Some((vec![d, n, m, a], true)); // FMADD family
+    }
+    let vec_grp = !bit(i, 31) && bits(i, 28, 24) == 0b01110;
+    let sc_grp = !bit(i, 31) && bit(i, 30) && bits(i, 28, 24) == 0b11110;
+    if vec_grp || sc_grp {
+        if bit(i, 21) && bit(i, 10) { return Some((vec![d, n, m], true)); } // three same
+        if bit(i, 21) && bits(i, 11, 10) == 0b10 && (bits(i, 20, 17) == 0 || bits(i, 20, 17) == 0b1000) { return Some((vec![d, n], true)); } // two-misc, across
+        if vec_grp && bit(i, 21) && bits(i, 11, 10) == 0 { return Some((vec![d, n, m], true)); } // three different
+        if vec_grp && bits(i, 29, 21) == 0b001110000 && bit(i, 10) && !bit(i, 15) {
+            return if bits(i, 14, 11) == 0 { Some((vec![d, n], true)) } else { None }; // DUP (element); general-register forms not native
+        }
+        if vec_grp && bits(i, 29, 21) == 0b101110000 && bit(i, 10) && !bit(i, 15) { return Some((vec![d, n], true)); } // INS (element)
+        if sc_grp && bits(i, 29, 21) == 0b011110000 && bits(i, 15, 10) == 1 { return Some((vec![d, n], true)); } // DUP scalar
+        if vec_grp && !bit(i, 21) && !bit(i, 15) && bits(i, 11, 10) == 0b10 && !bit(i, 29) { return Some((vec![d, n, m], true)); } // permute
+        if vec_grp && bits(i, 29, 21) & 0b111111001 == 0b101110000 && !bit(i, 10) && !bit(i, 15) { return Some((vec![d, n, m], true)); } // EXT
+        if vec_grp && !bit(i, 29) && bits(i, 23, 21) == 0 && bits(i, 11, 10) == 0 && !bit(i, 15) {
+            let len = bits(i, 14, 13) + 1;
+            return Some((vec![d, VOp { shift: 5, width: 5, count: len }, m], true)); // TBL/TBX
+        }
+        return None;
+    }
+    if !bit(i, 31) && (bits(i, 28, 24) == 0b01111 || (bit(i, 30) && bits(i, 28, 24) == 0b11111)) {
+        if bit(i, 10) {
+            if bits(i, 22, 19) == 0 { return if bits(i, 28, 19) == 0b0111100000 { Some((vec![d], true)) } else { None }; } // modified immediate
+            return Some((vec![d, n], true)); // shift by immediate
+        }
+        // by element: a halfword Rm is v0..v15 with bit 20 an index bit
+        let mw = if bits(i, 23, 22) == 1 { VOp { shift: 16, width: 4, count: 1 } } else { m };
+        return Some((vec![d, n, mw], true));
+    }
+    None
+}
+
+/// Rename the guest V registers of `i` to host v0..v7: (re-encoded instruction, (guest, host)).
+/// None when the operands cannot be mapped (table overlaps, too many registers).
+fn map_simd(i: u32, ops: &[VOp]) -> Option<(u32, Vec<(u32, u32)>)> {
+    let mut map: Vec<(u32, u32)> = Vec::new();
+    let mut enc = i;
+    let mut order: Vec<VOp> = ops.to_vec();
+    order.sort_by_key(|o| std::cmp::Reverse(o.count)); // tables need consecutive host registers
+    let mut next = 0u32;
+    for o in &order {
+        let fm = if o.width == 4 { 15 } else { 31 };
+        let r = (i >> o.shift) & fm;
+        let host0 = if o.count > 1 {
+            if (0..o.count).any(|k| map.iter().any(|m| m.0 == (r + k) % 32)) { return None; }
+            let h = next;
+            for k in 0..o.count { map.push(((r + k) % 32, h + k)); }
+            next += o.count;
+            h
+        } else if let Some(&(_, h)) = map.iter().find(|m| m.0 == r) {
+            h
+        } else {
+            let h = next;
+            map.push((r, h));
+            next += 1;
+            h
+        };
+        if next > 8 || (o.width == 4 && host0 > 15) { return None; }
+        enc = (enc & !(fm << o.shift)) | (host0 << o.shift);
+    }
+    Some((enc, map))
+}
+
 /// The interpreter for one instruction, called from generated code.
 /// Returns 0 = continue with the next instruction, 1 = leave the block (pc set), 2 = trap.
 unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
@@ -245,7 +347,9 @@ unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
     }
 }
 
-struct Ctx { off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize }
+struct Ctx { off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_v: usize, off_fpsr: usize }
+
+fn v_off(c: &Ctx, r: u32) -> u32 { (c.off_v + 16 * r as usize) as u32 }
 
 fn ctx() -> Ctx {
     Ctx {
@@ -257,10 +361,12 @@ fn ctx() -> Ctx {
         off_utlb: std::mem::offset_of!(Cpu, utlb),
         off_ram: std::mem::offset_of!(Cpu, ram),
         off_excl: std::mem::offset_of!(Cpu, excl_armed),
+        off_v: std::mem::offset_of!(Cpu, v),
+        off_fpsr: std::mem::offset_of!(Cpu, fpsr),
     }
 }
 
-struct Emit<'a> { out: Vec<u32>, c: &'a Ctx, sp_slot: usize, pending_native: u64 }
+struct Emit<'a> { out: Vec<u32>, c: &'a Ctx, sp_slot: usize, pending_native: u64, /** block runs native FP/SIMD: carry FPSR */ fpsr: bool }
 
 impl Emit<'_> {
     fn reg_off(&self, r: u32) -> usize { self.c.off_x + 8 * r as usize }
@@ -279,8 +385,23 @@ impl Emit<'_> {
         self.out.push(str_x(X_SCRATCH, X_CPU, self.c.off_instret));
         self.out.push(0xd280_0000 | X_COUNT); // movz x20, #0
     }
-    fn save_flags(&mut self) { self.out.push(MRS_NZCV_X9); self.out.push(str_w(9, X_CPU, self.c.off_nzcv)); }
-    fn load_flags(&mut self) { self.out.push(ldr_w(9, X_CPU, self.c.off_nzcv)); self.out.push(MSR_NZCV_X9); }
+    /// guest NZCV and FPSR live in the host registers inside a block
+    fn save_flags(&mut self) {
+        self.out.push(MRS_NZCV_X9);
+        self.out.push(str_w(9, X_CPU, self.c.off_nzcv));
+        if self.fpsr {
+            self.out.push(0xd53b_4429); // mrs x9, fpsr
+            self.out.push(str_x(9, X_CPU, self.c.off_fpsr));
+        }
+    }
+    fn load_flags(&mut self) {
+        self.out.push(ldr_w(9, X_CPU, self.c.off_nzcv));
+        self.out.push(MSR_NZCV_X9);
+        if self.fpsr {
+            self.out.push(ldr_x(9, X_CPU, self.c.off_fpsr));
+            self.out.push(0xd51b_4429); // msr fpsr, x9
+        }
+    }
     /// epilogue: return `status` in w0
     fn ret(&mut self, status: u32) {
         self.out.push(0x5280_0000 | (status << 5)); // movz w0, #status
@@ -305,7 +426,7 @@ impl Cpu {
         // physical address of pc through the fetch micro-TLB (no fault taken here)
         let tag = ((self.pc >> 12) + 1) | ((self.el as u64) << 60);
         let pa = if self.utlb[0].0 == tag { self.utlb[0].1 | (self.pc & 0xfff) } else { return None };
-        let k = (self.pc, key(pa, self.el, self.spsel));
+        let k = (self.pc, key(pa, self.el, self.spsel, (self.sys.cpacr_el1 >> 20) & 3));
         let jit = self.jit.as_mut()?;
         let slot = ((self.pc ^ (self.pc >> 14)) as usize >> 2) & (FRONT - 1);
         let f: BlockFn = if jit.front[slot].0 == k.0 && jit.front[slot].1 == k.1 {
@@ -336,7 +457,20 @@ impl Cpu {
     fn compile(&mut self, pa: u64) -> Option<BlockFn> {
         let c = ctx();
         let sp_slot = c.off_sp + 8 * if self.spsel { self.el as usize } else { 0 };
-        let mut e = Emit { out: Vec::with_capacity(512), c: &c, sp_slot, pending_native: 0 };
+        // does this block (up to the page end or the length limit) contain native FP/SIMD?
+        let mut fpsr = false;
+        if !self.ram.is_null() {
+            let mut a2 = pa;
+            for _ in 0..MAX_INSNS {
+                if a2 + 4 > self.ram_len { break; }
+                // SAFETY: inside guest RAM (checked)
+                let w = unsafe { (self.ram.add(a2 as usize) as *const u32).read_unaligned() };
+                if simd_operands(w).is_some() { fpsr = true; break; }
+                a2 += 4;
+                if a2 & 0xfff == 0 { break; }
+            }
+        }
+        let mut e = Emit { out: Vec::with_capacity(512), c: &c, sp_slot, pending_native: 0, fpsr };
         // prologue: save x19/x20 and the frame, x19 = cpu, guest flags into host NZCV
         e.out.push(0xa9be_7bfd); // stp x29, x30, [sp, #-32]!
         e.out.push(0xa901_53f3); // stp x19, x20, [sp, #16]
@@ -349,7 +483,7 @@ impl Cpu {
         let mut a = pa;
         let mut natives = 0u64;
         let mut ended = false;
-        let mask: u32 = std::env::var("SBC_JIT_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+        let mask: u32 = std::env::var("SBC_JIT_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
         for _ in 0..MAX_INSNS {
             // SAFETY: `a` is inside guest RAM (checked) and blocks stop at the page end
             let i = unsafe { (self.ram.add(a as usize) as *const u32).read_unaligned() };
@@ -390,6 +524,20 @@ impl Cpu {
                 e.pending_native += 1;
             } else if let Some(done) = if mask & 2 != 0 { self.emit_branch(&mut e, i, pc) } else { None } {
                 if done { natives += 1; ended = true; break; }
+            } else if let Some((enc, map, writes)) = simd_operands(i)
+                .filter(|_| mask & 8 != 0 && (self.sys.cpacr_el1 >> 20) & 3 == 3 && self.jit.as_mut().is_some_and(|j| j.interp_supports(i)))
+                .and_then(|(ops, writes)| map_simd(i, &ops).map(|(enc, map)| (enc, map, writes)))
+            {
+                // FP/SIMD natively: guest V registers in host v0..v7 (caller-saved)
+                for &(g, h) in &map { e.out.push(0x3dc0_0000 | ((v_off(&c, g) / 16) << 10) | (X_CPU << 5) | h); } // ldr q
+                e.out.push(enc);
+                if writes {
+                    let rd = i & 31;
+                    let h = map.iter().find(|m| m.0 == rd).map(|m| m.1)?;
+                    e.out.push(0x3d80_0000 | ((v_off(&c, rd) / 16) << 10) | (X_CPU << 5) | h); // str q
+                }
+                natives += 1;
+                e.pending_native += 1;
             } else if self.emit_ldst(&mut e, i, pc) {
                 // native load/store with an interpreter slow path
             } else {
