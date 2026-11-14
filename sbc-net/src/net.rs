@@ -28,6 +28,9 @@ pub struct VirtualNet {
     pub pings: u64,
     pub unhandled: u64,
     now_us: u64,
+    /// the station's MAC, learned from its frames (forwarded connections go there)
+    guest_mac: Option<[u8; 6]>,
+    last_arp_us: u64,
 }
 
 fn be16(b: &[u8]) -> u16 { u16::from_be_bytes([b[0], b[1]]) }
@@ -39,7 +42,7 @@ impl VirtualNet {
     pub fn new(log: bool) -> Self {
         VirtualNet { gw_mac: GATEWAY_MAC, gw_ip: [10, 0, 2, 2], dns_ip: [10, 0, 2, 3],
                      sta_ip: [10, 0, 2, 15], mask: [255, 255, 255, 0],
-                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0 }
+                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0, guest_mac: None, last_arp_us: 0 }
     }
 
     /// Handle one Ethernet frame from the station; returns frames to send back to it.
@@ -47,6 +50,7 @@ impl VirtualNet {
         if eth.len() < 14 { return Vec::new(); }
         self.now_us = now_us;
         let mut src = [0u8; 6]; src.copy_from_slice(&eth[6..12]);
+        if src[0] & 1 == 0 { self.guest_mac = Some(src); }
         match be16(&eth[12..14]) {
             0x0806 => self.arp(&eth[14..], &src),
             0x0800 => self.ipv4(&eth[14..], &src),
@@ -178,7 +182,18 @@ impl VirtualNet {
     /// Pump the NAT's host sockets; returns frames for the guest.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         self.now_us = now_us;
-        match &mut self.nat { Some(n) => n.poll(now_us), None => Vec::new() }
+        let guest = self.guest_mac.map(|m| (m, self.sta_ip));
+        let mut out = match &mut self.nat { Some(n) => n.poll(now_us, guest, self.gw_ip), None => Vec::new() };
+        // forwarded connections need the station's MAC: ask for it (once a second) until it talks
+        if guest.is_none() && self.nat.as_ref().is_some_and(|n| n.has_forwards()) && now_us.wrapping_sub(self.last_arp_us) >= 1_000_000 {
+            self.last_arp_us = now_us;
+            let mut r = Vec::with_capacity(28);
+            r.extend_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);                       // ethernet/ipv4, request
+            r.extend_from_slice(&self.gw_mac); r.extend_from_slice(&self.gw_ip);
+            r.extend_from_slice(&[0; 6]); r.extend_from_slice(&self.sta_ip);
+            out.push(self.frame(&[0xff; 6], 0x0806, &r));
+        }
+        out
     }
 
     /// Answer A queries with the local resolver address, so name lookups resolve to something that

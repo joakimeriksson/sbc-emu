@@ -552,6 +552,14 @@ impl Machine {
         self.soc.wifi_net = Some(sbc_net::net::VirtualNet::new(log));
     }
 
+    /// Relay host TCP address `host` to the guest's TCP `guest_port` over Ethernet (QEMU's
+    /// hostfwd); needs `connect_network` with NAT first.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forward_tcp(&mut self, host: std::net::SocketAddr, guest_port: u16) -> Result<(), String> {
+        let nat = self.soc.net.as_mut().and_then(|n| n.nat.as_mut()).ok_or("port forwarding needs --net nat")?;
+        nat.add_forward(host, guest_port).map_err(|e| format!("{host}: {e}"))
+    }
+
     /// Physical inputs of the emulated board's sensors: temp (degC), pressure (hPa), humidity (%RH).
     pub fn set_sensor(&mut self, what: &str, v: f64) {
         let b = &mut self.soc.i2c.bme280;

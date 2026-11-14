@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use crate::net::packet::{ethernet, ip_packet, transport_checksum, udp_packet, GATEWAY_MAC};
@@ -78,6 +78,8 @@ struct Tcp {
     to_host: VecDeque<u8>,
     unacked: VecDeque<Sent>,
     last_activity_us: u64,
+    /// opened from the host side (port forwarding): we sent the SYN
+    inbound: bool,
 }
 
 impl Tcp {
@@ -170,8 +172,17 @@ struct Udp {
     last_activity_us: u64,
 }
 
+/// A host port relayed to a guest TCP port (QEMU's hostfwd).
+struct Forward {
+    listener: TcpListener,
+    guest_port: u16,
+}
+
 pub struct Nat {
     tcp: Vec<Tcp>,
+    forwards: Vec<Forward>,
+    /// source ports for forwarded connections (as seen by the guest, from the gateway)
+    next_fwd_port: u16,
     udp: Vec<Udp>,
     isn: u32,
     pub resolver: [u8; 4],
@@ -183,7 +194,7 @@ pub struct Nat {
 
 impl Nat {
     pub fn new(log: bool) -> Self {
-        Self { tcp: Vec::new(), udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log,
+        Self { tcp: Vec::new(), forwards: Vec::new(), next_fwd_port: 49152, udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log,
             tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
     }
 
@@ -221,6 +232,38 @@ impl Nat {
         }
     }
 
+    /// Port forwards are configured (the network must find the guest to deliver them).
+    pub fn has_forwards(&self) -> bool { !self.forwards.is_empty() }
+
+    /// Accept connections on `host` and relay them to the guest's TCP `guest_port`.
+    pub fn add_forward(&mut self, host: SocketAddr, guest_port: u16) -> io::Result<()> {
+        let listener = TcpListener::bind(host)?;
+        listener.set_nonblocking(true)?;
+        self.forwards.push(Forward { listener, guest_port });
+        Ok(())
+    }
+
+    /// New forwarded connections: the gateway opens a TCP connection to the guest.
+    fn accept_forwards(&mut self, guest: ([u8; 6], [u8; 4]), gw_ip: [u8; 4], now_us: u64, out: &mut Vec<Vec<u8>>) {
+        for f in 0..self.forwards.len() {
+            while self.tcp.len() < MAX_FLOWS {
+                let Ok((sock, peer)) = self.forwards[f].listener.accept() else { break };
+                if sock.set_nonblocking(true).is_err() || sock.set_nodelay(true).is_err() { continue; }
+                let port = self.next_fwd_port;
+                self.next_fwd_port = if port == 65535 { 49152 } else { port + 1 };
+                self.isn = self.isn.wrapping_add(0x10000);
+                let guest_port = self.forwards[f].guest_port;
+                let mut c = Tcp { guest_mac: guest.0, guest_ip: guest.1, guest_port, dst_ip: gw_ip, dst_port: port,
+                    transport: Transport::Connected(sock), guest_write: GuestWrite::Open, host_closed: false,
+                    our_seq: self.isn, guest_seq: 0, guest_window: WINDOW, to_host: VecDeque::new(), unacked: VecDeque::new(),
+                    last_activity_us: now_us, inbound: true };
+                if self.log { eprintln!("[nat] forward {peer} -> guest port {guest_port}"); }
+                out.push(c.send(SYN, Vec::new(), now_us));
+                self.tcp.push(c);
+            }
+        }
+    }
+
     pub fn tcp_in(&mut self, gmac: &[u8; 6], gip: &[u8; 4], dip: &[u8; 4], seg: &[u8], now_us: u64) -> Vec<Vec<u8>> {
         self.tcp_in_with_connect(gmac, gip, dip, seg, now_us, connect)
     }
@@ -251,7 +294,7 @@ impl Nat {
             self.tcp.push(Tcp { guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
                 transport: Transport::Connecting(pending), guest_write: GuestWrite::Open, host_closed: false,
                 our_seq: self.isn, guest_seq: seq.wrapping_add(1), guest_window: window,
-                to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us });
+                to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us, inbound: false });
             if self.log { eprintln!("[nat] TCP {}:{} -> {}:{} connecting", ip(gip), sport, ip(dip), dport); }
             return Vec::new();
         }
@@ -261,6 +304,16 @@ impl Nat {
         if flags & RST != 0 { c.transport = Transport::Closed; return Vec::new(); }
         if matches!(c.transport, Transport::TimeWait) {
             return if flags & FIN != 0 { vec![c.segment(ACK, &[], c.our_seq)] } else { Vec::new() };
+        }
+        if c.inbound && flags & (SYN | ACK) == SYN | ACK {
+            // the guest accepted a forwarded connection: acknowledge its SYN
+            if c.handshake_pending() {
+                c.guest_seq = seq.wrapping_add(1);
+                c.acknowledge(ack);
+                c.guest_window = window;
+                self.tcp_opened += 1;
+            }
+            return if c.handshake_pending() { Vec::new() } else { vec![c.segment(ACK, &[], c.our_seq)] };
         }
         if flags & SYN != 0 {
             return if c.handshake_pending() { vec![c.segment(SYN | ACK, &[], c.unacked[0].seq)] } else { Vec::new() };
@@ -275,9 +328,11 @@ impl Nat {
         Vec::new()
     }
 
-    /// Pump a bounded amount of host traffic, then retransmit and expire flows.
-    pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
+    /// Pump a bounded amount of host traffic, then retransmit and expire flows. `guest` (MAC
+    /// and IP, once known) is where forwarded connections go; `gw_ip` is where they come from.
+    pub fn poll(&mut self, now_us: u64, guest: Option<([u8; 6], [u8; 4])>, gw_ip: [u8; 4]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        if let Some(g) = guest { self.accept_forwards(g, gw_ip, now_us, &mut out); }
         for c in &mut self.tcp {
             if c.closed() { continue; }
             if c.host_closed && c.guest_write == GuestWrite::Closed && c.unacked.is_empty()

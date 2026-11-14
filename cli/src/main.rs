@@ -64,7 +64,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -153,6 +153,21 @@ fn run(args: &[String]) -> ExitCode {
         if std::env::var("SBC_JIT_VERIFY").is_ok_and(|v| v == "1") { if let Some(j) = m.jit_mut() { j.verify = true; } }
         if std::env::var("SBC_JIT_PROFILE").is_ok_and(|v| v == "1") { arm_a64::jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
         match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
+        // --hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT (QEMU's syntax), repeatable
+        for (i, a) in args.iter().enumerate() {
+            if a != "--hostfwd" { continue; }
+            let spec = args.get(i + 1).map(String::as_str).unwrap_or("");
+            let parsed = spec.strip_prefix("tcp:").and_then(|r| r.split_once('-')).and_then(|(h, g)| {
+                let (ha, hp) = h.rsplit_once(':')?;
+                let gp = g.rsplit_once(':').map_or(g, |(_, p)| p).parse::<u16>().ok()?;
+                let host: std::net::SocketAddr = format!("{}:{}", if ha.is_empty() { "127.0.0.1" } else { ha }, hp).parse().ok()?;
+                Some((host, gp))
+            });
+            match parsed {
+                Some((host, gp)) => { m.forward_tcp(host, gp)?; eprintln!("[sbc-emu] forwarding {host} -> guest port {gp}"); }
+                None => return Err(format!("--hostfwd {spec}: expected tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT")),
+            }
+        }
         m.soc.genet.trace = trace_net;
         m.soc.wifi.trace = args.iter().any(|a| a == "--trace-sdio");
         if let Some(c) = m.soc.wifi.sdio.as_mut() { c.set_trace(args.iter().any(|a| a == "--trace-wifi")); }
@@ -341,6 +356,7 @@ fn run(args: &[String]) -> ExitCode {
             Stop::Reset => {
                 eprintln!("\r\n[sbc-emu] system reset: rebooting\r");
                 let d = m.soc.sd.disk.take();
+                if let Some(n) = m.soc.net.as_mut() { n.nat = None; } // free forwarded host ports
                 m = match power_on(d) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
             }
             other => break other,
