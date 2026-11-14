@@ -77,6 +77,8 @@ pub struct BootInfo<'a> {
     pub fb: Option<(u64, u32, u32, u32)>,
     /// cores (started through PSCI CPU_ON)
     pub cpus: u32,
+    /// the Bluetooth controller is on the mini UART (`dtoverlay=miniuart-bt`)
+    pub bluetooth: bool,
 }
 
 const GIC_SPI: u32 = 0;
@@ -305,6 +307,13 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("interrupts", &[GIC_SPI, 93, LEVEL_HIGH]);
     f.cells("clocks", &[aux, 0]);
     f.str("status", "okay");
+    if b.bluetooth {
+        // the CYW43455's Bluetooth on the mini UART, as with dtoverlay=miniuart-bt
+        f.begin("bluetooth");
+        f.str("compatible", "brcm,bcm43438-bt");
+        f.cells("max-speed", &[460_800]);
+        f.end();
+    }
     f.end();
 
     f.begin("spi@fe204000");

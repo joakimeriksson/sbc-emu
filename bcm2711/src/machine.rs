@@ -82,6 +82,8 @@ pub struct Soc {
     pub dma: crate::dma::Dma,
     /// PCM/I²S with a PCM5102A DAC behind it
     pub i2s: crate::i2s::I2s,
+    /// the Bluetooth controller on the mini UART (None: the mini UART is a serial port)
+    pub bt: Option<crate::bluetooth::Bluetooth>,
     /// when DREQ-paced DMA wants another look (ns; Some(0): now)
     pace_next: Option<u64>,
     /// the network behind the Ethernet port (None = cable unplugged)
@@ -116,7 +118,7 @@ impl Soc {
             AVS..=0xfd5d_2eff => self.avs.read(a - AVS),
             PM..=0xfe10_0113 => self.pm.read(a - PM),
             SYSTIMER..=0xfe00_301b => self.systimer.read(a - SYSTIMER),
-            AUX..=0xfe21_50ff => self.aux.read(a - AUX),
+            AUX..=0xfe21_50ff => { let v = self.aux.read(a - AUX); self.bt_pump(); v }
             DMA..=0xfe00_7fff => self.dma.read(a - DMA),
             PCM..=0xfe20_3023 => self.i2s.read(a - PCM),
             // AXI bridges (ASB): the ID register; request bits are acknowledged at once
@@ -159,7 +161,7 @@ impl Soc {
             AVS..=0xfd5d_2eff => {}
             PM..=0xfe10_0113 => self.pm.write(a - PM, v),
             SYSTIMER..=0xfe00_301b => self.systimer.write(a - SYSTIMER, v),
-            AUX..=0xfe21_50ff => self.aux.write(a - AUX, v),
+            AUX..=0xfe21_50ff => { self.aux.write(a - AUX, v); self.bt_pump(); }
             DMA..=0xfe00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
             PCM..=0xfe20_3023 => self.i2s.write(a - PCM, v),
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v,
@@ -324,8 +326,18 @@ impl Soc {
         c.cs = (c.cs & !ACTIVE) | END;
     }
 
+    /// Bluetooth on the mini UART: what the host sent goes to the controller, and the
+    /// controller's bytes fill the receive FIFO as it empties.
+    pub(crate) fn bt_pump(&mut self) {
+        let Some(bt) = self.bt.as_mut() else { return };
+        if !self.aux.out.is_empty() { let b = std::mem::take(&mut self.aux.out); bt.receive(&b); }
+        while self.aux.rx_room() { match bt.tx.pop_front() { Some(b) => self.aux.push_rx(b), None => break } }
+    }
+
     /// USB time: DWC2 frames, xHCI polling of devices with input.
     pub(crate) fn usb_tick(&mut self, now: u64) {
+        if let Some(bt) = self.bt.as_mut() { bt.tick(now); }
+        self.bt_pump();
         self.usb.tick(now);
         self.pcie.xhci.tick(now, &mut self.ram, &mut self.devs);
     }
@@ -333,7 +345,8 @@ impl Soc {
     /// The next USB deadline.
     pub(crate) fn usb_next_event(&self) -> Option<u64> {
         let x = self.pcie.xhci.next_event(&self.devs);
-        [self.usb.next_event(), x, self.pace_next].into_iter().flatten().min()
+        let bt = self.bt.as_ref().and_then(|b| b.next_event());
+        [self.usb.next_event(), x, self.pace_next, bt].into_iter().flatten().min()
     }
 
     fn note(&mut self, a: u64) {
@@ -458,7 +471,7 @@ impl Machine {
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
@@ -938,6 +951,8 @@ impl Machine {
         self.soc.pcie.save_state(&mut w);
         self.soc.rng.save_state(&mut w);
         self.soc.i2s.save_state(&mut w);
+        w.bool(self.soc.bt.is_some());
+        if let Some(bt) = self.soc.bt.as_ref() { bt.save_state(&mut w); }
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -1002,6 +1017,12 @@ impl Machine {
             self.soc.rng.load_state(&mut r).map_err(e)?;
             self.soc.i2s.load_state(&mut r).map_err(e)?;
             self.soc.mbox.audio_clk = self.soc.i2s.bclk;
+            if r.bool().map_err(e)? {
+                let bt = self.soc.bt.get_or_insert_with(crate::bluetooth::Bluetooth::new);
+                bt.load_state(&mut r).map_err(e)?;
+            } else {
+                self.soc.bt = None;
+            }
             self.soc.pace_next = Some(0);
         } else {
             // before PCIe: the keyboard was on the OTG port and the guest never saw the xHCI

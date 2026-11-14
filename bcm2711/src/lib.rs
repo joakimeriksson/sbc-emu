@@ -23,6 +23,7 @@ pub(crate) mod mt;
 pub mod pl011;
 pub mod pcie;
 pub mod i2s;
+pub mod bluetooth;
 pub mod usbdev;
 pub mod xhci;
 

@@ -219,6 +219,7 @@ pub struct AuxUart {
 impl AuxUart {
     pub fn new() -> Self { AuxUart { out: Vec::new(), rx: VecDeque::new(), enables: 0, ier: 0, lcr: 0, mcr: 0, scratch: 0, cntl: 3, baud: 0 } }
     pub fn push_rx(&mut self, b: u8) { if self.rx.len() < 8 { self.rx.push_back(b); } }
+    pub fn rx_room(&self) -> bool { self.rx.len() < 8 }
     fn dlab(&self) -> bool { self.lcr & 0x80 != 0 }
     fn rx_irq(&self) -> bool { self.ier & 1 != 0 && !self.rx.is_empty() }
     fn tx_irq(&self) -> bool { self.ier & 2 != 0 }
@@ -233,7 +234,7 @@ impl AuxUart {
             0x4c => self.lcr,
             0x50 => self.mcr,
             0x54 => 0x60 | !self.rx.is_empty() as u32,      // LSR: THRE | TEMT | DR
-            0x58 => 0x20,                                    // MSR: CTS
+            0x58 => 0x30,                                    // MSR: CTS and DSR asserted (flow control lets data through)
             0x5c => self.scratch,
             0x60 => self.cntl,
             0x64 => 0x30c | (!self.rx.is_empty() as u32) | ((self.rx.len() as u32) << 16), // STAT

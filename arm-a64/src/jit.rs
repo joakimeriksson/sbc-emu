@@ -149,7 +149,12 @@ const HOTC: usize = 1 << 16;
 const WASM_MAX_BLOCKS: usize = 32768;
 
 impl Jit {
-    pub fn new() -> Option<Box<Jit>> { Self::with(CODE_BYTES, if cfg!(target_arch = "wasm32") { 1024 } else { HOT }) }
+    pub fn new() -> Option<Box<Jit>> {
+        // SBC_JIT_HOT / SBC_JIT_MB: experiments with the compile threshold and the cache size
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+        let hot = env("SBC_JIT_HOT").map(|h| h as u32).unwrap_or(if cfg!(target_arch = "wasm32") { 1024 } else { HOT });
+        Self::with(env("SBC_JIT_MB").map(|m| (m << 20).min(CODE_BYTES)).unwrap_or(CODE_BYTES), hot) // branches reach 128 MiB
+    }
 
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
         if !host::AVAILABLE { return None; }
