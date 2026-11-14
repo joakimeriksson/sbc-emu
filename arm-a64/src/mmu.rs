@@ -54,6 +54,14 @@ impl Cpu {
         }
     }
 
+    /// TLBI: `va` = u64::MAX drops every cached translation, otherwise those of `va`'s page.
+    pub fn tlb_invalidate(&mut self, va: u64) {
+        if va == u64::MAX { return self.tlb_flush(); }
+        let u = (va >> 12) as usize & (UT - 1);
+        for t in self.utlb.iter_mut() { t[u] = (0, 0); }
+        if let Some(t) = self.tlb.as_mut() { t[(va >> 12) as usize & (TLB_SIZE - 1)].tag = 0; }
+    }
+
     pub(crate) fn translate(
         &mut self,
         bus: &mut dyn Bus,

@@ -667,7 +667,7 @@ impl Cpu {
                     0b0010 => {
                         // hints
                         return match (crm << 3) | op2 {
-                            0b000_0010 | 0b000_0011 => Err(Trap::Wait), // WFE, WFI
+                            0b000_0010 | 0b000_0011 => { self.last_wfe = op2 == 0b010; Err(Trap::Wait) } // WFE, WFI
                             _ => Ok(()), // NOP, YIELD, SEV, SEVL, PAC/BTI hints (not implemented: NOP)
                         };
                     }
@@ -797,7 +797,15 @@ impl Cpu {
                 if self.el == 0 {
                     return Err(self.undefined());
                 }
-                self.tlb_flush();
+                // by-VA operations (VAE*, VAAE*, VALE*, VAALE*) drop one page, the rest everything;
+                // the inner-shareable forms (CRm = 3) also reach the other cores
+                let by_va = matches!(crm, 3 | 7) && op2 & 1 == 1;
+                let op = if by_va {
+                    let v = (self.xr(rt) & ((1 << 44) - 1)) << 12;
+                    if v >> 55 & 1 != 0 { v | 0xff00_0000_0000_0000 } else { v }
+                } else { u64::MAX };
+                self.tlb_invalidate(op);
+                if crm == 3 { self.tlbi_bcast = Some(match self.tlbi_bcast { Some(o) if o != op => u64::MAX, _ => op }); }
                 Ok(())
             }
             _ => {
@@ -961,6 +969,12 @@ impl Cpu {
                         0b001001 => shift_reg(sf, x, 1, (y % w) as u32),
                         0b001010 => shift_reg(sf, x, 2, (y % w) as u32),
                         0b001011 => shift_reg(sf, x, 3, (y % w) as u32),
+                        // CRC32B/H/W/X and CRC32CB/H/W/X: sz 3 needs sf = 1, the others sf = 0
+                        op @ 0b010000..=0b010111 if (op & 3 == 3) == sf => {
+                            let n = 8 << (op & 3);
+                            let poly = if op & 4 != 0 { 0x82f6_3b78 } else { 0xedb8_8320 };
+                            crc32(self.xr(rn) as u32, self.xr(rm), n, poly) as u64
+                        }
                         _ => return Err(self.undefined()),
                     }
                 } else {
@@ -1339,4 +1353,16 @@ impl Cpu {
         self.fp_enabled()?;
         self.simd_fp_exec(bus, i)
     }
+}
+
+/// The A64 CRC32 instructions: `bits` low bits of `data` into the bit-reflected `crc` (no inversion).
+pub(crate) fn crc32(crc: u32, data: u64, bits: u32, poly: u32) -> u32 {
+    let mut acc = crc;
+    let mut d = data;
+    for _ in 0..bits / 8 {
+        acc ^= d as u8 as u32;
+        for _ in 0..8 { acc = (acc >> 1) ^ (poly & (acc & 1).wrapping_neg()); }
+        d >>= 8;
+    }
+    acc
 }

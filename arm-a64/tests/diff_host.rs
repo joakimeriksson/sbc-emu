@@ -31,6 +31,8 @@ const SNIPPETS: &[&str] = &[
     "cmp x0, x1\n ccmp x2, x3, #5, lt\n ccmn w4, #17, #10, cc\n cset x5, gt\n csetm w6, pl",
     "subs x0, x1, x2\n b.eq 1f\n add x3, x3, #1\n1: b.ge 2f\n add x4, x4, #1\n2: cbz w5, 3f\n add x6, x6, #1\n3: tbnz x7, #63, 4f\n add x8, x8, #1\n4: tbz w9, #3, 5f\n add x10, x10, #1\n5:",
     "adr x0, .\n sub x0, x0, x15\n adds x1, x2, x2\n cinc x3, x4, cs",
+    "crc32b w0, w1, w2\n crc32h w3, w4, w5\n crc32w w6, w7, w8\n crc32x w9, w10, x11\n crc32x w12, w12, x13",
+    "crc32cb w0, w1, w2\n crc32ch w3, w4, w5\n crc32cw w6, w7, w8\n crc32cx w9, w10, x11\n crc32cw w12, w12, wzr",
 ];
 
 fn wrapper(name: &str, body: &str) -> String {
@@ -192,7 +194,7 @@ fn integer_snippets_match_host() {
                 .map(|i| ram.read64(state + 8 * i).unwrap())
                 .collect();
             // adr result depends on load address: compare it modulo the address
-            if got != host[idx] && !(k == SNIPPETS.len() - 1) {
+            if got != host[idx] && !SNIPPETS[k].starts_with("adr") {
                 failures += 1;
                 if failures <= 10 {
                     eprintln!("snippet {k} seed {seed}: `{}`", b.replace('\n', ";"));

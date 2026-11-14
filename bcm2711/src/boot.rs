@@ -35,7 +35,7 @@ pub fn boot_linux(m: &mut Machine, kernel: &[u8], initrd: Option<&[u8]>, cmdline
         let f = &m.soc.mbox.fb;
         Some((f.base, f.width, f.height, f.pitch()))
     } else { None };
-    let dtb = fdt::pi4b(&fdt::BootInfo { ram: linux_ram, bootargs: cmdline, initrd: initrd_range, fb });
+    let dtb = fdt::pi4b(&fdt::BootInfo { ram: linux_ram, bootargs: cmdline, initrd: initrd_range, fb, cpus: m.cpus.len() as u32 });
     m.load(DTB, &dtb);
     m.boot_linux(entry, DTB);
     Ok(())

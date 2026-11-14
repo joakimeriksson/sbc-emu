@@ -22,7 +22,7 @@ pub fn assemble(src: &str) -> Vec<u8> {
     let o = dir.join("t.o");
     std::fs::write(&s, format!(".text\n.globl _start\n_start:\n{src}\n")).unwrap();
     let out = Command::new("clang")
-        .args(["--target=aarch64-none-elf", "-march=armv8-a", "-c"])
+        .args(["--target=aarch64-none-elf", "-march=armv8-a+crc", "-c"])
         .arg(&s)
         .arg("-o")
         .arg(&o)

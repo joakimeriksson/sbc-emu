@@ -81,6 +81,11 @@ pub struct Cpu {
     pub(crate) chain_stop: bool,
     /// the native JIT's block dispatcher (code address)
     pub(crate) jit_disp: u64,
+    /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
+    pub last_wfe: bool,
+    /// an inner-shareable TLBI ran: the other cores must do the same (`Cpu::tlb_invalidate`
+    /// operand: a VA, or u64::MAX for everything); the machine takes it
+    pub tlbi_bcast: Option<u64>,
 }
 
 // SAFETY: `ram` is only dereferenced by the core that owns it; see the field documentation.
@@ -121,7 +126,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None,
         }
     }
 
@@ -347,6 +352,16 @@ impl Cpu {
 }
 
 impl Cpu {
+    /// Drop the exclusive monitor's reservation (another core may have written the location).
+    pub fn clear_exclusive(&mut self) { self.set_excl(None); }
+
+    /// Hand the JIT (code cache and dispatcher) to another core of the same machine: compiled
+    /// code only reaches core state through the pointer it is called with, so one cache serves
+    /// all cores.
+    pub fn hand_jit_to(&mut self, other: &mut Cpu) {
+        if let Some(j) = self.jit.take() { other.jit = Some(j); other.jit_disp = self.jit_disp; }
+    }
+
     #[inline]
     pub(crate) fn set_excl(&mut self, e: Option<u64>) { self.excl = e; self.excl_armed = e.is_some() as u64; }
 }

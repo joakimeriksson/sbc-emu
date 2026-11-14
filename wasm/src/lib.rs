@@ -53,6 +53,12 @@ struct State {
 }
 
 thread_local! { static ST: RefCell<Option<State>> = const { RefCell::new(None) }; }
+thread_local! { static SMP: std::cell::Cell<usize> = const { std::cell::Cell::new(4) }; }
+fn smp() -> usize { SMP.with(|c| c.get()) }
+
+/// Cores of the machines booted after this call (1..4; the Pi 4 has 4, the default).
+#[no_mangle]
+pub extern "C" fn sbc_smp(n: u32) { SMP.with(|c| c.set((n as usize).clamp(1, 4))); }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> { ST.with(|s| s.borrow_mut().as_mut().map(f)) }
 
@@ -68,7 +74,7 @@ pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *co
     let cmdline = if clen > 0 { String::from_utf8_lossy(std::slice::from_raw_parts(c, clen)).into_owned() } else {
         format!("{} sbcemu.shell=fb", bcm2711::boot::DEFAULT_CMDLINE)
     };
-    let mut m = Machine::new((ram_mb as usize) << 20);
+    let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     if bcm2711::boot::boot_linux(&mut m, kernel, initrd, &cmdline, true).is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
     0
@@ -80,7 +86,7 @@ pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *co
 pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     let mut disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: HashMap::new() });
     let b = match bcm2711::boot::read_sd_boot(disk.as_mut()) { Ok(b) => b, Err(_) => return -2 };
-    let mut m = Machine::new((ram_mb as usize) << 20);
+    let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
     if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { return -1; }
@@ -91,7 +97,7 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
 #[no_mangle]
 pub extern "C" fn sbc_jit(on: u32) -> u32 {
-    with(|s| { if on != 0 { s.m.cpu.enable_jit() as u32 } else { s.m.cpu.jit = None; 0 } }).unwrap_or(0)
+    with(|s| { if on != 0 { s.m.enable_jit() as u32 } else { s.m.disable_jit(); 0 } }).unwrap_or(0)
 }
 
 /// JIT profiling: count the instructions compiled blocks hand to the interpreter (1 on).
@@ -109,21 +115,21 @@ pub unsafe extern "C" fn sbc_jit_fallbacks(out: *mut u64, n: usize) -> usize {
 
 /// JIT: executions before a block is compiled.
 #[no_mangle]
-pub extern "C" fn sbc_jit_hot(n: u32) { with(|s| { if let Some(j) = s.m.cpu.jit.as_mut() { j.hot = n.max(1); } }); }
+pub extern "C" fn sbc_jit_hot(n: u32) { with(|s| { if let Some(j) = s.m.jit_mut() { j.hot = n.max(1); } }); }
 
 /// JIT: guest instructions retired inside compiled blocks (per mille of all).
 #[no_mangle]
-pub extern "C" fn sbc_jit_coverage() -> u32 { with(|s| s.m.cpu.jit.as_ref().map_or(0, |j| (j.exec_insns * 1000 / s.m.cpu.instret.max(1)) as u32)).unwrap_or(0) }
+pub extern "C" fn sbc_jit_coverage() -> u32 { with(|s| s.m.jit().map_or(0, |j| (j.exec_insns * 1000 / s.m.instret().max(1)) as u32)).unwrap_or(0) }
 
 /// JIT verify mode (every block re-run in the interpreter): 1 on.
 #[no_mangle]
-pub extern "C" fn sbc_jit_verify(on: u32) { with(|s| { if let Some(j) = s.m.cpu.jit.as_mut() { j.verify = on != 0; } }); }
+pub extern "C" fn sbc_jit_verify(on: u32) { with(|s| { if let Some(j) = s.m.jit_mut() { j.verify = on != 0; } }); }
 
 /// The first JIT/interpreter mismatch found in verify mode (length; text via sbc_uart_ptr-style buffer).
 #[no_mangle]
 pub extern "C" fn sbc_jit_report(out: *mut u8, cap: usize) -> usize {
     with(|s| {
-        let r = s.m.cpu.jit.as_ref().and_then(|j| j.report.clone()).unwrap_or_default();
+        let r = s.m.jit().and_then(|j| j.report.clone()).unwrap_or_default();
         let n = r.len().min(cap);
         // SAFETY: the caller provides `cap` writable bytes
         unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), out, n) };
@@ -133,7 +139,7 @@ pub extern "C" fn sbc_jit_report(out: *mut u8, cap: usize) -> usize {
 
 /// JIT counters: compiled blocks.
 #[no_mangle]
-pub extern "C" fn sbc_jit_blocks() -> f64 { with(|s| s.m.cpu.jit.as_ref().map(|j| j.compiled as f64).unwrap_or(0.0)).unwrap_or(0.0) }
+pub extern "C" fn sbc_jit_blocks() -> f64 { with(|s| s.m.jit().map(|j| j.compiled as f64).unwrap_or(0.0)).unwrap_or(0.0) }
 
 /// USB keyboard: press (down=1) or release (down=0) a key by HID usage code.
 #[no_mangle]
@@ -151,9 +157,9 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
         if s.stop.is_some() { return 2; }
         let off = *s.wall_offset.get_or_insert(s.m.now as f64 - wall_ns);
         let wall = (wall_ns + off).max(0.0) as u64;
-        let end = s.m.cpu.instret + budget as u64;
+        let end = s.m.instret() + budget as u64;
         loop {
-            let left = end.saturating_sub(s.m.cpu.instret);
+            let left = end.saturating_sub(s.m.instret());
             if left == 0 { break 0; }
             match s.m.run(left) {
                 Stop::Budget => break 0,
@@ -168,7 +174,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                     match disk.map(|mut d| (bcm2711::boot::read_sd_boot(d.as_mut()), d)) {
                         Some((Ok(b), d)) => {
                             let ram = s.m.soc.ram.len();
-                            let mut m = Machine::new(ram);
+                            let mut m = Machine::with_cpus(ram, smp());
                             m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(d));
                             if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { s.stop = Some(Stop::Reset); break 2; }
                             s.m = m;
@@ -193,7 +199,7 @@ pub extern "C" fn sbc_wake(wall_ns: f64) { with(|s| { let t = ((wall_ns + s.wall
 #[no_mangle]
 pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8, len: usize) -> i32 {
     let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: HashMap::new() });
-    let mut m = Machine::new((ram_mb as usize) << 20);
+    let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
     if m.restore(std::slice::from_raw_parts(snap, len)).is_err() { return -1; }
@@ -229,14 +235,14 @@ pub extern "C" fn sbc_fb_w() -> u32 { with(|s| s.fb_w).unwrap_or(0) }
 pub extern "C" fn sbc_fb_h() -> u32 { with(|s| s.fb_h).unwrap_or(0) }
 
 #[no_mangle]
-pub extern "C" fn sbc_insns() -> f64 { with(|s| s.m.cpu.instret as f64).unwrap_or(0.0) }
+pub extern "C" fn sbc_insns() -> f64 { with(|s| s.m.instret() as f64).unwrap_or(0.0) }
 #[no_mangle]
 pub extern "C" fn sbc_now_ns() -> f64 { with(|s| s.m.now as f64).unwrap_or(0.0) }
 /// Stop reason: 0 running, 1 unimplemented instruction (see sbc_stop_pc), 2 other.
 #[no_mangle]
 pub extern "C" fn sbc_stop_kind() -> i32 { with(|s| match s.stop { None => 0, Some(Stop::Unimplemented(..)) => 1, _ => 2 }).unwrap_or(2) }
 #[no_mangle]
-pub extern "C" fn sbc_stop_pc() -> f64 { with(|s| match s.stop { Some(Stop::Unimplemented(pc, _)) => pc as f64, _ => s.m.cpu.pc as f64 }).unwrap_or(0.0) }
+pub extern "C" fn sbc_stop_pc() -> f64 { with(|s| match s.stop { Some(Stop::Unimplemented(pc, _)) => pc as f64, _ => s.m.cpu().pc as f64 }).unwrap_or(0.0) }
 #[no_mangle]
 pub extern "C" fn sbc_stop_insn() -> u32 { with(|s| match s.stop { Some(Stop::Unimplemented(_, i)) => i, _ => 0 }).unwrap_or(0) }
 

@@ -101,6 +101,7 @@ fn run(args: &[String]) -> ExitCode {
     let max = arg(args, "--max-insns").and_then(|s| s.parse::<u64>().ok()).unwrap_or(u64::MAX);
     let screenshot = arg(args, "--screenshot");
     let ram_mb = arg(args, "--ram-mb").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1024);
+    let smp = arg(args, "--smp").and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
     let display = !args.iter().any(|a| a == "--no-display");
     let trace_sd = args.iter().any(|a| a == "--trace-sd");
     let trace_net = args.iter().any(|a| a == "--trace-net");
@@ -123,7 +124,7 @@ fn run(args: &[String]) -> ExitCode {
 
     // power-on: firmware-style boot from the SD card unless a kernel is given explicitly
     let power_on = |mut disk: Option<Box<dyn bcm2711::sdhci::Disk>>| -> Result<Machine, String> {
-        let mut m = Machine::new(ram_mb << 20);
+        let mut m = Machine::with_cpus(ram_mb << 20, smp);
         let (k, i, c) = match (&kernel, disk.as_mut()) {
             (Some(k), _) => (k.clone(), initrd.clone(), append.clone().unwrap_or_else(|| format!("{} sbcemu.shell={shell}", bcm2711::boot::DEFAULT_CMDLINE))),
             (None, Some(d)) => {
@@ -135,8 +136,8 @@ fn run(args: &[String]) -> ExitCode {
         };
         m.soc.sd = bcm2711::sdhci::Sdhci::new(disk);
         m.soc.sd.trace = trace_sd;
-        if use_jit { m.cpu.enable_jit(); }
-        if std::env::var("SBC_JIT_VERIFY").is_ok_and(|v| v == "1") { if let Some(j) = m.cpu.jit.as_mut() { j.verify = true; } }
+        if use_jit { m.enable_jit(); }
+        if std::env::var("SBC_JIT_VERIFY").is_ok_and(|v| v == "1") { if let Some(j) = m.jit_mut() { j.verify = true; } }
         if std::env::var("SBC_JIT_PROFILE").is_ok_and(|v| v == "1") { arm_a64::jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
         match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
         m.soc.genet.trace = trace_net;
@@ -151,7 +152,7 @@ fn run(args: &[String]) -> ExitCode {
         let snap = match std::fs::read(p) { Ok(b) => b, Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } };
         if let Err(e) = m.restore(&snap) { eprintln!("{p}: {e}"); return ExitCode::FAILURE; }
         clock_offset = Duration::from_nanos(m.now);
-        eprintln!("[sbc-emu] restored {p}: guest time {:.1} s, {} instructions", m.now as f64 / 1e9, m.cpu.instret);
+        eprintln!("[sbc-emu] restored {p}: guest time {:.1} s, {} instructions", m.now as f64 / 1e9, m.instret());
     }
 
     // console input: a thread forwards stdin bytes
@@ -258,7 +259,7 @@ fn run(args: &[String]) -> ExitCode {
                 }
             }
         }
-        let budget = 2_000_000u64.min(max.saturating_sub(m.cpu.instret));
+        let budget = 2_000_000u64.min(max.saturating_sub(m.instret()));
         if budget == 0 { break Stop::Budget; }
         let stop = m.run(budget);
         if gpio_log {
@@ -307,20 +308,20 @@ fn run(args: &[String]) -> ExitCode {
     }
     if !m.soc.mbox.unknown.is_empty() { eprintln!("[sbc-emu] unanswered mailbox tags: {:x?}", m.soc.mbox.unknown); }
     eprintln!("\n[sbc-emu] stopped: {:?} pc={:#x} insns={} sim={:.3}s wall={:.1}s exceptions={} irqs={}",
-        result, m.cpu.pc, m.cpu.instret, m.now as f64 / 1e9, started.elapsed().as_secs_f64(), m.exceptions, m.irqs);
-    if let Some(j) = m.cpu.jit.as_ref() {
+        result, m.cpu().pc, m.instret(), m.now as f64 / 1e9, started.elapsed().as_secs_f64(), m.exceptions, m.irqs);
+    if let Some(j) = m.jit() {
         eprintln!("[sbc-emu] jit: {} blocks compiled, {} links, {} flushes; {} block runs, {:.1} instructions per run, {:.0}% of instructions in blocks",
-            j.compiled, j.linked, j.flushes, j.execs, j.exec_insns as f64 / j.execs.max(1) as f64, 100.0 * j.exec_insns as f64 / m.cpu.instret.max(1) as f64);
+            j.compiled, j.linked, j.flushes, j.execs, j.exec_insns as f64 / j.execs.max(1) as f64, 100.0 * j.exec_insns as f64 / m.instret().max(1) as f64);
         if j.verify { eprintln!("[sbc-emu] jit verify ({} stale blocks skipped): {}", j.stale_skips, j.report.as_deref().unwrap_or("no mismatch")); }
     }
     if arm_a64::jit::PROFILE.load(std::sync::atomic::Ordering::Relaxed) {
         let f = arm_a64::jit::profile_fallbacks();
         let total: u64 = f.iter().map(|e| e.1).sum();
-        eprintln!("[sbc-emu] jit interpreter fallbacks: {total} (instret {}); most frequent words:", m.cpu.instret);
+        eprintln!("[sbc-emu] jit interpreter fallbacks: {total} (instret {}); most frequent words:", m.instret());
         for (i, n) in f.iter().take(60) { eprintln!("  {i:08x} {n}"); }
     }
-    if !m.cpu.sys.unknown.is_empty() {
-        let names: Vec<String> = m.cpu.sys.unknown.iter().map(|k| format!("S{}_{}_C{}_C{}_{}", k >> 14, (k >> 11) & 7, (k >> 7) & 15, (k >> 3) & 15, k & 7)).collect();
+    if !m.cpu().sys.unknown.is_empty() {
+        let names: Vec<String> = m.cpu().sys.unknown.iter().map(|k| format!("S{}_{}_C{}_C{}_{}", k >> 14, (k >> 11) & 7, (k >> 7) & 15, (k >> 3) & 15, k & 7)).collect();
         eprintln!("[sbc-emu] unmodelled system registers: {}", names.join(" "));
     }
     match result { Stop::Budget => ExitCode::SUCCESS, _ => ExitCode::FAILURE }

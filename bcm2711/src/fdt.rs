@@ -1,7 +1,7 @@
 //! Flattened device tree writer, and the reduced Pi 4B tree this machine describes.
 //!
 //! The tree is a *reduced* BCM2711 description, not the vendor `bcm2711-rpi-4-b.dtb`: it lists
-//! only the devices that are modelled (one Cortex-A72, RAM, GIC-400, the generic timer, PL011
+//! only the devices that are modelled (up to four Cortex-A72s, RAM, GIC-400, the generic timer, PL011
 //! UART0 with a fixed 48 MHz clock instead of the firmware mailbox clock). Compatible strings
 //! and addresses follow the vendor tree.
 
@@ -75,6 +75,8 @@ pub struct BootInfo<'a> {
     pub initrd: Option<(u64, u64)>,
     /// firmware-allocated framebuffer: (base, width, height, stride)
     pub fb: Option<(u64, u32, u32, u32)>,
+    /// cores (started through PSCI CPU_ON)
+    pub cpus: u32,
 }
 
 const GIC_SPI: u32 = 0;
@@ -118,11 +120,14 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.begin("cpus");
     f.cells("#address-cells", &[1]);
     f.cells("#size-cells", &[0]);
-    f.begin("cpu@0");
-    f.str("device_type", "cpu");
-    f.str("compatible", "arm,cortex-a72");
-    f.cells("reg", &[0]);
-    f.end();
+    for k in 0..b.cpus.max(1) {
+        f.begin(&format!("cpu@{k}"));
+        f.str("device_type", "cpu");
+        f.str("compatible", "arm,cortex-a72");
+        f.cells("reg", &[k]);
+        f.str("enable-method", "psci");
+        f.end();
+    }
     f.end();
 
     f.begin("psci");

@@ -100,7 +100,8 @@ impl Cpu {
             ID_AA64PFR0_EL1 => 0x1111,
             ID_AA64DFR0_EL1 => 0x0000_0006,
             // no AES/SHA/CRC32/atomics
-            ID_AA64ISAR0_EL1 => 0,
+            // CRC32 (as the Pi 4's Cortex-A72; no crypto extension on the BCM2711)
+            ID_AA64ISAR0_EL1 => 1 << 16,
             // 40-bit PA, 16-bit ASID, 4 KiB granule only (16K and 64K not supported)
             ID_AA64MMFR0_EL1 => 0x0f00_0022 | (0xf << 24),
             CTR_EL0 => 0x8444_c004,
