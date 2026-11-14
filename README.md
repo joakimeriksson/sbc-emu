@@ -19,7 +19,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
-| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 53 s (JIT with block chaining and linking); all CPU tests pass with and without it. Browser: WebAssembly block JIT (`?jit=0` turns it off), verified against the interpreter |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 53 s (JIT with block chaining and linking); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~7 min, ~200 MiB of the image read |
 
@@ -122,7 +122,7 @@ Single core; Wi-Fi has no radio model (emulated firmware host interface, WPA2-PS
 modes, flush-to-zero and FP exception flags are not modelled by the interpreter (JIT-native FP uses
 the host's default FPCR); no LSE atomics, crypto or CRC32 instructions (the ID registers say so, so
 software does not use them); the native JIT needs an AArch64 host and is still well below a real
-Pi 4 core; the browser JIT gains less (one WebAssembly module per block).
+Pi 4 core; the browser build is about 3× slower than native.
 
 ## The JIT
 
@@ -159,18 +159,37 @@ blocks still hand to the interpreter; `SBC_JIT_CHAIN=0` turns chaining and linki
 
 ### In the browser
 
-`arm-a64/src/jit_wasm.rs` compiles a hot block into its own small WebAssembly module (imports the
-emulator's memory and function table, exports one function) which the worker instantiates and
-installs in the table; the block then runs through `call_indirect`. Integer data processing,
-flags, conditional select, branches and integer loads/stores (inline micro-TLB probe, direct RAM
-access) are translated; everything else calls the interpreter for one instruction.
+`arm-a64/src/jit_wasm.rs` compiles a hot **region** into its own small WebAssembly module
+(imports the emulator's memory and function table, exports one function) which the worker
+instantiates and installs in the table. A region is the hot entry block plus the basic blocks
+reachable through constant branches on the same page (up to 24): one function with a `loop` +
+`br_table` dispatch, so loops and local control flow branch inside the function instead of going
+back to Rust (WebAssembly code cannot be patched, so this replaces the native JIT's direct links).
+Exits leaving the region return to a chaining loop in `jit_step` that calls the next block from the
+front cache. Translated natively: integer data processing (incl. extended-register add/sub,
+CCMP/CCMN, variable shifts, REV/RBIT/CLZ, ADC/SBC, UMULH/SMULH), flags, conditional select,
+branches, integer loads/stores (inline micro-TLB probe, direct RAM access), NOP-class hints,
+barriers, PRFM and thread-pointer/`SP_EL0` reads; everything else calls the interpreter for one
+instruction. Execution counting before compilation uses a direct-mapped table (no hashing on the
+interpreter's path).
 
-It is on by default (`index.html?jit=0` turns it off). It helps the kernel most (busybox kernel up after 9.3 s instead
-of 13.5 s); on a Raspberry Pi OS cold boot it is now a small win (`login:` after 335 s with the JIT,
-359 s without, Node 26) — the per-block module compile and instantiate cost on short-lived userland
-code eats most of the gain, so batching blocks into modules is the next step there. Checks:
+On by default (`index.html?jit=0` turns it off). Raspberry Pi OS cold boot to `login:` in the
+browser build (`tools/wasm-smoke-sd.mjs`, Node 26, M5, runs alone):
+
+| Step | `login:` after |
+|---|---|
+| block per module, every block back to the machine loop | 313 s |
+| direct-mapped hot counters, chaining loop in `jit_step` | 252 s |
+| more native instructions (hints, CCMP, extended add, shifts, ADC, MULH, ...) | 229 s |
+| regions (loop + `br_table` per page-local control flow) | 160 s |
+
+The interpreter alone takes about 360 s; the busybox kernel comes up after 1.9 s (13.5 s
+interpreted). Checks:
 
 - `node tools/wasm-jit-selftest.mjs` runs A64 snippets through the wasm build with the JIT off and
   on and compares registers and flags;
-- `SBC_JIT=1 SBC_JIT_VERIFY=1 node tools/wasm-smoke.mjs 30` re-runs every compiled block in the
-  interpreter (stores are rolled back) and prints the first mismatch, with the block's code.
+- `SBC_JIT=1 SBC_JIT_VERIFY=1 node tools/wasm-smoke.mjs 30` (or `wasm-smoke-sd.mjs IMAGE SECS`)
+  re-runs every compiled block in the interpreter (stores are rolled back) and prints the first
+  mismatch, with the block's code; `SBC_JIT_PROFILE=1 node tools/wasm-smoke-sd.mjs ...` lists the
+  instructions compiled code still hands to the interpreter, `SBC_JIT_HOT=n` sets the compile
+  threshold and `SBC_WASM=path` picks another build (for before/after comparisons).

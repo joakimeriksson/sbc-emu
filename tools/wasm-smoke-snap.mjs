@@ -22,7 +22,7 @@ const env = { sbc_jit_compile: (p, l) => jitCompile(p, l), sbc_jit_reset: () => 
   const n = fs.readSync(fd, buf, 0, count * 512, lba * 512);
   if (n < count * 512) buf.fill(0, n);
 } };
-const { instance } = await WebAssembly.instantiate(fs.readFileSync('web/wasm/sbc-emu.wasm'), { env });
+const { instance } = await WebAssembly.instantiate(fs.readFileSync(process.env.SBC_WASM ?? 'web/wasm/sbc-emu.wasm'), { env });
 ex = instance.exports;
 jitEx = ex;
 const snap = fs.readFileSync(snapPath);

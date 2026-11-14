@@ -14,7 +14,7 @@ function jitCompile(ptr, len) {
 }
 function jitReset() { const t = jitEx.__indirect_function_table; for (const i of jitUsed) { t.set(i, null); jitFree.push(i); } jitUsed = []; }
 const secs = Number(process.argv[2] || 120), out = process.argv[3];
-const { instance } = await WebAssembly.instantiate(fs.readFileSync('web/wasm/sbc-emu.wasm'), { env: { sbc_disk_read: () => {}, sbc_jit_compile: (p, l) => jitCompile(p, l), sbc_jit_reset: () => jitReset() } });
+const { instance } = await WebAssembly.instantiate(fs.readFileSync(process.env.SBC_WASM ?? 'web/wasm/sbc-emu.wasm'), { env: { sbc_disk_read: () => {}, sbc_jit_compile: (p, l) => jitCompile(p, l), sbc_jit_reset: () => jitReset() } });
 const ex = instance.exports;
 jitEx = ex;
 jitEx = ex;

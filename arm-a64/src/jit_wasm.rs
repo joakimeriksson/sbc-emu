@@ -28,9 +28,13 @@ pub(crate) fn reset() { unsafe { sbc_jit_reset() } }
 /// 0 = continue, 1 = leave the block (pc set), 2 = trap stored in jit_trap.
 unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
     let cpu = &mut *cpu;
+    if super::jit::PROFILE.load(std::sync::atomic::Ordering::Relaxed) { super::jit::profile_fallback(cpu); }
     let bus = &mut *cpu.jit_bus.expect("bus");
-    match cpu.exec_one(bus) {
-        Ok(()) => if cpu.pc == expect_next { 0 } else { 1 },
+    let r = cpu.exec_one(bus);
+    // as the native h_step: system/branch-register instructions and device accesses stop chaining
+    if super::jit::is_block_end(cpu.cur_insn) { cpu.chain_stop = true; }
+    match r {
+        Ok(()) => if cpu.pc == expect_next && !cpu.chain_stop { 0 } else { 1 },
         Err(t) => { cpu.jit_trap = Some(t); 2 }
     }
 }
@@ -55,9 +59,15 @@ const L_A: u32 = 1; // i64 temporaries
 const L_B: u32 = 2;
 const L_R: u32 = 3;
 const L_ST: u32 = 4; // i32 temporary
+const L_C: u32 = 5; // more i64 temporaries
+const L_D: u32 = 6;
+const L_E: u32 = 7;
+const L_IDX: u32 = 8; // i32: the region's next basic block
 
 struct W { c: Vec<u8>, off_x: u32, off_sp_slot: u32, off_pc: u32, off_nzcv: u32, off_instret: u32, pending: u64, step_idx: u32,
-           off_utlb: u32, off_ram: u32, off_excl: u32, el: u8 }
+           off_utlb: u32, off_ram: u32, off_excl: u32, el: u8, off_sp0: u32, off_tpidr: u32,
+           /** basic blocks of the region (start pcs; index = dispatch value) */ region: Vec<u64>,
+           /** the basic block being emitted */ cur_bb: usize, off_chain_until: u32 }
 
 impl W {
     fn op(&mut self, b: u8) { self.c.push(b); }
@@ -92,6 +102,20 @@ impl W {
     }
     fn set_pc(&mut self, pc: u64) { self.i64c(pc as i64); self.store64(self.off_pc); }
     fn ret(&mut self, status: i32) { self.i32c(status); self.op(0x0f); }
+    /// Leave the basic block for constant `target` (instret flushed). A target inside the region
+    /// is a branch back to the dispatch loop while the budget lasts; `nest` = structured blocks
+    /// opened since the basic block's start.
+    fn exit_const(&mut self, target: u64, nest: u32) {
+        if let Some(k) = self.region.iter().position(|&s| s == target) {
+            self.load64(self.off_instret); self.load64(self.off_chain_until); self.op(0x54); // i64.lt_u
+            self.op(0x04); self.op(0x40);
+            self.i32c(k as i32); self.lset(L_IDX);
+            self.op(0x0c); uleb(&mut self.c, (self.region.len() - self.cur_bb) as u64 + nest as u64 + 1); // br loop
+            self.op(0x0b);
+        }
+        self.set_pc(target);
+        self.ret(0);
+    }
 
     /// NZCV for a result r (L_R) of an add/sub of a, b (L_A, L_B): sub = a - b.
     fn flags_addsub(&mut self, sf: bool, sub: bool) {
@@ -154,6 +178,7 @@ impl W {
 }
 
 impl Cpu {
+    #[inline(never)]
     pub(crate) fn compile_wasm(&mut self, pa: u64) -> Option<crate::jit::BlockFn> {
         if self.ram.is_null() { return None; }
         let sp_slot = std::mem::offset_of!(Cpu, sp) + 8 * if self.spsel { self.el as usize } else { 0 };
@@ -170,9 +195,48 @@ impl Cpu {
             off_ram: std::mem::offset_of!(Cpu, ram) as u32,
             off_excl: std::mem::offset_of!(Cpu, excl_armed) as u32,
             el: self.el,
+            off_sp0: std::mem::offset_of!(Cpu, sp) as u32,
+            off_tpidr: (std::mem::offset_of!(Cpu, sys) + std::mem::offset_of!(crate::sysreg::SysRegs, tpidr)) as u32,
+            region: Vec::new(),
+            cur_bb: 0,
+            off_chain_until: std::mem::offset_of!(Cpu, chain_until) as u32,
         };
-        let mut pc = self.pc;
-        let mut a = pa;
+        // ---- the region: basic blocks reachable through constant branches on this page
+        let page = self.pc & !0xfff;
+        let pa_page = pa & !0xfff;
+        let word = |cpu: &Cpu, pc: u64| -> Option<u32> {
+            let a = pa_page | (pc & 0xfff);
+            // SAFETY: inside guest RAM (checked)
+            (a + 4 <= cpu.ram_len).then(|| unsafe { (cpu.ram.add(a as usize) as *const u32).read_unaligned() })
+        };
+        let mut bbs: Vec<u64> = vec![self.pc];
+        let mut q = 0;
+        while q < bbs.len() {
+            let mut pc = bbs[q];
+            q += 1;
+            for _ in 0..64 {
+                let Some(i) = word(self, pc) else { break };
+                if let Some(ts) = const_targets(i, pc) {
+                    for t in ts { if t & !0xfff == page && bbs.len() < MAX_BBS && !bbs.contains(&t) { bbs.push(t); } }
+                    break;
+                }
+                if super::jit::is_block_end(i) { break; }
+                pc += 4;
+                if pc & 0xfff == 0 { break; }
+            }
+        }
+        let n = bbs.len();
+        w.region = bbs.clone();
+        w.op(0x03); w.op(0x40); // loop: the dispatch
+        for _ in 0..=n { w.op(0x02); w.op(0x40); } // $exit, then one block per basic block
+        w.lget(L_IDX); w.op(0x0e); uleb(&mut w.c, n as u64);
+        for j in 0..n { uleb(&mut w.c, j as u64); }
+        uleb(&mut w.c, n as u64); // default: $exit
+        for (k, &start) in bbs.iter().enumerate() {
+        w.op(0x0b); // end of the basic block's label: its code follows
+        w.cur_bb = k;
+        let mut pc = start;
+        let mut a = pa_page | (start & 0xfff);
         let mut ended = false;
         for _ in 0..64 {
             if a + 4 > self.ram_len { break; }
@@ -209,9 +273,13 @@ impl Cpu {
         }
         if !ended {
             w.flush_instret();
-            w.set_pc(pc);
-            w.ret(0);
+            w.exit_const(pc, 0);
         }
+        }
+        w.op(0x0b); // end of $exit (not reached: every basic block ends in a branch or return)
+        w.ret(0);
+        w.op(0x0b); // end of the loop
+        w.op(0x00); // unreachable
         w.op(0x0b); // end of function
         let module = assemble(&w.c);
         // SAFETY: the import writes nothing; it reads `len` bytes of the module
@@ -226,6 +294,151 @@ impl Cpu {
     fn wasm_native(&self, w: &mut W, i: u32, pc: u64) -> bool {
         let sf = bit(i, 31);
         let (rd, rn, rm) = (i & 31, bits(i, 9, 5), bits(i, 20, 16));
+        // NOP and the hints that are NOPs here (PAC, BTI, YIELD, ...), DSB/DMB/ISB, PRFM
+        if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
+            || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6))
+            || i & 0xffc0_0000 == 0xf980_0000 || i & 0xffe0_0c00 == 0xf880_0000 || i & 0xffe0_0c00 == 0xf8a0_0800
+        {
+            return true;
+        }
+        // MRS SP_EL0 (EL1+), TPIDR_EL0, TPIDRRO_EL0, TPIDR_EL1 (EL1+)
+        let mrs = match i & 0xffff_ffe0 {
+            0xd538_4100 if self.el >= 1 => Some(w.off_sp0),
+            0xd53b_d040 => Some(w.off_tpidr),
+            0xd53b_d060 => Some(w.off_tpidr + 8),
+            0xd538_d080 if self.el >= 1 => Some(w.off_tpidr + 16),
+            _ => None,
+        };
+        if let Some(off) = mrs {
+            if rd != 31 { w.load64(off); w.set_x(rd, false, true); }
+            return true;
+        }
+        // ADD/SUB (extended register)
+        if bits(i, 28, 24) == 0b01011 && bit(i, 21) && bits(i, 23, 22) == 0 {
+            let (opt, sh) = (bits(i, 15, 13), bits(i, 12, 10));
+            if sh > 4 { return false; }
+            let (sub, s) = (bit(i, 30), bit(i, 29));
+            w.get_x(rn, true); w.mask32(sf); w.lset(L_A);
+            w.get_x(rm, false);
+            match opt { 0 => { w.i64c(0xff); w.op(0x83); } 1 => { w.i64c(0xffff); w.op(0x83); } 2 => { w.i64c(0xffff_ffff); w.op(0x83); }
+                        4 => w.op(0xc2), 5 => w.op(0xc3), 6 => w.op(0xc4), _ => {} }
+            if sh != 0 { w.i64c(sh as i64); w.op(0x86); }
+            w.mask32(sf); w.lset(L_B);
+            w.lget(L_A); w.lget(L_B); w.op(if sub { 0x7d } else { 0x7c }); w.mask32(sf); w.lset(L_R);
+            if s { w.flags_addsub(sf, sub); }
+            w.lget(L_R); w.set_x(rd, !s, sf);
+            return true;
+        }
+        // CCMP / CCMN (register, immediate)
+        if bits(i, 29, 21) == 0b1_1101_0010 && !bit(i, 10) && !bit(i, 4) {
+            let sub = bit(i, 30);
+            w.cond(bits(i, 15, 12));
+            w.op(0x04); w.op(0x40); // if cond: flags of the comparison
+            w.get_x(rn, false); w.mask32(sf); w.lset(L_A);
+            if bit(i, 11) { w.i64c(rm as i64); } else { w.get_x(rm, false); w.mask32(sf); }
+            w.lset(L_B);
+            w.lget(L_A); w.lget(L_B); w.op(if sub { 0x7d } else { 0x7c }); w.mask32(sf); w.lset(L_R);
+            w.flags_addsub(sf, sub);
+            w.op(0x05); // else: the immediate flags
+            w.i32c((bits(i, 3, 0) << 28) as i32); w.store32(w.off_nzcv);
+            w.op(0x0b);
+            return true;
+        }
+        // data processing (2 source): LSLV / LSRV / ASRV / RORV
+        if bits(i, 30, 21) == 0b00_1101_0110 && matches!(bits(i, 15, 10), 0b001000..=0b001011) {
+            let op = bits(i, 11, 10);
+            if sf {
+                w.get_x(rn, false); w.get_x(rm, false);
+                w.op([0x86, 0x88, 0x87, 0x8a][op as usize]);
+            } else {
+                w.get_x(rn, false); w.op(0xa7); w.get_x(rm, false); w.op(0xa7);
+                w.op([0x74, 0x76, 0x75, 0x78][op as usize]); w.op(0xad);
+            }
+            w.set_x(rd, false, sf);
+            return true;
+        }
+        // data processing (1 source): RBIT, REV16, REV32/REV, REV, CLZ
+        if bits(i, 30, 21) == 0b10_1101_0110 && bits(i, 20, 16) == 0 && bits(i, 15, 10) <= 4 {
+            let op = bits(i, 15, 10);
+            if op == 3 && !sf { return false; }
+            w.get_x(rn, false); w.mask32(sf); w.lset(L_A);
+            // swap adjacent fields of `sh` bits: x = (x >> sh & m) | (x & m) << sh
+            let swap = |w: &mut W, sh: i64, m: u64| {
+                w.lget(L_A); w.i64c(sh); w.op(0x88); w.i64c(m as i64); w.op(0x83);
+                w.lget(L_A); w.i64c(m as i64); w.op(0x83); w.i64c(sh); w.op(0x86);
+                w.op(0x84); w.lset(L_A);
+            };
+            let bytes = |w: &mut W, sf: bool, upto: u32| {
+                // byte swap within units of 2^upto bytes (1 = halfwords, 2 = words, 3 = doublewords)
+                if upto >= 1 { swap(w, 8, 0x00ff_00ff_00ff_00ff); }
+                if upto >= 2 { swap(w, 16, 0x0000_ffff_0000_ffff); }
+                if upto >= 3 && sf { swap(w, 32, 0x0000_0000_ffff_ffff); }
+            };
+            match op {
+                0 => {
+                    swap(w, 1, 0x5555_5555_5555_5555); swap(w, 2, 0x3333_3333_3333_3333); swap(w, 4, 0x0f0f_0f0f_0f0f_0f0f);
+                    bytes(w, sf, 3);
+                    w.lget(L_A);
+                }
+                1 => { bytes(w, sf, 1); w.lget(L_A); }
+                2 => { bytes(w, sf, 2); w.lget(L_A); }
+                3 => { bytes(w, sf, 3); w.lget(L_A); }
+                _ => { if sf { w.lget(L_A); w.op(0x79); } else { w.lget(L_A); w.op(0xa7); w.op(0x67); w.op(0xad); } }
+            }
+            w.set_x(rd, false, sf);
+            return true;
+        }
+        // ADC / ADCS / SBC / SBCS
+        if bits(i, 28, 21) == 0b1101_0000 && bits(i, 15, 10) == 0 {
+            let (sbc, s) = (bit(i, 30), bit(i, 29));
+            let m = if sf { u64::MAX } else { 0xffff_ffff };
+            w.get_x(rn, false); w.mask32(sf); w.lset(L_A);
+            w.get_x(rm, false); if sbc { w.i64c(m as i64); w.op(0x85); } w.mask32(sf); w.lset(L_B); // b' = ~b for SBC
+            w.load32(w.off_nzcv); w.i32c(29); w.op(0x76); w.i32c(1); w.op(0x71); w.op(0xad); w.lset(L_C); // carry in
+            // t = a + b'; r = t + c (masked); carry out = t < a || r < t (64) / bit 32 (32)
+            w.lget(L_A); w.lget(L_B); w.op(0x7c); w.lset(L_D);
+            w.lget(L_D); w.lget(L_C); w.op(0x7c); w.lset(L_E);
+            w.lget(L_E); w.mask32(sf); w.lset(L_R);
+            if s {
+                // N, Z
+                let top = if sf { 63 } else { 31 };
+                w.lget(L_R); w.i64c(top); w.op(0x88); w.i64c(1); w.op(0x83); w.i64c(31); w.op(0x86);
+                w.lget(L_R); w.op(0x50); w.op(0xad); w.i64c(30); w.op(0x86); w.op(0x84);
+                // C
+                if sf { w.lget(L_D); w.lget(L_A); w.op(0x54); w.lget(L_E); w.lget(L_D); w.op(0x54); w.op(0x72); w.op(0xad); }
+                else { w.lget(L_E); w.i64c(32); w.op(0x88); w.i64c(1); w.op(0x83); }
+                w.i64c(29); w.op(0x86); w.op(0x84);
+                // V = ((a ^ r) & (b' ^ r)) top bit
+                w.lget(L_A); w.lget(L_R); w.op(0x85); w.lget(L_B); w.lget(L_R); w.op(0x85); w.op(0x83);
+                w.i64c(top); w.op(0x88); w.i64c(1); w.op(0x83); w.i64c(28); w.op(0x86); w.op(0x84);
+                w.op(0xa7); w.store32(w.off_nzcv);
+            }
+            w.lget(L_R); w.set_x(rd, false, sf);
+            return true;
+        }
+        // UMULH / SMULH: 64x64 -> high 64 from 32-bit partial products
+        if bits(i, 31, 24) == 0b1001_1011 && bits(i, 22, 21) == 0b10 && bits(i, 15, 10) == 0b011111 {
+            let signed = !bit(i, 23);
+            w.get_x(rn, false); w.lset(L_A);
+            w.get_x(rm, false); w.lset(L_B);
+            let lo = |w: &mut W, l: u32| { w.lget(l); w.i64c(0xffff_ffff); w.op(0x83); };
+            let hi = |w: &mut W, l: u32| { w.lget(l); w.i64c(32); w.op(0x88); };
+            // L_C = a_lo*b_hi, L_D = a_hi*b_lo, L_E = (a_lo*b_lo >> 32) + lo(C) + lo(D)
+            lo(w, L_A); hi(w, L_B); w.op(0x7e); w.lset(L_C);
+            hi(w, L_A); lo(w, L_B); w.op(0x7e); w.lset(L_D);
+            lo(w, L_A); lo(w, L_B); w.op(0x7e); w.i64c(32); w.op(0x88);
+            lo(w, L_C); w.op(0x7c); lo(w, L_D); w.op(0x7c); w.lset(L_E);
+            // high = a_hi*b_hi + hi(C) + hi(D) + hi(E)
+            hi(w, L_A); hi(w, L_B); w.op(0x7e);
+            hi(w, L_C); w.op(0x7c); hi(w, L_D); w.op(0x7c); hi(w, L_E); w.op(0x7c);
+            if signed {
+                // signed high = unsigned high - (a < 0 ? b : 0) - (b < 0 ? a : 0)
+                w.lget(L_B); w.lget(L_A); w.i64c(63); w.op(0x87); w.op(0x83); w.op(0x7d);
+                w.lget(L_A); w.lget(L_B); w.i64c(63); w.op(0x87); w.op(0x83); w.op(0x7d);
+            }
+            w.set_x(rd, false, true);
+            return true;
+        }
         match bits(i, 28, 23) {
             0b100010 => {
                 // ADD/SUB (immediate)
@@ -359,15 +572,20 @@ impl Cpu {
         if bits(i, 30, 26) == 0b00101 {
             let t = pc.wrapping_add(sx((bits(i, 25, 0) as u64) << 2, 28));
             if bit(i, 31) { w.i64c((pc + 4) as i64); w.set_x(30, false, true); }
-            w.set_pc(t);
-            finish(w);
+            w.pending += 1;
+            w.flush_instret();
+            w.exit_const(t, 0);
             return Some(true);
         }
         if bits(i, 31, 24) == 0b0101_0100 && !bit(i, 4) {
             let t = pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21));
-            w.i64c(t as i64); w.i64c((pc + 4) as i64); w.cond(bits(i, 3, 0)); w.op(0x1b);
-            w.store64(w.off_pc);
-            finish(w);
+            w.pending += 1;
+            w.flush_instret();
+            w.cond(bits(i, 3, 0));
+            w.op(0x04); w.op(0x40); // if taken
+            w.exit_const(t, 1);
+            w.op(0x0b);
+            w.exit_const(pc + 4, 0);
             return Some(true);
         }
         let cb = bits(i, 30, 25) == 0b011010;
@@ -375,7 +593,8 @@ impl Cpu {
         if cb || tb {
             let rt = i & 31;
             let t = if cb { pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21)) } else { pc.wrapping_add(sx((bits(i, 18, 5) as u64) << 2, 16)) };
-            w.i64c(t as i64); w.i64c((pc + 4) as i64);
+            w.pending += 1;
+            w.flush_instret();
             w.get_x(rt, false);
             if cb {
                 w.mask32(bit(i, 31));
@@ -386,9 +605,10 @@ impl Cpu {
                 w.i64c(b as i64); w.op(0x88); w.i64c(1); w.op(0x83); w.op(0xa7);
                 if !bit(i, 24) { w.op(0x45); } // TBZ: taken when the bit is 0
             }
-            w.op(0x1b);
-            w.store64(w.off_pc);
-            finish(w);
+            w.op(0x04); w.op(0x40); // if taken
+            w.exit_const(t, 1);
+            w.op(0x0b);
+            w.exit_const(pc + 4, 0);
             return Some(true);
         }
         if bits(i, 31, 25) == 0b110_1011 && bits(i, 20, 16) == 0b11111 && bits(i, 15, 10) == 0 && bits(i, 4, 0) == 0 {
@@ -402,6 +622,20 @@ impl Cpu {
         }
         None
     }
+}
+
+/// Basic blocks per compiled region.
+const MAX_BBS: usize = 24;
+
+/// A branch ends a basic block: its constant successors (empty for register branches).
+fn const_targets(i: u32, pc: u64) -> Option<Vec<u64>> {
+    let sx = |v: u64, b: u32| ((v << (64 - b)) as i64 >> (64 - b)) as u64;
+    if bits(i, 30, 26) == 0b00101 { return Some(vec![pc.wrapping_add(sx((bits(i, 25, 0) as u64) << 2, 28))]); }
+    if bits(i, 31, 24) == 0b0101_0100 && !bit(i, 4) { return Some(vec![pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21)), pc + 4]); }
+    if bits(i, 30, 25) == 0b011010 { return Some(vec![pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21)), pc + 4]); }
+    if bits(i, 30, 25) == 0b011011 { return Some(vec![pc.wrapping_add(sx((bits(i, 18, 5) as u64) << 2, 16)), pc + 4]); }
+    if bits(i, 31, 25) == 0b110_1011 { return Some(Vec::new()); }
+    None
 }
 
 /// The interpreter call for the instruction at `pc` inside a block (continue on status 0).
@@ -516,8 +750,8 @@ fn assemble(body: &[u8]) -> Vec<u8> {
     section(&mut m, 2, &imp);
     section(&mut m, 3, &[1, 0]); // one function of type 0
     section(&mut m, 7, &[1, 1, b'f', 0x00, 0]); // export "f" = function 0
-    // code: locals = 3 x i64, 1 x i32
-    let mut f = vec![2, 3, 0x7e, 1, 0x7f];
+    // code: locals = 3 x i64, 1 x i32, 3 x i64 (L_C, L_D, L_E), 1 x i32 (L_IDX)
+    let mut f = vec![4, 3, 0x7e, 1, 0x7f, 3, 0x7e, 1, 0x7f];
     f.extend_from_slice(body);
     let mut code = vec![1];
     uleb(&mut code, f.len() as u64);

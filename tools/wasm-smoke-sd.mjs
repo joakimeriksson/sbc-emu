@@ -24,16 +24,19 @@ const env = { sbc_jit_compile: (p, l) => jitCompile(p, l), sbc_jit_reset: () => 
   if (n < count * 512) buf.fill(0, n);
   readBytes += count * 512;
 } };
-const { instance } = await WebAssembly.instantiate(fs.readFileSync('web/wasm/sbc-emu.wasm'), { env });
+const { instance } = await WebAssembly.instantiate(fs.readFileSync(process.env.SBC_WASM ?? 'web/wasm/sbc-emu.wasm'), { env });
 ex = instance.exports;
 jitEx = ex;
 const r = ex.sbc_boot_sd(1024, size / 512);
 if (r !== 0) throw new Error(`sbc_boot_sd: ${r}`);
 if (process.env.SBC_JIT !== '0') console.log('jit', ex.sbc_jit(1) ? 'on' : 'unavailable');
+if (process.env.SBC_JIT_HOT) ex.sbc_jit_hot(Number(process.env.SBC_JIT_HOT));
+if (process.env.SBC_JIT_PROFILE === '1') ex.sbc_jit_profile(1);
+if (process.env.SBC_JIT_VERIFY === '1') ex.sbc_jit_verify(1);
 const t0 = performance.now(), wall = () => (performance.now() - t0) * 1e6;
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 let uart = '', marks = {};
-const mark = (k) => { if (!marks[k]) { marks[k] = true; console.log(`${k}: wall ${((performance.now() - t0) / 1000).toFixed(0)} s, guest ${(ex.sbc_now_ns() / 1e9).toFixed(1)} s, ${(ex.sbc_insns() / 1e9).toFixed(1)} G insns, SD read ${(readBytes / 2 ** 20).toFixed(0)} MiB`); } };
+const mark = (k) => { if (!marks[k]) { marks[k] = true; console.log(`${k}: wall ${((performance.now() - t0) / 1000).toFixed(0)} s, guest ${(ex.sbc_now_ns() / 1e9).toFixed(1)} s, ${(ex.sbc_insns() / 1e9).toFixed(1)} G insns, SD read ${(readBytes / 2 ** 20).toFixed(0)} MiB, JIT coverage ${(ex.sbc_jit_coverage ? ex.sbc_jit_coverage() / 10 : 0).toFixed(1)}%`); } };
 while (performance.now() - t0 < Number(secs) * 1000) {
   const st = ex.sbc_run(4_000_000, wall());
   const n = ex.sbc_uart_take();
@@ -50,6 +53,11 @@ while (performance.now() - t0 < Number(secs) * 1000) {
   }
 }
 mark('end');
+if (process.env.SBC_JIT_VERIFY === '1') { const b = ex.sbc_alloc(8192), n = ex.sbc_jit_report(b, 8192); console.log('jit verify:', n ? new TextDecoder().decode(new Uint8Array(ex.memory.buffer, b, n)) : 'no mismatch'); }
+if (process.env.SBC_JIT_PROFILE === '1') {
+  const p = ex.sbc_alloc(16 * 80), n = ex.sbc_jit_fallbacks(p, 80), v = new BigUint64Array(ex.memory.buffer, p, 2 * n);
+  for (let i = 0; i < n; i++) console.log(`  ${v[2 * i].toString(16).padStart(8, '0')} ${v[2 * i + 1]}`);
+}
 const p = ex.sbc_fb_render();
 if (p && out) {
   const w = ex.sbc_fb_w(), h = ex.sbc_fb_h(), px = new Uint8Array(ex.memory.buffer, p, w * h * 4);

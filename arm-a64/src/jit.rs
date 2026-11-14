@@ -110,7 +110,8 @@ pub struct Jit {
     blocks: Map<(u64, u64), BlockFn>,
     /// direct-mapped front cache over `blocks`
     front: Box<[(u64, u64, usize)]>,
-    counts: Map<(u64, u64), u32>,
+    /// direct-mapped execution counters for blocks not compiled yet: (pc, key, count)
+    hotc: Box<[(u64, u64, u32)]>,
     /// FP/SIMD instruction words the interpreter implements (see `interp_supports`)
     probe: Map<u32, bool>,
     scratch: Option<Box<(Cpu, emu_core::FlatRam)>>,
@@ -142,6 +143,7 @@ pub struct Jit {
 }
 
 const FRONT: usize = 1 << 14;
+const HOTC: usize = 1 << 16;
 /// wasm32: live compiled blocks before the cache is flushed (each is a module in the engine)
 #[cfg(target_arch = "wasm32")]
 const WASM_MAX_BLOCKS: usize = 32768;
@@ -152,13 +154,13 @@ impl Jit {
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
         if !host::AVAILABLE { return None; }
         Some(Box::new(Jit { code: host::CodeCache::new(code_bytes)?, blocks: Map::default(), front: vec![(u64::MAX, u64::MAX, 0); FRONT].into_boxed_slice(),
-                            counts: Map::default(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None, code_hash: Map::default(), stale_skips: 0, execs: 0, exec_insns: 0, disp: None, links: Map::default(), new_sites: Vec::new(), linked: 0 }))
+                            hotc: vec![(u64::MAX, u64::MAX, 0); HOTC].into_boxed_slice(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None, code_hash: Map::default(), stale_skips: 0, execs: 0, exec_insns: 0, disp: None, links: Map::default(), new_sites: Vec::new(), linked: 0 }))
     }
 
     pub fn flush(&mut self) {
         if watch_page().is_some() { eprintln!("[jit-watch] flush all"); }
         self.blocks.clear();
-        self.counts.clear();
+        self.hotc.fill((u64::MAX, u64::MAX, 0));
         self.pages.clear();
         self.front.fill((u64::MAX, u64::MAX, 0));
         self.code.reset();
@@ -441,7 +443,7 @@ pub fn profile_fallbacks() -> Vec<(u32, u64)> {
 }
 
 #[cold]
-fn profile_fallback(cpu: &Cpu) {
+pub(crate) fn profile_fallback(cpu: &Cpu) {
     let e = cpu.utlb[0][(cpu.pc >> 12) as usize & (UT - 1)];
     let pa = if e.0 == ((cpu.pc >> 12) + 1) | ((cpu.el as u64) << 60) { e.1 | (cpu.pc & 0xfff) } else { return };
     if pa + 4 > cpu.ram_len { return; }
@@ -578,13 +580,18 @@ impl Cpu {
         let f: BlockFn = if jit.front[slot].0 == k.0 && jit.front[slot].1 == k.1 {
             // SAFETY: front entries are only filled from `blocks`, which hold published code
             unsafe { std::mem::transmute::<usize, BlockFn>(jit.front[slot].2) }
-        } else if let Some(&f) = jit.blocks.get(&k) {
-            jit.front[slot] = (k.0, k.1, f as usize);
-            f
         } else {
-            let c = jit.counts.entry(k).or_insert(0);
-            *c += 1;
-            if *c < jit.hot { return None; }
+            // count executions in a direct-mapped table (no allocation, no hashing of the map);
+            // only a hot entry looks into `blocks` (a compiled block that left the front cache
+            // keeps a saturated counter) or compiles
+            let hs = ((self.pc ^ (self.pc >> 16)) as usize >> 2) & (HOTC - 1);
+            let h = &mut jit.hotc[hs];
+            if h.0 == k.0 && h.1 == k.1 { h.2 = h.2.saturating_add(1); } else { *h = (k.0, k.1, 1); }
+            if h.2 < jit.hot { return None; }
+            if let Some(&f) = jit.blocks.get(&k) {
+                jit.front[slot] = (k.0, k.1, f as usize);
+                return self.jit_run(f, pa, k, bus);
+            }
             let f = self.compile(pa)?;
             let jit = self.jit.as_mut()?;
             jit.blocks.insert(k, f);
@@ -592,20 +599,50 @@ impl Cpu {
             if watch_page() == Some(pa >> 12) { eprintln!("[jit-watch] compiled pc {:#x} pa {pa:#x} instret {}", self.pc, self.instret); }
             jit.front[slot] = (k.0, k.1, f as usize);
             jit.compiled += 1;
+            let hs = ((k.0 ^ (k.0 >> 16)) as usize >> 2) & (HOTC - 1);
+            jit.hotc[hs] = (k.0, k.1, u32::MAX);
             jit.link(k, f as usize);
             if jit.verify { let h = code_hash(self, pa); if let Some(j) = self.jit.as_mut() { j.code_hash.insert(k, h); } }
             f
         };
+        self.jit_run(f, pa, k, bus)
+    }
+
+    /// Run compiled block `f` (and, in the wasm build, the blocks it chains to).
+    #[inline(always)]
+    fn jit_run(&mut self, f: BlockFn, pa: u64, k: (u64, u64), bus: &mut dyn Bus) -> Option<Result<(), Trap>> {
         if self.jit.as_ref().is_some_and(|j| j.verify) { return Some(self.jit_verify_block(f, pa, k, bus)); }
         // SAFETY: the bus outlives the call; generated code only reaches it through h_step
         self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
         let i0 = self.instret;
         self.chain_stop = false;
         if !chain_enabled() { self.chain_until = 0; }
-        let r = unsafe { f(self as *mut Cpu) };
+        #[allow(unused_mut)]
+        let mut r = unsafe { f(self as *mut Cpu) };
+        // wasm: chain in Rust (native code chains through its own dispatcher): the next block
+        // from the front cache while the budget lasts and nothing needs the machine
+        #[cfg(target_arch = "wasm32")]
+        while r == 0 && !self.chain_stop && self.instret < self.chain_until {
+            let Some(g) = self.front_block() else { break };
+            r = unsafe { g(self as *mut Cpu) };
+        }
         self.jit_bus = None;
         if let Some(j) = self.jit.as_mut() { j.execs += 1; j.exec_insns += self.instret - i0; }
         Some(if r == 0 { Ok(()) } else { Err(self.jit_trap.take().unwrap_or(Trap::Wait)) })
+    }
+
+    /// The compiled block for the current pc if the front cache has it.
+    #[cfg(target_arch = "wasm32")]
+    #[inline(always)]
+    fn front_block(&self) -> Option<BlockFn> {
+        if self.pc & 3 != 0 { return None; }
+        let e = self.utlb[0][(self.pc >> 12) as usize & (UT - 1)];
+        if e.0 != ((self.pc >> 12) + 1) | ((self.el as u64) << 60) { return None; }
+        let kk = key(e.1 | (self.pc & 0xfff), self.el, self.spsel, (self.sys.cpacr_el1 >> 20) & 3);
+        let jit = self.jit.as_ref()?;
+        let fe = jit.front[((self.pc ^ (self.pc >> 14)) as usize >> 2) & (FRONT - 1)];
+        // SAFETY: front entries are only filled from `blocks`, which hold published code
+        (fe.0 == self.pc && fe.1 == kk).then(|| unsafe { std::mem::transmute::<usize, BlockFn>(fe.2) })
     }
 
     /// JIT verify mode: run block `f`, then re-run the same instructions in the interpreter from
@@ -670,6 +707,7 @@ impl Cpu {
         if r == 0 { Ok(()) } else { Err(self.jit_trap.take().unwrap_or(Trap::Wait)) }
     }
 
+    #[inline(never)]
     fn compile(&mut self, pa: u64) -> Option<BlockFn> {
         #[cfg(target_arch = "wasm32")]
         {

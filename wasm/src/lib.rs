@@ -94,6 +94,27 @@ pub extern "C" fn sbc_jit(on: u32) -> u32 {
     with(|s| { if on != 0 { s.m.cpu.enable_jit() as u32 } else { s.m.cpu.jit = None; 0 } }).unwrap_or(0)
 }
 
+/// JIT profiling: count the instructions compiled blocks hand to the interpreter (1 on).
+#[no_mangle]
+pub extern "C" fn sbc_jit_profile(on: u32) { arm_a64::jit::PROFILE.store(on != 0, std::sync::atomic::Ordering::Relaxed); }
+
+/// The most frequent interpreter fallbacks: up to `n` (word, count) pairs as u64s at `out`.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_jit_fallbacks(out: *mut u64, n: usize) -> usize {
+    let f = arm_a64::jit::profile_fallbacks();
+    let k = f.len().min(n);
+    for (i, (w, c)) in f.iter().take(k).enumerate() { *out.add(2 * i) = *w as u64; *out.add(2 * i + 1) = *c; }
+    k
+}
+
+/// JIT: executions before a block is compiled.
+#[no_mangle]
+pub extern "C" fn sbc_jit_hot(n: u32) { with(|s| { if let Some(j) = s.m.cpu.jit.as_mut() { j.hot = n.max(1); } }); }
+
+/// JIT: guest instructions retired inside compiled blocks (per mille of all).
+#[no_mangle]
+pub extern "C" fn sbc_jit_coverage() -> u32 { with(|s| s.m.cpu.jit.as_ref().map_or(0, |j| (j.exec_insns * 1000 / s.m.cpu.instret.max(1)) as u32)).unwrap_or(0) }
+
 /// JIT verify mode (every block re-run in the interpreter): 1 on.
 #[no_mangle]
 pub extern "C" fn sbc_jit_verify(on: u32) { with(|s| { if let Some(j) = s.m.cpu.jit.as_mut() { j.verify = on != 0; } }); }
@@ -259,7 +280,7 @@ pub unsafe extern "C" fn sbc_selftest(code: *const u8, len: usize, jit: u32) -> 
     cpu.sys.cpacr_el1 = 3 << 20;
     cpu.ram = ram.mem.as_mut_ptr();
     cpu.ram_len = ram.mem.len() as u64;
-    if jit != 0 { cpu.jit = arm_a64::jit::Jit::with(1 << 16, 1); }
+    if jit != 0 { cpu.jit = arm_a64::jit::Jit::with(1 << 16, 1); cpu.chain_until = u64::MAX; }
     for _ in 0..100_000 {
         match cpu.step(&mut ram) { Err(Trap::Brk(_)) => break, Err(Trap::Unimplemented(..)) => break, _ => {} }
     }
