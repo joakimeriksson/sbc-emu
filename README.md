@@ -21,7 +21,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
 | Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 53 s (JIT with block chaining and linking); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
-| Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~7 min, ~200 MiB of the image read |
+| Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~2.7 min (JIT on), ~200 MiB of the image read |
 
 Compatibility labels in the plan's terms (per-feature evidence above; nothing else is claimed):
 
@@ -34,7 +34,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 - **network**: W0 — the Pi 4's own Ethernet MAC (GENET) and PHY, behind a virtual network with
   user-mode NAT (native) or an isolated network (browser). **wifi_tier**: W2 — original driver
   (`brcmfmac`) against an emulated CYW43455 host interface (firmware download real, firmware
-  behaviour emulated, open network only, no radio model; see docs/decisions.md D5). **clock_mode**: T0 real-time pacing
+  behaviour emulated, open and WPA2-PSK networks, no radio model; see docs/decisions.md D5). **clock_mode**: T0 real-time pacing
   (virtual time is deterministic per run; wall-clock pacing only governs idle time).
 - **tested_cpu_count**: 1 (the Pi 4 has 4).
 
