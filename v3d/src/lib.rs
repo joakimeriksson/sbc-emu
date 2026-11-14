@@ -38,19 +38,38 @@ pub fn log_once(s: &str) {
     if first { eprintln!("\r{s}\r"); }
 }
 
-/// Decoded-instruction cache for QPU code, valid for one job (BOs get remapped between jobs).
-#[derive(Default)]
-pub struct Code { cache: HashMap<u32, qpu::Inst> }
+/// Host time for job costs (none in the browser build, where jobs then cost no guest time).
+struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
+impl Clock {
+    fn now() -> Clock { Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant::now()) }
+    fn elapsed(&self) -> std::time::Duration {
+        #[cfg(not(target_arch = "wasm32"))] { self.0.elapsed() }
+        #[cfg(target_arch = "wasm32")] { std::time::Duration::ZERO }
+    }
+}
+
+/// Decoded-instruction cache for QPU code (direct-mapped), valid for one job: BOs get remapped
+/// between jobs.
+pub struct Code { tags: Vec<u32>, insts: Vec<qpu::Inst> }
+
+const CODE_SLOTS: usize = 16384;
+
+impl Default for Code {
+    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![qpu::Inst::Invalid(0); CODE_SLOTS] } }
+}
 
 impl Code {
+    #[inline]
     pub fn fetch(&mut self, pc: u32, env: &mut dyn qpu::Env) -> qpu::Inst {
-        if let Some(i) = self.cache.get(&pc) { return *i; }
+        let k = (pc >> 3) as usize & (CODE_SLOTS - 1);
+        if self.tags[k] == pc { return self.insts[k]; }
         let w = env.read32(pc) as u64 | (env.read32(pc.wrapping_add(4)) as u64) << 32;
         let i = qpu::decode(w);
-        self.cache.insert(pc, i);
+        self.tags[k] = pc;
+        self.insts[k] = i;
         i
     }
-    pub fn clear(&mut self) { self.cache.clear(); }
+    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); tmu::clear_cache(); }
 }
 
 // hub registers
@@ -120,11 +139,21 @@ pub struct V3d {
     core: Vec<u32>,
     pub binned: BinResults,
     pub code: Code,
-    /// statistics
+    /// statistics: jobs (bin, render, TFU, CSD), QPU instructions, host time in jobs (ns)
     pub jobs: [u64; 4],
     pub insns: u64,
+    pub host_ns: [u64; 4],
     /// the PM block powered the GPU up (bcm2835-power, V3D domain)
     pub powered: bool,
+    /// guest time (ns), as the SoC last told it
+    pub now: u64,
+    /// done interrupts not yet raised: (guest time, hub?, bits). A job's results are computed when
+    /// it starts; its interrupt comes after the host time it took (scaled by `time_scale`), so the
+    /// guest sees the emulated GPU's real speed.
+    pending: Vec<(u64, bool, u32)>,
+    pub time_scale: f64,
+    /// the bin jobs whose tile lists are live, to re-bin after a snapshot restore
+    bin_jobs: HashMap<u32, [u32; 5]>,
 }
 
 impl Default for V3d { fn default() -> Self { Self::new() } }
@@ -133,7 +162,8 @@ impl V3d {
     pub fn new() -> V3d {
         LOG_ON.store(std::env::var_os("SBC_V3D_LOG").is_some(), std::sync::atomic::Ordering::Relaxed);
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
-        let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], binned: HashMap::new(), code: Code::default(), jobs: [0; 4], insns: 0, powered: true };
+        let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], binned: HashMap::new(), code: Code::default(), jobs: [0; 4], insns: 0, host_ns: [0; 4], powered: true, now: 0, pending: Vec::new(),
+            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), bin_jobs: HashMap::new() };
         v.reset();
         v
     }
@@ -145,7 +175,30 @@ impl V3d {
         self.hub[HUB_INT_MSK_STS / 4] = !0;
         self.core[CTL_INT_MSK_STS / 4] = !0;
         self.binned.clear();
+        self.pending.clear();
+        self.bin_jobs.clear();
     }
+
+    /// Schedule a done interrupt after `ns` of host time.
+    fn done(&mut self, hub: bool, bits: u32, ns: u64) {
+        let delay = (ns as f64 * self.time_scale) as u64;
+        if delay == 0 { if hub { self.hub[HUB_INT_STS / 4] |= bits } else { self.core[CTL_INT_STS / 4] |= bits } return; }
+        self.pending.push((self.now + delay, hub, bits));
+    }
+
+    /// Raise the interrupts that are due at `now`.
+    pub fn tick(&mut self, now: u64) {
+        self.now = now;
+        if self.pending.is_empty() { return; }
+        let (hub, core) = (&mut self.hub, &mut self.core);
+        self.pending.retain(|&(t, h, bits)| {
+            if t > now { return true; }
+            if h { hub[HUB_INT_STS / 4] |= bits } else { core[CTL_INT_STS / 4] |= bits }
+            false
+        });
+    }
+
+    pub fn next_event(&self) -> Option<u64> { self.pending.iter().map(|p| p.0).min() }
 
     fn ident(&self, hub: bool, off: usize) -> Option<u32> {
         Some(match (hub, off) {
@@ -198,11 +251,14 @@ impl V3d {
                 HUB_INT_MSK_CLR => self.hub[HUB_INT_MSK_STS / 4] &= !v,
                 TFU_ICFG => {
                     self.hub[o / 4] = v;
+                    let t0 = Clock::now();
                     let regs: Vec<u32> = (0..16).map(|k| self.hub[TFU_CS / 4 + k]).collect();
                     let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
                     tfu::run(&regs, &mut m);
                     self.jobs[2] += 1;
-                    if v & 1 != 0 { self.hub[HUB_INT_STS / 4] |= HUB_INT_TFUC; }
+                    let ns = t0.elapsed().as_nanos() as u64;
+                    self.host_ns[2] += ns;
+                    if v & 1 != 0 { self.done(true, HUB_INT_TFUC, ns); }
                 }
                 _ => self.hub[o / 4] = v,
             }
@@ -214,41 +270,64 @@ impl V3d {
                 CTL_INT_MSK_CLR => self.core[CTL_INT_MSK_STS / 4] &= !v,
                 CLE_CT0QEA => {
                     self.core[o / 4] = v;
+                    let t0 = Clock::now();
                     let (start, end) = (self.core[CLE_CT0QBA / 4], v);
                     let (qma, qms, qts) = (self.core[CLE_CT0QMA / 4], self.core[CLE_CT0QMS / 4], self.core[CLE_CT0QTS / 4]);
                     self.code.clear();
                     let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
                     let res = bin::run(start, end, qma, qms, qts, &mut m, &mut self.code, &mut self.insns);
-                    if let Some(r) = res { self.binned.insert(qma, std::sync::Arc::new(r)); }
+                    if let Some(r) = res { self.binned.insert(qma, std::sync::Arc::new(r)); self.bin_jobs.insert(qma, [start, end, qma, qms, qts]); }
                     self.core[CLE_CT0CA / 4] = end;
                     self.core[CLE_BFC / 4] = self.core[CLE_BFC / 4].wrapping_add(1);
                     self.jobs[0] += 1;
-                    self.core[CTL_INT_STS / 4] |= INT_FLDONE;
+                    let ns = t0.elapsed().as_nanos() as u64;
+                    self.host_ns[0] += ns;
+                    self.done(false, INT_FLDONE, ns);
                 }
                 CLE_CT1QEA => {
                     self.core[o / 4] = v;
+                    let t0 = Clock::now();
                     let (start, end) = (self.core[CLE_CT1QBA / 4], v);
                     self.code.clear();
                     let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
+                    // after a snapshot restore: rebuild the tile lists the render job will read
+                    if self.binned.len() < self.bin_jobs.len() {
+                        for (q, j) in self.bin_jobs.clone() {
+                            if self.binned.contains_key(&q) { continue; }
+                            if let Some(r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { self.binned.insert(q, std::sync::Arc::new(r)); }
+                        }
+                    }
                     render::run(start, end, &self.binned, &mut m, &mut self.code, &mut self.insns);
                     self.core[CLE_CT1CA / 4] = end;
                     self.core[CLE_RFC / 4] = self.core[CLE_RFC / 4].wrapping_add(1);
                     self.jobs[1] += 1;
-                    self.core[CTL_INT_STS / 4] |= INT_FRDONE;
+                    let ns = t0.elapsed().as_nanos() as u64;
+                    self.host_ns[1] += ns;
+                    self.done(false, INT_FRDONE, ns);
                 }
                 CSD_QUEUED_CFG0 => {
                     self.core[o / 4] = v;
+                    let t0 = Clock::now();
                     let cfg: Vec<u32> = (0..7).map(|k| self.core[CSD_QUEUED_CFG0 / 4 + k]).collect();
                     for k in 0..7 { self.core[CSD_CURRENT_CFG0 / 4 + k] = cfg[k]; }
                     self.code.clear();
                     let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
                     csd::run(&cfg, &mut m, &mut self.code, &mut self.insns);
                     self.jobs[3] += 1;
-                    self.core[CTL_INT_STS / 4] |= INT_CSDDONE;
+                    let ns = t0.elapsed().as_nanos() as u64;
+                    self.host_ns[3] += ns;
+                    self.done(false, INT_CSDDONE, ns);
                 }
                 _ => self.core[o / 4] = v,
             }
         }
+    }
+
+    /// One-line job statistics.
+    pub fn stats(&self) -> String {
+        let ms = |k: usize| self.host_ns[k] as f64 / 1e6;
+        format!("{} bin jobs ({:.0} ms), {} render jobs ({:.0} ms), {} TFU ({:.0} ms), {} compute ({:.0} ms); {} QPU instructions",
+                self.jobs[0], ms(0), self.jobs[1], ms(1), self.jobs[2], ms(2), self.jobs[3], ms(3), self.insns)
     }
 
     fn mmu_on(&self) -> bool { self.hub[MMU_CTL / 4] & 1 != 0 }
@@ -263,12 +342,20 @@ impl V3d {
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
         w.tag("v3d-v1");
         for r in self.hub.iter().chain(self.core.iter()) { w.u32(*r); }
+        w.u64(self.pending.len() as u64);
+        for &(t, h, b) in &self.pending { w.u64(t); w.bool(h); w.u32(b); }
+        w.u64(self.bin_jobs.len() as u64);
+        for j in self.bin_jobs.values() { for &x in j { w.u32(x); } }
     }
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
         r.tag("v3d-v1")?;
         for k in 0..self.hub.len() { self.hub[k] = r.u32()?; }
         for k in 0..self.core.len() { self.core[k] = r.u32()?; }
         self.binned.clear();
+        self.pending.clear();
+        for _ in 0..r.u64()? { let (t, h, b) = (r.u64()?, r.bool()?, r.u32()?); self.pending.push((t, h, b)); }
+        self.bin_jobs.clear();
+        for _ in 0..r.u64()? { let mut j = [0u32; 5]; for x in j.iter_mut() { *x = r.u32()?; } self.bin_jobs.insert(j[2], j); }
         Ok(())
     }
 }

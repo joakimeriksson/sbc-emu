@@ -1,0 +1,11 @@
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial glmark2-es2-drm -b build:duration=1 2>&1 | grep -E 'FPS|Score'; echo GM-""DONE\n
+wait-serial GM-DONE
+quit

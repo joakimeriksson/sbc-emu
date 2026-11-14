@@ -1,0 +1,14 @@
+# glmark2's own per-scene validation (800x600 off-screen, the size its references are for), on the
+# emulated V3D and then on llvmpipe for comparison
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial glmark2-es2-drm --off-screen -s 800x600 --validate 2>&1 | grep -E 'RENDERER|Validation'; MESA_LOADER_DRIVER_OVERRIDE=kms_swrast GALLIUM_DRIVER=llvmpipe glmark2-es2-drm --off-screen -s 800x600 --validate 2>&1 | grep -E 'RENDERER|Validation'; echo VAL-""DONE\n
+wait-serial VAL-DONE
+sleep 2
+quit

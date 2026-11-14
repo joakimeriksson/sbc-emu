@@ -28,6 +28,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core, breakpoints and watchpoints), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
 | Port forwarding | `--hostfwd tcp::2222-:22` (QEMU's syntax) through the user-mode NAT | `ssh-keyscan -p 2222 127.0.0.1` reads the Pi OS host keys |
 | HDMI | the vc4 KMS pipeline the image's `config.txt` asks for (`dtoverlay=vc4-kms-v3d`): HVS compositor, pixel valve, HDMI0 encoder + PHY, DDC with a 1080p monitor's EDID, HDMI audio; `--display fb` keeps the firmware's `simple-framebuffer` (1024×768) instead | stock `vc4`: `HDMI-A-1` connected, modes from the EDID, the console at 1920×1080; `kmstest` switches to 1024×768 and page-flips at 60.00 fps; `speaker-test -D hdmi:…`: a 440.0 Hz tone at 48 kHz on the host; screenshots via `--screenshot` / `shot` |
+| 3D GPU | V3D 4.2 (VideoCore VI) for the stock `v3d` kernel driver and Mesa's `v3d` (OpenGL ES 3.1) and `v3dv` (Vulkan 1.3) drivers: QPU shader cores, binner, rasterizer, tile buffer, texture unit, TFU, compute dispatch, GPU MMU ([docs/gpu.md](docs/gpu.md)) | `kmscube` on HDMI; 16 GLES scenes (depth, stencil, blending, mipmapped/cube/float textures, points/lines, instancing, discard, derivatives, a lit cube) match llvmpipe pixel for pixel in the guest, and a compute shader with shared memory and a barrier is exact; all 33 `glmark2-es2-drm` benchmark scenes run at 1920×1080 (score 12) |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~2.7 min (JIT on), ~200 MiB of the image read |
 
 Compatibility labels in the plan's terms (per-feature evidence above; nothing else is claimed):
@@ -65,6 +66,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | HDMI0 | encoder, PHY, DVP clocks/resets, packet RAM, scheduler; MAI audio (IEC 958 subframes through DMA on DREQ 10); hot-plug from the always-on L2 interrupt controller; CEC registers | `vc4`, `clk-bcm2711-dvp`, `irq-brcmstb-l2` |
 | DDC | brcmstb BSC controller (polled) with an EDID EEPROM: 1920×1080 preferred, 1280×720, 1024×768…, CEA block with HDMI and LPCM audio | `i2c-brcmstb` |
 | TXP | the transposer's registers (writeback; never busy) | `vc4` |
+| V3D | hub + core registers, GPU MMU, control-list executors (binning, rendering), QPUs (interpreted, 16 lanes), TMU, TLB, TFU, CSD; jobs finish when started, their interrupt follows after the host time they took (`SBC_GPU_TIME` scales it) | `v3d`, Mesa `v3d`/`v3dv` |
 | Firmware framebuffer | `simple-framebuffer` in the GPU memory carve-out until `vc4` takes over (the only display with `--display fb`) | `simplefb`, fbcon |
 | Ethernet | GENET v5 (DMA rings, status blocks, INTRL2), UniMAC MDIO, BCM54213PE PHY | `bcmgenet`, `unimac-mdio`, Broadcom PHY |
 | Wi-Fi | second SD host (SDIO) + CYW43455: CCCR/FBR/CIS, backplane, EROM, SDIO core, emulated FullMAC; open `sbc-emu` and WPA2-PSK `sbc-emu-wpa2` (passphrase `raspberry-pi`) | `sdhci-iproc`, `brcmfmac`, `brcmfmac-wcc` |
@@ -127,6 +129,10 @@ More options, mostly after QEMU's:
   `dtoverlay=vc4-kms-v3d` asks, so the stock `vc4` driver drives HDMI0 (a 1080p monitor; about
   2 s more boot time); `fb` leaves the firmware's 1024×768 framebuffer as the only display.
   The browser build uses `fb`.
+- `--no-gpu`: leave out the V3D 3D GPU (it comes with `--display kms`); Mesa then renders in
+  software.
+- `--sd-persist`: writes go to the SD image file itself instead of a copy-on-write overlay (for a
+  scratch copy of the image, e.g. one with Mesa and the GPU tests installed).
 - `--usb-drive IMAGE`: a USB stick (copy-on-write, like the SD card) on the third USB-A port;
   given with `--restore`, it is hot-plugged after the restore.
 - `--camera`: a USB webcam (UVC, 640×480 YUYV at 30 frames/s of guest time, a test pattern).
@@ -177,12 +183,15 @@ cargo test --release --workspace
 - `arm-a64/tests/system.rs`: exceptions, EL changes, MMU faults, timer interrupts.
 - `bcm2711/tests/watch.rs`: debugger watchpoints stop after the access, on the right core.
 - `tools/wasm-smoke.mjs`, `tools/wasm-smoke-sd.mjs`: headless boots of the WebAssembly build.
+- `tests/gpu/` + `scripts/gpu-gltest.txt`: OpenGL ES and Vulkan scenes rendered in the guest on the
+  emulated V3D and on Mesa's software renderers, compared per pixel ([docs/gpu.md](docs/gpu.md)).
 
 ## Layout
 
 ```
 emu-core/   Bus / Core / Trap and the snapshot serializer
 arm-a64/    the ARMv8-A core: decode+execute, system registers, MMU, FP/NEON
+v3d/        the V3D 4.2 3D GPU (packets generated from Mesa's v3d_packet.xml by tools/gen_v3d_packets.py)
 bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2, PCIe + xHCI, USB devices, I²S, Bluetooth,
             GENET, device tree, boot, FAT
 sbc-net/    virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP (from esp32sim)
@@ -193,7 +202,8 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 
 ## Known gaps
 
-No V3D 3D GPU (a desktop compositor has to render in software), no HDMI1 (the second port has
+The 3D GPU's shader cores are interpreted (glmark2 runs at 1–45 fps at 1080p; no ASTC, transform feedback or
+geometry shaders), no HDMI1 (the second port has
 no monitor), no CEC devices; the HVS draws RGB planes only (no YUV video planes, no tiled
 formats) and scales with nearest neighbour;
 no CSI camera (the webcam is USB); no USB 3 devices (the USB 3 root ports stay empty), no USB
@@ -213,6 +223,7 @@ specifically (QEMU 9/10 docs and its open patch series, November 2026):
 |---|---|---|
 | Boot | the stock Raspberry Pi OS `.img` (config.txt, cmdline.txt, kernel8.img) | kernel and DTB passed by hand |
 | Display | HDMI through the stock `vc4` KMS driver (HVS, pixel valve, HDMI encoder, EDID, HDMI audio) | the firmware framebuffer |
+| 3D GPU | V3D 4.2 for Mesa's OpenGL ES 3.1 and Vulkan 1.3 drivers | no |
 | Cores | 4: in turns on one thread (repeatable) or a thread each (`--threads multi`) | 4, a thread each (MTTCG) |
 | Ethernet (GENET) | yes, with NAT and port forwarding | not merged (patches in review) |
 | USB | keyboard, tablet, stick, webcam on the xHCI (USB-A) ports; OTG port | keyboard does not enumerate on raspi4b |

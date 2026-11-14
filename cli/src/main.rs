@@ -496,6 +496,7 @@ fn run(args: &[String]) -> ExitCode {
     if !m.soc.mbox.unknown.is_empty() { eprintln!("[sbc-emu] unanswered mailbox tags: {:x?}", m.soc.mbox.unknown); }
     eprintln!("\n[sbc-emu] stopped: {:?} pc={:#x} insns={} sim={:.3}s wall={:.1}s exceptions={} irqs={}",
         result, m.cpu().pc, m.instret(), m.now as f64 / 1e9, started.elapsed().as_secs_f64(), m.exceptions, m.irqs);
+    if let Some(g) = m.soc.v3d.as_ref() { eprintln!("[sbc-emu] gpu: {}", g.stats()); }
     if let Some(j) = m.jit() {
         eprintln!("[sbc-emu] jit: {} blocks compiled, {} links, {} flushes; {} block runs, {:.1} instructions per run, {:.0}% of instructions in blocks",
             j.compiled, j.linked, j.flushes, j.execs, j.exec_insns as f64 / j.execs.max(1) as f64, 100.0 * j.exec_insns as f64 / m.instret().max(1) as f64);

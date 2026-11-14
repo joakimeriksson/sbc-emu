@@ -253,7 +253,7 @@ impl Soc {
             let l = v.irq_pv();
             self.gic.set_level(crate::vc4::SPI_PV2, l);
         }
-        if let Some(g) = self.v3d.as_ref() { let l = g.irq(); self.gic.set_level(32 + v3d::SPI, l); }
+        if let Some(g) = self.v3d.as_mut() { g.tick(now); let l = g.irq(); self.gic.set_level(32 + v3d::SPI, l); }
         self.dirty = false;
     }
 
@@ -396,7 +396,8 @@ impl Soc {
         let x = self.pcie.xhci.next_event(&self.devs);
         let bt = self.bt.as_ref().and_then(|b| b.next_event());
         let vb = self.vc4.as_ref().and_then(|v| v.next_event());
-        [self.usb.next_event(), x, self.pace_next, bt, vb].into_iter().flatten().min()
+        let gpu = self.v3d.as_ref().and_then(|g| g.next_event());
+        [self.usb.next_event(), x, self.pace_next, bt, vb, gpu].into_iter().flatten().min()
     }
 
     fn note(&mut self, a: u64) {

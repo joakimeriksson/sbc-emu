@@ -1,0 +1,13 @@
+# Dumps Mesa's compiled QPU code (VIR and disassembly) of kmscube's shaders to serial (V3D_DEBUG)
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial V3D_DEBUG=qpu,vir kmscube -D /dev/dri/card1 -c 1 > /tmp/k.log 2>&1; grep -c . /tmp/k.log; cat /tmp/k.log; echo DUMP-""DONE\n
+wait-serial DUMP-DONE
+sleep 2
+quit

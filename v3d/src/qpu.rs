@@ -372,10 +372,10 @@ pub fn f32_to_f16(f: f32) -> u16 {
     s | r as u16
 }
 
-#[inline]
+#[inline(always)]
 fn ftz(f: f32) -> f32 { if f.is_subnormal() { if f.is_sign_negative() { -0.0 } else { 0.0 } } else { f } }
 
-#[inline]
+#[inline(always)]
 fn unpack_f32(v: u32, u: Unpack) -> f32 {
     let f = match u {
         Unpack::L => f16_to_f32(v as u16),
@@ -509,6 +509,57 @@ pub struct Thread {
     pub done: bool,
 }
 
+/// Lane-parallel evaluation of the common add-ALU ops without flag updates or output packing.
+#[inline]
+fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
+    let mut o = [0u32; LANES];
+    macro_rules! f2 { ($e:expr) => {{ for l in 0..LANES { let (p, q) = (unpack_f32(a[l], ua), unpack_f32(b[l], ub)); o[l] = ftz($e(p, q)).to_bits(); } }} }
+    macro_rules! i2 { ($e:expr) => {{ for l in 0..LANES { o[l] = $e(a[l], b[l]); } }} }
+    match op {
+        AddOp::Fadd | AddOp::Faddnf => f2!(|p: f32, q: f32| p + q),
+        AddOp::Fsub => f2!(|p: f32, q: f32| p - q),
+        AddOp::Fmin => f2!(fmin),
+        AddOp::Fmax => f2!(fmax),
+        AddOp::Add => i2!(|x: u32, y: u32| x.wrapping_add(y)),
+        AddOp::Sub => i2!(|x: u32, y: u32| x.wrapping_sub(y)),
+        AddOp::And => i2!(|x: u32, y: u32| x & y),
+        AddOp::Or => i2!(|x: u32, y: u32| x | y),
+        AddOp::Xor => i2!(|x: u32, y: u32| x ^ y),
+        AddOp::Shl => i2!(|x: u32, y: u32| x.wrapping_shl(y & 31)),
+        AddOp::Shr => i2!(|x: u32, y: u32| x.wrapping_shr(y & 31)),
+        AddOp::Asr => i2!(|x: u32, y: u32| ((x as i32) >> (y & 31)) as u32),
+        AddOp::Min => i2!(|x: u32, y: u32| (x as i32).min(y as i32) as u32),
+        AddOp::Max => i2!(|x: u32, y: u32| (x as i32).max(y as i32) as u32),
+        AddOp::Umin => i2!(|x: u32, y: u32| x.min(y)),
+        AddOp::Umax => i2!(|x: u32, y: u32| x.max(y)),
+        AddOp::Vfpack => { for l in 0..LANES { o[l] = (f32_to_f16(unpack_f32(a[l], ua)) as u32) | ((f32_to_f16(unpack_f32(b[l], ub)) as u32) << 16); } }
+        AddOp::Recip | AddOp::Rsqrt | AddOp::Exp | AddOp::Log | AddOp::Sin | AddOp::Rsqrt2 => {
+            for l in 0..LANES { o[l] = ftz(sfu(op, unpack_f32(a[l], ua))).to_bits(); }
+        }
+        AddOp::Itof => { for l in 0..LANES { o[l] = ftz(a[l] as i32 as f32).to_bits(); } }
+        AddOp::Utof => { for l in 0..LANES { o[l] = ftz(a[l] as f32).to_bits(); } }
+        AddOp::Ftoiz => { for l in 0..LANES { o[l] = f2i_sat(unpack_f32(a[l], ua).trunc()); } }
+        AddOp::Ffloor => { for l in 0..LANES { o[l] = unpack_f32(a[l], ua).floor().to_bits(); } }
+        AddOp::Not => { for l in 0..LANES { o[l] = !a[l]; } }
+        _ => return None,
+    }
+    Some(o)
+}
+
+#[inline]
+fn fast_mul(op: MulOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
+    let mut o = [0u32; LANES];
+    match op {
+        MulOp::Fmul => { for l in 0..LANES { o[l] = ftz(unpack_f32(a[l], ua) * unpack_f32(b[l], ub)).to_bits(); } }
+        MulOp::Fmov => { for l in 0..LANES { o[l] = unpack_f32(a[l], ua).to_bits(); } }
+        MulOp::Mov => o = *a,
+        MulOp::Add => { for l in 0..LANES { o[l] = a[l].wrapping_add(b[l]); } }
+        MulOp::Sub => { for l in 0..LANES { o[l] = a[l].wrapping_sub(b[l]); } }
+        _ => return None,
+    }
+    Some(o)
+}
+
 #[inline]
 fn lanes_of(mask: u16) -> impl Iterator<Item = usize> { (0..LANES).filter(move |l| mask & (1 << l) != 0) }
 
@@ -521,6 +572,18 @@ impl Thread {
             fx: [0.0; LANES], fy: [0.0; LANES], tidx: 0, barrier_id: 0, final_section, prev_thrsw: false, end_in: None,
             branch: None, delayed: Vec::new(), insns: 0, done: false,
         }
+    }
+
+    /// Start a new invocation reusing this thread's storage (the register file keeps stale
+    /// values, as on the hardware).
+    pub fn reset(&mut self, pc: u32, unif: u32, final_section: bool) {
+        self.acc = [[0; LANES]; 6];
+        self.fa = 0; self.fb = 0; self.msf = [0xf; LANES]; self.revf = false;
+        self.pc = pc; self.unif = unif; self.unifa = 0; self.lr = 0; self.rtop = [0; LANES]; self.valid = 0xffff;
+        self.tmu_cfg.clear(); self.tmu_req = TmuReq::default(); self.tmu_out.clear();
+        self.vpm.clear(); self.vpm_out_base = 0;
+        self.tidx = 0; self.barrier_id = 0; self.final_section = final_section; self.prev_thrsw = false; self.end_in = None;
+        self.branch = None; self.delayed.clear(); self.done = false;
     }
 
     fn next_uniform(&mut self, env: &mut dyn Env) -> u32 {
@@ -666,7 +729,8 @@ impl Thread {
         let mut ares = [0u32; LANES];
         let mut az = 0u16; let mut an = 0u16; let mut ac = 0u16;
         let mut a_has = true;
-        {
+        let afast = if add.pf == Pf::None && add.uf == Uf::None { fast_add(add.op, add.ua, add.ub, &a_a, &a_b) } else { None };
+        if let Some(r) = afast { ares = r; } else {
             use AddOp::*;
             let fl = |v: &V, k: usize, u: Unpack| unpack_f32(v[k], u);
             for l in 0..LANES {
@@ -793,6 +857,8 @@ impl Thread {
         let mut mres = [0u32; LANES];
         let mut mz = 0u16; let mut mn = 0u16; let mut mc = 0u16;
         let m_has = mul.op != MulOp::Nop && mul.op != MulOp::Multop;
+        let mfast = if mul.pf == Pf::None && mul.uf == Uf::None { fast_mul(mul.op, mul.ua, mul.ub, &m_a, &m_b) } else { None };
+        if let Some(r) = mfast { mres = r; } else if mul.op != MulOp::Nop {
         for l in 0..LANES {
             let (x, y) = (m_a[l], m_b[l]);
             let (mut z, mut n, mut c) = (false, false, false);
@@ -817,6 +883,7 @@ impl Thread {
             if z { mz |= 1 << l; }
             if n { mn |= 1 << l; }
             if c { mc |= 1 << l; }
+        }
         }
 
         // ---- signals that read uniforms come before ALU writes using them (TLBU/TMUAU take theirs after)
@@ -884,9 +951,19 @@ impl Thread {
                 Pack::H => (old & 0xffff) | ((f32_to_f16(f32::from_bits(new)) as u32) << 16),
             }
         };
+        if !magic && pack == Pack::None {
+            let r = &mut self.rf[waddr as usize];
+            if mask == 0xffff { *r = *v; } else { for l in 0..LANES { if mask & (1 << l) != 0 { r[l] = v[l]; } } }
+            return;
+        }
         if !magic {
             let r = &mut self.rf[waddr as usize];
             for l in lanes_of(mask) { r[l] = packed(r[l], v[l]); }
+            return;
+        }
+        if waddr <= 5 && pack == Pack::None {
+            let r = &mut self.acc[waddr as usize];
+            if mask == 0xffff { *r = *v; } else { for l in 0..LANES { if mask & (1 << l) != 0 { r[l] = v[l]; } } }
             return;
         }
         match waddr {

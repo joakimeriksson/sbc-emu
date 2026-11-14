@@ -54,16 +54,18 @@ struct Render<'r> {
     generic: (u32, u32),
     supertile: MulticoreRenderingSupertileCfg,
     /// vertex shader outputs per draw of the current bin result
-    vs_cache: HashMap<u32, Arc<Vec<Vec<u32>>>>,
+    vs_cache: HashMap<u32, Arc<VsOut>>,
     occlusion: HashMap<u32, u32>,
     insns: u64,
+    /// fragment shader thread storage, reused between invocations
+    thread: Option<Box<Thread>>,
 }
 
 pub fn run(start: u32, end: u32, binned: &BinResults, m: &mut Gmem, code: &mut Code, insns: &mut u64) {
     let mut r = Render {
         binned, cur: None, width: 0, height: 0, msaa: false, nrt: 1, rt: [RtCfg::default(); 4], depth_type: 0, early_ds_clear: false,
         z_clear: 1.0, s_clear: 0, tile_w: 64, tile_h: 64, tb: TileBuf::new(64, 64, 1), tile: (0, 0), generic: (0, 0),
-        supertile: MulticoreRenderingSupertileCfg::default(), vs_cache: HashMap::new(), occlusion: HashMap::new(), insns: 0,
+        supertile: MulticoreRenderingSupertileCfg::default(), vs_cache: HashMap::new(), occlusion: HashMap::new(), insns: 0, thread: None,
     };
     let mut cl = bin::Cl::new(start, end);
     while let Some((op, b)) = cl.next(m) {
@@ -246,6 +248,7 @@ impl Render<'_> {
 
     fn store(&mut self, c: &StoreTileBufferGeneral, m: &mut Gmem) {
         let buf = c.buffer_to_store;
+        if crate::log_enabled() && self.tile == (0, 0) { crate::log(&format!("v3d: store buf {buf} fmt {} mem {} addr {:#x} rb_swap {} stride {} dither {} type {:?}", c.output_image_format, c.memory_format, c.address, c.r_b_swap, c.height_in_ub_or_stride, c.dither_mode, self.rt.map(|r| (r.ty, r.bpp)))); }
         if buf == 8 { if c.clear_buffer_being_stored { self.clear(true, true); } return; }
         let fmt = c.output_image_format;
         let cpp = formats::out_cpp(fmt);
@@ -254,6 +257,30 @@ impl Render<'_> {
         let all = c.decimate_mode == 3 && self.msaa;
         let resolve = c.decimate_mode == 1 && self.msaa;
         let (x0, y0) = (self.tile.0 * self.tile_w, self.tile.1 * self.tile_h);
+        // fast path: a raster colour store, one memory write per row
+        if t == Tiling::Raster && (0..=3).contains(&buf) && !all && !resolve && !c.channel_reverse {
+            let ty = self.rt[buf as usize].ty;
+            let w = self.tile_w.min(self.width.saturating_sub(x0));
+            let mut row = vec![0u8; (w * cpp) as usize];
+            for y in 0..self.tile_h {
+                let gy = y0 + y;
+                if gy >= self.height { break; }
+                let my = if c.flip_y { c.height.saturating_sub(1).saturating_sub(gy) } else { gy };
+                for x in 0..w {
+                    let mut v = self.tb.color[buf as usize][self.tb.idx(x, y, 0)];
+                    if c.r_b_swap { v.swap(0, 2); }
+                    let o = (x * cpp) as usize;
+                    if fmt == 27 && ty == it::UNORM8 {
+                        for k in 0..4 { row[o + k] = (f32::from_bits(v[k]) * 255.0 + 0.5) as u8; }
+                    } else {
+                        formats::encode(fmt, v, &mut row[o..o + cpp as usize]);
+                    }
+                }
+                m.write(c.address.wrapping_add(my * stride + x0 * cpp), &row);
+            }
+            if c.clear_buffer_being_stored { let v = clear_value(ty, self.rt[buf as usize].bpp, self.rt[buf as usize].clear); self.tb.color[buf as usize].iter_mut().for_each(|p| *p = v); }
+            return;
+        }
         let mut px = [0u8; 16];
         for y in 0..self.tile_h {
             for x in 0..self.tile_w {
@@ -312,12 +339,13 @@ impl Render<'_> {
                 Some(o) => o.clone(),
                 None => {
                     let mut ins = 0;
-                    let o = Arc::new(bin::run_vs(m, code, &mut ins, &d, false, &d.verts));
+                    let o = bin::run_vs(m, code, &mut ins, &d, false, &d.verts);
                     self.insns += ins;
                     if crate::log_enabled() {
                         let row = |k: usize| o[k].iter().map(|v| format!("{:#x}/{}", v, f32::from_bits(*v))).collect::<Vec<_>>().join(" ");
                         crate::log(&format!("v3d: draw {} VS out v0: {}", p.draw, row(0)));
                     }
+                    let o = Arc::new(VsOut::new(&d, o));
                     self.vs_cache.insert(p.draw, o.clone());
                     o
                 }
@@ -326,62 +354,36 @@ impl Render<'_> {
         }
     }
 
-    fn draw_prim(&mut self, d: &DrawState, p: &Prim, outs: &[Vec<u32>], m: &mut Gmem, code: &mut Code) {
-        let psize = d.rec.point_size_in_shaded_vertex_data;
-        let vbase = 4 + psize as usize;
+    fn draw_prim(&mut self, d: &DrawState, p: &Prim, vo: &VsOut, m: &mut Gmem, code: &mut Code) {
         let nvary = d.rec.number_of_varyings_in_fragment_shader as usize;
-        let vert = |k: usize| -> RVert {
-            let o = &outs[p.v[k] as usize];
-            let g = |i: usize| *o.get(i).unwrap_or(&0);
-            RVert {
-                x: d.vp_center[0] + (g(0) as i32) as f32 / 256.0,
-                y: d.vp_center[1] + (g(1) as i32) as f32 / 256.0,
-                z: f32::from_bits(g(2)),
-                invw: f32::from_bits(g(3)),
-                vary: (0..nvary).map(|j| g(vbase + j)).collect(),
-            }
-        };
         let n = p.n as usize;
-        let orig: Vec<RVert> = (0..n).map(vert).collect();
+        let orig = [&vo.verts[p.v[0] as usize], &vo.verts[p.v[1] as usize], &vo.verts[p.v[2] as usize]];
         let pv = if d.cfg.direct3d_provoking_vertex { 0 } else { n - 1 };
-        let prov = orig[pv].vary.clone();
-        let tris: Vec<[RVert; 3]> = match &p.clipped {
-            None if n == 3 => vec![[orig[0].clone(), orig[1].clone(), orig[2].clone()]],
-            None => Vec::new(),
-            Some(poly) if n == 3 => {
-                let cv = |c: &ClipVert| -> RVert {
-                    let s = bin::to_screen(d, &c.pos);
-                    let iw = 1.0 / c.pos[3];
-                    let vary = (0..nvary).map(|j| {
-                        if d.flat & (1u128 << j) != 0 { return prov[j]; }
-                        let mut a = 0.0;
-                        for k in 0..3 { a += c.bary[k] * f32::from_bits(orig[k].vary[j]); }
-                        a.to_bits()
-                    }).collect();
-                    RVert { x: s[0], y: s[1], z: c.pos[2] * iw * d.z_scale + d.z_offset, invw: iw, vary }
-                };
-                let vs: Vec<RVert> = poly.iter().map(cv).collect();
-                (1..vs.len().saturating_sub(1)).map(|k| [vs[0].clone(), vs[k].clone(), vs[k + 1].clone()]).collect()
-            }
-            Some(_) => Vec::new(),
+        let prov: &[u32] = &orig[pv].vary;
+        // a vertex the clipper made: position from clip space, varyings weighted
+        let cv = |c: &ClipVert| -> RVert {
+            let s = bin::to_screen(d, &c.pos);
+            let iw = 1.0 / c.pos[3];
+            let vary = (0..nvary).map(|j| {
+                if d.flat & (1u128 << j) != 0 { return prov[j]; }
+                let mut a = 0.0;
+                for k in 0..n { a += c.bary[k] * f32::from_bits(orig[k].vary[j]); }
+                a.to_bits()
+            }).collect();
+            RVert { x: s[0], y: s[1], z: c.pos[2] * iw * d.z_scale + d.z_offset, invw: iw, vary }
         };
-        match n {
-            3 => for t in &tris { self.raster_tri(d, p, [&t[0], &t[1], &t[2]], &prov, m, code); },
-            2 => {
-                let (a, b) = match &p.clipped {
-                    Some(poly) if poly.len() == 2 => {
-                        let mk = |c: &ClipVert| { let s = bin::to_screen(d, &c.pos); let iw = 1.0 / c.pos[3];
-                            RVert { x: s[0], y: s[1], z: c.pos[2] * iw * d.z_scale + d.z_offset, invw: iw,
-                                    vary: (0..nvary).map(|j| (c.bary[0] * f32::from_bits(orig[0].vary[j]) + c.bary[1] * f32::from_bits(orig[1].vary[j])).to_bits()).collect() } };
-                        (mk(&poly[0]), mk(&poly[1]))
-                    }
-                    _ => (orig[0].clone(), orig[1].clone()),
-                };
-                self.raster_line(d, p, &a, &b, &prov, m, code);
+        match (n, &p.clipped) {
+            (3, None) => self.raster_tri(d, p, orig, prov, m, code),
+            (3, Some(poly)) => {
+                let vs: Vec<RVert> = poly.iter().map(cv).collect();
+                for k in 1..vs.len().saturating_sub(1) { self.raster_tri(d, p, [&vs[0], &vs[k], &vs[k + 1]], prov, m, code); }
             }
+            (2, Some(poly)) if poly.len() == 2 => { let (a, b) = (cv(&poly[0]), cv(&poly[1])); self.raster_line(d, p, &a, &b, prov, m, code); }
+            (2, Some(_)) => {}
+            (2, None) => self.raster_line(d, p, orig[0], orig[1], prov, m, code),
             _ => {
-                let size = if psize { f32::from_bits(*outs[p.v[0] as usize].get(4).unwrap_or(&0)) } else { d.point_size };
-                self.raster_point(d, p, &orig[0], size, m, code);
+                let size = if d.rec.point_size_in_shaded_vertex_data { f32::from_bits(*vo.outs[p.v[0] as usize].get(4).unwrap_or(&0)) } else { d.point_size };
+                self.raster_point(d, p, orig[0], size, m, code);
             }
         }
     }
@@ -427,7 +429,7 @@ impl Render<'_> {
             y += 2;
         }
         let pv = if d.cfg.direct3d_provoking_vertex { 0 } else { 2 };
-        let geo = Geo { v: [v[0].clone(), v[1].clone(), v[2].clone()], prov: prov.to_vec(), pv, offset, kind: 3, point: None };
+        let geo = Geo { v: [v[0], v[1], v[2]], prov, pv, offset, kind: 3, point: None };
         self.shade(d, p, &geo, &quads, m, code);
     }
 
@@ -470,7 +472,7 @@ impl Render<'_> {
             y += 2;
         }
         let pv = if d.cfg.direct3d_provoking_vertex { 0 } else { 1 };
-        let geo = Geo { v: [a.clone(), b.clone(), b.clone()], prov: prov.to_vec(), pv, offset: 0.0, kind: 2, point: None };
+        let geo = Geo { v: [a, b, b], prov, pv, offset: 0.0, kind: 2, point: None };
         self.shade(d, p, &geo, &quads, m, code);
     }
 
@@ -497,17 +499,18 @@ impl Render<'_> {
             }
             y += 2;
         }
-        let geo = Geo { v: [v.clone(), v.clone(), v.clone()], prov: v.vary.clone(), pv: 0, offset: 0.0, kind: 1, point: Some((l, t, s)) };
+        let geo = Geo { v: [v, v, v], prov: &v.vary, pv: 0, offset: 0.0, kind: 1, point: Some((l, t, s)) };
         self.shade(d, p, &geo, &quads, m, code);
     }
 
     /// Fragment shading of covered quads, four quads per QPU thread.
-    fn shade(&mut self, d: &DrawState, p: &Prim, geo: &Geo, quads: &[Quad], m: &mut Gmem, code: &mut Code) {
+    fn shade(&mut self, d: &DrawState, p: &Prim, geo: &Geo<'_>, quads: &[Quad], m: &mut Gmem, code: &mut Code) {
         let rec = &d.rec;
         let late_z = rec.fragment_shader_does_z_writes;
         let (tx0, ty0) = (self.tile.0 * self.tile_w, self.tile.1 * self.tile_h);
         for batch in quads.chunks(4) {
-            let mut t = Thread::new(rec.fragment_shader_code_address, rec.fragment_shader_uniforms_address, rec.fragment_shader_start_in_final_thread_section);
+            let mut t = self.thread.take().unwrap_or_else(|| Box::new(Thread::new(0, 0, false)));
+            t.reset(rec.fragment_shader_code_address, rec.fragment_shader_uniforms_address, rec.fragment_shader_start_in_final_thread_section);
             t.revf = p.reverse;
             let mut fe = FsEnv { r: self, d, geo, m, bary: [[0.0; 3]; LANES], z: [0.0; LANES], vary_n: 0, tlb_cfg: !0, pending: Vec::new(), spec: 0, need: 0,
                                  tile0: (tx0, ty0), passed: 0, prim: p };
@@ -536,7 +539,7 @@ impl Render<'_> {
             for l in batch.len() * 4..LANES { t.msf[l] = 0; }
             if !late_z {
                 for l in 0..LANES { if t.msf[l] != 0 { let z = fe.z[l]; fe.ds_test(&mut t, l, z); } }
-                if t.msf.iter().all(|&s| s == 0) { continue; }
+                if t.msf.iter().all(|&s| s == 0) { drop(fe); self.thread = Some(t); continue; }
             }
             let before = t.insns;
             let stop = t.run(code, &mut fe, 5_000_000);
@@ -544,16 +547,34 @@ impl Render<'_> {
             if d.occlusion != 0 { *fe.r.occlusion.entry(d.occlusion).or_default() += fe.passed; }
             let n = t.insns - before;
             fe.r.insns += n;
+            drop(fe);
+            self.thread = Some(t);
         }
+    }
+}
+
+/// Vertex shader outputs of a draw, and the vertices ready for rasterization.
+struct VsOut { outs: Vec<Vec<u32>>, verts: Vec<RVert> }
+
+impl VsOut {
+    fn new(d: &DrawState, outs: Vec<Vec<u32>>) -> VsOut {
+        let vbase = 4 + d.rec.point_size_in_shaded_vertex_data as usize;
+        let nvary = d.rec.number_of_varyings_in_fragment_shader as usize;
+        let verts = outs.iter().map(|o| {
+            let g = |i: usize| *o.get(i).unwrap_or(&0);
+            RVert { x: d.vp_center[0] + (g(0) as i32) as f32 / 256.0, y: d.vp_center[1] + (g(1) as i32) as f32 / 256.0,
+                    z: f32::from_bits(g(2)), invw: f32::from_bits(g(3)), vary: (0..nvary).map(|j| g(vbase + j)).collect() }
+        }).collect();
+        VsOut { outs, verts }
     }
 }
 
 #[derive(Clone)]
 struct Quad { x: u32, y: u32, cov: [u8; 4], bary: [[f32; 3]; 4] }
 
-struct Geo {
-    v: [RVert; 3],
-    prov: Vec<u32>,
+struct Geo<'g> {
+    v: [&'g RVert; 3],
+    prov: &'g [u32],
     pv: usize,
     offset: f32,
     kind: u8,
@@ -563,7 +584,7 @@ struct Geo {
 struct FsEnv<'a, 'r, 'm> {
     r: &'a mut Render<'r>,
     d: &'a DrawState,
-    geo: &'a Geo,
+    geo: &'a Geo<'a>,
     m: &'a mut Gmem<'m>,
     bary: [[f32; 3]; LANES],
     z: [f32; LANES],

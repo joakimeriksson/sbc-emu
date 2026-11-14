@@ -90,6 +90,13 @@ fn general(m: &mut Gmem, cfg: u32, req: &TmuReq, lanes: u16) -> Vec<V> {
     vec![out]
 }
 
+thread_local! {
+    static TEX_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, u32, u8), std::rc::Rc<Tex>>> = Default::default();
+}
+
+/// Forget the cached texture setups (at the start of each job).
+pub fn clear_cache() { TEX_CACHE.with(|c| c.borrow_mut().clear()); }
+
 /// Texture state and sampler for one lookup.
 struct Tex {
     ts: TextureShaderState,
@@ -168,28 +175,37 @@ pub fn texture(m: &mut Gmem, t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuRe
     let unnorm = p1 & 2 != 0;
     let ts_addr = p0 & !0xf;
     let ss_addr = p1 & !0x7;
-    let ts = TextureShaderState::parse(&m.bytes(ts_addr, TextureShaderState::LEN));
-    let ss = if ss_addr != 0 { Some(SamplerState::parse(&m.bytes(ss_addr, SamplerState::LEN))) } else { None };
     let gather = p2 & (1 << 7) != 0;
     let gather_comp = (p2 >> 5) & 3;
     let disable_autolod = p2 & 2 != 0;
     let sx4 = |v: u32| ((v << 28) as i32 >> 28);
     let (off_s, off_t, off_r) = (sx4((p2 >> 8) & 0xf), sx4((p2 >> 12) & 0xf), sx4((p2 >> 16) & 0xf));
-    let fmt = tex_fmt(ts.texture_type);
     let one_d = req.t.is_none() && kind != TmuKind::TexCube;
     let is_3d = req.r.is_some() && kind != TmuKind::TexCube;
-    let width = if one_d { ts.image_width | ts.image_height << 14 } else { ts.image_width };
-    let height = if one_d { 1 } else { ts.image_height.max(1) };
-    let depth = ts.image_depth.max(1);
-    let max_level = ts.max_level;
-    let levels = if one_d {
-        vec![Level { offset: 0, tiling: tiling::Tiling::Raster, pw: width, ph: 1, w: width, h: 1, d: 1, stride: width * fmt.cpp, size: width * fmt.cpp }]
-    } else {
-        tiling::mip_chain(width.max(1), height, if is_3d { depth } else { 1 }, fmt.cpp, fmt.bw, fmt.bh, max_level, is_3d,
-                          ts.level_0_is_strictly_uif, ts.level_0_xor_enable, ts.level_0_ub_pad)
-    };
-    let srgb = ts.srgb && !ss.map_or(false, |s| s.srgb_disable);
-    let tex = Tex { ts, ss, fmt, base: ts.texture_base_pointer & !0x3f, levels, one_d, is_3d, srgb };
+    // the parsed records and the mip chain, cached for the job (they cannot change during it)
+    let key = (ts_addr, ss_addr, one_d as u8 | (is_3d as u8) << 1);
+    let tex = TEX_CACHE.with(|c| c.borrow().get(&key).cloned()).unwrap_or_else(|| {
+        let ts = TextureShaderState::parse(&m.bytes(ts_addr, TextureShaderState::LEN));
+        let ss = if ss_addr != 0 { Some(SamplerState::parse(&m.bytes(ss_addr, SamplerState::LEN))) } else { None };
+        let fmt = tex_fmt(ts.texture_type);
+        let width = if one_d { ts.image_width | ts.image_height << 14 } else { ts.image_width };
+        let height = if one_d { 1 } else { ts.image_height.max(1) };
+        let depth = ts.image_depth.max(1);
+        let levels = if one_d {
+            vec![Level { offset: 0, tiling: tiling::Tiling::Raster, pw: width, ph: 1, w: width, h: 1, d: 1, stride: width * fmt.cpp, size: width * fmt.cpp }]
+        } else {
+            tiling::mip_chain(width.max(1), height, if is_3d { depth } else { 1 }, fmt.cpp, fmt.bw, fmt.bh, ts.max_level, is_3d,
+                              ts.level_0_is_strictly_uif, ts.level_0_xor_enable, ts.level_0_ub_pad)
+        };
+        let srgb = ts.srgb && !ss.map_or(false, |s| s.srgb_disable);
+        let t = std::rc::Rc::new(Tex { ts, ss, fmt, base: ts.texture_base_pointer & !0x3f, levels, one_d, is_3d, srgb });
+        TEX_CACHE.with(|c| c.borrow_mut().insert(key, t.clone()));
+        t
+    });
+    let fmt = tex.fmt;
+    let width = if one_d { tex.ts.image_width | tex.ts.image_height << 14 } else { tex.ts.image_width };
+    let height = if one_d { 1 } else { tex.ts.image_height.max(1) };
+    let depth = tex.ts.image_depth.max(1);
 
     let (mag_nearest, min_nearest, mip_nearest, wrap_s, wrap_t, wrap_r, min_lod, max_lod, bias, cmp_fn) = match &tex.ss {
         Some(s) => (s.mag_filter_nearest, s.min_filter_nearest, s.mip_filter_nearest, s.wrap_s, s.wrap_t, s.wrap_r,

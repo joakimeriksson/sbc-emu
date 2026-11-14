@@ -1,0 +1,20 @@
+# Vulkan through Mesa's v3dv on the emulated V3D: device info, then vkcube on HDMI (VK_KHR_display)
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial vulkaninfo --summary 2>&1 | grep -v '^ *$' | head -60; echo VI-""DONE\n
+wait-serial VI-DONE
+serial (vkcube --wsi display --c 400 > /tmp/vk.log 2>&1; echo VK-""EXIT $?) &\n
+sleep 12
+shot out/gpu-vkcube-1.png
+sleep 4
+shot out/gpu-vkcube-2.png
+wait-serial VK-EXIT
+serial cat /tmp/vk.log | tail -20\n
+sleep 3
+quit
