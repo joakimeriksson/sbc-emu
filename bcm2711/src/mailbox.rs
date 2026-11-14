@@ -41,6 +41,8 @@ pub struct Mailbox {
     pub temp_mc: u32,
     /// the firmware clock that drives the I²S bit clock (Hz; the DISP clock, id 16)
     pub audio_clk: u32,
+    /// firmware clock rates as set (Hz, by clock id)
+    pub rates: [u32; 32],
 }
 
 impl Mailbox {
@@ -48,6 +50,7 @@ impl Mailbox {
         Mailbox {
             temp_mc: 45_000,
             audio_clk: 0,
+            rates: std::array::from_fn(|k| clock_rate(k as u32)),
             rd: VecDeque::new(),
             cfg: 0,
             fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
@@ -125,9 +128,10 @@ impl Mailbox {
             0x0000_0001 => set(v, &[FW_REVISION]),
             0x0000_0002 => set(v, &[0]), // firmware variant: none
             0x0000_0003 => set(v, &[0x5bc0_e000, 0, 0, 0, 0]), // firmware git hash (20 bytes)
-            // clocks for `raspberrypi,firmware-clocks`, (parent, id): the ARM clock (cpufreq: one
-            // operating point, 1.5 GHz) and the audio clock
-            0x0001_0007 => set(v, &[0, 3, 0, AUDIO_CLK]),
+            // clocks for `raspberrypi,firmware-clocks`, (parent, id): ARM (cpufreq: one operating
+            // point, 1.5 GHz), core (the HVS), M2MC (HDMI state machine), pixel-BVB (HDMI), and
+            // the audio clock
+            0x0001_0007 => set(v, &[0, 3, 0, 4, 0, 13, 0, 14, 0, AUDIO_CLK]),
             0x0001_0001 => set(v, &[0]),
             0x0001_0002 => set(v, &[BOARD_REVISION]),
             0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)
@@ -142,9 +146,18 @@ impl Mailbox {
             0x0003_0004 if arg(v, 0) == AUDIO_CLK => set(v, &[AUDIO_CLK, 100_000_000]),
             0x0003_0007 if arg(v, 0) == AUDIO_CLK => set(v, &[AUDIO_CLK, 0]),
             0x0003_8002 if arg(v, 0) == AUDIO_CLK => { self.audio_clk = arg(v, 1); set(v, &[AUDIO_CLK, self.audio_clk]) }
-            0x0003_0002 | 0x0003_0004 | 0x0003_0007 | 0x0003_0047 => { let id = arg(v, 0); set(v, &[id, clock_rate(id)]) }
+            0x0003_0002 | 0x0003_0047 => { let id = arg(v, 0); set(v, &[id, self.rates.get(id as usize).copied().unwrap_or(0)]) }
+            0x0003_0004 => { let id = arg(v, 0); set(v, &[id, clock_range(id).1]) }
+            0x0003_0007 => { let id = arg(v, 0); set(v, &[id, clock_range(id).0]) }
             0x0003_8001 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
-            0x0003_8002 => { let id = arg(v, 0); let r = arg(v, 1); set(v, &[id, r]) }
+            0x0003_8002 => {
+                let (id, r) = (arg(v, 0), arg(v, 1));
+                let (lo, hi) = clock_range(id);
+                let r = r.clamp(lo, hi.max(lo));
+                if let Some(x) = self.rates.get_mut(id as usize) { *x = r; }
+                set(v, &[id, r])
+            }
+            0x0003_0066 => set(v, &[]), // NOTIFY_DISPLAY_DONE: the kernel's display driver takes over
             0x0003_0006 => { let id = arg(v, 0); set(v, &[id, temp_mc]) }
             0x0003_000a => { let id = arg(v, 0); set(v, &[id, 85_000]) }
             0x0003_0003 => { let id = arg(v, 0); set(v, &[id, 1_200_000]) } // voltage (uV)
@@ -238,6 +251,18 @@ impl Mailbox {
 /// RPI_FIRMWARE_DISP_CLK_ID: exported by `clk-raspberrypi`, used here as the I²S bit clock.
 const AUDIO_CLK: u32 = 16;
 
+/// What a clock can be set to (Hz): the firmware's min and max.
+fn clock_range(id: u32) -> (u32, u32) {
+    match id {
+        3 => (1_500_000_000, 1_500_000_000), // ARM: fixed
+        4 => (200_000_000, 500_000_000),     // core
+        13 => (120_000_000, 600_000_000),    // M2MC (HDMI)
+        14 => (0, 300_000_000),              // pixel-BVB
+        AUDIO_CLK => (0, 100_000_000),
+        _ => { let r = clock_rate(id); (r, r) }
+    }
+}
+
 fn clock_rate(id: u32) -> u32 {
     match id {
         1 => 250_000_000,   // EMMC
@@ -251,6 +276,8 @@ fn clock_rate(id: u32) -> u32 {
         9 => 250_000_000,   // PIXEL
         10 => 750_000_000,  // PWM
         12 => 100_000_000,  // EMMC2
+        13 => 200_000_000,  // M2MC
+        14 => 75_000_000,   // pixel-BVB
         _ => 0,
     }
 }

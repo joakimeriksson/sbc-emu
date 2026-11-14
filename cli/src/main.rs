@@ -67,7 +67,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -166,6 +166,9 @@ fn run(args: &[String]) -> ExitCode {
             // Bluetooth on the mini UART (dtoverlay=miniuart-bt), unless that UART is the
             // --serial1 port or --no-bluetooth
             if arg(args, "--serial1").is_none() && !args.iter().any(|a| a == "--no-bluetooth") { m.soc.bt = Some(bcm2711::bluetooth::Bluetooth::new()); }
+            // --display kms (default): the vc4 HDMI pipeline for the KMS driver, as the image's
+            // dtoverlay=vc4-kms-v3d asks; fb: the firmware's framebuffer only
+            if arg(args, "--display") != Some("fb") { m.soc.vc4 = Some(bcm2711::vc4::Vc4::new()); }
             // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern)
             if args.iter().any(|a| a == "--camera") { m.soc.devs.camera = Some(bcm2711::usbdev::Camera::new()); ports.push(DevId::Camera); }
             m.soc.pcie.xhci.attach(&ports);
@@ -331,16 +334,16 @@ fn run(args: &[String]) -> ExitCode {
                     "wait-serial" => done = serial_log.contains(rest),
                     "wait-idle" => done = last_busy.elapsed().as_secs_f64() >= rest.parse().unwrap_or(5.0),
                     "wait-pixel" => {
-                        // wait-pixel X Y RRGGBB: the framebuffer shows that colour at (X, Y)
+                        // wait-pixel X Y RRGGBB: the screen shows that colour at (X, Y), each channel
+                        // within 8 (a 16-bit console framebuffer, as the KMS driver's, rounds colours)
                         let a: Vec<&str> = rest.split_whitespace().collect();
                         let (x, y, rgb) = (a.first().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0), a.get(1).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
                                            a.get(2).and_then(|v| u32::from_str_radix(v, 16).ok()).unwrap_or(0));
                         let mut rgba = Vec::new();
-                        done = match m.soc.mbox.render(&m.soc.ram, &mut rgba) {
+                        done = match m.soc.render(&mut rgba) {
                             Some((w, h)) if x < w && y < h => {
                                 let o = ((y * w + x) * 4) as usize;
-                                let px = (rgba[o] as u32) << 16 | (rgba[o + 1] as u32) << 8 | rgba[o + 2] as u32;
-                                px == rgb
+                                (0..3).all(|k| (rgba[o + k] as i32 - ((rgb >> (16 - 8 * k)) & 0xff) as i32).abs() <= 8)
                             }
                             _ => false,
                         };
@@ -362,7 +365,7 @@ fn run(args: &[String]) -> ExitCode {
                     }
                     "shot" => {
                         let mut rgba = Vec::new();
-                        if let Some((w, h)) = m.soc.mbox.render(&m.soc.ram, &mut rgba) { let _ = std::fs::write(rest, bcm2711::png::encode_rgba(w, h, &rgba)); }
+                        if let Some((w, h)) = m.soc.render(&mut rgba) { let _ = std::fs::write(rest, bcm2711::png::encode_rgba(w, h, &rgba)); }
                     }
                     "quit" => { script.pop_front(); break Stop::Budget; }
                     "gpio" => {
@@ -480,7 +483,7 @@ fn run(args: &[String]) -> ExitCode {
     drop(tty);
     if let Some(path) = screenshot {
         let mut rgba = Vec::new();
-        match m.soc.mbox.render(&m.soc.ram, &mut rgba) {
+        match m.soc.render(&mut rgba) {
             Some((w, h)) => { let _ = std::fs::write(path, bcm2711::png::encode_rgba(w, h, &rgba)); eprintln!("[sbc-emu] screenshot {w}x{h} -> {path}"); }
             None => eprintln!("[sbc-emu] no framebuffer allocated: no screenshot"),
         }

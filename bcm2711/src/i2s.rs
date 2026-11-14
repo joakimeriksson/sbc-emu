@@ -81,7 +81,9 @@ impl I2s {
         }
         let rate = self.sample_rate() as u64;
         if now <= self.played_to { return 0; }
-        let num = (now - self.played_to) * rate + self.frac;
+        // a FIFO that ran dry underran: it never owes more than a short catch-up
+        let from = self.played_to.max(now.saturating_sub(crate::vc4::MAX_CATCHUP_NS));
+        let num = (now - from) * rate + self.frac;
         let frames = num / 1_000_000_000;
         self.frac = num % 1_000_000_000;
         self.played_to = now;
@@ -107,7 +109,7 @@ impl I2s {
             }
         }
         // keep at most ~10 s if nobody drains it
-        if self.out.len() > 2 * 48_000 * 10 { self.out.drain(..self.out.len() / 2); }
+        if self.out.len() > 2 * 48_000 * 10 { self.out.drain(..self.out.len() / 4 * 2); } // whole frames
     }
 
     pub fn read(&self, off: u64) -> u32 {

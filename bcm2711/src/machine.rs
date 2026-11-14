@@ -84,6 +84,9 @@ pub struct Soc {
     pub i2s: crate::i2s::I2s,
     /// the Bluetooth controller on the mini UART (None: the mini UART is a serial port)
     pub bt: Option<crate::bluetooth::Bluetooth>,
+    /// the vc4 display pipeline (HVS, pixel valve, HDMI0) for the KMS driver; None: the
+    /// firmware's framebuffer (`simple-framebuffer`) is the display
+    pub vc4: Option<crate::vc4::Vc4>,
     /// when DREQ-paced DMA wants another look (ns; Some(0): now)
     pace_next: Option<u64>,
     /// the network behind the Ethernet port (None = cable unplugged)
@@ -121,6 +124,11 @@ impl Soc {
             AUX..=0xfe21_50ff => { let v = self.aux.read(a - AUX); self.bt_pump(); v }
             DMA..=0xfe00_7fff => self.dma.read(a - DMA),
             PCM..=0xfe20_3023 => self.i2s.read(a - PCM),
+            crate::vc4::HVS..=0xfe40_7fff if self.vc4.is_some() => self.vc4.as_ref().unwrap().hvs_read(a - crate::vc4::HVS),
+            crate::vc4::PV2..=0xfe20_a0ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().pv_read(a - crate::vc4::PV2),
+            crate::vc4::HDMI_WIN..=0xfef0_ffff if self.vc4.is_some() => self.vc4.as_mut().unwrap().win_read(a - crate::vc4::HDMI_WIN),
+            crate::vc4::HD..=0xfef2_00ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().hd_read(a - crate::vc4::HD),
+            crate::vc4::TXP..=0xfe00_401f if self.vc4.is_some() => self.vc4.as_ref().unwrap().txp_read(a - crate::vc4::TXP),
             // AXI bridges (ASB): the ID register; request bits are acknowledged at once
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => match a & 0xff { 0x20 => 0x6272_6467, o => self.asb[(o / 4) as usize % 12] & !(1 << 1) },
             GICD..=0xff84_1fff => self.gic.dist_read(self.cur, a - GICD),
@@ -164,6 +172,11 @@ impl Soc {
             AUX..=0xfe21_50ff => { self.aux.write(a - AUX, v); self.bt_pump(); }
             DMA..=0xfe00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
             PCM..=0xfe20_3023 => self.i2s.write(a - PCM, v),
+            crate::vc4::HVS..=0xfe40_7fff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hvs_write(a - crate::vc4::HVS, v),
+            crate::vc4::PV2..=0xfe20_a0ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().pv_write(a - crate::vc4::PV2, v),
+            crate::vc4::HDMI_WIN..=0xfef0_ffff if self.vc4.is_some() => self.vc4.as_mut().unwrap().win_write(a - crate::vc4::HDMI_WIN, v),
+            crate::vc4::HD..=0xfef2_00ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hd_write(a - crate::vc4::HD, v),
+            crate::vc4::TXP..=0xfe00_401f if self.vc4.is_some() => self.vc4.as_mut().unwrap().txp_write(a - crate::vc4::TXP, v),
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v,
             GICD..=0xff84_1fff => self.gic.dist_write(self.cur, a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(self.cur, a - GICC, v),
@@ -226,6 +239,11 @@ impl Soc {
         let aux = self.aux.irq();
         self.gic.set_level(SPI_AUX, aux);
         for n in 0..11 { let l = self.dma.irq(n); self.gic.set_level(SPI_DMA0 + n, l); }
+        if let Some(v) = self.vc4.as_mut() {
+            v.tick(now);
+            let l = v.irq_pv();
+            self.gic.set_level(crate::vc4::SPI_PV2, l);
+        }
         self.dirty = false;
     }
 
@@ -255,12 +273,16 @@ impl Soc {
         true
     }
 
-    /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns).
+    /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns): the
+    /// PCM's transmit FIFO (DREQ 2) and HDMI0's audio FIFO (DREQ 10).
     pub(crate) fn dma_pace(&mut self, now: u64) {
         use crate::dma::*;
-        let mut demand = self.i2s.tx_demand(now);
+        let mut demands = [(crate::i2s::DREQ_TX, self.i2s.tx_demand(now)), (crate::vc4::DREQ_HDMI0, self.vc4.as_mut().map_or(0, |v| v.mai_demand(now)))];
         for n in 0..CHANNELS {
-            if self.dma.ch[n].cs & ACTIVE == 0 || paced(self.dma.ch[n].ti) != Some(crate::i2s::DREQ_TX) { continue; }
+            let Some(dreq) = paced(self.dma.ch[n].ti) else { continue };
+            if self.dma.ch[n].cs & ACTIVE == 0 { continue; }
+            let Some(slot) = demands.iter().position(|d| d.0 == dreq) else { continue };
+            let mut demand = demands[slot].1;
             let mut guard = 0;
             while demand > 0 && guard < 1 << 20 {
                 guard += 1;
@@ -271,7 +293,7 @@ impl Soc {
                     continue;
                 }
                 let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(dma_phys(c.src)).unwrap_or(0) };
-                self.i2s.push(v);
+                if dreq == crate::i2s::DREQ_TX { self.i2s.push(v); } else if let Some(vc) = self.vc4.as_mut() { vc.mai_push(v); }
                 let c = &mut self.dma.ch[n];
                 if c.ti & TI_SRC_INC != 0 { c.src = c.src.wrapping_add(4); }
                 c.len -= 4;
@@ -279,6 +301,11 @@ impl Soc {
             }
             // the block that just ran dry completes now, not at the next demand
             if self.dma.ch[n].cs & ACTIVE != 0 && self.dma.ch[n].len < 4 { self.dma_block_done(n); }
+            demands[slot].1 = demand;
+        }
+        // HDMI audio comes out where the DAC's does
+        if let Some(vc) = self.vc4.as_mut() {
+            if !vc.audio.is_empty() { self.i2s.rate = vc.audio_rate; self.i2s.out.extend(vc.audio.drain(..)); }
         }
         self.pace_next = if (0..CHANNELS).any(|n| self.dma.ch[n].cs & ACTIVE != 0 && paced(self.dma.ch[n].ti).is_some()) { Some(now + 500_000) } else { None };
     }
@@ -326,6 +353,18 @@ impl Soc {
         c.cs = (c.cs & !ACTIVE) | END;
     }
 
+    /// The size of what the HDMI output shows now.
+    pub fn display_size(&self) -> (u32, u32) {
+        self.vc4.as_ref().and_then(|v| v.size()).unwrap_or_else(|| self.mbox.fb_size())
+    }
+
+    /// What the HDMI output shows, as RGBA: the HVS's composition while the KMS driver drives
+    /// the display, else the firmware framebuffer.
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        if let Some(v) = self.vc4.as_ref().filter(|v| v.active()) { return v.render(&self.ram, out); }
+        self.mbox.render(&self.ram, out)
+    }
+
     /// Bluetooth on the mini UART: what the host sent goes to the controller, and the
     /// controller's bytes fill the receive FIFO as it empties.
     pub(crate) fn bt_pump(&mut self) {
@@ -346,7 +385,8 @@ impl Soc {
     pub(crate) fn usb_next_event(&self) -> Option<u64> {
         let x = self.pcie.xhci.next_event(&self.devs);
         let bt = self.bt.as_ref().and_then(|b| b.next_event());
-        [self.usb.next_event(), x, self.pace_next, bt].into_iter().flatten().min()
+        let vb = self.vc4.as_ref().and_then(|v| v.next_event());
+        [self.usb.next_event(), x, self.pace_next, bt, vb].into_iter().flatten().min()
     }
 
     fn note(&mut self, a: u64) {
@@ -471,7 +511,7 @@ impl Machine {
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, vc4: None, net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
@@ -927,7 +967,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v8");
+        w.tag("machine-v9");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -953,6 +993,10 @@ impl Machine {
         self.soc.i2s.save_state(&mut w);
         w.bool(self.soc.bt.is_some());
         if let Some(bt) = self.soc.bt.as_ref() { bt.save_state(&mut w); }
+        // v9: the display pipeline and the firmware clock rates
+        w.bool(self.soc.vc4.is_some());
+        if let Some(v) = self.soc.vc4.as_ref() { v.save_state(&mut w); }
+        for r in self.soc.mbox.rates { w.u32(r); }
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -969,7 +1013,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        let v8 = r.tag("machine-v8").is_ok();
+        let v9 = r.tag("machine-v9").is_ok();
+        if !v9 { r.p = 0; }
+        let v8 = v9 || r.tag("machine-v8").is_ok();
         if !v8 { r.p = 0; }
         let v7 = v8 || r.tag("machine-v7").is_ok();
         if !v7 { r.p = 0; }
@@ -1022,6 +1068,15 @@ impl Machine {
                 bt.load_state(&mut r).map_err(e)?;
             } else {
                 self.soc.bt = None;
+            }
+            if v9 {
+                if r.bool().map_err(e)? {
+                    let v = self.soc.vc4.get_or_insert_with(crate::vc4::Vc4::new);
+                    v.load_state(&mut r).map_err(e)?;
+                } else {
+                    self.soc.vc4 = None;
+                }
+                for x in self.soc.mbox.rates.iter_mut() { *x = r.u32().map_err(e)?; }
             }
             self.soc.pace_next = Some(0);
         } else {

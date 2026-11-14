@@ -24,6 +24,7 @@ pub mod pl011;
 pub mod pcie;
 pub mod i2s;
 pub mod bluetooth;
+pub mod vc4;
 pub mod usbdev;
 pub mod xhci;
 

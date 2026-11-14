@@ -37,7 +37,7 @@ pub fn boot_linux(m: &mut Machine, kernel: &[u8], initrd: Option<&[u8]>, cmdline
     } else { None };
     // like the firmware: one 8250 port for the mini UART (Pi kernels allocate none by default)
     let cmdline = if cmdline.contains("8250.nr_uarts") { cmdline.to_string() } else { format!("8250.nr_uarts=1 {cmdline}") };
-    let dtb = fdt::pi4b(&fdt::BootInfo { ram: linux_ram, bootargs: &cmdline, initrd: initrd_range, fb, cpus: m.cpus.len() as u32, bluetooth: m.soc.bt.is_some() });
+    let dtb = fdt::pi4b(&fdt::BootInfo { ram: linux_ram, bootargs: &cmdline, initrd: initrd_range, fb, cpus: m.cpus.len() as u32, bluetooth: m.soc.bt.is_some(), kms: m.soc.vc4.is_some() });
     m.load(DTB, &dtb);
     m.boot_linux(entry, DTB);
     Ok(())
@@ -96,6 +96,7 @@ pub fn read_sd_boot(disk: &mut dyn crate::sdhci::Disk) -> Result<SdBoot, String>
             ("cmdline", v) => cmdline_name = v.to_string(),
             ("auto_initramfs", v) => auto_initramfs = v == "1",
             ("arm_64bit", "0") => return Err("config.txt asks for a 32-bit kernel (arm_64bit=0): not supported".into()),
+            ("dtoverlay", v) if v.starts_with("vc4-kms-v3d") => notes.push("dtoverlay=vc4-kms-v3d: HDMI through the vc4 KMS driver (the device tree describes it unless --display fb)".into()),
             ("dtoverlay", v) | ("dtparam", v) => notes.push(format!("ignored {k}={v} (reduced device tree)", k = k.trim())),
             _ => {}
         }

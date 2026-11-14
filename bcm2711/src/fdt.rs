@@ -79,6 +79,9 @@ pub struct BootInfo<'a> {
     pub cpus: u32,
     /// the Bluetooth controller is on the mini UART (`dtoverlay=miniuart-bt`)
     pub bluetooth: bool,
+    /// the vc4 display pipeline for the KMS driver (`dtoverlay=vc4-kms-v3d`): HVS, pixel valve 2,
+    /// HDMI0 and its DDC bus
+    pub kms: bool,
 }
 
 const GIC_SPI: u32 = 0;
@@ -90,6 +93,7 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     let (gic, clk48, mbox, clk100, phy1, gpio, clkvpu, vref) = (1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32);
     let (thermal, aux) = (9u32, 10u32);
     let (dma, fwclk, i2s, dac, i2s_cpu) = (11u32, 12u32, 13u32, 14u32, 15u32);
+    let (clk27, clk108, dvp, ddc0, aon_intr) = (16u32, 17u32, 18u32, 19u32, 20u32);
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
@@ -155,6 +159,23 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.str("clock-output-names", "vpu");
     f.cells("phandle", &[clkvpu]);
     f.end();
+
+    if b.kms {
+        f.begin("clk-27M");
+        f.str("compatible", "fixed-clock");
+        f.cells("#clock-cells", &[0]);
+        f.cells("clock-frequency", &[27_000_000]);
+        f.str("clock-output-names", "27MHz-clock");
+        f.cells("phandle", &[clk27]);
+        f.end();
+        f.begin("clk-108M");
+        f.str("compatible", "fixed-clock");
+        f.cells("#clock-cells", &[0]);
+        f.cells("clock-frequency", &[108_000_000]);
+        f.str("clock-output-names", "108MHz-clock");
+        f.cells("phandle", &[clk108]);
+        f.end();
+    }
 
     f.begin("regulator-3v3");
     f.str("compatible", "regulator-fixed");
@@ -448,6 +469,68 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("ranges", &[0x0200_0000, 0, 0xf800_0000, 0x6, 0, 0, 0x0400_0000]);
     f.cells("dma-ranges", &[0x0200_0000, 0, 0, 0, 0, 0, 0xc000_0000]);
     f.end();
+    if b.kms {
+        // the display pipeline, as dtoverlay=vc4-kms-v3d enables it: HDMI0 fed by pixel valve 2
+        f.begin("gpu");
+        f.str("compatible", "brcm,bcm2711-vc5");
+        f.end();
+        f.begin("hvs@fe400000");
+        f.str("compatible", "brcm,bcm2711-hvs");
+        f.cells("reg", &[0, 0xfe40_0000, 0x8000]);
+        f.cells("interrupts", &[GIC_SPI, 97, LEVEL_HIGH]);
+        f.cells("clocks", &[fwclk, 4]);
+        f.end();
+        f.begin("txp@fe004000");
+        f.str("compatible", "brcm,bcm2835-txp");
+        f.cells("reg", &[0, 0xfe00_4000, 0x20]);
+        f.cells("interrupts", &[GIC_SPI, 75, LEVEL_HIGH]);
+        f.end();
+        f.begin("pixelvalve@fe20a000");
+        f.str("compatible", "brcm,bcm2711-pixelvalve2");
+        f.cells("reg", &[0, 0xfe20_a000, 0x100]);
+        f.cells("interrupts", &[GIC_SPI, 101, LEVEL_HIGH]);
+        f.end();
+        f.begin("clock@fef00000");
+        f.str("compatible", "brcm,brcm2711-dvp");
+        f.cells("reg", &[0, 0xfef0_0000, 0x10]);
+        f.cells("clocks", &[clk108]);
+        f.cells("#clock-cells", &[1]);
+        f.cells("#reset-cells", &[1]);
+        f.cells("phandle", &[dvp]);
+        f.end();
+        f.begin("interrupt-controller@fef00100");
+        f.strs("compatible", &["brcm,bcm2711-l2-intc", "brcm,l2-intc"]);
+        f.cells("reg", &[0, 0xfef0_0100, 0x30]);
+        f.cells("interrupts", &[GIC_SPI, 96, LEVEL_HIGH]);
+        f.empty("interrupt-controller");
+        f.cells("#interrupt-cells", &[1]);
+        f.cells("phandle", &[aon_intr]);
+        f.end();
+        f.begin("hdmi@fef00700");
+        f.str("compatible", "brcm,bcm2711-hdmi0");
+        f.cells("reg", &[0, 0xfef0_0700, 0x300, 0, 0xfef0_0300, 0x200, 0, 0xfef0_0f00, 0x80, 0, 0xfef0_0f80, 0x80, 0, 0xfef0_1b00, 0x200,
+                         0, 0xfef0_1f00, 0x400, 0, 0xfef0_0200, 0x80, 0, 0xfef0_4300, 0x100, 0, 0xfef2_0000, 0x100]);
+        f.strs("reg-names", &["hdmi", "dvp", "phy", "rm", "packet", "metadata", "csc", "cec", "hd"]);
+        f.cells("clocks", &[fwclk, 13, fwclk, 14, dvp, 0, clk27]);
+        f.strs("clock-names", &["hdmi", "bvb", "audio", "cec"]);
+        f.cells("resets", &[dvp, 0]);
+        f.cells("ddc", &[ddc0]);
+        f.cells("dmas", &[dma, 10]);
+        f.str("dma-names", "audio-rx");
+        f.cells("interrupt-parent", &[aon_intr]);
+        f.cells("interrupts", &[0, 1, 2, 3, 4, 5]);
+        f.strs("interrupt-names", &["cec-tx", "cec-rx", "cec-low", "wakeup", "hpd-connected", "hpd-removed"]);
+        f.end();
+        f.begin("i2c@fef04500");
+        f.str("compatible", "brcm,bcm2711-hdmi-i2c");
+        f.cells("reg", &[0, 0xfef0_4500, 0x100, 0, 0xfef0_0b00, 0x300]);
+        f.strs("reg-names", &["bsc", "auto-i2c"]);
+        f.cells("clock-frequency", &[97_500]);
+        f.cells("#address-cells", &[1]);
+        f.cells("#size-cells", &[0]);
+        f.cells("phandle", &[ddc0]);
+        f.end();
+    }
     f.end(); // soc
 
     // an I²S DAC HAT: PCM5102A (no control interface) on a simple sound card, the SoC as

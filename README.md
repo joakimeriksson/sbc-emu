@@ -27,7 +27,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | More peripherals | DMA controller, hardware RNG, thermal sensor, PM watchdog and power domains, system timer, mini UART | stock drivers bind: `/dev/hwrng`, `/sys/class/thermal`, `/dev/watchdog` (expiry reboots), `ttyS0`, `dma0chan*` |
 | Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core, breakpoints and watchpoints), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
 | Port forwarding | `--hostfwd tcp::2222-:22` (QEMU's syntax) through the user-mode NAT | `ssh-keyscan -p 2222 127.0.0.1` reads the Pi OS host keys |
-| Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
+| HDMI | the vc4 KMS pipeline the image's `config.txt` asks for (`dtoverlay=vc4-kms-v3d`): HVS compositor, pixel valve, HDMI0 encoder + PHY, DDC with a 1080p monitor's EDID, HDMI audio; `--display fb` keeps the firmware's `simple-framebuffer` (1024×768) instead | stock `vc4`: `HDMI-A-1` connected, modes from the EDID, the console at 1920×1080; `kmstest` switches to 1024×768 and page-flips at 60.00 fps; `speaker-test -D hdmi:…`: a 440.0 Hz tone at 48 kHz on the host; screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~2.7 min (JIT on), ~200 MiB of the image read |
 
 Compatibility labels in the plan's terms (per-feature evidence above; nothing else is claimed):
@@ -60,7 +60,12 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | USB OTG | DWC2 core, host mode (buffer DMA); takes the keyboard with `--otg-keyboard` | `dwc2` |
 | PCM/I²S + DAC | BCM2835 PCM as bit clock/frame master, bit clock from a firmware clock; PCM5102A | `bcm2835-i2s`, `pcm5102a`, `simple-audio-card` |
 | Bluetooth | CYW43455 HCI over H4 on the mini UART: Broadcom vendor commands, patch RAM download, LE scanning | `hci_uart` (`hci_bcm`, `btbcm`), BlueZ |
-| Display | `simple-framebuffer` in the GPU memory carve-out | `simplefb`, fbcon |
+| HVS | display lists in its own memory: RGB planes (565, 888, 8888) composed with alpha when the host takes a picture, channel status and frame counters, the list latched at each frame start | `vc4` |
+| Pixel valve 2 | timing registers, vblank (VFP start) at 60 Hz of guest time | `vc4` |
+| HDMI0 | encoder, PHY, DVP clocks/resets, packet RAM, scheduler; MAI audio (IEC 958 subframes through DMA on DREQ 10); hot-plug from the always-on L2 interrupt controller; CEC registers | `vc4`, `clk-bcm2711-dvp`, `irq-brcmstb-l2` |
+| DDC | brcmstb BSC controller (polled) with an EDID EEPROM: 1920×1080 preferred, 1280×720, 1024×768…, CEA block with HDMI and LPCM audio | `i2c-brcmstb` |
+| TXP | the transposer's registers (writeback; never busy) | `vc4` |
+| Firmware framebuffer | `simple-framebuffer` in the GPU memory carve-out until `vc4` takes over (the only display with `--display fb`) | `simplefb`, fbcon |
 | Ethernet | GENET v5 (DMA rings, status blocks, INTRL2), UniMAC MDIO, BCM54213PE PHY | `bcmgenet`, `unimac-mdio`, Broadcom PHY |
 | Wi-Fi | second SD host (SDIO) + CYW43455: CCCR/FBR/CIS, backplane, EROM, SDIO core, emulated FullMAC; open `sbc-emu` and WPA2-PSK `sbc-emu-wpa2` (passphrase `raspberry-pi`) | `sdhci-iproc`, `brcmfmac`, `brcmfmac-wcc` |
 | GPIO | function select, set/clear/level, edge/level detect, 2711 pulls, bank IRQs | `pinctrl-bcm2835` |
@@ -118,6 +123,10 @@ More options, mostly after QEMU's:
   into the guest over Ethernet, e.g. `--hostfwd tcp::2222-:22` then `ssh -p 2222 pi@127.0.0.1`.
 - `--serial1 FILE`: the mini UART as `ttyS0`, its output to FILE (Bluetooth is then off: it
   uses that UART, as `dtoverlay=miniuart-bt` arranges; `--no-bluetooth` turns it off too).
+- `--display kms|fb`: `kms` (default) describes the vc4 display pipeline, as the image's
+  `dtoverlay=vc4-kms-v3d` asks, so the stock `vc4` driver drives HDMI0 (a 1080p monitor; about
+  2 s more boot time); `fb` leaves the firmware's 1024×768 framebuffer as the only display.
+  The browser build uses `fb`.
 - `--usb-drive IMAGE`: a USB stick (copy-on-write, like the SD card) on the third USB-A port;
   given with `--restore`, it is hot-plugged after the restore.
 - `--camera`: a USB webcam (UVC, 640×480 YUYV at 30 frames/s of guest time, a test pattern).
@@ -184,7 +193,9 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 
 ## Known gaps
 
-No GPU/HVS/HDMI controller (software framebuffer only), so no HDMI audio and no `vc4` desktop;
+No V3D 3D GPU (a desktop compositor has to render in software), no HDMI1 (the second port has
+no monitor), no CEC devices; the HVS draws RGB planes only (no YUV video planes, no tiled
+formats) and scales with nearest neighbour;
 no CSI camera (the webcam is USB); no USB 3 devices (the USB 3 root ports stay empty), no USB
 hubs, no isochronous transfers; Bluetooth has no connections (the sensor only advertises) and
 no classic devices; Wi-Fi has no radio model (emulated firmware host interface, open and
@@ -201,6 +212,7 @@ specifically (QEMU 9/10 docs and its open patch series, November 2026):
 | | sbc-emu | QEMU `raspi4b` |
 |---|---|---|
 | Boot | the stock Raspberry Pi OS `.img` (config.txt, cmdline.txt, kernel8.img) | kernel and DTB passed by hand |
+| Display | HDMI through the stock `vc4` KMS driver (HVS, pixel valve, HDMI encoder, EDID, HDMI audio) | the firmware framebuffer |
 | Cores | 4: in turns on one thread (repeatable) or a thread each (`--threads multi`) | 4, a thread each (MTTCG) |
 | Ethernet (GENET) | yes, with NAT and port forwarding | not merged (patches in review) |
 | USB | keyboard, tablet, stick, webcam on the xHCI (USB-A) ports; OTG port | keyboard does not enumerate on raspi4b |

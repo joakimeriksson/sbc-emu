@@ -241,7 +241,7 @@ pub extern "C" fn sbc_uart_ptr() -> *const u8 { with(|s| s.uart.as_ptr()).unwrap
 /// Render the framebuffer as RGBA; returns a pointer (0 if no framebuffer), see sbc_fb_w/h.
 #[no_mangle]
 pub extern "C" fn sbc_fb_render() -> *const u8 {
-    with(|s| match s.m.soc.mbox.render(&s.m.soc.ram, &mut s.fb) {
+    with(|s| match s.m.soc.render(&mut s.fb) {
         Some((w, h)) => { s.fb_w = w; s.fb_h = h; s.fb.as_ptr() }
         None => std::ptr::null(),
     }).unwrap_or(std::ptr::null())

@@ -141,7 +141,7 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
         }
         ("screendump", [f]) => {
             let mut rgba = Vec::new();
-            out = match m.soc.mbox.render(&m.soc.ram, &mut rgba) {
+            out = match m.soc.render(&mut rgba) {
                 Some((w, h)) => match std::fs::write(f, bcm2711::png::encode_rgba(w, h, &rgba)) { Ok(()) => format!("{w}x{h} -> {f}\n"), Err(e) => format!("{f}: {e}\n") },
                 None => "no framebuffer\n".into(),
             };
@@ -167,7 +167,7 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
         }
         ("gdbserver", [p]) => match p.trim_start_matches("tcp::").parse() { Ok(port) => Effect::Gdb(port), Err(_) => { out = "usage: gdbserver PORT\n".into(); Effect::None } },
         ("mouse_move", [x, y]) => {
-            let (w, h) = m.soc.mbox.fb_size();
+            let (w, h) = m.soc.display_size();
             let scale = |v: &str, n: u32| v.parse::<u32>().ok().map(|v| (v.min(n.saturating_sub(1)) * 32767 / n.saturating_sub(1).max(1)) as u16);
             match (scale(x, w), scale(y, h)) {
                 (Some(x), Some(y)) => { let b = m.soc.devs.tablet.state.0; m.soc.devs.tablet.pointer(b, x, y, 0); }

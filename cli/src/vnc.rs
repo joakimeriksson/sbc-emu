@@ -86,7 +86,7 @@ impl Vnc {
         if !c.messages(m) { self.client = None; return; }
         if c.want.is_some() && c.phase == Phase::Normal && self.last.elapsed() >= Duration::from_millis(33) {
             self.last = Instant::now();
-            if let Some((w, h)) = m.soc.mbox.render(&m.soc.ram, &mut self.frame) {
+            if let Some((w, h)) = m.soc.render(&mut self.frame) {
                 if !c.update(&self.frame, w, h) { self.client = None; }
             }
         }
@@ -131,7 +131,7 @@ impl Client {
                 }
                 Phase::Init => {
                     self.phase = Phase::Normal;
-                    let (w, h) = m.soc.mbox.fb_size();
+                    let (w, h) = m.soc.display_size();
                     self.size = (w, h);
                     let mut r = Vec::new();
                     r.extend_from_slice(&(w as u16).to_be_bytes());
