@@ -1,0 +1,18 @@
+# kmscube on the emulated V3D, scanned out by vc4 on HDMI
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial (kmscube -D /dev/dri/card1 -c 240 > /tmp/k.log 2>&1; echo KMS-""DONE) &\n
+sleep 3
+shot out/gpu-kmscube-1.png
+sleep 1
+shot out/gpu-kmscube-2.png
+wait-serial KMS-DONE
+serial tail -1 /tmp/k.log\n
+sleep 2
+quit

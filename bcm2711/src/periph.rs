@@ -80,6 +80,8 @@ const PM_PASSWORD: u32 = 0x5a00_0000;
 
 /// Power management block: the watchdog (PM_RSTC, PM_RSTS, PM_WDOG) at 65536 ticks per second.
 pub struct Pm {
+    /// the other PM registers (power domains, pads), as written
+    regs: [u32; 0x114 / 4],
     rstc: u32,
     rsts: u32,
     /// virtual time at which the armed watchdog fires
@@ -89,7 +91,7 @@ pub struct Pm {
 }
 
 impl Pm {
-    pub fn new() -> Self { Pm { rstc: 0, rsts: 0x1000, deadline: None, wdog_ticks: 0, now: 0 } }
+    pub fn new() -> Self { Pm { regs: [0; 0x114 / 4], rstc: 0, rsts: 0x1000, deadline: None, wdog_ticks: 0, now: 0 } }
     fn ticks_left(&self) -> u32 {
         match self.deadline {
             Some(d) if d > self.now => (((d - self.now) as u128 * 65536 / 1_000_000_000) as u32).min(0xfffff),
@@ -102,6 +104,9 @@ impl Pm {
             0x1c => self.rstc,
             0x20 => self.rsts,
             0x24 => self.ticks_left(),
+            // power domains: a power-up request (POWUP) reports power good (POWOK) and memory
+            // repair (MRDONE) done at once
+            o if o < 0x114 => { let r = self.regs[(o / 4) as usize]; r | if r & 1 != 0 { (1 << 1) | (1 << 4) } else { 0 } }
             _ => 0,
         }
     }
@@ -116,6 +121,7 @@ impl Pm {
             }
             0x20 => self.rsts = v,
             0x24 => self.wdog_ticks = v & 0xfffff,
+            o if o < 0x114 => self.regs[(o / 4) as usize] = v,
             _ => {}
         }
     }

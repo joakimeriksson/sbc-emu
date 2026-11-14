@@ -87,6 +87,8 @@ pub struct Soc {
     /// the vc4 display pipeline (HVS, pixel valve, HDMI0) for the KMS driver; None: the
     /// firmware's framebuffer (`simple-framebuffer`) is the display
     pub vc4: Option<crate::vc4::Vc4>,
+    /// the V3D 4.2 3D GPU for the `v3d` DRM driver (with vc4 KMS, as dtoverlay=vc4-kms-v3d)
+    pub v3d: Option<v3d::V3d>,
     /// when DREQ-paced DMA wants another look (ns; Some(0): now)
     pace_next: Option<u64>,
     /// the network behind the Ethernet port (None = cable unplugged)
@@ -129,8 +131,9 @@ impl Soc {
             crate::vc4::HDMI_WIN..=0xfef0_ffff if self.vc4.is_some() => self.vc4.as_mut().unwrap().win_read(a - crate::vc4::HDMI_WIN),
             crate::vc4::HD..=0xfef2_00ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().hd_read(a - crate::vc4::HD),
             crate::vc4::TXP..=0xfe00_401f if self.vc4.is_some() => self.vc4.as_ref().unwrap().txp_read(a - crate::vc4::TXP),
-            // AXI bridges (ASB): the ID register; request bits are acknowledged at once
-            0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => match a & 0xff { 0x20 => 0x6272_6467, o => self.asb[(o / 4) as usize % 12] & !(1 << 1) },
+            v3d::BASE..=0xfec0_7fff if self.v3d.is_some() => self.v3d.as_mut().unwrap().read(a - v3d::BASE),
+            // AXI bridges (ASB): the ID register; a stop request (bit 0) is acknowledged (bit 1) at once
+            0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => match a & 0xff { 0x20 => 0x6272_6467, o => { let r = self.asb[(o / 4) as usize % 12]; (r & !2) | ((r & 1) << 1) } },
             GICD..=0xff84_1fff => self.gic.dist_read(self.cur, a - GICD),
             GICC..=0xff84_3fff => self.gic.cpu_read(self.cur, a - GICC),
             PERIPH..=0xffff_ffff => { self.note(a); 0 }
@@ -167,7 +170,12 @@ impl Soc {
             I2C1..=0xfe80_4fff => self.i2c.write(a - I2C1, v),
             RNG..=0xfe10_40ff => self.rng.write(a - RNG, v),
             AVS..=0xfd5d_2eff => {}
-            PM..=0xfe10_0113 => self.pm.write(a - PM, v),
+            PM..=0xfe10_0113 => {
+                // the V3D reset line (PM_GRAFX.V3DRSTN) going low resets the GPU
+                let before = self.pm.read(0x10c);
+                self.pm.write(a - PM, v);
+                if before & (1 << 6) != 0 && self.pm.read(0x10c) & (1 << 6) == 0 { if let Some(g) = self.v3d.as_mut() { g.reset(); } }
+            }
             SYSTIMER..=0xfe00_301b => self.systimer.write(a - SYSTIMER, v),
             AUX..=0xfe21_50ff => { self.aux.write(a - AUX, v); self.bt_pump(); }
             DMA..=0xfe00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
@@ -177,7 +185,8 @@ impl Soc {
             crate::vc4::HDMI_WIN..=0xfef0_ffff if self.vc4.is_some() => self.vc4.as_mut().unwrap().win_write(a - crate::vc4::HDMI_WIN, v),
             crate::vc4::HD..=0xfef2_00ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hd_write(a - crate::vc4::HD, v),
             crate::vc4::TXP..=0xfe00_401f if self.vc4.is_some() => self.vc4.as_mut().unwrap().txp_write(a - crate::vc4::TXP, v),
-            0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v,
+            v3d::BASE..=0xfec0_7fff if self.v3d.is_some() => self.v3d.as_mut().unwrap().write(a - v3d::BASE, v, &mut self.ram),
+            0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v & 0x00ff_ffff,
             GICD..=0xff84_1fff => self.gic.dist_write(self.cur, a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(self.cur, a - GICC, v),
             PERIPH..=0xffff_ffff => self.note(a),
@@ -244,6 +253,7 @@ impl Soc {
             let l = v.irq_pv();
             self.gic.set_level(crate::vc4::SPI_PV2, l);
         }
+        if let Some(g) = self.v3d.as_ref() { let l = g.irq(); self.gic.set_level(32 + v3d::SPI, l); }
         self.dirty = false;
     }
 
@@ -511,7 +521,7 @@ impl Machine {
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, vc4: None, net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, vc4: None, v3d: None, net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
@@ -967,7 +977,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v9");
+        w.tag("machine-v10");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -997,6 +1007,9 @@ impl Machine {
         w.bool(self.soc.vc4.is_some());
         if let Some(v) = self.soc.vc4.as_ref() { v.save_state(&mut w); }
         for r in self.soc.mbox.rates { w.u32(r); }
+        // v10: the 3D GPU
+        w.bool(self.soc.v3d.is_some());
+        if let Some(g) = self.soc.v3d.as_ref() { g.save_state(&mut w); }
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -1013,7 +1026,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        let v9 = r.tag("machine-v9").is_ok();
+        let v10 = r.tag("machine-v10").is_ok();
+        if !v10 { r.p = 0; }
+        let v9 = v10 || r.tag("machine-v9").is_ok();
         if !v9 { r.p = 0; }
         let v8 = v9 || r.tag("machine-v8").is_ok();
         if !v8 { r.p = 0; }
@@ -1077,6 +1092,14 @@ impl Machine {
                     self.soc.vc4 = None;
                 }
                 for x in self.soc.mbox.rates.iter_mut() { *x = r.u32().map_err(e)?; }
+            }
+            if v10 {
+                if r.bool().map_err(e)? {
+                    let g = self.soc.v3d.get_or_insert_with(v3d::V3d::new);
+                    g.load_state(&mut r).map_err(e)?;
+                } else {
+                    self.soc.v3d = None;
+                }
             }
             self.soc.pace_next = Some(0);
         } else {

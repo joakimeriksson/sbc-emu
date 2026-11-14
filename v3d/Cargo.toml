@@ -1,0 +1,9 @@
+[package]
+name = "v3d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Broadcom VideoCore VI (V3D 4.2) GPU model: control lists, binner, rasterizer, QPU shader cores, TMU, TFU, CSD"
+
+[dependencies]
+emu-core = { path = "../emu-core" }

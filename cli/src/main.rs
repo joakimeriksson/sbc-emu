@@ -67,7 +67,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--no-gpu] [--sd-persist]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -138,7 +138,8 @@ fn run(args: &[String]) -> ExitCode {
     // last wall time the guest ran a full busy slice (for the wait-idle script step)
     let mut last_busy = Instant::now();
     let disk: Option<Box<dyn bcm2711::sdhci::Disk>> = match sd_path {
-        Some(p) => match disk::CowFile::open(p) { Ok(d) => Some(Box::new(d)), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
+        Some(p) => match if args.iter().any(|a| a == "--sd-persist") { disk::CowFile::open_persistent(p) } else { disk::CowFile::open(p) } {
+            Ok(d) => Some(Box::new(d)), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
         None => None,
     };
 
@@ -168,7 +169,11 @@ fn run(args: &[String]) -> ExitCode {
             if arg(args, "--serial1").is_none() && !args.iter().any(|a| a == "--no-bluetooth") { m.soc.bt = Some(bcm2711::bluetooth::Bluetooth::new()); }
             // --display kms (default): the vc4 HDMI pipeline for the KMS driver, as the image's
             // dtoverlay=vc4-kms-v3d asks; fb: the firmware's framebuffer only
-            if arg(args, "--display") != Some("fb") { m.soc.vc4 = Some(bcm2711::vc4::Vc4::new()); }
+            if arg(args, "--display") != Some("fb") {
+                m.soc.vc4 = Some(bcm2711::vc4::Vc4::new());
+                // and the V3D 3D GPU next to it (dtoverlay=vc4-kms-v3d), unless --no-gpu
+                if !args.iter().any(|a| a == "--no-gpu") { m.soc.v3d = Some(v3d::V3d::new()); }
+            }
             // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern)
             if args.iter().any(|a| a == "--camera") { m.soc.devs.camera = Some(bcm2711::usbdev::Camera::new()); ports.push(DevId::Camera); }
             m.soc.pcie.xhci.attach(&ports);

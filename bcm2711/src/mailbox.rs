@@ -129,9 +129,9 @@ impl Mailbox {
             0x0000_0002 => set(v, &[0]), // firmware variant: none
             0x0000_0003 => set(v, &[0x5bc0_e000, 0, 0, 0, 0]), // firmware git hash (20 bytes)
             // clocks for `raspberrypi,firmware-clocks`, (parent, id): ARM (cpufreq: one operating
-            // point, 1.5 GHz), core (the HVS), M2MC (HDMI state machine), pixel-BVB (HDMI), and
+            // point, 1.5 GHz), core (the HVS), V3D, M2MC (HDMI state machine), pixel-BVB (HDMI), and
             // the audio clock
-            0x0001_0007 => set(v, &[0, 3, 0, 4, 0, 13, 0, 14, 0, AUDIO_CLK]),
+            0x0001_0007 => set(v, &[0, 3, 0, 4, 0, 5, 0, 13, 0, 14, 0, AUDIO_CLK]),
             0x0001_0001 => set(v, &[0]),
             0x0001_0002 => set(v, &[BOARD_REVISION]),
             0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)
@@ -256,6 +256,7 @@ fn clock_range(id: u32) -> (u32, u32) {
     match id {
         3 => (1_500_000_000, 1_500_000_000), // ARM: fixed
         4 => (200_000_000, 500_000_000),     // core
+        5 => (250_000_000, 550_000_000),     // V3D
         13 => (120_000_000, 600_000_000),    // M2MC (HDMI)
         14 => (0, 300_000_000),              // pixel-BVB
         AUDIO_CLK => (0, 100_000_000),

@@ -1,0 +1,17 @@
+# One-time setup of a persistent Pi OS image for the GPU tests: Mesa and the 3D examples from
+# the Pi OS/Debian archives over the emulated network (after raspios-firstboot.txt's first boot
+# on the same --sd-persist image).
+#   cp -c cache/os/raspios-lite.img cache/os/raspios-gpu.img; truncate -s 8g cache/os/raspios-gpu.img
+#   sbc-emu run --sd cache/os/raspios-gpu.img --sd-persist --script scripts/raspios-gpu-setup.txt
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial echo raspberry | sudo -S true; sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends kmscube glmark2-es2-drm mesa-utils mesa-utils-bin libgl1-mesa-dri libegl1 libgles2 libgbm1 mesa-vulkan-drivers vulkan-tools; echo APT-""DONE $?; df -h /; dpkg -l | grep -i mesa; sync; echo SYNC-""DONE\n
+wait-serial SYNC-DONE
+sleep 3
+quit

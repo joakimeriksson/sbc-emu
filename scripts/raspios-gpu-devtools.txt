@@ -1,0 +1,14 @@
+# Adds a C compiler and the EGL/GLES/GBM/DRM headers to the GPU test image (raspios-gpu-setup.txt
+# first), for the offscreen GL test programs in tests/gpu/.
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial echo raspberry | sudo -S true; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev libegl-dev libgles-dev libgbm-dev libdrm-dev pkg-config; echo APT-""DONE $?; sync; echo SYNC-""DONE\n
+wait-serial SYNC-DONE
+sleep 3
+quit

@@ -1,0 +1,13 @@
+# V3D probe check: the v3d DRM driver binds, render node appears
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial dmesg | grep -i -E 'v3d|vc4|drm' | head -30; ls -l /dev/dri /dev/dri/by-path; echo PROBE-""DONE\n
+wait-serial PROBE-DONE
+sleep 2
+quit

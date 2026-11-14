@@ -26,7 +26,12 @@ const ACK: u8 = 0x10;
 const PSH: u8 = 0x08;
 
 fn ip(a: &[u8; 4]) -> Ipv4Addr { Ipv4Addr::from(*a) }
-fn address(a: &[u8; 4], port: u16) -> SocketAddr { SocketAddr::new(IpAddr::V4(ip(a)), port) }
+/// The host address for a guest destination: the gateway (10.0.2.2) is the host itself, as in
+/// QEMU's user-mode networking.
+fn address(a: &[u8; 4], port: u16) -> SocketAddr {
+    if *a == [10, 0, 2, 2] { return SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port); }
+    SocketAddr::new(IpAddr::V4(ip(a)), port)
+}
 
 // A permit belongs to the blocking connect worker, not its guest flow. Removing a flow with RST
 // must not free a slot while connect_timeout is still running on the host.

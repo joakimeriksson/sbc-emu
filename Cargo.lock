@@ -23,6 +23,7 @@ dependencies = [
  "emu-core",
  "miniz_oxide",
  "sbc-net",
+ "v3d",
 ]
 
 [[package]]
@@ -45,6 +46,7 @@ dependencies = [
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "v3d",
 ]
 
 [[package]]
@@ -59,3 +61,10 @@ dependencies = [
 [[package]]
 name = "sbc-net"
 version = "0.0.1"
+
+[[package]]
+name = "v3d"
+version = "0.0.1"
+dependencies = [
+ "emu-core",
+]

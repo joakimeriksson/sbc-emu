@@ -1,0 +1,13 @@
+# GL test scenes on V3D vs llvmpipe (start tools/gpu_server.py on the host first)
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial wget -O /tmp/run.sh http://10.0.2.2:8800/run.sh && sh /tmp/run.sh; echo GLTEST-""END\n
+wait-serial GLTEST-END
+sleep 2
+quit

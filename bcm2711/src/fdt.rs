@@ -82,6 +82,8 @@ pub struct BootInfo<'a> {
     /// the vc4 display pipeline for the KMS driver (`dtoverlay=vc4-kms-v3d`): HVS, pixel valve 2,
     /// HDMI0 and its DDC bus
     pub kms: bool,
+    /// the V3D 3D GPU (with kms)
+    pub v3d: bool,
 }
 
 const GIC_SPI: u32 = 0;
@@ -94,6 +96,7 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     let (thermal, aux) = (9u32, 10u32);
     let (dma, fwclk, i2s, dac, i2s_cpu) = (11u32, 12u32, 13u32, 14u32, 15u32);
     let (clk27, clk108, dvp, ddc0, aon_intr) = (16u32, 17u32, 18u32, 19u32, 20u32);
+    let pm = 21u32;
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
@@ -125,6 +128,22 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     // RAM below the 0xfc00_0000 peripheral window, as the 32-bit-addressable part of a Pi 4
     f.cells("reg", &[0, 0, b.ram as u32]);
     f.end();
+
+    if b.kms {
+        // contiguous memory for scanout buffers (vc4 dumb buffers, Mesa's scanout resources),
+        // as dtoverlay=vc4-kms-v3d sets up (its cma-256 size)
+        f.begin("reserved-memory");
+        f.cells("#address-cells", &[2]);
+        f.cells("#size-cells", &[1]);
+        f.empty("ranges");
+        f.begin("linux,cma");
+        f.str("compatible", "shared-dma-pool");
+        f.cells("size", &[(256u32 << 20).min((b.ram / 4) as u32)]);
+        f.empty("reusable");
+        f.empty("linux,cma-default");
+        f.end();
+        f.end();
+    }
 
     f.begin("cpus");
     f.cells("#address-cells", &[1]);
@@ -305,6 +324,7 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.strs("reg-names", &["pm", "asb", "rpivid_asb"]);
     f.cells("#power-domain-cells", &[1]);
     f.cells("#reset-cells", &[1]);
+    f.cells("phandle", &[pm]);
     f.end();
 
     f.begin("timer@fe003000");
@@ -474,6 +494,21 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
         f.begin("gpu");
         f.str("compatible", "brcm,bcm2711-vc5");
         f.end();
+    }
+    if b.kms && b.v3d {
+        // the 3D GPU (V3D 4.2): hub + core 0 registers, one interrupt line, the GRAFX_V3D power
+        // domain and V3D reset of the PM block, the firmware's V3D clock
+        f.begin("v3d@fec00000");
+        f.str("compatible", "brcm,2711-v3d");
+        f.cells("reg", &[0, 0xfec0_0000, 0x4000, 0, 0xfec0_4000, 0x4000]);
+        f.strs("reg-names", &["hub", "core0"]);
+        f.cells("power-domains", &[pm, 1]);
+        f.cells("resets", &[pm, 0]);
+        f.cells("clocks", &[fwclk, 5]);
+        f.cells("interrupts", &[GIC_SPI, 74, LEVEL_HIGH]);
+        f.end();
+    }
+    if b.kms {
         f.begin("hvs@fe400000");
         f.str("compatible", "brcm,bcm2711-hvs");
         f.cells("reg", &[0, 0xfe40_0000, 0x8000]);
