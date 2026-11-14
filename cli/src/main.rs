@@ -7,6 +7,7 @@ mod cpio;
 mod disk;
 #[cfg(not(target_arch = "wasm32"))]
 mod gdb;
+mod monitor;
 
 use bcm2711::{Machine, Stop};
 use std::io::{Read, Write};
@@ -204,14 +205,55 @@ fn run(args: &[String]) -> ExitCode {
     let started = Instant::now();
     let mut escape = false;
     let mut pending: std::collections::VecDeque<u8> = Default::default();
+    // keys read while waiting (idle, paused), handled with the rest
+    let mut idle_keys: Vec<u8> = Vec::new();
+    // the monitor's input line while it is open (Ctrl-A c)
+    let mut monitor_line: Option<String> = None;
+    let mut paused = false;
+    let mut reset_req = false;
     let result = loop {
-        // input: Ctrl-A x quits
-        while let Ok(b) = rx.try_recv() {
-            if escape { escape = false; if b == b'x' { break; } if b != 1 { pending.push_back(1); } }
-            if b == 1 { escape = true; continue; }
+        // input: Ctrl-A x quits, Ctrl-A c opens/closes the monitor, Ctrl-A Ctrl-A sends Ctrl-A
+        let mut quit = false;
+        let mut keys = std::mem::take(&mut idle_keys);
+        while let Ok(b) = rx.try_recv() { keys.push(b); }
+        for b in keys {
+            if escape {
+                escape = false;
+                match b {
+                    b'x' => { quit = true; break; }
+                    b'c' => {
+                        if monitor_line.take().is_some() { eprint!("\r\n"); } else { monitor_line = Some(String::new()); eprint!("\r\n(sbc-emu) "); }
+                        continue;
+                    }
+                    1 => {}
+                    _ => if monitor_line.is_none() { pending.push_back(1); },
+                }
+            } else if b == 1 { escape = true; continue; }
+            if let Some(line) = monitor_line.as_mut() {
+                match b {
+                    b'\r' | b'\n' => {
+                        let cmd = std::mem::take(line);
+                        eprint!("\r\n");
+                        let (text, effect) = monitor::command(&mut m, &cmd);
+                        eprint!("{}", text.replace('\n', "\r\n"));
+                        match effect {
+                            monitor::Effect::Quit => { quit = true; break; }
+                            monitor::Effect::Pause(p) => paused = p,
+                            monitor::Effect::Reset => reset_req = true,
+                            monitor::Effect::Gdb(port) => match gdb::Gdb::listen(port) { Ok(g) => gdb = Some(g), Err(e) => eprint!("gdbserver: {e}\r\n") },
+                            monitor::Effect::None => {}
+                        }
+                        eprint!("(sbc-emu) ");
+                    }
+                    0x7f | 8 => if line.pop().is_some() { eprint!("\x08 \x08"); },
+                    0x20..=0x7e => { line.push(b as char); eprint!("{}", b as char); }
+                    _ => {}
+                }
+                continue;
+            }
             pending.push_back(b);
         }
-        if escape && false { break Stop::Budget; }
+        if quit { break Stop::Budget; }
         if usb_input {
             // keystrokes go to the USB keyboard; terminal escape sequences become arrow keys
             while m.soc.usb.kbd.queued() < 64 {
@@ -258,6 +300,17 @@ fn run(args: &[String]) -> ExitCode {
                     "type" => for b in unescape(rest).bytes() { m.soc.usb.kbd.type_byte(b); },
                     "serial" => pending.extend(unescape(rest).bytes()),
                     "serial1" => for b in unescape(rest).bytes() { m.soc.aux.push_rx(b); m.soc.dirty = true; },
+                    "monitor" => {
+                        let (text, effect) = monitor::command(&mut m, rest);
+                        eprint!("{}", text.replace('\n', "\r\n"));
+                        match effect {
+                            monitor::Effect::Quit => { script.pop_front(); break Stop::Budget; }
+                            monitor::Effect::Pause(p) => paused = p,
+                            monitor::Effect::Reset => reset_req = true,
+                            monitor::Effect::Gdb(port) => if let Ok(g) = gdb::Gdb::listen(port) { gdb = Some(g) },
+                            monitor::Effect::None => {}
+                        }
+                    }
                     "shot" => {
                         let mut rgba = Vec::new();
                         if let Some((w, h)) = m.soc.mbox.render(&m.soc.ram, &mut rgba) { let _ = std::fs::write(rest, bcm2711::png::encode_rgba(w, h, &rgba)); }
@@ -305,7 +358,14 @@ fn run(args: &[String]) -> ExitCode {
         }
         let budget = 2_000_000u64.min(max.saturating_sub(m.instret()));
         if budget == 0 { break Stop::Budget; }
-        let mut stop = m.run(budget);
+        if paused && !reset_req {
+            // paused from the monitor: only keys move; the pause does not count as guest time
+            let t0 = Instant::now();
+            if let Ok(b) = rx.recv_timeout(Duration::from_millis(20)) { idle_keys.push(b); }
+            start += t0.elapsed();
+            continue;
+        }
+        let mut stop = if std::mem::take(&mut reset_req) { Stop::Reset } else { m.run(budget) };
         // a debugger looks at breakpoints and at stops that would end the run
         if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
             let hit = match stop {
@@ -331,7 +391,7 @@ fn run(args: &[String]) -> ExitCode {
             serial_log.push_str(&String::from_utf8_lossy(&m.soc.uart.out));
             if serial_log.len() > 1 << 20 { serial_log.drain(..serial_log.len() - (1 << 19)); }
         }
-        flush(&mut m, &mut out, tty.0);
+        if monitor_line.is_none() { flush(&mut m, &mut out, tty.0); }
         if !m.soc.aux.out.is_empty() {
             let b = std::mem::take(&mut m.soc.aux.out);
             if let Some(f) = serial1.as_mut() { let _ = f.write_all(&b); let _ = f.flush(); }
@@ -344,9 +404,7 @@ fn run(args: &[String]) -> ExitCode {
                 let target = t.min(wall.max(m.now));
                 if target <= m.now {
                     let wait = Duration::from_nanos((t - m.now).min(20_000_000));
-                    if let Ok(b) = rx.recv_timeout(wait) {
-                        if b == 1 { escape = true } else { pending.push_back(b) }
-                    }
+                    if let Ok(b) = rx.recv_timeout(wait) { idle_keys.push(b); }
                     let wall = start.elapsed().as_nanos() as u64;
                     m.idle_until(t.min(wall));
                 } else {
