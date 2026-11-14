@@ -1,0 +1,16 @@
+#cloud-config
+# Seeds Ubuntu's Raspberry Pi image for the emulator: copied over user-data on the image's boot
+# partition before the first boot. A test account for the emulated Pi only.
+users:
+  - name: pi
+    gecos: Pi
+    groups: [adm, sudo, video, render, input, audio, plugdev]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    plain_text_passwd: raspberry
+chpasswd:
+  expire: false
+swap:
+  filename: /swapfile
+  size: 1G

@@ -98,10 +98,14 @@ pub struct Soc {
     pub dirty: bool,
 }
 
-/// DMA bus addresses: the peripheral window at 0x7e.., RAM aliases at 0x40../0x80../0xc0..
-fn dma_phys(a: u32) -> u64 {
+/// DMA bus addresses: the peripheral window at 0x7e.., RAM itself (the device tree maps device
+/// addresses 1:1, so with more than 1 GiB they reach past 0x4000_0000), and the VideoCore RAM
+/// aliases at 0x40../0x80../0xc0.. above the end of RAM.
+pub(crate) fn dma_phys(a: u32, ram_len: u64) -> u64 {
     let a = a as u64;
-    if (0x7e00_0000..0x7f00_0000).contains(&a) { a + 0x8000_0000 } else if a >= 0x4000_0000 && a < 0xfc00_0000 { a & 0x3fff_ffff } else { a }
+    if (0x7e00_0000..0x7f00_0000).contains(&a) { a + 0x8000_0000 }
+    else if a < ram_len { a }
+    else if a >= 0x4000_0000 && a < 0xfc00_0000 { a & 0x3fff_ffff } else { a }
 }
 
 impl Soc {
@@ -261,7 +265,7 @@ impl Soc {
     fn dma_load_cb(&mut self, n: usize) -> bool {
         let cb = self.dma.ch[n].conblk & !31;
         if cb == 0 { return false; }
-        let base = dma_phys(cb);
+        let base = dma_phys(cb, self.ram.len() as u64);
         let mut w = [0u32; 8];
         for (k, x) in w.iter_mut().enumerate() { *x = self.read32(base + 4 * k as u64).unwrap_or(0); }
         let c = &mut self.dma.ch[n];
@@ -302,7 +306,7 @@ impl Soc {
                     if paced(self.dma.ch[n].ti).is_none() { self.dma_run(n); break; }
                     continue;
                 }
-                let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(dma_phys(c.src)).unwrap_or(0) };
+                let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(dma_phys(c.src, self.ram.len() as u64)).unwrap_or(0) };
                 if dreq == crate::i2s::DREQ_TX { self.i2s.push(v); } else if let Some(vc) = self.vc4.as_mut() { vc.mai_push(v); }
                 let c = &mut self.dma.ch[n];
                 if c.ti & TI_SRC_INC != 0 { c.src = c.src.wrapping_add(4); }
@@ -324,7 +328,8 @@ impl Soc {
     /// for a DREQ.
     fn dma_run(&mut self, n: usize) {
         use crate::dma::*;
-        let phys = dma_phys;
+        let ram_len = self.ram.len() as u64;
+        let phys = |a: u32| dma_phys(a, ram_len);
         for _ in 0..4096 {
             let cb = self.dma.ch[n].conblk & !31;
             if cb == 0 { break; }

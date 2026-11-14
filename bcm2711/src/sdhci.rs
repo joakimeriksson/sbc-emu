@@ -10,7 +10,7 @@
 //!
 //! Card model: SD physical layer 3.0 SDHC/SDXC, block addressed, 3.3 V only (no UHS voltage
 //! switch), 4-bit bus, high speed via CMD6. Supported commands: 0, 2, 3, 6, 7, 8, 9, 10, 12, 13,
-//! 16, 17, 18, 23, 24, 25, 55 and ACMD 6, 13, 23, 41, 42, 51. Anything else times out, which is
+//! 16, 17, 18, 23, 24, 25, 32, 33, 38, 55 and ACMD 6, 13, 23, 41, 42, 51. Anything else times out, which is
 //! how a real SD card answers SDIO/MMC probes (CMD5, CMD1, CMD52).
 
 /// Storage behind the card (512-byte sectors).
@@ -272,6 +272,12 @@ impl Sdhci {
             (_, 16) => r1(self),
             (_, 12) => { self.xfer = Xfer::None; self.raise(INT_XFER_DONE); r1(self) }
             (false, 23) => { self.pre_count = Some(arg); r1(self) }
+            // erase: CMD32/CMD33 set the first and last block, CMD38 (R1b) erases. Linux only
+            // erases to discard (TRIM), after which the data is undefined, so the blocks keep
+            // their contents. Sent with a busy response (R1b), the end of busy is the transfer-
+            // complete interrupt, at once; sent as plain R1, Linux polls CMD13 instead.
+            (false, 32) | (false, 33) => r1(self),
+            (false, 38) => { if resp_ty == 3 { self.raise(INT_XFER_DONE); } r1(self) }
             (false, 6) => {
                 // SWITCH_FUNC status: group 1 supports default + high speed
                 let mut s = vec![0u8; 64];

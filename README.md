@@ -219,25 +219,28 @@ core; the browser build is about 3× slower than native and single-threaded.
 
 ## Compared with QEMU's `raspi4b`
 
-QEMU emulates more boards and runs the guest's cores on several host threads; for a Pi 4
-specifically (QEMU 9/10 docs and its open patch series, November 2026):
+QEMU's side is what its own board page lists (["Raspberry Pi boards"](https://www.qemu.org/docs/master/system/arm/raspi.html),
+documentation for QEMU 11.1.90, November 2026): "implemented devices", "missing devices", and
+nothing for what the page does not mention. QEMU also models the raspi0, 1A+, 2B, 3A+ and 3B
+(ARM1176, Cortex-A7, Cortex-A53 cores); sbc-emu models only the Pi 4 and runs AArch64 only.
 
-| | sbc-emu | QEMU `raspi4b` |
+| | sbc-emu `pi4b` | QEMU `raspi4b` (its documentation) |
 |---|---|---|
-| Boot | the stock Raspberry Pi OS `.img` (config.txt, cmdline.txt, kernel8.img) | kernel and DTB passed by hand |
-| Display | HDMI through the stock `vc4` KMS driver (HVS, pixel valve, HDMI encoder, EDID, HDMI audio) | the firmware framebuffer |
-| 3D GPU | V3D 4.2 for Mesa's OpenGL ES 3.1 and Vulkan 1.3 drivers | no |
-| Cores | 4: in turns on one thread (repeatable) or a thread each (`--threads multi`) | 4, a thread each (MTTCG) |
-| Ethernet (GENET) | yes, with NAT and port forwarding | not merged (patches in review) |
-| USB | keyboard, tablet, stick, webcam on the xHCI (USB-A) ports; OTG port | keyboard does not enumerate on raspi4b |
-| Wi-Fi | yes (stock `brcmfmac`, WPA2) | no |
-| GPIO/I²C/SPI devices | LED, button, BME280, MCP3008 | controllers only |
-| RNG, thermal, watchdog, system timer, mini UART, DMA | yes | yes |
-| PCIe / xHCI | yes (VL805, stock `xhci-pci`) | not merged |
-| Audio | I²S DAC HAT, to a WAV file or the browser | no |
-| Bluetooth | yes (stock `hci_bcm`, LE scanning) | no |
-| FP exceptions and rounding modes | exact | exact |
-| GDB stub (incl. watchpoints), monitor, snapshots, port forwarding, VNC | yes | yes |
+| RAM | `--ram-mb`, up to 3.9 GiB (below the peripheral window) | 2 GiB |
+| Boot | the stock SD image: config.txt (`[pi4]`, `os_prefix`), cmdline.txt, gzip kernel, initramfs | not on the board page |
+| CPU, GIC, system timer, DMA, mailbox and firmware properties, RNG, thermal sensor | yes | yes |
+| Serial ports (PL011, mini UART) | yes | yes |
+| SD host | yes (incl. erase/TRIM) | yes |
+| GPIO, SPI, I²C controllers | yes, with an LED, a button, a BME280 and an MCP3008 attached | yes (controllers) |
+| PWM | no | listed as missing |
+| Display | HDMI through the stock `vc4` KMS driver: HVS, pixel valve, HDMI encoder, EDID (`--hdmi-mode`), HDMI audio | the firmware frame buffer |
+| 3D GPU (V3D) | yes: Mesa's OpenGL ES 3.1 and Vulkan 1.3 drivers | not listed |
+| PCIe root complex | yes (INTx; the device tree names no MSI controller) | yes; MSI/MSI-X listed as missing (INTx only) |
+| USB | VL805 xHCI behind PCIe (keyboard, tablet, stick, webcam) and the DWC2 OTG port | DWC2 USB2 host |
+| GENET Ethernet | yes, with NAT and port forwarding | yes |
+| Wi-Fi, Bluetooth (CYW43455) | yes: stock `brcmfmac` (WPA2), `hci_bcm` (LE scanning) | not listed |
+| I²S audio | yes: a DAC HAT, to a WAV file or the browser | not listed |
+| Cores on host threads | `--threads multi` (or in turns, repeatable to the instruction) | not on the board page (QEMU's MTTCG) |
 | In the browser | yes (WebAssembly build with its own JIT) | no |
 
 ## The JIT

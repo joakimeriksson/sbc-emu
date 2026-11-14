@@ -357,11 +357,19 @@ impl Vc4 {
     /// One plane entry (HVS5 layout), RGB formats, nearest-neighbour scaling. The bottom plane
     /// is opaque; planes above it blend with their per-pixel alpha (the cursor).
     fn draw_plane(&self, ram: &[u8], e: &dyn Fn(usize) -> u32, ctl0: u32, bottom: bool, out: &mut [u8], w: usize, h: usize) {
-        let fmt = ctl0 & 0xf;
+        let fmt = ctl0 & 0x1f; // SCALER5_CTL0_PIXEL_FORMAT: 5 bits on the HVS5
         let order = (ctl0 >> 13) & 3;
         let unity = ctl0 & (1 << 15) != 0;
         let tiling = (ctl0 >> 20) & 3;
-        if tiling != 0 { return; }
+        let skip = |why: &str| {
+            // each kind of plane the model cannot show, once
+            thread_local! { static SEEN: std::cell::RefCell<Vec<u32>> = Default::default(); }
+            let key = ctl0 & 0x0030_e00f;
+            if SEEN.with(|s| { let mut s = s.borrow_mut(); let new = !s.contains(&key); if new { s.push(key); } new }) {
+                eprintln!("[vc4] HVS plane not shown ({why}): ctl0={ctl0:#010x} format {} order {} tiling {}", ctl0 & 0xf, (ctl0 >> 13) & 3, (ctl0 >> 20) & 3);
+            }
+        };
+        if tiling != 0 && tiling != 3 { return skip("64/128/256-byte tiling"); }
         let pos0 = e(1);
         let (x0, y0) = ((pos0 & 0xfff) as usize, ((pos0 >> 16) & 0xfff) as usize);
         let mut k = 3; // control word 2 at 2
@@ -370,24 +378,57 @@ impl Vc4 {
         let pos2 = e(k);
         let (pw, ph) = ((pos2 & 0x1fff) as usize, ((pos2 >> 16) & 0x1fff) as usize);
         let ptr = e(k + 2) as usize;
-        let pitch = (e(k + 4) & 0xffff) as usize;
+        let pitch0 = e(k + 4);
+        let pitch = (pitch0 & 0xffff) as usize;
         let (dw, dh) = if unity { (pw, ph) } else { (sw.max(1), sh.max(1)) };
-        let bpp = match fmt { 4 | 1 | 2 | 3 => 2, 5 => 3, 7 => 4, _ => return };
+        let bpp = match fmt { 4 | 1 | 2 | 3 => 2, 5 => 3, 7 | 16 => 4, _ => return skip("pixel format") };
+        // T-tiled (DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED, what GNOME's compositor scans out): the
+        // pointer was advanced to the source origin; undo that to the start of its even row of
+        // 4 KiB tiles and address source pixels from there (vc4_plane.c, Mesa's vc4_tiling.c)
+        let t = (tiling == 3).then(|| {
+            if bpp == 3 { return None; }
+            let tw_px = if bpp == 2 { 64 } else { 32 };
+            let (x_off, y_off) = ((pitch0 >> 26) as usize, ((pitch0 >> 8) & 63) as usize);
+            let (tiles_l, tiles_r) = (((pitch0 >> 16) & 0x7f) as usize, (pitch0 & 0x7f) as usize);
+            let tiles_w = tiles_l + tiles_r;
+            let odd = y_off & 32 != 0;
+            let (tile_y, subtile_y, utile_y) = ((y_off >> 4) & 1, (y_off >> 2) & 3, y_off & 3);
+            let mut adj = (subtile_y << 8) + (utile_y << 4);
+            adj = if odd { adj + ((tiles_w - tiles_l) << 12) - ((1 + (tile_y ^ 1)) << 10) } else { adj + (tiles_l << 12) + (tile_y << 10) };
+            if odd { adj += tiles_w << 12; }
+            let base = ptr.checked_sub(adj)?;
+            Some((base, tiles_l * tw_px + x_off, y_off, tiles_w))
+        }).flatten();
+        if tiling == 3 && t.is_none() { return skip("T-tiled layout"); }
+        let addr = |sx: usize, sy: usize| -> usize {
+            match t {
+                Some((base, ox, oy, tiles_w)) => base + t_format_offset(ox + sx, oy + sy, bpp, tiles_w),
+                None => ptr + sy * pitch + sx * bpp,
+            }
+        };
         for dy in 0..dh {
             let y = y0 + dy;
             if y >= h { break; }
             let sy = if unity { dy } else { dy * ph / dh };
-            let row = ptr + sy * pitch;
             for dx in 0..dw {
                 let x = x0 + dx;
                 if x >= w { break; }
                 let sx = if unity { dx } else { dx * pw / dw };
-                let Some(p) = ram.get(row + sx * bpp..row + sx * bpp + bpp) else { continue };
+                let a0 = addr(sx, sy);
+                let Some(p) = ram.get(a0..a0 + bpp) else { continue };
                 let (r, g, b, a) = match (fmt, order) {
                     (7, 2) => (p[2], p[1], p[0], p[3]), // ARGB/XRGB8888: B, G, R, A in memory
                     (7, 3) => (p[0], p[1], p[2], p[3]), // ABGR/XBGR8888
                     (7, 0) => (p[3], p[2], p[1], p[0]),
                     (7, _) => (p[1], p[2], p[3], p[0]),
+                    (16, _) => {
+                        // XRGB/ARGB2101010 (order ARGB) or XBGR/ABGR2101010: 10 bits a channel,
+                        // GNOME's choice when the display takes 30-bit colour
+                        let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                        let (hi, mid, lo) = (((v >> 22) & 255) as u8, ((v >> 12) & 255) as u8, ((v >> 2) & 255) as u8);
+                        let a = ((v >> 30) * 85) as u8;
+                        if order == 3 { (lo, mid, hi, a) } else { (hi, mid, lo, a) }
+                    }
                     (5, 3) => (p[0], p[1], p[2], 255), // BGR888
                     (5, _) => (p[2], p[1], p[0], 255), // RGB888
                     (4, _) => {
@@ -399,7 +440,7 @@ impl Vc4 {
                     _ => (0, 0, 0, 255),
                 };
                 let o = (y * w + x) * 4;
-                if a == 255 || bottom || fmt != 7 {
+                if a == 255 || bottom || (fmt != 7 && fmt != 16) {
                     out[o..o + 4].copy_from_slice(&[r, g, b, 255]);
                 } else {
                     let a = a as u32;
@@ -433,6 +474,21 @@ impl Vc4 {
         if v2 { self.edid = r.bytes()?.to_vec(); }
         Ok(())
     }
+}
+
+/// Byte offset of pixel (x, y) in a VC4 T-format image `tiles_w` 4 KiB tiles wide (Mesa's
+/// vc4_tiling.c): 64-byte micro-tiles (4x4 pixels at 32 bpp, 8x4 at 16), 1 KiB sub-tiles of 4x4
+/// micro-tiles, 4 KiB tiles of 2x2 sub-tiles whose order alternates with the tile row, and
+/// rows of tiles running left to right on even rows, right to left on odd ones.
+fn t_format_offset(x: usize, y: usize, cpp: usize, tiles_w: usize) -> usize {
+    let uw = 16 / cpp;
+    let (ux, uy) = (x / uw, y / 4);
+    let (tile_x, tile_y) = (ux >> 3, uy >> 3);
+    let odd = tile_y & 1 == 1;
+    let tile_x = if odd { tiles_w.saturating_sub(tile_x + 1) } else { tile_x };
+    let stile = (((uy >> 2) & 1) << 1) | ((ux >> 2) & 1);
+    let stile_off = if odd { [2, 1, 3, 0][stile] } else { [0, 3, 1, 2][stile] };
+    4096 * (tile_y * tiles_w + tile_x) + 1024 * stile_off + 64 * ((uy & 3) * 4 + (ux & 3)) + (y & 3) * uw * cpp + (x % uw) * cpp
 }
 
 // ---------------------------------------------------------------------- the monitor
@@ -525,6 +581,46 @@ fn edid_with(pref: (u32, u32)) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn t_format_is_a_permutation() {
+        for cpp in [2usize, 4] {
+            let (tiles_w, tiles_h) = (3, 3);
+            let (w, h) = (tiles_w * if cpp == 2 { 64 } else { 32 }, tiles_h * 32);
+            let mut seen = vec![false; w * h];
+            for y in 0..h { for x in 0..w {
+                let o = t_format_offset(x, y, cpp, tiles_w);
+                assert_eq!(o % cpp, 0);
+                assert!(!seen[o / cpp], "cpp {cpp}: ({x},{y}) collides");
+                seen[o / cpp] = true;
+            } }
+        }
+        // Mesa's examples: the first 1 KiB sub-tile of an odd tile row is the top right
+        assert_eq!(t_format_offset(0, 32, 4, 2), 4096 * 3 + 1024 * 2);
+    }
+
+    #[test]
+    fn t_tiled_plane_origin() {
+        // vc4_plane.c's pointer and pitch for a source origin, then the HVS model's way back
+        for (sx, sy) in [(0, 0), (40, 0), (5, 33), (70, 47), (33, 70)] {
+            let (tiles_w, cpp) = (4usize, 4usize);
+            let (tiles_l, x_off, tiles_t, y_off) = (sx >> 5, sx & 31, sy >> 5, sy & 63);
+            let (tile_y, subtile_y, utile_y) = ((sy >> 4) & 1, (sy >> 2) & 3, sy & 3);
+            let mut off = tiles_t * (tiles_w << 12) + (subtile_y << 8) + (utile_y << 4);
+            if tiles_t & 1 == 1 { off += (tiles_w - tiles_l) << 12; off -= (1 + (tile_y ^ 1)) << 10; } else { off += (tiles_l << 12) + (tile_y << 10); }
+            let base = 0x10_0000usize;
+            let ptr = base + off;
+            // the model: undo to the even tile row, then address (x_off + 0, y_off + 0)
+            let odd = y_off & 32 != 0;
+            let mut adj = (subtile_y << 8) + (utile_y << 4);
+            adj = if odd { adj + ((tiles_w - tiles_l) << 12) - ((1 + (tile_y ^ 1)) << 10) } else { adj + (tiles_l << 12) + (tile_y << 10) };
+            if odd { adj += tiles_w << 12; }
+            let even_row = ptr - adj;
+            assert_eq!(even_row, base + (tiles_t & !1) * (tiles_w << 12), "origin ({sx},{sy})");
+            assert_eq!(even_row + t_format_offset(tiles_l * 32 + x_off, y_off, cpp, tiles_w),
+                       base + t_format_offset(sx, sy, cpp, tiles_w), "origin ({sx},{sy})");
+        }
+    }
+
     #[test]
     fn edid_checksums() {
         for mode in [(1920, 1080), (800, 600), (640, 480)] {

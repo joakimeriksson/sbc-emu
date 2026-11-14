@@ -76,6 +76,9 @@ pub fn read_sd_boot(disk: &mut dyn crate::sdhci::Disk) -> Result<SdBoot, String>
     let config = fat.read_file("config.txt").map(|c| String::from_utf8_lossy(&c).into_owned()).unwrap_or_default();
     let mut notes = Vec::new();
     let (mut kernel_name, mut initramfs_name, mut cmdline_name, mut auto_initramfs) = ("kernel8.img".to_string(), None::<String>, "cmdline.txt".to_string(), false);
+    // os_prefix: a directory (or name prefix) in front of the kernel, initramfs and cmdline
+    // (Ubuntu keeps them in current/, and new/ for [tryboot], which a normal boot skips)
+    let mut os_prefix = String::new();
     let mut applies = true;
     for line in config.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -94,6 +97,7 @@ pub fn read_sd_boot(disk: &mut dyn crate::sdhci::Disk) -> Result<SdBoot, String>
         match (k.trim(), v.trim()) {
             ("kernel", v) => kernel_name = v.to_string(),
             ("cmdline", v) => cmdline_name = v.to_string(),
+            ("os_prefix", v) => os_prefix = v.to_string(),
             ("auto_initramfs", v) => auto_initramfs = v == "1",
             ("arm_64bit", "0") => return Err("config.txt asks for a 32-bit kernel (arm_64bit=0): not supported".into()),
             ("dtoverlay", v) if v.starts_with("vc4-kms-v3d") => notes.push("dtoverlay=vc4-kms-v3d: HDMI through the vc4 KMS driver (the device tree describes it unless --display fb)".into()),
@@ -103,7 +107,13 @@ pub fn read_sd_boot(disk: &mut dyn crate::sdhci::Disk) -> Result<SdBoot, String>
     }
     if initramfs_name.is_none() && auto_initramfs {
         let name = kernel_name.replace("kernel", "initramfs").trim_end_matches(".img").to_string();
-        if fat.find(&name).is_some() { initramfs_name = Some(name); }
+        if fat.find(&format!("{os_prefix}{name}")).is_some() { initramfs_name = Some(name); }
+    }
+    if !os_prefix.is_empty() {
+        notes.push(format!("os_prefix={os_prefix}"));
+        kernel_name = format!("{os_prefix}{kernel_name}");
+        cmdline_name = format!("{os_prefix}{cmdline_name}");
+        initramfs_name = initramfs_name.map(|n| format!("{os_prefix}{n}"));
     }
     let kernel = fat.read_file(&kernel_name).ok_or(format!("{kernel_name} not found on the boot partition"))?;
     let kernel = gunzip_if_needed(kernel)?;

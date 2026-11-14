@@ -78,7 +78,7 @@ impl Mailbox {
             0x1c => self.cfg = v,
             0x20 => {
                 let ch = v & 0xf;
-                let addr = (v & !0xf & 0x3fff_ffff) as usize;
+                let addr = crate::machine::dma_phys(v & !0xf, ram.len() as u64) as usize;
                 if ch == 8 { self.property(ram, addr); }
                 self.rd.push_back(v);
             }
