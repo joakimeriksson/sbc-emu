@@ -18,7 +18,8 @@ pub mod nat {
         #[allow(clippy::too_many_arguments)]
         pub fn udp_out(&mut self, _gmac: &[u8; 6], _gip: &[u8; 4], _sport: u16, _dip: &[u8; 4], _reply_src: &[u8; 4], _dport: u16, _payload: &[u8], _now_us: u64) {}
         pub fn tcp_in(&mut self, _gmac: &[u8; 6], _gip: &[u8; 4], _dip: &[u8; 4], _seg: &[u8], _now_us: u64) -> Vec<Vec<u8>> { Vec::new() }
-        pub fn poll(&mut self, _now_us: u64) -> Vec<Vec<u8>> { Vec::new() }
+        pub fn poll(&mut self, _now_us: u64, _guest: Option<([u8; 6], [u8; 4])>, _gw_ip: [u8; 4]) -> Vec<Vec<u8>> { Vec::new() }
+        pub fn has_forwards(&self) -> bool { false }
     }
 }
 pub mod crypto;

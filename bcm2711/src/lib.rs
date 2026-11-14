@@ -3,6 +3,7 @@
 //! Pi 4 firmware sets up by default. Only what the reduced device tree (`fdt.rs`) describes is
 //! modelled; everything else in the peripheral window reads as zero and is logged once.
 pub mod boot;
+pub mod dma;
 pub mod dwc2;
 pub mod fat;
 pub mod fdt;

@@ -30,6 +30,7 @@ pub const AVS: u64 = 0xfd5d_2000;
 pub const PM: u64 = 0xfe10_0000;
 pub const SYSTIMER: u64 = 0xfe00_3000;
 pub const AUX: u64 = 0xfe21_5000;
+pub const DMA: u64 = 0xfe00_7000;
 /// GPU memory carve-out at the top of RAM (firmware `gpu_mem=64`), holding the framebuffer
 pub const GPU_MEM: u64 = 64 << 20;
 const PPI_VTIMER: usize = 27;
@@ -45,6 +46,7 @@ const SPI_SPI: usize = 32 + 118;
 const SPI_GENET1: usize = 32 + 158;
 const SPI_SYSTIMER: usize = 32 + 64;
 const SPI_AUX: usize = 32 + 93;
+const SPI_DMA0: usize = 32 + 80;
 
 pub struct Soc {
     pub ram: Vec<u8>,
@@ -71,6 +73,7 @@ pub struct Soc {
     pub aux: crate::periph::AuxUart,
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
+    pub dma: crate::dma::Dma,
     /// the network behind the Ethernet port (None = cable unplugged)
     pub net: Option<sbc_net::net::VirtualNet>,
     pub unknown: Vec<u64>,
@@ -96,6 +99,7 @@ impl Soc {
             PM..=0xfe10_0113 => self.pm.read(a - PM),
             SYSTIMER..=0xfe00_301b => self.systimer.read(a - SYSTIMER),
             AUX..=0xfe21_50ff => self.aux.read(a - AUX),
+            DMA..=0xfe00_7fff => self.dma.read(a - DMA),
             // AXI bridges (ASB): the ID register; request bits are acknowledged at once
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => match a & 0xff { 0x20 => 0x6272_6467, o => self.asb[(o / 4) as usize % 12] & !(1 << 1) },
             GICD..=0xff84_1fff => self.gic.dist_read(self.cur, a - GICD),
@@ -135,6 +139,7 @@ impl Soc {
             PM..=0xfe10_0113 => self.pm.write(a - PM, v),
             SYSTIMER..=0xfe00_301b => self.systimer.write(a - SYSTIMER, v),
             AUX..=0xfe21_50ff => self.aux.write(a - AUX, v),
+            DMA..=0xfe00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v,
             GICD..=0xff84_1fff => self.gic.dist_write(self.cur, a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(self.cur, a - GICC, v),
@@ -143,6 +148,49 @@ impl Soc {
         }
         Ok(())
     }
+    /// DMA channel `n` was made active: walk its control blocks now.
+    fn dma_run(&mut self, n: usize) {
+        use crate::dma::*;
+        // bus addresses: the peripheral window at 0x7e.., RAM aliases at 0x40../0x80../0xc0..
+        let phys = |a: u32| -> u64 { let a = a as u64; if (0x7e00_0000..0x7f00_0000).contains(&a) { a + 0x8000_0000 } else if a >= 0x4000_0000 && a < 0xfc00_0000 { a & 0x3fff_ffff } else { a } };
+        for _ in 0..4096 {
+            let cb = self.dma.ch[n].conblk & !31;
+            if cb == 0 { break; }
+            let base = phys(cb);
+            let mut w = [0u32; 8];
+            for (k, x) in w.iter_mut().enumerate() { *x = self.read32(base + 4 * k as u64).unwrap_or(0); }
+            let [ti, src, dst, len, stride, next, _, _] = w;
+            let (xlen, rows) = if ti & TI_TDMODE != 0 { (len & 0xffff, (len >> 16) & 0x3fff) } else { (len & 0x3fff_ffff, 1) };
+            let (sstride, dstride) = ((stride & 0xffff) as i16 as i64, (stride >> 16) as i16 as i64);
+            let (mut s, mut d) = (phys(src), phys(dst));
+            for row in 0..rows {
+                let mut off = 0;
+                while off < xlen {
+                    let n4 = (xlen - off).min(4);
+                    if n4 == 4 {
+                        let v = if ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(s).unwrap_or(0) };
+                        if ti & TI_DEST_IGNORE == 0 { let _ = self.write32(d, v); }
+                    } else {
+                        for b in 0..n4 as u64 {
+                            let v = if ti & TI_SRC_IGNORE != 0 { 0 } else { self.read8(s + b).unwrap_or(0) };
+                            if ti & TI_DEST_IGNORE == 0 { let _ = self.write8(d + b, v); }
+                        }
+                    }
+                    if ti & TI_SRC_INC != 0 { s += n4 as u64; }
+                    if ti & TI_DEST_INC != 0 { d += n4 as u64; }
+                    off += n4;
+                }
+                if ti & TI_TDMODE != 0 && row + 1 < rows { s = s.wrapping_add(sstride as u64); d = d.wrapping_add(dstride as u64); }
+            }
+            let c = &mut self.dma.ch[n];
+            c.ti = ti; c.src = src; c.dst = dst; c.len = 0; c.stride = stride; c.next = next;
+            if ti & TI_INTEN != 0 { c.cs |= INT; }
+            c.conblk = next;
+        }
+        let c = &mut self.dma.ch[n];
+        c.cs = (c.cs & !ACTIVE) | END;
+    }
+
     fn note(&mut self, a: u64) {
         let page = a & !0xfff;
         if !self.unknown.contains(&page) {
@@ -255,7 +303,7 @@ impl Machine {
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
@@ -369,6 +417,7 @@ impl Machine {
         for k in 0..4 { let l = self.soc.systimer.irq(k); self.soc.gic.set_level(SPI_SYSTIMER + k, l); }
         let aux = self.soc.aux.irq();
         self.soc.gic.set_level(SPI_AUX, aux);
+        for n in 0..11 { let l = self.soc.dma.irq(n); self.soc.gic.set_level(SPI_DMA0 + n, l); }
         for k in 0..self.cpus.len() {
             if self.state[k] == CoreState::Off { continue; }
             let irq = self.soc.gic.irq_out(k);
@@ -624,6 +673,7 @@ impl Machine {
         c.x[0] = context;
         c.sys.cpacr_el1 = 3 << 20;
         c.jit_off = self.cpus[caller].jit_off;
+        c.crypto = self.cpus[caller].crypto;
         // the JIT stays with whichever core holds it
         let mut old = std::mem::replace(&mut self.cpus[t], c);
         old.hand_jit_to(&mut self.cpus[t]);
@@ -631,6 +681,9 @@ impl Machine {
         self.round_end = self.round_end.min(now + quantum());
         self.soc.dirty = true;
     }
+
+    /// The optional Cryptographic Extension on every core (QEMU's cortex-a72 has it; a Pi 4 does not).
+    pub fn set_crypto(&mut self, on: bool) { for c in self.cpus.iter_mut() { c.crypto = on; } }
 
     /// Debugging: interpreter only on all cores (needed while breakpoints are set).
     pub fn set_debugging(&mut self, on: bool) { for c in self.cpus.iter_mut() { c.jit_off = on; } }
@@ -708,7 +761,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v6");
+        w.tag("machine-v7");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -727,6 +780,7 @@ impl Machine {
         self.soc.pm.save_state(&mut w);
         self.soc.systimer.save_state(&mut w);
         self.soc.aux.save_state(&mut w);
+        self.soc.dma.save_state(&mut w);
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -743,7 +797,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        let v6 = r.tag("machine-v6").is_ok();
+        let v7 = r.tag("machine-v7").is_ok();
+        if !v7 { r.p = 0; }
+        let v6 = v7 || r.tag("machine-v6").is_ok();
         if !v6 { r.p = 0; }
         let v5 = v6 || r.tag("machine-v5").is_ok();
         if !v5 { r.p = 0; r.tag("machine-v4").map_err(e)?; }
@@ -780,6 +836,7 @@ impl Machine {
             self.soc.systimer.load_state(&mut r).map_err(e)?;
             self.soc.aux.load_state(&mut r).map_err(e)?;
         }
+        if v7 { self.soc.dma.load_state(&mut r).map_err(e)?; }
         self.soc.ram.fill(0);
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;

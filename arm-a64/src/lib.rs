@@ -2,6 +2,7 @@
 //! EL0–EL3, stage-1 MMU (4 KiB granule), FP/SIMD load/store. Interpreter first; a block cache
 //! and JIT can follow esp32sim's pattern once the interpreter is the oracle.
 mod cpu;
+mod crypto;
 mod exec;
 pub mod fpu;
 pub mod jit;

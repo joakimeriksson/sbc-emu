@@ -14,12 +14,17 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | | Status | Evidence |
 |---|---|---|
 | Raspberry Pi kernel 6.18 (firmware 1.20260915 `kernel8.img`) | boots to userspace | busybox initramfs shell on serial and HDMI |
-| Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | boots: firmware-style SD boot → initramfs → ext4 root → systemd 257 → `raspberrypi login:` and the first-boot setup wizard on HDMI | `scripts/raspios-firstboot.txt`; ~27 G instructions to the login prompt |
+| Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | boots on all four cores: firmware-style SD boot → initramfs → ext4 root → systemd 257 → `raspberrypi login:` and the first-boot setup wizard on HDMI | `scripts/raspios-firstboot.txt`; ~27 G instructions to the login prompt |
+| Four cores | four Cortex-A72s started through PSCI, GIC-400 with per-core interfaces, SGIs (IPIs) and SPI routing | `smp: Brought up 1 node, 4 CPUs`; four busy loops finish in 1.6 s of guest time instead of 6.5 s |
 | Keyboard | emulated USB keyboard on the DWC2 OTG port (host mode) | Linux enumerates it, `hid-generic` binds, typing works on tty1 |
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
-| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 53 s (JIT with block chaining and linking); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 49 s on one core, 47 s on four (22 s of guest time); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
+| Floating point | exact Arm semantics: FPCR rounding modes, flush-to-zero, default NaN, all FPSR exception flags, Arm's estimate tables | `diff_fp.rs`: 18,800 random cases bit-exact against the host CPU (interpreter and JIT) |
+| More peripherals | DMA controller, hardware RNG, thermal sensor, PM watchdog and power domains, system timer, mini UART | stock drivers bind: `/dev/hwrng`, `/sys/class/thermal`, `/dev/watchdog` (expiry reboots), `ttyS0`, `dma0chan*` |
+| Debugging | GDB remote stub (`--gdb PORT`, one thread per core), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump) | lldb: kernel breakpoint, step, memory read, detach |
+| Port forwarding | `--hostfwd tcp::2222-:22` (QEMU's syntax) through the user-mode NAT | `ssh-keyscan -p 2222 127.0.0.1` reads the Pi OS host keys |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~2.7 min (JIT on), ~200 MiB of the image read |
 
@@ -36,14 +41,14 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
   (`brcmfmac`) against an emulated CYW43455 host interface (firmware download real, firmware
   behaviour emulated, open and WPA2-PSK networks, no radio model; see docs/decisions.md D5). **clock_mode**: T0 real-time pacing
   (virtual time is deterministic per run; wall-clock pacing only governs idle time).
-- **tested_cpu_count**: 1 (the Pi 4 has 4).
+- **tested_cpu_count**: 4, as on the Pi 4 (`--smp 1..4`).
 
 ## The emulated hardware
 
 | Block | Model | Linux driver |
 |---|---|---|
-| CPU | ARMv8.0-A, Cortex-A72 identity: A64 integer ISA, FP, Advanced SIMD, EL0–EL3, stage-1 MMU (4 KiB), generic timer, PSCI via the host | — |
-| GIC-400 | distributor + CPU interface | `gic-400` |
+| CPU | 4× ARMv8.0-A, Cortex-A72 identity: A64 integer ISA with CRC32, FP (exact, all FPCR modes), Advanced SIMD, EL0–EL3, stage-1 MMU (4 KiB), generic timers, PSCI (CPU_ON/OFF, AFFINITY_INFO, reset, off) via the host | — |
+| GIC-400 | distributor + four CPU interfaces, banked SGIs/PPIs, SPI targets | `gic-400` |
 | UART0 | PL011 | `amba-pl011` |
 | Mailbox | VideoCore property channel (board, memory, clocks, power, framebuffer) | `bcm2835-mbox`, `raspberrypi-firmware` |
 | EMMC2 | SDHCI v3 (PIO) + SDHC card on an image file | `sdhci-iproc` |
@@ -54,6 +59,12 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | GPIO | function select, set/clear/level, edge/level detect, 2711 pulls, bank IRQs | `pinctrl-bcm2835` |
 | I²C1 + BME280 | BSC FIFO controller; BME280 with datasheet compensation (host sets physical values) | `i2c-bcm2835`, `bmp280` (IIO) |
 | SPI0 + MCP3008 | FIFO controller, GPIO chip select; bit-serial 10-bit ADC | `spi-bcm2835`, `mcp320x` (IIO) |
+| DMA | legacy channels: control-block chains, 2D mode, ignore/increment, completes at once (no DREQ pacing) | `bcm2835-dma` |
+| RNG | iproc RNG200 FIFO | `iproc-rng200` |
+| Thermal | AVS monitor temperature register, thermal zone (`sensor cpu-temp C` sets it) | `bcm2711-thermal` |
+| PM | watchdog (65536 Hz; expiry resets the machine), AXI bridges for the power domains | `bcm2835-wdt`, `bcm2835-power` |
+| System timer | 1 MHz counter, four compare channels | `bcm2835-system-timer` |
+| Mini UART | AUX + mini UART as a 16550 (`--serial1 FILE`, script step `serial1 TEXT`) | `8250_bcm2835aux` (`ttyS0`) |
 
 ## Running it
 
@@ -78,6 +89,19 @@ Script steps for the board: `gpio PIN 0|1|float`, `sensor temp|pressure|humidity
 Snapshots: a script step `save FILE` writes the whole machine (CPU, devices, RAM, disk overlay);
 `--restore FILE` resumes it (the same SD image must be attached).
 
+More options, mostly after QEMU's:
+
+- `--smp N`: cores (1..4, default 4).
+- `--gdb PORT [--gdb-wait]`: GDB remote stub (`gdb`: `target remote :PORT`, `lldb`:
+  `gdb-remote PORT`); `--gdb-wait` holds the machine at reset until a debugger attaches. Cores are
+  threads; software/hardware breakpoints switch the cores to the interpreter while set.
+- `--hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (repeatable): forward a host TCP port
+  into the guest over Ethernet, e.g. `--hostfwd tcp::2222-:22` then `ssh -p 2222 pi@127.0.0.1`.
+- `--serial1 FILE`: the mini UART's output (`ttyS0`).
+- Ctrl-A c opens the **monitor** (`help` lists the commands: `info registers|cpus|irq|network|jit`,
+  `x`/`xp`, `stop`/`cont`, `savevm`/`loadvm`, `screendump`, `sendkey`, `hostfwd_add`,
+  `gdbserver`, `system_reset`, `quit`); scripts can run them with `monitor CMD`.
+
 ### In the browser
 
 ```sh
@@ -96,11 +120,13 @@ present) and the quick busybox demo. Click the screen to type on the USB keyboar
 cargo test --release --workspace
 ```
 
-- `arm-a64/tests/diff_host.rs`, `diff_neon.rs`: **differential tests against the host CPU**
-  (Apple silicon is AArch64): integer, FP and NEON snippets run natively and on the emulator from
-  the same random states; registers, flags, NaN payloads and FPSR.QC must match bit for bit.
+- `arm-a64/tests/diff_host.rs`, `diff_neon.rs`, `diff_fp.rs`: **differential tests against the
+  host CPU** (Apple silicon is AArch64): integer (incl. CRC32), FP and NEON snippets run natively
+  and on the emulator from the same random states; registers, flags, NaN payloads and FPSR must
+  match bit for bit. `diff_fp.rs` draws a random FPCR (rounding mode, FZ, DN) per case and
+  operands from the hard classes (subnormals, overflow, ties, NaNs).
 - `bcm2711` unit tests: GPIO edges, BME280 compensation against the Linux driver's formula, MCP3008
-  framing against `mcp320x`'s decode.
+  framing against `mcp320x`'s decode, GIC SGI/SPI routing between cores, DMA control-block chains.
 - `arm-a64/tests/system.rs`: exceptions, EL changes, MMU faults, timer interrupts.
 - `tools/wasm-smoke.mjs`, `tools/wasm-smoke-sd.mjs`: headless boots of the WebAssembly build.
 
@@ -118,11 +144,32 @@ scripts/    action scripts (first boot of Raspberry Pi OS)
 
 ## Known gaps
 
-Single core; Wi-Fi has no radio model (emulated firmware host interface, WPA2-PSK only); no GPU/HVS/HDMI controller (software framebuffer only); FPCR rounding
-modes, flush-to-zero and FP exception flags are not modelled by the interpreter (JIT-native FP uses
-the host's default FPCR); no LSE atomics, crypto or CRC32 instructions (the ID registers say so, so
-software does not use them); the native JIT needs an AArch64 host and is still well below a real
-Pi 4 core; the browser build is about 3× slower than native.
+No GPU/HVS/HDMI controller (software framebuffer only); no PCIe, so no VL805 xHCI behind the
+USB-A ports (the keyboard sits on the OTG port); no audio, camera or Bluetooth; Wi-Fi has no radio
+model (emulated firmware host interface, open and WPA2-PSK networks); DMA transfers are not paced
+by peripheral DREQs; no crypto or LSE instructions (the BCM2711's A72 has neither; the ID registers
+say so); the cores run in turns on one host thread (deterministic, but four busy cores share one
+host core); the native JIT needs an AArch64 host and is still well below a real Pi 4 core; the
+browser build is about 3× slower than native; GDB watchpoints are not supported.
+
+## Compared with QEMU's `raspi4b`
+
+QEMU emulates more boards and runs the guest's cores on several host threads; for a Pi 4
+specifically (QEMU 9/10 docs and its open patch series, November 2026):
+
+| | sbc-emu | QEMU `raspi4b` |
+|---|---|---|
+| Boot | the stock Raspberry Pi OS `.img` (config.txt, cmdline.txt, kernel8.img) | kernel and DTB passed by hand |
+| Cores | 4 | 4 |
+| Ethernet (GENET) | yes, with NAT and port forwarding | not merged (patches in review) |
+| USB keyboard | yes (OTG port) | does not enumerate on raspi4b |
+| Wi-Fi | yes (stock `brcmfmac`, WPA2) | no |
+| GPIO/I²C/SPI devices | LED, button, BME280, MCP3008 | controllers only |
+| RNG, thermal, watchdog, system timer, mini UART, DMA | yes | yes |
+| PCIe / xHCI | no | not merged |
+| FP exceptions and rounding modes | exact | exact |
+| GDB stub, monitor, snapshots, port forwarding | yes | yes |
+| In the browser | yes (WebAssembly build with its own JIT) | no |
 
 ## The JIT
 

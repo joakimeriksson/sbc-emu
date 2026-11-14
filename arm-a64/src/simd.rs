@@ -47,6 +47,7 @@ impl Cpu {
 
     pub(crate) fn simd_fp_exec(&mut self, bus: &mut dyn Bus, i: u32) -> Result<Option<u64>, Trap> {
         let _ = bus;
+        if self.crypto && self.crypto_op(i).is_some() { return Ok(None); }
         if !bit(i, 30) && bits(i, 28, 24) == 0b11110 && !bit(i, 31) && !bit(i, 29) {
             return self.fp_scalar(i);
         }

@@ -233,6 +233,19 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("phandle", &[gpio]);
     f.end();
 
+    f.begin("dma-controller@fe007000");
+    f.str("compatible", "brcm,bcm2835-dma");
+    f.cells("reg", &[0, 0xfe00_7000, 0xb00]);
+    let irqs: Vec<u32> = (0..11).flat_map(|n| [GIC_SPI, 80 + n, LEVEL_HIGH]).collect();
+    f.cells("interrupts", &irqs);
+    let names: Vec<String> = (0..11).map(|n| format!("dma{n}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    f.strs("interrupt-names", &refs);
+    f.cells("#dma-cells", &[1]);
+    // the channels the firmware leaves to Linux on a Pi 4
+    f.cells("brcm,dma-channel-mask", &[0x01f5]);
+    f.end();
+
     f.begin("rng@fe104000");
     f.str("compatible", "brcm,bcm2711-rng200");
     f.cells("reg", &[0, 0xfe10_4000, 0x28]);

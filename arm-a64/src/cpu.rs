@@ -83,6 +83,8 @@ pub struct Cpu {
     pub(crate) jit_disp: u64,
     /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
     pub last_wfe: bool,
+    /// the optional Cryptographic Extension (AES, SHA-1, SHA-256, PMULL): off on a Pi 4
+    pub crypto: bool,
     /// debugging: run the interpreter only (breakpoints and single steps see every instruction)
     pub jit_off: bool,
     /// an inner-shareable TLBI ran: the other cores must do the same (`Cpu::tlb_invalidate`
@@ -128,7 +130,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, crypto: false,
         }
     }
 
