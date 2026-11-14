@@ -1,0 +1,28 @@
+# The browser GPU demo snapshot: Raspberry Pi OS logged in on the HDMI console (a 1024x768
+# monitor), every demo run once so its binaries and Mesa are in RAM. Made on a frozen copy of the
+# GPU test image, which the page then serves:
+#   cp -c cache/os/raspios-gpu.img cache/os/raspios-gpu-demo.img
+#   sbc-emu run --sd cache/os/raspios-gpu-demo.img --hdmi-mode 1024x768 --script scripts/gpu-demo-snapshot.txt
+wait-serial raspberrypi login:
+sleep 3
+wait-idle 4
+type pi\n
+sleep 2
+wait-idle 4
+type raspberry\n
+sleep 3
+wait-idle 6
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial kmscube -c 20 > /dev/null 2>&1; for b in build shading:shading=phong shading:shading=cel jellyfish refract desktop:effect=shadow bump:bump-render=normals pulsar shadow terrain; do glmark2-es2-drm -b $b:duration=1 2>&1 | grep FPS; done; echo WARM-""DONE\n
+wait-serial WARM-DONE
+type clear\n
+sleep 3
+wait-idle 6
+shot out/gpu-demo-ready.png
+save web/assets/gpu-demo.snap
+quit

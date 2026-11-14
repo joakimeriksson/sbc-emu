@@ -139,6 +139,46 @@ by the host time the job took, so they show how fast the interpreted GPU is on t
 | loop | `fragment-steps=5:fragment-uniform=false:vertex-steps=5` | 16 | 66.449 ms |
 | loop | `fragment-steps=5:fragment-uniform=true:vertex-steps=5` | 11 | 96.275 ms |
 
+## In the browser
+
+`web/index.html` runs the 3D demos in the WebAssembly build: it restores a snapshot of Raspberry
+Pi OS with Mesa, logged in on the HDMI console with every demo already run once (so the program
+files, Mesa and the shader cache are in the guest's page cache), and types each demo's command
+on the USB keyboard. The V3D model is the same Rust code as natively; in WebAssembly the job
+timing uses `performance.now()` through the `sbc_host_now_ms` import.
+
+```sh
+cp -c cache/os/raspios-gpu.img cache/os/raspios-gpu-demo.img   # frozen: the snapshot refers to it
+sbc-emu run --sd cache/os/raspios-gpu-demo.img --hdmi-mode 1024x768 --script scripts/gpu-demo-snapshot.txt
+ln -s ../../cache/os/raspios-gpu-demo.img web/assets/raspios-gpu.img
+tools/wasm-build.sh && tools/serve.py     # http://127.0.0.1:8791/  (?demo=cube starts one at once)
+```
+
+`--hdmi-mode WxH` plugs in a monitor whose preferred mode is 1920×1080, 1280×720, 1024×768,
+800×600 or 640×480; the console, `kmscube` and `glmark2` use it. The demos use 1024×768: at
+800×600 `glmark2-es2-drm` fails to set up its canvas. Snapshots keep the monitor's EDID, so a
+restored guest that re-probes the connector keeps its mode.
+
+`tools/wasm-gpu-bench.mjs` runs the same snapshot in Node (V8, as in Chrome), types each demo and
+reports its frame rate; `tools/browser-check.mjs URL PREFIX SECS...` drives headless Chrome over
+the DevTools protocol and saves screenshots. At 1024×768 (Node 26, M5, one thread):
+
+| Demo | WebAssembly | native |
+|---|---|---|
+| `kmscube` | 43 fps | 60 fps (vsync) |
+| `glmark2` build (horse) | 36 fps | 56–65 fps |
+| `shading:shading=phong` | 11 fps | 18 fps |
+| `jellyfish` | 2.5 fps | 4–6 fps |
+| `desktop:effect=shadow` | 4 fps | 4–5 fps |
+
+The QPU interpreter resolves each ALU operation's operand unpacking once per instruction and
+then runs a plain loop over the 16 lanes, with branch-free denormal flushing, so the compiler
+vectorises it (NEON natively, SIMD128 in the WebAssembly build). That cut the
+render time of a Phong frame from 81 ms to 56 ms natively and raised the browser's Phong rate
+from 4.4 to 7.1 fps (at 1080p). The glmark2 table above was measured before that change.
+Texture-heavy scenes (jellyfish, refract, terrain) spend their time in texture fetch and
+filtering instead.
+
 ## Debugging aids
 
 - `SBC_V3D_LOG=1`: one line per bin job, the first vertex shader output of each draw, the first

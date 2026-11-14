@@ -155,10 +155,13 @@ More options, mostly after QEMU's:
 tools/wasm-build.sh                               # web/wasm/sbc-emu.wasm + web/assets
 ln -s ../../cache/os/raspios-lite.img web/assets/raspios-lite.img
 tools/serve.py                                    # needs HTTP Range support: use this, not http.server
-open http://127.0.0.1:8791/
+open http://127.0.0.1:8791/            # the sbc-emu page: live 3D demos on the Pi 4's GPU
+open http://127.0.0.1:8791/pi4.html    # the full Pi 4 console
 ```
 
-The page offers a cold boot of the SD image, a resume from `web/assets/raspios-lite.snap` (if
+`index.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
+scenes on the emulated V3D GPU (setup in [docs/gpu.md](docs/gpu.md#in-the-browser)).
+`pi4.html` offers a cold boot of the SD image, a resume from `web/assets/raspios-lite.snap` (if
 present) and the quick busybox demo. Click the screen to type on the USB keyboard; the mouse
 over the screen is the USB tablet, and what the guest plays on the DAC comes out of the page
 (after the first click or key press, as browsers require). The browser build runs the cores in
@@ -291,7 +294,7 @@ barriers, PRFM and thread-pointer/`SP_EL0` reads; everything else calls the inte
 instruction. Execution counting before compilation uses a direct-mapped table (no hashing on the
 interpreter's path).
 
-On by default (`index.html?jit=0` turns it off). Raspberry Pi OS cold boot to `login:` in the
+On by default (`pi4.html?jit=0` or `index.html?jit=0` turns it off). Raspberry Pi OS cold boot to `login:` in the
 browser build (`tools/wasm-smoke-sd.mjs`, Node 26, M5, runs alone):
 
 | Step | `login:` after |

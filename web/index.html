@@ -3,170 +3,318 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sbc-emu Pi 4</title>
+<title>sbc-emu</title>
+<meta name="description" content="Real single-board computers, emulated in your browser: a Raspberry Pi 4 running unmodified Raspberry Pi OS, with its 3D GPU.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg: #f4f4f1; --fg: #1d1d1b; --muted: #6b6b66; --panel: #ffffff; --line: #d9d9d3; --accent: #c51a4a; --term-bg: #111; --term-fg: #d6d6d6; }
-  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; } }
-  :root[data-theme="dark"] { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; }
+  :root {
+    --mask: #103b2c;        /* solder mask */
+    --mask-2: #17493a;      /* raised areas of the mask */
+    --mask-3: #0b2a1f;      /* recessed: the screen surround */
+    --silk: #eef0e6;        /* silkscreen */
+    --silk-2: #9db5a8;      /* faded silkscreen */
+    --gold: #d4af5a;        /* ENIG pads: everything you can press */
+    --copper: #c2774a;      /* traces: the one live thing */
+    --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+    --body: "Atkinson Hyperlegible", system-ui, sans-serif;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
-  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
-  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
-  h1 { font-size: 20px; margin: 0; }
-  h1 span { color: var(--accent); }
-  .muted { color: var(--muted); }
-  #status { font-variant-numeric: tabular-nums; }
-  .screen { background: #000; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; outline: none; }
-  .screen:focus { box-shadow: 0 0 0 2px var(--accent); }
-  canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
-  .hint { margin: 6px 0 14px; font-size: 13px; }
-  details { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
-  summary { cursor: pointer; padding: 8px 12px; }
-  pre { margin: 0; padding: 10px 12px; background: var(--term-bg); color: var(--term-fg); height: 260px; overflow: auto; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; border-radius: 0 0 6px 6px; }
-  .chooser { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 12px; }
-  .chooser button { text-align: left; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
-  .chooser button span { color: var(--muted); font-size: 13px; }
-  .chooser button:hover { border-color: var(--accent); }
-  .board { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 4px 0 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
-  .board label { display: flex; align-items: center; gap: 6px; }
-  .board input[type=range] { width: 120px; }
-  .ledbox { display: flex; align-items: center; gap: 8px; }
-  .led { width: 16px; height: 16px; border-radius: 50%; background: #3a1a1a; border: 1px solid var(--line); }
-  .led.on { background: #ff3b3b; box-shadow: 0 0 10px #ff3b3b; }
-  .serialform { display: flex; gap: 8px; padding: 8px 12px; }
-  .serialform input { flex: 1; min-width: 0; font: 13px ui-monospace, Menlo, monospace; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--fg); }
-  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; }
+  html { background: var(--mask); }
+  body {
+    margin: 0; color: var(--silk); font: 17px/1.55 var(--body);
+    background:
+      radial-gradient(circle at 1px 1px, rgba(238,240,230,.06) 1px, transparent 1.4px) 0 0 / 22px 22px,
+      var(--mask);
+  }
+  a { color: var(--gold); text-underline-offset: 3px; }
+  a:hover { color: var(--silk); }
+  :focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px; }
+
+  /* header: the board's own silkscreen title block */
+  header.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 0 10px; }
+  .mark { display: flex; align-items: center; gap: 12px; text-decoration: none; color: var(--silk); }
+  .mark svg { flex: none; }
+  .mark b { font: 700 28px/1 var(--display); letter-spacing: .02em; }
+  nav.top { display: flex; gap: 22px; font: 600 18px/1 var(--display); letter-spacing: .03em; }
+  nav.top a { color: var(--silk-2); text-decoration: none; }
+  nav.top a:hover { color: var(--gold); }
+
+  /* hero */
+  .intro { max-width: 46rem; padding: 40px 0 28px; }
+  h1 { font: 700 clamp(44px, 6.4vw, 84px)/.95 var(--display); letter-spacing: -.005em; margin: 0 0 18px; text-wrap: balance; }
+  .intro p { margin: 0; color: var(--silk-2); font-size: 19px; max-width: 40rem; }
+
+  .stage { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 28px; align-items: start; padding-bottom: 56px; }
+
+  /* the HDMI output, framed like a connector with its reference designator */
+  .port { position: relative; border: 2px solid var(--silk-2); border-radius: 4px 4px 14px 14px; padding: 14px; background: var(--mask-3); }
+  .port .ref { position: absolute; top: -13px; left: 16px; padding: 0 8px; background: var(--mask); font: 600 17px/24px var(--display); color: var(--silk); letter-spacing: .04em; }
+  .port .ref span { color: var(--silk-2); font-weight: 500; }
+  .screen { position: relative; aspect-ratio: 4 / 3; background: #000; overflow: hidden; outline: none; }
+  .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; image-rendering: auto; }
+  .screen:focus-visible { box-shadow: 0 0 0 2px var(--gold); }
+  .power { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 18px; text-align: center; padding: 24px; background: radial-gradient(ellipse at center, #0f2f24 0%, #000 75%); }
+  .power[hidden] { display: none; }
+  .power button { font: 700 26px/1 var(--display); letter-spacing: .04em; color: var(--mask); background: var(--gold); border: 0; border-radius: 999px; padding: 18px 34px; cursor: pointer; box-shadow: inset 0 -3px 0 rgba(0,0,0,.25); }
+  .power button:hover { background: #e3c374; }
+  .power button:disabled { cursor: progress; opacity: .7; }
+  .power p { margin: 0; color: var(--silk-2); font-size: 15px; max-width: 30rem; }
+  .readout { display: flex; flex-wrap: wrap; gap: 6px 26px; margin-top: 12px; font: 500 17px/1.3 var(--display); letter-spacing: .03em; color: var(--silk-2); font-variant-numeric: tabular-nums; }
+  .readout strong { color: var(--silk); font-weight: 600; }
+  .readout .live { color: var(--copper); }
+
+  /* the demos: a row of pads you press */
+  .demos h2, .section h2 { font: 700 30px/1.05 var(--display); margin: 0 0 6px; letter-spacing: .01em; }
+  .demos > p { margin: 0 0 16px; color: var(--silk-2); font-size: 15px; }
+  .pads { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .pad { width: 100%; display: grid; grid-template-columns: 22px 1fr auto; gap: 2px 12px; align-items: center; text-align: left; font: inherit; color: var(--silk); background: var(--mask-2); border: 1px solid transparent; border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+  .pad:disabled { cursor: not-allowed; color: var(--silk-2); }
+  .pad:not(:disabled):hover { border-color: var(--gold); }
+  .pad .dot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--gold); grid-row: span 2; justify-self: center; }
+  .pad:disabled .dot { border-color: var(--silk-2); opacity: .5; }
+  .pad[aria-pressed="true"] { border-color: var(--copper); }
+  .pad[aria-pressed="true"] .dot { background: var(--copper); border-color: var(--copper); }
+  .pad .name { font: 600 21px/1.1 var(--display); letter-spacing: .02em; }
+  .pad .fps { font: 500 15px/1 var(--display); color: var(--silk-2); grid-row: span 2; letter-spacing: .03em; }
+  .pad .what { font-size: 14px; color: var(--silk-2); line-height: 1.35; }
+  .demos .keys { margin: 14px 0 0; font-size: 14px; color: var(--silk-2); }
+  kbd, code { font: 15px/1 ui-monospace, "SF Mono", Menlo, monospace; color: var(--silk); }
+
+  /* sections below the fold */
+  .section { padding: 56px 0; border-top: 1px solid rgba(157,181,168,.25); }
+  .section > p.lede { color: var(--silk-2); max-width: 44rem; margin: 0 0 28px; }
+
+  .bench { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 24px; }
+  .slot { border-radius: 10px; padding: 20px; }
+  .slot.live { background: var(--mask-2); }
+  .slot.next { border: 2px dashed rgba(157,181,168,.45); }
+  .slot svg { display: block; width: 100%; height: auto; margin-bottom: 14px; }
+  .slot h3 { font: 700 26px/1.05 var(--display); margin: 0 0 4px; }
+  .slot .state { font: 600 16px/1 var(--display); letter-spacing: .04em; color: var(--copper); }
+  .slot.next .state { color: var(--silk-2); }
+  .slot p { margin: 10px 0 0; font-size: 15px; color: var(--silk-2); }
+  .slot ul { margin: 12px 0 0; padding-left: 18px; font-size: 15px; }
+  .slot li { margin: 3px 0; }
+
+  .soc { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0; border: 2px solid var(--silk-2); border-radius: 12px; overflow: hidden; }
+  .blk { padding: 16px 18px; border-right: 1px solid rgba(157,181,168,.3); border-bottom: 1px solid rgba(157,181,168,.3); }
+  .blk h3 { font: 700 21px/1.1 var(--display); margin: 0 0 4px; letter-spacing: .02em; }
+  .blk p { margin: 0; font-size: 14px; color: var(--silk-2); line-height: 1.4; }
+  .blk.gpu { background: var(--mask-2); }
+  .blk.gpu h3 { color: var(--gold); }
+
+  footer { padding: 34px 0 48px; color: var(--silk-2); font-size: 15px; border-top: 1px solid rgba(157,181,168,.25); }
+  footer p { margin: 0 0 6px; max-width: 52rem; }
+
+  @media (max-width: 920px) {
+    .stage { grid-template-columns: 1fr; }
+    .intro { padding-top: 22px; }
+  }
+  @media (max-width: 520px) {
+    .wrap { padding: 0 16px; }
+    nav.top { gap: 14px; }
+    .port { padding: 8px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <h1>sbc-emu <span>Raspberry Pi 4B</span></h1>
-    <span class="muted">Linux in an instruction-level AArch64 emulator, running in your browser</span>
+<div class="wrap">
+  <header class="top">
+    <a class="mark" href="./" aria-label="sbc-emu home">
+      <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><rect x="5" y="5" width="24" height="24" rx="3" fill="none" stroke="#eef0e6" stroke-width="2"/><rect x="11" y="11" width="12" height="12" rx="1" fill="#d4af5a"/><g stroke="#eef0e6" stroke-width="2" stroke-linecap="round"><path d="M12 1v4M17 1v4M22 1v4M12 29v4M17 29v4M22 29v4M1 12h4M1 17h4M1 22h4M29 12h4M29 17h4M29 22h4"/></g></svg>
+      <b>sbc-emu</b>
+    </a>
+    <nav class="top" aria-label="Site">
+      <a href="pi4.html">Pi 4 console</a>
+      <a href="#bench">Devices</a>
+      <a href="#inside">Inside</a>
+    </nav>
   </header>
-  <div id="chooser" class="chooser">
-    <button type="button" data-os="raspios-snap"><strong>Resume Raspberry Pi OS Lite</strong><span>A snapshot of the same SD-card boot taken after first-boot setup: the login prompt in seconds. Log in as <code>pi</code> / <code>raspberry</code>.</span></button>
-    <button type="button" data-os="raspios"><strong>Raspberry Pi OS Lite</strong><span>Boots the unmodified trixie SD card image: firmware-style boot, systemd, first-boot setup. Cold boot to the setup screen takes several minutes.</span></button>
-    <button type="button" data-os="busybox"><strong>Quick demo: Pi kernel + busybox</strong><span>The same Pi kernel with a tiny initramfs: a shell on the screen in about a minute.</span></button>
-  </div>
-  <p id="status" class="muted">choose a system to boot</p>
-  <div class="screen" id="screen" tabindex="0"><canvas id="fb" width="1024" height="768"></canvas></div>
-  <p class="hint muted">Click the screen to type on the Pi's USB keyboard (emulated DWC2 USB host + HID keyboard). The screen is the firmware framebuffer (simplefb, fbcon). Try <code>cat /proc/cpuinfo</code> or <code>cat /dev/urandom &gt; /dev/fb0</code>.</p>
-  <section class="board" aria-label="Board peripherals">
-    <div class="ledbox"><span id="led" class="led" aria-label="GPIO17 LED"></span><span>LED · GPIO17</span></div>
-    <button id="btn" type="button" title="GPIO27, active high while held">Button · GPIO27</button>
-    <label>BME280 temperature <input id="temp" type="range" min="-10" max="45" step="0.5" value="21.5"> <output id="tempv">21.5 °C</output></label>
-    <label>BME280 humidity <input id="hum" type="range" min="0" max="100" step="1" value="45"> <output id="humv">45 %</output></label>
-    <label>MCP3008 CH0 <input id="adc0" type="range" min="0" max="3.3" step="0.05" value="0"> <output id="adcv">0.00 V</output></label>
+
+  <section class="intro">
+    <h1>Real boards, booted in a browser tab</h1>
+    <p>sbc-emu emulates single-board computers instruction by instruction, with their peripherals, and runs their stock operating systems. First on the bench is the Raspberry Pi 4. It runs unmodified Raspberry Pi OS, and now its VideoCore VI 3D GPU as well.</p>
   </section>
-  <p class="hint muted">In the guest: <code>gpioset -t0 GPIO17_LED=1</code>, <code>gpioget GPIO27_BUTTON</code>, <code>cat /sys/bus/iio/devices/iio:device0/in_temp_input</code>, <code>…/iio:device1/in_voltage0_raw</code>.</p>
-  <details open>
-    <summary>Serial console (UART0) <button id="clear" type="button">clear</button></summary>
-    <pre id="term"></pre>
-    <form id="serialform" class="serialform"><input id="serialin" placeholder="send a line to the serial console (ttyAMA0)" autocomplete="off"><button type="submit">send</button></form>
-  </details>
-</main>
+
+  <section class="stage" aria-label="Live Raspberry Pi 4">
+    <div>
+      <div class="port">
+        <div class="ref">HDMI0 <span id="mode">1024 × 768</span></div>
+        <div class="screen" id="screen" tabindex="0" aria-label="The Pi's HDMI output. Click to type on its keyboard.">
+          <canvas id="fb" width="1024" height="768"></canvas>
+          <div class="power" id="power">
+            <button id="powerbtn" type="button">Power on the Pi 4</button>
+            <p id="powernote">Downloads a 135 MB snapshot of Raspberry Pi OS with Mesa, logged in and ready, then reads the rest of the SD card as it needs it.</p>
+          </div>
+        </div>
+      </div>
+      <div class="readout" aria-live="polite">
+        <span id="st">Powered off</span>
+        <span>GPU <strong id="gfps">–</strong> frames/s</span>
+        <span>CPU <strong id="mips">–</strong> M instructions/s</span>
+        <span>Guest time <strong id="gt">–</strong></span>
+      </div>
+    </div>
+
+    <aside class="demos" aria-labelledby="demos-h">
+      <h2 id="demos-h">3D demos</h2>
+      <p>Each one is a real Linux program using Mesa's V3D driver. The GPU's shader cores run in WebAssembly, so the heavier scenes are slow.</p>
+      <ul class="pads" id="pads"></ul>
+      <p class="keys">Click the screen to type on the Pi's USB keyboard. <kbd>Ctrl</kbd>+<kbd>C</kbd> stops a demo.</p>
+    </aside>
+  </section>
+
+  <section class="section" id="bench" aria-labelledby="bench-h">
+    <h2 id="bench-h">On the bench</h2>
+    <p class="lede">One board so far, modelled down to the registers its Linux drivers touch. Each new board reuses the CPU cores, the snapshot format and this page.</p>
+    <div class="bench">
+      <article class="slot live">
+        <svg viewBox="0 0 260 172" aria-hidden="true">
+          <rect x="2" y="2" width="256" height="168" rx="10" fill="#0b2a1f" stroke="#9db5a8" stroke-width="2"/>
+          <g fill="none" stroke="#9db5a8" stroke-width="2"><circle cx="16" cy="16" r="5"/><circle cx="160" cy="16" r="5"/><circle cx="16" cy="156" r="5"/><circle cx="160" cy="156" r="5"/></g>
+          <g fill="#d4af5a"><rect x="30" y="8" width="118" height="10" rx="1"/></g>
+          <g fill="#0b2a1f" stroke="#eef0e6" stroke-width="1.5"><rect x="78" y="62" width="44" height="44" rx="3"/></g>
+          <text x="100" y="89" fill="#eef0e6" font-family="Barlow Condensed, sans-serif" font-size="11" text-anchor="middle">BCM2711</text>
+          <g fill="none" stroke="#eef0e6" stroke-width="1.5"><rect x="132" y="66" width="20" height="34" rx="2"/><rect x="34" y="120" width="34" height="22" rx="2"/></g>
+          <g fill="#c2774a"><rect x="206" y="10" width="50" height="38" rx="2"/><rect x="206" y="62" width="50" height="38" rx="2"/><rect x="206" y="114" width="50" height="48" rx="2"/></g>
+          <g fill="#d4af5a"><rect x="40" y="162" width="16" height="8" rx="1"/><rect x="82" y="162" width="14" height="8" rx="1"/><rect x="104" y="162" width="14" height="8" rx="1"/></g>
+        </svg>
+        <span class="state">Live in this page</span>
+        <h3>Raspberry Pi 4 Model B</h3>
+        <ul>
+          <li>Four Cortex-A72 cores, booting the stock Raspberry Pi OS card image</li>
+          <li>HDMI through the stock vc4 KMS driver, and the V3D 3D GPU</li>
+          <li>USB keyboard and tablet, Ethernet with NAT, Wi-Fi, Bluetooth LE</li>
+          <li>GPIO, I²C and SPI sensors, I²S audio</li>
+        </ul>
+        <p><a href="pi4.html">Open the full Pi 4 console</a> for the serial port, the LED, the button and the sensors.</p>
+      </article>
+      <article class="slot next">
+        <svg viewBox="0 0 260 172" aria-hidden="true"><rect x="2" y="2" width="256" height="168" rx="10" fill="none" stroke="#9db5a8" stroke-width="2" stroke-dasharray="6 6"/><rect x="82" y="62" width="40" height="40" rx="3" fill="none" stroke="#9db5a8" stroke-width="1.5" stroke-dasharray="4 4"/><text x="102" y="86" fill="#9db5a8" font-family="Barlow Condensed, sans-serif" font-size="11" text-anchor="middle">BCM2837</text></svg>
+        <span class="state">Planned</span>
+        <h3>Raspberry Pi 3 Model B</h3>
+        <p>Listed in the emulator's board table; the BCM2837 SoC model is not written yet.</p>
+      </article>
+      <article class="slot next">
+        <svg viewBox="0 0 260 172" aria-hidden="true"><rect x="2" y="2" width="256" height="168" rx="10" fill="none" stroke="#9db5a8" stroke-width="2" stroke-dasharray="6 6"/><path d="M118 86h24M130 74v24" stroke="#9db5a8" stroke-width="2"/></svg>
+        <span class="state">Open slot</span>
+        <h3>Your next board</h3>
+        <p>New boards plug into the same CPU cores, device-tree generator, snapshots and web page.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="inside" aria-labelledby="inside-h">
+    <h2 id="inside-h">Inside the emulated BCM2711</h2>
+    <p class="lede">No QEMU, no host GPU: every block below is modelled in Rust, compiled to WebAssembly for this page, and driven by the unmodified Linux drivers.</p>
+    <div class="soc">
+      <div class="blk"><h3>4 × Cortex-A72</h3><p>ARMv8-A cores with FP and NEON, an MMU and timers. A block JIT translates guest code to WebAssembly.</p></div>
+      <div class="blk gpu"><h3>V3D 4.2 GPU</h3><p>The binner, rasterizer, tile buffer, texture unit and QPU shader cores. Mesa's OpenGL ES 3.1 and Vulkan drivers run on it.</p></div>
+      <div class="blk"><h3>HVS, pixel valve, HDMI</h3><p>The vc4 display pipeline: planes, vblank, EDID, HDMI audio.</p></div>
+      <div class="blk"><h3>PCIe, VL805 xHCI</h3><p>USB keyboard, tablet, stick and webcam on the USB-A ports.</p></div>
+      <div class="blk"><h3>GENET, CYW43455</h3><p>Ethernet and Wi-Fi with the stock drivers, behind a virtual network.</p></div>
+      <div class="blk"><h3>GPIO, I²C, SPI, PCM</h3><p>An LED, a button, a BME280, an MCP3008 and an I²S DAC.</p></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>sbc-emu runs entirely in this tab: the emulator is WebAssembly in a Web Worker, and the SD card image is read in 1 MiB pieces as the guest asks for them.</p>
+    <p>The 3D demos are <code>kmscube</code> and scenes from <code>glmark2</code>, from the Raspberry Pi OS and Debian archives. Frame rates are what the emulated GPU manages on your computer, not a real Pi 4.</p>
+  </footer>
+</div>
+
 <script>
+const DEMOS = [
+  { id: 'cube', name: 'Spinning cube', what: 'kmscube: Mesa\'s lit cube, page-flipped on HDMI', cmd: 'kmscube' },
+  { id: 'horse', name: 'Horse', what: 'glmark2\'s horse model, lit per vertex', cmd: 'glmark2-es2-drm --run-forever -b build:duration=30' },
+  { id: 'phong', name: 'Shaded cat', what: 'Phong lighting computed per fragment', cmd: 'glmark2-es2-drm --run-forever -b shading:shading=phong:duration=30' },
+  { id: 'cel', name: 'Cartoon cat', what: 'Cel shading with outlines', cmd: 'glmark2-es2-drm --run-forever -b shading:shading=cel:duration=30' },
+  { id: 'jelly', name: 'Jellyfish', what: 'An animated, textured jellyfish; a few frames a second', cmd: 'glmark2-es2-drm --run-forever -b jellyfish:duration=30' },
+  { id: 'desktop', name: 'Desktop', what: 'Windows with soft shadows, rendered to textures', cmd: 'glmark2-es2-drm --run-forever -b desktop:effect=shadow:duration=30' },
+  { id: 'refract', name: 'Refraction', what: 'A glass horse refracting its background; very slow', cmd: 'glmark2-es2-drm --run-forever -b refract:duration=30' },
+];
+const pads = document.getElementById('pads');
+const params = new URLSearchParams(location.search);
+let current = null, running = false;
+for (const d of DEMOS) {
+  const li = document.createElement('li');
+  li.innerHTML = `<button class="pad" type="button" disabled aria-pressed="false" data-id="${d.id}"><span class="dot" aria-hidden="true"></span><span class="name">${d.name}</span><span class="fps" data-fps="${d.id}"></span><span class="what">${d.what}</span></button>`;
+  pads.appendChild(li);
+}
 const canvas = document.getElementById('fb'), ctx = canvas.getContext('2d');
-const term = document.getElementById('term'), status = document.getElementById('status');
 const screen = document.getElementById('screen');
 const worker = new Worker('worker.js');
-let state = 'starting…';
-const strip = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
+const $ = (id) => document.getElementById(id);
 worker.onmessage = (e) => {
   const m = e.data;
-  if (m.type === 'status') { state = m.text; status.textContent = state; }
-  else if (m.type === 'uart') {
-    const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 4;
-    term.textContent += strip(m.text);
-    if (term.textContent.length > 200000) term.textContent = term.textContent.slice(-150000);
-    if (atEnd) term.scrollTop = term.scrollHeight;
+  if (m.type === 'status') {
+    $('st').textContent = m.phase === 'running' ? 'Running' : m.text;
+    if (m.phase === 'running' && !running) {
+      running = true; $('power').hidden = true; pads.querySelectorAll('.pad').forEach((b) => b.disabled = false); screen.focus();
+      const want = params.get('demo');
+      if (want) setTimeout(() => pads.querySelector(`[data-id="${want}"]`)?.click(), 1500);
+    }
+    else if (m.phase === 'error') { $('powernote').textContent = `The Pi did not start: ${m.text}`; $('powerbtn').textContent = 'Try again'; $('powerbtn').disabled = false; }
+    else if (!running) $('powernote').textContent = m.text.charAt(0).toUpperCase() + m.text.slice(1);
   } else if (m.type === 'frame') {
-    if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
+    if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; $('mode').textContent = `${m.w} × ${m.h}`; }
     ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
-  } else if (m.type === 'audio') {
-    play(m.rate, m.samples);
-  } else if (m.type === 'gpio' && m.pin === 17) {
-    document.getElementById('led').classList.toggle('on', m.level === 1);
   } else if (m.type === 'stats') {
-    if (state === 'booting…' || state === 'resumed' || state === 'running') state = 'running';
-    status.textContent = `${state} · ${m.mips.toFixed(1)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '') + (m.jit ? ` · JIT ${m.jit} blocks` : '');
+    $('gfps').textContent = m.gpuFps.toFixed(m.gpuFps < 10 ? 1 : 0);
+    $('mips').textContent = m.mips.toFixed(0);
+    $('gt').textContent = `${m.simS.toFixed(0)} s`;
+    if (current && m.gpuFps > 0) { const f = pads.querySelector(`[data-fps="${current}"]`); f.textContent = `${m.gpuFps.toFixed(m.gpuFps < 10 ? 1 : 0)} fps`; }
   }
 };
-// sound from the emulated I²S DAC (a PCM5102A HAT): queued buffers, started on the first click
-// or key press (browsers only start audio after a user gesture)
-let audio = null, audioAt = 0;
-const startAudio = () => { if (!audio) { try { audio = new AudioContext(); } catch { audio = null; } } };
-function play(rate, s) {
-  if (!audio || !rate || s.length < 2) return;
-  const frames = s.length >> 1, buf = audio.createBuffer(2, frames, rate);
-  const l = buf.getChannelData(0), r = buf.getChannelData(1);
-  for (let i = 0; i < frames; i++) { l[i] = s[2 * i] / 32768; r[i] = s[2 * i + 1] / 32768; }
-  const src = audio.createBufferSource();
-  src.buffer = buf;
-  src.connect(audio.destination);
-  audioAt = Math.max(audioAt, audio.currentTime + 0.05);
-  if (audioAt > audio.currentTime + 2) audioAt = audio.currentTime + 0.05; // the guest ran ahead: drop the backlog
-  src.start(audioAt);
-  audioAt += frames / rate;
-}
-// the mouse on the screen is the USB tablet (absolute position, buttons, wheel)
+$('powerbtn').onclick = () => {
+  $('powerbtn').disabled = true;
+  $('powerbtn').textContent = 'Powering on…';
+  $('powernote').textContent = 'Starting…';
+  worker.postMessage({ type: 'start', os: 'gpu-demo', ramMb: 1024, jit: params.get('jit') !== '0' });
+};
+pads.addEventListener('click', (e) => {
+  const b = e.target.closest('.pad');
+  if (!b || b.disabled) return;
+  const d = DEMOS.find((x) => x.id === b.dataset.id);
+  pads.querySelectorAll('.pad').forEach((p) => p.setAttribute('aria-pressed', String(p === b)));
+  current = d.id;
+  // stop whatever runs (Ctrl-C), then type the demo's command on the HDMI console
+  worker.postMessage({ type: 'type', text: '\x03' });
+  setTimeout(() => worker.postMessage({ type: 'type', text: `clear; ${d.cmd}\n` }), 400);
+  screen.focus();
+});
+// the screen takes the keyboard (USB HID usages) and the mouse (the USB tablet)
+const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
+  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, ArrowRight: 0x4f, ArrowLeft: 0x50,
+  ArrowDown: 0x51, ArrowUp: 0x52, Home: 0x4a, End: 0x4d, Delete: 0x4c, PageUp: 0x4b, PageDown: 0x4e,
+  ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6 };
+for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
+for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
+HID.Digit0 = 0x27;
+const held = new Set();
+screen.addEventListener('keydown', (e) => {
+  const u = HID[e.code];
+  if (!running || u === undefined || e.metaKey) return;
+  e.preventDefault();
+  if (!held.has(u)) { held.add(u); worker.postMessage({ type: 'key', usage: u, down: true }); }
+});
+screen.addEventListener('keyup', (e) => { const u = HID[e.code]; if (u === undefined) return; e.preventDefault(); if (held.delete(u)) worker.postMessage({ type: 'key', usage: u, down: false }); });
+screen.addEventListener('blur', () => { for (const u of held) worker.postMessage({ type: 'key', usage: u, down: false }); held.clear(); });
 const pointer = (e, wheel = 0) => {
+  if (!running) return;
   const b = canvas.getBoundingClientRect();
   const x = Math.round(Math.min(Math.max((e.clientX - b.left) / b.width, 0), 1) * 32767);
   const y = Math.round(Math.min(Math.max((e.clientY - b.top) / b.height, 0), 1) * 32767);
   worker.postMessage({ type: 'pointer', buttons: e.buttons & 7, x, y, wheel });
 };
 canvas.addEventListener('pointermove', (e) => pointer(e));
-canvas.addEventListener('pointerdown', (e) => { startAudio(); screen.focus(); pointer(e); });
+canvas.addEventListener('pointerdown', (e) => { screen.focus(); pointer(e); });
 canvas.addEventListener('pointerup', (e) => pointer(e));
-canvas.addEventListener('wheel', (e) => { e.preventDefault(); pointer(e, e.deltaY < 0 ? 1 : -1); }, { passive: false });
-canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-screen.addEventListener('keydown', startAudio);
-document.getElementById('clear').onclick = (e) => { e.preventDefault(); term.textContent = ''; };
-// KeyboardEvent.code -> USB HID usage (keyboard page)
-const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
-  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39, PrintScreen: 0x46,
-  ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f,
-  ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53, IntlBackslash: 0x64, ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2,
-  MetaLeft: 0xe3, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6, MetaRight: 0xe7 };
-for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
-for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
-HID.Digit0 = 0x27;
-for (let i = 1; i <= 12; i++) HID['F' + i] = 0x39 + i;
-const held = new Set();
-const sendKey = (usage, down) => worker.postMessage({ type: 'key', usage, down });
-screen.addEventListener('keydown', (e) => {
-  const u = HID[e.code];
-  if (u === undefined || (e.metaKey && e.code !== 'MetaLeft' && e.code !== 'MetaRight')) return;
-  e.preventDefault();
-  if (!held.has(u)) { held.add(u); sendKey(u, true); }
-});
-screen.addEventListener('keyup', (e) => { const u = HID[e.code]; if (u === undefined) return; e.preventDefault(); if (held.delete(u)) sendKey(u, false); });
-screen.addEventListener('blur', () => { for (const u of held) sendKey(u, false); held.clear(); });
-document.getElementById('serialform').onsubmit = (e) => {
-  e.preventDefault();
-  const inp = document.getElementById('serialin');
-  worker.postMessage({ type: 'serial', bytes: [...new TextEncoder().encode(inp.value + '\r')] });
-  inp.value = '';
-};
-const btn = document.getElementById('btn');
-const press = (p) => worker.postMessage({ type: 'button', pressed: p });
-btn.addEventListener('pointerdown', () => press(true));
-btn.addEventListener('pointerup', () => press(false));
-btn.addEventListener('pointerleave', () => press(false));
-const slider = (id, out, fmt, send) => { const el = document.getElementById(id); el.oninput = () => { document.getElementById(out).textContent = fmt(+el.value); send(+el.value); }; };
-slider('temp', 'tempv', (v) => `${v} °C`, (v) => worker.postMessage({ type: 'sensor', kind: 0, value: v }));
-slider('hum', 'humv', (v) => `${v} %`, (v) => worker.postMessage({ type: 'sensor', kind: 2, value: v }));
-slider('adc0', 'adcv', (v) => `${v.toFixed(2)} V`, (v) => worker.postMessage({ type: 'adc', ch: 0, volts: v }));
-const params = new URLSearchParams(location.search);
-const boot = (os) => {
-  document.getElementById('chooser').hidden = true;
-  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512, jit: params.get('jit') !== '0' }); // ?jit=0: interpreter only
-  screen.focus();
-};
-document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));
-if (params.get('os')) boot(params.get('os'));
+if (params.has('autostart') || params.has('demo')) $('powerbtn').click();
 </script>
 </body>
 </html>

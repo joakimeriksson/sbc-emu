@@ -56,6 +56,22 @@ struct State {
 
 thread_local! { static ST: RefCell<Option<State>> = const { RefCell::new(None) }; }
 thread_local! { static SMP: std::cell::Cell<usize> = const { std::cell::Cell::new(4) }; }
+// The HDMI monitor's preferred mode for machines booted with the display pipeline (0 = the
+// firmware framebuffer only, no vc4/V3D)
+thread_local! { static KMS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) }; }
+
+/// Machines booted after this call get the vc4 display pipeline (an HDMI monitor of `w`x`h`)
+/// and the V3D 3D GPU, as `dtoverlay=vc4-kms-v3d` asks; 0x0 leaves the firmware framebuffer.
+#[no_mangle]
+pub extern "C" fn sbc_kms(w: u32, h: u32) { KMS.with(|c| c.set((w, h))); }
+
+fn add_gpu(m: &mut Machine) {
+    let (w, h) = KMS.with(|c| c.get());
+    if w > 0 {
+        m.soc.vc4 = Some(bcm2711::vc4::Vc4::with_mode(w, h));
+        m.soc.v3d = Some(v3d::V3d::new());
+    }
+}
 fn smp() -> usize { SMP.with(|c| c.get()) }
 
 /// Cores of the machines booted after this call (1..4; the Pi 4 has 4, the default).
@@ -91,6 +107,7 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
+    add_gpu(&mut m);
     if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
     0
@@ -193,6 +210,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                             let ram = s.m.soc.ram.len();
                             let mut m = Machine::with_cpus(ram, smp());
                             m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(d));
+                            add_gpu(&mut m);
                             if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { s.stop = Some(Stop::Reset); break 2; }
                             s.m = m;
                         }
@@ -250,6 +268,13 @@ pub extern "C" fn sbc_fb_render() -> *const u8 {
 pub extern "C" fn sbc_fb_w() -> u32 { with(|s| s.fb_w).unwrap_or(0) }
 #[no_mangle]
 pub extern "C" fn sbc_fb_h() -> u32 { with(|s| s.fb_h).unwrap_or(0) }
+
+/// Render jobs the 3D GPU has finished (one per frame for most programs), 0 without a GPU.
+#[no_mangle]
+pub extern "C" fn sbc_gpu_frames() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.jobs[1] as f64)).unwrap_or(0.0) }
+/// Host milliseconds spent in GPU jobs.
+#[no_mangle]
+pub extern "C" fn sbc_gpu_ms() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.host_ns.iter().sum::<u64>() as f64 / 1e6)).unwrap_or(0.0) }
 
 #[no_mangle]
 pub extern "C" fn sbc_insns() -> f64 { with(|s| s.m.instret() as f64).unwrap_or(0.0) }

@@ -373,7 +373,24 @@ pub fn f32_to_f16(f: f32) -> u16 {
 }
 
 #[inline(always)]
-fn ftz(f: f32) -> f32 { if f.is_subnormal() { if f.is_sign_negative() { -0.0 } else { 0.0 } } else { f } }
+fn ftz(f: f32) -> f32 {
+    // denormals flush to a signed zero (branchless, so the lane loops vectorise)
+    let b = f.to_bits();
+    let keep = if b & 0x7f80_0000 == 0 { 0x8000_0000 } else { 0xffff_ffff };
+    f32::from_bits(b & keep)
+}
+
+/// An operand array as f32 (the unpack resolved once, outside the lane loop).
+#[inline(always)]
+fn unpack_v(v: &V, u: Unpack) -> [f32; LANES] {
+    let mut o = [0f32; LANES];
+    match u {
+        Unpack::None => for l in 0..LANES { o[l] = ftz(f32::from_bits(v[l])); },
+        Unpack::Abs => for l in 0..LANES { o[l] = ftz(f32::from_bits(v[l] & 0x7fff_ffff)); },
+        _ => for l in 0..LANES { o[l] = unpack_f32(v[l], u); },
+    }
+    o
+}
 
 #[inline(always)]
 fn unpack_f32(v: u32, u: Unpack) -> f32 {
@@ -513,7 +530,7 @@ pub struct Thread {
 #[inline]
 fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
     let mut o = [0u32; LANES];
-    macro_rules! f2 { ($e:expr) => {{ for l in 0..LANES { let (p, q) = (unpack_f32(a[l], ua), unpack_f32(b[l], ub)); o[l] = ftz($e(p, q)).to_bits(); } }} }
+    macro_rules! f2 { ($e:expr) => {{ let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = ftz($e(p[l], q[l])).to_bits(); } }} }
     macro_rules! i2 { ($e:expr) => {{ for l in 0..LANES { o[l] = $e(a[l], b[l]); } }} }
     match op {
         AddOp::Fadd | AddOp::Faddnf => f2!(|p: f32, q: f32| p + q),
@@ -532,15 +549,21 @@ fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
         AddOp::Max => i2!(|x: u32, y: u32| (x as i32).max(y as i32) as u32),
         AddOp::Umin => i2!(|x: u32, y: u32| x.min(y)),
         AddOp::Umax => i2!(|x: u32, y: u32| x.max(y)),
-        AddOp::Vfpack => { for l in 0..LANES { o[l] = (f32_to_f16(unpack_f32(a[l], ua)) as u32) | ((f32_to_f16(unpack_f32(b[l], ub)) as u32) << 16); } }
+        AddOp::Vfpack => { let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = (f32_to_f16(p[l]) as u32) | ((f32_to_f16(q[l]) as u32) << 16); } }
         AddOp::Recip | AddOp::Rsqrt | AddOp::Exp | AddOp::Log | AddOp::Sin | AddOp::Rsqrt2 => {
-            for l in 0..LANES { o[l] = ftz(sfu(op, unpack_f32(a[l], ua))).to_bits(); }
+            let p = unpack_v(a, ua);
+            for l in 0..LANES { o[l] = ftz(sfu(op, p[l])).to_bits(); }
         }
         AddOp::Itof => { for l in 0..LANES { o[l] = ftz(a[l] as i32 as f32).to_bits(); } }
         AddOp::Utof => { for l in 0..LANES { o[l] = ftz(a[l] as f32).to_bits(); } }
-        AddOp::Ftoiz => { for l in 0..LANES { o[l] = f2i_sat(unpack_f32(a[l], ua).trunc()); } }
-        AddOp::Ffloor => { for l in 0..LANES { o[l] = unpack_f32(a[l], ua).floor().to_bits(); } }
+        AddOp::Ftoiz => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = f2i_sat(p[l].trunc()); } }
+        AddOp::Ftoin => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = f2i_sat(round_even(p[l])); } }
+        AddOp::Ffloor => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = p[l].floor().to_bits(); } }
+        AddOp::Fceil => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = p[l].ceil().to_bits(); } }
+        AddOp::Ftrunc => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = p[l].trunc().to_bits(); } }
         AddOp::Not => { for l in 0..LANES { o[l] = !a[l]; } }
+        AddOp::Neg => { for l in 0..LANES { o[l] = a[l].wrapping_neg(); } }
+        AddOp::Eidx => { for l in 0..LANES { o[l] = l as u32; } }
         _ => return None,
     }
     Some(o)
@@ -550,8 +573,8 @@ fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
 fn fast_mul(op: MulOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
     let mut o = [0u32; LANES];
     match op {
-        MulOp::Fmul => { for l in 0..LANES { o[l] = ftz(unpack_f32(a[l], ua) * unpack_f32(b[l], ub)).to_bits(); } }
-        MulOp::Fmov => { for l in 0..LANES { o[l] = unpack_f32(a[l], ua).to_bits(); } }
+        MulOp::Fmul => { let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = ftz(p[l] * q[l]).to_bits(); } }
+        MulOp::Fmov => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = p[l].to_bits(); } }
         MulOp::Mov => o = *a,
         MulOp::Add => { for l in 0..LANES { o[l] = a[l].wrapping_add(b[l]); } }
         MulOp::Sub => { for l in 0..LANES { o[l] = a[l].wrapping_sub(b[l]); } }
@@ -592,10 +615,12 @@ impl Thread {
         v
     }
 
+    #[inline(always)]
     fn cond_mask(&self, c: Cond) -> u16 {
         match c { Cond::None => 0xffff, Cond::Ifa => self.fa, Cond::Ifb => self.fb, Cond::Ifna => !self.fa, Cond::Ifnb => !self.fb }
     }
 
+    #[inline(always)]
     fn read_mux(&self, mux: u8, i: &AluInst) -> V {
         match mux {
             0..=5 => self.acc[mux as usize],
@@ -609,11 +634,11 @@ impl Thread {
     /// Run until the program ends, hits a barrier or uses up `budget` instructions.
     pub fn run(&mut self, code: &mut crate::Code, env: &mut dyn Env, budget: u64) -> Stop {
         let stop_at = self.insns + budget;
+        let tracing = crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0;
         while !self.done {
             if self.insns >= stop_at { return Stop::Budget; }
             let inst = code.fetch(self.pc, env);
             self.insns += 1;
-            let tracing = crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0;
             let snap = if tracing { Some((self.rf.clone(), self.acc)) } else { None };
             let this_pc = self.pc;
             self.pc = self.pc.wrapping_add(8);
@@ -705,6 +730,7 @@ impl Thread {
     }
 
     /// Execute one ALU instruction; true if it hit a barrier.
+    #[inline(always)]
     fn alu(&mut self, i: &AluInst, env: &mut dyn Env) -> bool {
         let add = &i.add;
         let mul = &i.mul;
@@ -943,6 +969,7 @@ impl Thread {
         self.write_reg(waddr, magic, v, mask, pack, env, barrier)
     }
 
+    #[inline(always)]
     fn write_reg(&mut self, waddr: u8, magic: bool, v: &V, mask: u16, pack: Pack, env: &mut dyn Env, barrier: &mut bool) {
         let packed = |old: u32, new: u32| -> u32 {
             match pack {

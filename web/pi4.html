@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sbc-emu Pi 4</title>
+<style>
+  :root { --bg: #f4f4f1; --fg: #1d1d1b; --muted: #6b6b66; --panel: #ffffff; --line: #d9d9d3; --accent: #c51a4a; --term-bg: #111; --term-fg: #d6d6d6; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; } }
+  :root[data-theme="dark"] { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  h1 span { color: var(--accent); }
+  .muted { color: var(--muted); }
+  #status { font-variant-numeric: tabular-nums; }
+  .screen { background: #000; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; outline: none; }
+  .screen:focus { box-shadow: 0 0 0 2px var(--accent); }
+  canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+  .hint { margin: 6px 0 14px; font-size: 13px; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  summary { cursor: pointer; padding: 8px 12px; }
+  pre { margin: 0; padding: 10px 12px; background: var(--term-bg); color: var(--term-fg); height: 260px; overflow: auto; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; border-radius: 0 0 6px 6px; }
+  .chooser { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .chooser button { text-align: left; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .chooser button span { color: var(--muted); font-size: 13px; }
+  .chooser button:hover { border-color: var(--accent); }
+  .board { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 4px 0 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
+  .board label { display: flex; align-items: center; gap: 6px; }
+  .board input[type=range] { width: 120px; }
+  .ledbox { display: flex; align-items: center; gap: 8px; }
+  .led { width: 16px; height: 16px; border-radius: 50%; background: #3a1a1a; border: 1px solid var(--line); }
+  .led.on { background: #ff3b3b; box-shadow: 0 0 10px #ff3b3b; }
+  .serialform { display: flex; gap: 8px; padding: 8px 12px; }
+  .serialform input { flex: 1; min-width: 0; font: 13px ui-monospace, Menlo, monospace; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--fg); }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="./" style="color:inherit;text-decoration:none">sbc-emu</a> <span>Raspberry Pi 4B</span></h1>
+    <span class="muted">Linux in an instruction-level AArch64 emulator, running in your browser</span>
+  </header>
+  <div id="chooser" class="chooser">
+    <button type="button" data-os="raspios-snap"><strong>Resume Raspberry Pi OS Lite</strong><span>A snapshot of the same SD-card boot taken after first-boot setup: the login prompt in seconds. Log in as <code>pi</code> / <code>raspberry</code>.</span></button>
+    <button type="button" data-os="raspios"><strong>Raspberry Pi OS Lite</strong><span>Boots the unmodified trixie SD card image: firmware-style boot, systemd, first-boot setup. Cold boot to the setup screen takes several minutes.</span></button>
+    <button type="button" data-os="busybox"><strong>Quick demo: Pi kernel + busybox</strong><span>The same Pi kernel with a tiny initramfs: a shell on the screen in about a minute.</span></button>
+  </div>
+  <p id="status" class="muted">choose a system to boot</p>
+  <div class="screen" id="screen" tabindex="0"><canvas id="fb" width="1024" height="768"></canvas></div>
+  <p class="hint muted">Click the screen to type on the Pi's USB keyboard (emulated DWC2 USB host + HID keyboard). The screen is the firmware framebuffer (simplefb, fbcon). Try <code>cat /proc/cpuinfo</code> or <code>cat /dev/urandom &gt; /dev/fb0</code>.</p>
+  <section class="board" aria-label="Board peripherals">
+    <div class="ledbox"><span id="led" class="led" aria-label="GPIO17 LED"></span><span>LED · GPIO17</span></div>
+    <button id="btn" type="button" title="GPIO27, active high while held">Button · GPIO27</button>
+    <label>BME280 temperature <input id="temp" type="range" min="-10" max="45" step="0.5" value="21.5"> <output id="tempv">21.5 °C</output></label>
+    <label>BME280 humidity <input id="hum" type="range" min="0" max="100" step="1" value="45"> <output id="humv">45 %</output></label>
+    <label>MCP3008 CH0 <input id="adc0" type="range" min="0" max="3.3" step="0.05" value="0"> <output id="adcv">0.00 V</output></label>
+  </section>
+  <p class="hint muted">In the guest: <code>gpioset -t0 GPIO17_LED=1</code>, <code>gpioget GPIO27_BUTTON</code>, <code>cat /sys/bus/iio/devices/iio:device0/in_temp_input</code>, <code>…/iio:device1/in_voltage0_raw</code>.</p>
+  <details open>
+    <summary>Serial console (UART0) <button id="clear" type="button">clear</button></summary>
+    <pre id="term"></pre>
+    <form id="serialform" class="serialform"><input id="serialin" placeholder="send a line to the serial console (ttyAMA0)" autocomplete="off"><button type="submit">send</button></form>
+  </details>
+</main>
+<script>
+const canvas = document.getElementById('fb'), ctx = canvas.getContext('2d');
+const term = document.getElementById('term'), status = document.getElementById('status');
+const screen = document.getElementById('screen');
+const worker = new Worker('worker.js');
+let state = 'starting…';
+const strip = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'status') { state = m.text; status.textContent = state; }
+  else if (m.type === 'uart') {
+    const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 4;
+    term.textContent += strip(m.text);
+    if (term.textContent.length > 200000) term.textContent = term.textContent.slice(-150000);
+    if (atEnd) term.scrollTop = term.scrollHeight;
+  } else if (m.type === 'frame') {
+    if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
+  } else if (m.type === 'audio') {
+    play(m.rate, m.samples);
+  } else if (m.type === 'gpio' && m.pin === 17) {
+    document.getElementById('led').classList.toggle('on', m.level === 1);
+  } else if (m.type === 'stats') {
+    if (state === 'booting…' || state === 'resumed' || state === 'running') state = 'running';
+    status.textContent = `${state} · ${m.mips.toFixed(1)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '') + (m.jit ? ` · JIT ${m.jit} blocks` : '');
+  }
+};
+// sound from the emulated I²S DAC (a PCM5102A HAT): queued buffers, started on the first click
+// or key press (browsers only start audio after a user gesture)
+let audio = null, audioAt = 0;
+const startAudio = () => { if (!audio) { try { audio = new AudioContext(); } catch { audio = null; } } };
+function play(rate, s) {
+  if (!audio || !rate || s.length < 2) return;
+  const frames = s.length >> 1, buf = audio.createBuffer(2, frames, rate);
+  const l = buf.getChannelData(0), r = buf.getChannelData(1);
+  for (let i = 0; i < frames; i++) { l[i] = s[2 * i] / 32768; r[i] = s[2 * i + 1] / 32768; }
+  const src = audio.createBufferSource();
+  src.buffer = buf;
+  src.connect(audio.destination);
+  audioAt = Math.max(audioAt, audio.currentTime + 0.05);
+  if (audioAt > audio.currentTime + 2) audioAt = audio.currentTime + 0.05; // the guest ran ahead: drop the backlog
+  src.start(audioAt);
+  audioAt += frames / rate;
+}
+// the mouse on the screen is the USB tablet (absolute position, buttons, wheel)
+const pointer = (e, wheel = 0) => {
+  const b = canvas.getBoundingClientRect();
+  const x = Math.round(Math.min(Math.max((e.clientX - b.left) / b.width, 0), 1) * 32767);
+  const y = Math.round(Math.min(Math.max((e.clientY - b.top) / b.height, 0), 1) * 32767);
+  worker.postMessage({ type: 'pointer', buttons: e.buttons & 7, x, y, wheel });
+};
+canvas.addEventListener('pointermove', (e) => pointer(e));
+canvas.addEventListener('pointerdown', (e) => { startAudio(); screen.focus(); pointer(e); });
+canvas.addEventListener('pointerup', (e) => pointer(e));
+canvas.addEventListener('wheel', (e) => { e.preventDefault(); pointer(e, e.deltaY < 0 ? 1 : -1); }, { passive: false });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+screen.addEventListener('keydown', startAudio);
+document.getElementById('clear').onclick = (e) => { e.preventDefault(); term.textContent = ''; };
+// KeyboardEvent.code -> USB HID usage (keyboard page)
+const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
+  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39, PrintScreen: 0x46,
+  ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f,
+  ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53, IntlBackslash: 0x64, ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2,
+  MetaLeft: 0xe3, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6, MetaRight: 0xe7 };
+for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
+for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
+HID.Digit0 = 0x27;
+for (let i = 1; i <= 12; i++) HID['F' + i] = 0x39 + i;
+const held = new Set();
+const sendKey = (usage, down) => worker.postMessage({ type: 'key', usage, down });
+screen.addEventListener('keydown', (e) => {
+  const u = HID[e.code];
+  if (u === undefined || (e.metaKey && e.code !== 'MetaLeft' && e.code !== 'MetaRight')) return;
+  e.preventDefault();
+  if (!held.has(u)) { held.add(u); sendKey(u, true); }
+});
+screen.addEventListener('keyup', (e) => { const u = HID[e.code]; if (u === undefined) return; e.preventDefault(); if (held.delete(u)) sendKey(u, false); });
+screen.addEventListener('blur', () => { for (const u of held) sendKey(u, false); held.clear(); });
+document.getElementById('serialform').onsubmit = (e) => {
+  e.preventDefault();
+  const inp = document.getElementById('serialin');
+  worker.postMessage({ type: 'serial', bytes: [...new TextEncoder().encode(inp.value + '\r')] });
+  inp.value = '';
+};
+const btn = document.getElementById('btn');
+const press = (p) => worker.postMessage({ type: 'button', pressed: p });
+btn.addEventListener('pointerdown', () => press(true));
+btn.addEventListener('pointerup', () => press(false));
+btn.addEventListener('pointerleave', () => press(false));
+const slider = (id, out, fmt, send) => { const el = document.getElementById(id); el.oninput = () => { document.getElementById(out).textContent = fmt(+el.value); send(+el.value); }; };
+slider('temp', 'tempv', (v) => `${v} °C`, (v) => worker.postMessage({ type: 'sensor', kind: 0, value: v }));
+slider('hum', 'humv', (v) => `${v} %`, (v) => worker.postMessage({ type: 'sensor', kind: 2, value: v }));
+slider('adc0', 'adcv', (v) => `${v.toFixed(2)} V`, (v) => worker.postMessage({ type: 'adc', ch: 0, volts: v }));
+const params = new URLSearchParams(location.search);
+const boot = (os) => {
+  document.getElementById('chooser').hidden = true;
+  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512, jit: params.get('jit') !== '0' }); // ?jit=0: interpreter only
+  screen.focus();
+};
+document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));
+if (params.get('os')) boot(params.get('os'));
+</script>
+</body>
+</html>

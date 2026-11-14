@@ -10,5 +10,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcm2711 = { path = "../bcm2711" }
+v3d = { path = "../v3d" }
 arm-a64 = { path = "../arm-a64" }
 emu-core = { path = "../emu-core" }

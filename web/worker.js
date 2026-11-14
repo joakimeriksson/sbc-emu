@@ -1,5 +1,6 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'busybox', ramMb}, {type:'key', usage, down}, {type:'serial', bytes}
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox', ramMb}, {type:'key', usage, down},
+//      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
 let ex;
 const mem8 = () => new Uint8Array(ex.memory.buffer);
@@ -69,8 +70,25 @@ function jitReset() {
 
 async function start(os, ramMb, jit) {
   postMessage({ type: 'status', text: 'loading emulator…' });
-  const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead, sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset } });
+  const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead, sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset, sbc_host_now_ms: () => performance.now() } });
   ex = instance.exports;
+  if (os === 'gpu-demo') {
+    // Raspberry Pi OS with Mesa, logged in on HDMI, every demo run once (scripts/gpu-demo-snapshot.txt)
+    imageUrl = 'assets/raspios-gpu.img';
+    const head = await fetch(imageUrl, { method: 'HEAD' });
+    const size = Number(head.headers.get('Content-Length'));
+    if (!head.ok || !size) throw new Error('SD image assets/raspios-gpu.img not found (see docs/gpu.md: the browser demos)');
+    postMessage({ type: 'status', text: 'loading the machine snapshot…', phase: 'snapshot' });
+    const snap = await fetchBytes('assets/gpu-demo.snap', false);
+    postMessage({ type: 'status', text: 'restoring the Pi…', phase: 'restore' });
+    const r = ex.sbc_restore(ramMb, size / 512, copyIn(snap), snap.length);
+    if (r !== 0) throw new Error(`snapshot restore failed (${r})`);
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 33;
+    postMessage({ type: 'status', text: 'running', phase: 'running' });
+    loop();
+    return;
+  }
   if (os === 'raspios' || os === 'raspios-snap') {
     imageUrl = 'assets/raspios-lite.img';
     const head = await fetch(imageUrl, { method: 'HEAD' });
@@ -101,7 +119,7 @@ async function start(os, ramMb, jit) {
 }
 
 let lastLed = -1;
-let lastFrame = 0, lastStats = 0, lastInsns = 0, lastStatsT = performance.now();
+let lastFrame = 0, lastStats = 0, lastInsns = 0, lastStatsT = performance.now(), frameEvery = 66, lastGpu = 0;
 function loop() {
   const sliceEnd = performance.now() + 40;
   let r = 0;
@@ -119,7 +137,7 @@ function loop() {
   const n = ex.sbc_uart_take();
   if (n) postMessage({ type: 'uart', text: dec.decode(mem8().slice(ex.sbc_uart_ptr(), ex.sbc_uart_ptr() + n)) });
   const now = performance.now();
-  if (now - lastFrame > 66) {
+  if (now - lastFrame > frameEvery) {
     lastFrame = now;
     const p = ex.sbc_fb_render();
     if (p) {
@@ -133,8 +151,10 @@ function loop() {
   if (led !== lastLed) { lastLed = led; postMessage({ type: 'gpio', pin: 17, level: led }); }
   if (now - lastStats > 500) {
     const insns = ex.sbc_insns();
-    postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20, jit: ex.sbc_jit_blocks() });
-    lastInsns = insns; lastStatsT = now; lastStats = now;
+    const gpu = ex.sbc_gpu_frames();
+    postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20, jit: ex.sbc_jit_blocks(),
+                  gpuFps: (gpu - lastGpu) / ((now - lastStatsT) / 1e3), gpuFrames: gpu, gpuMs: ex.sbc_gpu_ms() });
+    lastInsns = insns; lastStatsT = now; lastStats = now; lastGpu = gpu;
   }
   if (r === 2) {
     const kind = ex.sbc_stop_kind();
@@ -152,10 +172,11 @@ function loop() {
 
 onmessage = (e) => {
   const m = e.data;
-  if (m.type === 'start') start(m.os, m.ramMb, m.jit).catch((err) => postMessage({ type: 'status', text: String(err) }));
+  if (m.type === 'start') start(m.os, m.ramMb, m.jit).catch((err) => postMessage({ type: 'status', text: String(err), phase: 'error' }));
   else if (m.type === 'key' && ex) ex.sbc_key(m.usage, m.down ? 1 : 0);
   else if (m.type === 'pointer' && ex) ex.sbc_pointer(m.buttons, m.x, m.y, m.wheel);
   else if (m.type === 'serial') serialQueue.push(...m.bytes);
+  else if (m.type === 'type' && ex) for (const c of new TextEncoder().encode(m.text)) ex.sbc_type(c);
   else if (m.type === 'button' && ex) ex.sbc_gpio_input(27, m.pressed ? 1 : -1);
   else if (m.type === 'sensor' && ex) ex.sbc_set_sensor(m.kind, m.value);
   else if (m.type === 'adc' && ex) ex.sbc_set_adc(m.ch, m.volts);

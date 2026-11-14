@@ -38,14 +38,24 @@ pub fn log_once(s: &str) {
     if first { eprintln!("\r{s}\r"); }
 }
 
-/// Host time for job costs (none in the browser build, where jobs then cost no guest time).
-struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
+/// Host time for job costs: `Instant` natively, the page's `performance.now()` in the browser.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    /// Provided by the page (web/worker.js): `performance.now()` in milliseconds.
+    fn sbc_host_now_ms() -> f64;
+}
+struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant, #[cfg(target_arch = "wasm32")] f64);
 impl Clock {
-    fn now() -> Clock { Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant::now()) }
-    fn elapsed(&self) -> std::time::Duration {
-        #[cfg(not(target_arch = "wasm32"))] { self.0.elapsed() }
-        #[cfg(target_arch = "wasm32")] { std::time::Duration::ZERO }
-    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn now() -> Clock { Clock(std::time::Instant::now()) }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn elapsed(&self) -> std::time::Duration { self.0.elapsed() }
+    // SAFETY: a pure clock read provided by the page
+    #[cfg(target_arch = "wasm32")]
+    fn now() -> Clock { Clock(unsafe { sbc_host_now_ms() }) }
+    #[cfg(target_arch = "wasm32")]
+    fn elapsed(&self) -> std::time::Duration { std::time::Duration::from_secs_f64(((unsafe { sbc_host_now_ms() }) - self.0).max(0.0) / 1000.0) }
 }
 
 /// Decoded-instruction cache for QPU code (direct-mapped), valid for one job: BOs get remapped
@@ -164,6 +174,7 @@ impl V3d {
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
         let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], binned: HashMap::new(), code: Code::default(), jobs: [0; 4], insns: 0, host_ns: [0; 4], powered: true, now: 0, pending: Vec::new(),
             time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), bin_jobs: HashMap::new() };
+        // (std::env is empty in the browser: the defaults apply)
         v.reset();
         v
     }
@@ -325,6 +336,7 @@ impl V3d {
 
     /// One-line job statistics.
     pub fn stats(&self) -> String {
+
         let ms = |k: usize| self.host_ns[k] as f64 / 1e6;
         format!("{} bin jobs ({:.0} ms), {} render jobs ({:.0} ms), {} TFU ({:.0} ms), {} compute ({:.0} ms); {} QPU instructions",
                 self.jobs[0], ms(0), self.jobs[1], ms(1), self.jobs[2], ms(2), self.jobs[3], ms(3), self.insns)

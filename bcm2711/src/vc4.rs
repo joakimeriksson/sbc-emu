@@ -89,7 +89,17 @@ pub struct Vc4 {
 impl Default for Vc4 { fn default() -> Self { Self::new() } }
 
 impl Vc4 {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::with_mode(1920, 1080) }
+
+    /// A monitor whose preferred mode is `w`x`h` (1920x1080, 1280x720, 1024x768, 800x600 or
+    /// 640x480): the console, `kmscube` and `glmark2` use the preferred mode.
+    pub fn with_mode(w: u32, h: u32) -> Self {
+        let mut v = Self::new_inner();
+        v.edid = edid_with((w, h));
+        v
+    }
+
+    fn new_inner() -> Self {
         Vc4 { hvs: vec![0; (HVS_SIZE / 4) as usize], frcnt: [0; 3], pv: [0; 64], win: vec![0; (HDMI_WIN_SIZE / 4) as usize], hd: [0; 64], txp: [0; 8],
               edid_ptr: 0, edid: edid(), next_vblank: FRAME_NS, connected: true, frames: 0,
               mai_played_to: 0, mai_frac: 0, mai_ch: 0, mai_left: 0, audio: Vec::new(), audio_rate: 0,
@@ -400,7 +410,8 @@ impl Vc4 {
     }
 
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("vc4-v1");
+        // v2 adds the monitor's EDID, so a restore keeps the mode the guest chose from it
+        w.tag("vc4-v2");
         for v in &self.hvs { w.u32(*v); }
         for v in self.frcnt { w.u32(v); }
         for v in self.pv { w.u32(v); }
@@ -408,9 +419,10 @@ impl Vc4 {
         for v in self.hd { w.u32(v); }
         w.u64(self.edid_ptr as u64); w.u64(self.next_vblank); w.bool(self.connected);
         w.u64(self.mai_played_to); w.u64(self.mai_frac); w.u32(self.mai_ch);
+        w.bytes(&self.edid);
     }
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        r.tag("vc4-v1")?;
+        let v2 = match r.bytes()? { b"vc4-v2" => true, b"vc4-v1" => false, t => return Err(emu_core::snap::SnapError(format!("snapshot layout mismatch: expected vc4 state, found {}", String::from_utf8_lossy(t)))) };
         for v in self.hvs.iter_mut() { *v = r.u32()?; }
         for v in self.frcnt.iter_mut() { *v = r.u32()?; }
         for v in self.pv.iter_mut() { *v = r.u32()?; }
@@ -418,6 +430,7 @@ impl Vc4 {
         for v in self.hd.iter_mut() { *v = r.u32()?; }
         self.edid_ptr = r.u64()? as usize; self.next_vblank = r.u64()?; self.connected = r.bool()?;
         self.mai_played_to = r.u64()?; self.mai_frac = r.u64()?; self.mai_ch = r.u32()?;
+        if v2 { self.edid = r.bytes()?.to_vec(); }
         Ok(())
     }
 }
@@ -454,7 +467,20 @@ fn descriptor(tag: u8, text: &[u8]) -> [u8; 18] {
 
 /// A 1080p HDMI monitor: base block (1920x1080 preferred, 1024x768 and others listed) and a
 /// CEA-861 extension (HDMI, basic audio, LPCM 2 channels).
-fn edid() -> Vec<u8> {
+fn edid() -> Vec<u8> { edid_with((1920, 1080)) }
+
+/// Detailed timing of a mode the monitor offers (CEA/VESA timings at 60 Hz).
+fn mode_dtd(w: u32, h: u32) -> [u8; 18] {
+    match (w, h) {
+        (1280, 720) => dtd(74_250, [1280, 110, 40, 220], [720, 5, 5, 20], true),
+        (1024, 768) => dtd(65_000, [1024, 24, 136, 160], [768, 3, 6, 29], false),
+        (800, 600) => dtd(40_000, [800, 40, 128, 88], [600, 1, 4, 23], true),
+        (640, 480) => dtd(25_175, [640, 16, 96, 48], [480, 10, 2, 33], false),
+        _ => dtd(148_500, [1920, 88, 44, 148], [1080, 4, 5, 36], true),
+    }
+}
+
+fn edid_with(pref: (u32, u32)) -> Vec<u8> {
     let mut b = vec![0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
     // manufacturer "SBC" (5-bit letters), product 0x0001, serial, week 46 of 2026, EDID 1.4
     let m = |c: u8| (c - b'A' + 1) as u16;
@@ -463,10 +489,17 @@ fn edid() -> Vec<u8> {
     b.extend_from_slice(&[0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 46, (2026 - 1990) as u8, 1, 4]);
     b.extend_from_slice(&[0xa5, 56, 32, 120, 0x3a]); // digital 8 bpc HDMI-a, 56x32 cm, gamma 2.2, RGB, preferred timing
     b.extend_from_slice(&[0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54]); // chromaticity (sRGB-ish)
-    b.extend_from_slice(&[0x21, 0x08, 0x00]); // established: 640x480@60, 800x600@60, 1024x768@60
-    b.extend_from_slice(&[0x81, 0xc0, 0xd1, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01]); // standard: 1280x720, 1920x1080
-    b.extend_from_slice(&dtd(148_500, [1920, 88, 44, 148], [1080, 4, 5, 36], true));
-    b.extend_from_slice(&dtd(65_000, [1024, 24, 136, 160], [768, 3, 6, 29], false));
+    let full = pref == (1920, 1080);
+    // established: 640x480@60, 800x600@60 and (unless the monitor is smaller) 1024x768@60
+    b.extend_from_slice(&[0x21, if pref.0 >= 1024 { 0x08 } else { 0x00 }, 0x00]);
+    if full {
+        b.extend_from_slice(&[0x81, 0xc0, 0xd1, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01]); // standard: 1280x720, 1920x1080
+    } else {
+        b.extend_from_slice(&[0x01; 16]); // a smaller monitor: nothing above its preferred mode
+    }
+    // the first detailed timing is the preferred mode
+    b.extend_from_slice(&mode_dtd(pref.0, pref.1));
+    b.extend_from_slice(&if full { mode_dtd(1024, 768) } else { mode_dtd(640, 480) });
     b.extend_from_slice(&[0, 0, 0, 0xfd, 0, 50, 75, 30, 80, 15, 0, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]); // range limits
     b.extend_from_slice(&descriptor(0xfc, b"sbc-emu HDMI"));
     b.push(1); // one extension
@@ -475,13 +508,13 @@ fn edid() -> Vec<u8> {
     // CEA-861 extension: audio, video (1080p native, 720p, 480p, 640x480), speakers, HDMI VSDB
     let blocks: Vec<u8> = [
         &[0x23, 0x09, 0x07, 0x07][..],             // audio: LPCM, 2 channels, 32/44.1/48 kHz, 16/20/24 bit
-        &[0x44, 0x90, 0x04, 0x02, 0x01][..],       // video: VIC 16 (native), 4, 2, 1
+        if full { &[0x44, 0x90, 0x04, 0x02, 0x01][..] } else { &[0x41, 0x01][..] }, // video: VIC 16 (native), 4, 2, 1 / 640x480
         &[0x83, 0x01, 0x00, 0x00][..],             // speakers: front left/right
         &[0x65, 0x03, 0x0c, 0x00, 0x10, 0x00][..], // HDMI vendor block, physical address 1.0.0.0
     ].concat();
     let mut c = vec![0x02, 0x03, (4 + blocks.len()) as u8, 0x40 | 0x01]; // basic audio, 1 native DTD
     c.extend_from_slice(&blocks);
-    c.extend_from_slice(&dtd(74_250, [1280, 110, 40, 220], [720, 5, 5, 20], true));
+    c.extend_from_slice(&if full { mode_dtd(1280, 720) } else { mode_dtd(pref.0, pref.1) });
     c.resize(127, 0);
     let sum: u8 = c.iter().fold(0u8, |a, &x| a.wrapping_add(x));
     c.push(0u8.wrapping_sub(sum));
@@ -494,9 +527,12 @@ mod tests {
     use super::*;
     #[test]
     fn edid_checksums() {
+        for mode in [(1920, 1080), (800, 600), (640, 480)] {
+            let e = edid_with(mode);
+            assert_eq!(e.len(), 256);
+            for blk in e.chunks(128) { assert_eq!(blk.iter().fold(0u8, |a, &x| a.wrapping_add(x)), 0); }
+        }
         let e = edid();
-        assert_eq!(e.len(), 256);
-        for blk in e.chunks(128) { assert_eq!(blk.iter().fold(0u8, |a, &x| a.wrapping_add(x)), 0); }
         assert_eq!(&e[0..8], &[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
     }
 }

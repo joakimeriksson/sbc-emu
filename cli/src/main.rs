@@ -67,7 +67,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--no-gpu] [--sd-persist]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--hdmi-mode WxH] [--no-gpu] [--sd-persist]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -170,7 +170,9 @@ fn run(args: &[String]) -> ExitCode {
             // --display kms (default): the vc4 HDMI pipeline for the KMS driver, as the image's
             // dtoverlay=vc4-kms-v3d asks; fb: the firmware's framebuffer only
             if arg(args, "--display") != Some("fb") {
-                m.soc.vc4 = Some(bcm2711::vc4::Vc4::new());
+                // --hdmi-mode WxH: the monitor's preferred mode (default 1920x1080)
+                let (w, h) = arg(args, "--hdmi-mode").and_then(|s| s.split_once('x')).and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).unwrap_or((1920, 1080));
+                m.soc.vc4 = Some(bcm2711::vc4::Vc4::with_mode(w, h));
                 // and the V3D 3D GPU next to it (dtoverlay=vc4-kms-v3d), unless --no-gpu
                 if !args.iter().any(|a| a == "--no-gpu") { m.soc.v3d = Some(v3d::V3d::new()); }
             }
