@@ -87,8 +87,13 @@ snapshot taken mid-run restores and the run continues to its last frame.
 ### Vulkan
 
 `vulkaninfo` lists `V3D 4.2.14.0` (driver `V3DV Mesa`, Vulkan 1.3, conformance version 1.3.8.3)
-next to lavapipe. `vkcube --wsi display` crashes in the client before it submits any GPU work
-(VK_KHR_display mode selection), so it is not part of the evaluation.
+next to lavapipe. Through VK_KHR_display, v3dv finds the HDMI monitor (`sbc-emu HDMI 1920x1080`,
+13 modes, one plane), and `tests/gpu/vkdisp.c` (`scripts/gpu-vkdisp.txt`) presents 1500 frames
+from a FIFO swapchain on it: v3dv allocates the images on vc4, clears them on the V3D, and vc4
+scans them out. `vkcube --wsi display` (vulkan-tools 1.4.304) segfaults in the client during
+instance setup on this image, before any GPU work, even with only the v3dv driver and the
+device-select layer turned off; the same Vulkan calls work from the small test program, so it
+is not part of the evaluation.
 
 ### glmark2-es2-drm 2023.01 at 1920×1080 (all scenes, default durations)
 

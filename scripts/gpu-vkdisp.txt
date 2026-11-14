@@ -1,0 +1,18 @@
+# Vulkan on HDMI without a window system (VK_KHR_display): tests/gpu/vkdisp.c presents 1500
+# frames from a v3dv swapchain through vc4 (start tools/gpu_server.py on the host first)
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial cd /tmp; wget -q http://10.0.2.2:8800/vkdisp.c; gcc -o vkdisp vkdisp.c -lvulkan -lm && (VK_DRIVER_FILES=/usr/share/vulkan/icd.d/broadcom_icd.json ./vkdisp 1500 2>&1 | tail -6; echo VK-""EXIT) &\n
+sleep 8
+shot out/gpu-vkdisp-1.png
+sleep 2
+shot out/gpu-vkdisp-2.png
+wait-serial VK-EXIT
+sleep 2
+quit
