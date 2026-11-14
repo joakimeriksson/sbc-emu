@@ -23,7 +23,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 49 s on one core, 47 s on four (22 s of guest time); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
 | Floating point | exact Arm semantics: FPCR rounding modes, flush-to-zero, default NaN, all FPSR exception flags, Arm's estimate tables | `diff_fp.rs`: 18,800 random cases bit-exact against the host CPU (interpreter and JIT) |
 | More peripherals | DMA controller, hardware RNG, thermal sensor, PM watchdog and power domains, system timer, mini UART | stock drivers bind: `/dev/hwrng`, `/sys/class/thermal`, `/dev/watchdog` (expiry reboots), `ttyS0`, `dma0chan*` |
-| Debugging | GDB remote stub (`--gdb PORT`, one thread per core), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump) | lldb: kernel breakpoint, step, memory read, detach |
+| Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
 | Port forwarding | `--hostfwd tcp::2222-:22` (QEMU's syntax) through the user-mode NAT | `ssh-keyscan -p 2222 127.0.0.1` reads the Pi OS host keys |
 | Display | firmware framebuffer handed over as `simple-framebuffer` (1024×768, fbcon) | screenshots via `--screenshot` / `shot` |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~2.7 min (JIT on), ~200 MiB of the image read |
@@ -98,6 +98,11 @@ More options, mostly after QEMU's:
 - `--hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (repeatable): forward a host TCP port
   into the guest over Ethernet, e.g. `--hostfwd tcp::2222-:22` then `ssh -p 2222 pi@127.0.0.1`.
 - `--serial1 FILE`: the mini UART's output (`ttyS0`).
+- `--vnc :N` (port 5900+N): a VNC server for the HDMI framebuffer (no password, Raw encoding of the
+  rows that changed, desktop resize); keys go to the USB keyboard. Works with TigerVNC/RealVNC
+  viewers (macOS Screen Sharing insists on a password).
+- `--cpu-crypto`: the Cryptographic Extension (AES, SHA-1/256, PMULL) as QEMU's `cortex-a72`
+  has it; the real BCM2711 does not, so it is off by default.
 - Ctrl-A c opens the **monitor** (`help` lists the commands: `info registers|cpus|irq|network|jit`,
   `x`/`xp`, `stop`/`cont`, `savevm`/`loadvm`, `screendump`, `sendkey`, `hostfwd_add`,
   `gdbserver`, `system_reset`, `quit`); scripts can run them with `monitor CMD`.
@@ -168,7 +173,7 @@ specifically (QEMU 9/10 docs and its open patch series, November 2026):
 | RNG, thermal, watchdog, system timer, mini UART, DMA | yes | yes |
 | PCIe / xHCI | no | not merged |
 | FP exceptions and rounding modes | exact | exact |
-| GDB stub, monitor, snapshots, port forwarding | yes | yes |
+| GDB stub, monitor, snapshots, port forwarding, VNC | yes | yes |
 | In the browser | yes (WebAssembly build with its own JIT) | no |
 
 ## The JIT

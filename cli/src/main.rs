@@ -8,6 +8,7 @@ mod disk;
 #[cfg(not(target_arch = "wasm32"))]
 mod gdb;
 mod monitor;
+mod vnc;
 
 use bcm2711::{Machine, Stop};
 use std::io::{Read, Write};
@@ -65,7 +66,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -118,6 +119,10 @@ fn run(args: &[String]) -> ExitCode {
         None => None,
     };
     let gdb_wait = args.iter().any(|a| a == "--gdb-wait");
+    let mut vnc = match arg(args, "--vnc") {
+        Some(spec) => match vnc::Vnc::listen(spec) { Ok(v) => Some(v), Err(e) => { eprintln!("--vnc {spec}: {e}"); return ExitCode::FAILURE } },
+        None => None,
+    };
     // the mini UART (ttyS0): its output goes to a file
     let mut serial1 = match arg(args, "--serial1") {
         Some(p) => match std::fs::File::create(p) { Ok(f) => Some(f), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
@@ -349,6 +354,7 @@ fn run(args: &[String]) -> ExitCode {
                 }
             }
         }
+        if let Some(v) = vnc.as_mut() { v.poll(&mut m); }
         if let Some(g) = gdb.as_mut() {
             let p = g.poll();
             if !matches!(p, gdb::Poll::Running) {

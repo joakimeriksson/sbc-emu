@@ -191,6 +191,9 @@ impl Mailbox {
     }
 
     /// Render the visible part of the framebuffer as RGBA bytes (`out` resized to w*h*4).
+    /// The screen size a display should show (the allocated framebuffer, else the default mode).
+    pub fn fb_size(&self) -> (u32, u32) { (self.fb.width, self.fb.height) }
+
     pub fn render(&self, ram: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
         let fb = &self.fb;
         if !fb.allocated { return None; }
