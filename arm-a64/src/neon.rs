@@ -1,7 +1,8 @@
 //! Advanced SIMD (NEON) integer and floating-point vector instructions, and their scalar forms.
-//! Organised by the Arm ARM encoding groups. Saturation sets FPSR.QC. Floating point uses host
-//! IEEE arithmetic in round-to-nearest-even (FPCR controls are not modelled).
+//! Organised by the Arm ARM encoding groups. Saturation sets FPSR.QC. Floating point goes through
+//! `fpu` (FPCR rounding, FZ and DN; FPSR exception flags).
 use crate::cpu::Cpu;
+use crate::fpu::{Pred, Rnd};
 use emu_core::Trap;
 
 #[inline] fn bits(x: u32, hi: u32, lo: u32) -> u32 { (x >> lo) & ((1u32 << (hi - lo + 1)) - 1) }
@@ -20,83 +21,6 @@ use emu_core::Trap;
 fn sat(x: i128, es: u32, signed: bool) -> (u64, bool) {
     let (lo, hi) = if signed { (-(1i128 << (es - 1)), (1i128 << (es - 1)) - 1) } else { (0, (1i128 << es) - 1) };
     if x < lo { ((lo as u64) & emask(es), true) } else if x > hi { ((hi as u64) & emask(es), true) } else { ((x as u64) & emask(es), false) }
-}
-
-fn f_of(x: u64, es: u32) -> f64 { if es == 32 { f32::from_bits(x as u32) as f64 } else { f64::from_bits(x) } }
-fn bits_of(f: f64, es: u32) -> u64 { if es == 32 { (f as f32).to_bits() as u64 } else { f.to_bits() } }
-
-fn is_nan(x: u64, es: u32) -> bool { f_of(x, es).is_nan() }
-fn is_snan(x: u64, es: u32) -> bool { is_nan(x, es) && x & (1u64 << (if es == 32 { 22 } else { 51 })) == 0 }
-fn quiet(x: u64, es: u32) -> u64 { x | (1u64 << (if es == 32 { 22 } else { 51 })) }
-
-/// FPProcessNaNs: the first signalling NaN (quietened), else the first quiet NaN, in operand order.
-pub(crate) fn process_nans(es: u32, ops: &[u64]) -> Option<u64> {
-    if let Some(&x) = ops.iter().find(|&&x| is_snan(x, es)) { return Some(quiet(x, es)); }
-    ops.iter().find(|&&x| is_nan(x, es)).copied()
-}
-
-/// Fused multiply-add acc + a*b with Arm NaN rules (operand order acc, a, b; a quiet-NaN
-/// addend with inf*0 gives the default NaN).
-pub(crate) fn fma(es: u32, acc: u64, a: u64, b: u64) -> u64 {
-    let (x, y, z) = (f_of(a, es), f_of(b, es), f_of(acc, es));
-    let inf_zero = (x.is_infinite() && y == 0.0) || (x == 0.0 && y.is_infinite());
-    if is_nan(acc, es) && !is_snan(acc, es) && !is_snan(a, es) && !is_snan(b, es) && inf_zero {
-        return if es == 32 { 0x7fc0_0000 } else { 0x7ff8_0000_0000_0000 };
-    }
-    if let Some(n) = process_nans(es, &[acc, a, b]) { return n; }
-    if es == 32 { ((x as f32).mul_add(y as f32, z as f32)).to_bits() as u64 } else { x.mul_add(y, z).to_bits() }
-}
-
-/// FP binary op in the element's precision (single computed in f64 and rounded once:
-/// exact for + - * / ), with Arm NaN propagation.
-fn fop(es: u32, a: u64, b: u64, f: impl Fn(f64, f64) -> f64) -> u64 {
-    if let Some(n) = process_nans(es, &[a, b]) { return n; }
-    fop_raw(es, a, b, f)
-}
-
-/// For FMAXNM/FMINNM: a single quiet NaN loses to a number.
-fn fop_nm(es: u32, a: u64, b: u64, f: impl Fn(f64, f64) -> f64) -> u64 {
-    let (na, nb) = (is_nan(a, es), is_nan(b, es));
-    if is_snan(a, es) || is_snan(b, es) || (na && nb) { return process_nans(es, &[a, b]).unwrap(); }
-    if na { return b; }
-    if nb { return a; }
-    fop_raw(es, a, b, f)
-}
-
-fn fop_raw(es: u32, a: u64, b: u64, f: impl Fn(f64, f64) -> f64) -> u64 {
-    if es == 32 {
-        let r = f(f32::from_bits(a as u32) as f64, f32::from_bits(b as u32) as f64);
-        (r as f32).to_bits() as u64
-    } else {
-        f(f64::from_bits(a), f64::from_bits(b)).to_bits()
-    }
-}
-
-fn fmax(a: f64, b: f64) -> f64 { if a.is_nan() || b.is_nan() { f64::NAN } else if a == 0.0 && b == 0.0 { if a.is_sign_negative() { b } else { a } } else { a.max(b) } }
-fn fmin(a: f64, b: f64) -> f64 { if a.is_nan() || b.is_nan() { f64::NAN } else if a == 0.0 && b == 0.0 { if a.is_sign_negative() { a } else { b } } else { a.min(b) } }
-fn fmaxnm(a: f64, b: f64) -> f64 { if a.is_nan() { b } else if b.is_nan() { a } else { fmax(a, b) } }
-fn fminnm(a: f64, b: f64) -> f64 { if a.is_nan() { b } else if b.is_nan() { a } else { fmin(a, b) } }
-
-fn round_mode(x: f64, mode: u32) -> f64 {
-    match mode { 0 => x.round_ties_even(), 1 => x.ceil(), 2 => x.floor(), 3 => x.trunc(), _ => x.round() }
-}
-
-fn f_to_int(f: f64, es: u32, unsigned: bool) -> u64 {
-    match (es, unsigned) {
-        (32, false) => f as i32 as u32 as u64,
-        (32, true) => f as u32 as u64,
-        (_, false) => f as i64 as u64,
-        (_, true) => f as u64,
-    }
-}
-
-fn int_to_f(x: u64, es: u32, unsigned: bool) -> u64 {
-    match (es, unsigned) {
-        (32, false) => (x as u32 as i32 as f32).to_bits() as u64,
-        (32, true) => (x as u32 as f32).to_bits() as u64,
-        (_, false) => (x as i64 as f64).to_bits(),
-        (_, true) => (x as f64).to_bits(),
-    }
 }
 
 fn shl_signed(a: u64, es: u32, sh: i64, unsigned: bool, round: bool) -> i128 {
@@ -247,6 +171,7 @@ impl Cpu {
         let lanes = if scalar { 1 } else if q { 128 / es } else { 64 / es };
         if !scalar && !q && es == 64 { return Err(self.undefined()); }
         let mut out = 0u128;
+        let mut fp = self.fpu();
         for k in 0..lanes {
             let (a, b) = (el(n, es, k), el(m, es, k));
             let pair = |k: u32| -> (u64, u64) {
@@ -256,34 +181,36 @@ impl Cpu {
             };
             let all = emask(es);
             let cmp = |t: bool| if t { all } else { 0 };
+            let sign = 1u64 << (es - 1);
             let v = match (u, opc, a_bit) {
-                (false, 0b11000, false) => fop_nm(es, a, b, fmaxnm),
-                (false, 0b11000, true) => fop_nm(es, a, b, fminnm),
-                (false, 0b11001, _) => fma(es, el(d, es, k), if a_bit { a ^ (1u64 << (es - 1)) } else { a }, b),
-                (false, 0b11010, false) => fop(es, a, b, |x, y| x + y),
-                (false, 0b11010, true) => fop(es, a, b, |x, y| x - y),
-                (false, 0b11011, false) => fop(es, a, b, |x, y| x * y), // FMULX (inf*0 = 2 not modelled)
-                (false, 0b11100, false) => cmp(f_of(a, es) == f_of(b, es)),
-                (false, 0b11110, false) => fop(es, a, b, fmax),
-                (false, 0b11110, true) => fop(es, a, b, fmin),
-                (false, 0b11111, false) => fop(es, a, b, |x, y| 2.0 - x * y),          // FRECPS
-                (false, 0b11111, true) => fop(es, a, b, |x, y| (3.0 - x * y) / 2.0),   // FRSQRTS
-                (true, 0b11000, false) if !scalar => { let (x, y) = pair(k); fop_nm(es, x, y, fmaxnm) }
-                (true, 0b11000, true) if !scalar => { let (x, y) = pair(k); fop_nm(es, x, y, fminnm) }
-                (true, 0b11010, false) if !scalar => { let (x, y) = pair(k); fop(es, x, y, |x, y| x + y) }
-                (true, 0b11010, true) => fop(es, a, b, |x, y| x - y) & !(1u64 << (es - 1)), // FABD = |a - b|, NaNs too
-                (true, 0b11011, false) => fop(es, a, b, |x, y| x * y),
-                (true, 0b11100, false) => cmp(f_of(a, es) >= f_of(b, es)),
-                (true, 0b11100, true) => cmp(f_of(a, es) > f_of(b, es)),
-                (true, 0b11101, false) => cmp(f_of(a, es).abs() >= f_of(b, es).abs()),
-                (true, 0b11101, true) => cmp(f_of(a, es).abs() > f_of(b, es).abs()),
-                (true, 0b11110, false) if !scalar => { let (x, y) = pair(k); fop(es, x, y, fmax) }
-                (true, 0b11110, true) if !scalar => { let (x, y) = pair(k); fop(es, x, y, fmin) }
-                (true, 0b11111, false) => fop(es, a, b, |x, y| x / y),
+                (false, 0b11000, false) => fp.maxnm(es, a, b),
+                (false, 0b11000, true) => fp.minnm(es, a, b),
+                (false, 0b11001, _) => fp.fma(es, el(d, es, k), if a_bit { a ^ sign } else { a }, b),
+                (false, 0b11010, false) => fp.add(es, a, b),
+                (false, 0b11010, true) => fp.sub(es, a, b),
+                (false, 0b11011, false) => fp.mulx(es, a, b),
+                (false, 0b11100, false) => cmp(fp.cmp_pred(es, a, b, Pred::Eq)),
+                (false, 0b11110, false) => fp.max(es, a, b),
+                (false, 0b11110, true) => fp.min(es, a, b),
+                (false, 0b11111, false) => fp.recip_step(es, a, b, false), // FRECPS
+                (false, 0b11111, true) => fp.recip_step(es, a, b, true),   // FRSQRTS
+                (true, 0b11000, false) if !scalar => { let (x, y) = pair(k); fp.maxnm(es, x, y) }
+                (true, 0b11000, true) if !scalar => { let (x, y) = pair(k); fp.minnm(es, x, y) }
+                (true, 0b11010, false) if !scalar => { let (x, y) = pair(k); fp.add(es, x, y) }
+                (true, 0b11010, true) => fp.sub(es, a, b) & !sign, // FABD = |a - b|, NaNs too
+                (true, 0b11011, false) => fp.mul(es, a, b),
+                (true, 0b11100, false) => cmp(fp.cmp_pred(es, a, b, Pred::Ge)),
+                (true, 0b11100, true) => cmp(fp.cmp_pred(es, a, b, Pred::Gt)),
+                (true, 0b11101, false) => cmp(fp.cmp_pred(es, a & !sign, b & !sign, Pred::Ge)),
+                (true, 0b11101, true) => cmp(fp.cmp_pred(es, a & !sign, b & !sign, Pred::Gt)),
+                (true, 0b11110, false) if !scalar => { let (x, y) = pair(k); fp.max(es, x, y) }
+                (true, 0b11110, true) if !scalar => { let (x, y) = pair(k); fp.min(es, x, y) }
+                (true, 0b11111, false) => fp.div(es, a, b),
                 _ => return Err(Trap::Unimplemented(self.pc, i)),
             };
             set_el(&mut out, es, k, v);
         }
+        self.fpu_done(fp);
         self.v[rd] = if scalar { out & emask(es) as u128 } else { qmask(q, out) };
         Ok(())
     }
@@ -465,59 +392,67 @@ impl Cpu {
         let (rd, rn) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize);
         let n = self.v[rn];
         let es = if sz { 64 } else { 32 };
-        // FCVTN/FCVTL (precision change) and FCVTXN
+        let mut fp = self.fpu();
+        // FCVTN/FCVTXN (narrow, into the low or high half) and FCVTL (widen, from either half)
         if !a_bit && (opc == 0b10110 || opc == 0b10111) {
-            let mut out = 0u128;
+            let (wide, narrow) = if sz { (64, 32) } else { (32, 16) };
             if opc == 0b10110 {
-                // FCVTN(2): double -> single (sz=1) into the low/high half
-                if !sz { return Err(Trap::Unimplemented(self.pc, i)); }
-                out = if q && !scalar { self.v[rd] & u64::MAX as u128 } else { 0 };
-                let off = if q && !scalar { 2 } else { 0 };
-                for k in 0..2 { set_el(&mut out, 32, k + off, (f64::from_bits(el(n, 64, k)) as f32).to_bits() as u64); }
+                if u && !sz { return Err(self.undefined()); }
+                if u { fp.rnd = Rnd::Odd; } // FCVTXN
+                let lanes = if scalar { 1 } else { 64 / narrow };
+                let off = if q && !scalar { lanes } else { 0 };
+                let mut out = if off != 0 { self.v[rd] & u64::MAX as u128 } else { 0 };
+                for k in 0..lanes { set_el(&mut out, narrow, k + off, fp.convert(wide, narrow, el(n, wide, k))); }
+                self.v[rd] = out;
             } else {
-                if !sz { return Err(Trap::Unimplemented(self.pc, i)); }
-                let off = if q { 2 } else { 0 };
-                for k in 0..2 { set_el(&mut out, 64, k, (f32::from_bits(el(n, 32, k + off) as u32) as f64).to_bits()); }
+                if scalar || u { return Err(self.undefined()); }
+                let lanes = 128 / wide;
+                let off = if q { lanes } else { 0 };
+                let mut out = 0u128;
+                for k in 0..lanes { set_el(&mut out, wide, k, fp.convert(narrow, wide, el(n, narrow, k + off))); }
+                self.v[rd] = out;
             }
-            self.v[rd] = out;
+            self.fpu_done(fp);
             return Ok(());
         }
         let lanes = if scalar { 1 } else if q { 128 / es } else { 64 / es };
         if !scalar && !q && es == 64 { return Err(self.undefined()); }
         let mut out = 0u128;
         let all = emask(es);
+        let sign = 1u64 << (es - 1);
+        let cur = fp.rnd;
         for k in 0..lanes {
             let x = el(n, es, k);
-            let f = f_of(x, es);
-            let nan_out = is_nan(x, es) && matches!((a_bit, opc), (true, 0b11111) | (false, 0b11000) | (false, 0b11001) | (true, 0b11000) | (true, 0b11001) | (true, 0b11101));
-            let v = if nan_out { quiet(x, es) } else { match (a_bit, opc, u) {
-                (true, 0b01100, false) => if f > 0.0 { all } else { 0 },
-                (true, 0b01100, true) => if f >= 0.0 { all } else { 0 },
-                (true, 0b01101, false) => if f == 0.0 { all } else { 0 },
-                (true, 0b01101, true) => if f <= 0.0 { all } else { 0 },
-                (true, 0b01110, false) => if f < 0.0 { all } else { 0 },
-                (true, 0b01111, false) => x & !(1u64 << (es - 1)),
-                (true, 0b01111, true) => x ^ (1u64 << (es - 1)),
-                (true, 0b11111, true) => bits_of(f.sqrt(), es),
-                (false, 0b11000, false) => bits_of(round_mode(f, 0), es), // FRINTN
-                (false, 0b11000, true) => bits_of(round_mode(f, 4), es),  // FRINTA
-                (false, 0b11001, false) => bits_of(round_mode(f, 2), es), // FRINTM
-                (false, 0b11001, true) => bits_of(round_mode(f, 0), es),  // FRINTX
-                (true, 0b11000, false) => bits_of(round_mode(f, 1), es),  // FRINTP
-                (true, 0b11001, false) => bits_of(round_mode(f, 3), es),  // FRINTZ
-                (true, 0b11001, true) => bits_of(round_mode(f, 0), es),   // FRINTI
-                (false, 0b11010, _) => f_to_int(round_mode(f, 0), es, u), // FCVTN[SU]
-                (false, 0b11011, _) => f_to_int(round_mode(f, 2), es, u), // FCVTM[SU]
-                (false, 0b11100, _) => f_to_int(round_mode(f, 4), es, u), // FCVTA[SU]
-                (false, 0b11101, _) => int_to_f(x, es, u),                // [SU]CVTF
-                (true, 0b11010, _) => f_to_int(round_mode(f, 1), es, u),  // FCVTP[SU]
-                (true, 0b11011, _) => f_to_int(round_mode(f, 3), es, u),  // FCVTZ[SU]
-                (true, 0b11101, false) => bits_of(1.0 / f, es),           // FRECPE (exact reciprocal)
-                (true, 0b11101, true) => bits_of(1.0 / f.sqrt(), es),     // FRSQRTE
+            let t = |b: bool| if b { all } else { 0 };
+            let v = match (a_bit, opc, u) {
+                (true, 0b01100, false) => t(fp.cmp_pred(es, x, 0, Pred::Gt)), // FCMGT #0
+                (true, 0b01100, true) => t(fp.cmp_pred(es, x, 0, Pred::Ge)),  // FCMGE #0
+                (true, 0b01101, false) => t(fp.cmp_pred(es, x, 0, Pred::Eq)), // FCMEQ #0
+                (true, 0b01101, true) => t(fp.cmp_pred(es, 0, x, Pred::Ge)),  // FCMLE #0
+                (true, 0b01110, false) => t(fp.cmp_pred(es, 0, x, Pred::Gt)), // FCMLT #0
+                (true, 0b01111, false) => x & !sign,                           // FABS
+                (true, 0b01111, true) => x ^ sign,                             // FNEG
+                (true, 0b11111, true) => fp.sqrt(es, x),
+                (false, 0b11000, false) => fp.round_int(es, x, Rnd::Even, false), // FRINTN
+                (false, 0b11000, true) => fp.round_int(es, x, Rnd::Away, false),  // FRINTA
+                (false, 0b11001, false) => fp.round_int(es, x, Rnd::Down, false), // FRINTM
+                (false, 0b11001, true) => fp.round_int(es, x, cur, true),         // FRINTX
+                (true, 0b11000, false) => fp.round_int(es, x, Rnd::Up, false),    // FRINTP
+                (true, 0b11001, false) => fp.round_int(es, x, Rnd::Zero, false),  // FRINTZ
+                (true, 0b11001, true) => fp.round_int(es, x, cur, false),         // FRINTI
+                (false, 0b11010, _) => fp.to_int(es, x, Rnd::Even, u, es, 0),     // FCVTN[SU]
+                (false, 0b11011, _) => fp.to_int(es, x, Rnd::Down, u, es, 0),     // FCVTM[SU]
+                (false, 0b11100, _) => fp.to_int(es, x, Rnd::Away, u, es, 0),     // FCVTA[SU]
+                (false, 0b11101, _) => fp.from_int(es, x, !u, es, 0),             // [SU]CVTF
+                (true, 0b11010, _) => fp.to_int(es, x, Rnd::Up, u, es, 0),        // FCVTP[SU]
+                (true, 0b11011, _) => fp.to_int(es, x, Rnd::Zero, u, es, 0),      // FCVTZ[SU]
+                (true, 0b11101, false) => fp.recip_estimate(es, x),               // FRECPE
+                (true, 0b11101, true) => fp.rsqrt_estimate(es, x),                // FRSQRTE
                 _ => return Err(Trap::Unimplemented(self.pc, i)),
-            } };
+            };
             set_el(&mut out, es, k, v);
         }
+        self.fpu_done(fp);
         self.v[rd] = if scalar { out & all as u128 } else { qmask(q, out) };
         Ok(())
     }
@@ -533,13 +468,16 @@ impl Cpu {
         if opc == 0b01100 || opc == 0b01111 {
             // FMAXNMV / FMINNMV / FMAXV / FMINV (single precision, Q=1): Reduce() pairs (0,1),(2,3)
             let es = 32;
-            let op = |a: u64, b: u64| match (opc, bit(i, 23)) {
-                (0b01100, false) => fop_nm(es, a, b, fmaxnm),
-                (0b01100, true) => fop_nm(es, a, b, fminnm),
-                (_, false) => fop(es, a, b, fmax),
-                (_, true) => fop(es, a, b, fmin),
+            let mut fp = self.fpu();
+            let mut op = |a: u64, b: u64| match (opc, bit(i, 23)) {
+                (0b01100, false) => fp.maxnm(es, a, b),
+                (0b01100, true) => fp.minnm(es, a, b),
+                (_, false) => fp.max(es, a, b),
+                (_, true) => fp.min(es, a, b),
             };
-            let r = op(op(el(n, es, 0), el(n, es, 1)), op(el(n, es, 2), el(n, es, 3)));
+            let (x, y) = (op(el(n, es, 0), el(n, es, 1)), op(el(n, es, 2), el(n, es, 3)));
+            let r = op(x, y);
+            self.fpu_done(fp);
             self.v[rd] = r as u128;
             return Some(Ok(()));
         }
@@ -569,14 +507,16 @@ impl Cpu {
         if u {
             let es = if bit(i, 22) { 64 } else { 32 };
             let (a, b) = (el(n, es, 0), el(n, es, 1));
+            let mut fp = self.fpu();
             let v = match (opc, bit(i, 23)) {
-                (0b01101, false) => fop(es, a, b, |x, y| x + y),
-                (0b01100, false) => fop_nm(es, a, b, fmaxnm),
-                (0b01100, true) => fop_nm(es, a, b, fminnm),
-                (0b01111, false) => fop(es, a, b, fmax),
-                (0b01111, true) => fop(es, a, b, fmin),
+                (0b01101, false) => fp.add(es, a, b),
+                (0b01100, false) => fp.maxnm(es, a, b),
+                (0b01100, true) => fp.minnm(es, a, b),
+                (0b01111, false) => fp.max(es, a, b),
+                (0b01111, true) => fp.min(es, a, b),
                 _ => return None,
             };
+            self.fpu_done(fp);
             self.v[rd] = v as u128;
             return Some(Ok(()));
         }
@@ -758,12 +698,8 @@ impl Cpu {
                 (0b01010, true) => { let msk = (emask(es) << shl) & emask(es); (acc & !msk) | ((a << shl) & msk) }
                 (0b01100, true) => { let (r, s) = sat((sx(a, es) as i128) << shl, es, false); satd |= s; r } // SQSHLU
                 (0b01110, _) => { let (r, s) = sat(wide << shl, es, !u); satd |= s; r }                      // SQSHL/UQSHL
-                (0b11100, _) => {
-                    // SCVTF/UCVTF (fixed point, fbits = shr)
-                    let f = if es == 32 { if u { (a as u32) as f64 } else { (a as u32 as i32) as f64 } } else if u { a as f64 } else { a as i64 as f64 };
-                    bits_of(f / 2f64.powi(shr as i32), es)
-                }
-                (0b11111, _) => f_to_int((f_of(a, es) * 2f64.powi(shr as i32)).trunc(), es, u), // FCVTZS/U fixed
+                (0b11100, _) if es >= 32 => { let mut fp = self.fpu(); let v = fp.from_int(es, a, !u, es, shr); self.fpu_done(fp); v } // [SU]CVTF fixed
+                (0b11111, _) if es >= 32 => { let mut fp = self.fpu(); let v = fp.to_int(es, a, Rnd::Zero, u, es, shr); self.fpu_done(fp); v } // FCVTZ[SU] fixed
                 _ => return None,
             };
             set_el(&mut out, es, k, v);
@@ -839,8 +775,9 @@ impl Cpu {
                     satd |= s;
                     r
                 }
-                (0b0001, false, true) | (0b0101, false, true) => fma(es, acc, if opc == 0b0101 { a ^ (1u64 << (es - 1)) } else { a }, e),
-                (0b1001, _, true) => fop(es, a, e, |x, y| x * y),
+                (0b0001, false, true) | (0b0101, false, true) => { let mut f = self.fpu(); let v = f.fma(es, acc, if opc == 0b0101 { a ^ (1u64 << (es - 1)) } else { a }, e); self.fpu_done(f); v }
+                (0b1001, false, true) => { let mut f = self.fpu(); let v = f.mul(es, a, e); self.fpu_done(f); v }
+                (0b1001, true, true) => { let mut f = self.fpu(); let v = f.mulx(es, a, e); self.fpu_done(f); v } // FMULX
                 _ => return None,
             };
             set_el(&mut out, es, k, v);

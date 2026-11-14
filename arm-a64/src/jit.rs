@@ -220,6 +220,16 @@ impl Jit {
     }
 }
 
+/// FPCR fields that change native FP results: AHP (26), DN (25), FZ (24), RMode (23:22).
+#[cfg(target_arch = "aarch64")]
+const FPCR_HOST_MASK: u64 = 0x1f << 22;
+
+/// # Safety
+/// Only changes how host floating point rounds and flushes; callers restore 0.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn set_host_fpcr(v: u64) { std::arch::asm!("msr fpcr, {}", in(reg) v, options(nomem, nostack)); }
+
 /// debugging: `SBC_JIT_CHAIN=0` turns block chaining and linking off
 fn chain_enabled() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -617,8 +627,16 @@ impl Cpu {
         let i0 = self.instret;
         self.chain_stop = false;
         if !chain_enabled() { self.chain_until = 0; }
+        // native FP in compiled code runs under the guest's FPCR (rounding, FZ, DN, AHP); the
+        // host's default (all zero) is restored afterwards
+        #[cfg(target_arch = "aarch64")]
+        let fpcr = self.fpcr & FPCR_HOST_MASK;
+        #[cfg(target_arch = "aarch64")]
+        if fpcr != 0 { unsafe { set_host_fpcr(fpcr) }; }
         #[allow(unused_mut)]
         let mut r = unsafe { f(self as *mut Cpu) };
+        #[cfg(target_arch = "aarch64")]
+        if fpcr != 0 { unsafe { set_host_fpcr(0) }; }
         // wasm: chain in Rust (native code chains through its own dispatcher): the next block
         // from the front cache while the budget lasts and nothing needs the machine
         #[cfg(target_arch = "wasm32")]
@@ -660,7 +678,13 @@ impl Cpu {
         if verify { self.store_log = Some(Vec::new()); }
         // SAFETY: the bus outlives the call; generated code only reaches it through h_step
         self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
+        #[cfg(target_arch = "aarch64")]
+        let fpcr = self.fpcr & FPCR_HOST_MASK;
+        #[cfg(target_arch = "aarch64")]
+        if fpcr != 0 { unsafe { set_host_fpcr(fpcr) }; }
         let r = unsafe { f(self as *mut Cpu) };
+        #[cfg(target_arch = "aarch64")]
+        if fpcr != 0 { unsafe { set_host_fpcr(0) }; }
         self.jit_bus = None;
         let log = self.store_log.take();
         if let (Some(b), 0, Some(log)) = (before, r, log) {

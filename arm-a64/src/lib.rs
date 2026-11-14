@@ -3,6 +3,7 @@
 //! and JIT can follow esp32sim's pattern once the interpreter is the oracle.
 mod cpu;
 mod exec;
+pub mod fpu;
 pub mod jit;
 mod jit_wasm;
 pub mod mmu;

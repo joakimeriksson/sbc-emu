@@ -3,6 +3,7 @@
 //! FPCR mode); FPCR rounding-mode, flush-to-zero and default-NaN controls and FPSR exception
 //! flags are not modelled yet.
 use crate::cpu::Cpu;
+use crate::fpu::Rnd;
 use emu_core::{Bus, Trap};
 
 #[inline] fn bits(x: u32, hi: u32, lo: u32) -> u32 { (x >> lo) & ((1u32 << (hi - lo + 1)) - 1) }
@@ -37,17 +38,12 @@ fn vfp_imm(imm8: u32, double: bool) -> u64 {
     }
 }
 
-#[derive(Clone, Copy)]
-enum F { S(f32), D(f64) }
-
 impl Cpu {
-    fn fread(&self, r: u32, double: bool) -> F {
-        let v = self.v[r as usize];
-        if double { F::D(f64::from_bits(v as u64)) } else { F::S(f32::from_bits(v as u32)) }
-    }
-    fn fwrite(&mut self, r: u32, f: F) {
-        self.v[r as usize] = match f { F::S(x) => x.to_bits() as u128, F::D(x) => x.to_bits() as u128 };
-    }
+    /// The FP unit as FPCR configures it; `fpu_done` adds its exception flags to FPSR.
+    #[inline]
+    pub(crate) fn fpu(&self) -> crate::fpu::Fpu { crate::fpu::Fpu::new(self.fpcr) }
+    #[inline]
+    pub(crate) fn fpu_done(&mut self, f: crate::fpu::Fpu) { self.fpsr |= f.flags as u64; }
 
     pub(crate) fn simd_fp_exec(&mut self, bus: &mut dyn Bus, i: u32) -> Result<Option<u64>, Trap> {
         let _ = bus;
@@ -107,82 +103,68 @@ impl Cpu {
                 (0, 0b010) | (0, 0b011) => {
                     // SCVTF / UCVTF
                     if ty > 1 { return Err(self.unimpl_fp(i)); }
-                    let x = self.xr(rn);
-                    let unsigned = op == 0b011;
-                    let val = |d: bool| -> F {
-                        match (sf, unsigned, d) {
-                            (true, false, true) => F::D(x as i64 as f64),
-                            (true, true, true) => F::D(x as f64),
-                            (false, false, true) => F::D(x as u32 as i32 as f64),
-                            (false, true, true) => F::D(x as u32 as f64),
-                            (true, false, false) => F::S(x as i64 as f32),
-                            (true, true, false) => F::S(x as f32),
-                            (false, false, false) => F::S(x as u32 as i32 as f32),
-                            (false, true, false) => F::S(x as u32 as f32),
-                        }
-                    };
-                    let v = val(double);
-                    self.fwrite(rd, v);
+                    let mut fp = self.fpu();
+                    let v = fp.from_int(if double { 64 } else { 32 }, self.xr(rn), op == 0b010, if sf { 64 } else { 32 }, 0);
+                    self.fpu_done(fp);
+                    self.v[rd as usize] = v as u128;
                     return Ok(None);
                 }
                 (_, 0b000) | (_, 0b001) | (0, 0b100) | (0, 0b101) => {
                     // FCVT{N,P,M,Z,A}{S,U}
                     if ty > 1 { return Err(self.unimpl_fp(i)); }
-                    let f = match self.fread(rn, double) { F::S(x) => x as f64, F::D(x) => x };
-                    let r = match (rmode, op >> 2) {
-                        (0, 0) => f.round_ties_even(),
-                        (1, 0) => f.ceil(),
-                        (2, 0) => f.floor(),
-                        (3, 0) => f.trunc(),
-                        _ => f.round(), // FCVTA*: ties away
-                    };
-                    let unsigned = op & 1 != 0;
-                    let v = match (sf, unsigned) {
-                        (true, false) => r as i64 as u64,
-                        (true, true) => r as u64,
-                        (false, false) => r as i32 as u32 as u64,
-                        (false, true) => r as u32 as u64,
-                    };
+                    let rnd = if op & 4 != 0 { Rnd::Away } else { Rnd::from_bits(rmode as u64) };
+                    let mut fp = self.fpu();
+                    let es = if double { 64 } else { 32 };
+                    let v = fp.to_int(es, self.v[rn as usize] as u64 & emask(es), rnd, op & 1 != 0, if sf { 64 } else { 32 }, 0);
+                    self.fpu_done(fp);
                     self.set_x(rd, v);
                     return Ok(None);
                 }
                 _ => return Err(self.unimpl_fp(i)),
             }
         }
-        if bit(i, 31) { return Err(self.undefined()); }
-        if ty > 1 { return Err(self.unimpl_fp(i)); } // half precision
+        if bit(i, 31) || ty == 2 { return Err(self.undefined()); }
+        let es = match ty { 0 => 32, 1 => 64, _ => 16 };
+        let get = |c: &Self, r: u32| c.v[r as usize] as u64 & emask(es);
         if bit(i, 21) && bits(i, 14, 10) == 0b10000 {
             // 1-source
             let opc = bits(i, 20, 15);
-            let a = self.fread(rn, double);
-            let r = match (opc, a) {
-                (0, a) => a,
-                (1, F::S(x)) => F::S(x.abs()),
-                (1, F::D(x)) => F::D(x.abs()),
-                (2, F::S(x)) => F::S(-x),
-                (2, F::D(x)) => F::D(-x),
-                (3, F::S(x)) => F::S(x.sqrt()),
-                (3, F::D(x)) => F::D(x.sqrt()),
-                (4, F::D(x)) => F::S(x as f32),
-                (5, F::S(x)) => F::D(x as f64),
-                (8..=15, a) => {
-                    let rnd = |x: f64| match opc { 8 | 14 | 15 => x.round_ties_even(), 9 => x.ceil(), 10 => x.floor(), 11 => x.trunc(), _ => x.round() };
-                    match a { F::S(x) => F::S(rnd(x as f64) as f32), F::D(x) => F::D(rnd(x)) }
+            let a = get(self, rn);
+            let sign = 1u64 << (es - 1);
+            // half precision: only the conversions exist on ARMv8.0
+            if es == 16 && !matches!(opc, 4 | 5) { return Err(self.unimpl_fp(i)); }
+            let mut fp = self.fpu();
+            let r = match opc {
+                0 => a,
+                1 => a & !sign,
+                2 => a ^ sign,
+                3 => fp.sqrt(es, a),
+                4 | 5 | 7 => {
+                    let to = match opc { 4 => 32, 5 => 64, _ => 16 };
+                    if to == es { return Err(self.undefined()); }
+                    let r = fp.convert(es, to, a);
+                    self.fpu_done(fp);
+                    self.v[rd as usize] = r as u128;
+                    return Ok(None);
+                }
+                8..=12 | 14 | 15 => {
+                    let rnd = match opc { 8..=11 => Rnd::from_bits((opc - 8) as u64), 12 => Rnd::Away, _ => fp.rnd };
+                    fp.round_int(es, a, rnd, opc == 14)
                 }
                 _ => return Err(self.unimpl_fp(i)),
             };
-            self.fwrite(rd, r);
+            self.fpu_done(fp);
+            self.v[rd as usize] = r as u128;
             return Ok(None);
         }
+        if es == 16 { return Err(self.unimpl_fp(i)); }
         if bit(i, 21) && bits(i, 13, 10) == 0b1000 && bits(i, 15, 14) == 0 {
-            // FCMP / FCMPE
-            let a = self.fread(rn, double);
-            let zero = bit(i, 3);
-            let (x, y) = match a {
-                F::S(x) => (x as f64, if zero { 0.0 } else { f32::from_bits(self.v[rm as usize] as u32) as f64 }),
-                F::D(x) => (x, if zero { 0.0 } else { f64::from_bits(self.v[rm as usize] as u64) }),
-            };
-            self.nzcv = fcmp_flags(x, y);
+            // FCMP / FCMPE (bit 4), against zero (bit 3)
+            let a = get(self, rn);
+            let b = if bit(i, 3) { 0 } else { get(self, rm) };
+            let mut fp = self.fpu();
+            self.nzcv = fp.cmp(es, a, b, bit(i, 4));
+            self.fpu_done(fp);
             return Ok(None);
         }
         if bit(i, 21) && bits(i, 12, 10) == 0b100 {
@@ -194,40 +176,31 @@ impl Cpu {
         if bit(i, 21) && bits(i, 11, 10) == 0b01 {
             // FCCMP / FCCMPE
             if self.cond_holds(bits(i, 15, 12)) {
-                let (x, y) = match (self.fread(rn, double), self.fread(rm, double)) {
-                    (F::S(a), F::S(b)) => (a as f64, b as f64),
-                    (F::D(a), F::D(b)) => (a, b),
-                    _ => unreachable!(),
-                };
-                self.nzcv = fcmp_flags(x, y);
+                let mut fp = self.fpu();
+                self.nzcv = fp.cmp(es, get(self, rn), get(self, rm), bit(i, 4));
+                self.fpu_done(fp);
             } else {
                 self.nzcv = bits(i, 3, 0) << 28;
             }
             return Ok(None);
         }
         if bit(i, 21) && bits(i, 11, 10) == 0b10 {
-            let es = if double { 64 } else { 32 };
-            let opc = bits(i, 15, 12);
-            let (ab, bb) = if double { (self.v[rn as usize] as u64, self.v[rm as usize] as u64) } else { (self.v[rn as usize] as u32 as u64, self.v[rm as usize] as u32 as u64) };
-            let nm = matches!(opc, 6 | 7);
-            let nan = crate::neon::process_nans(es, &[ab, bb]);
-            let snan_or_both = nan.is_some() && (!nm || (f_is_nan(ab, es) && f_is_nan(bb, es)) || nan != Some(if f_is_nan(ab, es) { ab } else { bb }));
-            let a = self.fread(rn, double);
-            let b = self.fread(rm, double);
-            let r = if let (Some(n), true) = (nan, snan_or_both) {
-                if double { F::D(f64::from_bits(n)) } else { F::S(f32::from_bits(n as u32)) }
-            } else if let (Some(_), true) = (nan, nm) {
-                // one quiet NaN and a number: FMAXNM/FMINNM return the number
-                if f_is_nan(ab, es) { b } else { a }
-            } else {
-                match (a, b) {
-                    (F::S(x), F::S(y)) => F::S(fp2(opc, x as f64, y as f64).ok_or(Trap::Unimplemented(self.pc, i))? as f32),
-                    (F::D(x), F::D(y)) => F::D(fp2(opc, x, y).ok_or(Trap::Unimplemented(self.pc, i))?),
-                    _ => unreachable!(),
-                }
+            let (a, b) = (get(self, rn), get(self, rm));
+            let mut fp = self.fpu();
+            let r = match bits(i, 15, 12) {
+                0 => fp.mul(es, a, b),
+                1 => fp.div(es, a, b),
+                2 => fp.add(es, a, b),
+                3 => fp.sub(es, a, b),
+                4 => fp.max(es, a, b),
+                5 => fp.min(es, a, b),
+                6 => fp.maxnm(es, a, b),
+                7 => fp.minnm(es, a, b),
+                8 => fp.mul(es, a, b) ^ (1u64 << (es - 1)), // FNMUL
+                _ => return Err(self.unimpl_fp(i)),
             };
-            // single-precision ops computed in f64 then rounded once: exact for + - * / and sqrt
-            self.fwrite(rd, r);
+            self.fpu_done(fp);
+            self.v[rd as usize] = r as u128;
             return Ok(None);
         }
         if bit(i, 21) && bits(i, 11, 10) == 0b11 {
@@ -249,33 +222,21 @@ impl Cpu {
         let (rd, rn) = (bits(i, 4, 0), bits(i, 9, 5));
         if ty > 1 || (!sf && scale < 32) { return Err(self.undefined()); }
         let fbits = 64 - scale;
-        let double = ty == 1;
-        let k = 2f64.powi(fbits as i32);
+        let es = if ty == 1 { 64 } else { 32 };
+        let bits_i = if sf { 64 } else { 32 };
+        let mut fp = self.fpu();
         match rmode_op {
             0b00010 | 0b00011 => {
-                let x = self.xr(rn);
-                let f = match (sf, rmode_op == 0b00011) {
-                    (true, false) => x as i64 as f64, (true, true) => x as f64,
-                    (false, false) => x as u32 as i32 as f64, (false, true) => x as u32 as f64,
-                };
-                // single precision: convert from the exact integer once (x/2^f is exact in binary)
-                let r = if double { F::D(f / k) } else {
-                    let v = match (sf, rmode_op == 0b00011) { (true, false) => x as i64 as f32, (true, true) => x as f32, (false, false) => x as u32 as i32 as f32, (false, true) => x as u32 as f32 };
-                    F::S(v / k as f32)
-                };
-                self.fwrite(rd, r);
+                let v = fp.from_int(es, self.xr(rn), rmode_op == 0b00010, bits_i, fbits);
+                self.v[rd as usize] = v as u128;
             }
             0b11000 | 0b11001 => {
-                let f = match self.fread(rn, double) { F::S(x) => x as f64, F::D(x) => x };
-                let t = (f * k).trunc();
-                let v = match (sf, rmode_op == 0b11001) {
-                    (true, false) => t as i64 as u64, (true, true) => t as u64,
-                    (false, false) => t as i32 as u32 as u64, (false, true) => t as u32 as u64,
-                };
+                let v = fp.to_int(es, self.v[rn as usize] as u64 & emask(es), Rnd::Zero, rmode_op == 0b11001, bits_i, fbits);
                 self.set_x(rd, v);
             }
             _ => return Err(self.undefined()),
         }
+        self.fpu_done(fp);
         Ok(None)
     }
 
@@ -290,9 +251,10 @@ impl Cpu {
         let get = |r: u32| if ty == 1 { self.v[r as usize] as u64 } else { self.v[r as usize] as u32 as u64 };
         let sign = 1u64 << (es - 1);
         let (n, m, a) = (get(rn), get(rm), get(ra));
-        let v = crate::neon::fma(es, if neg_acc { a ^ sign } else { a }, if neg_prod { n ^ sign } else { n }, m);
-        let r = if ty == 1 { F::D(f64::from_bits(v)) } else { F::S(f32::from_bits(v as u32)) };
-        self.fwrite(rd, r);
+        let mut fp = self.fpu();
+        let v = fp.fma(es, if neg_acc { a ^ sign } else { a }, if neg_prod { n ^ sign } else { n }, m);
+        self.fpu_done(fp);
+        self.v[rd as usize] = v as u128;
         Ok(None)
     }
 
@@ -445,26 +407,5 @@ impl Cpu {
     }
 }
 
-fn f_is_nan(x: u64, es: u32) -> bool { if es == 32 { f32::from_bits(x as u32).is_nan() } else { f64::from_bits(x).is_nan() } }
 
-fn fcmp_flags(x: f64, y: f64) -> u32 {
-    if x.is_nan() || y.is_nan() { 0b0011 << 28 }
-    else if x == y { 0b0110 << 28 }
-    else if x < y { 0b1000 << 28 }
-    else { 0b0010 << 28 }
-}
 
-fn fp2(opc: u32, x: f64, y: f64) -> Option<f64> {
-    Some(match opc {
-        0 => x * y,
-        1 => x / y,
-        2 => x + y,
-        3 => x - y,
-        4 => if x.is_nan() || y.is_nan() { f64::NAN } else { x.max(y) },
-        5 => if x.is_nan() || y.is_nan() { f64::NAN } else { x.min(y) },
-        6 => x.max(y),
-        7 => x.min(y),
-        8 => -(x * y),
-        _ => return None,
-    })
-}
