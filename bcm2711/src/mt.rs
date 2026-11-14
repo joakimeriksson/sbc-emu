@@ -421,7 +421,7 @@ impl Machine {
             // SAFETY: lock held; the cores only reach the SoC under it
             let soc = unsafe { sh.soc() };
             soc.pump_network(now);
-            soc.usb.tick(now);
+            soc.usb_tick(now);
             soc.device_lines(now);
             sh.publish(soc);
             if let Some(halt) = soc.pm.expired() { break if halt { Stop::PowerOff } else { Stop::Reset }; }

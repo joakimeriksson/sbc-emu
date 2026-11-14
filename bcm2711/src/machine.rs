@@ -31,6 +31,7 @@ pub const PM: u64 = 0xfe10_0000;
 pub const SYSTIMER: u64 = 0xfe00_3000;
 pub const AUX: u64 = 0xfe21_5000;
 pub const DMA: u64 = 0xfe00_7000;
+pub const PCM: u64 = 0xfe20_3000;
 /// GPU memory carve-out at the top of RAM (firmware `gpu_mem=64`), holding the framebuffer
 pub const GPU_MEM: u64 = 64 << 20;
 const PPI_VTIMER: usize = 27;
@@ -47,6 +48,7 @@ const SPI_GENET1: usize = 32 + 158;
 const SPI_SYSTIMER: usize = 32 + 64;
 const SPI_AUX: usize = 32 + 93;
 const SPI_DMA0: usize = 32 + 80;
+const SPI_PCIE_INTA: usize = 32 + 143;
 
 pub struct Soc {
     pub ram: Vec<u8>,
@@ -61,6 +63,10 @@ pub struct Soc {
     /// the network behind the Wi-Fi access point
     pub wifi_net: Option<sbc_net::net::VirtualNet>,
     pub usb: Dwc2,
+    /// PCIe root complex with the VL805 xHCI (the USB-A ports)
+    pub pcie: crate::pcie::Pcie,
+    /// USB devices, plugged into the DWC2 or the xHCI ports
+    pub devs: crate::usbdev::Devices,
     pub genet: Genet,
     pub gpio: crate::gpio::Gpio,
     pub i2c: crate::i2c::I2c,
@@ -74,11 +80,21 @@ pub struct Soc {
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
     pub dma: crate::dma::Dma,
+    /// PCM/I²S with a PCM5102A DAC behind it
+    pub i2s: crate::i2s::I2s,
+    /// when DREQ-paced DMA wants another look (ns; Some(0): now)
+    pace_next: Option<u64>,
     /// the network behind the Ethernet port (None = cable unplugged)
     pub net: Option<sbc_net::net::VirtualNet>,
     pub unknown: Vec<u64>,
     /// a device register was touched: interrupt lines must be re-derived
     pub dirty: bool,
+}
+
+/// DMA bus addresses: the peripheral window at 0x7e.., RAM aliases at 0x40../0x80../0xc0..
+fn dma_phys(a: u32) -> u64 {
+    let a = a as u64;
+    if (0x7e00_0000..0x7f00_0000).contains(&a) { a + 0x8000_0000 } else if a >= 0x4000_0000 && a < 0xfc00_0000 { a & 0x3fff_ffff } else { a }
 }
 
 impl Soc {
@@ -90,6 +106,8 @@ impl Soc {
             EMMC2..=0xfe34_00ff => self.sd.read(a - EMMC2),
             SDHOST_WIFI..=0xfe30_00ff => self.wifi.read(a - SDHOST_WIFI),
             USB..=0xfe98_ffff => self.usb.read(a - USB),
+            crate::pcie::BASE..=0xfd50_ffff => self.pcie.read(a - crate::pcie::BASE),
+            crate::pcie::MEM_CPU..=0x6_03ff_ffff => self.pcie.mem_read(a),
             GENET..=0xfd58_ffff => self.genet.read(a - GENET),
             GPIO..=0xfe20_00ff => self.gpio.read(a - GPIO),
             SPI0..=0xfe20_41ff => self.spi.read(a - SPI0),
@@ -100,6 +118,7 @@ impl Soc {
             SYSTIMER..=0xfe00_301b => self.systimer.read(a - SYSTIMER),
             AUX..=0xfe21_50ff => self.aux.read(a - AUX),
             DMA..=0xfe00_7fff => self.dma.read(a - DMA),
+            PCM..=0xfe20_3023 => self.i2s.read(a - PCM),
             // AXI bridges (ASB): the ID register; request bits are acknowledged at once
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => match a & 0xff { 0x20 => 0x6272_6467, o => self.asb[(o / 4) as usize % 12] & !(1 << 1) },
             GICD..=0xff84_1fff => self.gic.dist_read(self.cur, a - GICD),
@@ -113,6 +132,7 @@ impl Soc {
         self.dirty = true;
         if (EMMC2..=0xfe34_00ff).contains(&a) { self.sd.write(a - EMMC2, v, size); return Ok(()); }
         if (SDHOST_WIFI..=0xfe30_00ff).contains(&a) { self.wifi.write(a - SDHOST_WIFI, v, size); return Ok(()); }
+        if (crate::pcie::BASE..=0xfd50_ffff).contains(&a) { self.pcie.write(a - crate::pcie::BASE, v, size); return Ok(()); }
         if (GICD..=0xff84_1fff).contains(&a) && size < 4 {
             // byte-accessible registers (priorities, targets): read-modify-write of the word
             let (o, sh) = ((a - GICD) & !3, 8 * (a & 3));
@@ -125,7 +145,8 @@ impl Soc {
         match a {
             UART0..=0xfe20_1fff => self.uart.write(a - UART0, v),
             MBOX..=0xfe00_b8bf => self.mbox.write(a - MBOX, v, &mut self.ram),
-            USB..=0xfe98_ffff => self.usb.write(a - USB, v, &mut self.ram),
+            USB..=0xfe98_ffff => self.usb.write(a - USB, v, &mut self.ram, &mut self.devs),
+            crate::pcie::MEM_CPU..=0x6_03ff_ffff => self.pcie.mem_write(a, v, &mut self.ram, &mut self.devs),
             GENET..=0xfd58_ffff => self.genet.write(a - GENET, v, &mut self.ram),
             GPIO..=0xfe20_00ff => {
                 let ce0_before = self.gpio.level(8);
@@ -140,6 +161,7 @@ impl Soc {
             SYSTIMER..=0xfe00_301b => self.systimer.write(a - SYSTIMER, v),
             AUX..=0xfe21_50ff => self.aux.write(a - AUX, v),
             DMA..=0xfe00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
+            PCM..=0xfe20_3023 => self.i2s.write(a - PCM, v),
             0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v,
             GICD..=0xff84_1fff => self.gic.dist_write(self.cur, a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(self.cur, a - GICC, v),
@@ -172,6 +194,8 @@ impl Soc {
 
     /// Device interrupt lines into the GIC at virtual time `now` (ns).
     pub(crate) fn device_lines(&mut self, now: u64) {
+        self.i2s.bclk = self.mbox.audio_clk;
+        if self.pace_next.is_some_and(|t| now >= t) { self.dma_pace(now); }
         let u = self.uart.irq();
         self.gic.set_level(SPI_UART0, u);
         self.gpio.now_ns = now;
@@ -187,6 +211,8 @@ impl Soc {
         self.gic.set_level(SPI_GENET1, g1);
         let usb = self.usb.irq();
         self.gic.set_level(SPI_USB, usb);
+        let xhci = self.pcie.irq();
+        self.gic.set_level(SPI_PCIE_INTA, xhci);
         // EMMC2 and the Wi-Fi SD host share SPI 126, as on the Pi 4
         let sd = self.sd.irq() || self.wifi.irq();
         self.gic.set_level(SPI_EMMC2, sd);
@@ -201,18 +227,72 @@ impl Soc {
         self.dirty = false;
     }
 
-    /// DMA channel `n` was made active: walk its control blocks now.
+    /// Load channel `n`'s next control block into its registers; false at the end of the chain.
+    fn dma_load_cb(&mut self, n: usize) -> bool {
+        let cb = self.dma.ch[n].conblk & !31;
+        if cb == 0 { return false; }
+        let base = dma_phys(cb);
+        let mut w = [0u32; 8];
+        for (k, x) in w.iter_mut().enumerate() { *x = self.read32(base + 4 * k as u64).unwrap_or(0); }
+        let c = &mut self.dma.ch[n];
+        [c.ti, c.src, c.dst, c.len, c.stride, c.next] = [w[0], w[1], w[2], w[3], w[4], w[5]];
+        true
+    }
+
+    /// The current block of channel `n` is done: interrupt, then on to the next one.
+    fn dma_block_done(&mut self, n: usize) -> bool {
+        use crate::dma::*;
+        let c = &mut self.dma.ch[n];
+        if c.ti & TI_INTEN != 0 { c.cs |= INT; }
+        c.conblk = c.next;
+        if c.conblk == 0 || !self.dma_load_cb(n) {
+            let c = &mut self.dma.ch[n];
+            c.cs = (c.cs & !ACTIVE) | END;
+            return false;
+        }
+        true
+    }
+
+    /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns).
+    pub(crate) fn dma_pace(&mut self, now: u64) {
+        use crate::dma::*;
+        let mut demand = self.i2s.tx_demand(now);
+        for n in 0..CHANNELS {
+            if self.dma.ch[n].cs & ACTIVE == 0 || paced(self.dma.ch[n].ti) != Some(crate::i2s::DREQ_TX) { continue; }
+            let mut guard = 0;
+            while demand > 0 && guard < 1 << 20 {
+                guard += 1;
+                let c = self.dma.ch[n];
+                if c.len < 4 {
+                    if !self.dma_block_done(n) { break; }
+                    if paced(self.dma.ch[n].ti).is_none() { self.dma_run(n); break; }
+                    continue;
+                }
+                let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(dma_phys(c.src)).unwrap_or(0) };
+                self.i2s.push(v);
+                let c = &mut self.dma.ch[n];
+                if c.ti & TI_SRC_INC != 0 { c.src = c.src.wrapping_add(4); }
+                c.len -= 4;
+                demand -= 1;
+            }
+            // the block that just ran dry completes now, not at the next demand
+            if self.dma.ch[n].cs & ACTIVE != 0 && self.dma.ch[n].len < 4 { self.dma_block_done(n); }
+        }
+        self.pace_next = if (0..CHANNELS).any(|n| self.dma.ch[n].cs & ACTIVE != 0 && paced(self.dma.ch[n].ti).is_some()) { Some(now + 500_000) } else { None };
+    }
+
+    /// DMA channel `n` was made active: walk its control blocks now, up to one that waits
+    /// for a DREQ.
     fn dma_run(&mut self, n: usize) {
         use crate::dma::*;
-        // bus addresses: the peripheral window at 0x7e.., RAM aliases at 0x40../0x80../0xc0..
-        let phys = |a: u32| -> u64 { let a = a as u64; if (0x7e00_0000..0x7f00_0000).contains(&a) { a + 0x8000_0000 } else if a >= 0x4000_0000 && a < 0xfc00_0000 { a & 0x3fff_ffff } else { a } };
+        let phys = dma_phys;
         for _ in 0..4096 {
             let cb = self.dma.ch[n].conblk & !31;
             if cb == 0 { break; }
-            let base = phys(cb);
-            let mut w = [0u32; 8];
-            for (k, x) in w.iter_mut().enumerate() { *x = self.read32(base + 4 * k as u64).unwrap_or(0); }
-            let [ti, src, dst, len, stride, next, _, _] = w;
+            if !self.dma_load_cb(n) { break; }
+            let c = self.dma.ch[n];
+            if paced(c.ti).is_some() { self.pace_next = Some(0); return; } // runs as its peripheral asks
+            let [ti, src, dst, len, stride, next] = [c.ti, c.src, c.dst, c.len, c.stride, c.next];
             let (xlen, rows) = if ti & TI_TDMODE != 0 { (len & 0xffff, (len >> 16) & 0x3fff) } else { (len & 0x3fff_ffff, 1) };
             let (sstride, dstride) = ((stride & 0xffff) as i16 as i64, (stride >> 16) as i16 as i64);
             let (mut s, mut d) = (phys(src), phys(dst));
@@ -242,6 +322,18 @@ impl Soc {
         }
         let c = &mut self.dma.ch[n];
         c.cs = (c.cs & !ACTIVE) | END;
+    }
+
+    /// USB time: DWC2 frames, xHCI polling of devices with input.
+    pub(crate) fn usb_tick(&mut self, now: u64) {
+        self.usb.tick(now);
+        self.pcie.xhci.tick(now, &mut self.ram, &mut self.devs);
+    }
+
+    /// The next USB deadline.
+    pub(crate) fn usb_next_event(&self) -> Option<u64> {
+        let x = self.pcie.xhci.next_event(&self.devs);
+        [self.usb.next_event(), x, self.pace_next].into_iter().flatten().min()
     }
 
     fn note(&mut self, a: u64) {
@@ -306,6 +398,9 @@ pub enum Stop {
     Reset,
     /// a debugger breakpoint: core `k` is about to execute an instruction at a breakpoint
     Breakpoint(usize),
+    /// a debugger watchpoint: core `k` just made an access (kind 1 write, 2 read) to the
+    /// watched address
+    Watchpoint(usize, u64, u8),
     /// the core keeps taking exceptions without retiring instructions (a fault loop)
     ExceptionStorm { pc: u64, esr: u64, elr: u64, far: u64, el: u8 },
 }
@@ -323,10 +418,10 @@ pub enum CoreState {
 }
 
 /// Virtual time each core runs per round while several cores are runnable (ns = instructions);
-/// `SBC_quantum()` overrides it (experiments).
+/// `SBC_QUANTUM` overrides it (experiments).
 fn quantum() -> u64 {
     static Q: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *Q.get_or_init(|| std::env::var("SBC_quantum()").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000))
+    *Q.get_or_init(|| std::env::var("SBC_QUANTUM").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000))
 }
 
 pub struct Machine {
@@ -363,7 +458,7 @@ impl Machine {
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
@@ -453,7 +548,7 @@ impl Machine {
         }
         let now = self.now;
         self.soc.pump_network(now);
-        self.soc.usb.tick(now);
+        self.soc.usb_tick(now);
         self.soc.device_lines(now);
         for k in 0..self.cpus.len() {
             if self.state[k] == CoreState::Off { continue; }
@@ -477,7 +572,7 @@ impl Machine {
     /// The earliest deadline after `t` that core `c` running alone must notice: its own timers,
     /// those of sleeping cores, devices.
     fn deadline_after(&self, t: u64, c: usize) -> Option<u64> {
-        let mut d: Option<u64> = [self.soc.usb.next_event(), self.soc.pm.next_event(), self.soc.systimer.next_event()]
+        let mut d: Option<u64> = [self.soc.usb_next_event(), self.soc.pm.next_event(), self.soc.systimer.next_event()]
             .into_iter().flatten().filter(|&x| x > t).min();
         for (k, cpu) in self.cpus.iter().enumerate() {
             if self.state[k] == CoreState::Off || (k != c && self.state[k] == CoreState::Run) { continue; }
@@ -494,7 +589,7 @@ impl Machine {
 
     /// Next timer (of any core that is on) or device deadline in ns.
     fn next_deadline(&self) -> Option<u64> {
-        let mut d: Option<u64> = [self.soc.usb.next_event(), self.soc.pm.next_event(), self.soc.systimer.next_event()].into_iter().flatten().min();
+        let mut d: Option<u64> = [self.soc.usb_next_event(), self.soc.pm.next_event(), self.soc.systimer.next_event()].into_iter().flatten().min();
         for (k, cpu) in self.cpus.iter().enumerate() {
             if self.state[k] == CoreState::Off { continue; }
             let s = &cpu.sys;
@@ -510,12 +605,12 @@ impl Machine {
 
     /// Run until the cores have retired `budget` instructions between them.
     ///
-    /// The cores take turns in rounds of `quantum()` ns of virtual time each, all starting the
+    /// The cores take turns in rounds of 20 µs of virtual time (`SBC_QUANTUM` ns) each, all starting the
     /// round at the same time, as if they ran in parallel. A core that is alone (the others off
     /// or asleep) runs without rounds until something wakes another one.
     pub fn run(&mut self, budget: u64) -> Stop {
         #[cfg(not(target_arch = "wasm32"))]
-        if self.multi && self.breakpoints.is_empty() && !self.cpus.iter().any(|c| c.jit_off) {
+        if self.multi && self.breakpoints.is_empty() && !self.cpus.iter().any(|c| c.jit_off || !c.watch.is_empty()) {
             return self.run_threaded(std::time::Duration::from_millis(10));
         }
         if self.cpus[0].mt {
@@ -576,6 +671,7 @@ impl Machine {
             cpu.chain_until = i0.saturating_add(self.round_end - t).min(self.next_check).min(i0 + (end - *total));
             let r = cpu.step(&mut self.soc);
             *total += self.cpus[k].instret - i0;
+            if let Some((a, kind)) = self.cpus[k].watch_hit.take() { if r.is_ok() { return Some(Stop::Watchpoint(k, a, kind)); } }
             if let Some(op) = self.cpus[k].tlbi_bcast.take() {
                 for (j, o) in self.cpus.iter_mut().enumerate() { if j != k { o.tlb_invalidate(op); } }
             }
@@ -730,6 +826,17 @@ impl Machine {
     /// Debugging: interpreter only on all cores (needed while breakpoints are set).
     pub fn set_debugging(&mut self, on: bool) { for c in self.cpus.iter_mut() { c.jit_off = on; } }
 
+    /// Debugging: set or clear (`insert` false) a watchpoint on [addr, addr + len) for
+    /// accesses of `kind` (1 write, 2 read, 3 either), on every core.
+    pub fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        for c in self.cpus.iter_mut() {
+            c.watch.retain(|&w| w != (addr, len, kind));
+            if insert { c.watch.push((addr, len, kind)); }
+        }
+        let on = !self.breakpoints.is_empty() || !self.cpus[0].watch.is_empty();
+        self.set_debugging(on);
+    }
+
     /// Debugging: execute one instruction on core `k` (interpreter); a stop it causes, if any.
     pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
         if self.state[k] == CoreState::Off { return None; }
@@ -807,7 +914,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v7");
+        w.tag("machine-v8");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -827,6 +934,10 @@ impl Machine {
         self.soc.systimer.save_state(&mut w);
         self.soc.aux.save_state(&mut w);
         self.soc.dma.save_state(&mut w);
+        self.soc.devs.save_state(&mut w);
+        self.soc.pcie.save_state(&mut w);
+        self.soc.rng.save_state(&mut w);
+        self.soc.i2s.save_state(&mut w);
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -843,7 +954,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        let v7 = r.tag("machine-v7").is_ok();
+        let v8 = r.tag("machine-v8").is_ok();
+        if !v8 { r.p = 0; }
+        let v7 = v8 || r.tag("machine-v7").is_ok();
         if !v7 { r.p = 0; }
         let v6 = v7 || r.tag("machine-v6").is_ok();
         if !v6 { r.p = 0; }
@@ -873,7 +986,7 @@ impl Machine {
         self.soc.uart.load_state(&mut r).map_err(e)?;
         self.soc.mbox.load_state(&mut r).map_err(e)?;
         self.soc.sd.load_state(&mut r).map_err(e)?;
-        self.soc.usb.load_state(&mut r).map_err(e)?;
+        self.soc.usb.load_state(&mut r, &mut self.soc.devs.kbd, !v8).map_err(e)?;
         self.soc.genet.load_state(&mut r).map_err(e)?;
         self.soc.wifi.load_state(&mut r).map_err(e)?;
         self.soc.gpio.load_state(&mut r).map_err(e)?;
@@ -883,6 +996,19 @@ impl Machine {
             self.soc.aux.load_state(&mut r).map_err(e)?;
         }
         if v7 { self.soc.dma.load_state(&mut r).map_err(e)?; }
+        if v8 {
+            self.soc.devs.load_state(&mut r).map_err(e)?;
+            self.soc.pcie.load_state(&mut r).map_err(e)?;
+            self.soc.rng.load_state(&mut r).map_err(e)?;
+            self.soc.i2s.load_state(&mut r).map_err(e)?;
+            self.soc.mbox.audio_clk = self.soc.i2s.bclk;
+            self.soc.pace_next = Some(0);
+        } else {
+            // before PCIe: the keyboard was on the OTG port and the guest never saw the xHCI
+            self.soc.pcie = crate::pcie::Pcie::new();
+            // and the RNG's control register was not saved: it was enabled by then
+            if v7 { self.soc.rng.write(0, 0x00ff_2001); }
+        }
         self.soc.ram.fill(0);
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;

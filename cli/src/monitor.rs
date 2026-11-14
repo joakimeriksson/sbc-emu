@@ -20,12 +20,15 @@ info network         virtual network and NAT counters
 info jit             JIT statistics
 x /COUNT ADDR        dump guest memory at a virtual address (as core 0 sees it), 8-byte words
 xp /COUNT ADDR       dump guest memory at a physical address
+xlate VA             translate a virtual address (core 0's tables)
 stop | cont          pause or resume the guest
 savevm FILE          write a snapshot      loadvm FILE   restore one (same SD image)
 screendump FILE.png  save the screen
 sendkey KEYS         type on the USB keyboard (text; \\n for Enter)
 hostfwd_add tcp:[HOST]:PORT-[GUEST]:PORT   forward a host TCP port to the guest
 gdbserver PORT       start the gdb stub
+mouse_move X Y       move the USB tablet's pointer to screen pixel X, Y
+mouse_button N       tablet buttons: bit 0 left, 1 right, 2 middle
 sensor NAME VALUE    temp|pressure|humidity|cpu-temp
 system_reset         reset the machine     quit   stop the emulator";
 
@@ -115,6 +118,13 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
             }
             Effect::None
         }
+        ("xlate", [a]) => {
+            out = match parse_num(a) {
+                Some(va) => { let soc = &mut m.soc; match m.cpus[0].debug_translate(soc, va) { Some(pa) => format!("{va:#x} -> {pa:#x}\n"), None => format!("{va:#x}: not mapped\n") } }
+                None => "usage: xlate VA\n".into(),
+            };
+            Effect::None
+        }
         ("stop", _) => { out = "paused\n".into(); Effect::Pause(true) }
         ("cont" | "c", _) => Effect::Pause(false),
         ("savevm", [f]) => {
@@ -139,7 +149,7 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
         }
         ("sendkey", _) => {
             let text = line.trim_start().strip_prefix("sendkey").unwrap_or("").trim_start();
-            for b in text.replace("\\n", "\r").bytes() { m.soc.usb.kbd.type_byte(b); }
+            for b in text.replace("\\n", "\r").bytes() { m.soc.devs.kbd.type_byte(b); }
             Effect::None
         }
         ("hostfwd_add", [spec]) => {
@@ -156,6 +166,22 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
             Effect::None
         }
         ("gdbserver", [p]) => match p.trim_start_matches("tcp::").parse() { Ok(port) => Effect::Gdb(port), Err(_) => { out = "usage: gdbserver PORT\n".into(); Effect::None } },
+        ("mouse_move", [x, y]) => {
+            let (w, h) = m.soc.mbox.fb_size();
+            let scale = |v: &str, n: u32| v.parse::<u32>().ok().map(|v| (v.min(n.saturating_sub(1)) * 32767 / n.saturating_sub(1).max(1)) as u16);
+            match (scale(x, w), scale(y, h)) {
+                (Some(x), Some(y)) => { let b = m.soc.devs.tablet.state.0; m.soc.devs.tablet.pointer(b, x, y, 0); }
+                _ => out = "usage: mouse_move X Y\n".into(),
+            }
+            Effect::None
+        }
+        ("mouse_button", [b]) => {
+            match b.parse::<u8>() {
+                Ok(b) => { let (_, x, y) = m.soc.devs.tablet.state; m.soc.devs.tablet.pointer(b & 7, x, y, 0); }
+                Err(_) => out = "usage: mouse_button N\n".into(),
+            }
+            Effect::None
+        }
         ("sensor", [name, v]) => { if let Ok(v) = v.parse() { m.set_sensor(name, v); } Effect::None }
         ("system_reset", _) => Effect::Reset,
         ("quit" | "q", _) => Effect::Quit,

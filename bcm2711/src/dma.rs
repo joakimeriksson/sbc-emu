@@ -1,6 +1,8 @@
 //! BCM2835 DMA controller (the legacy channels 0..14 at 0xfe007000, `brcm,bcm2835-dma`).
 //! A channel set ACTIVE walks its chain of 32-byte control blocks (TI, SOURCE_AD, DEST_AD,
-//! TXFR_LEN, STRIDE, NEXTCONBK) and completes at once: transfers are not paced by DREQs.
+//! TXFR_LEN, STRIDE, NEXTCONBK). A block that waits for a peripheral's DREQ (TI.DEST_DREQ or
+//! SRC_DREQ with a PERMAP) moves data only as fast as that peripheral asks for it, with the
+//! channel registers showing its progress (`Soc::dma_pace`); other blocks complete at once.
 //! The SoC performs the memory accesses (`Soc::dma_run`); this holds the register state.
 
 pub const CHANNELS: usize = 15;
@@ -21,6 +23,14 @@ pub const TI_DEST_IGNORE: u32 = 1 << 7;
 pub const TI_SRC_INC: u32 = 1 << 8;
 pub const TI_SRC_WIDTH: u32 = 1 << 9;
 pub const TI_SRC_IGNORE: u32 = 1 << 11;
+pub const TI_DEST_DREQ: u32 = 1 << 6;
+pub const TI_SRC_DREQ: u32 = 1 << 10;
+
+/// The peripheral a block waits for (TI.PERMAP), if it waits for one.
+pub fn paced(ti: u32) -> Option<u32> {
+    let permap = (ti >> 16) & 0x1f;
+    (ti & (TI_DEST_DREQ | TI_SRC_DREQ) != 0 && permap != 0).then_some(permap)
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct Chan {

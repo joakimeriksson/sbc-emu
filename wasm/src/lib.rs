@@ -143,11 +143,11 @@ pub extern "C" fn sbc_jit_blocks() -> f64 { with(|s| s.m.jit().map(|j| j.compile
 
 /// USB keyboard: press (down=1) or release (down=0) a key by HID usage code.
 #[no_mangle]
-pub extern "C" fn sbc_key(usage: u32, down: u32) { with(|s| s.m.soc.usb.kbd.key(usage as u8, down != 0)); }
+pub extern "C" fn sbc_key(usage: u32, down: u32) { with(|s| s.m.soc.devs.kbd.key(usage as u8, down != 0)); }
 
 /// USB keyboard: type one byte of text (US layout).
 #[no_mangle]
-pub extern "C" fn sbc_type(b: u32) { with(|s| s.m.soc.usb.kbd.type_byte(b as u8)); }
+pub extern "C" fn sbc_type(b: u32) { with(|s| s.m.soc.devs.kbd.type_byte(b as u8)); }
 
 /// Run up to `budget` instructions with the page's wall clock `wall_ns` (real-time pacing).
 /// Returns 0 = budget used, 1 = idle (wait `sbc_wait_ms()` or until input), 2 = stopped.

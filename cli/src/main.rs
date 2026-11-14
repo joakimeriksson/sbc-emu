@@ -9,6 +9,7 @@ mod disk;
 mod gdb;
 mod monitor;
 mod vnc;
+mod wav;
 
 use bcm2711::{Machine, Stop};
 use std::io::{Read, Write};
@@ -66,7 +67,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -141,9 +142,31 @@ fn run(args: &[String]) -> ExitCode {
         None => None,
     };
 
+    // --usb-drive IMAGE: a USB stick on the third USB-A port (copy-on-write, like the SD card)
+    let usb_drive: Option<Box<dyn bcm2711::sdhci::Disk + Send>> = match arg(args, "--usb-drive") {
+        Some(p) => match disk::CowFile::open(p) { Ok(d) => Some(Box::new(d)), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
+        None => None,
+    };
+    // --audio-out FILE.wav: what the guest plays on the I²S DAC
+    let mut audio_out = match arg(args, "--audio-out") {
+        Some(p) => match wav::Wav::create(p) { Ok(w) => Some(w), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
+        None => None,
+    };
+    // --otg-keyboard: the keyboard on the USB-C (DWC2 OTG) port, as before the xHCI existed
+    let otg_keyboard = args.iter().any(|a| a == "--otg-keyboard");
+
     // power-on: firmware-style boot from the SD card unless a kernel is given explicitly
-    let power_on = |mut disk: Option<Box<dyn bcm2711::sdhci::Disk>>| -> Result<Machine, String> {
+    let power_on = |mut disk: Option<Box<dyn bcm2711::sdhci::Disk>>, usb_drive: Option<Box<dyn bcm2711::sdhci::Disk + Send>>| -> Result<Machine, String> {
         let mut m = Machine::with_cpus(ram_mb << 20, smp);
+        {
+            use bcm2711::usbdev::DevId;
+            let mut ports = vec![DevId::Keyboard, DevId::Tablet];
+            if otg_keyboard { ports.remove(0); m.soc.usb.port = Some(DevId::Keyboard); }
+            if let Some(d) = usb_drive { m.soc.devs.storage = Some(bcm2711::usbdev::Storage::new(d)); ports.push(DevId::Storage); }
+            // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern)
+            if args.iter().any(|a| a == "--camera") { m.soc.devs.camera = Some(bcm2711::usbdev::Camera::new()); ports.push(DevId::Camera); }
+            m.soc.pcie.xhci.attach(&ports);
+        }
         let (k, i, c) = match (&kernel, disk.as_mut()) {
             (Some(k), _) => (k.clone(), initrd.clone(), append.clone().unwrap_or_else(|| format!("{} sbcemu.shell={shell}", bcm2711::boot::DEFAULT_CMDLINE))),
             (None, Some(d)) => {
@@ -190,13 +213,20 @@ fn run(args: &[String]) -> ExitCode {
         bcm2711::boot::boot_linux(&mut m, &k, i.as_deref(), &c, display)?;
         Ok(m)
     };
-    let mut m = match power_on(disk) { Ok(m) => m, Err(e) => { eprintln!("boot: {e}"); return ExitCode::FAILURE } };
+    let mut m = match power_on(disk, usb_drive) { Ok(m) => m, Err(e) => { eprintln!("boot: {e}"); return ExitCode::FAILURE } };
     let mut clock_offset = Duration::ZERO;
     if let Some(p) = arg(args, "--restore") {
         let snap = match std::fs::read(p) { Ok(b) => b, Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } };
         if let Err(e) = m.restore(&snap) { eprintln!("{p}: {e}"); return ExitCode::FAILURE; }
         clock_offset = Duration::from_nanos(m.now);
         eprintln!("[sbc-emu] restored {p}: guest time {:.1} s, {} instructions", m.now as f64 / 1e9, m.instret());
+        // a USB stick given now but absent from the snapshot is plugged in
+        use bcm2711::usbdev::DevId;
+        for (dev, name, present) in [(DevId::Storage, "USB stick", m.soc.devs.storage.is_some()), (DevId::Camera, "USB camera", m.soc.devs.camera.is_some())] {
+            if !present || m.soc.usb.port == Some(dev) { continue; }
+            let soc = &mut m.soc;
+            if let Some(k) = soc.pcie.xhci.plug(dev, &mut soc.ram, &mut soc.devs) { eprintln!("[sbc-emu] {name} plugged into port {k}"); }
+        }
     }
 
     // console input: a thread forwards stdin bytes
@@ -271,15 +301,15 @@ fn run(args: &[String]) -> ExitCode {
         if quit { break Stop::Budget; }
         if usb_input {
             // keystrokes go to the USB keyboard; terminal escape sequences become arrow keys
-            while m.soc.usb.kbd.queued() < 64 {
+            while m.soc.devs.kbd.queued() < 64 {
                 let Some(b) = pending.pop_front() else { break };
                 if b == 0x1b && pending.front() == Some(&b'[') && pending.len() >= 2 {
                     pending.pop_front();
                     let k = pending.pop_front().unwrap();
                     let usage = match k { b'A' => 0x52, b'B' => 0x51, b'C' => 0x4f, b'D' => 0x50, b'H' => 0x4a, b'F' => 0x4d, _ => 0 };
-                    if usage != 0 { m.soc.usb.kbd.tap(usage, 0); }
+                    if usage != 0 { m.soc.devs.kbd.tap(usage, 0); }
                 } else {
-                    m.soc.usb.kbd.type_byte(b);
+                    m.soc.devs.kbd.type_byte(b);
                 }
             }
         } else {
@@ -313,7 +343,7 @@ fn run(args: &[String]) -> ExitCode {
                         };
                     }
                     "sleep" => { script_wait_until = Some(Instant::now() + Duration::from_secs_f64(rest.parse().unwrap_or(1.0))); }
-                    "type" => for b in unescape(rest).bytes() { m.soc.usb.kbd.type_byte(b); },
+                    "type" => for b in unescape(rest).bytes() { m.soc.devs.kbd.type_byte(b); },
                     "serial" => pending.extend(unescape(rest).bytes()),
                     "serial1" => for b in unescape(rest).bytes() { m.soc.aux.push_rx(b); m.soc.dirty = true; },
                     "monitor" => {
@@ -387,6 +417,7 @@ fn run(args: &[String]) -> ExitCode {
         if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
             let hit = match stop {
                 Stop::Breakpoint(k) => Some((k, 5)),
+                Stop::Watchpoint(k, a, kind) => { g.reason = gdb::watch_reason(a, kind); Some((k, 5)) }
                 Stop::Unimplemented(..) => Some((0, 4)),
                 Stop::Brk(_) | Stop::Hlt(_) | Stop::ExceptionStorm { .. } => Some((0, 5)),
                 _ => None,
@@ -398,7 +429,7 @@ fn run(args: &[String]) -> ExitCode {
                 stop = Stop::Budget;
             }
         }
-        if let Stop::Breakpoint(_) = stop { stop = Stop::Budget; }
+        if let Stop::Breakpoint(_) | Stop::Watchpoint(..) = stop { stop = Stop::Budget; }
         if gpio_log {
             for ev in std::mem::take(&mut m.soc.gpio.events) {
                 eprintln!("\r[gpio] GPIO{} -> {} at t={:.6}s\r", ev.pin, ev.level as u8, ev.time_ns as f64 / 1e9);
@@ -409,6 +440,10 @@ fn run(args: &[String]) -> ExitCode {
             if serial_log.len() > 1 << 20 { serial_log.drain(..serial_log.len() - (1 << 19)); }
         }
         if monitor_line.is_none() { flush(&mut m, &mut out, tty.0); }
+        if let Some(w) = audio_out.as_mut() {
+            let s = std::mem::take(&mut m.soc.i2s.out);
+            w.push(m.soc.i2s.rate, &s);
+        } else if !m.soc.i2s.out.is_empty() { m.soc.i2s.out.clear(); }
         if !m.soc.aux.out.is_empty() {
             let b = std::mem::take(&mut m.soc.aux.out);
             if let Some(f) = serial1.as_mut() { let _ = f.write_all(&b); let _ = f.flush(); }
@@ -431,8 +466,9 @@ fn run(args: &[String]) -> ExitCode {
             Stop::Reset => {
                 eprintln!("\r\n[sbc-emu] system reset: rebooting\r");
                 let d = m.soc.sd.disk.take();
+                let u = m.soc.devs.storage.take().map(|s| s.disk);
                 if let Some(n) = m.soc.net.as_mut() { n.nat = None; } // free forwarded host ports
-                m = match power_on(d) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
+                m = match power_on(d, u) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
             }
             other => break other,
         }

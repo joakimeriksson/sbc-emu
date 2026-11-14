@@ -43,6 +43,14 @@ impl Rng200 {
         }
     }
     pub fn write(&mut self, off: u64, v: u32) { if off == 0 { self.ctrl = v; } }
+
+    pub fn save_state(&self, w: &mut emu_core::snap::W) { w.tag("rng-v1"); w.u32(self.ctrl); w.u64(self.state); }
+    pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        r.tag("rng-v1")?;
+        self.ctrl = r.u32()?;
+        self.state = r.u64()?;
+        Ok(())
+    }
 }
 
 impl Default for Rng200 { fn default() -> Self { Self::new() } }

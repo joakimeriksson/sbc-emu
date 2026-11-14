@@ -172,6 +172,15 @@ impl Cpu {
         }
     }
 
+    /// A debugger watchpoint covering [va, va + size) for an access of `kind` (1 write, 2 read).
+    #[cold]
+    fn watch_check(&mut self, va: u64, size: u32, kind: u8) {
+        if self.watch_hit.is_some() { return; }
+        if let Some(&(a, _, _)) = self.watch.iter().find(|&&(a, n, k)| k & kind != 0 && va < a.wrapping_add(n) && a < va.wrapping_add(size as u64)) {
+            self.watch_hit = Some((a, kind));
+        }
+    }
+
     /// Load `size` bytes (1..=16) little-endian.
     pub(crate) fn load(
         &mut self,
@@ -180,6 +189,7 @@ impl Cpu {
         size: u32,
         unpriv: bool,
     ) -> Result<u128, Trap> {
+        if !self.watch.is_empty() { self.watch_check(va, size, 2); }
         if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
             let ti = (va >> 12) as usize & (UT - 1);
@@ -254,6 +264,7 @@ impl Cpu {
         v: u128,
         unpriv: bool,
     ) -> Result<(), Trap> {
+        if !self.watch.is_empty() { self.watch_check(va, size, 1); }
         if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
             let ti = (va >> 12) as usize & (UT - 1);

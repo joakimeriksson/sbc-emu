@@ -1,6 +1,7 @@
 //! A small VNC (RFB 3.3/3.7/3.8) server for the HDMI framebuffer (`--vnc :N`, as QEMU's
 //! `-vnc`): no authentication, Raw encoding of the rows that changed, any true-colour pixel
-//! format the viewer asks for, desktop resizes; keys go to the emulated USB keyboard.
+//! format the viewer asks for, desktop resizes; keys go to the emulated USB keyboard and the
+//! pointer to the USB tablet.
 use bcm2711::Machine;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -38,7 +39,7 @@ pub struct Vnc {
 /// X11 keysym -> HID usage.
 fn keysym_usage(k: u32) -> Option<u8> {
     Some(match k {
-        0x20..=0x7e => bcm2711::dwc2::ascii_to_usage(k as u8)?.0,
+        0x20..=0x7e => bcm2711::usbdev::ascii_to_usage(k as u8)?.0,
         0xff0d | 0xff8d => 0x28, 0xff1b => 0x29, 0xff08 => 0x2a, 0xff09 => 0x2b,
         0xff51 => 0x50, 0xff52 => 0x52, 0xff53 => 0x4f, 0xff54 => 0x51,
         0xff50 => 0x4a, 0xff57 => 0x4d, 0xff55 => 0x4b, 0xff56 => 0x4e, 0xff63 => 0x49, 0xffff => 0x4c,
@@ -153,8 +154,16 @@ impl Client {
                         }
                         2 => self.resize_ok = msg[4..].chunks(4).any(|e| i32::from_be_bytes(e.try_into().unwrap()) == -223),
                         3 => self.want = Some(msg[1] != 0 && self.want != Some(false)),
-                        4 => if let Some(u) = keysym_usage(u32::from_be_bytes(msg[4..8].try_into().unwrap())) { m.soc.usb.kbd.key(u, msg[1] != 0); },
-                        _ => {} // pointer (no mouse on the board), clipboard
+                        4 => if let Some(u) = keysym_usage(u32::from_be_bytes(msg[4..8].try_into().unwrap())) { m.soc.devs.kbd.key(u, msg[1] != 0); },
+                        5 => {
+                            // the pointer goes to the USB tablet: buttons left/middle/right/wheel
+                            let (mask, x, y) = (msg[1], u16::from_be_bytes([msg[2], msg[3]]) as u32, u16::from_be_bytes([msg[4], msg[5]]) as u32);
+                            let buttons = (mask & 1) | (mask >> 1 & 2) | (mask << 1 & 4);
+                            let wheel = if mask & 8 != 0 { 1 } else if mask & 16 != 0 { -1 } else { 0 };
+                            let scale = |v: u32, n: u32| (v.min(n.saturating_sub(1)) * 32767 / n.saturating_sub(1).max(1)) as u16;
+                            m.soc.devs.tablet.pointer(buttons, scale(x, self.size.0), scale(y, self.size.1), wheel);
+                        }
+                        _ => {} // clipboard
                     }
                     true
                 }

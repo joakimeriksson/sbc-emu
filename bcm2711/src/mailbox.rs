@@ -39,12 +39,15 @@ pub struct Mailbox {
     pub unknown: Vec<u32>,
     /// SoC temperature reported to the firmware's GET_TEMPERATURE (millidegrees C)
     pub temp_mc: u32,
+    /// the firmware clock that drives the I²S bit clock (Hz; the DISP clock, id 16)
+    pub audio_clk: u32,
 }
 
 impl Mailbox {
     pub fn new(fb_base: u64, fb_max: u64, width: u32, height: u32) -> Self {
         Mailbox {
             temp_mc: 45_000,
+            audio_clk: 0,
             rd: VecDeque::new(),
             cfg: 0,
             fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
@@ -122,7 +125,7 @@ impl Mailbox {
             0x0000_0001 => set(v, &[FW_REVISION]),
             0x0000_0002 => set(v, &[0]), // firmware variant: none
             0x0000_0003 => set(v, &[0x5bc0_e000, 0, 0, 0, 0]), // firmware git hash (20 bytes)
-            0x0001_0007 => set(v, &[0, 1, 0, 2, 0, 3, 0, 4]), // clocks: (parent, id) pairs
+            0x0001_0007 => set(v, &[0, AUDIO_CLK]), // clocks for `raspberrypi,firmware-clocks`: (parent, id) pairs
             0x0001_0001 => set(v, &[0]),
             0x0001_0002 => set(v, &[BOARD_REVISION]),
             0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)
@@ -132,6 +135,11 @@ impl Mailbox {
             0x0002_0001 | 0x0002_0002 => { let id = arg(v, 0); set(v, &[id, 1]) }
             0x0002_8001 => { let id = arg(v, 0); let st = arg(v, 1) & 1; set(v, &[id, st]) }
             0x0003_0001 => { let id = arg(v, 0); set(v, &[id, 1]) }
+            // the audio clock: any rate up to 100 MHz, as set
+            0x0003_0002 | 0x0003_0047 if arg(v, 0) == AUDIO_CLK => set(v, &[AUDIO_CLK, self.audio_clk]),
+            0x0003_0004 if arg(v, 0) == AUDIO_CLK => set(v, &[AUDIO_CLK, 100_000_000]),
+            0x0003_0007 if arg(v, 0) == AUDIO_CLK => set(v, &[AUDIO_CLK, 0]),
+            0x0003_8002 if arg(v, 0) == AUDIO_CLK => { self.audio_clk = arg(v, 1); set(v, &[AUDIO_CLK, self.audio_clk]) }
             0x0003_0002 | 0x0003_0004 | 0x0003_0007 | 0x0003_0047 => { let id = arg(v, 0); set(v, &[id, clock_rate(id)]) }
             0x0003_8001 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
             0x0003_8002 => { let id = arg(v, 0); let r = arg(v, 1); set(v, &[id, r]) }
@@ -225,6 +233,9 @@ impl Mailbox {
 }
 
 /// Clock rates the Pi 4 firmware reports (Hz) by firmware clock id.
+/// RPI_FIRMWARE_DISP_CLK_ID: exported by `clk-raspberrypi`, used here as the I²S bit clock.
+const AUDIO_CLK: u32 = 16;
+
 fn clock_rate(id: u32) -> u32 {
     match id {
         1 => 250_000_000,   // EMMC

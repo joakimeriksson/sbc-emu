@@ -98,6 +98,11 @@ pub struct Cpu {
     pub crypto: bool,
     /// debugging: run the interpreter only (breakpoints and single steps see every instruction)
     pub jit_off: bool,
+    /// debugger watchpoints: (address, length, kind: 1 write, 2 read, 3 access); interpreter
+    /// only (`jit_off`)
+    pub watch: Vec<(u64, u64, u8)>,
+    /// the access that hit a watchpoint: (address, kind of the access)
+    pub watch_hit: Option<(u64, u8)>,
     /// an inner-shareable TLBI ran: the other cores must do the same (`Cpu::tlb_invalidate`
     /// operand: a VA, or u64::MAX for everything); the machine takes it
     pub tlbi_bcast: Option<u64>,
@@ -141,7 +146,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
         }
     }
 

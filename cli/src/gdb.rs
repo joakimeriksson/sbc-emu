@@ -1,7 +1,7 @@
 //! GDB remote serial protocol stub (`--gdb PORT`, `--gdb-wait`), as QEMU's `-gdb` / `-s -S`:
 //! registers (x0-x30, sp, pc, cpsr, v0-v31, fpsr, fpcr), virtual memory as the selected core
-//! sees it, software and hardware breakpoints (by pc, interpreter only while set), single
-//! step, Ctrl-C, one thread per core. Works with gdb (`target remote :1234`) and lldb
+//! sees it, software and hardware breakpoints (by pc), write/read/access watchpoints (both
+//! interpreter only while set), single step, Ctrl-C, one thread per core. Works with gdb (`target remote :1234`) and lldb
 //! (`gdb-remote 1234`).
 use bcm2711::{Machine, Stop};
 use std::io::{ErrorKind, Read, Write};
@@ -19,6 +19,8 @@ pub struct Gdb {
     /// core for register and memory requests (Hg)
     thread: usize,
     no_ack: bool,
+    /// why the guest stopped, for the next stop reply ("watch:ADDR;" and the like)
+    pub reason: String,
 }
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
@@ -26,6 +28,11 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()).collect()
 }
 fn num(s: &str) -> Option<u64> { u64::from_str_radix(s, 16).ok() }
+
+/// The stop-reply field for a watchpoint hit (gdb's "watch", "rwatch", "awatch").
+pub fn watch_reason(addr: u64, kind: u8) -> String {
+    format!("{}:{addr:x};", if kind == 1 { "watch" } else { "rwatch" })
+}
 
 fn target_xml() -> String {
     let mut x = String::from("<?xml version=\"1.0\"?><!DOCTYPE target SYSTEM \"gdb-target.dtd\"><target version=\"1.0\"><architecture>aarch64</architecture><feature name=\"org.gnu.gdb.aarch64.core\">");
@@ -83,7 +90,7 @@ impl Gdb {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         eprintln!("[sbc-emu] gdb stub on 127.0.0.1:{port} (gdb: target remote :{port}; lldb: gdb-remote {port})");
-        Ok(Gdb { listener, conn: None, rx: Vec::new(), thread: 0, no_ack: false })
+        Ok(Gdb { listener, conn: None, rx: Vec::new(), thread: 0, no_ack: false, reason: String::new() })
     }
 
     pub fn connected(&self) -> bool { self.conn.is_some() }
@@ -160,7 +167,8 @@ impl Gdb {
 
     fn stop_reply(&mut self, sig: u8, core: usize) {
         self.thread = core;
-        self.send(&format!("T{sig:02x}thread:{:x};", core + 1));
+        let why = std::mem::take(&mut self.reason);
+        self.send(&format!("T{sig:02x}{why}thread:{:x};", core + 1));
     }
 
     /// The guest is stopped (by `sig` on core `core`): serve the debugger until it resumes.
@@ -205,11 +213,19 @@ impl Gdb {
                     match (kind, addr) {
                         (Some("0") | Some("1"), Some(a)) => {
                             if p.starts_with('Z') { if !m.breakpoints.contains(&a) { m.breakpoints.push(a); } } else { m.breakpoints.retain(|&x| x != a); }
-                            let on = !m.breakpoints.is_empty();
+                            let on = !m.breakpoints.is_empty() || !m.cpus[0].watch.is_empty();
                             m.set_debugging(on);
                             "OK".into()
                         }
-                        _ => String::new(), // watchpoints: not supported
+                        // watchpoints: 2 write, 3 read, 4 access
+                        (Some(k @ ("2" | "3" | "4")), Some(a)) => {
+                            let len = it.next().and_then(num).unwrap_or(1).max(1);
+                            let kind = match k { "2" => 1, "3" => 2, _ => 3 };
+                            m.watchpoint(a, len, kind, p.starts_with('Z'));
+                            if m.breakpoints.is_empty() && m.cpus[0].watch.is_empty() { m.set_debugging(false); }
+                            "OK".into()
+                        }
+                        _ => String::new(),
                     }
                 }
                 Some(b'H') => { if p.len() > 2 && &p[1..2] == "g" { self.thread = tid(&p[2..], self.thread); } "OK".into() }
@@ -220,7 +236,7 @@ impl Gdb {
                     stopped = self.step(m, c);
                     continue;
                 }
-                Some(b'D') => { self.send("OK"); m.breakpoints.clear(); m.set_debugging(false); self.conn = None; return Resume::Detach; }
+                Some(b'D') => { self.send("OK"); m.breakpoints.clear(); for c in m.cpus.iter_mut() { c.watch.clear(); } m.set_debugging(false); self.conn = None; return Resume::Detach; }
                 Some(b'k') => { self.conn = None; return Resume::Kill; }
                 _ if p == "vCont?" => "vCont;c;C;s;S".into(),
                 _ if p.starts_with("vCont;") => {
@@ -235,6 +251,7 @@ impl Gdb {
                         None => return Resume::Continue,
                     }
                 }
+                _ if p == "qWatchpointSupportInfo:" || p == "qWatchpointSupportInfo" => "num:16;".into(),
                 _ if p.starts_with("qSupported") => "PacketSize=4000;qXfer:features:read+;vContSupported+;QStartNoAckMode+".into(),
                 _ if p == "QStartNoAckMode" => { self.send("OK"); self.no_ack = true; continue; }
                 _ if p.starts_with("qXfer:features:read:target.xml:") => {
@@ -260,6 +277,7 @@ impl Gdb {
     /// One instruction on core `c`; the stop to report.
     fn step(&mut self, m: &mut Machine, c: usize) -> (u8, usize) {
         let r = m.debug_step(c);
+        if let Some(Stop::Watchpoint(_, a, kind)) = r { self.reason = watch_reason(a, kind); }
         let sig = match r { Some(Stop::Unimplemented(..)) => 4, _ => 5 };
         self.stop_reply(sig, c);
         (sig, c)

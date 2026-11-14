@@ -87,6 +87,7 @@ const PPI_LEVEL_LOW_ALL: u32 = 0xf08;
 pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     let (gic, clk48, mbox, clk100, phy1, gpio, clkvpu, vref) = (1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32);
     let (thermal, aux) = (9u32, 10u32);
+    let (dma, fwclk, i2s, dac, i2s_cpu) = (11u32, 12u32, 13u32, 14u32, 15u32);
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
@@ -244,6 +245,19 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("#dma-cells", &[1]);
     // the channels the firmware leaves to Linux on a Pi 4
     f.cells("brcm,dma-channel-mask", &[0x01f5]);
+    f.cells("phandle", &[dma]);
+    f.end();
+
+    // PCM/I²S, bit clock from the firmware (DISP clock), DMA through DREQ 2 (TX) and 3 (RX)
+    f.begin("i2s@fe203000");
+    f.str("compatible", "brcm,bcm2835-i2s");
+    f.cells("reg", &[0, 0xfe20_3000, 0x24]);
+    f.cells("clocks", &[fwclk, 16]);
+    f.cells("dmas", &[dma, 2, dma, 3]);
+    f.strs("dma-names", &["tx", "rx"]);
+    f.cells("#sound-dai-cells", &[0]);
+    f.str("status", "okay");
+    f.cells("phandle", &[i2s]);
     f.end();
 
     f.begin("rng@fe104000");
@@ -336,6 +350,11 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.begin("firmware");
     f.strs("compatible", &["raspberrypi,bcm2835-firmware", "simple-mfd"]);
     f.cells("mboxes", &[mbox]);
+    f.begin("clocks");
+    f.str("compatible", "raspberrypi,firmware-clocks");
+    f.cells("#clock-cells", &[1]);
+    f.cells("phandle", &[fwclk]);
+    f.end();
     f.end();
     // Gigabit Ethernet: GENET v5 with the BCM54213PE PHY at MDIO address 1
     f.begin("ethernet@fd580000");
@@ -403,7 +422,46 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.empty("non-removable");
     f.str("status", "okay");
     f.end();
+    // PCIe root complex with the VL805 USB 3.0 controller (the USB-A ports) on bus 1
+    f.begin("pcie@fd500000");
+    f.str("compatible", "brcm,bcm2711-pcie");
+    f.cells("reg", &[0, 0xfd50_0000, 0x9310]);
+    f.str("device_type", "pci");
+    f.cells("#address-cells", &[3]);
+    f.cells("#interrupt-cells", &[1]);
+    f.cells("#size-cells", &[2]);
+    f.cells("interrupts", &[GIC_SPI, 147, LEVEL_HIGH, GIC_SPI, 148, LEVEL_HIGH]);
+    f.strs("interrupt-names", &["pcie", "msi"]);
+    f.cells("interrupt-map-mask", &[0, 0, 0, 7]);
+    f.cells("interrupt-map", &[0, 0, 0, 1, gic, GIC_SPI, 143, LEVEL_HIGH, 0, 0, 0, 2, gic, GIC_SPI, 144, LEVEL_HIGH,
+                               0, 0, 0, 3, gic, GIC_SPI, 145, LEVEL_HIGH, 0, 0, 0, 4, gic, GIC_SPI, 146, LEVEL_HIGH]);
+    // PCI 0xf8000000 at CPU 0x6_0000_0000, 64 MiB; inbound DMA identity-mapped below 3 GiB
+    f.cells("ranges", &[0x0200_0000, 0, 0xf800_0000, 0x6, 0, 0, 0x0400_0000]);
+    f.cells("dma-ranges", &[0x0200_0000, 0, 0, 0, 0, 0, 0xc000_0000]);
+    f.end();
     f.end(); // soc
+
+    // an I²S DAC HAT: PCM5102A (no control interface) on a simple sound card, the SoC as
+    // bit clock and frame master
+    f.begin("pcm5102a");
+    f.str("compatible", "ti,pcm5102a");
+    f.cells("#sound-dai-cells", &[0]);
+    f.cells("phandle", &[dac]);
+    f.end();
+    f.begin("sound");
+    f.str("compatible", "simple-audio-card");
+    f.str("simple-audio-card,name", "sbc-emu DAC");
+    f.str("simple-audio-card,format", "i2s");
+    f.cells("simple-audio-card,bitclock-master", &[i2s_cpu]);
+    f.cells("simple-audio-card,frame-master", &[i2s_cpu]);
+    f.begin("simple-audio-card,cpu");
+    f.cells("sound-dai", &[i2s]);
+    f.cells("phandle", &[i2s_cpu]);
+    f.end();
+    f.begin("simple-audio-card,codec");
+    f.cells("sound-dai", &[dac]);
+    f.end();
+    f.end();
 
     if let Some((base, w, h, stride)) = b.fb {
         f.begin(&format!("framebuffer@{base:x}"));

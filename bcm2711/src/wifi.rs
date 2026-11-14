@@ -461,9 +461,14 @@ impl Cyw43455 {
             "event_msgs" => { let mut m = self.event_mask.clone(); m.resize(len.max(1), 0); m }
             "cap" => b"sta wme 802.11d 802.11h ampdu ampdu_tx ampdu_rx\0".to_vec(),
             "chanspecs" => {
-                let mut v = u32v(13);
-                for ch in 1..=13u32 { v.extend_from_slice(&u32v(0x1000 | ch)); }
-                v
+                // the query carries a chanspec naming the bandwidth asked for: 20 MHz channels
+                // only (a 40 MHz query gets an empty list, as bw_cap says)
+                let q = data.get(name_end + 1..name_end + 3).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+                if q & 0x3800 == 0x1800 { u32v(0) } else {
+                    let mut v = u32v(13);
+                    for ch in 1..=13u32 { v.extend_from_slice(&u32v(0x1000 | ch)); }
+                    v
+                }
             }
             "per_chan_info" | "nmode" | "vhtmode" | "mpc" => u32v(0),
             "chanspec" => u32v(0x1000 | CHANNEL as u32),
