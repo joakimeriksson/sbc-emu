@@ -82,7 +82,7 @@ pub struct Soc {
 }
 
 impl Soc {
-    fn mmio_read(&mut self, a: u64) -> Result<u32, Fault> {
+    pub(crate) fn mmio_read(&mut self, a: u64) -> Result<u32, Fault> {
         self.dirty = true;
         Ok(match a {
             UART0..=0xfe20_1fff => self.uart.read(a - UART0),
@@ -148,6 +148,59 @@ impl Soc {
         }
         Ok(())
     }
+    /// Exchange frames between the Ethernet MAC and the virtual network.
+    pub(crate) fn pump_network(&mut self, now: u64) {
+        let soc = self;
+        let now_us = now / 1000;
+        match soc.net.as_mut() {
+            Some(net) => {
+                for f in std::mem::take(&mut soc.genet.tx_out) { soc.genet.rx_queue.extend(net.handle(&f, now_us)); }
+                soc.genet.rx_queue.extend(net.poll(now_us));
+            }
+            None => soc.genet.tx_out.clear(),
+        }
+        if soc.genet.rx_queue.len() > 512 { soc.genet.rx_queue.drain(..soc.genet.rx_queue.len() - 512); }
+        soc.genet.deliver(&mut soc.ram);
+        // Wi-Fi: the associated interface's frames go to the network behind the access point
+        if let (Some(card), Some(wnet)) = (soc.wifi.sdio.as_mut(), soc.wifi_net.as_mut()) {
+            let mut replies = Vec::new();
+            for f in card.take_tx() { replies.extend(wnet.handle(&f, now_us)); }
+            replies.extend(wnet.poll(now_us));
+            for r in replies { card.deliver(&r); }
+        }
+    }
+
+    /// Device interrupt lines into the GIC at virtual time `now` (ns).
+    pub(crate) fn device_lines(&mut self, now: u64) {
+        let u = self.uart.irq();
+        self.gic.set_level(SPI_UART0, u);
+        self.gpio.now_ns = now;
+        let banks = self.gpio.irq();
+        for (k, b) in banks.iter().enumerate() { self.gic.set_level(SPI_GPIO0 + k, *b); }
+        self.gic.set_level(SPI_GPIO0 + 3, banks.iter().any(|b| *b));
+        let i2c = self.i2c.irq();
+        self.gic.set_level(SPI_I2C, i2c);
+        let spi = self.spi.irq();
+        self.gic.set_level(SPI_SPI, spi);
+        let (g0, g1) = (self.genet.irq0(), self.genet.irq1());
+        self.gic.set_level(SPI_GENET0, g0);
+        self.gic.set_level(SPI_GENET1, g1);
+        let usb = self.usb.irq();
+        self.gic.set_level(SPI_USB, usb);
+        // EMMC2 and the Wi-Fi SD host share SPI 126, as on the Pi 4
+        let sd = self.sd.irq() || self.wifi.irq();
+        self.gic.set_level(SPI_EMMC2, sd);
+        let mb = self.mbox.irq();
+        self.gic.set_level(SPI_MBOX, mb);
+        self.pm.now = now;
+        self.systimer.set_now(now);
+        for k in 0..4 { let l = self.systimer.irq(k); self.gic.set_level(SPI_SYSTIMER + k, l); }
+        let aux = self.aux.irq();
+        self.gic.set_level(SPI_AUX, aux);
+        for n in 0..11 { let l = self.dma.irq(n); self.gic.set_level(SPI_DMA0 + n, l); }
+        self.dirty = false;
+    }
+
     /// DMA channel `n` was made active: walk its control blocks now.
     fn dma_run(&mut self, n: usize) {
         use crate::dma::*;
@@ -294,6 +347,13 @@ pub struct Machine {
     pub breakpoints: Vec<u64>,
     /// the breakpoint just reported (core, pc): resuming executes it once
     bp_resume: Option<(usize, u64)>,
+    /// the deadline of the last idle stop (`idle_until` wakes sleeping cores there, not before)
+    idle_target: u64,
+    /// run the cores on their own host threads (faster with several busy cores, not repeatable);
+    /// false: one thread, cores in turns, deterministic
+    pub multi: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) mt: Option<crate::mt::Mt>,
 }
 
 impl Machine {
@@ -304,7 +364,8 @@ impl Machine {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
         let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), net: None, unknown: Vec::new(), dirty: true };
-        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None };
+        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
+                             #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
         m
@@ -390,34 +451,10 @@ impl Machine {
             self.soc.gic.set_ppi(k, PPI_VTIMER, v);
             self.soc.gic.set_ppi(k, PPI_PTIMER, p);
         }
-        let u = self.soc.uart.irq();
-        self.soc.gic.set_level(SPI_UART0, u);
-        self.pump_network();
-        self.soc.gpio.now_ns = self.now;
-        let banks = self.soc.gpio.irq();
-        for (k, b) in banks.iter().enumerate() { self.soc.gic.set_level(SPI_GPIO0 + k, *b); }
-        self.soc.gic.set_level(SPI_GPIO0 + 3, banks.iter().any(|b| *b));
-        let i2c = self.soc.i2c.irq();
-        self.soc.gic.set_level(SPI_I2C, i2c);
-        let spi = self.soc.spi.irq();
-        self.soc.gic.set_level(SPI_SPI, spi);
-        let (g0, g1) = (self.soc.genet.irq0(), self.soc.genet.irq1());
-        self.soc.gic.set_level(SPI_GENET0, g0);
-        self.soc.gic.set_level(SPI_GENET1, g1);
-        self.soc.usb.tick(self.now);
-        let usb = self.soc.usb.irq();
-        self.soc.gic.set_level(SPI_USB, usb);
-        // EMMC2 and the Wi-Fi SD host share SPI 126, as on the Pi 4
-        let sd = self.soc.sd.irq() || self.soc.wifi.irq();
-        self.soc.gic.set_level(SPI_EMMC2, sd);
-        let mb = self.soc.mbox.irq();
-        self.soc.gic.set_level(SPI_MBOX, mb);
-        self.soc.pm.now = self.now;
-        self.soc.systimer.set_now(self.now);
-        for k in 0..4 { let l = self.soc.systimer.irq(k); self.soc.gic.set_level(SPI_SYSTIMER + k, l); }
-        let aux = self.soc.aux.irq();
-        self.soc.gic.set_level(SPI_AUX, aux);
-        for n in 0..11 { let l = self.soc.dma.irq(n); self.soc.gic.set_level(SPI_DMA0 + n, l); }
+        let now = self.now;
+        self.soc.pump_network(now);
+        self.soc.usb.tick(now);
+        self.soc.device_lines(now);
         for k in 0..self.cpus.len() {
             if self.state[k] == CoreState::Off { continue; }
             let irq = self.soc.gic.irq_out(k);
@@ -477,6 +514,14 @@ impl Machine {
     /// round at the same time, as if they ran in parallel. A core that is alone (the others off
     /// or asleep) runs without rounds until something wakes another one.
     pub fn run(&mut self, budget: u64) -> Stop {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.multi && self.breakpoints.is_empty() && !self.cpus.iter().any(|c| c.jit_off) {
+            return self.run_threaded(std::time::Duration::from_millis(10));
+        }
+        if self.cpus[0].mt {
+            // back on one thread (a debugger is attached): turn-taking semantics again
+            for c in self.cpus.iter_mut() { c.mt = false; }
+        }
         let end = self.instret().saturating_add(budget);
         let mut total = self.instret();
         // steps, not retired instructions, bound the call: faults do not retire
@@ -491,6 +536,7 @@ impl Machine {
             let runnable = self.state.iter().filter(|s| **s == CoreState::Run).count();
             if runnable == 0 {
                 let until = self.next_deadline().unwrap_or(self.now + 10_000_000).max(self.now);
+                self.idle_target = until;
                 break Stop::Idle(until);
             }
             let round_start = self.now;
@@ -533,6 +579,10 @@ impl Machine {
             if let Some(op) = self.cpus[k].tlbi_bcast.take() {
                 for (j, o) in self.cpus.iter_mut().enumerate() { if j != k { o.tlb_invalidate(op); } }
             }
+            if let Some(op) = self.cpus[k].ic_bcast.take() {
+                // cores with their own JIT (after a multi-threaded run) drop that code too
+                for (j, o) in self.cpus.iter_mut().enumerate() { if j != k { o.jit_invalidate(op); } }
+            }
             match r {
                 Ok(()) => *storm = 0,
                 Err(Trap::Exception(_, el)) => {
@@ -564,28 +614,6 @@ impl Machine {
                 Err(Trap::Hlt(n)) => return Some(Stop::Hlt(n)),
                 Err(Trap::Brk(n)) => return Some(Stop::Brk(n)),
             }
-        }
-    }
-
-    /// Exchange frames between the Ethernet MAC and the virtual network.
-    fn pump_network(&mut self) {
-        let soc = &mut self.soc;
-        let now_us = self.now / 1000;
-        match soc.net.as_mut() {
-            Some(net) => {
-                for f in std::mem::take(&mut soc.genet.tx_out) { soc.genet.rx_queue.extend(net.handle(&f, now_us)); }
-                soc.genet.rx_queue.extend(net.poll(now_us));
-            }
-            None => soc.genet.tx_out.clear(),
-        }
-        if soc.genet.rx_queue.len() > 512 { soc.genet.rx_queue.drain(..soc.genet.rx_queue.len() - 512); }
-        soc.genet.deliver(&mut soc.ram);
-        // Wi-Fi: the associated interface's frames go to the network behind the access point
-        if let (Some(card), Some(wnet)) = (soc.wifi.sdio.as_mut(), soc.wifi_net.as_mut()) {
-            let mut replies = Vec::new();
-            for f in card.take_tx() { replies.extend(wnet.handle(&f, now_us)); }
-            replies.extend(wnet.poll(now_us));
-            for r in replies { card.deliver(&r); }
         }
     }
 
@@ -660,26 +688,40 @@ impl Machine {
 
     /// Start core `t` at `entry` (MMU off, interrupts masked, x0 = `context`) in the caller's EL.
     fn cpu_on(&mut self, caller: usize, t: usize, entry: u64, context: u64) {
-        let el = self.cpus[caller].el;
-        let now = self.cpus[caller].now_ns();
-        let mut c = self.fresh_cpu(t);
-        c.instret = self.cpus[t].instret;
-        c.sys.time_base_ns = now;
-        c.sys.time_base_instret = c.instret;
-        c.el = el;
-        c.spsel = true;
-        c.daif = 0xf << 6;
-        c.pc = entry;
-        c.x[0] = context;
-        c.sys.cpacr_el1 = 3 << 20;
-        c.jit_off = self.cpus[caller].jit_off;
-        c.crypto = self.cpus[caller].crypto;
-        // the JIT stays with whichever core holds it
-        let mut old = std::mem::replace(&mut self.cpus[t], c);
-        old.hand_jit_to(&mut self.cpus[t]);
+        let (el, now) = (self.cpus[caller].el, self.cpus[caller].now_ns());
+        let (jit_off, crypto) = (self.cpus[caller].jit_off, self.cpus[caller].crypto);
+        let c = &mut self.cpus[t];
+        Self::reset_core(c, t, el, entry, context, now);
+        c.jit_off = jit_off;
+        c.crypto = crypto;
         self.state[t] = CoreState::Run;
         self.round_end = self.round_end.min(now + quantum());
         self.soc.dirty = true;
+    }
+
+    /// Core `k` out of reset at `entry` (PSCI CPU_ON): RAM, retired count and JIT are kept.
+    pub(crate) fn reset_core(c: &mut Cpu, k: usize, el: u8, entry: u64, context: u64, now: u64) {
+        let mut f = Cpu::new();
+        f.sys.cntfrq = CNTFRQ;
+        f.sys.mpidr = k as u64;
+        f.firmware_calls_to_host = true;
+        f.ram = c.ram;
+        f.ram_len = c.ram_len;
+        f.instret = c.instret;
+        f.sys.time_base_ns = now;
+        f.sys.time_base_instret = c.instret;
+        f.el = el;
+        f.spsel = true;
+        f.daif = 0xf << 6;
+        f.pc = entry;
+        f.x[0] = context;
+        f.sys.cpacr_el1 = 3 << 20;
+        f.jit_off = c.jit_off;
+        f.crypto = c.crypto;
+        f.mt = c.mt;
+        f.wall_clock = c.wall_clock;
+        let mut old = std::mem::replace(c, f);
+        old.hand_jit_to(c);
     }
 
     /// The optional Cryptographic Extension on every core (QEMU's cortex-a72 has it; a Pi 4 does not).
@@ -737,13 +779,17 @@ impl Machine {
     pub fn idle_until(&mut self, t: u64) {
         if t > self.now { self.now = t; }
         let now = self.now;
+        // waking happens at the idle stop's own deadline only: the caller may get there in
+        // wall-clock steps, and those steps must not show (runs stay repeatable)
+        let reached = now >= self.idle_target;
         for k in 0..self.cpus.len() {
             if self.state[k] == CoreState::Off { continue; }
             self.catch_up(k, now);
             // a core waiting for an event wakes when time is skipped (its timer, the event stream)
-            if self.state[k] == CoreState::Wfe { self.state[k] = CoreState::Run; }
+            if reached && self.state[k] == CoreState::Wfe { self.state[k] = CoreState::Run; }
         }
         self.update_irqs();
+        if !reached { return; }
         // the old single-core behaviour: an idle stop ends at a deadline, and `wfi` may wake
         // spuriously: a core whose own timer deadline has passed resumes
         for k in 0..self.cpus.len() {

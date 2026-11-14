@@ -66,7 +66,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N] [--threads single|multi] [--seed N]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -157,6 +157,15 @@ fn run(args: &[String]) -> ExitCode {
         m.soc.sd.trace = trace_sd;
         if use_jit { m.enable_jit(); }
         if args.iter().any(|a| a == "--cpu-crypto") { m.set_crypto(true); }
+        // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
+        m.multi = arg(args, "--threads") == Some("multi");
+        // the hardware RNG: --seed N, else a fixed seed on one thread (repeatable) and host
+        // entropy with a thread per core (not repeatable anyway)
+        match arg(args, "--seed").and_then(|v| v.parse::<u64>().ok()) {
+            Some(seed) => m.soc.rng.reseed(seed),
+            None if m.multi => m.soc.rng.reseed(bcm2711::periph::Rng200::host_seed()),
+            None => {}
+        }
         if std::env::var("SBC_JIT_VERIFY").is_ok_and(|v| v == "1") { if let Some(j) = m.jit_mut() { j.verify = true; } }
         if std::env::var("SBC_JIT_PROFILE").is_ok_and(|v| v == "1") { arm_a64::jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed); }
         match net_mode { "none" => {}, "local" => m.connect_network(false, trace_net), _ => m.connect_network(true, trace_net) }
@@ -297,7 +306,8 @@ fn run(args: &[String]) -> ExitCode {
                         done = match m.soc.mbox.render(&m.soc.ram, &mut rgba) {
                             Some((w, h)) if x < w && y < h => {
                                 let o = ((y * w + x) * 4) as usize;
-                                ((rgba[o] as u32) << 16 | (rgba[o + 1] as u32) << 8 | rgba[o + 2] as u32) == rgb
+                                let px = (rgba[o] as u32) << 16 | (rgba[o + 1] as u32) << 8 | rgba[o + 2] as u32;
+                                px == rgb
                             }
                             _ => false,
                         };

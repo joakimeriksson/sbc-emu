@@ -20,7 +20,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
-| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 49 s on one core, 47 s on four (22 s of guest time); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 49 s on one core, 47 s on four cores in turns, 36 s with a host thread per core (`--threads multi`); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
 | Floating point | exact Arm semantics: FPCR rounding modes, flush-to-zero, default NaN, all FPSR exception flags, Arm's estimate tables | `diff_fp.rs`: 18,800 random cases bit-exact against the host CPU (interpreter and JIT) |
 | More peripherals | DMA controller, hardware RNG, thermal sensor, PM watchdog and power domains, system timer, mini UART | stock drivers bind: `/dev/hwrng`, `/sys/class/thermal`, `/dev/watchdog` (expiry reboots), `ttyS0`, `dma0chan*` |
 | Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
@@ -92,6 +92,18 @@ Snapshots: a script step `save FILE` writes the whole machine (CPU, devices, RAM
 More options, mostly after QEMU's:
 
 - `--smp N`: cores (1..4, default 4).
+- `--threads single|multi`: how the cores are scheduled. `single` (default): the cores take turns
+  on one host thread in rounds of virtual time; runs are **repeatable** (same inputs, same
+  result, instruction for instruction). `multi`: a host thread per core, as QEMU's MTTCG; busy
+  cores really run in parallel, guest time follows the host clock, and runs are **not**
+  repeatable. Devices sit behind one lock, RAM is shared directly; barriers and
+  acquire/release become host fences and store-exclusive a host compare-and-swap (QEMU's
+  approach: an ABA change between LDXR and STXR goes unnoticed); TLB and instruction-cache
+  invalidations reach the other cores before the issuing core goes on, as the guest's DSB
+  requires. A debugger with breakpoints switches back to one thread. Raspberry Pi OS to
+  `login:`: 52 s single, 36 s multi; the first-boot and peripherals script: 170 s → 141 s.
+- `--seed N`: seed of the hardware RNG. One-thread runs use a fixed seed by default, so a run
+  with the same inputs is repeatable to the instruction (`--threads multi` seeds from the host).
 - `--gdb PORT [--gdb-wait]`: GDB remote stub (`gdb`: `target remote :PORT`, `lldb`:
   `gdb-remote PORT`); `--gdb-wait` holds the machine at reset until a debugger attaches. Cores are
   threads; software/hardware breakpoints switch the cores to the interpreter while set.
@@ -131,7 +143,9 @@ cargo test --release --workspace
   match bit for bit. `diff_fp.rs` draws a random FPCR (rounding mode, FZ, DN) per case and
   operands from the hard classes (subnormals, overflow, ties, NaNs).
 - `bcm2711` unit tests: GPIO edges, BME280 compensation against the Linux driver's formula, MCP3008
-  framing against `mcp320x`'s decode, GIC SGI/SPI routing between cores, DMA control-block chains.
+  framing against `mcp320x`'s decode, GIC SGI/SPI routing between cores, DMA control-block chains,
+  and `smp.rs`: four cores add to one counter with LDXR/STXR, one thread and a thread per core,
+  interpreted and compiled (a plain store instead of the compare-and-swap loses ~70% of them).
 - `arm-a64/tests/system.rs`: exceptions, EL changes, MMU faults, timer interrupts.
 - `tools/wasm-smoke.mjs`, `tools/wasm-smoke-sd.mjs`: headless boots of the WebAssembly build.
 
@@ -153,8 +167,7 @@ No GPU/HVS/HDMI controller (software framebuffer only); no PCIe, so no VL805 xHC
 USB-A ports (the keyboard sits on the OTG port); no audio, camera or Bluetooth; Wi-Fi has no radio
 model (emulated firmware host interface, open and WPA2-PSK networks); DMA transfers are not paced
 by peripheral DREQs; no crypto or LSE instructions (the BCM2711's A72 has neither; the ID registers
-say so); the cores run in turns on one host thread (deterministic, but four busy cores share one
-host core); the native JIT needs an AArch64 host and is still well below a real Pi 4 core; the
+say so); the native JIT needs an AArch64 host and is still well below a real Pi 4 core; the
 browser build is about 3× slower than native; GDB watchpoints are not supported.
 
 ## Compared with QEMU's `raspi4b`
@@ -165,7 +178,7 @@ specifically (QEMU 9/10 docs and its open patch series, November 2026):
 | | sbc-emu | QEMU `raspi4b` |
 |---|---|---|
 | Boot | the stock Raspberry Pi OS `.img` (config.txt, cmdline.txt, kernel8.img) | kernel and DTB passed by hand |
-| Cores | 4 | 4 |
+| Cores | 4: in turns on one thread (repeatable) or a thread each (`--threads multi`) | 4, a thread each (MTTCG) |
 | Ethernet (GENET) | yes, with NAT and port forwarding | not merged (patches in review) |
 | USB keyboard | yes (OTG port) | does not enumerate on raspi4b |
 | Wi-Fi | yes (stock `brcmfmac`, WPA2) | no |

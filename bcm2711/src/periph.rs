@@ -12,15 +12,17 @@ pub struct Rng200 {
 }
 
 impl Rng200 {
-    pub fn new() -> Self {
-        // seeded from the host where it can (a deterministic seed on targets without one)
-        let seed = {
-            use std::hash::{BuildHasher, Hasher};
-            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-            h.write_u64(0x5bc0_e0b8);
-            h.finish()
-        };
-        Rng200 { ctrl: 0, state: seed | 1 }
+    /// A fixed seed by default: repeatable runs stay repeatable (`reseed` changes it).
+    pub fn new() -> Self { Rng200 { ctrl: 0, state: 0x5bc0_e0b8_9e37_79b9 } }
+
+    pub fn reseed(&mut self, seed: u64) { self.state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1; }
+
+    /// A seed from the host's entropy (where the target has one).
+    pub fn host_seed() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0x5bc0_e0b8);
+        h.finish()
     }
     fn next(&mut self) -> u32 {
         let x = &mut self.state;

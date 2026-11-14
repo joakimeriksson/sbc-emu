@@ -83,6 +83,17 @@ pub struct Cpu {
     pub(crate) jit_disp: u64,
     /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
     pub last_wfe: bool,
+    /// multi-threaded run: cores execute in parallel on shared memory, so barriers and
+    /// acquire/release become host fences and store-exclusive a compare-and-swap
+    pub mt: bool,
+    /// multi-threaded run: virtual time is the host's monotonic clock since `.0` plus `.1` ns,
+    /// the same for every core (instruction counts would let a fast core's clock run ahead)
+    pub wall_clock: Option<(std::time::Instant, i64)>,
+    /// value and size the last load-exclusive read (the compare value for `mt` store-exclusive)
+    pub(crate) excl_val: u128,
+    /// an instruction-cache invalidation ran (a physical page, or u64::MAX for all): other
+    /// cores with their own JIT must drop that code too (the machine takes it)
+    pub ic_bcast: Option<u64>,
     /// the optional Cryptographic Extension (AES, SHA-1, SHA-256, PMULL): off on a Pi 4
     pub crypto: bool,
     /// debugging: run the interpreter only (breakpoints and single steps see every instruction)
@@ -130,7 +141,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, crypto: false,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
         }
     }
 
@@ -363,7 +374,17 @@ impl Cpu {
     /// code only reaches core state through the pointer it is called with, so one cache serves
     /// all cores.
     pub fn hand_jit_to(&mut self, other: &mut Cpu) {
+        if other.jit.is_some() { return; } // it has its own (multi-threaded runs)
         if let Some(j) = self.jit.take() { other.jit = Some(j); other.jit_disp = self.jit_disp; }
+    }
+
+    /// Address of `chain_until`: another thread may store 0 there (atomically) to make this core
+    /// leave its compiled chain at the next block boundary.
+    pub fn chain_until_ptr(&mut self) -> *mut u64 { &mut self.chain_until }
+
+    /// Another core invalidated instruction cache: `page` (physical page number) or u64::MAX.
+    pub fn jit_invalidate(&mut self, page: u64) {
+        if let Some(j) = self.jit.as_mut() { if page == u64::MAX { j.flush() } else { j.invalidate_page(page) } }
     }
 
     #[inline]

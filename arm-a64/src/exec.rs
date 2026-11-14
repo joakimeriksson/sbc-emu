@@ -674,7 +674,10 @@ impl Cpu {
                     0b0011 => {
                         if op2 == 0b010 {
                             self.set_excl(None);
-                        } // CLREX; barriers are no-ops
+                        } else if self.mt && matches!(op2, 0b100 | 0b101) {
+                            // DSB / DMB: other cores run at the same time
+                            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                        }
                         return Ok(());
                     }
                     0b0100 => {
@@ -778,14 +781,12 @@ impl Cpu {
                 // IC IALLU / IC IALLUIS / IC IVAU: drop compiled code (the only instruction cache)
                 if op1 == 0 && (crm == 5 || crm == 1) && op2 == 0 {
                     if let Some(j) = self.jit.as_mut() { j.flush(); }
+                    self.ic_bcast = Some(u64::MAX);
                 } else if op1 == 3 && crm == 5 && op2 == 1 {
                     let va = self.xr(rt);
-                    if self.jit.is_some() {
-                        match self.translate(bus, va, Access::Read) {
-                            Ok(pa) => { if let Some(j) = self.jit.as_mut() { j.invalidate_page(pa >> 12); } }
-                            Err(_) => { if let Some(j) = self.jit.as_mut() { j.flush(); } }
-                        }
-                    }
+                    let page = match self.translate(bus, va, Access::Read) { Ok(pa) => pa >> 12, Err(_) => u64::MAX };
+                    self.jit_invalidate(page);
+                    self.ic_bcast = Some(match self.ic_bcast { Some(p) if p != page => u64::MAX, _ => page });
                 }
                 // DC / IC maintenance: caches are not modelled
                 if self.el == 0 && op1 != 3 {
@@ -1142,12 +1143,16 @@ impl Cpu {
             if o1 {
                 return Err(self.unimpl());
             } // CAS (LSE): not advertised
-              // LDAR / STLR / LDLAR / STLLR: ordinary accesses on a single in-order core
+              // LDAR / STLR / LDLAR / STLLR: ordinary accesses on one core; with cores running in
+              // parallel the acquire/release order is a host fence
+            use std::sync::atomic::{fence, Ordering};
             if l {
                 let v = self.load(bus, addr, size, false)?;
+                if self.mt { fence(Ordering::SeqCst); }
                 self.set_x(rt, v as u64);
             } else {
                 let v = self.xr(rt) as u128;
+                if self.mt { fence(Ordering::SeqCst); }
                 self.store(bus, addr, size, v, false)?;
             }
             return Ok(());
@@ -1156,13 +1161,13 @@ impl Cpu {
             if l {
                 let v = self.load(bus, addr, size, false)?;
                 self.set_excl(Some(addr));
+                self.excl_val = v;
+                if self.mt { std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst); }
                 self.set_x(rt, v as u64);
             } else {
-                let ok = self.excl.is_some_and(|m| m & !63 == addr & !63);
-                if ok {
-                    let v = self.xr(rt) as u128;
-                    self.store(bus, addr, size, v, false)?;
-                }
+                let held = self.excl.is_some_and(|m| m & !63 == addr & !63);
+                let v = self.xr(rt) as u128;
+                let ok = if !held { false } else if self.mt { self.store_cas(bus, addr, size, self.excl_val, v)? } else { self.store(bus, addr, size, v, false)?; true };
                 self.set_excl(None);
                 self.set_x(rs, (!ok) as u64);
             }
@@ -1175,20 +1180,53 @@ impl Cpu {
                 let a = self.load(bus, addr, size, false)?;
                 let b = self.load(bus, addr + size as u64, size, false)?;
                 self.set_excl(Some(addr));
+                self.excl_val = a | (b << (8 * size));
+                if self.mt { std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst); }
                 self.set_x(rt, a as u64);
                 self.set_x(rt2, b as u64);
             } else {
-                let ok = self.excl.is_some_and(|m| m & !63 == addr & !63);
-                if ok {
-                    let (a, b) = (self.xr(rt) as u128, self.xr(rt2) as u128);
-                    let v = a | (b << (8 * size));
-                    self.store(bus, addr, 2 * size, v, false)?;
-                }
+                let held = self.excl.is_some_and(|m| m & !63 == addr & !63);
+                let (a, b) = (self.xr(rt) as u128, self.xr(rt2) as u128);
+                let v = a | (b << (8 * size));
+                let ok = if !held { false } else if self.mt { self.store_cas(bus, addr, 2 * size, self.excl_val, v)? } else { self.store(bus, addr, 2 * size, v, false)?; true };
                 self.set_excl(None);
                 self.set_x(rs, (!ok) as u64);
             }
         }
         Ok(())
+    }
+
+    /// Store-exclusive with other cores running at the same time: the store happens only if
+    /// memory still holds what the load-exclusive read (a host compare-and-swap; 16-byte pairs
+    /// take a global lock). Returns whether it stored.
+    fn store_cas(&mut self, bus: &mut dyn Bus, va: u64, size: u32, old: u128, new: u128) -> Result<bool, Trap> {
+        use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
+        static PAIRS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let pa = self.pa(bus, va, Access::Write)?;
+        if self.ram.is_null() || pa + size as u64 > self.ram_len || pa % size as u64 != 0 {
+            self.store(bus, va, size, new, false)?;
+            return Ok(true);
+        }
+        // SAFETY: inside guest RAM and naturally aligned (the buffer is at least 16-byte aligned)
+        let p = unsafe { self.ram.add(pa as usize) };
+        let ok = unsafe {
+            match size {
+                1 => AtomicU8::from_ptr(p).compare_exchange(old as u8, new as u8, SeqCst, SeqCst).is_ok(),
+                2 => AtomicU16::from_ptr(p as *mut u16).compare_exchange(old as u16, new as u16, SeqCst, SeqCst).is_ok(),
+                4 => AtomicU32::from_ptr(p as *mut u32).compare_exchange(old as u32, new as u32, SeqCst, SeqCst).is_ok(),
+                8 => AtomicU64::from_ptr(p as *mut u64).compare_exchange(old as u64, new as u64, SeqCst, SeqCst).is_ok(),
+                _ => {
+                    let _g = PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+                    let cur = (p as *const u128).read_volatile();
+                    if cur == old { (p as *mut u128).write_volatile(new); true } else { false }
+                }
+            }
+        };
+        if ok {
+            // the store went around the micro-TLB: keep JIT verify logs and our own monitor right
+            self.chain_stop = true;
+        }
+        Ok(ok)
     }
 
     fn ldst_pair(&mut self, bus: &mut dyn Bus, i: u32) -> Result<(), Trap> {

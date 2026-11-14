@@ -84,7 +84,10 @@ pub fn count_at(ns: u64, frq: u64) -> u64 {
 
 impl Cpu {
     /// Virtual time now, in ns.
-    pub fn now_ns(&self) -> u64 { self.sys.time_base_ns + (self.instret - self.sys.time_base_instret) }
+    pub fn now_ns(&self) -> u64 {
+        if let Some((t0, off)) = self.wall_clock { return (t0.elapsed().as_nanos() as i64 + off).max(0) as u64; }
+        self.sys.time_base_ns + (self.instret - self.sys.time_base_instret)
+    }
 
     /// Bring `sys.cnt` up to the current virtual time.
     pub fn refresh_counter(&mut self) { self.sys.cnt = count_at(self.now_ns(), self.sys.cntfrq); }

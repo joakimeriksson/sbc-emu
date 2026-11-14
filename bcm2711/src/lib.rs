@@ -18,6 +18,8 @@ pub mod sdhci;
 pub mod spi;
 pub mod wifi;
 pub mod machine;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod mt;
 pub mod pl011;
 
 pub use machine::{Machine, Stop};

@@ -808,7 +808,9 @@ impl Cpu {
             } else if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
                 || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6))
             {
-                // NOP and the hints that are NOPs here (YIELD, SEV, PAC, BTI, ...), DSB/DMB/ISB
+                // NOP and the hints that are NOPs here (YIELD, SEV, PAC, BTI, ...), DSB/DMB/ISB;
+                // with cores running in parallel DSB/DMB order the host's accesses too
+                if self.mt && i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4 | 5) { e.out.push(0xd503_3bbf); } // dmb ish
                 natives += 1;
                 e.pending_native += 1;
             } else if i & 0xffc0_0000 == 0xf980_0000 || i & 0xffe0_0c00 == 0xf880_0000 || i & 0xffe0_0c00 == 0xf8a0_0800 {
