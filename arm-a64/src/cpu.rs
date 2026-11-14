@@ -83,6 +83,8 @@ pub struct Cpu {
     pub(crate) jit_disp: u64,
     /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
     pub last_wfe: bool,
+    /// debugging: run the interpreter only (breakpoints and single steps see every instruction)
+    pub jit_off: bool,
     /// an inner-shareable TLBI ran: the other cores must do the same (`Cpu::tlb_invalidate`
     /// operand: a VA, or u64::MAX for everything); the machine takes it
     pub tlbi_bcast: Option<u64>,
@@ -126,7 +128,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false,
         }
     }
 
@@ -271,7 +273,7 @@ impl Core for Cpu {
                 return Err(t);
             }
         }
-        if self.jit.is_some() {
+        if self.jit.is_some() && !self.jit_off {
             if let Some(r) = self.jit_step(bus) {
                 return r;
             }

@@ -62,6 +62,16 @@ impl Cpu {
         if let Some(t) = self.tlb.as_mut() { t[(va >> 12) as usize & (TLB_SIZE - 1)].tag = 0; }
     }
 
+    /// Debugger view of virtual address `va`: its physical address in the current translation
+    /// regime, ignoring permissions (EL0 contexts are looked up with EL1 privilege).
+    pub fn debug_translate(&mut self, bus: &mut dyn Bus, va: u64) -> Option<u64> {
+        let el = self.el;
+        if el == 0 { self.el = 1; }
+        let r = self.translate(bus, va, Access::Read).or_else(|_| self.translate(bus, va, Access::Exec)).ok();
+        self.el = el;
+        r
+    }
+
     pub(crate) fn translate(
         &mut self,
         bus: &mut dyn Bus,

@@ -5,6 +5,8 @@
 //!   sbc-emu run --board pi4b --kernel Image [--initrd X.cpio] [--append ARGS] [--max-insns N]
 mod cpio;
 mod disk;
+#[cfg(not(target_arch = "wasm32"))]
+mod gdb;
 
 use bcm2711::{Machine, Stop};
 use std::io::{Read, Write};
@@ -13,7 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const BOARDS: &[(&str, &str)] = &[
-    ("pi4b", "experimental: BCM2711 reduced (1x A72, GIC-400, PL011 UART0, generic timer)"),
+    ("pi4b", "BCM2711 (4x Cortex-A72, GIC-400, UART, SD, USB keyboard, Ethernet, Wi-Fi, GPIO/I2C/SPI)"),
     ("pi3b", "unverified: BCM2837 SoC model not yet implemented"),
 ];
 
@@ -62,7 +64,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -109,6 +111,12 @@ fn run(args: &[String]) -> ExitCode {
     let gpio_log = args.iter().any(|a| a == "--gpio-log");
     let net_mode = arg(args, "--net").unwrap_or("nat");
     let usb_input = arg(args, "--input") == Some("usb");
+    let mut gdb = match arg(args, "--gdb").map(|p| p.trim_start_matches("tcp::").parse::<u16>()) {
+        Some(Ok(port)) => match gdb::Gdb::listen(port) { Ok(g) => Some(g), Err(e) => { eprintln!("--gdb {port}: {e}"); return ExitCode::FAILURE } },
+        Some(Err(_)) => { eprintln!("--gdb needs a port number"); return ExitCode::FAILURE }
+        None => None,
+    };
+    let gdb_wait = args.iter().any(|a| a == "--gdb-wait");
     let mut script: std::collections::VecDeque<String> = match arg(args, "--script") {
         Some(p) => match std::fs::read_to_string(p) { Ok(t) => t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect(), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
         None => Default::default(),
@@ -165,7 +173,14 @@ fn run(args: &[String]) -> ExitCode {
     let tty = RawTty::enable();
     let mut out = std::io::stdout();
     // the wall clock is anchored so a restored guest's time continues where it was saved
-    let start = Instant::now() - clock_offset;
+    let mut start = Instant::now() - clock_offset;
+    if let Some(g) = gdb.as_mut() {
+        if gdb_wait {
+            g.wait_for_client();
+            if let gdb::Resume::Kill = g.halted(&mut m, 0, 5, false) { return ExitCode::SUCCESS; }
+            start = Instant::now() - Duration::from_nanos(m.now);
+        }
+    }
     let started = Instant::now();
     let mut escape = false;
     let mut pending: std::collections::VecDeque<u8> = Default::default();
@@ -259,9 +274,33 @@ fn run(args: &[String]) -> ExitCode {
                 }
             }
         }
+        if let Some(g) = gdb.as_mut() {
+            let p = g.poll();
+            if !matches!(p, gdb::Poll::Running) {
+                let t0 = Instant::now();
+                if let gdb::Resume::Kill = g.halted(&mut m, 0, 2, matches!(p, gdb::Poll::Interrupt)) { break Stop::Budget; }
+                start += t0.elapsed(); // halted time does not count as guest idle time
+            }
+        }
         let budget = 2_000_000u64.min(max.saturating_sub(m.instret()));
         if budget == 0 { break Stop::Budget; }
-        let stop = m.run(budget);
+        let mut stop = m.run(budget);
+        // a debugger looks at breakpoints and at stops that would end the run
+        if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
+            let hit = match stop {
+                Stop::Breakpoint(k) => Some((k, 5)),
+                Stop::Unimplemented(..) => Some((0, 4)),
+                Stop::Brk(_) | Stop::Hlt(_) | Stop::ExceptionStorm { .. } => Some((0, 5)),
+                _ => None,
+            };
+            if let Some((k, sig)) = hit {
+                let t0 = Instant::now();
+                if let gdb::Resume::Kill = g.halted(&mut m, k, sig, true) { break Stop::Budget; }
+                start += t0.elapsed();
+                stop = Stop::Budget;
+            }
+        }
+        if let Stop::Breakpoint(_) = stop { stop = Stop::Budget; }
         if gpio_log {
             for ev in std::mem::take(&mut m.soc.gpio.events) {
                 eprintln!("\r[gpio] GPIO{} -> {} at t={:.6}s\r", ev.pin, ev.level as u8, ev.time_ns as f64 / 1e9);

@@ -175,6 +175,8 @@ pub enum Stop {
     PowerOff,
     /// PSCI SYSTEM_RESET
     Reset,
+    /// a debugger breakpoint: core `k` is about to execute an instruction at a breakpoint
+    Breakpoint(usize),
     /// the core keeps taking exceptions without retiring instructions (a fault loop)
     ExceptionStorm { pc: u64, esr: u64, elr: u64, far: u64, el: u8 },
 }
@@ -212,6 +214,10 @@ pub struct Machine {
     next_check: u64,
     /// virtual time at which the current round ends (u64::MAX: one core runs alone)
     round_end: u64,
+    /// debugger breakpoints (virtual pcs, any core); see `set_debugging`
+    pub breakpoints: Vec<u64>,
+    /// the breakpoint just reported (core, pc): resuming executes it once
+    bp_resume: Option<(usize, u64)>,
 }
 
 impl Machine {
@@ -222,7 +228,7 @@ impl Machine {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
         let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), net: None, unknown: Vec::new(), dirty: true };
-        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX };
+        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
         m
@@ -423,6 +429,12 @@ impl Machine {
         loop {
             let t = self.cpus[k].now_ns();
             if t >= self.round_end || *total >= end || *steps == 0 { return None; }
+            if !self.breakpoints.is_empty() {
+                let pc = self.cpus[k].pc;
+                if self.breakpoints.contains(&pc) {
+                    if self.bp_resume == Some((k, pc)) { self.bp_resume = None; } else { self.bp_resume = Some((k, pc)); return Some(Stop::Breakpoint(k)); }
+                }
+            }
             *steps -= 1;
             if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret >= self.next_check { self.update_irqs(); }
             let cpu = &mut self.cpus[k];
@@ -564,12 +576,61 @@ impl Machine {
         c.pc = entry;
         c.x[0] = context;
         c.sys.cpacr_el1 = 3 << 20;
+        c.jit_off = self.cpus[caller].jit_off;
         // the JIT stays with whichever core holds it
         let mut old = std::mem::replace(&mut self.cpus[t], c);
         old.hand_jit_to(&mut self.cpus[t]);
         self.state[t] = CoreState::Run;
         self.round_end = self.round_end.min(now + quantum());
         self.soc.dirty = true;
+    }
+
+    /// Debugging: interpreter only on all cores (needed while breakpoints are set).
+    pub fn set_debugging(&mut self, on: bool) { for c in self.cpus.iter_mut() { c.jit_off = on; } }
+
+    /// Debugging: execute one instruction on core `k` (interpreter); a stop it causes, if any.
+    pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
+        if self.state[k] == CoreState::Off { return None; }
+        self.state[k] = CoreState::Run;
+        let jit_off = self.cpus[k].jit_off;
+        self.cpus[k].jit_off = true;
+        self.bp_resume = Some((k, self.cpus[k].pc));
+        self.round_end = u64::MAX;
+        let (mut total, mut steps, mut storm) = (self.instret(), 1, 0);
+        let t = self.cpus[k].now_ns();
+        let r = self.slice(k, t, &mut total, u64::MAX, &mut steps, &mut storm);
+        self.bp_resume = None;
+        self.cpus[k].jit_off = jit_off;
+        let t = self.cpus[k].now_ns();
+        if t > self.now { self.now = t; }
+        r
+    }
+
+    /// Debugging: read guest memory at virtual address `va` as core `k` sees it (RAM only).
+    pub fn debug_read(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let a = va.wrapping_add(out.len() as u64);
+            let pa = self.cpus[k].debug_translate(&mut self.soc, a)?;
+            let n = (len - out.len()).min(0x1000 - (a & 0xfff) as usize);
+            out.extend_from_slice(self.soc.ram.get(pa as usize..pa as usize + n)?);
+        }
+        Some(out)
+    }
+
+    /// Debugging: write guest memory at virtual address `va` (RAM only); compiled code is dropped.
+    pub fn debug_write(&mut self, k: usize, va: u64, data: &[u8]) -> bool {
+        let mut done = 0;
+        while done < data.len() {
+            let a = va.wrapping_add(done as u64);
+            let Some(pa) = self.cpus[k].debug_translate(&mut self.soc, a) else { return false };
+            let n = (data.len() - done).min(0x1000 - (a & 0xfff) as usize);
+            let Some(dst) = self.soc.ram.get_mut(pa as usize..pa as usize + n) else { return false };
+            dst.copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        if let Some(j) = self.jit_mut() { j.flush(); }
+        true
     }
 
     /// Advance idle time to `t` (after an `Idle` stop) and re-evaluate interrupts.
