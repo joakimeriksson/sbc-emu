@@ -25,6 +25,11 @@ pub const GENET: u64 = 0xfd58_0000;
 pub const GPIO: u64 = 0xfe20_0000;
 pub const SPI0: u64 = 0xfe20_4000;
 pub const I2C1: u64 = 0xfe80_4000;
+pub const RNG: u64 = 0xfe10_4000;
+pub const AVS: u64 = 0xfd5d_2000;
+pub const PM: u64 = 0xfe10_0000;
+pub const SYSTIMER: u64 = 0xfe00_3000;
+pub const AUX: u64 = 0xfe21_5000;
 /// GPU memory carve-out at the top of RAM (firmware `gpu_mem=64`), holding the framebuffer
 pub const GPU_MEM: u64 = 64 << 20;
 const PPI_VTIMER: usize = 27;
@@ -38,6 +43,8 @@ const SPI_GPIO0: usize = 32 + 113;
 const SPI_I2C: usize = 32 + 117;
 const SPI_SPI: usize = 32 + 118;
 const SPI_GENET1: usize = 32 + 158;
+const SPI_SYSTIMER: usize = 32 + 64;
+const SPI_AUX: usize = 32 + 93;
 
 pub struct Soc {
     pub ram: Vec<u8>,
@@ -56,6 +63,14 @@ pub struct Soc {
     pub gpio: crate::gpio::Gpio,
     pub i2c: crate::i2c::I2c,
     pub spi: crate::spi::Spi,
+    pub rng: crate::periph::Rng200,
+    pub avs: crate::periph::Avs,
+    pub pm: crate::periph::Pm,
+    pub systimer: crate::periph::SysTimer,
+    /// the mini UART (ttyS0)
+    pub aux: crate::periph::AuxUart,
+    /// AXI bridge (ASB) control registers
+    asb: [u32; 12],
     /// the network behind the Ethernet port (None = cable unplugged)
     pub net: Option<sbc_net::net::VirtualNet>,
     pub unknown: Vec<u64>,
@@ -76,6 +91,13 @@ impl Soc {
             GPIO..=0xfe20_00ff => self.gpio.read(a - GPIO),
             SPI0..=0xfe20_41ff => self.spi.read(a - SPI0),
             I2C1..=0xfe80_4fff => self.i2c.read(a - I2C1),
+            RNG..=0xfe10_40ff => self.rng.read(a - RNG),
+            AVS..=0xfd5d_2eff => self.avs.read(a - AVS),
+            PM..=0xfe10_0113 => self.pm.read(a - PM),
+            SYSTIMER..=0xfe00_301b => self.systimer.read(a - SYSTIMER),
+            AUX..=0xfe21_50ff => self.aux.read(a - AUX),
+            // AXI bridges (ASB): the ID register; request bits are acknowledged at once
+            0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => match a & 0xff { 0x20 => 0x6272_6467, o => self.asb[(o / 4) as usize % 12] & !(1 << 1) },
             GICD..=0xff84_1fff => self.gic.dist_read(self.cur, a - GICD),
             GICC..=0xff84_3fff => self.gic.cpu_read(self.cur, a - GICC),
             PERIPH..=0xffff_ffff => { self.note(a); 0 }
@@ -108,6 +130,12 @@ impl Soc {
             }
             SPI0..=0xfe20_41ff => { let ce0 = !self.gpio.level(8); self.spi.write(a - SPI0, v, ce0); }
             I2C1..=0xfe80_4fff => self.i2c.write(a - I2C1, v),
+            RNG..=0xfe10_40ff => self.rng.write(a - RNG, v),
+            AVS..=0xfd5d_2eff => {}
+            PM..=0xfe10_0113 => self.pm.write(a - PM, v),
+            SYSTIMER..=0xfe00_301b => self.systimer.write(a - SYSTIMER, v),
+            AUX..=0xfe21_50ff => self.aux.write(a - AUX, v),
+            0xfe00_a000..=0xfe00_a02f | 0xfec1_1000..=0xfec1_102f => self.asb[((a & 0xff) / 4) as usize % 12] = v,
             GICD..=0xff84_1fff => self.gic.dist_write(self.cur, a - GICD, v),
             GICC..=0xff84_3fff => self.gic.cpu_write(self.cur, a - GICC, v),
             PERIPH..=0xffff_ffff => self.note(a),
@@ -227,7 +255,7 @@ impl Machine {
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = ram as u64 - GPU_MEM;
-        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), net: None, unknown: Vec::new(), dirty: true };
+        let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: Dwc2::new(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
@@ -336,6 +364,11 @@ impl Machine {
         self.soc.gic.set_level(SPI_EMMC2, sd);
         let mb = self.soc.mbox.irq();
         self.soc.gic.set_level(SPI_MBOX, mb);
+        self.soc.pm.now = self.now;
+        self.soc.systimer.set_now(self.now);
+        for k in 0..4 { let l = self.soc.systimer.irq(k); self.soc.gic.set_level(SPI_SYSTIMER + k, l); }
+        let aux = self.soc.aux.irq();
+        self.soc.gic.set_level(SPI_AUX, aux);
         for k in 0..self.cpus.len() {
             if self.state[k] == CoreState::Off { continue; }
             let irq = self.soc.gic.irq_out(k);
@@ -358,7 +391,8 @@ impl Machine {
     /// The earliest deadline after `t` that core `c` running alone must notice: its own timers,
     /// those of sleeping cores, devices.
     fn deadline_after(&self, t: u64, c: usize) -> Option<u64> {
-        let mut d: Option<u64> = self.soc.usb.next_event().filter(|&x| x > t);
+        let mut d: Option<u64> = [self.soc.usb.next_event(), self.soc.pm.next_event(), self.soc.systimer.next_event()]
+            .into_iter().flatten().filter(|&x| x > t).min();
         for (k, cpu) in self.cpus.iter().enumerate() {
             if self.state[k] == CoreState::Off || (k != c && self.state[k] == CoreState::Run) { continue; }
             let s = &cpu.sys;
@@ -374,7 +408,7 @@ impl Machine {
 
     /// Next timer (of any core that is on) or device deadline in ns.
     fn next_deadline(&self) -> Option<u64> {
-        let mut d: Option<u64> = self.soc.usb.next_event();
+        let mut d: Option<u64> = [self.soc.usb.next_event(), self.soc.pm.next_event(), self.soc.systimer.next_event()].into_iter().flatten().min();
         for (k, cpu) in self.cpus.iter().enumerate() {
             if self.state[k] == CoreState::Off { continue; }
             let s = &cpu.sys;
@@ -402,6 +436,7 @@ impl Machine {
         let stop = 'run: loop {
             if total >= end || steps == 0 { break Stop::Budget; }
             self.update_irqs();
+            if let Some(halt) = self.soc.pm.expired() { break if halt { Stop::PowerOff } else { Stop::Reset }; }
             let any_run = self.state.contains(&CoreState::Run);
             if any_run { for s in self.state.iter_mut() { if *s == CoreState::Wfe { *s = CoreState::Run; } } }
             let runnable = self.state.iter().filter(|s| **s == CoreState::Run).count();
@@ -436,7 +471,10 @@ impl Machine {
                 }
             }
             *steps -= 1;
-            if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret >= self.next_check { self.update_irqs(); }
+            if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret >= self.next_check {
+                self.update_irqs();
+                if let Some(halt) = self.soc.pm.expired() { return Some(if halt { Stop::PowerOff } else { Stop::Reset }); }
+            }
             let cpu = &mut self.cpus[k];
             let i0 = cpu.instret;
             // compiled code may chain blocks until the slice or budget ends or a device needs a look
@@ -521,6 +559,7 @@ impl Machine {
             "temp" | "temperature" => b.temp_c = v,
             "pressure" => b.pressure_pa = v * 100.0,
             "humidity" => b.humidity = v,
+            "cpu-temp" | "soc-temp" => { self.soc.avs.temp_mc = (v * 1000.0) as i32; self.soc.mbox.temp_mc = (v * 1000.0).max(0.0) as u32; }
             _ => {}
         }
     }
@@ -661,7 +700,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Vec<u8> {
         let mut w = emu_core::snap::W::default();
-        w.tag("machine-v5");
+        w.tag("machine-v6");
         w.u64(self.soc.ram.len() as u64);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -677,6 +716,9 @@ impl Machine {
         self.soc.genet.save_state(&mut w);
         self.soc.wifi.save_state(&mut w);
         self.soc.gpio.save_state(&mut w);
+        self.soc.pm.save_state(&mut w);
+        self.soc.systimer.save_state(&mut w);
+        self.soc.aux.save_state(&mut w);
         // RAM: list of non-zero 4 KiB pages
         let pages: Vec<usize> = (0..self.soc.ram.len() / 4096).filter(|&p| self.soc.ram[p * 4096..(p + 1) * 4096].iter().any(|&b| b != 0)).collect();
         w.u64(pages.len() as u64);
@@ -693,7 +735,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
         let mut r = emu_core::snap::R::new(&raw);
         let e = |e: emu_core::snap::SnapError| e.0;
-        let v5 = r.tag("machine-v5").is_ok();
+        let v6 = r.tag("machine-v6").is_ok();
+        if !v6 { r.p = 0; }
+        let v5 = v6 || r.tag("machine-v5").is_ok();
         if !v5 { r.p = 0; r.tag("machine-v4").map_err(e)?; }
         let ram = r.u64().map_err(e)? as usize;
         if ram != self.soc.ram.len() { return Err(format!("snapshot RAM is {} MiB, machine has {} MiB", ram >> 20, self.soc.ram.len() >> 20)); }
@@ -723,6 +767,11 @@ impl Machine {
         self.soc.genet.load_state(&mut r).map_err(e)?;
         self.soc.wifi.load_state(&mut r).map_err(e)?;
         self.soc.gpio.load_state(&mut r).map_err(e)?;
+        if v6 {
+            self.soc.pm.load_state(&mut r).map_err(e)?;
+            self.soc.systimer.load_state(&mut r).map_err(e)?;
+            self.soc.aux.load_state(&mut r).map_err(e)?;
+        }
         self.soc.ram.fill(0);
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;

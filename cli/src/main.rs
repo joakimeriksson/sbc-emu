@@ -64,7 +64,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs --busybox PATH -o OUT.cpio\n  sbc-emu run --board pi4b --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE]\n  sbc-emu run --board pi4b --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -117,6 +117,11 @@ fn run(args: &[String]) -> ExitCode {
         None => None,
     };
     let gdb_wait = args.iter().any(|a| a == "--gdb-wait");
+    // the mini UART (ttyS0): its output goes to a file
+    let mut serial1 = match arg(args, "--serial1") {
+        Some(p) => match std::fs::File::create(p) { Ok(f) => Some(f), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
+        None => None,
+    };
     let mut script: std::collections::VecDeque<String> = match arg(args, "--script") {
         Some(p) => match std::fs::read_to_string(p) { Ok(t) => t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect(), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
         None => Default::default(),
@@ -237,6 +242,7 @@ fn run(args: &[String]) -> ExitCode {
                     "sleep" => { script_wait_until = Some(Instant::now() + Duration::from_secs_f64(rest.parse().unwrap_or(1.0))); }
                     "type" => for b in unescape(rest).bytes() { m.soc.usb.kbd.type_byte(b); },
                     "serial" => pending.extend(unescape(rest).bytes()),
+                    "serial1" => for b in unescape(rest).bytes() { m.soc.aux.push_rx(b); m.soc.dirty = true; },
                     "shot" => {
                         let mut rgba = Vec::new();
                         if let Some((w, h)) = m.soc.mbox.render(&m.soc.ram, &mut rgba) { let _ = std::fs::write(rest, bcm2711::png::encode_rgba(w, h, &rgba)); }
@@ -311,6 +317,10 @@ fn run(args: &[String]) -> ExitCode {
             if serial_log.len() > 1 << 20 { serial_log.drain(..serial_log.len() - (1 << 19)); }
         }
         flush(&mut m, &mut out, tty.0);
+        if !m.soc.aux.out.is_empty() {
+            let b = std::mem::take(&mut m.soc.aux.out);
+            if let Some(f) = serial1.as_mut() { let _ = f.write_all(&b); let _ = f.flush(); }
+        }
         match stop {
             Stop::Budget => last_busy = Instant::now(),
             Stop::Idle(t) => {
@@ -329,7 +339,7 @@ fn run(args: &[String]) -> ExitCode {
                 }
             }
             Stop::Reset => {
-                eprintln!("\r\n[sbc-emu] PSCI SYSTEM_RESET: rebooting\r");
+                eprintln!("\r\n[sbc-emu] system reset: rebooting\r");
                 let d = m.soc.sd.disk.take();
                 m = match power_on(d) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
             }

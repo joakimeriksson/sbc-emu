@@ -86,6 +86,7 @@ const PPI_LEVEL_LOW_ALL: u32 = 0xf08;
 
 pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     let (gic, clk48, mbox, clk100, phy1, gpio, clkvpu, vref) = (1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32);
+    let (thermal, aux) = (9u32, 10u32);
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &["raspberrypi,4-model-b", "brcm,bcm2711"]);
@@ -96,6 +97,7 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
 
     f.begin("aliases");
     f.str("serial0", "/serial@fe201000");
+    f.str("serial1", "/soc/serial@fe215040");
     f.str("mmc0", "/soc/mmc@fe340000");
     f.str("mmc1", "/soc/mmc@fe300000");
     f.str("i2c1", "/soc/i2c@fe804000");
@@ -191,6 +193,22 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     f.cells("arm,primecell-periphid", &[0x0024_1011]);
     f.end();
 
+    f.begin("thermal-zones");
+    f.begin("cpu-thermal");
+    f.cells("polling-delay-passive", &[0]);
+    f.cells("polling-delay", &[1000]);
+    f.cells("thermal-sensors", &[thermal]);
+    f.cells("coefficients", &[(-487i32) as u32, 410_040]);
+    f.begin("trips");
+    f.begin("cpu-crit");
+    f.cells("temperature", &[90_000]);
+    f.cells("hysteresis", &[0]);
+    f.str("type", "critical");
+    f.end();
+    f.end();
+    f.end();
+    f.end();
+
     f.begin("soc");
     f.str("compatible", "simple-bus");
     f.cells("#address-cells", &[2]);
@@ -213,6 +231,53 @@ pub fn pi4b(b: &BootInfo) -> Vec<u8> {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     f.strs("gpio-line-names", &refs);
     f.cells("phandle", &[gpio]);
+    f.end();
+
+    f.begin("rng@fe104000");
+    f.str("compatible", "brcm,bcm2711-rng200");
+    f.cells("reg", &[0, 0xfe10_4000, 0x28]);
+    f.end();
+
+    f.begin("avs-monitor@fd5d2000");
+    f.strs("compatible", &["brcm,bcm2711-avs-monitor", "syscon", "simple-mfd"]);
+    f.cells("reg", &[0, 0xfd5d_2000, 0xf00]);
+    f.begin("thermal");
+    f.str("compatible", "brcm,bcm2711-thermal");
+    f.cells("#thermal-sensor-cells", &[0]);
+    f.cells("phandle", &[thermal]);
+    f.end();
+    f.end();
+
+    // power management: watchdog, and power domains behind the AXI bridges (ASB)
+    f.begin("watchdog@fe100000");
+    f.strs("compatible", &["brcm,bcm2711-pm", "brcm,bcm2835-pm-wdt"]);
+    f.cells("reg", &[0, 0xfe10_0000, 0x114, 0, 0xfe00_a000, 0x24, 0, 0xfec1_1000, 0x20]);
+    f.strs("reg-names", &["pm", "asb", "rpivid_asb"]);
+    f.cells("#power-domain-cells", &[1]);
+    f.cells("#reset-cells", &[1]);
+    f.end();
+
+    f.begin("timer@fe003000");
+    f.str("compatible", "brcm,bcm2835-system-timer");
+    f.cells("reg", &[0, 0xfe00_3000, 0x1000]);
+    f.cells("interrupts", &[GIC_SPI, 64, LEVEL_HIGH, GIC_SPI, 65, LEVEL_HIGH, GIC_SPI, 66, LEVEL_HIGH, GIC_SPI, 67, LEVEL_HIGH]);
+    f.cells("clock-frequency", &[1_000_000]);
+    f.end();
+
+    f.begin("aux@fe215000");
+    f.str("compatible", "brcm,bcm2835-aux");
+    f.cells("#clock-cells", &[1]);
+    f.cells("reg", &[0, 0xfe21_5000, 0x8]);
+    f.cells("clocks", &[clkvpu]);
+    f.cells("phandle", &[aux]);
+    f.end();
+
+    f.begin("serial@fe215040");
+    f.str("compatible", "brcm,bcm2835-aux-uart");
+    f.cells("reg", &[0, 0xfe21_5040, 0x40]);
+    f.cells("interrupts", &[GIC_SPI, 93, LEVEL_HIGH]);
+    f.cells("clocks", &[aux, 0]);
+    f.str("status", "okay");
     f.end();
 
     f.begin("spi@fe204000");

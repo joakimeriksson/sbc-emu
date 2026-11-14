@@ -37,11 +37,14 @@ pub struct Mailbox {
     pub fb: Framebuffer,
     /// tags we answered with "unknown" (diagnostics)
     pub unknown: Vec<u32>,
+    /// SoC temperature reported to the firmware's GET_TEMPERATURE (millidegrees C)
+    pub temp_mc: u32,
 }
 
 impl Mailbox {
     pub fn new(fb_base: u64, fb_max: u64, width: u32, height: u32) -> Self {
         Mailbox {
+            temp_mc: 45_000,
             rd: VecDeque::new(),
             cfg: 0,
             fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
@@ -113,6 +116,7 @@ impl Mailbox {
     fn tag(&mut self, tag: u32, v: &mut Vec<u32>) -> Option<usize> {
         let set = |v: &mut Vec<u32>, vals: &[u32]| { if v.len() < vals.len() { v.resize(vals.len(), 0); } v[..vals.len()].copy_from_slice(vals); vals.len() * 4 };
         let arg = |v: &Vec<u32>, k: usize| v.get(k).copied().unwrap_or(0);
+        let temp_mc = self.temp_mc;
         let fb = &mut self.fb;
         Some(match tag {
             0x0000_0001 => set(v, &[FW_REVISION]),
@@ -131,7 +135,7 @@ impl Mailbox {
             0x0003_0002 | 0x0003_0004 | 0x0003_0007 | 0x0003_0047 => { let id = arg(v, 0); set(v, &[id, clock_rate(id)]) }
             0x0003_8001 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
             0x0003_8002 => { let id = arg(v, 0); let r = arg(v, 1); set(v, &[id, r]) }
-            0x0003_0006 => { let id = arg(v, 0); set(v, &[id, 45_000]) }
+            0x0003_0006 => { let id = arg(v, 0); set(v, &[id, temp_mc]) }
             0x0003_000a => { let id = arg(v, 0); set(v, &[id, 85_000]) }
             0x0003_0003 => { let id = arg(v, 0); set(v, &[id, 1_200_000]) } // voltage (uV)
             0x0003_0046 => set(v, &[0]), // throttled: none
