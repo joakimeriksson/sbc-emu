@@ -1,10 +1,12 @@
 //! EMMC2: the BCM2711's SD host controller (SDHCI v3 register set, driven by Linux's
 //! `sdhci-iproc` as "brcm,bcm2711-emmc2") with an SDHC card behind it.
 //!
-//! Data moves by PIO through the buffer data port: the capabilities register advertises no
-//! SDMA/ADMA, so the driver never programs DMA. Accesses may be 8, 16 or 32 bits wide; each
-//! write is applied with byte enables, then its side effects run (command issue on the command
-//! register's bytes, W1C on interrupt status, software reset, clock-stable handshake).
+//! Data moves by ADMA2 (32-bit descriptors) for the memory card: a data command with DMA
+//! enabled walks the descriptor table and completes at once. PIO through the buffer data
+//! port works too, and is what the SDIO host (Wi-Fi) uses: ADMA2 is advertised only for a
+//! memory card. Accesses may be 8, 16 or 32 bits wide; each write is applied with byte
+//! enables, then its side effects run (command issue on the command register's bytes, W1C on
+//! interrupt status, software reset, clock-stable handshake).
 //!
 //! Card model: SD physical layer 3.0 SDHC/SDXC, block addressed, 3.3 V only (no UHS voltage
 //! switch), 4-bit bus, high speed via CMD6. Supported commands: 0, 2, 3, 6, 7, 8, 9, 10, 12, 13,
@@ -124,7 +126,11 @@ const INTSTAT: usize = 0x30 / 4;
 const INTEN: usize = 0x34 / 4;
 const SIGEN: usize = 0x38 / 4;
 const CAPS: usize = 0x40 / 4;
+const ADMA_ADDR: usize = 0x58 / 4;
 const VERSION: usize = 0xfc / 4;
+/// capabilities: ADMA2 supported
+const CAP_ADMA2: u32 = 1 << 19;
+const ERR_ADMA: u32 = 1 << 25;
 
 impl Default for Sdhci {
     fn default() -> Self { Self::new(None) }
@@ -186,12 +192,13 @@ impl Sdhci {
             DATA => self.data_read(),
             PRESENT => self.present(),
             INTSTAT => self.status(),
+            CAPS => self.regs[CAPS] | if self.sdio.is_none() { CAP_ADMA2 } else { 0 },
             _ => self.regs[r],
         }
     }
 
     /// `size` bytes written at `off` (any alignment within a word).
-    pub fn write(&mut self, off: u64, v: u32, size: u32) {
+    pub fn write(&mut self, off: u64, v: u32, size: u32, ram: &mut [u8]) {
         let r = (off as usize >> 2) & 63;
         let shift = (off as u32 & 3) * 8;
         let mask = if size >= 4 { u32::MAX } else { ((1u32 << (8 * size)) - 1) << shift };
@@ -206,7 +213,7 @@ impl Sdhci {
         }
         self.regs[r] = (self.regs[r] & !mask) | val;
         match r {
-            CMD if mask & 0xffff_0000 != 0 => self.command(),
+            CMD if mask & 0xffff_0000 != 0 => { self.command(); self.run_dma(ram); }
             CLOCK => {
                 // internal clock enable -> stable; software reset bits self-clear
                 if self.regs[CLOCK] & 1 != 0 { self.regs[CLOCK] |= 2; } else { self.regs[CLOCK] &= !2; }
@@ -378,6 +385,82 @@ impl Sdhci {
             self.xfer = Xfer::Write;
             self.raise(INT_BUF_WR);
         }
+    }
+
+    /// A data transfer just started with DMA enabled (transfer mode bit 0, ADMA2 selected in
+    /// host control): move all of it through the descriptor table now.
+    fn run_dma(&mut self, ram: &mut [u8]) {
+        let mode = self.regs[CMD] & 0xffff;
+        let adma2 = (self.regs[CTRL] >> 3) & 3 == 2;
+        if self.sdio.is_some() || mode & 1 == 0 || !adma2 || self.xfer == Xfer::None { return; }
+        let blksz = ((self.regs[BLKSIZE] & 0xfff) as usize).max(1);
+        // descriptors: (host address, length) of each transfer chunk, in order
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        let mut d = self.regs[ADMA_ADDR] as usize;
+        let mut ok = true;
+        for _ in 0..65536 {
+            let Some(b) = ram.get(d..d + 8) else { ok = false; break };
+            let attr = u16::from_le_bytes([b[0], b[1]]);
+            let len = match u16::from_le_bytes([b[2], b[3]]) { 0 => 65536, l => l as usize };
+            let addr = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+            if attr & 1 == 0 { ok = false; break; } // not valid
+            match attr & 0x30 {
+                0x20 => { chunks.push((addr, len)); d += 8; }
+                0x30 => { d = addr; continue; }
+                _ => d += 8,
+            }
+            if attr & 2 != 0 { break; } // end
+        }
+        let total: usize = chunks.iter().map(|c| c.1).sum();
+        if !ok || chunks.iter().any(|&(a, l)| a + l > ram.len()) {
+            self.xfer = Xfer::None;
+            self.raise(ERR_ADMA);
+            return;
+        }
+        match self.xfer {
+            Xfer::Read => {
+                // the data: this buffer (a special read or the first block), then more blocks
+                let mut data = std::mem::take(&mut self.buf);
+                data.truncate(blksz.min(data.len()));
+                while data.len() < total {
+                    match self.left {
+                        Some(0) => break,
+                        left => {
+                            if let Some(l) = left { self.left = Some(l - 1); }
+                            self.lba += 1;
+                            self.buf = vec![0; 512];
+                            self.load_block();
+                            data.extend_from_slice(&self.buf);
+                        }
+                    }
+                }
+                let mut o = 0;
+                for (a, l) in chunks {
+                    let n = l.min(data.len().saturating_sub(o));
+                    ram[a..a + n].copy_from_slice(&data[o..o + n]);
+                    o += n;
+                }
+            }
+            Xfer::Write => {
+                let mut data = Vec::with_capacity(total);
+                for (a, l) in chunks { data.extend_from_slice(&ram[a..a + l]); }
+                for blk in data.chunks(512) {
+                    let mut b = blk.to_vec();
+                    b.resize(512, 0);
+                    let lba = self.lba;
+                    if let Some(d) = self.disk.as_mut() { if lba < d.sectors() { d.write(lba, &b); } }
+                    self.writes += 1;
+                    self.lba += 1;
+                    if let Some(l) = self.left { if l == 0 { break; } self.left = Some(l - 1); }
+                }
+            }
+            Xfer::None => {}
+        }
+        self.xfer = Xfer::None;
+        self.pos = 0;
+        self.buf.clear();
+        self.regs[INTSTAT] &= !(INT_BUF_RD | INT_BUF_WR);
+        self.raise(INT_XFER_DONE);
     }
 
     fn load_block(&mut self) {

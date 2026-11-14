@@ -110,6 +110,12 @@ function loop() {
     r = ex.sbc_run(2_000_000, wallNs());
     if (r !== 0) break;
   }
+  // what the guest played on the I²S DAC goes to the page's WebAudio
+  const na = ex.sbc_audio_take();
+  if (na) {
+    const samples = new Int16Array(mem8().buffer.slice(ex.sbc_audio_ptr(), ex.sbc_audio_ptr() + 2 * na));
+    postMessage({ type: 'audio', rate: ex.sbc_audio_rate(), samples }, [samples.buffer]);
+  }
   const n = ex.sbc_uart_take();
   if (n) postMessage({ type: 'uart', text: dec.decode(mem8().slice(ex.sbc_uart_ptr(), ex.sbc_uart_ptr() + n)) });
   const now = performance.now();
@@ -148,6 +154,7 @@ onmessage = (e) => {
   const m = e.data;
   if (m.type === 'start') start(m.os, m.ramMb, m.jit).catch((err) => postMessage({ type: 'status', text: String(err) }));
   else if (m.type === 'key' && ex) ex.sbc_key(m.usage, m.down ? 1 : 0);
+  else if (m.type === 'pointer' && ex) ex.sbc_pointer(m.buttons, m.x, m.y, m.wheel);
   else if (m.type === 'serial') serialQueue.push(...m.bytes);
   else if (m.type === 'button' && ex) ex.sbc_gpio_input(27, m.pressed ? 1 : -1);
   else if (m.type === 'sensor' && ex) ex.sbc_set_sensor(m.kind, m.value);

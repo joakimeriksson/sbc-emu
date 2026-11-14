@@ -46,6 +46,8 @@ struct State {
     fb_w: u32,
     fb_h: u32,
     uart: Vec<u8>,
+    /// samples taken from the I²S DAC for the page (16-bit interleaved stereo)
+    audio: Vec<i16>,
     wait_ms: f64,
     stop: Option<Stop>,
     /// added to the page's wall clock so a restored machine's time keeps running (ns)
@@ -76,7 +78,7 @@ pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *co
     };
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     if bcm2711::boot::boot_linux(&mut m, kernel, initrd, &cmdline, true).is_err() { return -1; }
-    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
+    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
     0
 }
 
@@ -90,7 +92,7 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
     if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { return -1; }
-    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
+    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
     0
 }
 
@@ -146,6 +148,21 @@ pub extern "C" fn sbc_jit_blocks() -> f64 { with(|s| s.m.jit().map(|j| j.compile
 pub extern "C" fn sbc_key(usage: u32, down: u32) { with(|s| s.m.soc.devs.kbd.key(usage as u8, down != 0)); }
 
 /// USB keyboard: type one byte of text (US layout).
+/// The USB tablet: buttons (bit 0 left, 1 right, 2 middle), position 0..=32767, wheel clicks.
+#[no_mangle]
+pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
+    with(|s| s.m.soc.devs.tablet.pointer(buttons as u8 & 7, x.min(32767) as u16, y.min(32767) as u16, wheel.clamp(-127, 127) as i8));
+}
+
+/// What the guest played on the I²S DAC since the last call: the number of 16-bit samples
+/// (interleaved stereo) now at `sbc_audio_ptr`, played at `sbc_audio_rate` Hz.
+#[no_mangle]
+pub extern "C" fn sbc_audio_take() -> usize { with(|s| { s.audio = std::mem::take(&mut s.m.soc.i2s.out); s.audio.len() }).unwrap_or(0) }
+#[no_mangle]
+pub extern "C" fn sbc_audio_ptr() -> *const i16 { with(|s| s.audio.as_ptr()).unwrap_or(std::ptr::null()) }
+#[no_mangle]
+pub extern "C" fn sbc_audio_rate() -> u32 { with(|s| s.m.soc.i2s.rate).unwrap_or(0) }
+
 #[no_mangle]
 pub extern "C" fn sbc_type(b: u32) { with(|s| s.m.soc.devs.kbd.type_byte(b as u8)); }
 
@@ -203,7 +220,7 @@ pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8,
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
     if m.restore(std::slice::from_raw_parts(snap, len)).is_err() { return -1; }
-    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: None }));
+    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: None }));
     0
 }
 

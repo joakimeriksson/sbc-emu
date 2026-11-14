@@ -132,8 +132,8 @@ impl Soc {
     /// `size`-byte write of `v` at `a` (unshifted value, any alignment within the word).
     fn mmio_write(&mut self, a: u64, v: u32, size: u32) -> Result<(), Fault> {
         self.dirty = true;
-        if (EMMC2..=0xfe34_00ff).contains(&a) { self.sd.write(a - EMMC2, v, size); return Ok(()); }
-        if (SDHOST_WIFI..=0xfe30_00ff).contains(&a) { self.wifi.write(a - SDHOST_WIFI, v, size); return Ok(()); }
+        if (EMMC2..=0xfe34_00ff).contains(&a) { self.sd.write(a - EMMC2, v, size, &mut self.ram); return Ok(()); }
+        if (SDHOST_WIFI..=0xfe30_00ff).contains(&a) { self.wifi.write(a - SDHOST_WIFI, v, size, &mut self.ram); return Ok(()); }
         if (crate::pcie::BASE..=0xfd50_ffff).contains(&a) { self.pcie.write(a - crate::pcie::BASE, v, size); return Ok(()); }
         if (GICD..=0xff84_1fff).contains(&a) && size < 4 {
             // byte-accessible registers (priorities, targets): read-modify-write of the word

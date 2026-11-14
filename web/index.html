@@ -84,6 +84,8 @@ worker.onmessage = (e) => {
   } else if (m.type === 'frame') {
     if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
     ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
+  } else if (m.type === 'audio') {
+    play(m.rate, m.samples);
   } else if (m.type === 'gpio' && m.pin === 17) {
     document.getElementById('led').classList.toggle('on', m.level === 1);
   } else if (m.type === 'stats') {
@@ -91,6 +93,36 @@ worker.onmessage = (e) => {
     status.textContent = `${state} · ${m.mips.toFixed(1)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '') + (m.jit ? ` · JIT ${m.jit} blocks` : '');
   }
 };
+// sound from the emulated I²S DAC (a PCM5102A HAT): queued buffers, started on the first click
+// or key press (browsers only start audio after a user gesture)
+let audio = null, audioAt = 0;
+const startAudio = () => { if (!audio) { try { audio = new AudioContext(); } catch { audio = null; } } };
+function play(rate, s) {
+  if (!audio || !rate || s.length < 2) return;
+  const frames = s.length >> 1, buf = audio.createBuffer(2, frames, rate);
+  const l = buf.getChannelData(0), r = buf.getChannelData(1);
+  for (let i = 0; i < frames; i++) { l[i] = s[2 * i] / 32768; r[i] = s[2 * i + 1] / 32768; }
+  const src = audio.createBufferSource();
+  src.buffer = buf;
+  src.connect(audio.destination);
+  audioAt = Math.max(audioAt, audio.currentTime + 0.05);
+  if (audioAt > audio.currentTime + 2) audioAt = audio.currentTime + 0.05; // the guest ran ahead: drop the backlog
+  src.start(audioAt);
+  audioAt += frames / rate;
+}
+// the mouse on the screen is the USB tablet (absolute position, buttons, wheel)
+const pointer = (e, wheel = 0) => {
+  const b = canvas.getBoundingClientRect();
+  const x = Math.round(Math.min(Math.max((e.clientX - b.left) / b.width, 0), 1) * 32767);
+  const y = Math.round(Math.min(Math.max((e.clientY - b.top) / b.height, 0), 1) * 32767);
+  worker.postMessage({ type: 'pointer', buttons: e.buttons & 7, x, y, wheel });
+};
+canvas.addEventListener('pointermove', (e) => pointer(e));
+canvas.addEventListener('pointerdown', (e) => { startAudio(); screen.focus(); pointer(e); });
+canvas.addEventListener('pointerup', (e) => pointer(e));
+canvas.addEventListener('wheel', (e) => { e.preventDefault(); pointer(e, e.deltaY < 0 ? 1 : -1); }, { passive: false });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+screen.addEventListener('keydown', startAudio);
 document.getElementById('clear').onclick = (e) => { e.preventDefault(); term.textContent = ''; };
 // KeyboardEvent.code -> USB HID usage (keyboard page)
 const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,

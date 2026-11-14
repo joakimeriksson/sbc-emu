@@ -125,7 +125,9 @@ impl Mailbox {
             0x0000_0001 => set(v, &[FW_REVISION]),
             0x0000_0002 => set(v, &[0]), // firmware variant: none
             0x0000_0003 => set(v, &[0x5bc0_e000, 0, 0, 0, 0]), // firmware git hash (20 bytes)
-            0x0001_0007 => set(v, &[0, AUDIO_CLK]), // clocks for `raspberrypi,firmware-clocks`: (parent, id) pairs
+            // clocks for `raspberrypi,firmware-clocks`, (parent, id): the ARM clock (cpufreq: one
+            // operating point, 1.5 GHz) and the audio clock
+            0x0001_0007 => set(v, &[0, 3, 0, AUDIO_CLK]),
             0x0001_0001 => set(v, &[0]),
             0x0001_0002 => set(v, &[BOARD_REVISION]),
             0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)

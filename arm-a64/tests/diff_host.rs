@@ -33,6 +33,12 @@ const SNIPPETS: &[&str] = &[
     "adr x0, .\n sub x0, x0, x15\n adds x1, x2, x2\n cinc x3, x4, cs",
     "crc32b w0, w1, w2\n crc32h w3, w4, w5\n crc32w w6, w7, w8\n crc32x w9, w10, x11\n crc32x w12, w12, x13",
     "crc32cb w0, w1, w2\n crc32ch w3, w4, w5\n crc32cw w6, w7, w8\n crc32cx w9, w10, x11\n crc32cw w12, w12, wzr",
+    // compiled natively: FMOV between the register files, LDNP/STNP, DC ZVA (stack memory only)
+    "fmov d0, x1\n fmov x2, d0\n fmov s1, w3\n fmov w4, s1\n fmov x5, d1\n fmov d2, xzr\n fmov x6, d2\n fmov s3, w7\n fmov x8, d3",
+    "dup v0.16b, w1\n dup v1.4s, w2\n dup v2.2d, x3\n dup v3.8b, w4\n dup v4.4h, wzr\n mov x5, v0.d[1]\n mov x6, v1.d[0]\n mov x7, v2.d[1]\n mov x8, v3.d[0]\n mov x9, v3.d[1]\n mov x10, v4.d[0]",
+    "sub sp, sp, #256\n mov x9, sp\n stp x1, x2, [x9]\n stp x3, x4, [x9, #16]\n ld1 {v0.16b}, [x9]\n ld1 {v1.4s}, [x9], #16\n ld1 {v2.8b}, [x9], #8\n st1 {v0.2d}, [x9]\n add x10, x9, #32\n st1 {v2.4h}, [x10]\n ldr x11, [x9, #32]\n ldp x5, x6, [x9]\n mov x7, v1.d[0]\n mov x8, v1.d[1]\n mov x10, v2.d[1]\n add sp, sp, #256\n mov x9, #0",
+    "sub sp, sp, #256\n stnp x1, x2, [sp, #16]\n ldnp x3, x4, [sp, #16]\n stnp w5, w6, [sp, #64]\n ldnp w7, w8, [sp, #64]\n stp x9, x10, [sp, #128]\n ldnp x11, x12, [sp, #128]\n add sp, sp, #256",
+    "sub sp, sp, #256\n mov x9, sp\n add x9, x9, #64\n and x9, x9, #~63\n stp x1, x2, [x9]\n stp x3, x4, [x9, #48]\n stp x5, x6, [x9, #64]\n add x10, x9, #13\n dc zva, x10\n ldp x11, x12, [x9]\n ldp x13, x14, [x9, #48]\n ldp x7, x8, [x9, #64]\n add sp, sp, #256\n mov x9, #0\n mov x10, #0",
 ];
 
 fn wrapper(name: &str, body: &str) -> String {
@@ -172,6 +178,7 @@ fn integer_snippets_match_host() {
     cpu.ram = ram.mem.as_mut_ptr();
     cpu.ram_len = ram.mem.len() as u64;
             cpu.el = 0;
+            cpu.sys.cpacr_el1 = 3 << 20; // FP/SIMD on (the FMOV snippet)
             cpu.pc = common::LOAD;
             cpu.sp[0] = 0x30_0000;
             cpu.x[0] = state;

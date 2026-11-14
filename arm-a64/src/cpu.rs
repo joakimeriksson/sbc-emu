@@ -20,8 +20,9 @@ impl Exc {
     pub const BRK: u32 = 0x3c;
 }
 
-/// Entries per micro-TLB (a power of two).
-pub(crate) const UT: usize = 64;
+/// Entries per micro-TLB (a power of two). At most 256: compiled code reaches the `Cpu`
+/// fields laid out after the tables with short immediate offsets (512 breaks that).
+pub(crate) const UT: usize = 256;
 
 pub struct Cpu {
     pub x: [u64; 31],
@@ -98,6 +99,8 @@ pub struct Cpu {
     pub crypto: bool,
     /// debugging: run the interpreter only (breakpoints and single steps see every instruction)
     pub jit_off: bool,
+    /// the interpreter is running a block that is not hot yet, up to its end
+    pub(crate) interp_run: bool,
     /// debugger watchpoints: (address, length, kind: 1 write, 2 read, 3 access); interpreter
     /// only (`jit_off`)
     pub watch: Vec<(u64, u64, u8)>,
@@ -146,7 +149,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
         }
     }
 
@@ -288,13 +291,21 @@ impl Core for Cpu {
     fn step(&mut self, bus: &mut dyn Bus) -> Result<(), Trap> {
         if self.irq || self.fiq {
             if let Some(t) = self.check_interrupts() {
+                self.interp_run = false;
                 return Err(t);
             }
         }
         if self.jit.is_some() && !self.jit_off {
-            if let Some(r) = self.jit_step(bus) {
-                return r;
+            if !self.interp_run {
+                if let Some(r) = self.jit_step(bus) {
+                    return r;
+                }
             }
+            // interpreting a cold block: until a branch (or an exception) leaves the straight line
+            let pc = self.pc;
+            let r = self.exec_one(bus);
+            if self.pc != pc.wrapping_add(4) || r.is_err() { self.interp_run = false; }
+            return r;
         }
         self.exec_one(bus)
     }

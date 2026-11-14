@@ -366,6 +366,24 @@ struct VOp { shift: u32, width: u32, count: u32 }
 
 /// Pure V-register FP/SIMD instructions: (operands, writes Rd). None = not handled natively
 /// (mixed general/vector register instructions, loads/stores, anything else).
+/// LD1/ST1 {Vt.<T>}, [Xn] or [Xn], #8/#16 with one register: on a little-endian machine the
+/// bytes land exactly as LDR/STR Qt (Dt for 64-bit vectors) of the same address would put them.
+fn ld1_as_ldr(i: u32) -> Option<u32> {
+    let (q, load, rn, rt) = (i >> 30 & 1, i >> 22 & 1 != 0, (i >> 5) & 31, i & 31);
+    let base = i & 0xbfbf_f000; // without Q, L
+    let (post, rm) = (i >> 23 & 1 != 0, (i >> 16) & 31);
+    if base == 0x0c00_7000 && !post {
+        // offset 0
+        return Some(match (q, load) { (1, true) => 0x3dc0_0000, (1, false) => 0x3d80_0000, (_, true) => 0xfd40_0000, (_, false) => 0xfd00_0000 } | (rn << 5) | rt);
+    }
+    if (i & 0xbfa0_f000) == 0x0c80_7000 && rm == 31 {
+        // post-index by the register size
+        let imm = if q == 1 { 16u32 } else { 8 };
+        return Some(match (q, load) { (1, true) => 0x3cc0_0400, (1, false) => 0x3c80_0400, (_, true) => 0xfc40_0400, (_, false) => 0xfc00_0400 } | (imm << 12) | (rn << 5) | rt);
+    }
+    None
+}
+
 fn simd_operands(i: u32) -> Option<(Vec<VOp>, bool)> {
     let v = |shift| VOp { shift, width: 5, count: 1 };
     let (d, n, m, a) = (v(0), v(5), v(16), v(10));
@@ -585,10 +603,16 @@ impl Cpu {
     /// None = not handled here: the caller interprets one instruction.
     pub(crate) fn jit_step(&mut self, bus: &mut dyn Bus) -> Option<Result<(), Trap>> {
         if self.pc & 3 != 0 { return None; }
-        // physical address of pc through the fetch micro-TLB (no fault taken here)
+        // physical address of pc through the fetch micro-TLB, filled here on a miss (a
+        // translation fault is left to the interpreter, which takes it)
         let tag = ((self.pc >> 12) + 1) | ((self.el as u64) << 60);
-        let e = self.utlb[0][(self.pc >> 12) as usize & (UT - 1)];
-        let pa = if e.0 == tag { e.1 | (self.pc & 0xfff) } else { return None };
+        let ti = (self.pc >> 12) as usize & (UT - 1);
+        if self.utlb[0][ti].0 != tag {
+            let pa = self.translate(bus, self.pc, crate::mmu::Access::Exec).ok()?;
+            if self.ram.is_null() || (pa | 0xfff) >= self.ram_len { return None; }
+            self.utlb[0][ti] = (tag, pa & !0xfff);
+        }
+        let pa = self.utlb[0][ti].1 | (self.pc & 0xfff);
         let k = (self.pc, key(pa, self.el, self.spsel, (self.sys.cpacr_el1 >> 20) & 3));
         let jit = self.jit.as_mut()?;
         let slot = ((self.pc ^ (self.pc >> 14)) as usize >> 2) & (FRONT - 1);
@@ -602,7 +626,12 @@ impl Cpu {
             let hs = ((self.pc ^ (self.pc >> 16)) as usize >> 2) & (HOTC - 1);
             let h = &mut jit.hotc[hs];
             if h.0 == k.0 && h.1 == k.1 { h.2 = h.2.saturating_add(1); } else { *h = (k.0, k.1, 1); }
-            if h.2 < jit.hot { return None; }
+            if h.2 < jit.hot {
+                // cold: the interpreter runs up to the end of this block (block starts alone
+                // count, so no overlapping blocks get compiled from mid-block pcs)
+                self.interp_run = true;
+                return None;
+            }
             if let Some(&f) = jit.blocks.get(&k) {
                 jit.front[slot] = (k.0, k.1, f as usize);
                 return self.jit_run(f, pa, k, bus);
@@ -840,6 +869,24 @@ impl Cpu {
                 }
                 natives += 1;
                 e.pending_native += 1;
+            } else if matches!(i & 0xffff_fc00, 0x9e66_0000 | 0x1e26_0000 | 0x9e67_0000 | 0x1e27_0000)
+                && (self.sys.cpacr_el1 >> 20) & 3 == 3 && v_off(&c, 31) + 16 < if i >> 31 != 0 { 32768 } else { 16384 } && e.reg_off(31) < 16384 {
+                // FMOV between the register files (64-bit X<->D, 32-bit W<->S): a plain move
+                let (rd, rn, x) = (i & 31, (i >> 5) & 31, i >> 31 != 0);
+                if i & 0x0001_0000 == 0 {
+                    // to a general register (zero-extended for W)
+                    if rd != 31 {
+                        e.out.push(if x { ldr_x(T[0], X_CPU, v_off(&c, rn) as usize) } else { ldr_w(T[0], X_CPU, v_off(&c, rn) as usize) });
+                        e.out.push(str_x(T[0], X_CPU, e.reg_off(rd)));
+                    }
+                } else {
+                    // to a SIMD&FP register: the rest of the vector is zeroed
+                    if rn == 31 { e.out.push(0xaa1f_03e0 | T[0]); } else if x { e.out.push(ldr_x(T[0], X_CPU, e.reg_off(rn))); } else { e.out.push(ldr_w(T[0], X_CPU, e.reg_off(rn))); }
+                    e.out.push(str_x(T[0], X_CPU, v_off(&c, rd) as usize));
+                    e.out.push(str_x(31, X_CPU, v_off(&c, rd) as usize + 8));
+                }
+                natives += 1;
+                e.pending_native += 1;
             } else if let Some(done) = if mask & 2 != 0 { self.emit_branch(&mut e, i, pc) } else { None } {
                 if done { natives += 1; ended = true; break; }
             } else if let Some((enc, map, writes)) = simd_operands(i)
@@ -856,6 +903,17 @@ impl Cpu {
                 }
                 natives += 1;
                 e.pending_native += 1;
+            } else if (i & 0xbfe0_fc00) == 0x0e00_0c00 && (i >> 16) & 0xf != 0 && !((i >> 16) & 0xf == 8 && i & (1 << 30) == 0)
+                && (self.sys.cpacr_el1 >> 20) & 3 == 3 && v_off(&c, 31) < 65536 {
+                // DUP Vd.<T>, Wn/Xn: the host's own DUP from a scratch register into v0
+                let (rd, rn) = (i & 31, (i >> 5) & 31);
+                if rn == 31 { e.out.push(0xaa1f_03e0 | T[0]); } else { e.out.push(ldr_x(T[0], X_CPU, e.reg_off(rn))); }
+                e.out.push((i & !0x3ff) | (T[0] << 5)); // dup v0.<T>, w9/x9
+                e.out.push(0x3d80_0000 | ((v_off(&c, rd) / 16) << 10) | (X_CPU << 5)); // str q0, [cpu.v[rd]]
+                natives += 1;
+                e.pending_native += 1;
+            } else if ld1_as_ldr(i).is_some_and(|w| self.emit_ldst(&mut e, w, pc)) {
+                // LD1/ST1 of one register: the same access as LDR/STR of a Q or D register
             } else if self.emit_ldst(&mut e, i, pc) {
                 // native load/store with an interpreter slow path
             } else {
@@ -988,6 +1046,7 @@ impl Cpu {
     /// LDP/STP/LDPSW: a micro-TLB fast path on guest RAM, the interpreter otherwise.
     fn emit_ldst(&self, e: &mut Emit, i: u32, pc: u64) -> bool {
         if self.ram.is_null() { return false; }
+        if i & 0xffff_ffe0 == 0xd50b_7420 { return self.emit_dc_zva(e, i, pc); }
         // ---- decode into (base, address computation, size, kind, writeback, pair)
         enum Addr { Imm(i64), Reg(u32, u32, u32) } // Reg(rm, option, shift)
         let rt = i & 31;
@@ -1010,7 +1069,8 @@ impl Cpu {
                 let imm = ((bits(i, 20, 12) as i64) << 55) >> 55;
                 match bits(i, 11, 10) { 0 => { addr = Addr::Imm(imm); mode = 0; } 1 => { addr = Addr::Imm(imm); mode = 1; } 3 => { addr = Addr::Imm(imm); mode = 2; } _ => return false }
             }
-        } else if vec && bits(i, 29, 27) == 0b101 && !bit(i, 25) && bits(i, 24, 23) != 0 {
+        } else if vec && bits(i, 29, 27) == 0b101 && !bit(i, 25) {
+            // LDP/STP, and LDNP/STNP (bits 24:23 = 00: an offset access with a cache hint)
             let sz = match bits(i, 31, 30) { 0 => 2, 1 => 3, 2 => 4, _ => return false };
             size = 1 << sz; load = bit(i, 22); signed_to = 0; pair = true; rt2 = bits(i, 14, 10);
             addr = Addr::Imm((((bits(i, 21, 15) as i64) << 57) >> 57) << sz);
@@ -1032,9 +1092,10 @@ impl Cpu {
                 let imm = ((bits(i, 20, 12) as i64) << 55) >> 55;
                 match bits(i, 11, 10) { 0 => { addr = Addr::Imm(imm); mode = 0; } 1 => { addr = Addr::Imm(imm); mode = 1; } 3 => { addr = Addr::Imm(imm); mode = 2; } _ => return false }
             }
-        } else if bits(i, 29, 27) == 0b101 && !bit(i, 26) && !bit(i, 25) && bits(i, 24, 23) != 0 {
+        } else if bits(i, 29, 27) == 0b101 && !bit(i, 26) && !bit(i, 25) {
             let opc = bits(i, 31, 30);
             let ld = bit(i, 22);
+            if bits(i, 24, 23) == 0 && opc == 1 { return false; } // no LDNPSW
             let (sz, st) = match (opc, ld) { (0, _) => (2, 0), (1, true) => (2, 64), (2, _) => (3, 0), _ => return false };
             size = 1 << sz; load = ld; signed_to = st; pair = true; rt2 = bits(i, 14, 10);
             let imm = (((bits(i, 21, 15) as i64) << 57) >> 57) << sz;
@@ -1148,6 +1209,48 @@ impl Cpu {
             let w = e.out[b];
             e.out[b] = if w & 0x7e00_0000 == 0x3600_0000 { w | ((off & 0x3fff) << 5) } else { w | ((off & 0x7ffff) << 5) };
         }
+        let ended = emit_interp(e, i, pc);
+        debug_assert!(!ended);
+        let done = e.out.len();
+        e.out[skip_at] |= ((done - skip_at) as u32) & 0x3ff_ffff;
+        true
+    }
+}
+
+impl Cpu {
+    /// DC ZVA, Xt: zero the 64-byte block holding Xt (DCZID_EL0 = 4), with the micro-TLB
+    /// fast path of a store and the interpreter as the slow path.
+    fn emit_dc_zva(&self, e: &mut Emit, i: u32, pc: u64) -> bool {
+        if self.jit.as_ref().is_some_and(|j| j.verify) { return false; } // verify mode logs stores in the interpreter
+        let rt = i & 31;
+        let c = e.c;
+        let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
+        e.count_pending();
+        if rt == 31 { e.out.push(0xaa1f_03e0 | vreg); } else { e.out.push(ldr_x(vreg, X_CPU, e.reg_off(rt))); }
+        e.out.push(0x9240_0000 | (58 << 16) | (57 << 10) | (vreg << 5) | vreg); // and x13, x13, #~63
+        let mut slow: Vec<usize> = Vec::new();
+        let ent = c.off_utlb + 16 * UT * 2;
+        e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
+        e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
+        e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
+        e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
+        if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
+        e.out.push(ldr_x(tmp2, 17, ent));
+        e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
+        slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow
+        e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
+        slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow (reservation held)
+        e.out.push(0x9240_2c00 | (vreg << 5) | tmp2); // and x15, x13, #0xfff
+        e.out.push(ldr_x(tmp, 17, ent + 8)); // physical page
+        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // add x14, x14, x15
+        e.out.push(ldr_x(tmp2, X_CPU, c.off_ram));
+        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // x14 = host address
+        for k in 0..4u32 { e.out.push(0xa900_0000 | ((2 * k) << 15) | (31 << 10) | (tmp << 5) | 31); } // stp xzr, xzr, [x14, #16k]
+        e.out.push(0x9100_0400 | (X_COUNT << 5) | X_COUNT); // add x20, x20, #1
+        let skip_at = e.out.len();
+        e.out.push(0x1400_0000); // b done (patched)
+        let slow_at = e.out.len();
+        for b in slow { let off = (slow_at - b) as u32; e.out[b] |= (off & 0x7ffff) << 5; }
         let ended = emit_interp(e, i, pc);
         debug_assert!(!ended);
         let done = e.out.len();
