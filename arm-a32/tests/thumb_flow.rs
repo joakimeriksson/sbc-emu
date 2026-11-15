@@ -76,3 +76,53 @@ fn data_abort_in_thumb_reports_address_plus_8() {
     assert_eq!(cpu.r[14], 0x2008);
     assert_eq!(cpu.cpsr & (1 << 5), 0, "handlers run in ARM state");
 }
+
+fn thumb_machine(halfwords: &[u16]) -> (Cpu, FlatRam) {
+    let mut ram = FlatRam::new(0, 0x10000);
+    for (i, hw) in halfwords.iter().enumerate() {
+        ram.write16(0x2000 + i as u64 * 2, *hw).unwrap();
+    }
+    let mut cpu = Cpu::new();
+    cpu.r[15] = 0x2000;
+    cpu.cpsr |= 1 << 5;
+    (cpu, ram)
+}
+
+#[test]
+fn thumb_neon_is_undefined_not_a_supervisor_call() {
+    // vorr q8, q9, q9 (0xef62 0x01f2): its A32 rendering 0xEF... would be SVC.
+    let (mut cpu, mut ram) = thumb_machine(&[0xef62, 0x01f2]);
+    assert!(matches!(cpu.step(&mut ram), Err(Trap::Unimplemented(0x2000, _))));
+    assert_eq!(cpu.cpsr & 0x1f, MODE_SVC);
+    cpu.undef_to_guest = true;
+    assert!(matches!(cpu.step(&mut ram), Err(Trap::Exception(0, _))));
+    assert_eq!(cpu.r[15], 0x04, "undefined-instruction vector, not the SVC vector");
+    assert_eq!(cpu.r[14], 0x2002, "Thumb UNDEFINED: LR = address + 2");
+}
+
+#[test]
+fn svc_inside_an_it_block_saves_the_advanced_it_state() {
+    // itt eq; svceq #1; moveq r0, #5 with Z set.
+    let (mut cpu, mut ram) = thumb_machine(&[0xbf04, 0xdf01, 0x2005]);
+    cpu.cpsr |= 1 << 30;
+    cpu.step(&mut ram).unwrap();
+    assert!(matches!(cpu.step(&mut ram), Err(Trap::Exception(..))));
+    assert_eq!(cpu.r[14], 0x2004);
+    assert_eq!(cpu.spsr() & 0x0600_fc00, 0x0800, "one IT slot (moveq) left");
+}
+
+#[test]
+fn thumb_ldrexd_strexd_accept_any_register_pair() {
+    // ldrexd r1, r4, [r0]; strexd r2, r1, r4, [r0]
+    let (mut cpu, mut ram) = thumb_machine(&[0xe8d0, 0x147f, 0xe8c0, 0x1472]);
+    cpu.r[0] = 0x3000;
+    ram.write32(0x3000, 0x1111_1111).unwrap();
+    ram.write32(0x3004, 0x2222_2222).unwrap();
+    cpu.step(&mut ram).unwrap();
+    assert_eq!((cpu.r[1], cpu.r[4]), (0x1111_1111, 0x2222_2222));
+    cpu.r[1] = 0xaaaa_aaaa;
+    cpu.r[4] = 0xbbbb_bbbb;
+    cpu.step(&mut ram).unwrap();
+    assert_eq!(cpu.r[2], 0, "store-exclusive succeeded");
+    assert_eq!(ram.read64(0x3000).unwrap(), 0xbbbb_bbbb_aaaa_aaaa);
+}

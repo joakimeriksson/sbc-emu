@@ -35,6 +35,8 @@ pub struct Cpu {
     pub(crate) cur_size: u32,
     /// Set by any PC write while executing a Thumb instruction.
     pub(crate) pc_written: bool,
+    /// Set when an instruction restored CPSR from SPSR (exception return).
+    pub(crate) psr_restored: bool,
     /// The event register (WFE/SEV).
     pub event: bool,
     /// Set by SEV; the machine delivers the event to the other cores and clears it.
@@ -109,6 +111,7 @@ impl Cpu {
             cur_pc: 0,
             cur_size: 4,
             pc_written: false,
+            psr_restored: false,
             sent_event: false,
             firmware_calls_to_host: false,
             midr: 0x410f_c075,
@@ -248,7 +251,9 @@ impl Cpu {
     }
 
     fn read_reg(&self, n: u32) -> u32 {
-        // execute() has already advanced r15 by four: architectural reads see old PC + 8.
+        // ARM: execute() has already advanced r15 by four, so reads see the instruction
+        // address + 8. Thumb: r15 holds the instruction address while it executes, so
+        // reads see address + 4. Never compute PC-relative values from self.r[15] directly.
         if n == 15 {
             self.r[15].wrapping_add(4)
         } else {
@@ -333,11 +338,11 @@ impl Cpu {
         true
     }
 
-    pub(crate) fn restore_spsr(&mut self) -> bool {
+    pub(crate) fn restore_spsr(&mut self) {
         let restored = self.banked_spsr[Self::bank(self.cpsr)];
         self.change_mode(restored & 0x1f);
         self.cpsr = restored;
-        true
+        self.psr_restored = true;
     }
 
     /// BranchWritePC: stay in the current instruction set.
@@ -416,7 +421,10 @@ impl Cpu {
         self.change_mode(mode);
         self.banked_spsr[Self::bank(mode)] = old;
         self.r[14] = return_addr;
-        self.cpsr = (self.cpsr & !(T | F | 0x0600_fc00)) | I | if mask_fiq { F } else { 0 };
+        // Handlers run in Thumb state when SCTLR.TE is set (Thumb-2 kernels).
+        let thumb_handlers = if self.sctlr & (1 << 30) != 0 { T } else { 0 };
+        self.cpsr = (self.cpsr & !(T | F | 0x0600_fc00)) | I | thumb_handlers
+            | if mask_fiq { F } else { 0 };
         self.pc_written = true;
         let base = if self.sctlr & (1 << 13) != 0 {
             0xffff_0000

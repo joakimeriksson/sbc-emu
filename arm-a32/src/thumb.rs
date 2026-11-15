@@ -56,29 +56,34 @@ impl Cpu {
         }
     }
 
-    fn fetch16(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u32, Trap> {
-        let pa = match self.translate(bus, va, Access::Execute) {
-            Ok(pa) => pa,
-            Err((va, status)) => return Err(self.prefetch_abort(va, status)),
-        };
-        match bus.read16(pa as u64) {
-            Ok(value) => Ok(value as u32),
-            Err(_) => Err(self.prefetch_abort(va, 0x08)),
-        }
+    fn fetch_pa(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u32, Trap> {
+        self.translate(bus, va, Access::Execute)
+            .map_err(|(va, status)| self.prefetch_abort(va, status))
+    }
+
+    fn read_code16(&mut self, bus: &mut dyn Bus, va: u32, pa: u32) -> Result<u32, Trap> {
+        bus.read16(pa as u64)
+            .map(u32::from)
+            .map_err(|_| self.prefetch_abort(va, 0x08))
     }
 
     /// Fetch, decode and execute one Thumb instruction at `pc`.
     pub(crate) fn step_thumb(&mut self, bus: &mut dyn Bus, pc: u32) -> Result<(), Trap> {
         self.cur_size = 2;
-        let hw1 = self.fetch16(bus, pc)?;
+        let pa = self.fetch_pa(bus, pc)?;
+        let hw1 = self.read_code16(bus, pc, pa)?;
         let wide = hw1 >> 11 >= 0b11101;
         let insn = if wide {
             self.cur_size = 4;
-            hw1 << 16 | self.fetch16(bus, pc.wrapping_add(2))?
+            let next = pc.wrapping_add(2);
+            // Both halfwords come from one translation unless they straddle a page.
+            let pa2 = if pc & 0xfff == 0xffe { self.fetch_pa(bus, next)? } else { pa + 2 };
+            hw1 << 16 | self.read_code16(bus, next, pa2)?
         } else {
             hw1
         };
         self.r[15] = pc; // A32-path PC reads see pc + 4
+        self.psr_restored = false;
         let it = self.it_state();
         let mut is_it = false;
         let result = if it & 0xf != 0 && !self.condition(it >> 4) {
@@ -91,7 +96,12 @@ impl Cpu {
         if !self.pc_written {
             self.r[15] = pc.wrapping_add(self.cur_size);
         }
-        if !is_it && !matches!(result, Err(Trap::Exception(..)) | Err(Trap::Unimplemented(..))) {
+        // No ITAdvance for IT itself, after an exception (SPSR holds the state), or after
+        // an exception return (the restored state belongs to the interrupted code).
+        if !is_it
+            && !self.psr_restored
+            && !matches!(result, Err(Trap::Exception(..)) | Err(Trap::Unimplemented(..)))
+        {
             self.it_advance();
         }
         self.finish(pc, insn, result)
@@ -251,7 +261,13 @@ impl Cpu {
                 let cond = (hw >> 8) & 15;
                 return match cond {
                     14 => self.undefined(hw),
-                    15 => self.a32(bus, 0x0f00_0000 | imm8), // SVC
+                    15 => {
+                        // SVC returns to the next instruction: ITSTATE advances before
+                        // the CPSR is saved in SPSR_svc.
+                        self.it_advance();
+                        *is_it = true;
+                        self.a32(bus, 0x0f00_0000 | imm8)
+                    }
                     _ => {
                         if self.condition(cond) {
                             let target = self.pc_value().wrapping_add(sign_extend(imm8 << 1, 9));
@@ -387,11 +403,13 @@ impl Cpu {
                 if op2 & 0x60 == 0x20 {
                     return self.thumb32_dp_shifted(bus, hw1, hw2);
                 }
-                // Coprocessor, including VFP: the A32 encoding with an AL condition.
-                if hw1 & 0x1000 == 0 {
-                    return self.a32(bus, insn);
+                // Coprocessor space (VFP, CP15, CP14): the A32 encoding with an AL
+                // condition. 111x 1111 is Advanced SIMD data processing: UNDEFINED here
+                // (no NEON), and it must not reach the A32 path, where 0xEFxxxxxx is SVC.
+                if hw1 & 0x0300 == 0x0300 {
+                    return self.undefined(insn);
                 }
-                self.undefined(insn)
+                self.a32(bus, insn)
             }
             2 => {
                 if hw2 & 0x8000 != 0 {
@@ -545,7 +563,23 @@ impl Cpu {
                 match (hw2 >> 4) & 15 {
                     4 => self.a32(bus, 0x01c0_0f90 | rn << 16 | status << 12 | rt),
                     5 => self.a32(bus, 0x01e0_0f90 | rn << 16 | status << 12 | rt),
-                    7 if rt & 1 == 0 && rd == rt + 1 => self.a32(bus, 0x01a0_0f90 | rn << 16 | status << 12 | rt),
+                    7 => {
+                        // STREXD: T32 allows any Rt/Rt2 pair (A32 needs an even pair).
+                        let address = self.r[rn as usize];
+                        let reserved =
+                            self.exclusive_addr == Some(address) && self.exclusive_size == 8;
+                        self.exclusive_addr = None;
+                        self.exclusive_size = 0;
+                        if !reserved {
+                            self.r[status as usize] = 1;
+                            return Ok(());
+                        }
+                        let (a, b) = (self.r[rt as usize], self.r[rd as usize]);
+                        self.store(bus, address, 4, a)?;
+                        self.store(bus, address.wrapping_add(4), 4, b)?;
+                        self.r[status as usize] = 0;
+                        Ok(())
+                    }
                     _ => self.undefined(insn),
                 }
             }
@@ -571,7 +605,25 @@ impl Cpu {
                 }
                 4 => self.a32(bus, 0x01d0_0f9f | rn << 16 | rt << 12),
                 5 => self.a32(bus, 0x01f0_0f9f | rn << 16 | rt << 12),
-                7 if rt & 1 == 0 && rd == rt + 1 => self.a32(bus, 0x01b0_0f9f | rn << 16 | rt << 12),
+                7 => {
+                    // LDREXD: any Rt/Rt2 pair.
+                    let address = self.r[rn as usize];
+                    let first = self.mem_read32(bus, address, Access::Read);
+                    let second =
+                        first.and_then(|_| self.mem_read32(bus, address.wrapping_add(4), Access::Read));
+                    match (first, second) {
+                        (Ok(a), Ok(b)) => {
+                            self.r[rt as usize] = a;
+                            self.r[rd as usize] = b;
+                            self.exclusive_addr = Some(address);
+                            self.exclusive_size = 8;
+                            Ok(())
+                        }
+                        (Err((va, status)), _) | (_, Err((va, status))) => {
+                            Err(self.data_abort(va, status, false))
+                        }
+                    }
+                }
                 _ => self.undefined(insn),
             },
             _ => {

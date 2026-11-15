@@ -477,7 +477,7 @@ impl Cpu {
         );
         let rn = ((insn >> 16) & 0xf) as usize;
         let imm8 = insn & 0xff;
-        let undefined = Err(Trap::Unimplemented(self.r[15] as u64 - 4, insn));
+        let undefined = Err(Trap::Unimplemented(self.cur_pc as u64, insn));
         let base = if rn == 15 { self.r[15].wrapping_add(4) & !3 } else { self.r[rn] };
 
         // VLDR/VSTR
