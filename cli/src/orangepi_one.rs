@@ -42,7 +42,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd"])?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel zImage is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb sun8i-h3-orangepi-one.dtb is required")?)?;
@@ -53,8 +53,14 @@ fn execute(args: &[String]) -> Result<(), String> {
         return Err("--ram-mb must be between 1 and 2048 (the H3 maps up to 2 GiB of DRAM)".into());
     }
     let config = RunConfig::from_args("orangepi-one", args)?;
+    // The SD card survives guest reboots (one disk shared by the successive machines).
+    let persist = args.iter().any(|a| a == "--sd-persist");
+    let disk = arg(args, "--sd")
+        .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
+        .transpose()?;
     let make_machine = || -> Result<allwinner_h3::Machine, String> {
         let mut m = allwinner_h3::Machine::with_ram_size(ram);
+        m.soc.mmc.card.disk = disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         allwinner_h3::boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), cmdline)?;
         Ok(m)
     };
