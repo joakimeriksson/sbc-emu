@@ -51,7 +51,7 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
         if end>m.soc.ram.len() as u64 {return Err("initrd exceeds RAM".into());}
         m.soc.ram[INITRD as usize..end as usize].copy_from_slice(data);Some((INITRD,end))
     }else{None};
-    let dt=device_tree(m.soc.ram.len() as u64,cmdline,range,m.soc.mmc.disk.is_some());
+    let dt=device_tree(m.soc.ram.len() as u64,cmdline,range,m.soc.mmc.card.present());
     if DTB+dt.len() as u64>INITRD {return Err("device tree exceeds boot layout".into());}
     m.soc.ram[DTB as usize..DTB as usize+dt.len()].copy_from_slice(&dt);
     m.cpu.el=1; m.cpu.spsel=true; m.cpu.daif=0x3c0;m.cpu.pc=entry;

@@ -252,7 +252,6 @@ bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2, PCIe + xHCI, USB
             GENET, device tree, boot, FAT
 rk3588/     the experimental Orange Pi 5 machine (RK3588S): GICv3, UART2, timer
 sbc-machine/ the board catalogue and the host-facing machine layer the boards share
-boards/     board descriptions
 sbc-net/    virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP (from esp32sim)
 cli/        the sbc-emu command
 wasm/       C ABI for the browser; web/ is the page and worker

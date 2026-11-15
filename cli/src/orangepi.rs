@@ -10,6 +10,8 @@ impl emu_core::disk::Disk for SharedDisk {
     fn read(&mut self,lba:u64,out:&mut [u8]) { self.0.borrow_mut().read(lba,out); }
     fn write(&mut self,lba:u64,data:&[u8]) { self.0.borrow_mut().write(lba,data); }
     fn overlay(&self)->Vec<(u64,Vec<u8>)> { self.0.borrow().overlay() }
+    fn restore_overlay(&mut self,sectors:Vec<(u64,Vec<u8>)>) { self.0.borrow_mut().restore_overlay(sectors); }
+    fn snapshots_disk(&self)->bool { self.0.borrow().snapshots_disk() }
 }
 
 impl SerialBoard for rk3588::Machine {
@@ -46,7 +48,7 @@ fn execute(args:&[String])->Result<(),String> {
     }
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::new(ram)?;
-        m.soc.mmc.disk=disk.as_ref().map(|d|Box::new(SharedDisk(d.clone())) as Box<dyn emu_core::disk::Disk>);
+        m.soc.mmc.card.disk=disk.as_ref().map(|d|Box::new(SharedDisk(d.clone())) as Box<dyn emu_core::disk::Disk>);
         rk3588::boot::boot_linux(&mut m,&kernel,initrd.as_deref(),cmdline)?;
         if !args.iter().any(|a|a=="--no-jit") {m.cpu.enable_jit();}
         Ok(m)

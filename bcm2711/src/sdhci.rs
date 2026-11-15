@@ -37,22 +37,8 @@ pub trait SdioCard {
     fn load_state(&mut self, _r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> { Ok(()) }
 }
 
-/// A RAM disk (tests, small images).
-pub struct MemDisk(pub Vec<u8>);
-impl Disk for MemDisk {
-    fn sectors(&self) -> u64 { self.0.len() as u64 / 512 }
-    fn read(&mut self, lba: u64, out: &mut [u8]) {
-        let o = (lba * 512) as usize;
-        let end = (o + out.len()).min(self.0.len());
-        out.fill(0);
-        if o < end { out[..end - o].copy_from_slice(&self.0[o..end]); }
-    }
-    fn write(&mut self, lba: u64, data: &[u8]) {
-        let o = (lba * 512) as usize;
-        let end = (o + data.len()).min(self.0.len());
-        if o < end { self.0[o..end].copy_from_slice(&data[..end - o]); }
-    }
-}
+/// A RAM disk (tests, small images): the shared one.
+pub use emu_core::disk::MemDisk;
 
 // normal interrupt status bits
 const INT_CMD_DONE: u32 = 1 << 0;
@@ -560,6 +546,9 @@ impl Sdhci {
         w.bool(self.special.is_some()); w.bytes(self.special.as_deref().unwrap_or(&[]));
         w.opt_u32(self.pre_count);
         if let Some(c) = self.sdio.as_ref() { c.save_state(w); }
+        if self.disk.as_ref().is_some_and(|d| !d.snapshots_disk()) {
+            eprintln!("[sd] snapshot does not include the SD card: --sd-persist writes go to the image");
+        }
         let ov = self.disk.as_ref().map(|d| d.overlay()).unwrap_or_default();
         w.u64(ov.len() as u64);
         for (lba, data) in ov { w.u64(lba); w.bytes(&data); }
@@ -575,10 +564,18 @@ impl Sdhci {
         self.pre_count = r.opt_u32()?;
         if let Some(c) = self.sdio.as_mut() { c.load_state(r)?; }
         let n = r.u64()?;
+        // `n` comes from the snapshot: no pre-allocation from an untrusted count.
+        let mut sectors = Vec::new();
         for _ in 0..n {
             let lba = r.u64()?;
-            let data = r.bytes()?;
-            if let Some(d) = self.disk.as_mut() { d.write(lba, data); }
+            sectors.push((lba, r.bytes()?.to_vec()));
+        }
+        // Exactly the snapshot's sectors: writes made after it was taken are dropped.
+        if let Some(d) = self.disk.as_mut() {
+            if !d.snapshots_disk() {
+                eprintln!("[sd] restored snapshot without the SD card's state: --sd-persist writes go to the image");
+            }
+            d.restore_overlay(sectors);
         }
         Ok(())
     }
