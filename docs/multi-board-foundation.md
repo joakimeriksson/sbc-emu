@@ -136,8 +136,19 @@ reservation (as on the Pi 4 model). WFE/SEV use the event register: without it, 
 waiting for a spinlock slept until the next timer tick and the four-core boot stalled.
 SGIs are permanently enabled, as on the GIC-400: with them disabled no IPI was delivered.
 
+**Thumb-2 (follow-up PR).** T32 with IT blocks and interworking (BX/BLX, LDR/LDM/POP
+of the PC, ARM-state ALU writes, BLX immediate both ways). Most encodings are translated
+to the A32 instruction and run by the A32 path; branches, IT, PC-relative forms, modified
+immediates, ORN, 12-bit offsets, LDRD with any pair and TBB/TBH run natively.
+`arm-a32/tests/thumb_diff.rs` runs 152 instructions (and equivalent sequences for the
+Thumb-only forms) assembled for both sets by `arm-none-eabi-as` from 64 random states
+each and requires identical registers, flags and memory; `thumb_flow.rs` runs a linked
+ARM/Thumb program. One kernel-visible detail: the UNDEFINED return address in Thumb state
+is the instruction + 2 even for 32-bit encodings (Linux reads the halfwords at LR - 2 and
+LR); with + 4 the lazy VFP enable failed and Thumb programs died with SIGILL.
+
 **Not yet.** SD/MMC, EMAC, USB, display,
-Thumb-2 and NEON (both needed for Debian/Armbian armhf userlands and the RK3288 plan),
+NEON (Armbian userlands and the panel board application),
 a JIT, snapshots and the browser build. The RK3288 / panel board work builds on `arm-a32`;
 `arm-a32` needs a per-board CPU identity (MIDR, cache and feature ID registers) before a
 second board uses it.

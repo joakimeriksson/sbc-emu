@@ -65,7 +65,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(
-        "[orangepi-one] experimental Allwinner H3: one Cortex-A7 (interpreter), GIC-400, UART0, timers; \
+        "[orangepi-one] experimental Allwinner H3: four Cortex-A7s (interpreter, A32 + Thumb-2 + VFPv4), GIC-400, UART0, timers; \
          direct kernel boot with the distribution DTB, PSCI by the host; other devices are stubs"
     );
     serial_board::run(config, make_machine)
