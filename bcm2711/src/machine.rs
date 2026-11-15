@@ -542,6 +542,11 @@ impl Machine {
         cpu.firmware_calls_to_host = true;
         cpu.ram = self.soc.ram.as_mut_ptr();
         cpu.ram_len = self.soc.ram.len() as u64;
+        // one compiled-pages map for all cores (IC IVAU broadcasts only where code was compiled)
+        cpu.code_pages = Some(match self.cpus.first().and_then(|c| c.code_pages.clone()) {
+            Some(m) => m,
+            None => Cpu::code_page_map(cpu.ram_len),
+        });
         cpu
     }
 

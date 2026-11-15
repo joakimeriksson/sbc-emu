@@ -272,10 +272,10 @@ impl Sdhci {
             (_, 16) => r1(self),
             (_, 12) => { self.xfer = Xfer::None; self.raise(INT_XFER_DONE); r1(self) }
             (false, 23) => { self.pre_count = Some(arg); r1(self) }
-            // erase: CMD32/CMD33 set the first and last block, CMD38 (R1b) erases. Linux only
-            // erases to discard (TRIM), after which the data is undefined, so the blocks keep
-            // their contents. Sent with a busy response (R1b), the end of busy is the transfer-
-            // complete interrupt, at once; sent as plain R1, Linux polls CMD13 instead.
+            // erase: CMD32/CMD33 set the first and last block, CMD38 (R1b) erases. Linux uses it
+            // for discard only (the queue's write_zeroes_max_bytes is 0), after which the data is
+            // undefined: the blocks keep their contents. Sent with a busy response (R1b), the end
+            // of busy is the transfer-complete interrupt, at once; as plain R1, Linux polls CMD13.
             (false, 32) | (false, 33) => r1(self),
             (false, 38) => { if resp_ty == 3 { self.raise(INT_XFER_DONE); } r1(self) }
             (false, 6) => {

@@ -500,8 +500,13 @@ fn run(args: &[String]) -> ExitCode {
         result, m.cpu().pc, m.instret(), m.now as f64 / 1e9, started.elapsed().as_secs_f64(), m.exceptions, m.irqs);
     if let Some(g) = m.soc.v3d.as_ref() { eprintln!("[sbc-emu] gpu: {}", g.stats()); }
     if let Some(j) = m.jit() {
-        eprintln!("[sbc-emu] jit: {} blocks compiled, {} links, {} flushes; {} block runs, {:.1} instructions per run, {:.0}% of instructions in blocks",
-            j.compiled, j.linked, j.flushes, j.execs, j.exec_insns as f64 / j.execs.max(1) as f64, 100.0 * j.exec_insns as f64 / m.instret().max(1) as f64);
+        // every core has its own JIT (one per host thread with --threads multi): sum them
+        let js: Vec<&arm_a64::jit::Jit> = m.cpus.iter().filter_map(|c| c.jit.as_deref()).collect();
+        let sum = |f: fn(&arm_a64::jit::Jit) -> u64| js.iter().map(|j| f(j)).sum::<u64>();
+        let (execs, insns) = (sum(|j| j.execs), sum(|j| j.exec_insns));
+        eprintln!("[sbc-emu] jit ({} cores): {} blocks compiled, {} links, {} flushes ({} with the cache full), {} pages invalidated ({} blocks); {} block runs, {:.1} instructions per run, {:.0}% of instructions in blocks",
+            js.len(), sum(|j| j.compiled), sum(|j| j.linked), sum(|j| j.flushes), sum(|j| j.full_flushes), sum(|j| j.inval_pages), sum(|j| j.inval_blocks), execs,
+            insns as f64 / execs.max(1) as f64, 100.0 * insns as f64 / m.instret().max(1) as f64);
         if j.verify { eprintln!("[sbc-emu] jit verify ({} stale blocks skipped): {}", j.stale_skips, j.report.as_deref().unwrap_or("no mismatch")); }
     }
     if arm_a64::jit::PROFILE.load(std::sync::atomic::Ordering::Relaxed) {

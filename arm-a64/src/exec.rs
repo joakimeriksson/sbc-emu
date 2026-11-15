@@ -190,11 +190,15 @@ impl Cpu {
         unpriv: bool,
     ) -> Result<u128, Trap> {
         if !self.watch.is_empty() { self.watch_check(va, size, 2); }
-        if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
-            let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
+        // unprivileged (LDTR) at EL1 goes through the EL0 entries, which exist only for pages EL0
+        // may read, while they belong to the current ASID (see `utlb_unpriv`)
+        let fast = !unpriv || (self.el <= 1 && self.utlb_unpriv == 0);
+        if fast && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
+            let el = if unpriv { 0 } else { self.el as u64 };
+            let tag = ((va >> 12) + 1) | (el << 60);
             let ti = (va >> 12) as usize & (UT - 1);
             if self.utlb[1][ti].0 != tag {
-                let pa = self.pa(bus, va, Access::Read)?;
+                let pa = self.pa(bus, va, if unpriv { Access::ReadUnpriv } else { Access::Read })?;
                 if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
                     return self.load_slow(bus, va, size, unpriv);
                 }
@@ -265,11 +269,13 @@ impl Cpu {
         unpriv: bool,
     ) -> Result<(), Trap> {
         if !self.watch.is_empty() { self.watch_check(va, size, 1); }
-        if !unpriv && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
-            let tag = ((va >> 12) + 1) | ((self.el as u64) << 60);
+        let fast = !unpriv || (self.el <= 1 && self.utlb_unpriv == 0);
+        if fast && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
+            let el = if unpriv { 0 } else { self.el as u64 };
+            let tag = ((va >> 12) + 1) | (el << 60);
             let ti = (va >> 12) as usize & (UT - 1);
             if self.utlb[2][ti].0 != tag {
-                let pa = self.pa(bus, va, Access::Write)?;
+                let pa = self.pa(bus, va, if unpriv { Access::WriteUnpriv } else { Access::Write })?;
                 if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
                     return self.store_slow(bus, va, size, v, unpriv);
                 }
@@ -796,6 +802,8 @@ impl Cpu {
                 } else if op1 == 3 && crm == 5 && op2 == 1 {
                     let va = self.xr(rt);
                     let page = match self.translate(bus, va, Access::Read) { Ok(pa) => pa >> 12, Err(_) => u64::MAX };
+                    // nothing was ever compiled from this page, on any core: nothing to drop
+                    if page != u64::MAX && !self.code_page_used(page) { return Ok(()); }
                     self.jit_invalidate(page);
                     self.ic_bcast = Some(match self.ic_bcast { Some(p) if p != page => u64::MAX, _ => page });
                 }

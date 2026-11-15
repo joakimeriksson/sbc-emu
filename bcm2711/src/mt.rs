@@ -43,9 +43,12 @@ pub(crate) struct Shared {
     /// published interrupt inputs per core: bit 0 IRQ
     lines: Vec<AtomicU8>,
     state: Vec<AtomicU8>,
-    /// queued invalidations per core: (TLB?, operand)
-    inval: Mutex<Vec<Vec<(bool, u64)>>>,
+    /// queued invalidations per core, each behind its own lock: (TLB?, operand)
+    inval: Vec<Mutex<Vec<(bool, u64)>>>,
     has_inval: Vec<AtomicBool>,
+    /// per core: invalidations queued for it so far (a broadcaster's ticket) and applied so far
+    queued: Vec<AtomicU64>,
+    applied: Vec<AtomicU64>,
     /// the first stop a core ran into (reset, power off, unimplemented, ...)
     event: Mutex<Option<Stop>>,
     soc: AtomicPtr<Soc>,
@@ -56,9 +59,6 @@ pub(crate) struct Shared {
     offset: AtomicI64,
     exceptions: AtomicU64,
     irqs: AtomicU64,
-    /// invalidation broadcasts so far, and the last one each core has applied
-    inval_seq: AtomicU64,
-    seen: Vec<AtomicU64>,
     /// each core's `chain_until` (other threads store 0 to kick it out of a compiled chain)
     kick: Vec<AtomicPtr<u64>>,
     /// core k is executing (in `run_core`)
@@ -97,20 +97,36 @@ impl Shared {
         self.cv.notify_all();
     }
 
-    /// TLBI or IC from core `from`: the other cores apply it before `from` goes on (as the
-    /// guest's DSB guarantees). Cores that are not executing apply it before they next run.
+    /// TLBI or IC from core `from`, for the other cores. A TLBI is applied by every executing
+    /// core before `from` goes on (as the guest's DSB guarantees); an IC invalidation when each
+    /// next leaves its compiled chain. Cores that are not executing apply both before they run.
     fn broadcast(&self, from: usize, tlb: bool, op: u64, cpu: &mut Cpu) {
-        let seq = {
-            let mut q = self.inval.lock().unwrap_or_else(|e| e.into_inner());
-            for (j, v) in q.iter_mut().enumerate() {
-                if j != from { v.push((tlb, op)); self.has_inval[j].store(true, SeqCst); }
+        // a ticket per target: its queue position, taken under that core's lock
+        let mut tickets = [0u64; 4];
+        for j in 0..self.ncpu {
+            if j == from { continue; }
+            let mut q = self.inval[j].lock().unwrap_or_else(|e| e.into_inner());
+            q.push((tlb, op));
+            tickets[j] = self.queued[j].fetch_add(1, SeqCst) + 1;
+            self.has_inval[j].store(true, SeqCst);
+        }
+        // instruction cache: another core needs the new code only after its own context
+        // synchronization (an ISB, an exception entry or return). It is kicked out of its
+        // compiled chain and applies the queue at the next block boundary; nobody waits for
+        // that. Only TLBI waits (the guest's DSB ISH).
+        if !tlb {
+            for j in 0..self.ncpu {
+                if j == from || !self.active[j].load(SeqCst) { continue; }
+                // SAFETY: as below
+                let p = self.kick[j].load(SeqCst);
+                if !p.is_null() { unsafe { AtomicU64::from_ptr(p).store(0, SeqCst) }; }
             }
-            self.inval_seq.fetch_add(1, SeqCst) + 1
-        };
+            return;
+        }
         loop {
             let mut pending = false;
             for j in 0..self.ncpu {
-                if j == from || !self.active[j].load(SeqCst) || self.seen[j].load(SeqCst) >= seq { continue; }
+                if j == from || !self.active[j].load(SeqCst) || self.applied[j].load(SeqCst) >= tickets[j] { continue; }
                 pending = true;
                 // SAFETY: points at core j's chain_until while it is active; an atomic store
                 let p = self.kick[j].load(SeqCst);
@@ -126,13 +142,14 @@ impl Shared {
     /// Apply core `k`'s queued invalidations and acknowledge them.
     fn apply(&self, k: usize, cpu: &mut Cpu) {
         if !self.has_inval[k].load(SeqCst) { return; }
-        let (ops, seq) = {
-            let mut q = self.inval.lock().unwrap_or_else(|e| e.into_inner());
+        let ops = {
+            let mut q = self.inval[k].lock().unwrap_or_else(|e| e.into_inner());
             self.has_inval[k].store(false, SeqCst);
-            (std::mem::take(&mut q[k]), self.inval_seq.load(SeqCst))
+            std::mem::take(&mut *q)
         };
-        for (tlb, op) in ops { if tlb { cpu.tlb_invalidate(op) } else { cpu.jit_invalidate(op) } }
-        self.seen[k].store(seq, SeqCst);
+        for &(tlb, op) in &ops { if tlb { cpu.tlb_invalidate(op) } else { cpu.jit_invalidate(op) } }
+        // queue order = ticket order, so the count applied covers every ticket up to it
+        self.applied[k].fetch_add(ops.len() as u64, SeqCst);
     }
 }
 
@@ -198,10 +215,11 @@ impl Mt {
         let sh = Arc::new(Shared {
             lock: Mutex::new(()), cv: Condvar::new(), stop: AtomicBool::new(true), quit: AtomicBool::new(false), running: AtomicUsize::new(0),
             lines: (0..ncpu).map(|_| AtomicU8::new(0)).collect(), state: (0..ncpu).map(|_| AtomicU8::new(OFF)).collect(),
-            inval: Mutex::new(vec![Vec::new(); ncpu]), has_inval: (0..ncpu).map(|_| AtomicBool::new(false)).collect(),
+            inval: (0..ncpu).map(|_| Mutex::new(Vec::new())).collect(), has_inval: (0..ncpu).map(|_| AtomicBool::new(false)).collect(),
+            queued: (0..ncpu).map(|_| AtomicU64::new(0)).collect(), applied: (0..ncpu).map(|_| AtomicU64::new(0)).collect(),
             event: Mutex::new(None), soc: AtomicPtr::new(std::ptr::null_mut()), cpus: AtomicPtr::new(std::ptr::null_mut()),
             ncpu, t0: Instant::now(), offset: AtomicI64::new(0), exceptions: AtomicU64::new(0), irqs: AtomicU64::new(0),
-            inval_seq: AtomicU64::new(0), seen: (0..ncpu).map(|_| AtomicU64::new(0)).collect(),
+
             kick: (0..ncpu).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect(), active: (0..ncpu).map(|_| AtomicBool::new(false)).collect(),
         });
         let threads = (0..ncpu).map(|k| {
@@ -455,9 +473,11 @@ impl Machine {
             s => s,
         };
         // queued invalidations land now
-        let mut q = sh.inval.lock().unwrap_or_else(|e| e.into_inner());
-        for (k, v) in q.iter_mut().enumerate() {
-            for (tlb, op) in v.drain(..) { if tlb { self.cpus[k].tlb_invalidate(op) } else { self.cpus[k].jit_invalidate(op) } }
+        for k in 0..n {
+            let mut q = sh.inval[k].lock().unwrap_or_else(|e| e.into_inner());
+            let ops = std::mem::take(&mut *q);
+            for &(tlb, op) in &ops { if tlb { self.cpus[k].tlb_invalidate(op) } else { self.cpus[k].jit_invalidate(op) } }
+            sh.applied[k].fetch_add(ops.len() as u64, SeqCst);
             sh.has_inval[k].store(false, SeqCst);
         }
         stop

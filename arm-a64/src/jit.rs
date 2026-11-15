@@ -140,9 +140,16 @@ pub struct Jit {
     new_sites: Vec<(usize, u64)>,
     pub linked: u64,
     pub exec_insns: u64,
+    /// flushes because the code cache was full (the rest come from IC IALLU or an IC broadcast)
+    pub full_flushes: u64,
+    /// pages invalidated (IC IVAU) and the compiled blocks they dropped
+    pub inval_pages: u64,
+    pub inval_blocks: u64,
 }
 
-const FRONT: usize = 1 << 14;
+/// front cache slots: large enough for a desktop's working set (Ubuntu's GNOME runs ~10^5 hot
+/// blocks; a block evicted from here is found again in `blocks`, but only through Rust)
+const FRONT: usize = 1 << 16;
 const HOTC: usize = 1 << 16;
 /// wasm32: live compiled blocks before the cache is flushed (each is a module in the engine)
 #[cfg(target_arch = "wasm32")]
@@ -159,7 +166,7 @@ impl Jit {
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
         if !host::AVAILABLE { return None; }
         Some(Box::new(Jit { code: host::CodeCache::new(code_bytes)?, blocks: Map::default(), front: vec![(u64::MAX, u64::MAX, 0); FRONT].into_boxed_slice(),
-                            hotc: vec![(u64::MAX, u64::MAX, 0); HOTC].into_boxed_slice(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None, code_hash: Map::default(), stale_skips: 0, execs: 0, exec_insns: 0, disp: None, links: Map::default(), new_sites: Vec::new(), linked: 0 }))
+                            hotc: vec![(u64::MAX, u64::MAX, 0); HOTC].into_boxed_slice(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None, code_hash: Map::default(), stale_skips: 0, execs: 0, exec_insns: 0, disp: None, links: Map::default(), new_sites: Vec::new(), linked: 0, full_flushes: 0, inval_pages: 0, inval_blocks: 0 }))
     }
 
     pub fn flush(&mut self) {
@@ -216,7 +223,9 @@ impl Jit {
 
     pub fn invalidate_page(&mut self, page: u64) {
         if watch_page() == Some(page) { eprintln!("[jit-watch] invalidate page {page:#x} ({} blocks)", self.pages.get(&page).map_or(0, |v| v.len())); }
+        self.inval_pages += 1;
         let Some(keys) = self.pages.remove(&page) else { return };
+        self.inval_blocks += keys.len() as u64;
         for k in keys {
             self.blocks.remove(&k);
             let slot = ((k.0 ^ (k.0 >> 14)) as usize >> 2) & (FRONT - 1);
@@ -466,11 +475,11 @@ fn map_simd(i: u32, ops: &[VOp]) -> Option<(u32, Vec<(u32, u32)>)> {
 /// Returns 0 = continue with the next instruction, 1 = leave the block (pc set), 2 = trap.
 /// `SBC_JIT_PROFILE=1`: count the instruction words that compiled blocks hand to the interpreter.
 pub static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-thread_local! { static FALLBACKS: std::cell::RefCell<std::collections::HashMap<u32, u64>> = Default::default(); }
+static FALLBACKS: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> = std::sync::Mutex::new(None);
 
 /// The interpreter fallbacks counted so far, most frequent first.
 pub fn profile_fallbacks() -> Vec<(u32, u64)> {
-    let mut v: Vec<(u32, u64)> = FALLBACKS.with(|f| f.borrow().iter().map(|(k, v)| (*k, *v)).collect());
+    let mut v: Vec<(u32, u64)> = FALLBACKS.lock().unwrap().as_ref().map_or(Vec::new(), |f| f.iter().map(|(k, v)| (*k, *v)).collect());
     v.sort_by(|a, b| b.1.cmp(&a.1));
     v
 }
@@ -482,7 +491,7 @@ pub(crate) fn profile_fallback(cpu: &Cpu) {
     if pa + 4 > cpu.ram_len { return; }
     // SAFETY: inside guest RAM
     let i = unsafe { (cpu.ram.add(pa as usize) as *const u32).read_unaligned() };
-    FALLBACKS.with(|f| *f.borrow_mut().entry(i).or_insert(0) += 1);
+    *FALLBACKS.lock().unwrap().get_or_insert_with(Default::default).entry(i).or_insert(0) += 1;
 }
 
 unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
@@ -498,12 +507,16 @@ unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
     }
 }
 
-struct Ctx { off_tpidr: usize, off_chain_until: usize, off_chain_stop: usize, off_disp: usize, off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_v: usize, off_fpsr: usize }
+struct Ctx { off_utlb_unpriv: usize, off_tpidr: usize, off_chain_until: usize, off_chain_stop: usize, off_disp: usize, off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_v: usize, off_fpsr: usize }
+
+/// A Cpu field offset an `ldr x, [x19, #off]` can reach (scaled 12-bit immediate).
+fn c_off_ok(off: usize) -> Option<usize> { (off % 8 == 0 && off < 32768).then_some(off) }
 
 fn v_off(c: &Ctx, r: u32) -> u32 { (c.off_v + 16 * r as usize) as u32 }
 
 fn ctx() -> Ctx {
     Ctx {
+        off_utlb_unpriv: std::mem::offset_of!(Cpu, utlb_unpriv),
         off_tpidr: std::mem::offset_of!(Cpu, sys) + std::mem::offset_of!(crate::sysreg::SysRegs, tpidr),
         off_chain_until: std::mem::offset_of!(Cpu, chain_until),
         off_chain_stop: std::mem::offset_of!(Cpu, chain_stop),
@@ -620,9 +633,14 @@ impl Cpu {
             // SAFETY: front entries are only filled from `blocks`, which hold published code
             unsafe { std::mem::transmute::<usize, BlockFn>(jit.front[slot].2) }
         } else {
-            // count executions in a direct-mapped table (no allocation, no hashing of the map);
-            // only a hot entry looks into `blocks` (a compiled block that left the front cache
-            // keeps a saturated counter) or compiles
+            // a block compiled before (evicted from the front cache by another pc) runs at once:
+            // one hash lookup instead of interpreting it until its counter is hot again (the
+            // counters are direct-mapped too, and a large working set overwrites them)
+            if let Some(&f) = jit.blocks.get(&k) {
+                jit.front[slot] = (k.0, k.1, f as usize);
+                return self.jit_run(f, pa, k, bus);
+            }
+            // count executions in a direct-mapped table (no allocation); a hot entry compiles
             let hs = ((self.pc ^ (self.pc >> 16)) as usize >> 2) & (HOTC - 1);
             let h = &mut jit.hotc[hs];
             if h.0 == k.0 && h.1 == k.1 { h.2 = h.2.saturating_add(1); } else { *h = (k.0, k.1, 1); }
@@ -631,10 +649,6 @@ impl Cpu {
                 // count, so no overlapping blocks get compiled from mid-block pcs)
                 self.interp_run = true;
                 return None;
-            }
-            if let Some(&f) = jit.blocks.get(&k) {
-                jit.front[slot] = (k.0, k.1, f as usize);
-                return self.jit_run(f, pa, k, bus);
             }
             let f = self.compile(pa)?;
             let jit = self.jit.as_mut()?;
@@ -767,6 +781,7 @@ impl Cpu {
 
     #[inline(never)]
     fn compile(&mut self, pa: u64) -> Option<BlockFn> {
+        self.mark_code_page(pa >> 12);
         #[cfg(target_arch = "wasm32")]
         {
             // browser: one small wasm module per block; keep the live set bounded
@@ -934,14 +949,14 @@ impl Cpu {
             let words = dispatcher(&c, self.jit.as_ref()?.front.as_ptr() as u64);
             match self.jit.as_mut()?.code.write(&words) {
                 Some(d) => self.jit.as_mut()?.disp = Some(d as u64),
-                None => { self.jit.as_mut()?.flush(); return None; }
+                None => { let j = self.jit.as_mut()?; j.full_flushes += 1; j.flush(); return None; }
             }
         }
         if let Some(d) = self.jit.as_ref()?.disp { self.jit_disp = d; }
         let f = self.jit.as_mut()?.code.write(&e.out);
         let f = match f {
             Some(p) => p,
-            None => { self.jit.as_mut()?.flush(); return None; }
+            None => { let j = self.jit.as_mut()?; j.full_flushes += 1; j.flush(); return None; }
         };
         let sites: Vec<(usize, u64)> = e.links.iter().map(|&(ix, t)| (f as usize + 4 * ix, t)).collect();
         self.jit.as_mut()?.new_sites = sites;
@@ -1052,6 +1067,8 @@ impl Cpu {
         let rt = i & 31;
         let rn = (i >> 5) & 31;
         let (size, load, signed_to, pair, rt2, addr, mode): (u32, bool, u32, bool, u32, Addr, u8);
+        // LDTR/STTR (and sign-extending forms): EL1's unprivileged access, as EL0 would make it
+        let mut unpriv = false;
         // mode: 0 = offset, 1 = post-index, 2 = pre-index
         // SIMD&FP registers (B/H/S/D/Q, LDP/STP S/D/Q) need FP enabled at this EL
         let vec = bit(i, 26);
@@ -1090,7 +1107,12 @@ impl Cpu {
                 addr = Addr::Reg(bits(i, 20, 16), bits(i, 15, 13), if bit(i, 12) { sz } else { 0 }); mode = 0;
             } else {
                 let imm = ((bits(i, 20, 12) as i64) << 55) >> 55;
-                match bits(i, 11, 10) { 0 => { addr = Addr::Imm(imm); mode = 0; } 1 => { addr = Addr::Imm(imm); mode = 1; } 3 => { addr = Addr::Imm(imm); mode = 2; } _ => return false }
+                match bits(i, 11, 10) {
+                    0 => { addr = Addr::Imm(imm); mode = 0; }
+                    1 => { addr = Addr::Imm(imm); mode = 1; }
+                    3 => { addr = Addr::Imm(imm); mode = 2; }
+                    _ => { if self.el > 1 { return false; } unpriv = self.el == 1; addr = Addr::Imm(imm); mode = 0; }
+                }
             }
         } else if bits(i, 29, 27) == 0b101 && !bit(i, 26) && !bit(i, 25) {
             let opc = bits(i, 31, 30);
@@ -1105,7 +1127,9 @@ impl Cpu {
         } else {
             return false;
         }
-        if mode != 0 && rn != 31 && (rn == rt || (pair && rn == rt2)) { return false; }
+        // write-back onto a loaded/stored register (the vector forms name V registers: no clash)
+        if mode != 0 && rn != 31 && !vec && (rn == rt || (pair && rn == rt2)) { return false; }
+        if unpriv && c_off_ok(e.c.off_utlb_unpriv).is_none() { return false; }
         if !load && self.jit.as_ref().is_some_and(|j| j.verify) { return false; } // verify mode logs stores in the interpreter
         let span = if pair { 2 * size } else { size };
         let c = e.c;
@@ -1140,7 +1164,11 @@ impl Cpu {
         e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
         e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
         e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
-        if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
+        if unpriv {
+            // the EL0 entry, poisoned (bit 59) while they belong to another ASID
+            e.out.push(ldr_x(tmp2, X_CPU, c.off_utlb_unpriv));
+            e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp);
+        } else if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
         e.out.push(ldr_x(tmp2, 17, ent));
         e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
         slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow

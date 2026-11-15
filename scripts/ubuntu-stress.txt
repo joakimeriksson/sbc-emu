@@ -1,0 +1,15 @@
+# Corruption check for the threaded runner (TLB coherence across cores): 40 Python runs, 4 at a
+# time, each with 3 threads allocating and reallocating ~100 MB (huge pages included), must all
+# print the same digest; then the crash reports and core dumps since boot.
+wait-serial login:
+sleep 20
+serial \n
+wait-serial login:
+serial pi\n
+wait-serial Password:
+serial raspberry\n
+wait-serial $
+serial cat > /tmp/s.py <<'PY'\nimport hashlib, json, threading\ndef work(k, out):\n    h = hashlib.sha256(); d = {}\n    for r in range(6):\n        big = [str(i * k + r) * 3 for i in range(150000)]\n        d[r] = json.loads(json.dumps(big[::50]))\n        s = ''.join(big[::7]); h.update(s.encode()); big.clear()\n    h.update(json.dumps(d, sort_keys=True).encode()); out[k] = h.hexdigest()\nout = {}\nts = [threading.Thread(target=work, args=(k, out)) for k in range(3)]\n[t.start() for t in ts]; [t.join() for t in ts]\nprint(hashlib.sha256(''.join(out[k] for k in range(3)).encode()).hexdigest())\nPY\n
+serial echo S-START; seq 40 | xargs -P4 -I{} python3 /tmp/s.py | sort | uniq -c; ls /var/crash | grep -c crash; coredumpctl list --no-pager 2>/dev/null | tail -n +2 | wc -l; echo S-""END\n
+wait-serial S-END
+quit

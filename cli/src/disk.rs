@@ -1,6 +1,8 @@
 //! SD card image backed by a file, copy-on-write: the image is opened read-only and every
 //! written sector lives in an in-memory overlay (optionally saved/loaded as an overlay file);
-//! with `--sd-persist` writes go to the file itself.
+//! with `--sd-persist` writes go to the file itself. The image is locked: shared while it is
+//! only read, exclusive with `--sd-persist`, so a guest never writes a filesystem that another
+//! emulator is running from (two writers corrupt it; a reader sees it change underneath).
 use bcm2711::sdhci::Disk;
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,15 +13,22 @@ pub struct CowFile { file: File, sectors: u64, overlay: HashMap<u64, Box<[u8; 51
 impl CowFile {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = File::open(path)?;
+        file.try_lock_shared().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len() / 512;
         Ok(CowFile { file, sectors, overlay: HashMap::new(), persist: false })
     }
     /// Writes go straight to the image file (`--sd-persist`): what the guest installs survives.
     pub fn open_persistent(path: &str) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        file.try_lock().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len() / 512;
         Ok(CowFile { file, sectors, overlay: HashMap::new(), persist: true })
     }
+}
+
+fn in_use(_path: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::WouldBlock,
+        "in use by another sbc-emu (--sd-persist needs the image to itself; copy it for a second run)")
 }
 
 impl Disk for CowFile {

@@ -180,8 +180,6 @@ impl Cpu {
             SCTLR_EL1
                 | SCTLR_EL2
                 | SCTLR_EL3
-                | TTBR0_EL1
-                | TTBR1_EL1
                 | TTBR0_EL2
                 | TTBR0_EL3
                 | TCR_EL1
@@ -253,8 +251,11 @@ impl Cpu {
                 s.other.insert(k, v);
             }
         }
-        if flush {
+        if flush || (matches!(k, TTBR0_EL1 | TTBR1_EL1) && !crate::mmu::asid_tlb()) {
             self.tlb_flush();
+        } else if matches!(k, TTBR0_EL1 | TTBR1_EL1) {
+            // the TLB is ASID-tagged (mmu.rs); only the untagged micro-TLBs drop user pages
+            self.utlb_ttbr_written();
         }
     }
 }

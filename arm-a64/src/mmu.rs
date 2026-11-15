@@ -1,6 +1,8 @@
 //! Stage-1 address translation, 4 KiB granule, for the EL1&0, EL2 and EL3 regimes (no stage 2,
 //! no VHE, no hardware Access-flag/dirty management — as on ARMv8.0). A small direct-mapped
-//! software TLB caches walks; it is flushed by TLBI and by writes to SCTLR/TTBR/TCR.
+//! software TLB caches walks. As on hardware, EL1&0 entries from non-global (nG) descriptors
+//! are tagged with their ASID, so TTBR writes (Linux's context switches, and its software PAN
+//! on every kernel entry and user access) keep the cache; TLBI and SCTLR/TCR writes flush it.
 use crate::cpu::Cpu;
 use emu_core::Bus;
 
@@ -20,6 +22,12 @@ impl Access {
 
 pub const TLB_SIZE: usize = 1024;
 
+/// `SBC_TLB_ASID=0`: flush on every TTBR write instead of keeping ASID-tagged entries (A/B tests)
+pub(crate) fn asid_tlb() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(|| std::env::var("SBC_TLB_ASID").map_or(true, |v| v != "0"))
+}
+
 /// Cached translation of one 4 KiB page.
 #[derive(Clone, Copy, Default)]
 pub struct TlbEntry {
@@ -28,6 +36,10 @@ pub struct TlbEntry {
     pa_page: u64,
     /// permission bits: 1 EL0 read, 2 EL0 write, 4 EL0 exec, 8 priv read, 16 priv write, 32 priv exec
     perm: u8,
+    /// a global translation (nG clear, or a regime without ASIDs): valid for every ASID
+    global: bool,
+    /// the ASID a non-global translation belongs to
+    asid: u16,
 }
 
 const PA_MASK: u64 = 0x0000_ffff_ffff_f000;
@@ -49,6 +61,9 @@ use crate::cpu::UT;
 impl Cpu {
     pub fn tlb_flush(&mut self) {
         self.utlb = [[(0, 0); UT]; 3];
+        self.tlb_blocks = [(u64::MAX, 0); 2];
+        self.utlb_asid = self.asid();
+        self.utlb_unpriv = 0;
         if let Some(t) = self.tlb.as_mut() {
             t.iter_mut().for_each(|e| e.tag = 0);
         }
@@ -57,6 +72,9 @@ impl Cpu {
     /// TLBI: `va` = u64::MAX drops every cached translation, otherwise those of `va`'s page.
     pub fn tlb_invalidate(&mut self, va: u64) {
         if va == u64::MAX { return self.tlb_flush(); }
+        // inside a block that was cached page by page: the TLBI covers all of its pages
+        let (lo, hi) = self.tlb_blocks[(va >> 55 & 1) as usize];
+        if va >= lo && va < hi { return self.tlb_flush(); }
         let u = (va >> 12) as usize & (UT - 1);
         for t in self.utlb.iter_mut() { t[u] = (0, 0); }
         if let Some(t) = self.tlb.as_mut() { t[(va >> 12) as usize & (TLB_SIZE - 1)].tag = 0; }
@@ -93,25 +111,61 @@ impl Cpu {
         };
         let tag = ((va >> 12) + 1) | ((regime as u64) << 62);
         let idx = ((va >> 12) as usize) & (TLB_SIZE - 1);
+        let asid = if regime == 1 { self.asid() } else { 0 };
         if let Some(t) = self.tlb.as_ref() {
             let e = t[idx];
-            if e.tag == tag && e.perm & need != 0 {
+            if e.tag == tag && e.perm & need != 0 && (e.global || e.asid == asid) {
                 return Ok(e.pa_page | (va & 0xfff));
             }
         }
-        let (pa_page, perm, level) = self.walk(bus, va, regime)?;
+        let (pa_page, perm, level, ng) = self.walk(bus, va, regime)?;
         if perm & need == 0 {
             return Err(permission_fault(level));
+        }
+        if level < 3 {
+            // a block (1 GiB at level 1, 2 MiB at level 2): remember the range it covers
+            let size = 1u64 << (12 + 9 * (3 - level));
+            let base = va & !(size - 1);
+            let b = &mut self.tlb_blocks[(va >> 55 & 1) as usize];
+            *b = (b.0.min(base), b.1.max(base.saturating_add(size)));
         }
         let tlb = self
             .tlb
             .get_or_insert_with(|| vec![TlbEntry::default(); TLB_SIZE].into_boxed_slice());
-        tlb[idx] = TlbEntry { tag, pa_page, perm };
+        tlb[idx] = TlbEntry { tag, pa_page, perm, global: regime != 1 || !ng, asid };
         Ok(pa_page | (va & 0xfff))
     }
 
-    /// Walk the tables for `va`; returns (PA of the page, permission bits, final level).
-    fn walk(&mut self, bus: &mut dyn Bus, va: u64, regime: u8) -> Result<(u64, u8, u32), u32> {
+    /// The current EL1&0 ASID: from TTBR1 or TTBR0 as TCR_EL1.A1 says, 8 or 16 bits (TCR.AS).
+    pub(crate) fn asid(&self) -> u16 {
+        let tcr = self.sys.tcr[1];
+        let ttbr = if tcr >> 22 & 1 != 0 { self.sys.ttbr1_el1 } else { self.sys.ttbr0[1] };
+        let a = (ttbr >> 48) as u16;
+        if tcr >> 36 & 1 != 0 { a } else { a & 0xff }
+    }
+
+    /// TTBR0_EL1 or TTBR1_EL1 was written. The main TLB is ASID-tagged and keeps everything.
+    /// The micro-TLBs are untagged (the JIT probes them inline), so their lower-half pages go,
+    /// except EL0 entries while the ASID stays that of their address space: Linux's software
+    /// PAN switches TTBR0 and the ASID (to the reserved 0) on every kernel entry and user
+    /// access, and EL0 entries cannot be used at EL1 anyway (the tag holds the EL). Kernel
+    /// (upper-half, global) pages always stay.
+    pub(crate) fn utlb_ttbr_written(&mut self) {
+        let a = self.asid();
+        let other_space = a != 0 && a != self.utlb_asid;
+        if other_space { self.utlb_asid = a; }
+        self.utlb_unpriv = if a == self.utlb_asid { 0 } else { 1 << 59 };
+        for t in self.utlb.iter_mut() {
+            for e in t.iter_mut() {
+                // tag = (va >> 12) + 1 | el << 60: bit 43 is VA bit 55, which selects TTBR1
+                // (also for user pointers with a top-byte tag)
+                if e.0 & (1 << 43) == 0 && (other_space || e.0 >> 60 != 0) { *e = (0, 0); }
+            }
+        }
+    }
+
+    /// Walk the tables for `va`; returns (PA of the page, permission bits, final level, nG).
+    fn walk(&mut self, bus: &mut dyn Bus, va: u64, regime: u8) -> Result<(u64, u8, u32, bool), u32> {
         let tcr = self.sys.tcr[regime as usize];
         let (ttbr, tsz) = if regime == 1 {
             let upper = va >> 63 != 0;
@@ -213,7 +267,58 @@ impl Cpu {
                     perm |= 32;
                 }
             }
-            return Ok((pa_page, perm, level));
+            return Ok((pa_page, perm, level, desc & (1 << 11) != 0));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_core::{Bus, FlatRam};
+
+    /// EL1&0 with 4 KiB granule, 39-bit VAs (3 levels), the tables at 0x10000.
+    fn machine() -> (Cpu, FlatRam) {
+        let mut cpu = Cpu::new();
+        let mut ram = FlatRam::new(0, 0x80_0000);
+        cpu.el = 1;
+        cpu.sctlr[1] = 1;
+        cpu.sys.tcr[1] = 25 | (1 << 23); // T0SZ = 25, no TTBR1 walks
+        cpu.sys.ttbr0[1] = 0x10000;
+        // L1[0] -> L2 at 0x11000; L2[1] = 2 MiB block VA 0x20_0000 -> PA 0x40_0000 (AF, EL1 RW)
+        ram.write64(0x10000, 0x11000 | 3).unwrap();
+        ram.write64(0x11008, 0x40_0000 | (1 << 10) | 1).unwrap();
+        (cpu, ram)
+    }
+
+    #[test]
+    fn tlbi_of_a_block_drops_all_its_pages() {
+        let (mut cpu, mut ram) = machine();
+        // two pages of the block, cached as separate entries
+        assert_eq!(cpu.translate(&mut ram, 0x20_0000, Access::Read), Ok(0x40_0000));
+        assert_eq!(cpu.translate(&mut ram, 0x20_5000, Access::Read), Ok(0x40_5000));
+        // remap the block to PA 0x60_0000 and invalidate it with one TLBI at its base, as
+        // Linux does for a huge page
+        ram.write64(0x11008, 0x60_0000 | (1 << 10) | 1).unwrap();
+        cpu.tlb_invalidate(0x20_0000);
+        assert_eq!(cpu.translate(&mut ram, 0x20_5000, Access::Read), Ok(0x60_5000));
+    }
+
+    #[test]
+    fn asid_tagged_entries_survive_ttbr_writes() {
+        let (mut cpu, mut ram) = machine();
+        // non-global page mappings: L2[2] -> L3 at 0x12000, L3[0] = VA 0x40_0000 -> PA 0x50_0000
+        ram.write64(0x11010, 0x12000 | 3).unwrap();
+        ram.write64(0x12000, 0x50_0000 | (1 << 11) | (1 << 10) | 3).unwrap();
+        cpu.sys.ttbr0[1] = 0x10000 | (5 << 48); // ASID 5 (TCR.A1 = 0: ASID from TTBR0)
+        assert_eq!(cpu.translate(&mut ram, 0x40_0000, Access::Read), Ok(0x50_0000));
+        // another address space (ASID 6) maps nothing there: its walk faults, ASID 5's entry
+        // must not answer for it
+        cpu.write_sysreg(crate::sysreg::TTBR0_EL1, 0x20000 | (6 << 48));
+        assert!(cpu.translate(&mut ram, 0x40_0000, Access::Read).is_err());
+        // back to ASID 5 without a TLBI: the entry is still valid
+        ram.write64(0x12000, 0).unwrap(); // a walk would fault now
+        cpu.write_sysreg(crate::sysreg::TTBR0_EL1, 0x10000 | (5 << 48));
+        assert_eq!(cpu.translate(&mut ram, 0x40_0000, Access::Read), Ok(0x50_0000));
     }
 }

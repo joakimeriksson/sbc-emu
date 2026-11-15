@@ -1,0 +1,13 @@
+# Ubuntu (seeded with scripts/ubuntu-user-data.yaml, first boot done): serial login, then three
+# timed workloads. The [script] t= of the login prompt is the boot time.
+wait-serial login:
+sleep 20
+serial \n
+wait-serial login:
+serial pi\n
+wait-serial Password:
+serial raspberry\n
+wait-serial $
+serial echo BENCH-START; time (for i in $(seq 300); do /bin/true; done); time (find /usr/lib -type f | wc -l); time python3 -c 'print(sum(i*i for i in range(2000000)))'; echo BENCH-""END\n
+wait-serial BENCH-END
+quit

@@ -67,8 +67,22 @@ pub struct Cpu {
     /// micro-TLBs for the RAM fast path: [fetch, read, write] = (tag, physical page)
     /// micro-TLBs for fetch, read and write: direct-mapped on the VA page, (tag, physical page)
     pub(crate) utlb: [[(u64, u64); UT]; 3],
+    /// the ASID the micro-TLBs' EL0 lower-half entries belong to (see `utlb_ttbr_written`)
+    pub(crate) utlb_asid: u16,
+    /// 0 while the micro-TLBs' EL0 entries belong to the current ASID, else a bit that makes
+    /// unprivileged (LDTR/STTR) probes miss: Linux's software PAN parks the reserved ASID 0
+    pub(crate) utlb_unpriv: u64,
+    /// per address half (VA bit 55): the range [lo, hi) covered by translations cached from
+    /// block descriptors since the last full flush. A block is cached as separate 4 KiB
+    /// entries but invalidated with one TLBI (Linux does that for huge pages), so a by-VA
+    /// TLBI inside this range flushes everything.
+    pub(crate) tlb_blocks: [(u64, u64); 2],
     /// block JIT (AArch64 hosts); None = interpreter only
     pub jit: Option<Box<crate::jit::Jit>>,
+    /// Physical pages any core of this machine has compiled code from (one bit each, shared by
+    /// the cores, never cleared). IC IVAU on a page without its bit drops nothing anywhere, so it
+    /// skips the cross-core broadcast. None: every IC IVAU is broadcast.
+    pub code_pages: Option<std::sync::Arc<[std::sync::atomic::AtomicU64]>>,
     pub(crate) jit_bus: Option<*mut dyn emu_core::Bus>,
     pub(crate) jit_trap: Option<Trap>,
     /// JIT verify mode: (RAM offset, previous bytes) of every store, for rollback
@@ -149,7 +163,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], jit: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
         }
     }
 
@@ -397,6 +411,27 @@ impl Cpu {
     /// Address of `chain_until`: another thread may store 0 there (atomically) to make this core
     /// leave its compiled chain at the next block boundary.
     pub fn chain_until_ptr(&mut self) -> *mut u64 { &mut self.chain_until }
+
+    /// A bitmap for `code_pages` covering `ram_len` bytes of RAM.
+    pub fn code_page_map(ram_len: u64) -> std::sync::Arc<[std::sync::atomic::AtomicU64]> {
+        (0..(ram_len >> 12).div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect()
+    }
+
+    /// Record that code is about to be compiled from physical page `page` (before its bytes are
+    /// read: an IC IVAU that finds the bit clear came before that read, see `code_page_used`).
+    pub(crate) fn mark_code_page(&self, page: u64) {
+        if let Some(m) = self.code_pages.as_ref() {
+            if let Some(w) = m.get((page / 64) as usize) { w.fetch_or(1 << (page % 64), std::sync::atomic::Ordering::SeqCst); }
+        }
+    }
+
+    /// Could any core hold code compiled from physical page `page`?
+    pub(crate) fn code_page_used(&self, page: u64) -> bool {
+        match self.code_pages.as_ref() {
+            Some(m) => m.get((page / 64) as usize).map_or(true, |w| w.load(std::sync::atomic::Ordering::SeqCst) >> (page % 64) & 1 != 0),
+            None => true,
+        }
+    }
 
     /// Another core invalidated instruction cache: `page` (physical page number) or u64::MAX.
     pub fn jit_invalidate(&mut self, page: u64) {
