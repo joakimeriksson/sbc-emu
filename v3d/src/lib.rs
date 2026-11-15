@@ -167,6 +167,9 @@ pub struct V3d {
     /// guest sees the emulated GPU's real speed.
     pending: Vec<(u64, bool, u32)>,
     pub time_scale: f64,
+    /// guest time follows the host's wall clock (cores on host threads): the host time a job took
+    /// has already passed for the guest while it ran, so the interrupt is not held back again
+    pub wall_clock: bool,
     /// the bin jobs whose tile lists are live, to re-bin after a snapshot restore
     bin_jobs: HashMap<u32, [u32; 5]>,
 }
@@ -178,7 +181,7 @@ impl V3d {
         LOG_ON.store(std::env::var_os("SBC_V3D_LOG").is_some(), std::sync::atomic::Ordering::Relaxed);
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
         let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], binned: HashMap::new(), code: Code::default(), jobs: [0; 4], insns: 0, host_ns: [0; 4], powered: true, now: 0, pending: Vec::new(),
-            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), bin_jobs: HashMap::new() };
+            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false, bin_jobs: HashMap::new() };
         // (std::env is empty in the browser: the defaults apply)
         v.reset();
         v
@@ -197,7 +200,9 @@ impl V3d {
 
     /// Schedule a done interrupt after `ns` of host time.
     fn done(&mut self, hub: bool, bits: u32, ns: u64) {
-        let delay = (ns as f64 * self.time_scale) as u64;
+        // capped well under Linux's GPU job timeout (500 ms): a job the host took long over must
+        // not look like a hung GPU (v3d resets it, and on 7.0 the timeout path can oops)
+        let delay = if self.wall_clock { 0 } else { ((ns as f64 * self.time_scale) as u64).min(250_000_000) };
         if delay == 0 { if hub { self.hub[HUB_INT_STS / 4] |= bits } else { self.core[CTL_INT_STS / 4] |= bits } return; }
         self.pending.push((self.now + delay, hub, bits));
     }

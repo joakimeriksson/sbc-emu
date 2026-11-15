@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #define W 128
@@ -736,6 +737,41 @@ static void s_render_big_targets(void) {
     glActiveTexture(GL_TEXTURE0); glDeleteTextures(3, tex);
 }
 
+/* WebRender's GPU-cache updates by pixel buffer: many single-row (and a few two-row) uploads of
+ * RGBA32F and RGBA32I data into different rows of 1024-wide textures, from one PBO at different
+ * offsets, all before one draw reads them back. */
+static void s_row_uploads(void) {
+    GLuint t[2]; glGenTextures(2, t);
+    GLenum ifmt[2] = {GL_RGBA32F, GL_RGBA32I}, fmt[2] = {GL_RGBA, GL_RGBA_INTEGER}, ty[2] = {GL_FLOAT, GL_INT};
+    static float fd[64 * 56 * 4]; static int id[64 * 56 * 4];
+    for (int i = 0; i < 64 * 56; i++) for (int c = 0; c < 4; c++) { fd[i * 4 + c] = ((i * 7 + c * 13) % 97) / 96.0f; id[i * 4 + c] = (i * 5 + c * 29) % 251; }
+    for (int k = 0; k < 2; k++) {
+        glBindTexture(GL_TEXTURE_2D, t[k]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 1024, 64);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        GLuint pbo; glGenBuffers(1, &pbo); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, sizeof fd, k ? (void *)id : (void *)fd, GL_STREAM_DRAW);
+        /* rows 1..30: one row each, 56 texels at x = 3 * row, data from row-sized slices of the PBO */
+        for (int r = 1; r <= 30; r++)
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 3 * r, r, 56, 1, fmt[k], ty[k], (void *)(intptr_t)(r * 56 * 16));
+        /* rows 40..41 and 50..52: multi-row uploads */
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 56);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 100, 40, 56, 2, fmt[k], ty[k], (void *)(intptr_t)(31 * 56 * 16));
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 700, 50, 40, 3, fmt[k], ty[k], (void *)(intptr_t)(35 * 56 * 16));
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); glDeleteBuffers(1, &pbo);
+    }
+    clear(0, 0, 0);
+    /* each output pixel (x, y): texel (x * 8 + y % 8 * 3 % 56 + ..., y / 2) of either texture */
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a; uniform highp isampler2D b; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); int row = q.y % 64; ivec2 c = ivec2(q.x * 8 + (row % 7), row);\n"
+                            " o = q.y < 64 ? texelFetch(a, c, 0) : vec4(texelFetch(b, c, 0)) / 255.0; }\n");
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, t[0]);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, t[1]); glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(p, "a"), 0); glUniform1i(glGetUniformLocation(p, "b"), 1);
+    quad(p, 1.0f, 1.0f);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0); glActiveTexture(GL_TEXTURE0); glDeleteTextures(2, t);
+}
+
 struct scene { const char *name; void (*fn)(void); };
 static const struct scene scenes[] = {
     {"clear", s_clear}, {"tri_color", s_tri_color}, {"flat", s_flat}, {"depth", s_depth}, {"blend", s_blend},
@@ -747,6 +783,7 @@ static const struct scene scenes[] = {
     {"tex_array", s_tex_array}, {"depth_ids", s_depth_ids}, {"instanced_int", s_instanced_int},
     {"scatter128", s_scatter128}, {"glyph_copies", s_glyph_copies},
     {"big_tex_layout", s_big_tex_layout}, {"render_big_targets", s_render_big_targets},
+    {"row_uploads", s_row_uploads},
 };
 #define NSCENES (sizeof scenes / sizeof scenes[0])
 

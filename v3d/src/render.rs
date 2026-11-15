@@ -201,6 +201,9 @@ impl Render<'_> {
     fn load(&mut self, c: &LoadTileBufferGeneral, m: &mut Gmem) {
         let buf = c.buffer_to_load;
         if buf == 8 { return; }
+        if crate::draws_enabled() {
+            crate::log_once(&format!("v3d load: buf {buf} fmt {} mem {} stride/ub {} rt {:?}", c.input_image_format, c.memory_format, c.height_in_ub_or_stride, self.rt.map(|r| (r.ty, r.bpp))));
+        }
         let fmt = c.input_image_format;
         let cpp = formats::out_cpp(fmt);
         if cpp == 0 { formats::decode(fmt, &[]); return; }

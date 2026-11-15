@@ -424,6 +424,7 @@ impl Machine {
             for c in self.cpus.iter_mut() { c.wall_clock = Some((sh.t0, off)); }
             for k in 0..n { sh.state[k].store(enc(self.state[k]), SeqCst); }
             *sh.event.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Some(g) = self.soc.v3d.as_mut() { g.wall_clock = true; }
             self.soc.device_lines(self.now);
             sh.publish(&self.soc);
             sh.stop.store(false, SeqCst);
@@ -454,6 +455,7 @@ impl Machine {
         }
         while sh.running.load(SeqCst) != 0 { std::thread::yield_now(); }
         let _g = sh.guard();
+        if let Some(g) = self.soc.v3d.as_mut() { g.wall_clock = false; }
         self.now = self.now.max(sh.now());
         self.exceptions += sh.exceptions.swap(0, Relaxed);
         self.irqs += sh.irqs.swap(0, Relaxed);

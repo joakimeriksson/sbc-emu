@@ -91,11 +91,25 @@ fn general(m: &mut Gmem, cfg: u32, req: &TmuReq, lanes: u16) -> Vec<V> {
 }
 
 thread_local! {
-    static TEX_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, u32, u8), std::rc::Rc<Tex>>> = Default::default();
+    /// (generation it belongs to, setups): per host thread, as `Tex` is not `Send`
+    static TEX_CACHE: std::cell::RefCell<(u64, std::collections::HashMap<(u32, u32, u8), std::rc::Rc<Tex>>)> = Default::default();
 }
 
-/// Forget the cached texture setups (at the start of each job).
-pub fn clear_cache() { TEX_CACHE.with(|c| c.borrow_mut().clear()); }
+/// Bumped at the start of each job. Jobs run on whichever host thread submitted them (one per
+/// emulated core with --threads multi), so every thread's cache checks it, not just the caller's.
+static TEX_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Forget the cached texture setups (at the start of each job), on every thread.
+pub fn clear_cache() { TEX_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+
+fn tex_cache<R>(f: impl FnOnce(&mut std::collections::HashMap<(u32, u32, u8), std::rc::Rc<Tex>>) -> R) -> R {
+    TEX_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let g = TEX_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        if c.0 != g { c.1.clear(); c.0 = g; }
+        f(&mut c.1)
+    })
+}
 
 /// Texture state and sampler for one lookup.
 struct Tex {
@@ -191,7 +205,7 @@ pub fn texture(m: &mut Gmem, t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuRe
     let mut raw = [0u8; 48];
     raw[..24].copy_from_slice(&m.bytes(ts_addr, TextureShaderState::LEN));
     if ss_addr != 0 { raw[24..].copy_from_slice(&m.bytes(ss_addr, SamplerState::LEN)); }
-    let tex = TEX_CACHE.with(|c| c.borrow().get(&key).filter(|t| t.raw == raw).cloned()).unwrap_or_else(|| {
+    let tex = tex_cache(|c| c.get(&key).filter(|t| t.raw == raw).cloned()).unwrap_or_else(|| {
         let ts = TextureShaderState::parse(&raw[..24]);
         let ss = if ss_addr != 0 { Some(SamplerState::parse(&raw[24..])) } else { None };
         let fmt = tex_fmt(ts.texture_type);
@@ -212,7 +226,7 @@ pub fn texture(m: &mut Gmem, t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuRe
                 srgb as u8, ss.is_some() as u8, kind, out32 as u8, ret_mask));
         }
         let t = std::rc::Rc::new(Tex { ts, ss, fmt, base: ts.texture_base_pointer & !0x3f, levels, one_d, is_3d, srgb, raw });
-        TEX_CACHE.with(|c| c.borrow_mut().insert(key, t.clone()));
+        tex_cache(|c| c.insert(key, t.clone()));
         t
     });
     let fmt = tex.fmt;
