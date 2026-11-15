@@ -10,7 +10,7 @@ use emu_core::{Bus, Trap};
 
 pub const FPSID: u32 = 0x4102_3075; // Cortex-A7 VFPv4
 pub const MVFR0: u32 = 0x1011_0222; // 32 double registers, single/double, divide, sqrt
-pub const MVFR1: u32 = 0x1000_0011; // fused multiply-add; no Advanced SIMD
+pub const MVFR1: u32 = 0x1111_1111; // Cortex-A7: Advanced SIMD (integer, single, load/store, half), FMA, half-precision VFP
 const FPEXC_EN: u32 = 1 << 30;
 
 #[derive(Clone)]
