@@ -48,7 +48,8 @@ impl Screen for allwinner_h3::Machine {
         self.soc.display.shown_size()
     }
     fn display_size(&self) -> (u32, u32) {
-        self.soc.display.shown_size().unwrap_or((1280, 720))
+        let mode = self.soc.display.mode;
+        self.soc.display.shown_size().unwrap_or((mode.width, mode.height))
     }
     fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         self.soc.render(out)

@@ -24,6 +24,8 @@ const HDMI_PHY_SIZE: u64 = 0x1000;
 pub const TCON0_IRQ: usize = 32 + 86;
 pub const HDMI_IRQ: usize = 32 + 88;
 
+/// Largest output width or height composed.
+const MAX_SIZE: u32 = 4096;
 /// 24 MHz ticks per 60 Hz frame.
 const FRAME_TICKS: u64 = 24_000_000 / 60;
 
@@ -225,6 +227,8 @@ pub struct Display {
     hdmi: Vec<u8>,
     phy: Vec<u32>,
     edid: [u8; 128],
+    /// The monitor's preferred mode.
+    pub mode: Mode,
     /// Tick of the next vblank while TCON0 runs.
     next_vblank: Option<u64>,
     /// Frames scanned out since reset.
@@ -262,6 +266,7 @@ impl Display {
             hdmi,
             phy: vec![0; (HDMI_PHY_SIZE / 4) as usize],
             edid: edid(&mode),
+            mode,
             next_vblank: None,
             frames: 0,
         }
@@ -439,8 +444,10 @@ impl Display {
         if !self.tcon_running() || self.mixer_reg(MIXER_GLOBAL_CTL) & 1 == 0 {
             return None;
         }
+        // HDMI goes up to 4096x2160; larger guest-programmed sizes are clipped so a
+        // render cannot allocate gigabytes.
         let size = self.mixer_reg(BLD_OUTSIZE);
-        Some(((size & 0x1fff) + 1, (size >> 16 & 0x1fff) + 1))
+        Some((((size & 0x1fff) + 1).min(MAX_SIZE), ((size >> 16 & 0x1fff) + 1).min(MAX_SIZE)))
     }
 
     /// Compose the mixer's output from `ram` (based at `ram_base`) as RGBA.

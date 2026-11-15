@@ -150,7 +150,7 @@ pub(crate) fn run<B: SerialBoard>(
     let start = Instant::now();
     let mut anchor = Instant::now();
     let mut escape = false;
-    let result = loop {
+    let result = 'run: loop {
         let mut input = std::mem::take(&mut idle_input);
         while let Ok(b) = rx.try_recv() {
             input.push(b);
@@ -159,7 +159,7 @@ pub(crate) fn run<B: SerialBoard>(
             if escape {
                 escape = false;
                 if b == b'x' {
-                    return Ok(());
+                    break 'run Ok(());
                 }
                 pending.push_back(1);
             } else if b == 1 {
