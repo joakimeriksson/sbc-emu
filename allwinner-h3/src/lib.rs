@@ -6,6 +6,7 @@
 
 pub mod boot;
 pub mod display;
+pub mod usb;
 mod gic;
 mod machine;
 mod mmc;

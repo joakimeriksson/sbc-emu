@@ -17,6 +17,8 @@ pub trait Screen {
     fn name(&self) -> &'static str;
     /// A key (HID usage) went down or up; boards without a keyboard ignore it.
     fn key(&mut self, _usage: u8, _down: bool) {}
+    /// Type an ASCII byte on the keyboard (script `type`).
+    fn type_byte(&mut self, _b: u8) {}
     /// Absolute pointer (0..32767) with buttons left/middle/right and the wheel.
     fn pointer(&mut self, _buttons: u8, _x: u16, _y: u16, _wheel: i8) {}
 }
@@ -27,6 +29,7 @@ impl Screen for Machine {
     fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.render(out) }
     fn name(&self) -> &'static str { "sbc-emu: Raspberry Pi 4" }
     fn key(&mut self, usage: u8, down: bool) { self.soc.devs.kbd.key(usage, down) }
+    fn type_byte(&mut self, b: u8) { self.soc.devs.kbd.type_byte(b) }
     fn pointer(&mut self, buttons: u8, x: u16, y: u16, wheel: i8) { self.soc.devs.tablet.pointer(buttons, x, y, wheel) }
 }
 use std::io::{ErrorKind, Read, Write};

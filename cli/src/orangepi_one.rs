@@ -57,6 +57,15 @@ impl Screen for allwinner_h3::Machine {
     fn name(&self) -> &'static str {
         "sbc-emu: Orange Pi One"
     }
+    fn key(&mut self, usage: u8, down: bool) {
+        self.soc.kbd.key(usage, down);
+    }
+    fn type_byte(&mut self, b: u8) {
+        self.soc.kbd.type_byte(b);
+    }
+    fn pointer(&mut self, buttons: u8, x: u16, y: u16, wheel: i8) {
+        self.soc.tablet.pointer(buttons, x, y, wheel);
+    }
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
