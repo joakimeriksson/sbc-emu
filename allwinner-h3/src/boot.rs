@@ -8,7 +8,7 @@ use emu_core::fdt::Node;
 pub const KERNEL_ADDR: u32 = 0x4200_0000;
 pub const DTB_ADDR: u32 = 0x4300_0000;
 pub const INITRD_ADDR: u32 = 0x4330_0000;
-pub const DEFAULT_CMDLINE: &str = "console=ttyS0,115200 earlycon rdinit=/init nosmp";
+pub const DEFAULT_CMDLINE: &str = "console=ttyS0,115200 earlycon rdinit=/init";
 
 /// Patch a stock DTB for direct boot.
 pub fn prepare_device_tree(

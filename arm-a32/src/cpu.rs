@@ -29,6 +29,10 @@ pub struct Cpu {
     pub fiq: bool,
     pub instret: u64,
     pub last_wfe: bool,
+    /// The event register (WFE/SEV).
+    pub event: bool,
+    /// Set by SEV; the machine delivers the event to the other cores and clears it.
+    pub sent_event: bool,
     /// Route SMC to the host as a firmware call (`Trap::HostCall`).
     pub firmware_calls_to_host: bool,
     pub midr: u32,
@@ -95,6 +99,8 @@ impl Cpu {
             fiq: false,
             instret: 0,
             last_wfe: false,
+            event: false,
+            sent_event: false,
             firmware_calls_to_host: false,
             midr: 0x410f_c075,
             mpidr: 0x8000_0000,
@@ -475,12 +481,22 @@ impl Cpu {
         if insn & 0x0fff_fff8 == 0x0320_f000 {
             match insn & 0xf {
                 2 => {
+                    // WFE completes at once, consuming the event, if one is pending.
+                    if std::mem::take(&mut self.event) {
+                        return Ok(());
+                    }
                     self.last_wfe = true;
                     return Err(Trap::Wait);
                 }
                 3 => {
                     self.last_wfe = false;
                     return Err(Trap::Wait);
+                }
+                4 => {
+                    // SEV: the machine broadcasts the event to every core.
+                    self.event = true;
+                    self.sent_event = true;
+                    return Ok(());
                 }
                 _ => return Ok(()),
             }

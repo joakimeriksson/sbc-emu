@@ -1,5 +1,5 @@
 use allwinner_h3::{
-    Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI, RAM_BASE, SPURIOUS, UART0_BASE,
+    CoreState, Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI, RAM_BASE, SPURIOUS, UART0_BASE,
 };
 use emu_core::{Bus, Core, Fault, Trap};
 
@@ -25,7 +25,7 @@ fn a32_program_writes_ok_to_h3_uart0() {
         machine.step().unwrap();
     }
     assert_eq!(machine.serial_output(), b"OK");
-    assert_eq!(machine.cpu.pc(), RAM_BASE + 24);
+    assert_eq!(machine.cpu().pc(), RAM_BASE + 24);
     assert_eq!(machine.step(), Err(Trap::Brk(0)));
     assert_eq!(machine.take_serial_output(), b"OK");
     assert!(machine.serial_output().is_empty());
@@ -108,11 +108,11 @@ fn physical_timer_wakes_wfi_and_enters_irq_through_gic() {
         .collect();
     let mut machine = Machine::with_ram_size(64 << 10);
     machine.load(RAM_BASE, &bytes).unwrap();
-    machine.cpu.vbar = (RAM_BASE + 0x100) as u32;
+    machine.cpu_mut().vbar = (RAM_BASE + 0x100) as u32;
     machine
         .load(RAM_BASE + 0x118, &0xe120_0070u32.to_le_bytes())
         .unwrap();
-    machine.cpu.cpsr &= !(1 << 7);
+    machine.cpu_mut().cpsr &= !(1 << 7);
 
     machine.soc.write32(GICD_BASE, 1).unwrap();
     machine
@@ -126,18 +126,18 @@ fn physical_timer_wakes_wfi_and_enters_irq_through_gic() {
     for _ in 0..5 {
         machine.step().unwrap();
     }
-    assert_eq!(machine.cpu.r[0], 24_000_000);
+    assert_eq!(machine.cpu().r[0], 24_000_000);
     assert_eq!(machine.step(), Err(Trap::Wait));
     assert_eq!(machine.step(), Err(Trap::Wait));
     assert_eq!(machine.step(), Err(Trap::Interrupt(0, 1)));
-    assert_eq!(machine.cpu.pc(), RAM_BASE + 0x118);
-    assert_eq!(machine.cpu.r[14], (RAM_BASE + 28) as u32);
+    assert_eq!(machine.cpu().pc(), RAM_BASE + 0x118);
+    assert_eq!(machine.cpu().r[14], (RAM_BASE + 28) as u32);
     assert_eq!(
         machine.soc.read32(GICC_BASE + 0x0c),
         Ok(PHYSICAL_TIMER_PPI as u32)
     );
 
-    machine.cpu.cntp_ctl = 0;
+    machine.cpu_mut().cntp_ctl = 0;
     machine.advance_time(0);
     machine
         .soc
@@ -145,6 +145,65 @@ fn physical_timer_wakes_wfi_and_enters_irq_through_gic() {
         .unwrap();
     machine.advance_time(0);
     assert!(!machine.soc.gic.irq_out());
-    assert!(!machine.cpu.irq);
+    assert!(!machine.cpu().irq);
     assert_eq!(machine.step(), Err(Trap::Brk(0)));
+}
+
+/// Core 0 starts core 1 through PSCI CPU_ON (entry 0x4000_0100, context id 0x55) and
+/// waits for its flag, then SEV wakes core 1 from WFE.
+#[test]
+fn psci_cpu_on_starts_a_second_core_and_sev_wakes_wfe() {
+    let core0 = [
+        0xe300_0003, 0xe348_0400, // movw/movt r0, #0x84000003 (CPU_ON)
+        0xe3a0_1001,              // mov r1, #1
+        0xe300_2100, 0xe344_2000, // movw/movt r2, #0x40000100
+        0xe3a0_3055,              // mov r3, #0x55
+        0xe160_0070,              // smc #0
+        0xe1a0_5000,              // mov r5, r0
+        0xe300_4200, 0xe344_4000, // movw/movt r4, #0x40000200
+        0xe594_6000,              // 1: ldr r6, [r4]
+        0xe356_0000,              // cmp r6, #0
+        0x0aff_fffc,              // beq 1b
+        0xe320_f004,              // sev
+        0xeaff_fffe,              // b .
+    ];
+    let core1 = [
+        0xe300_4200, 0xe344_4000, // movw/movt r4, #0x40000200
+        0xe584_0000,              // str r0, [r4]
+        0xe320_f002,              // wfe
+        0xe3a0_7077,              // mov r7, #0x77
+        0xe584_7004,              // str r7, [r4, #4]
+        0xeaff_fffe,              // b .
+    ];
+    let mut machine = Machine::with_ram_size(64 << 10);
+    for (base, code) in [(RAM_BASE, &core0[..]), (RAM_BASE + 0x100, &core1[..])] {
+        for (i, word) in code.iter().enumerate() {
+            machine.soc.write32(base + i as u64 * 4, *word).unwrap();
+        }
+    }
+    machine.cpu_mut().firmware_calls_to_host = true;
+    assert_eq!(machine.state[1], CoreState::Off);
+    machine.run(100_000);
+    assert_eq!(machine.cpus[0].r[5], 0, "PSCI SUCCESS");
+    assert_eq!(machine.state[1], CoreState::Run);
+    assert_eq!(machine.cpus[1].mpidr & 0xff, 1);
+    assert_eq!(machine.soc.read32(RAM_BASE + 0x200), Ok(0x55), "context id in r0");
+    assert_eq!(machine.soc.read32(RAM_BASE + 0x204), Ok(0x77), "SEV woke WFE");
+}
+
+/// Cores asleep in WFI do not slow the clock: a lone busy core runs at 1 ns per
+/// instruction; two busy cores share it.
+#[test]
+fn virtual_time_counts_only_running_cores() {
+    let mut machine = Machine::with_ram_size(64 << 10);
+    machine.soc.write32(RAM_BASE, 0xeaff_fffe).unwrap(); // b .
+    for core in 1..4 {
+        machine.state[core] = CoreState::Wait;
+    }
+    machine.run(12_000);
+    assert_eq!(machine.now(), 12_000);
+    machine.state[1] = CoreState::Run;
+    machine.cpus[1].r[15] = RAM_BASE as u32;
+    machine.run(12_000);
+    assert_eq!(machine.now(), 18_000, "two running cores: 0.5 ns per instruction");
 }
