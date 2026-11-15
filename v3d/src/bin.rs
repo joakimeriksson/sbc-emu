@@ -206,6 +206,11 @@ pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coo
     let mut out = Vec::with_capacity(verts.len());
     let mut env = VsEnv { m };
     for chunk in verts.chunks(LANES) {
+        if code.runaway {
+            // a shader in this job ran away: the remaining vertices get zero outputs
+            for _ in chunk { out.push(vec![0; (out_size as usize * 8).max(64)]); }
+            continue;
+        }
         // VPM inputs for each lane
         let mut rows: Vec<Vec<u32>> = Vec::new();
         for &(vtx, inst) in chunk {
@@ -230,7 +235,10 @@ pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coo
         let before = t.insns;
         match t.run(code, &mut env, 20_000_000) {
             Stop::Done => {}
-            s => crate::log_once(&format!("v3d: {} shader stopped: {s:?}", if coord { "coordinate" } else { "vertex" })),
+            s => {
+                crate::log_once(&format!("v3d: {} shader stopped: {s:?}", if coord { "coordinate" } else { "vertex" }));
+                if s == Stop::Budget { code.runaway = true; }
+            }
         }
         *insns += t.insns - before;
         for l in 0..chunk.len() {

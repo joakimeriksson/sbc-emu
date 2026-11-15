@@ -536,6 +536,9 @@ impl Render<'_> {
         let late_z = rec.fragment_shader_does_z_writes;
         let (tx0, ty0) = (self.tile.0 * self.tile_w, self.tile.1 * self.tile_h);
         for batch in quads.chunks(4) {
+            // a shader in this job ran away: nothing more is shaded, and no early depth/stencil
+            // test writes either
+            if code.runaway { return; }
             let mut t = self.thread.take().unwrap_or_else(|| Box::new(Thread::new(0, 0, false)));
             t.reset(rec.fragment_shader_code_address, rec.fragment_shader_uniforms_address, rec.fragment_shader_start_in_final_thread_section);
             t.revf = p.reverse;
@@ -571,6 +574,7 @@ impl Render<'_> {
             let before = t.insns;
             let stop = t.run(code, &mut fe, 5_000_000);
             if stop != crate::qpu::Stop::Done { crate::log_once(&format!("v3d: fragment shader stopped: {stop:?}")); }
+            if stop == crate::qpu::Stop::Budget { code.runaway = true; }
             if d.occlusion != 0 { *fe.r.occlusion.entry(d.occlusion).or_default() += fe.passed; }
             let n = t.insns - before;
             fe.r.insns += n;

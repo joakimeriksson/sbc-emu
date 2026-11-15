@@ -508,6 +508,8 @@ pub struct Thread {
     pub tmu_out: std::collections::VecDeque<V>,
     /// the last retired TMU request (kind, config words, words returned), for diagnostics
     pub last_tmu: (TmuKind, [u32; 3], usize),
+    /// where this invocation's code and uniform stream started (diagnostics)
+    pub start: (u32, u32),
     /// VPM: input rows then (if separate) output rows
     pub vpm: Vec<V>,
     pub vpm_out_base: usize,
@@ -595,7 +597,7 @@ impl Thread {
             pc, unif, unifa: 0, lr: 0, rtop: [0; LANES], valid: 0xffff, tmu_cfg: Vec::new(), tmu_req: TmuReq::default(),
             tmu_out: Default::default(), last_tmu: (TmuKind::General, [0; 3], 0), vpm: Vec::new(), vpm_out_base: 0, xcd: [0; LANES], ycd: [0; LANES],
             fx: [0.0; LANES], fy: [0.0; LANES], tidx: 0, barrier_id: 0, final_section, prev_thrsw: false, end_in: None,
-            branch: None, delayed: Vec::new(), insns: 0, done: false,
+            branch: None, delayed: Vec::new(), insns: 0, done: false, start: (pc, unif),
         }
     }
 
@@ -608,7 +610,23 @@ impl Thread {
         self.tmu_cfg.clear(); self.tmu_req = TmuReq::default(); self.tmu_out.clear();
         self.vpm.clear(); self.vpm_out_base = 0;
         self.tidx = 0; self.barrier_id = 0; self.final_section = final_section; self.prev_thrsw = false; self.end_in = None;
-        self.branch = None; self.delayed.clear(); self.done = false;
+        self.branch = None; self.delayed.clear(); self.done = false; self.start = (pc, unif);
+    }
+
+    /// With SBC_V3D_DUMP=DIR: write this invocation's code (from its start to a little past the
+    /// current pc) and uniform stream (to a little past the current position) as raw words.
+    fn dump_shader(&self, env: &mut dyn Env) {
+        let Some(dir) = std::env::var_os("SBC_V3D_DUMP") else { return };
+        let (pc0, u0) = self.start;
+        let words = |env: &mut dyn Env, from: u32, to: u32| -> String {
+            (from..to).step_by(4).map(|a| format!("{:08x}\n", env.read32(a))).collect()
+        };
+        let code = words(env, pc0, self.pc.max(pc0).wrapping_add(1024).min(pc0.wrapping_add(1 << 20)));
+        let unif = words(env, u0, self.unif.max(u0).wrapping_add(256).min(u0.wrapping_add(1 << 18)));
+        let base = std::path::Path::new(&dir).join(format!("shader-{pc0:x}"));
+        let _ = std::fs::write(base.with_extension("code"), code);
+        let _ = std::fs::write(base.with_extension("unif"), unif);
+        let _ = std::fs::write(base.with_extension("txt"), format!("start {pc0:#x}\nfail_pc {:#x}\nunif_start {u0:#x}\nunif_now {:#x}\n", self.pc, self.unif));
     }
 
     fn next_uniform(&mut self, env: &mut dyn Env) -> u32 {
@@ -957,7 +975,9 @@ impl Thread {
                 Some(v) => v,
                 None => {
                     let (k, c, n) = self.last_tmu;
-                    crate::log_once(&format!("v3d: ldtmu with no TMU result (pc {:#x}; last request {k:?} cfg {:#x} {:#x} {:#x} returned {n} words)", self.pc, c[0], c[1], c[2]));
+                    let msg = format!("v3d: ldtmu with no TMU result (pc {:#x}; last request {k:?} cfg {:#x} {:#x} {:#x} returned {n} words; shader {:#x} uniforms {:#x}, now at {:#x})",
+                                      self.pc, c[0], c[1], c[2], self.start.0, self.start.1, self.unif);
+                    if crate::log_first(&msg) { self.dump_shader(env); }
                     [0; LANES]
                 }
             };
