@@ -1,0 +1,52 @@
+# Working in this repository (all agents: Claude Code, Codex, others)
+
+Several agents work on sbc-emu at the same time. Everything reaches `main` through a pull
+request; nobody pushes to `main` directly. GitHub cannot enforce this on this plan, so it is
+the rule here.
+
+## Branches and worktrees
+
+- One agent, one branch, one git worktree. Never work in another agent's worktree or commit
+  to its branch: `git worktree list` shows who is where.
+- Branch names: `<agent>/<topic>`, e.g. `claude/firefox-glyphs`, `codex/orangepi5-usb`.
+- Start from the current `main`:
+  ```sh
+  git fetch origin
+  git worktree add ../sbc-emu-<topic> -b <agent>/<topic> origin/main
+  ```
+- Keep a branch small and about one thing; several small PRs merge more easily than one big
+  one.
+
+## Pull requests
+
+1. Rebase on `origin/main` before opening (and again if `main` moved): `git rebase origin/main`.
+2. Before pushing, check that nothing broke:
+   - `cargo test --workspace`
+   - `cargo build --release`
+   - the browser build: `"$(rustup which cargo)" check --target wasm32-unknown-unknown -p sbc-emu-wasm`
+   - for changes to a board, its boot scripts (`scripts/*.txt`); for GPU changes, the GL suite
+     (`scripts/gpu-gltest.txt` with `tools/gpu_server.py`, and `tests/gpu/run-snap-mesa.sh`)
+3. Open the PR with `gh pr create --base main`. In the description, say:
+   - what changed and why;
+   - how it was tested (commands and results);
+   - what is known not to work.
+4. Merge with a merge commit or rebase, never a force-push to `main`. Delete the branch after.
+5. A PR that touches shared crates (`emu-core`, `arm-a64`, `sbc-net`, `cli`, the board
+   facade) names the other agents' areas it affects, so their owners can look before merging.
+
+## Areas
+
+Who is working where right now (update this table when you start or finish something):
+
+| Area | Crates / paths | Agent |
+|---|---|---|
+| Raspberry Pi 4: SoC, GPU (V3D), display, Ubuntu | `bcm2711/`, `v3d/`, `cli/src/vnc*.rs`, `web/` | Claude Code |
+| Multi-board foundation, Orange Pi 5 (RK3588S), Orange Pi One (H3, `arm-a32`, not merged yet) | `sbc-machine/`, `rk3588/`, `boards/` | Codex |
+| RK3288 / Tinker Board (plan: `docs/rk3288-tinker-board-plan.md`) | new `rk3288/` crate, `arm-a32` with Codex | unassigned |
+
+## Never
+
+- Force-push to `main`, or rewrite history others have pulled.
+- Commit OS images, snapshots or build output (`cache/`, `target/`, `out/`, `web/assets/` are
+  ignored for that reason).
+- Run two emulators with `--sd-persist` on the same image (the emulator refuses).
