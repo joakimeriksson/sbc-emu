@@ -393,7 +393,18 @@ impl Cpu {
                     let mode = match (hw1 >> 7) & 3 {
                         1 => 0x0880_0000,
                         2 => 0x0900_0000,
-                        _ => return self.undefined(insn),
+                        op => {
+                            // RFEDB/RFEIA (L = 1) and SRSDB/SRSIA (L = 0): op 00 is DB, 11 IA.
+                            let increment = op == 3;
+                            let writeback = w != 0;
+                            return if l != 0 && hw2 == 0xc000 {
+                                self.return_from_exception(bus, rn as usize, increment, !increment, writeback)
+                            } else if l == 0 && rn == 13 && hw2 & 0xffe0 == 0xc000 {
+                                self.store_return_state(bus, hw2 & 0x1f, increment, !increment, writeback)
+                            } else {
+                                self.undefined(insn)
+                            };
+                        }
                     };
                     return self.a32(bus, mode | w << 21 | l << 20 | rn << 16 | hw2);
                 }
@@ -947,6 +958,10 @@ impl Cpu {
                 self.restore_spsr();
                 self.branch_to(target);
                 Ok(())
+            }
+            0x7f if hw2 & 0xf000 == 0x8000 => {
+                // SMC #imm4 (T32): the same firmware call as the A32 encoding.
+                self.execute(bus, self.cur_pc as u64, AL | 0x0160_0070 | hw1 & 0xf)
             }
             0x3e | 0x3f => {
                 // MRS

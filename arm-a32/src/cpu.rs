@@ -170,6 +170,11 @@ impl Cpu {
         }
     }
 
+    /// Set the current mode's SPSR (tests and boot code).
+    pub fn write_spsr_for_test(&mut self, value: u32) {
+        self.banked_spsr[Self::bank(self.cpsr)] = value;
+    }
+
     /// The SPSR of the current mode (diagnostics).
     pub fn spsr(&self) -> u32 {
         self.banked_spsr[Self::bank(self.cpsr)]
@@ -365,6 +370,80 @@ impl Cpu {
         self.psr_restored = true;
     }
 
+    /// RFE: load PC and CPSR from memory (exception return used by Thumb-2 kernels).
+    /// `increment`/`before` select IA, IB, DA or DB.
+    pub(crate) fn return_from_exception(
+        &mut self,
+        bus: &mut dyn Bus,
+        rn: usize,
+        increment: bool,
+        before: bool,
+        writeback: bool,
+    ) -> Result<(), Trap> {
+        if self.cpsr & 0x1f == MODE_USR {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, 0));
+        }
+        let base = self.r[rn];
+        let address = match (increment, before) {
+            (true, false) => base,
+            (true, true) => base.wrapping_add(4),
+            (false, false) => base.wrapping_sub(4),
+            (false, true) => base.wrapping_sub(8),
+        };
+        let pc = self.mem_read32(bus, address, Access::Read);
+        let psr = pc.and_then(|_| self.mem_read32(bus, address.wrapping_add(4), Access::Read));
+        let (pc, psr) = match (pc, psr) {
+            (Ok(pc), Ok(psr)) => (pc, psr),
+            (Err((va, status)), _) | (_, Err((va, status))) => return Err(self.data_abort(va, status, false)),
+        };
+        if writeback {
+            self.r[rn] = if increment { base.wrapping_add(8) } else { base.wrapping_sub(8) };
+        }
+        self.change_mode(psr & 0x1f);
+        self.cpsr = psr;
+        self.psr_restored = true;
+        self.branch_to(pc);
+        Ok(())
+    }
+
+    /// SRS: store LR and SPSR of the current mode on the stack of `mode`.
+    pub(crate) fn store_return_state(
+        &mut self,
+        bus: &mut dyn Bus,
+        mode: u32,
+        increment: bool,
+        before: bool,
+        writeback: bool,
+    ) -> Result<(), Trap> {
+        let current = self.cpsr & 0x1f;
+        if current == MODE_USR {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, 0));
+        }
+        let bank = Self::bank(mode);
+        let base = if Self::bank(current) == bank { self.r[13] } else { self.banked_sp[bank] };
+        let address = match (increment, before) {
+            (true, false) => base,
+            (true, true) => base.wrapping_add(4),
+            (false, false) => base.wrapping_sub(4),
+            (false, true) => base.wrapping_sub(8),
+        };
+        let (lr, spsr) = (self.r[14], self.banked_spsr[Self::bank(current)]);
+        for (offset, value) in [(0, lr), (4, spsr)] {
+            if let Err((va, status)) = self.mem_write32(bus, address.wrapping_add(offset), value) {
+                return Err(self.data_abort(va, status, true));
+            }
+        }
+        if writeback {
+            let new = if increment { base.wrapping_add(8) } else { base.wrapping_sub(8) };
+            if Self::bank(current) == bank {
+                self.r[13] = new;
+            } else {
+                self.banked_sp[bank] = new;
+            }
+        }
+        Ok(())
+    }
+
     /// BranchWritePC: stay in the current instruction set.
     pub(crate) fn branch_to(&mut self, target: u32) {
         self.r[15] = if self.cpsr & T != 0 { target & !1 } else { target & !3 };
@@ -507,6 +586,15 @@ impl Cpu {
                     self.change_mode(mode);
                 }
                 return Ok(());
+            }
+            // RFE{IA,IB,DA,DB} Rn{!} and SRS{IA,IB,DA,DB} SP{!}, #mode.
+            if insn & 0x0e50_ffff == 0x0810_0a00 {
+                let (p, u, w) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+                return self.return_from_exception(bus, ((insn >> 16) & 0xf) as usize, u, p, w);
+            }
+            if insn & 0x0e5f_ffe0 == 0x084d_0500 {
+                let (p, u, w) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+                return self.store_return_state(bus, insn & 0x1f, u, p, w);
             }
             // BLX immediate: call into Thumb code.
             if insn & 0x0e00_0000 == 0x0a00_0000 {

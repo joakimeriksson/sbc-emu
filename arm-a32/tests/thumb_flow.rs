@@ -126,3 +126,39 @@ fn thumb_ldrexd_strexd_accept_any_register_pair() {
     assert_eq!(cpu.r[2], 0, "store-exclusive succeeded");
     assert_eq!(ram.read64(0x3000).unwrap(), 0xbbbb_bbbb_aaaa_aaaa);
 }
+
+/// Thumb-2 kernels return from exceptions with RFE and enter PSCI with the T32 SMC.
+#[test]
+fn srs_rfe_round_trip_and_thumb_rfe() {
+    let mut ram = FlatRam::new(0, 0x10000);
+    ram.write32(0x1000, 0xf96d_0513).unwrap(); // srsdb sp!, #0x13
+    ram.write32(0x1004, 0xf8bd_0a00).unwrap(); // rfeia sp!
+    let mut cpu = Cpu::new();
+    cpu.r[15] = 0x1000;
+    cpu.r[13] = 0x8000;
+    cpu.r[14] = 0x2001; // return to Thumb code at 0x2000
+    cpu.write_spsr_for_test(0x6000_0030); // Thumb, user mode... SVC below
+    cpu.step(&mut ram).unwrap();
+    assert_eq!(cpu.r[13], 0x7ff8);
+    assert_eq!(ram.read32(0x7ff8).unwrap(), 0x2001);
+    ram.write32(0x7ff8, 0x2000).unwrap();
+    ram.write32(0x7ffc, 0x6000_0033).unwrap(); // SVC, Thumb, Z and C
+    cpu.step(&mut ram).unwrap();
+    assert_eq!((cpu.r[15], cpu.cpsr), (0x2000, 0x6000_0033));
+    assert_eq!(cpu.r[13], 0x8000);
+
+    // T32 rfeia sp! back to ARM code.
+    ram.write16(0x2000, 0xe9bd).unwrap();
+    ram.write16(0x2002, 0xc000).unwrap();
+    ram.write32(0x8000, 0x3000).unwrap();
+    ram.write32(0x8004, 0x0000_0013).unwrap();
+    cpu.step(&mut ram).unwrap();
+    assert_eq!((cpu.r[15], cpu.cpsr & 0x3f), (0x3000, 0x13));
+}
+
+#[test]
+fn thumb_smc_reaches_host_firmware() {
+    let (mut cpu, mut ram) = thumb_machine(&[0xf7f0, 0x8000]); // smc #0
+    cpu.firmware_calls_to_host = true;
+    assert_eq!(cpu.step(&mut ram), Err(Trap::HostCall(0)));
+}
