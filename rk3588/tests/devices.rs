@@ -71,9 +71,9 @@ fn uart_divisor_fifo_loopback_and_interrupt_acknowledge() {
 #[test]
 fn byte_priorities_and_64bit_affinity_registers() {
     let mut m=Machine::new(128<<20).unwrap();
-    m.soc.write32(GICD+0x400,0xa0a0_a0a0).unwrap();
-    m.soc.write8(GICD+0x401,0x47).unwrap();
-    assert_eq!(m.soc.read32(GICD+0x400).unwrap(),0xa0a0_40a0);
+    m.soc.write32(GICD+0x420,0xa0a0_a0a0).unwrap();
+    m.soc.write8(GICD+0x421,0x47).unwrap();
+    assert_eq!(m.soc.read32(GICD+0x420).unwrap(),0xa0a0_40a0);
     assert_eq!(m.soc.read64(GICR+8).unwrap(),0x10); // affinity 0, last redistributor
     m.soc.write64(GICD+0x6000+UART_IRQ as u64*8,0x100_0000_0000).unwrap();
     assert_eq!(m.soc.read64(GICD+0x6000+UART_IRQ as u64*8).unwrap(),0x100_0000_0000);
@@ -99,4 +99,23 @@ fn boot_rejects_invalid_layout_without_panicking() {
     let mut image=vec![0;64];image[56..60].copy_from_slice(b"ARMd");
     image[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(rk3588::boot::boot_linux(&mut m,&image,None,"").is_err());
+}
+
+#[test]
+fn private_banks_are_isolated_and_byte_clear_is_write_one() {
+    let mut m=Machine::new(128<<20).unwrap();
+    m.soc.write32(GICR+0x10100,0xffff).unwrap();
+    m.soc.write8(GICR+0x10180,1).unwrap();
+    assert_eq!(m.soc.read32(GICR+0x10100).unwrap(),0xfffe);
+    m.soc.write32(GICD+0x100,u32::MAX).unwrap();
+    assert_eq!(m.soc.read32(GICD+0x100).unwrap(),0);
+    assert_eq!(m.soc.read32(GICR+0x10100).unwrap(),0xfffe);
+    m.soc.write32(GICD+0x420,0x20202020).unwrap();
+    m.soc.write32(GICR+0x10420,0xffffffff).unwrap();
+    assert_eq!(m.soc.read32(GICD+0x420).unwrap(),0x20202020);
+}
+#[test]
+fn uart_reset_preserves_unread_output() {
+    let mut u=Uart::default();u.write(0,b'A' as u32);u.write(0x88,1);u.write(0,b'B' as u32);
+    assert_eq!(u.out,b"AB");
 }

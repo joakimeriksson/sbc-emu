@@ -1,18 +1,8 @@
 //! Native serial-only RK3588S bring-up adapter. Unsupported Pi options fail explicitly.
 use crate::arg;
-use std::{collections::VecDeque, io::{IsTerminal, Read, Write}, process::ExitCode,
+use std::{collections::VecDeque, io::{Read, Write}, process::ExitCode,
     sync::mpsc, time::{Duration, Instant}};
 use sbc_machine::{Machine as HostMachine, Stop};
-
-struct Terminal(bool);
-impl Terminal {
-    fn new()->Self {
-        let active=std::io::stdin().is_terminal() && std::process::Command::new("stty")
-            .args(["raw","-echo"]).stdin(std::process::Stdio::inherit()).status().is_ok_and(|s|s.success());
-        Self(active)
-    }
-}
-impl Drop for Terminal { fn drop(&mut self) {if self.0 {let _=std::process::Command::new("stty").arg("sane").stdin(std::process::Stdio::inherit()).status();}} }
 
 pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
@@ -55,13 +45,16 @@ fn execute(args:&[String])->Result<(),String> {
         if !matches!(line.split_whitespace().next(),Some("wait-serial"|"serial"|"quit"|"reset")) {return Err(format!("unsupported Orange Pi script command: {line}"));}
     }
     eprintln!("[orangepi5] experimental RK3588S: one reduced Cortex-A55, GICv3, UART2; direct kernel boot, reduced DT");
-    let _terminal=Terminal::new();
+    let _terminal=crate::terminal::RawTty::enable();
     let (tx,rx)=mpsc::channel();
     std::thread::spawn(move||{let mut stdin=std::io::stdin();let mut b=[0];while let Ok(1)=stdin.read(&mut b){if tx.send(b[0]).is_err(){break;}}});
+    let mut idle_input=Vec::new();
     let mut pending=VecDeque::new();let mut output=std::io::stdout();let mut serial=String::new();
     let start=Instant::now();let mut anchor=Instant::now();let mut escape=false;
     let result=loop {
-        while let Ok(b)=rx.try_recv(){
+        let mut input=std::mem::take(&mut idle_input);
+        while let Ok(b)=rx.try_recv(){input.push(b);}
+        for b in input {
             if escape {escape=false;if b==b'x' {return Ok(());} pending.push_back(1);}
             else if b==1 {escape=true;continue;}
             pending.push_back(b);
@@ -90,11 +83,14 @@ fn execute(args:&[String])->Result<(),String> {
             Stop::Budget=>{},
             Stop::Idle(deadline)=>{
                 let wall=anchor.elapsed().as_nanos() as u64;
-                if wall<m.now(){if let Ok(b)=rx.recv_timeout(Duration::from_millis(1)){pending.push_back(b);}}
+                if wall<=m.now(){
+                    let wait=Duration::from_nanos(deadline.saturating_sub(wall).min(20_000_000).max(1));
+                    if let Ok(b)=rx.recv_timeout(wait){idle_input.push(b);}
+                }
                 let target=deadline.min((anchor.elapsed().as_nanos() as u64).max(m.now()));
                 HostMachine::OrangePi5(&mut m).idle_until(target);
             },
-            Stop::Reset=>{m=make_machine()?;anchor=Instant::now();serial.clear();},
+            Stop::Reset=>{m=make_machine()?;anchor=Instant::now();serial.clear();pending.clear();},
             Stop::PowerOff=>break if script.is_empty(){Ok(())}else{Err("guest powered off before script completed".into())},
             other=>break Err(format!("stopped: {other:?}")),
         }

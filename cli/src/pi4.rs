@@ -2,25 +2,12 @@
 //! Shared run/idle/serial operations go through sbc-machine; CPU and device loops stay in BCM2711.
 use crate::{arg, usage, disk, gdb, monitor, vnc, wav};
 use bcm2711::Machine;
+use crate::terminal::RawTty;
 use sbc_machine::{Machine as HostMachine, Stop};
 use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-
-/// Restores the terminal mode on drop.
-struct RawTty(bool);
-impl RawTty {
-    fn enable() -> Self {
-        let tty = std::process::Command::new("stty").args(["raw", "-echo"]).stdin(std::process::Stdio::inherit()).status().is_ok_and(|s| s.success());
-        RawTty(tty)
-    }
-}
-impl Drop for RawTty {
-    fn drop(&mut self) {
-        if self.0 { let _ = std::process::Command::new("stty").arg("sane").stdin(std::process::Stdio::inherit()).status(); }
-    }
-}
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
     let kpath = arg(args, "--kernel");

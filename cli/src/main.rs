@@ -12,6 +12,7 @@ mod vnc;
 mod vnc_des;
 mod wav;
 mod pi4;
+mod terminal;
 mod orangepi;
 
 use sbc_machine::Board;
@@ -31,8 +32,9 @@ fn main() -> ExitCode {
         }
         Some("mkinitramfs") => {
             let (Some(bb), Some(out)) = (arg(&args, "--busybox"), arg(&args, "-o")) else { return usage() };
-            let busybox = match std::fs::read(bb) { Ok(b) => b, Err(e) => { eprintln!("{bb}: {e}"); return ExitCode::FAILURE } };
             let board = match Board::from_args(&args) { Ok(b) => b, Err(e) => {eprintln!("{e}");return ExitCode::from(2);} };
+            if let Err(e) = board.require_implemented() { eprintln!("{e}"); return ExitCode::from(2); }
+            let busybox = match std::fs::read(bb) { Ok(b) => b, Err(e) => { eprintln!("{bb}: {e}"); return ExitCode::FAILURE } };
             let image = if board == Board::OrangePi5 { cpio::orangepi_initramfs(&busybox) } else { cpio::busybox_initramfs(&busybox) };
             std::fs::write(out, image).unwrap();
             ExitCode::SUCCESS

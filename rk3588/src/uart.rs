@@ -63,7 +63,7 @@ impl Uart {
             12 => self.lcr = v,
             16 => self.mcr = v,
             28 => self.scratch = v,
-            0x88 => { if v & 1 != 0 { *self = Self::default(); } else { if v & 2 != 0 { self.rx.clear(); } if v & 4 != 0 { self.tx_pending = true; } } }
+            0x88 => { if v & 1 != 0 { let out=std::mem::take(&mut self.out); *self = Self::default(); self.out=out; } else { if v & 2 != 0 { self.rx.clear(); } if v & 4 != 0 { self.tx_pending = true; } } }
             _ => {}
         }
     }

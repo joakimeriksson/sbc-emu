@@ -13,6 +13,7 @@ pub const CTLR: u32 = key(3, 0, 12, 12, 4);
 pub const GROUP1: u32 = key(3, 0, 12, 12, 7);
 
 pub struct Gic {
+    cached: std::cell::Cell<Option<Option<usize>>>,
     ctlr: u32,
     group: [bool; NIRQ],
     enabled: [bool; NIRQ],
@@ -32,7 +33,7 @@ pub struct Gic {
 }
 impl Default for Gic {
     fn default() -> Self {
-        Self { ctlr: 0x40, group: [false; NIRQ], enabled: [false; NIRQ], pending: [false; NIRQ],
+        Self { cached: std::cell::Cell::new(None), ctlr: 0x40, group: [false; NIRQ], enabled: [false; NIRQ], pending: [false; NIRQ],
             level: [false; NIRQ], active: [false; NIRQ], edge: [false; NIRQ], priority: [0xa0; NIRQ],
             route: [0; NIRQ], pmr: 0, cpu_ctlr: 0, group1: false, waker: 6, sre: 7,
             running: Vec::new(), acknowledges: 0 }
@@ -40,10 +41,17 @@ impl Default for Gic {
 }
 impl Gic {
     pub fn set_line(&mut self, id: usize, high: bool) {
+        if self.level[id] != high { self.cached.set(None); }
         if self.edge[id] && high && !self.level[id] { self.pending[id] = true; }
         self.level[id] = high;
     }
     fn highest(&self) -> Option<usize> {
+        if let Some(result) = self.cached.get() { return result; }
+        let result = self.find_highest();
+        self.cached.set(Some(result));
+        result
+    }
+    fn find_highest(&self) -> Option<usize> {
         if self.ctlr & 3 == 0 || !self.group1 || self.waker & 2 != 0 { return None; }
         let running = self.running.last().map_or(256, |(_, p)| *p as u16);
         (0..NIRQ).filter(|&i| self.enabled[i] && self.group[i] && !self.active[i]
@@ -54,9 +62,10 @@ impl Gic {
     }
     pub fn irq(&self) -> bool { self.highest().is_some() }
     pub fn sys_read(&mut self, reg: u32) -> Option<u64> {
+        if reg == IAR { self.cached.set(None); }
         Some(match reg {
             IAR => match self.highest() {
-                Some(i) => { self.pending[i] = false; self.active[i] = true; self.running.push((i, self.priority[i])); self.acknowledges += 1; i as u64 }
+                Some(i) => { self.pending[i] = false; self.active[i] = true; self.running.push((i, self.priority[i])); self.acknowledges += 1; self.cached.set(None); i as u64 }
                 None => 1023,
             },
             PMR => self.pmr as u64,
@@ -73,6 +82,7 @@ impl Gic {
         })
     }
     pub fn sys_write(&mut self, reg: u32, v: u64) -> bool {
+        self.cached.set(None);
         match reg {
             PMR => self.pmr = v as u8 & 0xf8,
             SRE => self.sre = v | 7,
@@ -138,22 +148,26 @@ impl Gic {
             8 => 0x0200_043b,
             0xffe8 => 0x30,
             0x6000..=0x6eff => { let i=((off-0x6000)/8) as usize; if i<NIRQ { (self.route[i] >> ((off&4)*8)) as u32 } else {0} }
+            0x80..=0x83 | 0x100..=0x103 | 0x180..=0x183 | 0x200..=0x203 | 0x280..=0x283 | 0x300..=0x303 | 0x380..=0x383 | 0x400..=0x41f | 0xc00..=0xc07 => 0,
             _ => self.bank_read(off),
         }
     }
     pub fn dist_write(&mut self, off: u64, v: u32) {
+        self.cached.set(None);
         match off {
             0 => self.ctlr = (v & 0x37) | 0x40,
             0x6000..=0x6eff => { let i=((off-0x6000)/8) as usize; let shift=(off&4)*8; if i<NIRQ {self.route[i]=(self.route[i]&!(0xffff_ffff<<shift))|((v as u64)<<shift);} }
+            0x80..=0x83 | 0x100..=0x103 | 0x180..=0x183 | 0x200..=0x203 | 0x280..=0x283 | 0x300..=0x303 | 0x380..=0x383 | 0x400..=0x41f | 0xc00..=0xc07 => {},
             _ => self.bank_write(off,v),
         }
     }
     pub fn redist_read(&self, off: u64) -> u32 {
         match off { 0=>0, 4=>0x0200_043b, 8=>0x10, 12=>0, 0x14=>self.waker, 0xffe8=>0x30,
-            0x10000..=0x1ffff => self.bank_read(off-0x10000), _=>0 }
+            0x10080..=0x10083 | 0x10100..=0x10103 | 0x10180..=0x10183 | 0x10200..=0x10203 | 0x10280..=0x10283 | 0x10300..=0x10303 | 0x10380..=0x10383 | 0x10400..=0x1041f | 0x10c00..=0x10c07 => self.bank_read(off-0x10000), _=>0 }
     }
     pub fn redist_write(&mut self, off: u64,v: u32) {
+        self.cached.set(None);
         match off { 0x14=>self.waker=if v&2!=0 {6}else{0},
-            0x10000..=0x1ffff=>self.bank_write(off-0x10000,v), _=>{} }
+            0x10080..=0x10083 | 0x10100..=0x10103 | 0x10180..=0x10183 | 0x10200..=0x10203 | 0x10280..=0x10283 | 0x10300..=0x10303 | 0x10380..=0x10383 | 0x10400..=0x1041f | 0x10c00..=0x10c07 =>self.bank_write(off-0x10000,v), _=>{} }
     }
 }

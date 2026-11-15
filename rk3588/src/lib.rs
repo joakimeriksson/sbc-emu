@@ -43,7 +43,9 @@ impl Soc {
         // Linux uses byte accesses for GIC priority registers. Preserve neighbouring priorities.
         let v = if size < 4 {
             let shift=(addr&3)*8; let mask=((1u32<<(size*8))-1)<<shift;
-            let old=if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
+            let off = if (GICD..GICD+0x10000).contains(&addr) { addr-GICD } else { addr.saturating_sub(GICR+0x10000) };
+            let is_write_one = (0x100..0x400).contains(&off);
+            let old=if is_write_one { 0 } else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
                 else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)} else {0};
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};

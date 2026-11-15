@@ -65,3 +65,12 @@ fn malformed_selector_cannot_silently_boot_pi() {
             .contains("--board"));
     }
 }
+
+#[test]
+fn initramfs_rejects_unimplemented_board_before_opening_busybox() {
+    let output = run(&["mkinitramfs", "--board", "pi3b", "--busybox", "/nonexistent/busybox", "-o", "/tmp/unused-sbc-initramfs"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("not implemented"));
+    assert!(!stderr.contains("/nonexistent/busybox"));
+}
