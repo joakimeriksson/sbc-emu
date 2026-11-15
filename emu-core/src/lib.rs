@@ -6,6 +6,7 @@ pub mod snap;
 pub mod disk;
 pub mod gpt;
 pub mod sdcard;
+pub mod ext4;
 pub mod fdt;
 mod stop;
 pub use stop::Stop;

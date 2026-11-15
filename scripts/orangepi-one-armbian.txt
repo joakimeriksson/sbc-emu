@@ -1,0 +1,11 @@
+# Armbian 26.8.1 (trixie, kernel 6.18.44 built as a Thumb-2 kernel) from an unmodified
+# SD image: emulated firmware boot (armbianEnv.txt, zImage, DTB, uInitrd from the card's
+# ext4 /boot), four cores, initramfs, fsck, root by UUID, systemd to the console login.
+# The first login runs Armbian's first-run wizard; its password prompt proves userland.
+# Fixture: scripts/armbian-orangepi-one-fixture.sh; slow on the interpreter (tens of
+# minutes): use --timeout 3600.
+wait-serial Welcome to Armbian 26.8.1 trixie
+wait-serial Reached target multi-user.target
+wait-serial orangepione login:
+wait-serial Create root password:
+quit

@@ -280,6 +280,10 @@ pub struct Machine {
     subtick: u64,
     /// The core that caused the last non-budget, non-idle stop (diagnostics).
     pub last_stop_core: usize,
+    /// Debugging: print this many exceptions (vector, LR, SPSR, fault registers) to
+    /// stderr once `trace_from` instructions have run (env `H3_TRACE_EXC`, `H3_TRACE_FROM`).
+    pub trace_exceptions: u32,
+    pub trace_from: u64,
 }
 
 impl Machine {
@@ -309,6 +313,8 @@ impl Machine {
             exceptions: 0,
             subtick: 0,
             last_stop_core: 0,
+            trace_exceptions: std::env::var("H3_TRACE_EXC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            trace_from: std::env::var("H3_TRACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
 
@@ -338,7 +344,9 @@ impl Machine {
         let mut cpu = Cpu::new();
         cpu.instret = instret;
         cpu.mpidr = 0x8000_0000 | index as u32;
-        cpu.r[15] = entry;
+        // Bit 0 of an entry point selects Thumb state (Thumb-2 kernels pass a Thumb
+        // secondary_startup).
+        cpu.set_entry(entry);
         cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
         cpu.undef_to_guest = true;
         cpu.firmware_calls_to_host = true;
@@ -546,8 +554,20 @@ impl Machine {
                         self.irqs += 1;
                         storm[k] = 0;
                     }
-                    Err(Trap::Exception(..)) => {
+                    Err(Trap::Exception(class, _)) => {
                         self.exceptions += 1;
+                        if self.trace_exceptions > 0 && self.cpus[k].instret >= self.trace_from {
+                            self.trace_exceptions -= 1;
+                            let c = &self.cpus[k];
+                            let va = if class == 0x21 { c.ifar } else { c.dfar };
+                            let n = c.ttbcr & 7;
+                            let table = if n != 0 && (va as u64) >= (1u64 << 32 >> n) { c.ttbr1 & !0x3fff } else { c.ttbr0 & !((1u32 << (14 - n)) - 1) };
+                            let l1 = self.soc.ram.read32(table as u64 + (va >> 20) as u64 * 4).unwrap_or(0xdead);
+                            eprintln!(
+                                "[h3 exc] core {k} class {class:#x} vector {:#010x} lr {:#010x} spsr {:#010x} dfsr {:#x} dfar {:#010x} ifsr {:#x} ifar {:#010x} insns {} ttbcr {:#x} l1 {l1:#010x} dacr {:#x} sctlr {:#x}",
+                                c.r[15], c.r[14], c.spsr(), c.dfsr, c.dfar, c.ifsr, c.ifar, c.instret, c.ttbcr, c.dacr, c.sctlr
+                            );
+                        }
                         storm[k] += 1;
                         if storm[k] > 10_000 {
                             self.last_stop_core = k;
