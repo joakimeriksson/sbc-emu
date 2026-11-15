@@ -73,8 +73,8 @@ fn run() -> Result<(), String> {
             dump_kernel_image(&machine);
             for (k, cpu) in machine.cpus.iter().enumerate() {
                 eprintln!(
-                    "[h3-boot] core {k} {:?} pc={:#010x} lr={:#010x} cpsr={:#010x} irq={} insns={}",
-                    machine.state[k], cpu.r[15], cpu.r[14], cpu.cpsr, cpu.irq, cpu.instret
+                    "[h3-boot] core {k} {:?} pc={:#010x} lr={:#010x} cpsr={:#010x} irq={} insns={} last_undef={:x?}",
+                    machine.state[k], cpu.r[15], cpu.r[14], cpu.cpsr, cpu.irq, cpu.instret, cpu.last_undef
                 );
             }
             return Ok(());

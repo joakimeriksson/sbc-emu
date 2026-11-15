@@ -29,6 +29,14 @@ pub struct Cpu {
     pub fiq: bool,
     pub instret: u64,
     pub last_wfe: bool,
+    /// Address and size (2 or 4) of the instruction being executed: exception return
+    /// addresses are computed from these in both instruction sets.
+    pub(crate) cur_pc: u32,
+    pub(crate) cur_size: u32,
+    /// Set by any PC write while executing a Thumb instruction.
+    pub(crate) pc_written: bool,
+    /// Set when an instruction restored CPSR from SPSR (exception return).
+    pub(crate) psr_restored: bool,
     /// The event register (WFE/SEV).
     pub event: bool,
     /// Set by SEV; the machine delivers the event to the other cores and clears it.
@@ -100,6 +108,10 @@ impl Cpu {
             instret: 0,
             last_wfe: false,
             event: false,
+            cur_pc: 0,
+            cur_size: 4,
+            pc_written: false,
+            psr_restored: false,
             sent_event: false,
             firmware_calls_to_host: false,
             midr: 0x410f_c075,
@@ -239,7 +251,9 @@ impl Cpu {
     }
 
     fn read_reg(&self, n: u32) -> u32 {
-        // execute() has already advanced r15 by four: architectural reads see old PC + 8.
+        // ARM: execute() has already advanced r15 by four, so reads see the instruction
+        // address + 8. Thumb: r15 holds the instruction address while it executes, so
+        // reads see address + 4. Never compute PC-relative values from self.r[15] directly.
         if n == 15 {
             self.r[15].wrapping_add(4)
         } else {
@@ -247,7 +261,7 @@ impl Cpu {
         }
     }
 
-    fn condition(&self, cond: u32) -> bool {
+    pub(crate) fn condition(&self, cond: u32) -> bool {
         let n = self.cpsr & N != 0;
         let z = self.cpsr & Z != 0;
         let c = self.cpsr & C != 0;
@@ -276,19 +290,19 @@ impl Cpu {
         self.cpsr = (self.cpsr & !(N | Z)) | (value & N) | u32::from(value == 0) * Z;
     }
 
-    fn set_logic_flags(&mut self, value: u32, carry: bool) {
+    pub(crate) fn set_logic_flags(&mut self, value: u32, carry: bool) {
         self.set_nz(value);
         self.cpsr = (self.cpsr & !C) | u32::from(carry) * C;
     }
 
-    fn add_with_carry(a: u32, b: u32, carry: bool) -> (u32, bool, bool) {
+    pub(crate) fn add_with_carry(a: u32, b: u32, carry: bool) -> (u32, bool, bool) {
         let wide = a as u64 + b as u64 + carry as u64;
         let result = wide as u32;
         let overflow = (a ^ result) & (b ^ result) & N != 0;
         (result, wide >> 32 != 0, overflow)
     }
 
-    fn set_add_flags(&mut self, a: u32, b: u32, result: u32, carry: bool, overflow: bool) {
+    pub(crate) fn set_add_flags(&mut self, a: u32, b: u32, result: u32, carry: bool, overflow: bool) {
         let _ = (a, b);
         self.set_nz(result);
         self.cpsr = (self.cpsr & !(C | V)) | u32::from(carry) * C | u32::from(overflow) * V;
@@ -317,26 +331,49 @@ impl Cpu {
         if self.cpsr & 0x1f == MODE_USR {
             mask &= 0xf80f_0000; // User mode may only write NZCVQ and GE.
         }
+        mask &= !(T | 0x0600_fc00); // MSR does not write the execution state bits
         let updated = (self.cpsr & !mask) | (value & mask);
-        if updated & T != 0 {
-            return false;
-        }
         self.change_mode(updated & 0x1f);
         self.cpsr = updated;
         true
     }
 
-    fn restore_spsr(&mut self) -> bool {
+    pub(crate) fn restore_spsr(&mut self) {
         let restored = self.banked_spsr[Self::bank(self.cpsr)];
-        if restored & T != 0 {
-            return false;
-        }
         self.change_mode(restored & 0x1f);
         self.cpsr = restored;
-        true
+        self.psr_restored = true;
     }
 
-    fn shift(value: u32, kind: u32, amount: u32, carry: bool, immediate: bool) -> (u32, bool) {
+    /// BranchWritePC: stay in the current instruction set.
+    pub(crate) fn branch_to(&mut self, target: u32) {
+        self.r[15] = if self.cpsr & T != 0 { target & !1 } else { target & !3 };
+        self.pc_written = true;
+    }
+
+    /// BXWritePC (BX, BLX, and in ARMv7 also LDR/LDM/POP of the PC and ARM-state ALU
+    /// writes): bit 0 selects Thumb.
+    pub(crate) fn bx_to(&mut self, target: u32) {
+        if target & 1 != 0 {
+            self.cpsr |= T;
+            self.r[15] = target & !1;
+        } else {
+            self.cpsr &= !T;
+            self.r[15] = target & !3;
+        }
+        self.pc_written = true;
+    }
+
+    /// Return address after this instruction (LR for BL/BLX in either state).
+    pub(crate) fn next_pc(&self) -> u32 {
+        self.cur_pc.wrapping_add(self.cur_size)
+    }
+
+    pub(crate) fn thumb(&self) -> bool {
+        self.cpsr & T != 0
+    }
+
+    pub(crate) fn shift(value: u32, kind: u32, amount: u32, carry: bool, immediate: bool) -> (u32, bool) {
         if !immediate && amount == 0 {
             return (value, carry);
         }
@@ -384,7 +421,11 @@ impl Cpu {
         self.change_mode(mode);
         self.banked_spsr[Self::bank(mode)] = old;
         self.r[14] = return_addr;
-        self.cpsr = (self.cpsr & !(T | F)) | I | if mask_fiq { F } else { 0 };
+        // Handlers run in Thumb state when SCTLR.TE is set (Thumb-2 kernels).
+        let thumb_handlers = if self.sctlr & (1 << 30) != 0 { T } else { 0 };
+        self.cpsr = (self.cpsr & !(T | F | 0x0600_fc00)) | I | thumb_handlers
+            | if mask_fiq { F } else { 0 };
+        self.pc_written = true;
         let base = if self.sctlr & (1 << 13) != 0 {
             0xffff_0000
         } else {
@@ -393,21 +434,21 @@ impl Cpu {
         self.r[15] = base.wrapping_add(vector);
     }
 
-    fn prefetch_abort(&mut self, va: u32, status: u32) -> Trap {
+    pub(crate) fn prefetch_abort(&mut self, va: u32, status: u32) -> Trap {
         self.ifsr = status;
         self.ifar = va;
-        self.enter_exception(0x0c, self.r[15].wrapping_add(4), MODE_ABT, true);
+        self.enter_exception(0x0c, self.cur_pc.wrapping_add(4), MODE_ABT, true);
         Trap::Exception(0x21, 1)
     }
 
     pub(crate) fn data_abort(&mut self, va: u32, status: u32, write: bool) -> Trap {
         self.dfsr = status | u32::from(write) << 11;
         self.dfar = va;
-        self.enter_exception(0x10, self.r[15].wrapping_add(4), MODE_ABT, true);
+        self.enter_exception(0x10, self.cur_pc.wrapping_add(8), MODE_ABT, true);
         Trap::Exception(0x25, 1)
     }
 
-    fn execute(&mut self, bus: &mut dyn Bus, pc: u64, insn: u32) -> Result<(), Trap> {
+    pub(crate) fn execute(&mut self, bus: &mut dyn Bus, pc: u64, insn: u32) -> Result<(), Trap> {
         let unimplemented = || Trap::Unimplemented(pc, insn);
         if insn >> 28 == 15 {
             if insn == 0xf57f_f01f {
@@ -442,6 +483,14 @@ impl Cpu {
                 if change_mode {
                     self.change_mode(mode);
                 }
+                return Ok(());
+            }
+            // BLX immediate: call into Thumb code.
+            if insn & 0x0e00_0000 == 0x0a00_0000 {
+                let offset = ((((insn & 0x00ff_ffff) << 8) as i32 >> 6) as u32) | (insn >> 23) & 2;
+                let target = self.read_reg(15).wrapping_add(offset);
+                self.r[14] = self.next_pc();
+                self.bx_to(target | 1);
                 return Ok(());
             }
             // DMB/DSB/ISB are no-ops with synchronous devices and direct instruction fetch.
@@ -516,20 +565,15 @@ impl Cpu {
             return Err(Trap::Hlt((((insn >> 4) & 0xfff0) | (insn & 0xf)) as u16));
         }
         if insn & 0x0fff_fff0 == 0x012f_ff30 {
+            // BLX register: the return address keeps the caller's instruction set in bit 0.
             let target = self.read_reg(insn & 0xf);
-            if target & 1 != 0 {
-                return Err(unimplemented()); // Thumb entry is a later milestone.
-            }
-            self.r[14] = self.r[15];
-            self.r[15] = target;
+            self.r[14] = self.next_pc() | u32::from(self.thumb());
+            self.bx_to(target);
             return Ok(());
         }
         if insn & 0x0fff_fff0 == 0x012f_ff10 {
             let target = self.read_reg(insn & 0xf);
-            if target & 1 != 0 {
-                return Err(unimplemented()); // Thumb entry is a later milestone.
-            }
-            self.r[15] = target;
+            self.bx_to(target);
             return Ok(());
         }
 
@@ -753,15 +797,16 @@ impl Cpu {
         if insn & 0x0e00_0000 == 0x0a00_0000 {
             let offset = (((insn & 0x00ff_ffff) << 8) as i32 >> 6) as u32;
             if insn & (1 << 24) != 0 {
-                self.r[14] = self.r[15];
+                self.r[14] = self.next_pc() | u32::from(self.thumb());
             }
-            self.r[15] = self.read_reg(15).wrapping_add(offset);
+            let target = self.read_reg(15).wrapping_add(offset);
+            self.branch_to(target);
             return Ok(());
         }
 
         // SVC always enters the guest's supervisor call handler.
         if insn & 0x0f00_0000 == 0x0f00_0000 {
-            self.enter_exception(0x08, self.r[15], MODE_SVC, false);
+            self.enter_exception(0x08, self.next_pc(), MODE_SVC, false);
             return Err(Trap::Exception(0x15, 1));
         }
 
@@ -1116,9 +1161,6 @@ impl Cpu {
                         address = address.wrapping_add(4);
                     }
                 }
-                if loads_pc && values[15] & 3 != 0 {
-                    return Err(unimplemented());
-                }
                 if writeback {
                     self.r[rn as usize] = new_base;
                 }
@@ -1132,11 +1174,12 @@ impl Cpu {
                         }
                     }
                 }
-                if loads_pc {
-                    self.r[15] = values[15];
-                }
-                if spsr && loads_pc && !self.restore_spsr() {
-                    return Err(unimplemented());
+                if loads_pc && spsr {
+                    // Exception return: CPSR from SPSR, then a plain branch.
+                    self.restore_spsr();
+                    self.branch_to(values[15]);
+                } else if loads_pc {
+                    self.bx_to(values[15]);
                 }
             } else {
                 for register in 0..15 {
@@ -1289,10 +1332,10 @@ impl Cpu {
                 match value {
                     Ok(value) => {
                         if rd == 15 {
-                            if byte || value & 1 != 0 {
+                            if byte {
                                 return Err(unimplemented());
                             }
-                            self.r[15] = value;
+                            self.bx_to(value);
                         } else {
                             self.r[rd as usize] = value;
                         }
@@ -1425,10 +1468,13 @@ impl Cpu {
                 return Ok(());
             }
             if rd == 15 {
-                if result & 3 != 0 || set_flags && !self.restore_spsr() {
-                    return Err(unimplemented());
+                if set_flags {
+                    // SUBS PC, LR etc.: exception return.
+                    self.restore_spsr();
+                    self.branch_to(result);
+                } else {
+                    self.bx_to(result); // ARMv7 ALUWritePC interworks in ARM state
                 }
-                self.r[15] = result;
                 return Ok(());
             }
             self.r[rd as usize] = result;
@@ -1446,6 +1492,28 @@ impl Cpu {
     }
 }
 
+impl Cpu {
+    /// Retire an instruction or turn an unimplemented encoding into UNDEFINED.
+    pub(crate) fn finish(&mut self, pc: u32, insn: u32, result: Result<(), Trap>) -> Result<(), Trap> {
+        match result {
+            Ok(()) | Err(Trap::Wait | Trap::HostCall(_) | Trap::Brk(_) | Trap::Hlt(_)) => {
+                self.instret = self.instret.wrapping_add(1);
+            }
+            Err(Trap::Unimplemented(..)) if self.undef_to_guest => {
+                self.last_undef = Some((pc, insn));
+                // LR_und = instruction + 4 (ARM) or + 2 (Thumb, also for 32-bit
+                // encodings: Linux reads the halfwords at LR - 2 and LR).
+                let lr = pc.wrapping_add(if self.thumb() { 2 } else { 4 });
+                self.enter_exception(0x04, lr, MODE_UND, false);
+                return Err(Trap::Exception(0x00, 1));
+            }
+            Err(Trap::Unimplemented(..)) => self.r[15] = pc,
+            _ => {}
+        }
+        result
+    }
+}
+
 impl Core for Cpu {
     fn step(&mut self, bus: &mut dyn Bus) -> Result<(), Trap> {
         if self.irq && self.cpsr & I == 0 {
@@ -1456,26 +1524,20 @@ impl Core for Cpu {
             self.enter_exception(0x1c, self.r[15].wrapping_add(4), MODE_FIQ, true);
             return Err(Trap::Interrupt(1, 1));
         }
-        let pc = self.r[15] as u64;
-        let insn = match self.mem_read32(bus, pc as u32, Access::Execute) {
+        let pc = self.r[15];
+        self.cur_pc = pc;
+        self.pc_written = false;
+        if self.thumb() {
+            return self.step_thumb(bus, pc);
+        }
+        self.cur_size = 4;
+        let insn = match self.mem_read32(bus, pc, Access::Execute) {
             Ok(insn) => insn,
             Err((va, status)) => return Err(self.prefetch_abort(va, status)),
         };
-        self.r[15] = self.r[15].wrapping_add(4);
-        let result = self.execute(bus, pc, insn);
-        match result {
-            Ok(()) | Err(Trap::Wait | Trap::HostCall(_) | Trap::Brk(_) | Trap::Hlt(_)) => {
-                self.instret = self.instret.wrapping_add(1);
-            }
-            Err(Trap::Unimplemented(..)) if self.undef_to_guest => {
-                self.last_undef = Some((pc as u32, insn));
-                self.enter_exception(0x04, pc as u32 + 4, MODE_UND, false);
-                return Err(Trap::Exception(0x00, 1));
-            }
-            Err(Trap::Unimplemented(..)) => self.r[15] = pc as u32,
-            _ => {}
-        }
-        result
+        self.r[15] = pc.wrapping_add(4);
+        let result = self.execute(bus, pc as u64, insn);
+        self.finish(pc, insn, result)
     }
 
     fn pc(&self) -> u64 {

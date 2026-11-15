@@ -1,0 +1,20 @@
+# Thumb-2 userland on the Orange Pi One: Debian's armhf BusyBox (Thumb-2, VFP) runs
+# hashing, sorting, floating point and compression; the digests are the published ones.
+# Fixture: scripts/orangepi-one-fixture.sh and scripts/debian-armhf-busybox-fixture.sh, then
+#   sbc-emu run --board orangepi-one --kernel cache/orangepi-one/zImage \
+#     --dtb cache/orangepi-one/sun8i-h3-orangepi-one.dtb \
+#     --initrd cache/debian-armhf/initramfs.cpio.gz --script scripts/orangepi-one-thumb.txt
+wait-serial thumb#
+serial echo -n abc | sha256sum\r
+wait-serial ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+serial echo -n hello | md5sum\r
+wait-serial 5d41402abc4b2a76b9719d911017c592
+serial seq 1 3000 | sort -rn | head -1 | sed 's/^/MAX_/'\r
+wait-serial MAX_3000
+serial awk 'BEGIN{x=0; for(i=1;i<=100;i++) x+=1/i; printf "H_%.6f", x}'; echo\r
+wait-serial H_5.187378
+serial dd if=/dev/zero bs=1k count=256 2>/dev/null | gzip | gunzip | wc -c | sed 's/^/BYTES_/'\r
+wait-serial BYTES_262144
+serial printf 'CPUS_%s' $(nproc); echo\r
+wait-serial CPUS_4
+serial poweroff -f\r

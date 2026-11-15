@@ -1,7 +1,7 @@
 use allwinner_h3::{
-    CoreState, Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI, RAM_BASE, SPURIOUS, UART0_BASE,
+    ns_to_ticks, ticks_to_ns, CoreState, Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI, RAM_BASE, SPURIOUS, UART0_BASE,
 };
-use emu_core::{Bus, Core, Fault, Trap};
+use emu_core::{Bus, Core, Fault, Stop, Trap};
 
 #[test]
 fn a32_program_writes_ok_to_h3_uart0() {
@@ -206,4 +206,32 @@ fn virtual_time_counts_only_running_cores() {
     machine.cpus[1].r[15] = RAM_BASE as u32;
     machine.run(12_000);
     assert_eq!(machine.now(), 18_000, "two running cores: 0.5 ns per instruction");
+}
+
+/// An idle deadline for a compare value not divisible by 3 must still be reached:
+/// converting ticks -> ns -> ticks with truncation both ways stopped one tick short and
+/// the guest never woke (found in review of the RK3288 copy of this code).
+#[test]
+fn idle_until_the_reported_deadline_fires_the_timer() {
+    for cval in [1000u64, 1001, 1002, 999_999] {
+        assert!(ns_to_ticks(ticks_to_ns(cval)) >= cval, "cval {cval}");
+    }
+    // WFI loop with the physical timer due at 1000 ticks.
+    let mut machine = Machine::with_ram_size(64 << 10);
+    machine.soc.write32(RAM_BASE, 0xe320_f003).unwrap(); // wfi
+    machine.soc.write32(RAM_BASE + 4, 0xeaff_fffd).unwrap(); // b wfi
+    machine.cpu_mut().cntp_cval = 1000;
+    machine.cpu_mut().cntp_ctl = 1;
+    let mut woke = false;
+    for _ in 0..10 {
+        match machine.run(1000) {
+            Stop::Idle(deadline) => machine.idle_until(deadline),
+            _ => {}
+        }
+        if machine.cpu().physical_timer_irq() {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "timer never fired: count {}", machine.cpu().cntpct);
 }

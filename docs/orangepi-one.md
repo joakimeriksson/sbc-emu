@@ -22,8 +22,9 @@ sbc-emu run --board orangepi-one --kernel $F/zImage --dtb $F/sun8i-h3-orangepi-o
 | SMP | `nproc` = 4; four parallel shell loops; rescheduling and function-call IPIs on all four CPUs in `/proc/interrupts` | same script |
 | Userland | shell input on `ttyS0`, `/proc/device-tree/model` = `Xunlong Orange Pi One`, VFPv4 floating point (`awk` arithmetic), `sleep`, tmpfs I/O | same script |
 | Firmware | PSCI 1.0 over SMC from the host: `reboot -f` boots again, `poweroff -f` ends the run | same script |
+| Thumb-2 userland | Debian 13's armhf `busybox-static` (Thumb-2, hard float): SHA-256 and MD5 of known strings, `sort`, floating-point `awk`, a gzip round trip of 256 KiB, on four cores | `scripts/debian-armhf-busybox-fixture.sh`, `scripts/orangepi-one-thumb.txt` |
 
-Not modelled yet: SD/MMC, Ethernet (EMAC), USB, HDMI/display, Thumb-2 and NEON. The cores
+Not modelled yet: SD/MMC, Ethernet (EMAC), USB, HDMI/display and NEON. The cores
 take turns on one host thread (round-robin quanta of 1000 instructions). Every other device node in the
 distribution DTB is a plain read-back register file, so its driver probes without effect;
 the run summary lists the pages that were touched. Virtual time is 1 ns per instruction.
