@@ -4,6 +4,31 @@
 //! format the viewer asks for, desktop resizes; keys go to the emulated USB keyboard and the
 //! pointer to the USB tablet.
 use bcm2711::Machine;
+
+/// A board's HDMI output and input devices as the VNC server sees them.
+pub trait Screen {
+    /// The size of what the display shows now (None while it is off).
+    fn shown_size(&self) -> Option<(u32, u32)>;
+    /// The size to announce before anything was shown.
+    fn display_size(&self) -> (u32, u32);
+    /// The picture as RGBA (None while the display is off).
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)>;
+    /// The desktop name viewers show.
+    fn name(&self) -> &'static str;
+    /// A key (HID usage) went down or up; boards without a keyboard ignore it.
+    fn key(&mut self, _usage: u8, _down: bool) {}
+    /// Absolute pointer (0..32767) with buttons left/middle/right and the wheel.
+    fn pointer(&mut self, _buttons: u8, _x: u16, _y: u16, _wheel: i8) {}
+}
+
+impl Screen for Machine {
+    fn shown_size(&self) -> Option<(u32, u32)> { self.soc.shown_size() }
+    fn display_size(&self) -> (u32, u32) { self.soc.display_size() }
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.render(out) }
+    fn name(&self) -> &'static str { "sbc-emu: Raspberry Pi 4" }
+    fn key(&mut self, usage: u8, down: bool) { self.soc.devs.kbd.key(usage, down) }
+    fn pointer(&mut self, buttons: u8, x: u16, y: u16, wheel: i8) { self.soc.devs.tablet.pointer(buttons, x, y, wheel) }
+}
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -90,8 +115,8 @@ impl Vnc {
     }
 
     /// Serve the viewer: handshake, input, and at most ~30 updates a second.
-    pub fn poll(&mut self, m: &mut Machine) {
-        if let Some(sz) = m.soc.shown_size() { self.last_size = Some(sz); }
+    pub fn poll(&mut self, m: &mut dyn Screen) {
+        if let Some(sz) = m.shown_size() { self.last_size = Some(sz); }
         if let Ok((s, _)) = self.listener.accept() {
             let _ = s.set_nonblocking(true);
             let _ = s.set_nodelay(true);
@@ -115,7 +140,7 @@ impl Vnc {
             self.last = Instant::now();
             // a display that is off (blanked, between modes) shows black at the last size: viewers
             // that get no answer to an update request give up and reconnect (macOS Screen Sharing)
-            let shown = match m.soc.render(&mut self.frame) {
+            let shown = match m.render(&mut self.frame) {
                 Some((w, h)) => { self.last_size = Some((w, h)); Some((w, h)) }
                 None => self.last_size.or(Some(c.size)).filter(|s| s.0 > 0 && s.1 > 0).map(|(w, h)| {
                     self.frame.clear();
@@ -133,7 +158,7 @@ impl Vnc {
 
 impl Client {
     /// Parse what has arrived; false = drop the connection.
-    fn messages(&mut self, m: &mut Machine) -> bool {
+    fn messages(&mut self, m: &mut dyn Screen) -> bool {
         loop {
             let need = match self.phase {
                 Phase::Version => 12,
@@ -192,13 +217,13 @@ impl Client {
                 }
                 Phase::Init => {
                     self.phase = Phase::Normal;
-                    let (w, h) = self.init_size.unwrap_or_else(|| m.soc.display_size());
+                    let (w, h) = self.init_size.unwrap_or_else(|| m.display_size());
                     self.size = (w, h);
                     let mut r = Vec::new();
                     r.extend_from_slice(&(w as u16).to_be_bytes());
                     r.extend_from_slice(&(h as u16).to_be_bytes());
                     r.extend_from_slice(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
-                    let name = b"sbc-emu: Raspberry Pi 4";
+                    let name = m.name().as_bytes();
                     r.extend_from_slice(&(name.len() as u32).to_be_bytes());
                     r.extend_from_slice(name);
                     self.s.write_all(&r).is_ok()
@@ -215,14 +240,14 @@ impl Client {
                         }
                         2 => self.resize_ok = msg[4..].chunks(4).any(|e| i32::from_be_bytes(e.try_into().unwrap()) == -223),
                         3 => self.want = Some(msg[1] != 0 && self.want != Some(false)),
-                        4 => if let Some(u) = keysym_usage(u32::from_be_bytes(msg[4..8].try_into().unwrap())) { m.soc.devs.kbd.key(u, msg[1] != 0); },
+                        4 => if let Some(u) = keysym_usage(u32::from_be_bytes(msg[4..8].try_into().unwrap())) { m.key(u, msg[1] != 0); },
                         5 => {
                             // the pointer goes to the USB tablet: buttons left/middle/right/wheel
                             let (mask, x, y) = (msg[1], u16::from_be_bytes([msg[2], msg[3]]) as u32, u16::from_be_bytes([msg[4], msg[5]]) as u32);
                             let buttons = (mask & 1) | (mask >> 1 & 2) | (mask << 1 & 4);
                             let wheel = if mask & 8 != 0 { 1 } else if mask & 16 != 0 { -1 } else { 0 };
                             let scale = |v: u32, n: u32| (v.min(n.saturating_sub(1)) * 32767 / n.saturating_sub(1).max(1)) as u16;
-                            m.soc.devs.tablet.pointer(buttons, scale(x, self.size.0), scale(y, self.size.1), wheel);
+                            m.pointer(buttons, scale(x, self.size.0), scale(y, self.size.1), wheel);
                         }
                         _ => {} // clipboard
                     }

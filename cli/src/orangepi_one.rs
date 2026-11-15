@@ -1,6 +1,7 @@
 //! Orange Pi One (Allwinner H3) serial bring-up adapter: direct boot of an ARM32 zImage
 //! with the distribution's device tree, patched as U-Boot would patch it.
-use crate::{arg, serial_board::{self, RunConfig, SerialBoard}};
+use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
+use allwinner_h3::display::{Display, Mode};
 use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
 
@@ -29,10 +30,32 @@ impl SerialBoard for allwinner_h3::Machine {
                 eprintln!("[{tag}] core {k}: last UNDEFINED instruction {insn:#010x} at {pc:#010x}");
             }
         }
+        if self.soc.display.frames > 0 {
+            eprintln!("[{tag}] HDMI: {} frames scanned out", self.soc.display.frames);
+        }
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));
         }
+    }
+    fn screen(&mut self) -> Option<&mut dyn Screen> {
+        Some(self)
+    }
+}
+
+impl Screen for allwinner_h3::Machine {
+    fn shown_size(&self) -> Option<(u32, u32)> {
+        self.soc.display.shown_size()
+    }
+    fn display_size(&self) -> (u32, u32) {
+        let mode = self.soc.display.mode;
+        self.soc.display.shown_size().unwrap_or((mode.width, mode.height))
+    }
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.soc.render(out)
+    }
+    fn name(&self) -> &'static str {
+        "sbc-emu: Orange Pi One"
     }
 }
 
@@ -47,7 +70,15 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode"])?;
+    let mode = match arg(args, "--hdmi-mode") {
+        Some(spec) => {
+            let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
+            let (w, h) = (w.parse().map_err(|_| "--hdmi-mode WxH")?, h.parse().map_err(|_| "--hdmi-mode WxH")?);
+            Mode::find(w, h).ok_or("--hdmi-mode: the emulated monitor offers 1024x768, 1280x720 and 1920x1080")?
+        }
+        None => Mode::MODES[1],
+    };
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     // Without --kernel, an --sd card is booted the way the board's firmware would
     // (armbianEnv.txt, zImage, the board DTB and uInitrd from the card's ext4 /boot).
@@ -81,6 +112,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         .transpose()?;
     let make_machine = || -> Result<allwinner_h3::Machine, String> {
         let mut m = allwinner_h3::Machine::with_ram_size(ram);
+        m.soc.display = Display::new(mode);
         m.soc.mmc.card.disk = disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         if card_boot {
             let boot = allwinner_h3::boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
@@ -103,8 +135,8 @@ fn execute(args: &[String]) -> Result<(), String> {
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(
-        "[orangepi-one] experimental Allwinner H3: four Cortex-A7s (interpreter, A32 + Thumb-2 + VFPv4), GIC-400, UART0, timers; \
-         direct kernel boot with the distribution DTB, PSCI by the host; other devices are stubs"
+        "[orangepi-one] experimental Allwinner H3: four Cortex-A7s (interpreter, A32 + Thumb-2 + VFPv4), GIC-400, UART0, timers, SD card, HDMI \
+         (DE2 mixer, TCON, DW-HDMI); PSCI by the host; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }
