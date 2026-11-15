@@ -90,7 +90,7 @@ impl Soc {
     }
 
     /// Exchange frames between the Ethernet MAC and the network; true while the port
-    /// has to be polled (the guest receives).
+    /// has to be polled: frames wait for descriptors, or the NAT has connections to serve.
     fn pump_network(&mut self, now: u64) -> bool {
         let now_us = crate::machine::ticks_to_ns(now) / 1000;
         match self.net.as_mut() {
@@ -103,7 +103,7 @@ impl Soc {
             None => self.emac.tx_out.clear(),
         }
         self.emac.receive(&mut Dma { mem: &mut self.ram.mem, base: self.ram.base });
-        self.net.is_some() && self.emac.rx_enabled()
+        self.emac.rx_pending() || self.net.as_ref().is_some_and(|net| net.nat.is_some())
     }
 
     /// The USB controller and register offset at `addr`: (port, is OHCI, offset).
@@ -452,8 +452,6 @@ impl Machine {
         self.soc.gic.reset_cpu_interface(index);
     }
 
-    /// ARM32 Linux zImage entry on core 0: r0 = 0, r1 = ~0, r2 = the DTB address.
-    /// Cores 1-3 stay off until PSCI CPU_ON.
     /// Plug the Ethernet port into the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP);
     /// `nat` also relays guest TCP/UDP to the host's network (native builds only).
     pub fn connect_network(&mut self, nat: bool, log: bool) {
@@ -466,6 +464,8 @@ impl Machine {
         self.soc.net = Some(net);
     }
 
+    /// ARM32 Linux zImage entry on core 0: r0 = 0, r1 = ~0, r2 = the DTB address.
+    /// Cores 1-3 stay off until PSCI CPU_ON.
     pub fn boot_linux(&mut self, entry: u32, dtb: u32) {
         for index in 0..NCPU {
             self.state[index] = CoreState::Off;

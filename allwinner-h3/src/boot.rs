@@ -10,7 +10,6 @@ pub const DTB_ADDR: u32 = 0x4300_0000;
 pub const INITRD_ADDR: u32 = 0x4330_0000;
 pub const DEFAULT_CMDLINE: &str = "console=ttyS0,115200 earlycon rdinit=/init";
 
-/// Patch a stock DTB for direct boot.
 /// The Ethernet address the emulated firmware gives the board. U-Boot derives one from
 /// the SoC's chip ID and writes it to the `ethernet0` node; without it, Armbian's kernel
 /// derives one from the chip ID itself and defers the probe while that reads as zero.
@@ -25,6 +24,7 @@ fn node_at_path<'a>(root: &'a mut Node, path: &str) -> Option<&'a mut Node> {
     Some(node)
 }
 
+/// Patch a stock DTB for direct boot.
 pub fn prepare_device_tree(
     stock: &[u8],
     ram_bytes: u64,

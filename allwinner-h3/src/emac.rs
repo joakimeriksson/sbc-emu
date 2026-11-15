@@ -65,6 +65,8 @@ pub struct Emac {
     pub rx_queue: VecDeque<Vec<u8>>,
     pub tx_frames: u64,
     pub rx_frames: u64,
+    /// Received frames too large for the guest's receive buffers.
+    pub rx_dropped: u64,
 }
 
 impl Default for Emac {
@@ -78,6 +80,7 @@ impl Default for Emac {
             rx_queue: VecDeque::new(),
             tx_frames: 0,
             rx_frames: 0,
+            rx_dropped: 0,
         };
         e.reset();
         e.phy_reset();
@@ -191,9 +194,9 @@ impl Emac {
         self.regs[TX_CTL0] & ENABLE != 0 && self.regs[TX_CTL1] & DMA_EN != 0
     }
 
-    /// The receiver and its DMA are on (the interface is up).
-    pub fn rx_enabled(&self) -> bool {
-        self.rx_running()
+    /// Frames are waiting for the guest's receive descriptors.
+    pub fn rx_pending(&self) -> bool {
+        self.rx_running() && !self.rx_queue.is_empty()
     }
 
     fn rx_running(&self) -> bool {
@@ -250,42 +253,27 @@ impl Emac {
             return;
         }
         while let Some(frame) = self.rx_queue.front() {
-            // the frame and its FCS (stmmac strips four bytes from the reported length)
-            let mut data = frame.clone();
-            data.extend_from_slice(&crc32(frame).to_le_bytes());
-            // the descriptors the frame needs must all be the guest's
-            let mut descs = Vec::new();
-            let (mut desc, mut room) = (self.rx_desc, 0usize);
-            while room < data.len() && descs.len() < 64 {
-                let status = dma.read32(desc);
-                if status & OWN == 0 || desc == 0 {
-                    break;
-                }
-                let size = (dma.read32(desc + 4) & BUFFER_SIZE) as usize;
-                descs.push((desc, size));
-                room += size;
-                desc = dma.read32(desc + 12);
-            }
-            if room < data.len() {
+            let desc = self.rx_desc;
+            if desc == 0 || dma.read32(desc) & OWN == 0 {
                 self.regs[INT_STA] |= RX_BUF_UA_INT;
                 break;
             }
-            let mut done = 0;
-            for (k, &(desc, size)) in descs.iter().enumerate() {
-                let n = size.min(data.len() - done);
-                let buffer = dma.read32(desc + 8);
-                dma.write(buffer, &data[done..done + n]);
-                done += n;
-                let mut status = RX_FRAME_TYPE;
-                if k == 0 {
-                    status |= RX_FIRST;
-                }
-                if k + 1 == descs.len() {
-                    status |= RX_LAST | (data.len() as u32) << 16;
-                }
-                dma.write32(desc, status);
+            // The frame and its FCS (stmmac strips four bytes from the reported length)
+            // go into one buffer: Linux sizes its buffers for the MTU and passes the
+            // pieces of a frame spread over several descriptors up as separate packets,
+            // so a frame that does not fit is dropped, as the MAC drops oversized frames.
+            let size = (dma.read32(desc + 4) & BUFFER_SIZE) as usize;
+            if frame.len() + 4 > size {
+                self.rx_queue.pop_front();
+                self.rx_dropped += 1;
+                continue;
             }
-            self.rx_desc = desc;
+            let fcs = crc32(frame).to_le_bytes();
+            let buffer = dma.read32(desc + 8);
+            dma.write(buffer, frame);
+            dma.write(buffer.wrapping_add(frame.len() as u32), &fcs);
+            dma.write32(desc, RX_FRAME_TYPE | RX_FIRST | RX_LAST | ((frame.len() + 4) as u32) << 16);
+            self.rx_desc = dma.read32(desc + 12);
             self.rx_queue.pop_front();
             self.rx_frames += 1;
             self.regs[INT_STA] |= RX_INT;
@@ -487,6 +475,13 @@ mod tests {
         assert_eq!(&mem[at..at + 60], &frame[..]);
         assert_eq!(e.rx_queue.len(), 1, "third frame waits for a descriptor");
         assert_ne!(e.read(0x08) & RX_BUF_UA_INT, 0);
+        // a frame larger than the buffer is dropped, not split
+        dma(&mut mem).write32(d0, OWN);
+        e.rx_queue.clear();
+        e.rx_queue.push_back(vec![0; 1600]);
+        e.receive(&mut dma(&mut mem));
+        assert_eq!((e.rx_dropped, e.rx_queue.len()), (1, 0));
+        assert_ne!(dma(&mut mem).read32(d0) & OWN, 0, "descriptor still the guest's");
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
 }
