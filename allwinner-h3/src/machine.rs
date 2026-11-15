@@ -1,3 +1,4 @@
+use crate::display::{Display, HDMI_IRQ, TCON0_IRQ};
 use crate::gic::NCPU;
 use crate::{Gic, SunxiMmc, Timer, Uart};
 use arm_a32::Cpu;
@@ -41,6 +42,8 @@ pub struct Soc {
     pub gic: Gic,
     pub timer: Timer,
     pub mmc: SunxiMmc,
+    /// DE2 mixer, TCON0 and HDMI.
+    pub display: Display,
     /// CCU registers (PLLs, bus gates, resets, module clocks), byte offset / 4.
     ccu: Vec<u32>,
     /// Current 24 MHz time, set by the machine before each step.
@@ -55,6 +58,11 @@ pub struct Soc {
 }
 
 impl Soc {
+    /// What the HDMI output shows, as RGBA (None while the display is off).
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.display.render(&self.ram.mem, self.ram.base, out)
+    }
+
     pub fn new(ram_size: usize) -> Self {
         Self {
             ram: FlatRam::new(RAM_BASE, ram_size),
@@ -62,6 +70,7 @@ impl Soc {
             gic: Gic::default(),
             timer: Timer::default(),
             mmc: SunxiMmc::default(),
+            display: Display::default(),
             ccu: Self::ccu_reset(),
             now: 0,
             dirty: true,
@@ -141,6 +150,9 @@ impl Soc {
 
     fn mmio_read(&mut self, addr: u64, width: u64) -> Result<u32, Fault> {
         self.dirty = true;
+        if let Some(value) = self.display.read(addr, width) {
+            return Ok(value);
+        }
         if width == 4 && addr & 3 == 0 {
             if Self::in_region(addr, 4, CCU_BASE, CCU_SIZE) {
                 return Ok(self.ccu_read(addr - CCU_BASE));
@@ -177,6 +189,9 @@ impl Soc {
 
     fn mmio_write(&mut self, addr: u64, width: u64, value: u32) -> Result<(), Fault> {
         self.dirty = true;
+        if self.display.write(addr, width, value) {
+            return Ok(());
+        }
         if width == 4 && addr & 3 == 0 {
             if Self::in_region(addr, 4, CCU_BASE, CCU_SIZE) {
                 self.ccu[((addr - CCU_BASE) / 4) as usize] = value & !(1 << 28);
@@ -416,7 +431,11 @@ impl Machine {
         self.soc.gic.set_level(UART0_IRQ, uart);
         let mmc = self.soc.mmc.irq();
         self.soc.gic.set_level(MMC0_IRQ, mmc);
-        let mut next = u64::MAX;
+        self.soc.display.update(now);
+        let (tcon, hdmi) = (self.soc.display.tcon_irq(), self.soc.display.hdmi_irq());
+        self.soc.gic.set_level(TCON0_IRQ, tcon);
+        self.soc.gic.set_level(HDMI_IRQ, hdmi);
+        let mut next = self.soc.display.next_deadline().unwrap_or(u64::MAX);
         for k in 0..NCPU {
             let cpu = &self.cpus[k];
             self.timer_state[k] = Self::timer_state_of(cpu);

@@ -1,7 +1,8 @@
 //! Serial-console run loop shared by the direct-boot bring-up boards (Orange Pi 5,
 //! Orange Pi One): option validation, `--script` automation, host stdin with the
-//! Ctrl-A x escape, wall-clock pacing of idle time and guest reset/power-off.
-use crate::arg;
+//! Ctrl-A x escape, wall-clock pacing of idle time and guest reset/power-off, and for
+//! boards with a display `--screenshot`, `--vnc` and the `screenshot FILE` script command.
+use crate::{arg, vnc::{Screen, Vnc}};
 use sbc_machine::{Machine as HostMachine, Stop};
 use std::{
     collections::VecDeque,
@@ -18,6 +19,22 @@ pub(crate) trait SerialBoard {
     fn instret(&self) -> u64;
     /// One-line execution summary plus any unmodelled-hardware notes.
     fn report(&self, tag: &str);
+    /// The board's display, if it has one.
+    fn screen(&mut self) -> Option<&mut dyn Screen> {
+        None
+    }
+}
+
+/// Save what the display shows as a PNG.
+fn screenshot<B: SerialBoard>(m: &mut B, tag: &str, path: &str) {
+    let mut rgba = Vec::new();
+    match m.screen().and_then(|s| s.render(&mut rgba)) {
+        Some((w, h)) => match std::fs::write(path, bcm2711::png::encode_rgba(w, h, &rgba)) {
+            Ok(()) => eprintln!("[{tag}] screenshot {w}x{h} -> {path}"),
+            Err(e) => eprintln!("[{tag}] screenshot {path}: {e}"),
+        },
+        None => eprintln!("[{tag}] the display is off: no screenshot"),
+    }
 }
 
 /// Options every serial board accepts; `extra` lists board-specific valued options.
@@ -54,6 +71,10 @@ pub(crate) struct RunConfig {
     pub script: VecDeque<String>,
     pub timeout: Option<Duration>,
     pub max_insns: u64,
+    /// Screenshot at the end of the run (`--screenshot`).
+    pub screenshot: Option<String>,
+    /// VNC server for the display (`--vnc :N`).
+    pub vnc: Option<String>,
 }
 
 impl RunConfig {
@@ -79,11 +100,12 @@ impl RunConfig {
             None => VecDeque::new(),
         };
         for line in &script {
-            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset")) {
+            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot")) {
                 return Err(format!("unsupported script command: {line}"));
             }
         }
-        Ok(Self { tag, script, timeout, max_insns })
+        let (screenshot, vnc) = (arg(args, "--screenshot").map(str::to_owned), arg(args, "--vnc").map(str::to_owned));
+        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc })
     }
 }
 
@@ -105,6 +127,10 @@ pub(crate) fn run<B: SerialBoard>(
 ) -> Result<(), String> {
     let tag = config.tag;
     let mut m = make_machine()?;
+    let mut vnc = match config.vnc.as_deref() {
+        Some(spec) => Some(Vnc::listen(spec).map_err(|e| format!("--vnc {spec}: {e}"))?),
+        None => None,
+    };
     let _terminal = crate::terminal::RawTty::enable();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -167,6 +193,10 @@ pub(crate) fn run<B: SerialBoard>(
                     pending.clear();
                     true
                 }
+                "screenshot" => {
+                    screenshot(&mut m, tag, rest);
+                    true
+                }
                 "quit" => break Ok(()),
                 _ => unreachable!(),
             };
@@ -193,6 +223,9 @@ pub(crate) fn run<B: SerialBoard>(
             } else {
                 Err("instruction limit before script completed".into())
             };
+        }
+        if let (Some(v), Some(screen)) = (vnc.as_mut(), m.screen()) {
+            v.poll(screen);
         }
         let budget = (config.max_insns - m.instret()).min(1_000_000);
         let stop = m.host().run(budget);
@@ -240,5 +273,8 @@ pub(crate) fn run<B: SerialBoard>(
         }
     };
     m.report(tag);
+    if let Some(path) = config.screenshot.as_deref() {
+        screenshot(&mut m, tag, path);
+    }
     result
 }
