@@ -190,3 +190,20 @@ fn psci_cpu_on_starts_a_second_core_and_sev_wakes_wfe() {
     assert_eq!(machine.soc.read32(RAM_BASE + 0x200), Ok(0x55), "context id in r0");
     assert_eq!(machine.soc.read32(RAM_BASE + 0x204), Ok(0x77), "SEV woke WFE");
 }
+
+/// Cores asleep in WFI do not slow the clock: a lone busy core runs at 1 ns per
+/// instruction; two busy cores share it.
+#[test]
+fn virtual_time_counts_only_running_cores() {
+    let mut machine = Machine::with_ram_size(64 << 10);
+    machine.soc.write32(RAM_BASE, 0xeaff_fffe).unwrap(); // b .
+    for core in 1..4 {
+        machine.state[core] = CoreState::Wait;
+    }
+    machine.run(12_000);
+    assert_eq!(machine.now(), 12_000);
+    machine.state[1] = CoreState::Run;
+    machine.cpus[1].r[15] = RAM_BASE as u32;
+    machine.run(12_000);
+    assert_eq!(machine.now(), 18_000, "two running cores: 0.5 ns per instruction");
+}

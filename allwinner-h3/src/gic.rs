@@ -3,34 +3,20 @@ pub const NCPU: usize = 4;
 pub const SPURIOUS: u32 = 1023;
 
 /// Per-core state: the banked SGI/PPI lines (0-31) and the CPU interface.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Core {
     enabled: [bool; 32],
     pending: [bool; 32],
     active: [bool; 32],
     level: [bool; 32],
     priority: [u8; 32],
-    /// Requesting core of each pending SGI (reported in GICC_IAR bits 12:10).
+    /// Requesting core of each pending SGI (reported in GICC_IAR bits 12:10). Requests for
+    /// the same SGI from several cores merge into one pending interrupt (the last source
+    /// is reported); Linux IPI handling does not depend on the source.
     sgi_source: [u8; 16],
     control: u32,
     priority_mask: u8,
     running: Vec<(usize, u8)>,
-}
-
-impl Default for Core {
-    fn default() -> Self {
-        Self {
-            enabled: [false; 32],
-            pending: [false; 32],
-            active: [false; 32],
-            level: [false; 32],
-            priority: [0; 32],
-            sgi_source: [0; 16],
-            control: 0,
-            priority_mask: 0,
-            running: Vec::new(),
-        }
-    }
 }
 
 /// GIC-400 (GICv2) distributor and four CPU interfaces, as on the H3.
@@ -70,6 +56,14 @@ impl Default for Gic {
 }
 
 impl Gic {
+    /// A core powered on again (PSCI CPU_ON) starts with no interrupt in progress.
+    pub fn reset_cpu_interface(&mut self, cpu: usize) {
+        let core = &mut self.cores[cpu];
+        core.running.clear();
+        core.active = [false; 32];
+        core.control = 0;
+    }
+
     /// Drive a shared (SPI) line, or a PPI of core 0.
     pub fn set_level(&mut self, irq: usize, high: bool) {
         assert!((16..NIRQ).contains(&irq));
