@@ -365,11 +365,27 @@ impl Machine {
     /// instruction.
     fn tick(&mut self) {
         let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
-        self.subtick += 12 / running;
+        self.advance_subtick(12 / running);
+    }
+
+    /// Advance virtual time by `units` of 1/12 ns.
+    fn advance_subtick(&mut self, units: u64) {
+        self.subtick += units;
         if self.subtick >= 125 * 12 {
             self.subtick -= 125 * 12;
             let ticks = self.cpus[0].cntpct + 3;
             self.set_time(ticks);
+        }
+    }
+
+    /// Inner-shareable TLB maintenance on core `k` reaches every core (DVM broadcast);
+    /// see the H3 machine.
+    fn broadcast_tlb_flush(&mut self, k: usize) {
+        self.cpus[k].tlb_broadcast = false;
+        for (j, cpu) in self.cpus.iter_mut().enumerate() {
+            if j != k {
+                cpu.tlb_flush();
+            }
         }
     }
 
@@ -496,9 +512,13 @@ impl Machine {
             return Err(Trap::Wait);
         }
         let result = self.cpus[0].step(&mut self.soc);
-        self.tick();
+        // step() runs core 0 alone, so each instruction is a full 1 ns.
+        self.advance_subtick(12);
         if self.cpus[0].sent_event {
             self.send_event(0);
+        }
+        if self.cpus[0].tlb_broadcast {
+            self.broadcast_tlb_flush(0);
         }
         match result {
             Err(Trap::Wait) => {
@@ -515,7 +535,9 @@ impl Machine {
     /// when every running core waits for an interrupt and nothing is due before then.
     pub fn run(&mut self, budget: u64) -> Stop {
         let mut left = budget;
-        let mut storm = 0u32;
+        // Exception-storm detection per core: one core's progress must not hide another's
+        // abort loop.
+        let mut storm = [0u32; NCPU];
         while left > 0 {
             self.sync_irqs();
             if self.soc.cru.reset_requested {
@@ -540,8 +562,11 @@ impl Machine {
                 if self.cpus[k].sent_event {
                     self.send_event(k);
                 }
+                if self.cpus[k].tlb_broadcast {
+                    self.broadcast_tlb_flush(k);
+                }
                 match result {
-                    Ok(()) => storm = 0,
+                    Ok(()) => storm[k] = 0,
                     Err(Trap::Wait) => {
                         self.state[k] = CoreState::Wait;
                         self.update_irqs();
@@ -549,12 +574,12 @@ impl Machine {
                     }
                     Err(Trap::Interrupt(..)) => {
                         self.irqs += 1;
-                        storm = 0;
+                        storm[k] = 0;
                     }
                     Err(Trap::Exception(..)) => {
                         self.exceptions += 1;
-                        storm += 1;
-                        if storm > 10_000 {
+                        storm[k] += 1;
+                        if storm[k] > 10_000 {
                             self.last_stop_core = k;
                             let c = &self.cpus[k];
                             return Stop::ExceptionStorm {

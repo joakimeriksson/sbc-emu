@@ -928,8 +928,8 @@ impl Cpu {
                 (0, 9, 12, 0) => Some(self.model.pmcr),
                 (0, 9, 12..=14, _) => Some(0), // other PMU registers read as zero
                 (1, 9, 0, 2) => Some(self.model.l2ctlr),
-                (0, 15, 0, 1) if self.model.c15_diagnostic => Some(self.diagnostic),
-                (0, 15, 0, 2) if self.model.c15_diagnostic => Some(self.internal_feature),
+                (0, 15, 0, 1) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => Some(self.diagnostic),
+                (0, 15, 0, 2) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => Some(self.internal_feature),
                 (0, 12, 1, 0) => Some(u32::from(self.irq) << 7 | u32::from(self.fiq) << 6), // ISR
                 _ => None,
             };
@@ -999,8 +999,9 @@ impl Cpu {
                     (0, 9, 12..=14, _) => {}       // PMU writes ignored
                     (0, 7, 0, 4) | (0, 7, 13, 1) => {} // legacy WFI/prefetch encodings
                     (2, 0, 0, 0) => self.csselr = value & 0xf,
-                    (0, 15, 0, 1) if self.model.c15_diagnostic => self.diagnostic = value,
-                    (0, 15, 0, 2) if self.model.c15_diagnostic => self.internal_feature = value,
+                    // PL1 only: UNDEFINED from user mode, as on hardware.
+                    (0, 15, 0, 1) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => self.diagnostic = value,
+                    (0, 15, 0, 2) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => self.internal_feature = value,
                     _ => return Err(unimplemented()),
                 }
             }

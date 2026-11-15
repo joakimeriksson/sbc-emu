@@ -17,8 +17,9 @@ impl SerialBoard for Machine {
     }
     fn report(&self, tag: &str) {
         eprintln!(
-            "[{tag}] pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
-            self.cpu().r[15],
+            "[{tag}] core {} pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
+            self.last_stop_core,
+            self.cpus[self.last_stop_core].r[15],
             Machine::instret(self),
             self.now() as f64 / 1e9,
             self.irqs,

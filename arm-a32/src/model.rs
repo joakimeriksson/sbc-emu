@@ -92,6 +92,9 @@ pub const CORTEX_A12: CpuModel = CpuModel {
     // because `arm-a32` has no CP14 debug registers.
     id_dfr0: 0x0200_0000,
     id_afr0: 0,
+    // NOT verified: ID_MMFR0-3 and ID_ISAR0-3 are the Cortex-A7 preset's values (no A12 or
+    // A17 source confirmed them; A15-class cores may report e.g. ID_MMFR0 0x10201105).
+    // ID_ISAR4 differs from the A7 only in SWP_frac (0: SWP is not in the core).
     id_mmfr: [0x1010_1105, 0x4000_0000, 0x0124_0000, 0x0210_2211],
     id_isar: [0x0210_1110, 0x1311_2111, 0x2123_2041, 0x1111_2131, 0x0001_1142, 0],
     // Four cores (bits 25:24). Hardware reset has every RAM latency field at 0b111; this
