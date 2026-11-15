@@ -67,12 +67,16 @@ fn run() -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     let mut transcript: Vec<u8> = Vec::new();
     loop {
-        let retired = machine.cpu.instret;
+        let retired = machine.instret();
         if retired >= args.steps {
-            eprintln!(
-                "\n[h3-boot] instruction budget exhausted: {retired} retired, pc={:#010x}",
-                machine.cpu.r[15]
-            );
+            eprintln!("\n[h3-boot] instruction budget exhausted: {retired} retired");
+            dump_kernel_image(&machine);
+            for (k, cpu) in machine.cpus.iter().enumerate() {
+                eprintln!(
+                    "[h3-boot] core {k} {:?} pc={:#010x} lr={:#010x} cpsr={:#010x} irq={} insns={}",
+                    machine.state[k], cpu.r[15], cpu.r[14], cpu.cpsr, cpu.irq, cpu.instret
+                );
+            }
             return Ok(());
         }
         let stop = machine.run((args.steps - retired).min(1_000_000));
@@ -87,7 +91,7 @@ fn run() -> Result<(), String> {
             if transcript.windows(marker.len()).any(|window| window == marker.as_bytes()) {
                 eprintln!(
                     "\n[h3-boot] found {marker:?} after {} instructions, {:.3} s virtual",
-                    machine.cpu.instret,
+                    machine.instret(),
                     machine.now() as f64 / 1e9
                 );
                 dump_kernel_image(&machine);
@@ -109,7 +113,7 @@ fn run() -> Result<(), String> {
                 dump_kernel_image(&machine);
                 return Err(format!(
                     "stopped after {} instructions: {other:x?}\npc={:#010x} cpsr={:#010x} r={:08x?}",
-                    machine.cpu.instret, machine.cpu.r[15], machine.cpu.cpsr, machine.cpu.r
+                    machine.instret(), machine.cpu().r[15], machine.cpu().cpsr, machine.cpu().r
                 ));
             }
         }

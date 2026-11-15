@@ -1,3 +1,4 @@
+use crate::gic::NCPU;
 use crate::{Gic, Timer, Uart};
 use arm_a32::Cpu;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
@@ -214,7 +215,7 @@ impl Soc {
     }
 }
 
-/// PSCI function identifiers (SMC32 calling convention).
+/// PSCI function identifiers (SMC32 calling convention) and return codes.
 mod psci {
     pub const VERSION: u32 = 0x8400_0000;
     pub const CPU_OFF: u32 = 0x8400_0002;
@@ -224,30 +225,45 @@ mod psci {
     pub const SYSTEM_OFF: u32 = 0x8400_0008;
     pub const SYSTEM_RESET: u32 = 0x8400_0009;
     pub const FEATURES: u32 = 0x8400_000a;
+    pub const SUCCESS: u32 = 0;
     pub const NOT_SUPPORTED: u32 = -1i32 as u32;
     pub const INVALID_PARAMETERS: u32 = -2i32 as u32;
     pub const ALREADY_ON: u32 = -4i32 as u32;
 }
 
-/// One-core H3 machine: Cortex-A7, GIC-400, UART0, CCU, timers.
+/// Instructions a core runs before the next core gets its turn.
+const QUANTUM: u64 = 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreState {
+    /// Powered down (before PSCI CPU_ON, or after CPU_OFF).
+    Off,
+    Run,
+    /// In WFI/WFE until an interrupt.
+    Wait,
+}
+
+/// The H3: four Cortex-A7 cores, GIC-400, UART0, CCU, timers.
 ///
-/// Time is the 24 MHz architectural count. Each executed instruction takes 1 ns of
-/// virtual time (about a 1 GHz Cortex-A7), so the count advances 3 ticks every 125
-/// instructions (deterministic). `step` fast-forwards idle time to the next timer event; `run`
-/// instead returns `Stop::Idle` so a host loop can pace idle time against the wall clock.
-/// Boot firmware is emulated by the host: PSCI over SMC as U-Boot's secure monitor
-/// provides it on real boards.
+/// Time is one 24 MHz architectural count shared by the cores. Each executed instruction
+/// is 1 ns of one core's time; with several cores online they run in round-robin quanta
+/// and time advances as if they ran in parallel. `step` (single core 0) fast-forwards idle
+/// time; `run` returns `Stop::Idle` so a host loop can pace idle time against the wall
+/// clock. Boot firmware is emulated by the host: PSCI over SMC, as U-Boot's secure
+/// monitor provides it on real boards (CPU_ON brings up cores 1-3).
 pub struct Machine {
-    pub cpu: Cpu,
+    pub cpus: Vec<Cpu>,
+    pub state: Vec<CoreState>,
     pub soc: Soc,
-    waiting: bool,
+    /// The core whose turn it is.
+    cur: usize,
     /// Tick at which interrupt state must next be re-evaluated.
     next_event: u64,
-    timer_state: (u32, u64, u32, u64),
+    timer_state: Vec<(u32, u64, u32, u64)>,
     pub irqs: u64,
     pub exceptions: u64,
-    /// Instructions executed since the counter last advanced (0..125).
-    subtick: u32,
+    /// Instructions executed since the counter last advanced, scaled by online cores.
+    subtick: u64,
 }
 
 impl Machine {
@@ -256,62 +272,111 @@ impl Machine {
     }
 
     pub fn with_ram_size(ram_size: usize) -> Self {
-        let mut cpu = Cpu::new();
-        cpu.r[15] = RAM_BASE as u32;
+        let cpus = (0..NCPU)
+            .map(|index| {
+                let mut cpu = Cpu::new();
+                cpu.mpidr = 0x8000_0000 | index as u32;
+                cpu.r[15] = RAM_BASE as u32;
+                cpu
+            })
+            .collect();
+        let mut state = vec![CoreState::Off; NCPU];
+        state[0] = CoreState::Run;
         Self {
-            cpu,
+            cpus,
+            state,
             soc: Soc::new(ram_size),
-            waiting: false,
+            cur: 0,
             next_event: 0,
-            timer_state: (0, 0, 0, 0),
+            timer_state: vec![(0, 0, 0, 0); NCPU],
             irqs: 0,
             exceptions: 0,
             subtick: 0,
         }
     }
 
+    /// The boot core (core 0).
+    pub fn cpu(&self) -> &Cpu {
+        &self.cpus[0]
+    }
+
+    pub fn cpu_mut(&mut self) -> &mut Cpu {
+        &mut self.cpus[0]
+    }
+
+    /// Instructions retired by all cores.
+    pub fn instret(&self) -> u64 {
+        self.cpus.iter().map(|c| c.instret).sum()
+    }
+
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Fault> {
         self.soc.ram.load(addr, bytes)
     }
 
-    /// ARM32 Linux zImage entry: SVC/A32, MMU and caches off, IRQ/FIQ masked,
-    /// r0 = 0, r1 = ~0 and r2 = the DTB physical address. SMC goes to host PSCI.
+    /// Reset state of a core entering the kernel or a PSCI entry point: SVC/A32, MMU and
+    /// caches off, IRQ/FIQ masked; SMC goes to host PSCI.
+    fn reset_core(&mut self, index: usize, entry: u32) {
+        let now = self.cpus[0].cntpct.max(self.cpus[index].cntpct);
+        let mut cpu = Cpu::new();
+        cpu.mpidr = 0x8000_0000 | index as u32;
+        cpu.r[15] = entry;
+        cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
+        cpu.undef_to_guest = true;
+        cpu.firmware_calls_to_host = true;
+        cpu.cntpct = now;
+        self.cpus[index] = cpu;
+        self.state[index] = CoreState::Run;
+    }
+
+    /// ARM32 Linux zImage entry on core 0: r0 = 0, r1 = ~0, r2 = the DTB address.
+    /// Cores 1-3 stay off until PSCI CPU_ON.
     pub fn boot_linux(&mut self, entry: u32, dtb: u32) {
-        self.cpu = Cpu::new();
-        self.cpu.r[0] = 0;
-        self.cpu.r[1] = u32::MAX;
-        self.cpu.r[2] = dtb;
-        self.cpu.r[15] = entry;
-        self.cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
-        self.cpu.undef_to_guest = true;
-        self.cpu.firmware_calls_to_host = true;
-        self.waiting = false;
+        for index in 0..NCPU {
+            self.state[index] = CoreState::Off;
+        }
+        self.reset_core(0, entry);
+        let cpu = &mut self.cpus[0];
+        cpu.r[0] = 0;
+        cpu.r[1] = u32::MAX;
+        cpu.r[2] = dtb;
+        self.cur = 0;
         self.update_irqs();
     }
 
     /// Virtual time in nanoseconds.
     pub fn now(&self) -> u64 {
-        ticks_to_ns(self.cpu.cntpct) + self.subtick as u64
+        ticks_to_ns(self.cpus[0].cntpct) + self.subtick / self.online().max(1) as u64
     }
 
-    /// One instruction's worth of virtual time (1 ns).
-    fn tick(&mut self) {
-        self.subtick += 1;
-        if self.subtick == 125 {
-            self.subtick = 0;
-            self.cpu.cntpct += 3;
+    fn online(&self) -> usize {
+        self.state.iter().filter(|&&s| s != CoreState::Off).count()
+    }
+
+    fn set_time(&mut self, ticks: u64) {
+        for cpu in &mut self.cpus {
+            cpu.cntpct = ticks;
         }
     }
 
-    fn timer_state(&self) -> (u32, u64, u32, u64) {
-        (self.cpu.cntp_ctl, self.cpu.cntp_cval, self.cpu.cntv_ctl, self.cpu.cntv_cval)
+    /// One instruction of one core: 1 ns divided among the online cores.
+    fn tick(&mut self) {
+        self.subtick += 1;
+        let per_step = 125 * self.online().max(1) as u64;
+        if self.subtick >= per_step {
+            self.subtick -= per_step;
+            let ticks = self.cpus[0].cntpct + 3;
+            self.set_time(ticks);
+        }
+    }
+
+    fn timer_state_of(cpu: &Cpu) -> (u32, u64, u32, u64) {
+        (cpu.cntp_ctl, cpu.cntp_cval, cpu.cntv_ctl, cpu.cntv_cval)
     }
 
     fn update_irqs(&mut self) {
-        let now = self.cpu.cntpct;
+        let now = self.cpus[0].cntpct;
         self.soc.now = now;
         self.soc.dirty = false;
-        self.timer_state = self.timer_state();
         self.soc.timer.update(now);
         for (index, &irq) in TIMER_IRQS.iter().enumerate() {
             let level = self.soc.timer.irq(index);
@@ -319,158 +384,226 @@ impl Machine {
         }
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART0_IRQ, uart);
-        let physical = self.cpu.physical_timer_irq();
-        self.soc.gic.set_level(PHYSICAL_TIMER_PPI, physical);
-        self.soc.gic.set_level(SECURE_PHYSICAL_TIMER_PPI, physical);
-        self.soc
-            .gic
-            .set_level(VIRTUAL_TIMER_PPI, self.cpu.virtual_timer_irq());
-        let irq = self.soc.gic.irq_out();
-        self.cpu.set_irq(irq, false);
-        if irq {
-            self.waiting = false;
-        }
-        self.next_event = self.next_timer_event(now);
-    }
-
-    /// Earliest future tick at which a timer output can change.
-    fn next_timer_event(&self, now: u64) -> u64 {
         let mut next = u64::MAX;
-        for (ctl, cval) in [
-            (self.cpu.cntp_ctl, self.cpu.cntp_cval),
-            (self.cpu.cntv_ctl, self.cpu.cntv_cval),
-        ] {
-            if ctl & 1 != 0 && cval > now {
-                next = next.min(cval);
+        for k in 0..NCPU {
+            let cpu = &self.cpus[k];
+            self.timer_state[k] = Self::timer_state_of(cpu);
+            let physical = cpu.physical_timer_irq();
+            let virtual_ = cpu.virtual_timer_irq();
+            if self.state[k] != CoreState::Off {
+                for (ctl, cval) in [(cpu.cntp_ctl, cpu.cntp_cval), (cpu.cntv_ctl, cpu.cntv_cval)] {
+                    if ctl & 1 != 0 && cval > now {
+                        next = next.min(cval);
+                    }
+                }
+            }
+            self.soc.gic.set_ppi(k, PHYSICAL_TIMER_PPI, physical);
+            self.soc.gic.set_ppi(k, SECURE_PHYSICAL_TIMER_PPI, physical);
+            self.soc.gic.set_ppi(k, VIRTUAL_TIMER_PPI, virtual_);
+        }
+        for k in 0..NCPU {
+            let irq = self.soc.gic.irq_out_for(k);
+            self.cpus[k].set_irq(irq, false);
+            if irq && self.state[k] == CoreState::Wait {
+                self.state[k] = CoreState::Run;
             }
         }
         if let Some(deadline) = self.soc.timer.next_deadline(now) {
             next = next.min(deadline.max(now + 1));
         }
-        next
+        self.next_event = next;
     }
 
     fn sync_irqs(&mut self) {
-        if self.soc.dirty
-            || self.cpu.cntpct >= self.next_event
-            || self.timer_state != self.timer_state()
-        {
+        let changed = self
+            .cpus
+            .iter()
+            .zip(&self.timer_state)
+            .any(|(cpu, state)| Self::timer_state_of(cpu) != *state);
+        if self.soc.dirty || changed || self.cpus[0].cntpct >= self.next_event {
             self.update_irqs();
         }
     }
 
     pub fn advance_time(&mut self, ticks: u64) {
-        self.cpu.advance_time(ticks);
+        let now = self.cpus[0].cntpct + ticks;
+        self.set_time(now);
         self.update_irqs();
     }
 
     /// Advance idle virtual time toward an absolute deadline in nanoseconds.
     pub fn idle_until(&mut self, time_ns: u64) {
         let ticks = ns_to_ticks(time_ns);
-        if ticks > self.cpu.cntpct {
-            self.cpu.cntpct = ticks;
+        if ticks > self.cpus[0].cntpct {
+            self.set_time(ticks);
             self.subtick = 0;
         }
         self.update_irqs();
     }
 
-    /// Execute one instruction, fast-forwarding idle time to the next timer event.
+    /// Hand the machine to core `k`: the core that stops running loses its exclusive
+    /// reservation (another core may now write the location), and the GIC's banked
+    /// registers present core `k`'s view.
+    fn switch_to(&mut self, k: usize) {
+        if k != self.cur {
+            self.cpus[self.cur].exclusive_addr = None;
+            self.cur = k;
+        }
+        self.soc.gic.current = k;
+    }
+
+    /// Execute one instruction on core 0, fast-forwarding idle time to the next timer
+    /// event (single-core tests and probes).
     pub fn step(&mut self) -> Result<(), Trap> {
+        self.switch_to(0);
         self.sync_irqs();
-        if self.waiting && !self.cpu.irq {
+        if self.state[0] == CoreState::Wait {
             let ticks = match self.next_event {
                 u64::MAX => 1,
-                event => event.saturating_sub(self.cpu.cntpct).max(1),
+                event => event.saturating_sub(self.cpus[0].cntpct).max(1),
             };
-            self.cpu.advance_time(ticks);
-            self.update_irqs();
+            self.advance_time(ticks);
             return Err(Trap::Wait);
         }
-        let result = self.cpu.step(&mut self.soc);
+        let result = self.cpus[0].step(&mut self.soc);
         self.tick();
         if result == Err(Trap::Wait) {
-            self.waiting = true;
+            self.state[0] = CoreState::Wait;
             self.update_irqs();
         }
         result
     }
 
-    /// Run up to `budget` instructions. Returns `Stop::Idle(deadline_ns)` when the core
-    /// waits for an interrupt and nothing is due before the deadline.
+    /// Run up to `budget` instructions across the cores. Returns `Stop::Idle(deadline_ns)`
+    /// when every online core waits for an interrupt and nothing is due before then.
     pub fn run(&mut self, budget: u64) -> Stop {
+        let mut left = budget;
         let mut storm = 0u32;
-        for _ in 0..budget {
+        while left > 0 {
             self.sync_irqs();
-            if self.waiting {
+            let Some(k) = (1..=NCPU)
+                .map(|offset| (self.cur + offset) % NCPU)
+                .find(|&k| self.state[k] == CoreState::Run)
+            else {
                 return Stop::Idle(match self.next_event {
                     u64::MAX => u64::MAX,
                     event => ticks_to_ns(event),
                 });
-            }
-            let result = self.cpu.step(&mut self.soc);
-            self.tick();
-            match result {
-                Ok(()) => storm = 0,
-                Err(Trap::Wait) => {
-                    self.waiting = true;
+            };
+            self.switch_to(k);
+            let quantum = left.min(QUANTUM);
+            for _ in 0..quantum {
+                left -= 1;
+                let result = self.cpus[k].step(&mut self.soc);
+                self.tick();
+                if self.cpus[k].sent_event {
+                    self.send_event(k);
+                }
+                match result {
+                    Ok(()) => storm = 0,
+                    Err(Trap::Wait) => {
+                        self.state[k] = CoreState::Wait;
+                        self.update_irqs();
+                        break;
+                    }
+                    Err(Trap::Interrupt(..)) => {
+                        self.irqs += 1;
+                        storm = 0;
+                    }
+                    Err(Trap::Exception(..)) => {
+                        self.exceptions += 1;
+                        storm += 1;
+                        if storm > 10_000 {
+                            let c = &self.cpus[k];
+                            return Stop::ExceptionStorm {
+                                pc: c.r[15] as u64,
+                                esr: (c.dfsr as u64) << 32 | c.ifsr as u64,
+                                elr: c.r[14] as u64,
+                                far: c.dfar as u64,
+                                el: 1,
+                            };
+                        }
+                    }
+                    Err(Trap::HostCall(_)) => {
+                        if let Some(stop) = self.psci(k) {
+                            return stop;
+                        }
+                        if self.state[k] != CoreState::Run {
+                            break;
+                        }
+                    }
+                    Err(Trap::Unimplemented(pc, word)) => return Stop::Unimplemented(pc, word),
+                    Err(Trap::Brk(n)) => return Stop::Brk(n),
+                    Err(Trap::Hlt(n)) => return Stop::Hlt(n),
+                }
+                if self.soc.dirty {
+                    // A device access (e.g. an IPI) may wake or interrupt a core.
                     self.update_irqs();
                 }
-                Err(Trap::Interrupt(..)) => {
-                    self.irqs += 1;
-                    storm = 0;
+                if left == 0 {
+                    break;
                 }
-                Err(Trap::Exception(..)) => {
-                    self.exceptions += 1;
-                    storm += 1;
-                    if storm > 10_000 {
-                        let c = &self.cpu;
-                        return Stop::ExceptionStorm {
-                            pc: c.r[15] as u64,
-                            esr: (c.dfsr as u64) << 32 | c.ifsr as u64,
-                            elr: c.r[14] as u64,
-                            far: c.dfar as u64,
-                            el: 1,
-                        };
-                    }
-                }
-                Err(Trap::HostCall(_)) => {
-                    if let Some(stop) = self.psci() {
-                        return stop;
-                    }
-                }
-                Err(Trap::Unimplemented(pc, word)) => return Stop::Unimplemented(pc, word),
-                Err(Trap::Brk(n)) => return Stop::Brk(n),
-                Err(Trap::Hlt(n)) => return Stop::Hlt(n),
             }
         }
         Stop::Budget
     }
 
-    /// Host PSCI 1.0 for the single modelled core.
-    fn psci(&mut self) -> Option<Stop> {
-        let function = self.cpu.r[0];
+    /// SEV from core `k`: every core's event register is set; cores sleeping in WFE
+    /// wake (consuming the event).
+    fn send_event(&mut self, k: usize) {
+        self.cpus[k].sent_event = false;
+        for j in 0..NCPU {
+            if j == k || self.state[j] == CoreState::Off {
+                continue;
+            }
+            if self.state[j] == CoreState::Wait && self.cpus[j].last_wfe {
+                self.state[j] = CoreState::Run;
+            } else {
+                self.cpus[j].event = true;
+            }
+        }
+    }
+
+    /// Host PSCI 1.0, called by core `k`.
+    fn psci(&mut self, k: usize) -> Option<Stop> {
+        let [function, target, entry, context] = [0, 1, 2, 3].map(|n| self.cpus[k].r[n]);
+        let core_of = |mpidr: u32| -> Option<usize> {
+            let index = (mpidr & 0xff) as usize;
+            (mpidr & 0xff_ff00 == 0 && index < NCPU).then_some(index)
+        };
         let ret = match function {
             psci::VERSION => 0x0001_0000,
             psci::SYSTEM_OFF => return Some(Stop::PowerOff),
             psci::SYSTEM_RESET => return Some(Stop::Reset),
             psci::MIGRATE_INFO_TYPE => 2, // trusted OS not present
-            psci::AFFINITY_INFO => u32::from(self.cpu.r[1] & 0xff != 0), // 0 = on, 1 = off
-            psci::CPU_ON => {
-                if self.cpu.r[1] & 0xff == 0 {
-                    psci::ALREADY_ON
-                } else {
-                    psci::INVALID_PARAMETERS // secondary cores are not modelled yet
+            psci::AFFINITY_INFO => match core_of(target) {
+                Some(index) => u32::from(self.state[index] == CoreState::Off),
+                None => psci::INVALID_PARAMETERS,
+            },
+            psci::CPU_ON => match core_of(target) {
+                Some(index) if self.state[index] != CoreState::Off => psci::ALREADY_ON,
+                Some(index) => {
+                    self.reset_core(index, entry);
+                    self.cpus[index].r[0] = context;
+                    self.update_irqs();
+                    psci::SUCCESS
                 }
+                None => psci::INVALID_PARAMETERS,
+            },
+            psci::CPU_OFF => {
+                self.state[k] = CoreState::Off;
+                self.cpus[k].set_irq(false, false);
+                return None;
             }
-            psci::FEATURES => match self.cpu.r[1] {
+            psci::FEATURES => match target {
                 psci::VERSION | psci::SYSTEM_OFF | psci::SYSTEM_RESET | psci::FEATURES
-                | psci::AFFINITY_INFO | psci::MIGRATE_INFO_TYPE => 0,
+                | psci::AFFINITY_INFO | psci::MIGRATE_INFO_TYPE | psci::CPU_ON
+                | psci::CPU_OFF => 0,
                 _ => psci::NOT_SUPPORTED,
             },
-            psci::CPU_OFF => psci::NOT_SUPPORTED,
             _ => psci::NOT_SUPPORTED,
         };
-        self.cpu.r[0] = ret;
+        self.cpus[k].r[0] = ret;
         None
     }
 

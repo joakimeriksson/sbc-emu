@@ -128,7 +128,15 @@ the page and `execve` failed with EFAULT); `MLS`/`UMAAL` and the miscellaneous s
 (`SMC`, `QADD`, `SMLAxy`) fell through to data processing and executed as the wrong
 instruction; `CPS` decoded its A/I/F bits from the wrong positions.
 
-**Not yet.** SD/MMC, EMAC, USB, display, SMP (PSCI CPU_ON plus a second `arm-a32` core),
+**SMP (follow-up PR).** Four cores in round-robin quanta of 1000 instructions on one host
+thread; time advances as if the online cores ran in parallel. PSCI CPU_ON/CPU_OFF/
+AFFINITY_INFO from the host; GIC-400 with banked SGIs/PPIs, per-core CPU interfaces,
+ITARGETSR routing and GICD_SGIR. A core that is switched out loses its exclusive
+reservation (as on the Pi 4 model). WFE/SEV use the event register: without it, cores
+waiting for a spinlock slept until the next timer tick and the four-core boot stalled.
+SGIs are permanently enabled, as on the GIC-400: with them disabled no IPI was delivered.
+
+**Not yet.** SD/MMC, EMAC, USB, display,
 Thumb-2 and NEON (both needed for Debian/Armbian armhf userlands and the RK3288 plan),
 a JIT, snapshots and the browser build. The RK3288 / panel board work builds on `arm-a32`;
 `arm-a32` needs a per-board CPU identity (MIDR, cache and feature ID registers) before a
