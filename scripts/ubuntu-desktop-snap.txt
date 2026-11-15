@@ -1,0 +1,13 @@
+# Boot Ubuntu Desktop, log in at GDM as pi/raspberry, let GNOME settle, save a snapshot.
+# Run without --sd-persist (the snapshot carries the disk changes, the image stays as it was) and
+# with the serial console on, which Ubuntu's own cmdline.txt leaves out:
+#   --append "zswap.enabled=1 zswap.compressor=zstd multipath=off dwc_otg.lpm_enable=0 console=ttyAMA0,115200
+#             console=tty1 root=LABEL=writable rootfstype=ext4 panic=10 rootwait fixrtc quiet splash"
+wait-serial login:
+sleep 60
+type \n
+sleep 8
+type raspberry\n
+sleep 180
+save cache/os/ubuntu-desktop.snap
+quit

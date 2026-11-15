@@ -256,6 +256,8 @@ impl Soc {
             v.tick(now);
             let l = v.irq_pv();
             self.gic.set_level(crate::vc4::SPI_PV2, l);
+            let h = v.irq_hvs();
+            self.gic.set_level(crate::vc4::SPI_HVS, h);
         }
         if let Some(g) = self.v3d.as_mut() { g.tick(now); let l = g.irq(); self.gic.set_level(32 + v3d::SPI, l); }
         self.dirty = false;

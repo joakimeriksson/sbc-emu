@@ -140,9 +140,10 @@ More options, mostly after QEMU's:
 - `--audio-out FILE.wav`: what the guest plays on the I²S DAC (`aplay`, `speaker-test`), as a
   16-bit stereo WAV.
 - `--otg-keyboard`: the keyboard on the USB-C (DWC2 OTG) port instead of the xHCI ports.
-- `--vnc :N` (port 5900+N): a VNC server for the HDMI framebuffer (no password, Raw encoding of the
-  rows that changed, desktop resize); keys go to the USB keyboard, the pointer to the USB tablet. Works with TigerVNC/RealVNC
-  viewers (macOS Screen Sharing insists on a password).
+- `--vnc :N[,password=PW]` (port 5900+N): a VNC server for the HDMI framebuffer (Raw encoding of the
+  rows that changed, desktop resize); keys go to the USB keyboard, the pointer to the USB tablet. Without
+  `password=` it asks for none, which suits TigerVNC/RealVNC viewers; macOS Screen Sharing insists on a
+  password, so give one (`open vnc://127.0.0.1:5901`).
 - `--cpu-crypto`: the Cryptographic Extension (AES, SHA-1/256, PMULL) as QEMU's `cortex-a72`
   has it; the real BCM2711 does not, so it is off by default.
 - Ctrl-A c opens the **monitor** (`help` lists the commands: `info registers|cpus|irq|network|jit`,
@@ -156,7 +157,7 @@ More options, mostly after QEMU's:
 # the pristine image from cdimage.ubuntu.com (sha256-checked), then a seeded 16 GiB working copy
 tools/ubuntu-image.sh cache/os/ubuntu-26.04.1-preinstalled-desktop-arm64+raspi.img cache/os/ubuntu-desktop.img
 ./target/release/sbc-emu run --sd cache/os/ubuntu-desktop.img --sd-persist --ram-mb 3072 \
-    --threads multi --hdmi-mode 1280x720 --vnc :1
+    --threads multi --hdmi-mode 1280x720 --vnc :1,password=raspberry
 ```
 
 The first boot (cloud-init, snaps, growing the root filesystem) takes a few minutes; after it
@@ -165,6 +166,12 @@ the GDM greeter appears about 30 s after power-on and the desktop about 30 s aft
 would: `config.txt` with `os_prefix=current/`, a gzip `vmlinuz`, `initrd.img`. GNOME scans out
 10-bit `XRGB2101010` buffers, which the HVS model shows. `--sd-persist` takes the image for
 itself (a second emulator on it is refused): two guests writing one ext4 filesystem corrupt it.
+
+A logged-in desktop resumes in seconds from a snapshot: `scripts/ubuntu-desktop-snap.txt` boots a
+frozen copy of the image (`cache/os/ubuntu-desktop-base.img`, never written), logs in and saves
+`cache/os/ubuntu-desktop.snap`; `tools/ubuntu-resume.sh` resumes it with VNC on :1 (password
+`raspberry`). Changes live in memory and are gone at exit. Firefox (the snap, on its own Mesa
+25.2) renders pages on the V3D.
 
 ### In the browser
 

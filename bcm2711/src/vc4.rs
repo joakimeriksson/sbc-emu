@@ -63,6 +63,9 @@ pub struct Vc4 {
     hvs: Vec<u32>,
     /// frames shown on each HVS channel (6-bit counters in DISPSTAT1/2)
     frcnt: [u32; 3],
+    /// DISPSTAT's end-of-frame flags (bit 8 + 8 * channel), raised as each channel starts a frame
+    /// and cleared by writing them; not saved (the next frame raises them again)
+    eof: u32,
     pv: [u32; 64],
     win: Vec<u32>,
     hd: [u32; 64],
@@ -100,7 +103,7 @@ impl Vc4 {
     }
 
     fn new_inner() -> Self {
-        Vc4 { hvs: vec![0; (HVS_SIZE / 4) as usize], frcnt: [0; 3], pv: [0; 64], win: vec![0; (HDMI_WIN_SIZE / 4) as usize], hd: [0; 64], txp: [0; 8],
+        Vc4 { hvs: vec![0; (HVS_SIZE / 4) as usize], frcnt: [0; 3], eof: 0, pv: [0; 64], win: vec![0; (HDMI_WIN_SIZE / 4) as usize], hd: [0; 64], txp: [0; 8],
               edid_ptr: 0, edid: edid(), next_vblank: FRAME_NS, connected: true, frames: 0,
               mai_played_to: 0, mai_frac: 0, mai_ch: 0, mai_left: 0, audio: Vec::new(), audio_rate: 0,
               trace: std::env::var_os("SBC_TRACE_VC4").is_some() }
@@ -111,7 +114,7 @@ impl Vc4 {
     pub fn hvs_read(&self, off: u64) -> u32 {
         let o = off as usize & !3;
         match o {
-            DISPSTAT => 0, // no interrupt pending (underrun/EOF interrupts are not raised)
+            DISPSTAT => self.eof, // end-of-frame flags (underruns are not modelled)
             DISPID => 0x0000_0001,
             // channel status: running or empty, the line counter at 0; DISPSTAT1/2 also carry
             // the frame counters (FRCNT0/1 in DISPSTAT1, FRCNT2 in DISPSTAT2)
@@ -135,7 +138,7 @@ impl Vc4 {
         let o = off as usize & !3;
         if self.trace && o < DLIST { eprintln!("[hvs] {o:#x} <- {v:#x}"); }
         match o {
-            DISPSTAT => {}
+            DISPSTAT => self.eof &= !v, // write-one-to-clear
             o if (DISPCTRL0..DISPCTRL0 + 0x30).contains(&o) && (o - DISPCTRL0) % 0x10 == 0 => {
                 // RESET clears the channel; the frame counter restarts
                 if v & (1 << 30) != 0 { self.frcnt[(o - DISPCTRL0) / 0x10] = 0; }
@@ -164,6 +167,16 @@ impl Vc4 {
 
     pub fn irq_pv(&self) -> bool { self.pv[PV_INTSTAT / 4] & self.pv[PV_INTEN / 4] != 0 }
 
+    /// The HVS interrupt: an end of frame on a channel whose EOF interrupt is enabled
+    /// (DISPCTRL DSPEIEOF, bit 7 + 4 * channel on the BCM2711's HVS). Linux uses it to free the
+    /// display-list memory of frames that are no longer shown.
+    pub fn irq_hvs(&self) -> bool { self.eof_enabled() & self.eof != 0 }
+
+    fn eof_enabled(&self) -> u32 {
+        let c = self.hvs[DISPCTRL / 4];
+        (0..3).filter(|ch| c & (1 << (7 + 4 * ch)) != 0).fold(0, |m, ch| m | 1 << (8 + 8 * ch))
+    }
+
     /// Guest time passes: vblanks while the pixel valve runs.
     pub fn tick(&mut self, now: u64) {
         if !self.pv_running() { self.next_vblank = now + FRAME_NS; return; }
@@ -176,6 +189,7 @@ impl Vc4 {
             if self.hvs[(DISPCTRL0 + 0x10 * ch) / 4] & (1 << 31) != 0 {
                 self.hvs[(DISPLACT0 + 4 * ch) / 4] = self.hvs[(DISPLIST0 + 4 * ch) / 4];
                 self.frcnt[ch] = self.frcnt[ch].wrapping_add(n as u32);
+                self.eof |= 1 << (8 + 8 * ch);
             }
         }
         self.pv[PV_INTSTAT / 4] |= PV_INT_VFP_START;
@@ -183,7 +197,7 @@ impl Vc4 {
 
     /// The next vblank, while the driver wants vblank interrupts.
     pub fn next_event(&self) -> Option<u64> {
-        (self.pv_running() && self.pv[PV_INTEN / 4] & PV_INT_VFP_START != 0).then_some(self.next_vblank)
+        (self.pv_running() && (self.pv[PV_INTEN / 4] & PV_INT_VFP_START != 0 || self.eof_enabled() != 0)).then_some(self.next_vblank)
     }
 
     // ------------------------------------------------------------------ HDMI0, DVP, DDC

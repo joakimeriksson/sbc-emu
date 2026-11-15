@@ -1,5 +1,6 @@
 //! A small VNC (RFB 3.3/3.7/3.8) server for the HDMI framebuffer (`--vnc :N`, as QEMU's
-//! `-vnc`): no authentication, Raw encoding of the rows that changed, any true-colour pixel
+//! `-vnc`): no authentication unless `,password=PW` is given (VNC Authentication, which
+//! macOS Screen Sharing insists on), Raw encoding of the rows that changed, any true-colour pixel
 //! format the viewer asks for, desktop resizes; keys go to the emulated USB keyboard and the
 //! pointer to the USB tablet.
 use bcm2711::Machine;
@@ -8,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 #[derive(PartialEq)]
-enum Phase { Version, Security, Init, Normal }
+enum Phase { Version, Security, Auth, Init, Normal }
 
 #[derive(Clone, Copy)]
 struct PixelFormat { bpp: u8, big: bool, rmax: u16, gmax: u16, bmax: u16, rs: u8, gs: u8, bs: u8 }
@@ -27,6 +28,8 @@ struct Client {
     /// what the viewer has now (RGBA) and its size
     shown: Vec<u8>,
     size: (u32, u32),
+    password: Option<Vec<u8>>,
+    challenge: [u8; 16],
 }
 
 pub struct Vnc {
@@ -34,6 +37,19 @@ pub struct Vnc {
     client: Option<Client>,
     frame: Vec<u8>,
     last: Instant,
+    password: Option<Vec<u8>>,
+}
+
+/// A fresh 16-byte challenge (clock and address mixed; it only has to differ per connection).
+fn challenge() -> [u8; 16] {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0) as u64;
+    let mut x = t ^ (&t as *const u64 as u64).rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut out = [0u8; 16];
+    for b in out.chunks_mut(8) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        b.copy_from_slice(&x.to_le_bytes());
+    }
+    out
 }
 
 /// X11 keysym -> HID usage.
@@ -52,8 +68,13 @@ fn keysym_usage(k: u32) -> Option<u8> {
 }
 
 impl Vnc {
-    /// `spec`: ":N" (port 5900+N, like QEMU) or a port number; listens on 127.0.0.1.
+    /// `spec`: ":N" (port 5900+N, like QEMU) or a port number, optionally `,password=PW`
+    /// (the first 8 bytes count, as in every VNC server); listens on 127.0.0.1.
     pub fn listen(spec: &str) -> std::io::Result<Vnc> {
+        let (spec, password) = match spec.split_once(",password=") {
+            Some((s, p)) => (s, Some(p.as_bytes().iter().copied().take(8).collect::<Vec<u8>>())),
+            None => (spec, None),
+        };
         let port = match spec.strip_prefix(':') {
             Some(n) => 5900 + n.parse::<u16>().map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "--vnc :N"))?,
             None => spec.parse::<u16>().map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "--vnc :N or PORT"))?,
@@ -61,7 +82,7 @@ impl Vnc {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         eprintln!("[sbc-emu] VNC server on 127.0.0.1:{port} (display :{})", port.wrapping_sub(5900));
-        Ok(Vnc { listener, client: None, frame: Vec::new(), last: Instant::now() })
+        Ok(Vnc { listener, client: None, frame: Vec::new(), last: Instant::now(), password })
     }
 
     /// Serve the viewer: handshake, input, and at most ~30 updates a second.
@@ -69,7 +90,8 @@ impl Vnc {
         if let Ok((s, _)) = self.listener.accept() {
             let _ = s.set_nonblocking(true);
             let _ = s.set_nodelay(true);
-            let mut c = Client { s, rx: Vec::new(), phase: Phase::Version, minor: 8, pf: SERVER_PF, resize_ok: false, want: None, shown: Vec::new(), size: (0, 0) };
+            let mut c = Client { s, rx: Vec::new(), phase: Phase::Version, minor: 8, pf: SERVER_PF, resize_ok: false, want: None, shown: Vec::new(), size: (0, 0),
+                                 password: self.password.clone(), challenge: challenge() };
             let _ = c.s.write_all(b"RFB 003.008\n");
             self.client = Some(c);
         }
@@ -100,6 +122,7 @@ impl Client {
             let need = match self.phase {
                 Phase::Version => 12,
                 Phase::Security | Phase::Init => 1,
+                Phase::Auth => 16,
                 Phase::Normal => match self.rx.first() {
                     None => return true,
                     Some(0) => 20,
@@ -116,18 +139,40 @@ impl Client {
             let ok = match self.phase {
                 Phase::Version => {
                     self.minor = if msg.starts_with(b"RFB 003.00") { (msg[10] - b'0').clamp(3, 8) } else { 3 };
+                    let ty: u8 = if self.password.is_some() { 2 } else { 1 };
                     if self.minor < 7 {
-                        // 3.3: the server picks: None
-                        self.phase = Phase::Init;
-                        self.s.write_all(&1u32.to_be_bytes()).is_ok()
+                        // 3.3: the server picks
+                        self.phase = if ty == 2 { Phase::Auth } else { Phase::Init };
+                        let mut r = (ty as u32).to_be_bytes().to_vec();
+                        if ty == 2 { r.extend_from_slice(&self.challenge); }
+                        self.s.write_all(&r).is_ok()
                     } else {
                         self.phase = Phase::Security;
-                        self.s.write_all(&[1, 1]).is_ok()
+                        self.s.write_all(&[1, ty]).is_ok()
                     }
                 }
                 Phase::Security => {
-                    self.phase = Phase::Init;
-                    msg[0] != 1 || self.minor < 8 || self.s.write_all(&0u32.to_be_bytes()).is_ok()
+                    if self.password.is_some() {
+                        // only VNC Authentication is on offer
+                        self.phase = Phase::Auth;
+                        msg[0] == 2 && self.s.write_all(&self.challenge).is_ok()
+                    } else {
+                        self.phase = Phase::Init;
+                        msg[0] == 1 && (self.minor < 8 || self.s.write_all(&0u32.to_be_bytes()).is_ok())
+                    }
+                }
+                Phase::Auth => {
+                    let want = crate::vnc_des::vnc_response(self.password.as_deref().unwrap_or(&[]), &self.challenge);
+                    if msg[..] == want[..] {
+                        self.phase = Phase::Init;
+                        self.s.write_all(&0u32.to_be_bytes()).is_ok()
+                    } else {
+                        eprintln!("[sbc-emu] VNC: wrong password");
+                        let mut r = 1u32.to_be_bytes().to_vec();
+                        if self.minor >= 8 { let why = b"wrong password"; r.extend_from_slice(&(why.len() as u32).to_be_bytes()); r.extend_from_slice(why); }
+                        let _ = self.s.write_all(&r);
+                        false
+                    }
                 }
                 Phase::Init => {
                     self.phase = Phase::Normal;
