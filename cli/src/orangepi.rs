@@ -4,15 +4,7 @@ use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
 
 // Reboots reconstruct the SoC while preserving the same locked image and COW overlay.
-struct SharedDisk(std::rc::Rc<std::cell::RefCell<crate::disk::CowFile>>);
-impl emu_core::disk::Disk for SharedDisk {
-    fn sectors(&self)->u64 { self.0.borrow().sectors() }
-    fn read(&mut self,lba:u64,out:&mut [u8]) { self.0.borrow_mut().read(lba,out); }
-    fn write(&mut self,lba:u64,data:&[u8]) { self.0.borrow_mut().write(lba,data); }
-    fn overlay(&self)->Vec<(u64,Vec<u8>)> { self.0.borrow().overlay() }
-    fn restore_overlay(&mut self,sectors:Vec<(u64,Vec<u8>)>) { self.0.borrow_mut().restore_overlay(sectors); }
-    fn snapshots_disk(&self)->bool { self.0.borrow().snapshots_disk() }
-}
+use crate::disk::SharedDisk;
 
 impl SerialBoard for rk3588::Machine {
     fn host(&mut self) -> HostMachine<'_> { HostMachine::OrangePi5(self) }

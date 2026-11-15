@@ -29,7 +29,7 @@ pub(crate) fn validate_options(args: &[String], extra: &[&str]) -> Result<(), St
     let mut index = 1;
     while index < args.len() {
         let a = args[index].as_str();
-        if a.starts_with("--board=") || matches!(a, "--no-jit" | "--no-display") {
+        if a.starts_with("--board=") || matches!(a, "--no-jit" | "--no-display" | "--sd-persist") {
             index += 1;
             continue;
         }
