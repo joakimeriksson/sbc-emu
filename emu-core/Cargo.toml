@@ -3,3 +3,6 @@ name = "emu-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dev-dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
