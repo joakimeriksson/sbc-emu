@@ -128,37 +128,65 @@ pub struct CardBoot {
 /// `/boot/zImage`, `/boot/dtb/sun8i-h3-orangepi-one.dtb` and `/boot/uInitrd` (U-Boot
 /// legacy header stripped) from the first Linux partition of the card in mmc0.
 pub fn boot_from_card(machine: &mut Machine, extra_args: &str) -> Result<CardBoot, String> {
-    use emu_core::ext4::{mbr_partitions, Ext4};
+    use emu_core::ext4::Ext4;
     let disk = machine.soc.mmc.card.disk.as_mut().ok_or("no SD card (--sd IMAGE)")?;
     let mut mbr = [0u8; 512];
     disk.read(0, &mut mbr);
+    if mbr[510..512] != [0x55, 0xaa] {
+        return Err("the SD card has no MBR partition table".into());
+    }
     let disk_id = u32::from_le_bytes(mbr[440..444].try_into().unwrap());
-    let (index, part) = mbr_partitions(disk.as_mut())
-        .into_iter()
-        .enumerate()
-        .find(|(_, (ty, _, _))| *ty == 0x83)
-        .ok_or("no Linux partition on the SD card")?;
-    let mut fs = Ext4::open(disk.as_mut(), part.1)?;
+    // Linux partitions by MBR slot; the boot files are in /boot of the root partition, or
+    // at the root of a separate boot partition.
+    let slots = (0..4).filter_map(|slot| {
+        let e = &mbr[446 + 16 * slot..462 + 16 * slot];
+        let lba = u32::from_le_bytes(e[8..12].try_into().unwrap()) as u64;
+        (e[4] == 0x83).then_some((slot, lba))
+    });
+    let mut found = None;
+    for (slot, lba) in slots {
+        let Ok(mut fs) = Ext4::open(disk.as_mut(), lba) else { continue };
+        for prefix in ["/boot/", "/"] {
+            if fs.exists(&format!("{prefix}zImage")) {
+                found = Some((slot, lba, prefix));
+                break;
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let (slot, lba, prefix) = found.ok_or("no ext2/3/4 partition with zImage in / or /boot on the SD card")?;
+    let mut fs = Ext4::open(disk.as_mut(), lba)?;
     let mut notes = Vec::new();
+    if fs.needs_recovery {
+        notes.push("the card's filesystem was not cleanly unmounted; its journal is not replayed, recent changes to /boot may be missing".into());
+    }
     let mut env = std::collections::HashMap::new();
-    if let Ok(text) = fs.read_file("/boot/armbianEnv.txt") {
+    if let Ok(text) = fs.read_file(&format!("{prefix}armbianEnv.txt")) {
         for line in String::from_utf8_lossy(&text).lines() {
             if let Some((key, value)) = line.split_once('=') {
                 env.insert(key.trim().to_string(), value.trim().to_string());
             }
         }
     } else {
-        notes.push("no /boot/armbianEnv.txt: defaults".into());
+        notes.push("no armbianEnv.txt: defaults".into());
     }
     let get = |key: &str, default: &str| env.get(key).cloned().unwrap_or_else(|| default.to_string());
     if env.get("overlays").is_some_and(|o| !o.is_empty()) || env.get("user_overlays").is_some_and(|o| !o.is_empty()) {
         notes.push("device tree overlays in armbianEnv.txt are not applied".into());
     }
-    let kernel = fs.read_file("/boot/zImage")?;
+    let kernel = fs.read_file(&format!("{prefix}zImage"))?;
+    if kernel.len() > (DTB_ADDR - KERNEL_ADDR) as usize {
+        return Err(format!("zImage of {} bytes does not fit below the device tree (16 MiB)", kernel.len()));
+    }
+    // boot.cmd: fdtfile (U-Boot's default for the board), with or without a vendor dir.
+    let fdtfile = get("fdtfile", "sun8i-h3-orangepi-one.dtb");
+    let fdtfile = fdtfile.trim_start_matches("allwinner/");
     let dtb = fs
-        .read_file("/boot/dtb/sun8i-h3-orangepi-one.dtb")
-        .or_else(|_| fs.read_file("/boot/dtb/allwinner/sun8i-h3-orangepi-one.dtb"))?;
-    let mut initrd = fs.read_file("/boot/uInitrd").ok();
+        .read_file(&format!("{prefix}dtb/{fdtfile}"))
+        .or_else(|_| fs.read_file(&format!("{prefix}dtb/allwinner/{fdtfile}")))?;
+    let mut initrd = fs.read_file(&format!("{prefix}uInitrd")).ok();
     if let Some(data) = initrd.as_mut() {
         // U-Boot legacy image: 64-byte header (magic 0x27051956), then the payload.
         if data.len() > 64 && data[..4] == [0x27, 0x05, 0x19, 0x56] {
@@ -166,22 +194,30 @@ pub fn boot_from_card(machine: &mut Machine, extra_args: &str) -> Result<CardBoo
             *data = data[64..(64 + size).min(data.len())].to_vec();
         }
     }
-    // boot.cmd: root, consoles (serial last, so /dev/console is the serial port: there
-    // is no display model), log level, the partition U-Boot booted from.
+    // boot.cmd's consoles, with the serial console always present and last (so
+    // /dev/console is the serial port: there is no display model).
     let consoles = match get("console", "both").as_str() {
-        "display" => "console=tty1",
         "serial" => "console=ttyS0,115200",
-        _ => "console=tty1 console=ttyS0,115200",
+        other => {
+            if other == "display" {
+                notes.push("console=display: the serial console is added (no display model)".into());
+            }
+            "console=tty1 console=ttyS0,115200"
+        }
     };
+    let docker = if get("docker_optimizations", "on") == "on" { "cgroup_enable=memory" } else { "" };
     let cmdline = format!(
-        "root={} rootwait rootfstype={} splash=verbose {} consoleblank=0 loglevel={} ubootpart={:08x}-{:02x} ubootsource=mmc {} {}",
+        "root={} rootwait rootfstype={} splash=verbose {} consoleblank=0 loglevel={} ubootpart={:08x}-{:02x} ubootsource=mmc usb-storage.quirks={} {} {} {} {}",
         get("rootdev", &format!("UUID={}", fs.uuid_string())),
         get("rootfstype", "ext4"),
         consoles,
         get("verbosity", "1"),
         disk_id,
-        index + 1,
+        slot + 1,
+        get("usbstoragequirks", ""),
         get("extraargs", ""),
+        get("extraboardargs", ""),
+        docker,
         extra_args
     )
     .split_whitespace()

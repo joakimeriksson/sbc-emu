@@ -9,6 +9,8 @@ use crate::disk::Disk;
 
 const MAGIC: u16 = 0xef53;
 const INCOMPAT_64BIT: u32 = 0x80;
+const INCOMPAT_RECOVER: u32 = 0x4;
+const INCOMPAT_META_BG: u32 = 0x10;
 const EXTENTS_FL: u32 = 0x8_0000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
 const S_IFMT: u16 = 0xf000;
@@ -59,6 +61,9 @@ pub struct Ext4<'a> {
     is_64bit: bool,
     /// Filesystem UUID (`root=UUID=...`).
     pub uuid: [u8; 16],
+    /// The journal needs recovery (not cleanly unmounted): recent changes may only be in
+    /// the journal, which this reader does not replay.
+    pub needs_recovery: bool,
 }
 
 impl<'a> Ext4<'a> {
@@ -73,20 +78,29 @@ impl<'a> Ext4<'a> {
             return Err("unsupported ext4 block size".into());
         }
         let incompat = u32_at(&sb, 96);
+        if incompat & INCOMPAT_META_BG != 0 {
+            return Err("ext4 meta_bg layout is not supported".into());
+        }
         let is_64bit = incompat & INCOMPAT_64BIT != 0;
         let rev = u32_at(&sb, 76);
+        let inodes_per_group = u32_at(&sb, 40);
+        let inode_size = if rev >= 1 { u16_at(&sb, 88) as u64 } else { 128 };
+        if inodes_per_group == 0 || inode_size < 128 {
+            return Err("corrupt ext4 superblock".into());
+        }
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&sb[104..120]);
         Ok(Ext4 {
             disk,
             start: start_lba,
             block_size: 1024 << log,
-            inodes_per_group: u32_at(&sb, 40),
-            inode_size: if rev >= 1 { u16_at(&sb, 88) as u64 } else { 128 },
+            inodes_per_group,
+            inode_size,
             first_data_block: u32_at(&sb, 20) as u64,
             desc_size: if is_64bit { (u16_at(&sb, 254) as u64).max(32) } else { 32 },
             is_64bit,
             uuid,
+            needs_recovery: incompat & INCOMPAT_RECOVER != 0,
         })
     }
 
@@ -148,6 +162,9 @@ impl<'a> Ext4<'a> {
                 }
                 let entries = u16_at(&node, 2) as usize;
                 let depth = u16_at(&node, 6);
+                if 12 + 12 * entries > node.len() {
+                    return Err("corrupt extent node".into());
+                }
                 if depth == 0 {
                     for i in 0..entries {
                         let e = &node[12 + 12 * i..24 + 12 * i];

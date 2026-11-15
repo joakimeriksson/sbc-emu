@@ -52,6 +52,13 @@ fn execute(args: &[String]) -> Result<(), String> {
     // Without --kernel, an --sd card is booted the way the board's firmware would
     // (armbianEnv.txt, zImage, the board DTB and uInitrd from the card's ext4 /boot).
     let card_boot = arg(args, "--kernel").is_none() && arg(args, "--sd").is_some();
+    if card_boot {
+        for option in ["--dtb", "--initrd", "--dump-dtb"] {
+            if arg(args, option).is_some() {
+                eprintln!("[orangepi-one] {option} is ignored when booting the SD card (no --kernel)");
+            }
+        }
+    }
     let (kernel, dtb) = if card_boot {
         (Vec::new(), Vec::new())
     } else {
