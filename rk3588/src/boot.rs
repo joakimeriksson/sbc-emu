@@ -6,7 +6,7 @@ pub const DEFAULT_CMDLINE:&str="console=ttyS2,1500000n8 earlycon=uart8250,mmio32
 pub const DTB:u64=0x03f0_0000;
 pub const INITRD:u64=0x0400_0000;
 
-pub fn device_tree(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>)->Vec<u8> {
+pub fn device_tree(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>, sd:bool)->Vec<u8> {
     let mut f=Fdt::default();
     f.begin("");
     f.strs("compatible", &["xunlong,orangepi-5","rockchip,rk3588s"]);
@@ -30,6 +30,12 @@ pub fn device_tree(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>)->Vec<u8> {
     f.begin("serial@feb50000");f.strs("compatible",&["rockchip,rk3588-uart","snps,dw-apb-uart"]);
     f.cells("reg",&[0,0xfeb50000,0,0x100]);f.cells("interrupts",&[0,333,4]);
     f.cells("reg-shift",&[2]);f.cells("reg-io-width",&[4]);f.cells("clocks",&[2,2]);f.strs("clock-names",&["baudclk","apb_pclk"]);f.end();
+    if sd {
+        f.begin("mmc@fe2c0000");f.strs("compatible",&["rockchip,rk3588-dw-mshc","rockchip,rk3288-dw-mshc"]);
+        f.cells("reg",&[0,0xfe2c0000,0,0x4000]);f.cells("interrupts",&[0,203,4]);
+        f.cells("clocks",&[2,2]);f.strs("clock-names",&["biu","ciu"]);f.cells("fifo-depth",&[256]);
+        f.cells("bus-width",&[4]);f.cells("max-frequency",&[24000000]);f.empty("disable-wp");f.end();
+    }
     f.end();f.finish()
 }
 
@@ -45,7 +51,7 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
         if end>m.soc.ram.len() as u64 {return Err("initrd exceeds RAM".into());}
         m.soc.ram[INITRD as usize..end as usize].copy_from_slice(data);Some((INITRD,end))
     }else{None};
-    let dt=device_tree(m.soc.ram.len() as u64,cmdline,range);
+    let dt=device_tree(m.soc.ram.len() as u64,cmdline,range,m.soc.mmc.disk.is_some());
     if DTB+dt.len() as u64>INITRD {return Err("device tree exceeds boot layout".into());}
     m.soc.ram[DTB as usize..DTB as usize+dt.len()].copy_from_slice(&dt);
     m.cpu.el=1; m.cpu.spsel=true; m.cpu.daif=0x3c0;m.cpu.pc=entry;

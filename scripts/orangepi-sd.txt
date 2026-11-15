@@ -1,0 +1,15 @@
+wait-serial orangepi5#
+serial insmod /dw_mmc.ko; insmod /dw_mmc-pltfm.ko; insmod /dw_mmc-rockchip.ko; sleep 1; printf 'READY_%s\n' OK\r
+wait-serial READY_OK
+serial dd if=/dev/mmcblk0 of=/tmp/source bs=512 count=1 2>/dev/null; head -c 12 /tmp/source; echo\r
+wait-serial INPUT_SECTOR
+serial printf 'WRITTEN_%s' SECTOR > /tmp/new; dd if=/tmp/new of=/dev/mmcblk0 bs=512 count=1 conv=sync 2>/dev/null; dd if=/dev/mmcblk0 of=/tmp/read bs=512 count=1 2>/dev/null; head -c 14 /tmp/read; echo\r
+wait-serial WRITTEN_SECTOR
+serial reboot -f\r
+wait-serial Booting Linux on physical CPU
+wait-serial orangepi5#
+serial insmod /dw_mmc.ko; insmod /dw_mmc-pltfm.ko; insmod /dw_mmc-rockchip.ko; sleep 1; dd if=/dev/mmcblk0 of=/tmp/read bs=512 count=1 2>/dev/null; head -c 14 /tmp/read; echo\r
+wait-serial WRITTEN_SECTOR
+serial printf 'FINISH_%s\n' OK\r
+wait-serial FINISH_OK
+quit

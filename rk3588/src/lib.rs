@@ -3,10 +3,12 @@
 pub mod boot;
 pub mod gic;
 pub mod uart;
+pub mod mmc;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
 
+pub const MMC: u64 = 0xfe2c_0000;
 pub const UART2: u64 = 0xfeb5_0000;
 pub const GICD: u64 = 0xfe60_0000;
 pub const GICR: u64 = 0xfe68_0000;
@@ -16,6 +18,7 @@ pub const UART_IRQ: usize = 32 + 333;
 pub struct Soc {
     pub ram: Vec<u8>,
     pub uart: uart::Uart,
+    pub mmc: mmc::Mmc,
     pub gic: gic::Gic,
     pub dirty: bool,
     pub unknown: Vec<u64>,
@@ -28,7 +31,8 @@ impl Soc {
         }
         if size == 8 { return Ok(self.read(addr,4)? | (self.read(addr+4,4)? << 32)); }
         self.dirty = true;
-        let word = if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
+        let word = if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
+        else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
         else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)}
         else { if !self.unknown.contains(&addr) {self.unknown.push(addr);} return Err(Fault::Unmapped); };
@@ -49,7 +53,8 @@ impl Soc {
                 else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)} else {0};
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};
-        if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
+        if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
+        else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
         else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_write((addr-GICR)&!3,v);}
         else { if !self.unknown.contains(&addr) {self.unknown.push(addr);} return Err(Fault::Unmapped); }
@@ -82,7 +87,7 @@ pub struct Machine {
 impl Machine {
     pub fn new(ram_bytes: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
-        let mut soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), gic:Default::default(),dirty:true,unknown:Vec::new()};
+        let mut soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gic:Default::default(),dirty:true,unknown:Vec::new()};
         let mut cpu=Cpu::new();
         cpu.profile=CpuProfile::CORTEX_A55;
         cpu.sys.cntfrq=CNTFRQ;
@@ -106,6 +111,7 @@ impl Machine {
         self.soc.gic.set_line(30,s.ptimer.firing(s.cnt));
         self.soc.gic.set_line(27,s.vtimer.firing(s.cnt.wrapping_sub(s.cntvoff)));
         self.soc.gic.set_line(UART_IRQ,self.soc.uart.irq());
+        self.soc.gic.set_line(32+203,self.soc.mmc.irq());
         let irq=self.soc.gic.irq(); self.cpu.set_irq(irq,false);
         if irq {self.waiting=false;}
         self.soc.dirty=false; self.cpu.sys.timers_changed=false;
