@@ -15,7 +15,7 @@ instruction, in the style of [esp32sim](https://github.com/mikroverk/esp32sim):
 |---|---|---|---|
 | Raspberry Pi 4 Model B | Broadcom BCM2711, 4× Cortex-A72 | **complete enough for real use**: unmodified Raspberry Pi OS and Ubuntu 26.04 Desktop, V3D GPU (OpenGL ES 3.1, Vulkan 1.3), HDMI, USB, Ethernet, Wi-Fi, Bluetooth, audio, a JIT, and a WebAssembly build | [below](#raspberry-pi-4-model-b) |
 | Orange Pi 5 | Rockchip RK3588S | **experimental**: one Cortex-A55, GICv3, UART; a Debian kernel to a BusyBox shell by direct boot | [docs/orangepi5.md](docs/orangepi5.md) |
-| Orange Pi One | Allwinner H3, 4× Cortex-A7 | **experimental**: four Cortex-A7s on the 32-bit core (`arm-a32`), Thumb-2, VFPv4, NEON; the unmodified Armbian 26.8.1 SD image to its login prompt (Thumb-2 kernel, systemd), HDMI console over VNC, or Alpine by direct boot | [docs/orangepi-one.md](docs/orangepi-one.md) |
+| Orange Pi One | Allwinner H3, 4× Cortex-A7 | **experimental**: four Cortex-A7s on the 32-bit core (`arm-a32`), Thumb-2, VFPv4, NEON; the unmodified Armbian 26.8.1 SD image to its login prompt (Thumb-2 kernel, systemd), HDMI console over VNC with a USB keyboard and tablet, or Alpine by direct boot | [docs/orangepi-one.md](docs/orangepi-one.md) |
 | ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12/A17 | **experimental**: four Cortex-A12s on `arm-a32` started through the boot ROM mailbox (`rockchip,rk3066-smp`); a Debian armmp kernel and the stock DTB to a BusyBox shell by direct boot (`scripts/tinkerboard-shell.txt`); the same SoC as the vendor's first panel board generation | [docs/rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
 
 `sbc-emu boards list` shows what the build knows; `--board NAME` picks one (the Pi 4 is the
@@ -250,7 +250,7 @@ GitHub Actions runs the suite on every pull request and push to `main` ([.github
 emu-core/   Bus / Core / Trap, the snapshot serializer and a device tree reader/writer
 arm-a64/    the ARMv8-A core: decode+execute, system registers, MMU, FP/NEON
 arm-a32/    the ARMv7-A core for 32-bit boards: A32, Thumb-2, VFPv4, NEON, short-descriptor MMU
-allwinner-h3/ the experimental Orange Pi One machine (H3): four cores, GIC-400, UART0, CCU, timers, SD/MMC, HDMI (DE2 mixer, TCON, DW-HDMI), host PSCI, U-Boot-style DTB patching
+allwinner-h3/ the experimental Orange Pi One machine (H3): four cores, GIC-400, UART0, CCU, timers, SD/MMC, HDMI (DE2 mixer, TCON, DW-HDMI), USB (OHCI with keyboard and tablet, EHCI), host PSCI, U-Boot-style DTB patching
 v3d/        the V3D 4.2 3D GPU (packets generated from Mesa's v3d_packet.xml by tools/gen_v3d_packets.py)
 bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2, PCIe + xHCI, USB devices, I²S, Bluetooth,
             GENET, device tree, boot, FAT

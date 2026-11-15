@@ -100,7 +100,7 @@ impl RunConfig {
             None => VecDeque::new(),
         };
         for line in &script {
-            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot")) {
+            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep")) {
                 return Err(format!("unsupported script command: {line}"));
             }
         }
@@ -150,6 +150,8 @@ pub(crate) fn run<B: SerialBoard>(
     let start = Instant::now();
     let mut anchor = Instant::now();
     let mut escape = false;
+    // `sleep SECS`: the script waits until this virtual time (ns)
+    let mut sleep_until: Option<u64> = None;
     let result = 'run: loop {
         let mut input = std::mem::take(&mut idle_input);
         while let Ok(b) = rx.try_recv() {
@@ -168,7 +170,10 @@ pub(crate) fn run<B: SerialBoard>(
             }
             pending.push_back(b);
         }
-        if let Some(line) = script.front().cloned() {
+        if sleep_until.is_some_and(|t| m.now() >= t) {
+            sleep_until = None;
+        }
+        if let Some(line) = script.front().cloned().filter(|_| sleep_until.is_none()) {
             let (cmd, rest) = line.split_once(' ').unwrap_or((&line, ""));
             let mut consumed = 0;
             let done = match cmd {
@@ -195,6 +200,20 @@ pub(crate) fn run<B: SerialBoard>(
                 }
                 "screenshot" => {
                     screenshot(&mut m, tag, rest);
+                    true
+                }
+                "sleep" => {
+                    let seconds: f64 = rest.trim().parse().map_err(|_| format!("script: {line}"))?;
+                    sleep_until = Some(m.now() + (seconds * 1e9) as u64);
+                    true
+                }
+                // keystrokes on the board's USB keyboard (\n is Enter)
+                "type" => {
+                    if let Some(screen) = m.screen() {
+                        for b in rest.replace("\\n", "\r").bytes() {
+                            screen.type_byte(b);
+                        }
+                    }
                     true
                 }
                 "quit" => break Ok(()),
