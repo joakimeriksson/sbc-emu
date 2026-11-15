@@ -1,0 +1,12 @@
+# Prepared by tools/orangepi-sd-root.py; boot and write to the ext4 root.
+wait-serial SD_ROOT_MOUNTED
+wait-serial sdroot#
+serial mount | grep ' / '; printf 'persist-%s\n' root > /root-proof; sync; cat /root-proof; printf 'WRITE_%s\n' OK\r
+wait-serial WRITE_OK
+serial reboot -f\r
+wait-serial Booting Linux on physical CPU
+wait-serial SD_ROOT_MOUNTED
+wait-serial sdroot#
+serial cat /root-proof; test "$(cat /root-proof)" = persist-root && printf 'REBOOT_%s\n' OK\r
+wait-serial REBOOT_OK
+quit
