@@ -800,8 +800,10 @@ impl Cpu {
             if rd == 15 {
                 return Err(unimplemented());
             }
+            // MRS reads the CPSR's execution state bits (J, IT, T) as zero (ARMv7). Linux's
+            // Thumb-2 exception stubs depend on it: they XOR PSR_T_BIT into the value read.
             self.r[rd as usize] = if insn & (1 << 22) == 0 {
-                self.cpsr
+                self.cpsr & !(0x0100_0000 | 0x0600_fc00 | T)
             } else {
                 self.banked_spsr[Self::bank(self.cpsr)]
             };

@@ -162,3 +162,15 @@ fn thumb_smc_reaches_host_firmware() {
     cpu.firmware_calls_to_host = true;
     assert_eq!(cpu.step(&mut ram), Err(Trap::HostCall(0)));
 }
+
+/// MRS reads the execution state bits as zero: Linux's Thumb-2 vector stubs XOR the T
+/// bit into the value read and rely on it being 0.
+#[test]
+fn mrs_cpsr_reads_execution_state_as_zero() {
+    let (mut cpu, mut ram) = thumb_machine(&[0xf3ef, 0x8000]); // mrs r0, apsr (CPSR)
+    cpu.cpsr |= 1 << 30;
+    cpu.step(&mut ram).unwrap();
+    assert_eq!(cpu.r[0] & (1 << 5), 0, "T reads as zero");
+    assert_ne!(cpu.r[0] & (1 << 30), 0, "flags are read");
+    assert_eq!(cpu.r[0] & 0x1f, MODE_SVC);
+}
