@@ -62,6 +62,7 @@ impl Mmc {
     fn command(&mut self,cmd:u32) {
         let idx=cmd&63;let arg=self.regs[0x28/4];
         let reply=self.card.command(idx,arg);
+        if idx==0 {self.transfer=Transfer::None;self.buffer.clear();self.position=0;}
         let Some(response)=reply.response else {
             if idx!=0 {self.raw|=RTO;}
             self.raw|=CMD_DONE;
@@ -71,7 +72,9 @@ impl Mmc {
             Response::Short(word)=>{
                 self.regs[0x30/4]=word;
                 // A data command that is out of range: no data phase, a data error at once.
-                if word & OUT_OF_RANGE!=0 && cmd & (1<<9)!=0 {self.transfer=Transfer::None;self.raw|=DRTO;}
+                // dw_mmc completes a failed data phase on DATA_OVER, as the hardware sets DTO
+                // with the error.
+                if word & OUT_OF_RANGE!=0 && cmd & (1<<9)!=0 {self.transfer=Transfer::None;self.raw|=DRTO|DATA_OVER;}
             }
             Response::Long(value)=>for i in 0..4 {self.regs[0x30/4+i]=(value>>(i*32)) as u32;},
         }
@@ -83,7 +86,7 @@ impl Mmc {
                 if bytes==0 || bytes%512!=0 || !self.card.in_range(lba,(bytes/512) as u64) {
                     self.transfer=Transfer::None;
                     self.regs[0x30/4]|=OUT_OF_RANGE;
-                    self.raw|=DRTO;
+                    self.raw|=DRTO|DATA_OVER;
                 } else {
                     self.lba=lba;self.remaining=bytes;self.position=0;
                     if matches!(reply.data,Data::Read{..}) {self.transfer=Transfer::Read;self.load_block();}
@@ -114,17 +117,10 @@ impl Mmc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use emu_core::disk::Disk;
-    struct Memory(Vec<u8>);
-    impl Disk for Memory {
-        fn sectors(&self)->u64 {self.0.len() as u64/512}
-        fn read(&mut self,lba:u64,out:&mut [u8]) {let i=lba as usize*512;out.copy_from_slice(&self.0[i..i+out.len()]);}
-        fn write(&mut self,lba:u64,data:&[u8]) {let i=lba as usize*512;self.0[i..i+data.len()].copy_from_slice(data);}
-    }
     fn command(m:&mut Mmc,cmd:u32,arg:u32) {m.write(0x28,arg);m.write(0x2c,(1<<31)|cmd);}
     #[test]
     fn sd_read_write_and_irq() {
-        let mut m=Mmc::default();m.card.disk=Some(Box::new(Memory(vec![0;1024*512])));
+        let mut m=Mmc::default();m.card.disk=Some(Box::new(emu_core::disk::MemDisk::new(1024)));
         m.write(0,1<<4);m.write(0x24,u32::MAX);
         command(&mut m,55,0);command(&mut m,41,0x40ff8000);
         assert_eq!(m.read(0x30),0xc0ff8000);assert!(m.irq());m.write(0x44,u32::MAX);assert!(!m.irq());
@@ -137,15 +133,16 @@ mod tests {
     }
     #[test]
     fn out_of_range_block_request_reports_error() {
-        let mut m=Mmc::default();m.card.disk=Some(Box::new(Memory(vec![0;1024*512])));
+        let mut m=Mmc::default();m.card.disk=Some(Box::new(emu_core::disk::MemDisk::new(1024)));
         m.write(0x20,1024);command(&mut m,18|(1<<9),1023);
         assert_ne!(m.read(0x30)&(1<<31),0);
         assert_eq!(m.read(0x44)&RXDR,0);
         assert_ne!(m.read(0x44)&DRTO,0, "data error, not a stalled data phase");
+        assert_ne!(m.read(0x44)&DATA_OVER,0, "dw_mmc completes the failed request on DATA_OVER");
     }
     #[test]
     fn erase_commands_are_answered() {
-        let mut m=Mmc::default();m.card.disk=Some(Box::new(Memory(vec![0;1024*512])));
+        let mut m=Mmc::default();m.card.disk=Some(Box::new(emu_core::disk::MemDisk::new(1024)));
         for (cmd,arg) in [(32,8),(33,15),(38,0)] {
             command(&mut m,cmd,arg);
             assert_eq!(m.read(0x44)&RTO,0,"CMD{cmd} answered");

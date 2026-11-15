@@ -176,9 +176,10 @@ impl SdCard {
             }
             (true, 6) | (true, 23) | (true, 42) => Reply::short(r1 | APP_CMD),
             (true, 51) => Reply {
-                // SCR: SD 3.0, 1- and 4-bit bus, CMD23 support
+                // SCR: SD 3.0, 1- and 4-bit bus; no CMD20/CMD23 support advertised
+                // (SET_BLOCK_COUNT is accepted but not enforced).
                 response: Some(Response::Short(r1 | APP_CMD)),
-                data: Data::Bytes(vec![0x02, 0x35, 0x80, 0x03, 0, 0, 0, 0]),
+                data: Data::Bytes(vec![0x02, 0x35, 0x80, 0x00, 0, 0, 0, 0]),
             },
             (true, 13) => {
                 let mut status = vec![0u8; 64];

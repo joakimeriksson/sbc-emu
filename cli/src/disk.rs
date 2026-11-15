@@ -45,7 +45,10 @@ impl Disk for CowFile {
     fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.overlay.sorted() }
     fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) {
         if self.persist {
-            for (lba, data) in sectors { self.write(lba, &data); }
+            // Never mix a snapshot's copy-on-write sectors into a persistent image.
+            if !sectors.is_empty() {
+                eprintln!("[sd] --sd-persist: the snapshot's {} SD sectors are not written into the image", sectors.len());
+            }
         } else {
             self.overlay.replace(sectors, self.sectors);
         }

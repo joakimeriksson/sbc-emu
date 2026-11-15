@@ -10,6 +10,8 @@ impl emu_core::disk::Disk for SharedDisk {
     fn read(&mut self,lba:u64,out:&mut [u8]) { self.0.borrow_mut().read(lba,out); }
     fn write(&mut self,lba:u64,data:&[u8]) { self.0.borrow_mut().write(lba,data); }
     fn overlay(&self)->Vec<(u64,Vec<u8>)> { self.0.borrow().overlay() }
+    fn restore_overlay(&mut self,sectors:Vec<(u64,Vec<u8>)>) { self.0.borrow_mut().restore_overlay(sectors); }
+    fn snapshots_disk(&self)->bool { self.0.borrow().snapshots_disk() }
 }
 
 impl SerialBoard for rk3588::Machine {

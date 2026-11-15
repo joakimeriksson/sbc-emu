@@ -45,12 +45,12 @@ impl Disk for MemDisk {
     }
     fn read(&mut self, lba: u64, out: &mut [u8]) {
         out.fill(0);
-        let start = (lba as usize).saturating_mul(512).min(self.0.len());
+        let start = lba.saturating_mul(512).min(self.0.len() as u64) as usize;
         let n = out.len().min(self.0.len() - start);
         out[..n].copy_from_slice(&self.0[start..start + n]);
     }
     fn write(&mut self, lba: u64, data: &[u8]) {
-        let start = (lba as usize).saturating_mul(512).min(self.0.len());
+        let start = lba.saturating_mul(512).min(self.0.len() as u64) as usize;
         let n = data.len().min(self.0.len() - start);
         self.0[start..start + n].copy_from_slice(&data[..n]);
     }

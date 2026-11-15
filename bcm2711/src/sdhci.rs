@@ -37,22 +37,8 @@ pub trait SdioCard {
     fn load_state(&mut self, _r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> { Ok(()) }
 }
 
-/// A RAM disk (tests, small images).
-pub struct MemDisk(pub Vec<u8>);
-impl Disk for MemDisk {
-    fn sectors(&self) -> u64 { self.0.len() as u64 / 512 }
-    fn read(&mut self, lba: u64, out: &mut [u8]) {
-        let o = (lba * 512) as usize;
-        let end = (o + out.len()).min(self.0.len());
-        out.fill(0);
-        if o < end { out[..end - o].copy_from_slice(&self.0[o..end]); }
-    }
-    fn write(&mut self, lba: u64, data: &[u8]) {
-        let o = (lba * 512) as usize;
-        let end = (o + data.len()).min(self.0.len());
-        if o < end { self.0[o..end].copy_from_slice(&data[..end - o]); }
-    }
-}
+/// A RAM disk (tests, small images): the shared one.
+pub use emu_core::disk::MemDisk;
 
 // normal interrupt status bits
 const INT_CMD_DONE: u32 = 1 << 0;
@@ -578,13 +564,19 @@ impl Sdhci {
         self.pre_count = r.opt_u32()?;
         if let Some(c) = self.sdio.as_mut() { c.load_state(r)?; }
         let n = r.u64()?;
-        let mut sectors = Vec::with_capacity(n as usize);
+        // `n` comes from the snapshot: no pre-allocation from an untrusted count.
+        let mut sectors = Vec::new();
         for _ in 0..n {
             let lba = r.u64()?;
             sectors.push((lba, r.bytes()?.to_vec()));
         }
         // Exactly the snapshot's sectors: writes made after it was taken are dropped.
-        if let Some(d) = self.disk.as_mut() { d.restore_overlay(sectors); }
+        if let Some(d) = self.disk.as_mut() {
+            if !d.snapshots_disk() {
+                eprintln!("[sd] restored snapshot without the SD card's state: --sd-persist writes go to the image");
+            }
+            d.restore_overlay(sectors);
+        }
         Ok(())
     }
 }
