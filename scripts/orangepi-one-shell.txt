@@ -1,11 +1,15 @@
-# Orange Pi One acceptance: shell input, device tree, timer, filesystem, VFP userland,
-# PSCI reset and PSCI power-off. A prompt alone is not enough.
+# Orange Pi One acceptance: shell input, device tree, four cores under load, timer,
+# filesystem, VFP userland, PSCI reset and PSCI power-off. A prompt alone is not enough.
 wait-serial orangepi-one#
 serial uname -a; cat /proc/device-tree/model; echo\r
 wait-serial Xunlong Orange Pi One
 wait-serial orangepi-one#
 serial printf 'H3_%s' SHELL_OK; echo\r
 wait-serial H3_SHELL_OK
+serial printf 'CPUS_%s' $(nproc); echo\r
+wait-serial CPUS_4
+serial for i in 1 2 3 4; do (n=0; while [ $n -lt 3000 ]; do n=$((n+1)); done) & done; wait; printf 'PAR_%s' OK; echo\r
+wait-serial PAR_OK
 serial grep -q vfpv4 /proc/cpuinfo && awk 'BEGIN{printf "FP_%s %.3f", "OK", 2.5*1.5}'; echo\r
 wait-serial FP_OK 3.750
 serial sleep 1; printf 'TIMER_%s' OK; echo; cat /proc/interrupts\r

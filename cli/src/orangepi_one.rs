@@ -12,16 +12,17 @@ impl SerialBoard for allwinner_h3::Machine {
         allwinner_h3::Machine::now(self)
     }
     fn instret(&self) -> u64 {
-        self.cpu.instret
+        allwinner_h3::Machine::instret(self)
     }
     fn report(&self, tag: &str) {
         eprintln!(
-            "[{tag}] pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={}",
-            self.cpu.r[15],
-            self.cpu.instret,
+            "[{tag}] pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
+            self.cpu().r[15],
+            allwinner_h3::Machine::instret(self),
             self.now() as f64 / 1e9,
             self.irqs,
-            self.exceptions
+            self.exceptions,
+            self.state
         );
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
@@ -64,7 +65,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(
-        "[orangepi-one] experimental Allwinner H3: one Cortex-A7 (interpreter), GIC-400, UART0, timers; \
+        "[orangepi-one] experimental Allwinner H3: four Cortex-A7s (interpreter, A32 + Thumb-2 + VFPv4), GIC-400, UART0, timers; \
          direct kernel boot with the distribution DTB, PSCI by the host; other devices are stubs"
     );
     serial_board::run(config, make_machine)
