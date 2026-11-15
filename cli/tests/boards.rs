@@ -15,8 +15,13 @@ fn lists_support_honestly_and_rejects_before_opening_images() {
     assert!(listing
         .lines()
         .any(|l| l.starts_with("orangepi5") && l.contains("experimental")));
+    assert!(listing
+        .lines()
+        .any(|l| l.starts_with("orangepi-one") && l.contains("not implemented")));
     for (board, error) in [
+        ("orangepi-one", "not implemented"),
         ("pi3b", "not implemented"),
+        ("orangepi-pc", "unknown board"),
         ("typo", "unknown board"),
     ] {
         let output = run(&[

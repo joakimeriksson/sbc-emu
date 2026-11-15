@@ -84,6 +84,6 @@ fn run(args: &[String]) -> ExitCode {
     match board {
         Board::Pi4 => pi4::run(args),
         Board::OrangePi5 => orangepi::run(args),
-        Board::Pi3 => unreachable!("checked above"),
+        Board::Pi3 | Board::OrangePiOne => unreachable!("checked above"),
     }
 }
