@@ -1,5 +1,5 @@
 //! RK3288 kernel bring-up probe: direct-boots a zImage + stock DTB + initramfs on the
-//! one-core model and copies the serial console to stdout.
+//! four-core model and copies the serial console to stdout.
 use emu_core::Stop;
 use rockchip_rk3288::Machine;
 use std::io::{self, Write};
@@ -73,11 +73,11 @@ fn run() -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     let mut transcript: Vec<u8> = Vec::new();
     loop {
-        let retired = machine.cpu.instret;
+        let retired = machine.instret();
         if retired >= args.steps {
             eprintln!(
                 "\n[rk3288-boot] instruction budget exhausted: {retired} retired, pc={:#010x}",
-                machine.cpu.r[15]
+                machine.cpu().r[15]
             );
             return Ok(());
         }
@@ -93,12 +93,12 @@ fn run() -> Result<(), String> {
             if transcript.windows(marker.len()).any(|window| window == marker.as_bytes()) {
                 eprintln!(
                     "\n[rk3288-boot] found {marker:?} after {} instructions, {:.3} s virtual",
-                    machine.cpu.instret,
+                    machine.instret(),
                     machine.now() as f64 / 1e9
                 );
                 eprintln!(
                     "[rk3288-boot] irqs={} exceptions={} last undefined instruction (pc, word)={:x?}",
-                    machine.irqs, machine.exceptions, machine.cpu.last_undef
+                    machine.irqs, machine.exceptions, machine.cpu().last_undef
                 );
                 dump_kernel_image(&machine);
                 return Ok(());
@@ -121,9 +121,11 @@ fn run() -> Result<(), String> {
             }
             other => {
                 dump_kernel_image(&machine);
+                let core = machine.last_stop_core;
+                let c = &machine.cpus[core];
                 return Err(format!(
-                    "stopped after {} instructions: {other:x?}\npc={:#010x} cpsr={:#010x} r={:08x?}",
-                    machine.cpu.instret, machine.cpu.r[15], machine.cpu.cpsr, machine.cpu.r
+                    "stopped after {} instructions: {other:x?}\ncore {core} pc={:#010x} cpsr={:#010x} r={:08x?}",
+                    machine.instret(), c.r[15], c.cpsr, c.r
                 ));
             }
         }
