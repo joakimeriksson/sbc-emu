@@ -471,6 +471,8 @@ impl Cyw43455 {
                 }
             }
             "per_chan_info" | "nmode" | "vhtmode" | "mpc" => u32v(0),
+            // transmit power in quarter dBm (NetworkManager and `iw` read it): 20 dBm
+            "qtxpower" => u32v(80),
             "chanspec" => u32v(0x1000 | CHANNEL as u32),
             "assoc_info" => vec![0u8; 8], // no association request/response IEs recorded
             "bw_cap" | "mimo_bw_cap" | "rxchain" | "txstreams" => u32v(1),

@@ -30,6 +30,8 @@ struct Client {
     size: (u32, u32),
     password: Option<Vec<u8>>,
     challenge: [u8; 16],
+    /// the screen size to announce (the last one shown, so a display that is off keeps it)
+    init_size: Option<(u32, u32)>,
 }
 
 pub struct Vnc {
@@ -38,6 +40,8 @@ pub struct Vnc {
     frame: Vec<u8>,
     last: Instant,
     password: Option<Vec<u8>>,
+    /// the size of the last frame the display showed
+    last_size: Option<(u32, u32)>,
 }
 
 /// A fresh 16-byte challenge (clock and address mixed; it only has to differ per connection).
@@ -82,16 +86,17 @@ impl Vnc {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         eprintln!("[sbc-emu] VNC server on 127.0.0.1:{port} (display :{})", port.wrapping_sub(5900));
-        Ok(Vnc { listener, client: None, frame: Vec::new(), last: Instant::now(), password })
+        Ok(Vnc { listener, client: None, frame: Vec::new(), last: Instant::now(), password, last_size: None })
     }
 
     /// Serve the viewer: handshake, input, and at most ~30 updates a second.
     pub fn poll(&mut self, m: &mut Machine) {
+        if let Some(sz) = m.soc.shown_size() { self.last_size = Some(sz); }
         if let Ok((s, _)) = self.listener.accept() {
             let _ = s.set_nonblocking(true);
             let _ = s.set_nodelay(true);
             let mut c = Client { s, rx: Vec::new(), phase: Phase::Version, minor: 8, pf: SERVER_PF, resize_ok: false, want: None, shown: Vec::new(), size: (0, 0),
-                                 password: self.password.clone(), challenge: challenge() };
+                                 password: self.password.clone(), challenge: challenge(), init_size: self.last_size };
             let _ = c.s.write_all(b"RFB 003.008\n");
             self.client = Some(c);
         }
@@ -108,7 +113,18 @@ impl Vnc {
         if !c.messages(m) { self.client = None; return; }
         if c.want.is_some() && c.phase == Phase::Normal && self.last.elapsed() >= Duration::from_millis(33) {
             self.last = Instant::now();
-            if let Some((w, h)) = m.soc.render(&mut self.frame) {
+            // a display that is off (blanked, between modes) shows black at the last size: viewers
+            // that get no answer to an update request give up and reconnect (macOS Screen Sharing)
+            let shown = match m.soc.render(&mut self.frame) {
+                Some((w, h)) => { self.last_size = Some((w, h)); Some((w, h)) }
+                None => self.last_size.or(Some(c.size)).filter(|s| s.0 > 0 && s.1 > 0).map(|(w, h)| {
+                    self.frame.clear();
+                    self.frame.resize((w * h * 4) as usize, 0);
+                    for p in self.frame.chunks_exact_mut(4) { p[3] = 255; }
+                    (w, h)
+                }),
+            };
+            if let Some((w, h)) = shown {
                 if !c.update(&self.frame, w, h) { self.client = None; }
             }
         }
@@ -176,7 +192,7 @@ impl Client {
                 }
                 Phase::Init => {
                     self.phase = Phase::Normal;
-                    let (w, h) = m.soc.display_size();
+                    let (w, h) = self.init_size.unwrap_or_else(|| m.soc.display_size());
                     self.size = (w, h);
                     let mut r = Vec::new();
                     r.extend_from_slice(&(w as u16).to_be_bytes());

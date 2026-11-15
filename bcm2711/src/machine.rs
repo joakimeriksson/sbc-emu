@@ -371,6 +371,11 @@ impl Soc {
     }
 
     /// The size of what the HDMI output shows now.
+    /// The mode HDMI shows right now (None while the display is off).
+    pub fn shown_size(&self) -> Option<(u32, u32)> {
+        match self.vc4.as_ref() { Some(v) if v.active() => v.size(), _ => self.mbox.fb.allocated.then(|| self.mbox.fb_size()) }
+    }
+
     pub fn display_size(&self) -> (u32, u32) {
         self.vc4.as_ref().and_then(|v| v.size()).unwrap_or_else(|| self.mbox.fb_size())
     }
