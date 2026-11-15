@@ -15,6 +15,7 @@ See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
 |---|---|---|
 | Raspberry Pi kernel 6.18 (firmware 1.20260915 `kernel8.img`) | boots to userspace | busybox initramfs shell on serial and HDMI |
 | Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | boots on all four cores: firmware-style SD boot → initramfs → ext4 root → systemd 257 → `raspberrypi login:` and the first-boot setup wizard on HDMI | `scripts/raspios-firstboot.txt`; ~27 G instructions to the login prompt |
+| Ubuntu 26.04.1 LTS Desktop (unmodified `preinstalled-desktop-arm64+raspi` image, kernel 7.0) | GNOME on Wayland on the V3D GPU, 3 GiB RAM, four cores (`--threads multi`): boot to the GDM greeter, log in, the desktop and its Welcome app | `tools/ubuntu-image.sh` (cloud-init test account), `scripts/ubuntu-stress.txt` (40 identical digests from multi-threaded Python, no crash reports), `scripts/ubuntu-bench.txt`; see below |
 | Four cores | four Cortex-A72s started through PSCI, GIC-400 with per-core interfaces, SGIs (IPIs) and SPI routing | `smp: Brought up 1 node, 4 CPUs`; four busy loops finish in 1.6 s of guest time instead of 6.5 s |
 | USB | PCIe root complex + VL805 xHCI behind the four USB-A ports, as on a Pi 4: USB keyboard and tablet (absolute pointer) by default, a USB stick (`--usb-drive IMAGE`) and a UVC webcam (`--camera`) on request; the DWC2 OTG port too | `lsusb -t`: devices on the xHCI root hub; typing on tty1; `mkfs.vfat` + mount + read back on the stick; `v4l2-ctl` captures 30 frames of 640×480 YUYV |
 | Audio | an I²S DAC HAT (PCM5102A on `simple-audio-card`) on the BCM2835 PCM/I²S block, fed by DREQ-paced DMA; `--audio-out FILE.wav` (native) or WebAudio (browser) | `speaker-test -t sine -f 440`: the WAV holds a 440.0 Hz tone, 3.000 s per channel at 48 kHz |
@@ -148,6 +149,22 @@ More options, mostly after QEMU's:
   `x`/`xp`/`xlate`, `stop`/`cont`, `savevm`/`loadvm`, `screendump`, `sendkey`, `mouse_move`,
   `mouse_button`, `hostfwd_add`, `gdbserver`, `system_reset`, `quit`); scripts can run them with
   `monitor CMD`.
+
+### Ubuntu Desktop
+
+```sh
+# the pristine image from cdimage.ubuntu.com (sha256-checked), then a seeded 16 GiB working copy
+tools/ubuntu-image.sh cache/os/ubuntu-26.04.1-preinstalled-desktop-arm64+raspi.img cache/os/ubuntu-desktop.img
+./target/release/sbc-emu run --sd cache/os/ubuntu-desktop.img --sd-persist --ram-mb 3072 \
+    --threads multi --hdmi-mode 1280x720 --vnc :1
+```
+
+The first boot (cloud-init, snaps, growing the root filesystem) takes a few minutes; after it
+the GDM greeter appears about 30 s after power-on and the desktop about 30 s after logging in
+(`pi` / `raspberry`, from `scripts/ubuntu-user-data.yaml`). Ubuntu boots like the firmware
+would: `config.txt` with `os_prefix=current/`, a gzip `vmlinuz`, `initrd.img`. GNOME scans out
+10-bit `XRGB2101010` buffers, which the HVS model shows. `--sd-persist` takes the image for
+itself (a second emulator on it is refused): two guests writing one ext4 filesystem corrupt it.
 
 ### In the browser
 
