@@ -262,8 +262,11 @@ pub struct Machine {
     timer_state: Vec<(u32, u64, u32, u64)>,
     pub irqs: u64,
     pub exceptions: u64,
-    /// Instructions executed since the counter last advanced, scaled by online cores.
+    /// Time since the counter last advanced, in 1/12 ns. An instruction is 12 units
+    /// divided by the number of running cores (they run in parallel on real hardware).
     subtick: u64,
+    /// The core that caused the last non-budget, non-idle stop (diagnostics).
+    pub last_stop_core: usize,
 }
 
 impl Machine {
@@ -292,6 +295,7 @@ impl Machine {
             irqs: 0,
             exceptions: 0,
             subtick: 0,
+            last_stop_core: 0,
         }
     }
 
@@ -317,7 +321,9 @@ impl Machine {
     /// caches off, IRQ/FIQ masked; SMC goes to host PSCI.
     fn reset_core(&mut self, index: usize, entry: u32) {
         let now = self.cpus[0].cntpct.max(self.cpus[index].cntpct);
+        let instret = self.cpus[index].instret;
         let mut cpu = Cpu::new();
+        cpu.instret = instret;
         cpu.mpidr = 0x8000_0000 | index as u32;
         cpu.r[15] = entry;
         cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
@@ -326,6 +332,7 @@ impl Machine {
         cpu.cntpct = now;
         self.cpus[index] = cpu;
         self.state[index] = CoreState::Run;
+        self.soc.gic.reset_cpu_interface(index);
     }
 
     /// ARM32 Linux zImage entry on core 0: r0 = 0, r1 = ~0, r2 = the DTB address.
@@ -345,11 +352,7 @@ impl Machine {
 
     /// Virtual time in nanoseconds.
     pub fn now(&self) -> u64 {
-        ticks_to_ns(self.cpus[0].cntpct) + self.subtick / self.online().max(1) as u64
-    }
-
-    fn online(&self) -> usize {
-        self.state.iter().filter(|&&s| s != CoreState::Off).count()
+        ticks_to_ns(self.cpus[0].cntpct) + self.subtick / 12
     }
 
     fn set_time(&mut self, ticks: u64) {
@@ -358,12 +361,13 @@ impl Machine {
         }
     }
 
-    /// One instruction of one core: 1 ns divided among the online cores.
+    /// One instruction of one core: 1 ns divided among the running cores. Cores asleep
+    /// in WFI/WFE do not count, so a lone busy core still runs at 1 ns per instruction.
     fn tick(&mut self) {
-        self.subtick += 1;
-        let per_step = 125 * self.online().max(1) as u64;
-        if self.subtick >= per_step {
-            self.subtick -= per_step;
+        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        self.subtick += 12 / running;
+        if self.subtick >= 125 * 12 {
+            self.subtick -= 125 * 12;
             let ticks = self.cpus[0].cntpct + 3;
             self.set_time(ticks);
         }
@@ -467,6 +471,9 @@ impl Machine {
         }
         let result = self.cpus[0].step(&mut self.soc);
         self.tick();
+        if self.cpus[0].sent_event {
+            self.send_event(0);
+        }
         if result == Err(Trap::Wait) {
             self.state[0] = CoreState::Wait;
             self.update_irqs();
@@ -514,6 +521,7 @@ impl Machine {
                         self.exceptions += 1;
                         storm += 1;
                         if storm > 10_000 {
+                            self.last_stop_core = k;
                             let c = &self.cpus[k];
                             return Stop::ExceptionStorm {
                                 pc: c.r[15] as u64,
@@ -526,22 +534,33 @@ impl Machine {
                     }
                     Err(Trap::HostCall(_)) => {
                         if let Some(stop) = self.psci(k) {
+                            self.last_stop_core = k;
                             return stop;
                         }
                         if self.state[k] != CoreState::Run {
                             break;
                         }
                     }
-                    Err(Trap::Unimplemented(pc, word)) => return Stop::Unimplemented(pc, word),
-                    Err(Trap::Brk(n)) => return Stop::Brk(n),
-                    Err(Trap::Hlt(n)) => return Stop::Hlt(n),
+                    Err(Trap::Unimplemented(pc, word)) => {
+                        self.last_stop_core = k;
+                        return Stop::Unimplemented(pc, word);
+                    }
+                    Err(Trap::Brk(n)) => {
+                        self.last_stop_core = k;
+                        return Stop::Brk(n);
+                    }
+                    Err(Trap::Hlt(n)) => {
+                        self.last_stop_core = k;
+                        return Stop::Hlt(n);
+                    }
                 }
-                if self.soc.dirty {
-                    // A device access (e.g. an IPI) may wake or interrupt a core.
+                // A device access (e.g. an IPI), a timer deadline or this core's own timer
+                // registers may change an interrupt line.
+                if self.soc.dirty
+                    || self.cpus[0].cntpct >= self.next_event
+                    || Self::timer_state_of(&self.cpus[k]) != self.timer_state[k]
+                {
                     self.update_irqs();
-                }
-                if left == 0 {
-                    break;
                 }
             }
         }

@@ -111,9 +111,11 @@ fn run() -> Result<(), String> {
             }
             other => {
                 dump_kernel_image(&machine);
+                let core = machine.last_stop_core;
+                let cpu = &machine.cpus[core];
                 return Err(format!(
-                    "stopped after {} instructions: {other:x?}\npc={:#010x} cpsr={:#010x} r={:08x?}",
-                    machine.instret(), machine.cpu().r[15], machine.cpu().cpsr, machine.cpu().r
+                    "stopped after {} instructions on core {core}: {other:x?}\npc={:#010x} cpsr={:#010x} r={:08x?}",
+                    machine.instret(), cpu.r[15], cpu.cpsr, cpu.r
                 ));
             }
         }
