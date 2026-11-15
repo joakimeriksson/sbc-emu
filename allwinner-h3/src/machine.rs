@@ -344,12 +344,9 @@ impl Machine {
         let mut cpu = Cpu::new();
         cpu.instret = instret;
         cpu.mpidr = 0x8000_0000 | index as u32;
-        // PSCI: bit 0 of an AArch32 entry point selects Thumb state (Thumb-2 kernels pass
-        // a Thumb secondary_startup).
-        cpu.r[15] = entry & !1;
-        if entry & 1 != 0 {
-            cpu.cpsr |= 1 << 5;
-        }
+        // Bit 0 of an entry point selects Thumb state (Thumb-2 kernels pass a Thumb
+        // secondary_startup).
+        cpu.set_entry(entry);
         cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
         cpu.undef_to_guest = true;
         cpu.firmware_calls_to_host = true;

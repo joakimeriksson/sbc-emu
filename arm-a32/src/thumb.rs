@@ -398,9 +398,9 @@ impl Cpu {
                             let increment = op == 3;
                             let writeback = w != 0;
                             return if l != 0 && hw2 == 0xc000 {
-                                self.return_from_exception(bus, rn as usize, increment, !increment, writeback)
+                                self.return_from_exception(bus, insn, rn as usize, increment, !increment, writeback)
                             } else if l == 0 && rn == 13 && hw2 & 0xffe0 == 0xc000 {
-                                self.store_return_state(bus, hw2 & 0x1f, increment, !increment, writeback)
+                                self.store_return_state(bus, insn, hw2 & 0x1f, increment, !increment, writeback)
                             } else {
                                 self.undefined(insn)
                             };
@@ -586,6 +586,7 @@ impl Cpu {
         match hw1 & 0xfff0 {
             // LDREX/STREX Rt, [Rn, #imm8*4]: T32 has an offset (Linux's Thumb-2 exception
             // exit clears the monitor with `strex r2, r1, [sp, #S_LR]`).
+            0xe840 | 0xe850 if rt == 15 || rn == 15 || hw1 & 0xfff0 == 0xe840 && rd == 15 => self.undefined(insn),
             0xe850 => {
                 let address = self.r[rn as usize].wrapping_add((hw2 & 0xff) << 2);
                 match self.mem_read32(bus, address, Access::Read) {
@@ -987,7 +988,7 @@ impl Cpu {
             }
             0x7f if hw2 & 0xf000 == 0x8000 => {
                 // SMC #imm4 (T32): the same firmware call as the A32 encoding.
-                self.execute(bus, self.cur_pc as u64, AL | 0x0160_0070 | hw1 & 0xf)
+                self.a32(bus, 0x0160_0070 | hw1 & 0xf)
             }
             0x3e | 0x3f => {
                 // MRS
