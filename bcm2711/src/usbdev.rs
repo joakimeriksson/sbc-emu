@@ -518,7 +518,8 @@ impl Devices {
             for _ in 0..n_ov { ov.push((r.u64()?, r.bytes()?.to_vec())); }
             if let Some(s) = self.storage.as_mut() {
                 s.st = st; s.data = data; s.csw = has.then_some(c); s.write = hw.then_some((t, l, n)); s.sense = sense;
-                for (lba, d) in ov { s.disk.write(lba, &d); }
+                // Exactly the snapshot's sectors: writes made after it was taken are dropped.
+                s.disk.restore_overlay(ov);
             }
         }
         Ok(())
