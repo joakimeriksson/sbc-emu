@@ -14,6 +14,8 @@ mod wav;
 mod pi4;
 mod terminal;
 mod orangepi;
+mod orangepi_one;
+mod serial_board;
 
 use sbc_machine::Board;
 use std::io::Write;
@@ -84,6 +86,7 @@ fn run(args: &[String]) -> ExitCode {
     match board {
         Board::Pi4 => pi4::run(args),
         Board::OrangePi5 => orangepi::run(args),
+        Board::OrangePiOne => orangepi_one::run(args),
         Board::Pi3 => unreachable!("checked above"),
     }
 }

@@ -1,0 +1,9 @@
+[package]
+name = "allwinner-h3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+emu-core = { path = "../emu-core" }
+arm-a32 = { path = "../arm-a32" }

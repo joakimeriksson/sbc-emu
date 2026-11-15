@@ -5,16 +5,18 @@ pub enum Board {
     Pi4,
     Pi3,
     OrangePi5,
+    OrangePiOne,
 }
 
 impl Board {
-    pub const ALL: [Self; 3] = [Self::Pi4, Self::Pi3, Self::OrangePi5];
+    pub const ALL: [Self; 4] = [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::Pi4 => "pi4b",
             Self::Pi3 => "pi3b",
             Self::OrangePi5 => "orangepi5",
+            Self::OrangePiOne => "orangepi-one",
         }
     }
 
@@ -23,11 +25,12 @@ impl Board {
             Self::Pi4 => "BCM2711 (4x Cortex-A72, GIC-400, UART, SD, USB keyboard, Ethernet, Wi-Fi, GPIO/I2C/SPI)",
             Self::Pi3 => "unverified: BCM2837 SoC model not yet implemented",
             Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (one A55, GICv3, UART2, direct Linux boot)",
+            Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (one A7, GIC-400, UART0, direct Linux boot)",
         }
     }
 
     pub fn require_implemented(self) -> Result<(), String> {
-        if matches!(self, Self::Pi4 | Self::OrangePi5) {
+        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne) {
             Ok(())
         } else {
             Err(format!(
