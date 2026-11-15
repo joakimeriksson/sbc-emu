@@ -13,14 +13,7 @@
 //! 16, 17, 18, 23, 24, 25, 32, 33, 38, 55 and ACMD 6, 13, 23, 41, 42, 51. Anything else times out, which is
 //! how a real SD card answers SDIO/MMC probes (CMD5, CMD1, CMD52).
 
-/// Storage behind the card (512-byte sectors).
-pub trait Disk {
-    fn sectors(&self) -> u64;
-    fn read(&mut self, lba: u64, out: &mut [u8]);
-    fn write(&mut self, lba: u64, data: &[u8]);
-    /// Sectors written since the image was opened (copy-on-write disks), for snapshots.
-    fn overlay(&self) -> Vec<(u64, Vec<u8>)> { Vec::new() }
-}
+pub use emu_core::disk::Disk;
 
 /// An SDIO card (functions 0..7) behind the host instead of a memory card.
 pub trait SdioCard {

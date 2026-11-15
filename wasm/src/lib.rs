@@ -1,7 +1,7 @@
 //! C ABI over the Pi 4B machine for the browser (no wasm-bindgen; see web/worker.js).
 //! Single-threaded: one machine per module instance, driven from a Web Worker.
 #![allow(clippy::missing_safety_doc)]
-use bcm2711::sdhci::Disk;
+use emu_core::disk::Disk;
 use bcm2711::{Machine, Stop};
 use std::cell::RefCell;
 use std::collections::HashMap;

@@ -3,6 +3,7 @@
 //! step stopped). No dependencies, no chip knowledge.
 
 pub mod snap;
+pub mod disk;
 pub mod fdt;
 mod stop;
 pub use stop::Stop;

@@ -3,7 +3,7 @@
 //! with `--sd-persist` writes go to the file itself. The image is locked: shared while it is
 //! only read, exclusive with `--sd-persist`, so a guest never writes a filesystem that another
 //! emulator is running from (two writers corrupt it; a reader sees it change underneath).
-use bcm2711::sdhci::Disk;
+use emu_core::disk::Disk;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
