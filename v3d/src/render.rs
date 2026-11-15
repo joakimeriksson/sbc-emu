@@ -557,9 +557,11 @@ impl Render<'_> {
                 for l in 0..LANES { if t.msf[l] != 0 { let z = fe.z[l]; fe.ds_test(&mut t, l, z); } }
                 if t.msf.iter().all(|&s| s == 0) { drop(fe); self.thread = Some(t); continue; }
             }
+            if code.runaway { drop(fe); self.thread = Some(t); continue; }
             let before = t.insns;
             let stop = t.run(code, &mut fe, 5_000_000);
             if stop != crate::qpu::Stop::Done { crate::log_once(&format!("v3d: fragment shader stopped: {stop:?}")); }
+            if stop == crate::qpu::Stop::Budget { code.runaway = true; }
             if d.occlusion != 0 { *fe.r.occlusion.entry(d.occlusion).or_default() += fe.passed; }
             let n = t.insns - before;
             fe.r.insns += n;

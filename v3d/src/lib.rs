@@ -41,9 +41,13 @@ pub fn draws_enabled() -> bool {
 }
 pub fn log_enabled() -> bool { LOG_ON.load(std::sync::atomic::Ordering::Relaxed) }
 /// A diagnostic printed once per message (always).
-pub fn log_once(s: &str) {
+pub fn log_once(s: &str) { log_first(s); }
+
+/// Log a message the first time it is seen; true if it was new.
+pub fn log_first(s: &str) -> bool {
     let first = SEEN.with(|h| h.borrow_mut().insert(s.to_string()));
     if first { eprintln!("\r{s}\r"); }
+    first
 }
 
 /// Host time for job costs: `Instant` natively, the page's `performance.now()` in the browser.
@@ -68,12 +72,20 @@ impl Clock {
 
 /// Decoded-instruction cache for QPU code (direct-mapped), valid for one job: BOs get remapped
 /// between jobs.
-pub struct Code { tags: Vec<u32>, insts: Vec<qpu::Inst> }
+/// Decoded QPU instructions, and whether a shader in the current job ran away.
+pub struct Code {
+    tags: Vec<u32>,
+    insts: Vec<qpu::Inst>,
+    /// A shader invocation hit its instruction budget (an endless loop): the rest of the job
+    /// skips its shaders, as the kernel's GPU reset would end it on the hardware, instead of
+    /// spending the budget again on every remaining batch.
+    pub runaway: bool,
+}
 
 const CODE_SLOTS: usize = 16384;
 
 impl Default for Code {
-    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![qpu::Inst::Invalid(0); CODE_SLOTS] } }
+    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![qpu::Inst::Invalid(0); CODE_SLOTS], runaway: false } }
 }
 
 impl Code {
@@ -87,7 +99,7 @@ impl Code {
         self.insts[k] = i;
         i
     }
-    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); tmu::clear_cache(); }
+    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); self.runaway = false; tmu::clear_cache(); }
 }
 
 // hub registers

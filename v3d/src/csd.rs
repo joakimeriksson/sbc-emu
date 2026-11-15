@@ -60,16 +60,48 @@ pub fn run(cfg: &[u32], m: &mut Gmem, code: &mut Code, insns: &mut u64) {
         loop {
             let mut live = false;
             for t in threads.iter_mut().filter(|t| !t.done) {
+                if code.runaway { t.done = true; continue; }
                 let before = t.insns;
                 match t.run(code, &mut env, 50_000_000) {
                     Stop::Barrier => live = true,
                     Stop::Done => {}
-                    Stop::Budget | Stop::Fault => { crate::log_once("v3d: compute shader did not finish"); t.done = true; }
+                    s @ (Stop::Budget | Stop::Fault) => {
+                        crate::log_once("v3d: compute shader did not finish");
+                        t.done = true;
+                        if s == Stop::Budget { code.runaway = true; }
+                    }
                 }
                 *insns += t.insns - before;
             }
             if !live { break; }
         }
         wg += in_sg as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A compute shader that never ends: the first batch runs out its budget, the rest of the
+    /// job is skipped instead of each batch spending the budget again (the machine froze for
+    /// hours on a looping shader).
+    #[test]
+    fn runaway_shader_ends_the_job() {
+        let mut ram = vec![0u8; 0x4000];
+        // at 0x1000: "b 0x1000" (always, absolute) and its three delay slots
+        let branch = 16u64 << 53 | (0x1000u64 >> 3) << 35;
+        let nop = 0x3c00_3186_bb80_0000u64;
+        for (k, w) in [branch, nop, nop, nop].iter().enumerate() { ram[0x1000 + k * 8..0x1008 + k * 8].copy_from_slice(&w.to_le_bytes()); }
+        // one workgroup of 64 invocations: four batches of 16
+        let cfg = [1 << 16, 1 << 16, 1 << 16, 64 | 1 << 8, 0, 0x1000, 0x2000];
+        let mut m = Gmem::new(&mut ram, 0, false);
+        let mut code = Code::default();
+        let mut insns = 0;
+        run(&cfg, &mut m, &mut code, &mut insns);
+        assert!(code.runaway);
+        assert!(insns <= 50_000_000 + 16, "only the first batch ran: {insns} instructions");
+        code.clear();
+        assert!(!code.runaway, "the next job starts afresh");
     }
 }
