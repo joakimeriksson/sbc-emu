@@ -1,0 +1,11 @@
+# Ethernet on the unmodified Armbian image, quickly: a root shell (init=/bin/bash) brings
+# the EMAC up by hand and pings the virtual network's gateway. Armbian's full boot gets
+# its address by DHCP instead (the welcome banner shows "IP address: 10.0.2.15").
+#   sbc-emu run --board orangepi-one --sd cache/armbian/Armbian_26.8.1_Orangepione_trixie_current_6.18.44_minimal.img \
+#       --append init=/bin/bash --script scripts/orangepi-one-ethernet.txt --timeout 900
+# (markers are computed, so the echoed command line does not match the waits)
+wait-serial root@
+serial ip link set end0 up; ip addr add 10.0.2.15/24 dev end0; ip route add default via 10.0.2.2; sleep 3; ping -c 2 10.0.2.2; echo PING-$((6*7))\n
+wait-serial 2 packets transmitted, 2 received
+wait-serial PING-42
+quit

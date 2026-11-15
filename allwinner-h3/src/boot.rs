@@ -11,6 +11,20 @@ pub const INITRD_ADDR: u32 = 0x4330_0000;
 pub const DEFAULT_CMDLINE: &str = "console=ttyS0,115200 earlycon rdinit=/init";
 
 /// Patch a stock DTB for direct boot.
+/// The Ethernet address the emulated firmware gives the board. U-Boot derives one from
+/// the SoC's chip ID and writes it to the `ethernet0` node; without it, Armbian's kernel
+/// derives one from the chip ID itself and defers the probe while that reads as zero.
+pub const MAC_ADDRESS: [u8; 6] = [0x02, 0x48, 0x33, 0x0e, 0x00, 0x01];
+
+/// The node at an absolute device tree path (`/soc/ethernet@1c30000`).
+fn node_at_path<'a>(root: &'a mut Node, path: &str) -> Option<&'a mut Node> {
+    let mut node = root;
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        node = node.children.iter_mut().find(|c| c.name == part)?;
+    }
+    Some(node)
+}
+
 pub fn prepare_device_tree(
     stock: &[u8],
     ram_bytes: u64,
@@ -37,6 +51,17 @@ pub fn prepare_device_tree(
         b"arm,psci-1.0\0arm,psci-0.2\0".to_vec(),
     );
     psci.set_str("method", "smc");
+    // U-Boot's MAC address fixup for the first Ethernet interface
+    let ethernet = root
+        .children
+        .iter()
+        .find(|c| c.name == "aliases")
+        .and_then(|aliases| aliases.prop("ethernet0"))
+        .map(|path| String::from_utf8_lossy(path).trim_end_matches('\0').to_string());
+    if let Some(node) = ethernet.and_then(|path| node_at_path(&mut root, &path)) {
+        node.set("mac-address", MAC_ADDRESS.to_vec());
+        node.set("local-mac-address", MAC_ADDRESS.to_vec());
+    }
     Ok(root.to_blob())
 }
 
