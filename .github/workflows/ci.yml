@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (Apple silicon) - all tests, JIT, release build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (interpreter and JIT, differential tests against the host CPU)
+        run: cargo test --release --workspace
+      - name: JIT on for the CPU tests too
+        run: SBC_JIT=1 cargo test --release -p arm-a64
+      - name: Release build
+        run: cargo build --release
+
+  linux:
+    name: Linux x86-64 - tests (interpreter)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --release --workspace
+
+  wasm:
+    name: WebAssembly build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain with the wasm32 target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the browser build
+        run: cargo check --target wasm32-unknown-unknown -p sbc-emu-wasm
