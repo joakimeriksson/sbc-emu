@@ -29,7 +29,8 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 /// Read the primary GPT header and table, validating checksums, disk bounds, and entry bounds.
-/// Returns an error for a malformed table; no guest writes or journal recovery are performed.
+/// Returns an error for a malformed table; entries outside the usable range are skipped.
+/// No guest writes or journal recovery are performed.
 pub fn partitions(disk: &mut dyn Disk) -> Result<Vec<Partition>, String> {
     let sectors = disk.sectors();
     if sectors < 3 {
@@ -101,7 +102,7 @@ pub fn partitions(disk: &mut dyn Disk) -> Result<Vec<Partition>, String> {
         let start = u64le(e, 32);
         let end = u64le(e, 40);
         if start < first || start > end || end > last {
-            return Err(format!("GPT partition {} outside usable range", n + 1));
+            continue;
         }
         entries.push(Partition {
             number: n as u32 + 1,
@@ -163,20 +164,28 @@ mod tests {
         assert_eq!((p[0].number, p[0].first_lba, p[0].last_lba), (2, 8, 20));
     }
     #[test]
-    fn rejects_corruption_and_invalid_ranges() {
+    fn rejects_corrupted_checksums() {
         let mut d = fixture();
         d.0[512 + 24] ^= 1;
         assert!(partitions(&mut d).unwrap_err().contains("header checksum"));
         let mut d = fixture();
         d.0[1024 + 130] ^= 1;
         assert!(partitions(&mut d).unwrap_err().contains("table checksum"));
+    }
+    #[test]
+    fn skips_invalid_entry_and_keeps_other_partitions() {
         let mut d = fixture();
-        d.0[1024 + 160..1024 + 168].copy_from_slice(&63u64.to_le_bytes());
+        // Add an invalid first entry; the valid second entry must still be found.
+        d.0[1024] = 1;
+        d.0[1024 + 32..1024 + 40].copy_from_slice(&63u64.to_le_bytes());
+        d.0[1024 + 40..1024 + 48].copy_from_slice(&64u64.to_le_bytes());
         let sum = crc32(&d.0[1024..1536]);
         d.0[600..604].copy_from_slice(&sum.to_le_bytes());
         d.0[528..532].fill(0);
         let sum = crc32(&d.0[512..604]);
         d.0[528..532].copy_from_slice(&sum.to_le_bytes());
-        assert!(partitions(&mut d).unwrap_err().contains("usable range"));
+        let entries = partitions(&mut d).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!((entries[0].number, entries[0].first_lba), (2, 8));
     }
 }
