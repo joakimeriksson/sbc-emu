@@ -324,7 +324,8 @@ impl Machine {
         let instret = self.cpus[index].instret;
         let mut cpu = Self::new_cpu(index);
         cpu.instret = instret;
-        cpu.r[15] = entry;
+        // Bit 0 of an entry point selects Thumb state.
+        cpu.set_entry(entry);
         cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
         cpu.undef_to_guest = true;
         cpu.firmware_calls_to_host = true;

@@ -170,6 +170,12 @@ impl Cpu {
         }
     }
 
+    /// Set the current mode's SPSR (tests).
+    #[doc(hidden)]
+    pub fn write_spsr_for_test(&mut self, value: u32) {
+        self.banked_spsr[Self::bank(self.cpsr)] = value;
+    }
+
     /// The SPSR of the current mode (diagnostics).
     pub fn spsr(&self) -> u32 {
         self.banked_spsr[Self::bank(self.cpsr)]
@@ -365,6 +371,100 @@ impl Cpu {
         self.psr_restored = true;
     }
 
+    /// Start address and written-back base of a two-word transfer (RFE, SRS).
+    fn two_word_address(base: u32, increment: bool, before: bool) -> (u32, u32) {
+        let start = match (increment, before) {
+            (true, false) => base,
+            (true, true) => base.wrapping_add(4),
+            (false, false) => base.wrapping_sub(4),
+            (false, true) => base.wrapping_sub(8),
+        };
+        (start, if increment { base.wrapping_add(8) } else { base.wrapping_sub(8) })
+    }
+
+    /// A processor mode with its own registers (not Hyp/Monitor/reserved).
+    fn valid_mode(mode: u32) -> bool {
+        matches!(mode, MODE_USR | MODE_FIQ | MODE_IRQ | MODE_SVC | MODE_ABT | MODE_UND | MODE_SYS)
+    }
+
+    /// RFE: load PC and CPSR from memory (exception return used by Thumb-2 kernels).
+    /// `increment`/`before` select IA, IB, DA or DB; `insn` is reported if UNDEFINED.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn return_from_exception(
+        &mut self,
+        bus: &mut dyn Bus,
+        insn: u32,
+        rn: usize,
+        increment: bool,
+        before: bool,
+        writeback: bool,
+    ) -> Result<(), Trap> {
+        if self.cpsr & 0x1f == MODE_USR || rn == 15 {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        }
+        let (address, new_base) = Self::two_word_address(self.r[rn], increment, before);
+        let pc = self.mem_read32(bus, address, Access::Read);
+        let psr = pc.and_then(|_| self.mem_read32(bus, address.wrapping_add(4), Access::Read));
+        let (pc, psr) = match (pc, psr) {
+            (Ok(pc), Ok(psr)) => (pc, psr),
+            (Err((va, status)), _) | (_, Err((va, status))) => return Err(self.data_abort(va, status, false)),
+        };
+        if !Self::valid_mode(psr & 0x1f) {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        }
+        if writeback {
+            self.r[rn] = new_base;
+        }
+        self.change_mode(psr & 0x1f);
+        self.cpsr = psr;
+        self.psr_restored = true;
+        self.branch_to(pc);
+        Ok(())
+    }
+
+    /// SRS: store LR and SPSR of the current mode on the stack of `mode`.
+    pub(crate) fn store_return_state(
+        &mut self,
+        bus: &mut dyn Bus,
+        insn: u32,
+        mode: u32,
+        increment: bool,
+        before: bool,
+        writeback: bool,
+    ) -> Result<(), Trap> {
+        let current = self.cpsr & 0x1f;
+        if matches!(current, MODE_USR | MODE_SYS) || !Self::valid_mode(mode) || mode == MODE_USR {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        }
+        let bank = Self::bank(mode);
+        let base = if Self::bank(current) == bank { self.r[13] } else { self.banked_sp[bank] };
+        let (address, new_base) = Self::two_word_address(base, increment, before);
+        let (lr, spsr) = (self.r[14], self.banked_spsr[Self::bank(current)]);
+        for (offset, value) in [(0, lr), (4, spsr)] {
+            if let Err((va, status)) = self.mem_write32(bus, address.wrapping_add(offset), value) {
+                return Err(self.data_abort(va, status, true));
+            }
+        }
+        if writeback {
+            if Self::bank(current) == bank {
+                self.r[13] = new_base;
+            } else {
+                self.banked_sp[bank] = new_base;
+            }
+        }
+        Ok(())
+    }
+
+    /// Start a core at a boot or PSCI entry point: bit 0 selects Thumb state.
+    pub fn set_entry(&mut self, entry: u32) {
+        self.r[15] = entry & !1;
+        if entry & 1 != 0 {
+            self.cpsr |= T;
+        } else {
+            self.cpsr &= !T;
+        }
+    }
+
     /// BranchWritePC: stay in the current instruction set.
     pub(crate) fn branch_to(&mut self, target: u32) {
         self.r[15] = if self.cpsr & T != 0 { target & !1 } else { target & !3 };
@@ -507,6 +607,15 @@ impl Cpu {
                     self.change_mode(mode);
                 }
                 return Ok(());
+            }
+            // RFE{IA,IB,DA,DB} Rn{!} and SRS{IA,IB,DA,DB} SP{!}, #mode.
+            if insn & 0x0e50_ffff == 0x0810_0a00 {
+                let (p, u, w) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+                return self.return_from_exception(bus, insn, ((insn >> 16) & 0xf) as usize, u, p, w);
+            }
+            if insn & 0x0e5f_ffe0 == 0x084d_0500 {
+                let (p, u, w) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+                return self.store_return_state(bus, insn, insn & 0x1f, u, p, w);
             }
             // BLX immediate: call into Thumb code.
             if insn & 0x0e00_0000 == 0x0a00_0000 {
@@ -712,8 +821,10 @@ impl Cpu {
             if rd == 15 {
                 return Err(unimplemented());
             }
+            // MRS reads the CPSR's execution state bits (J, IT, T) as zero (ARMv7). Linux's
+            // Thumb-2 exception stubs depend on it: they XOR PSR_T_BIT into the value read.
             self.r[rd as usize] = if insn & (1 << 22) == 0 {
-                self.cpsr
+                self.cpsr & !(0x0100_0000 | 0x0600_fc00 | T)
             } else {
                 self.banked_spsr[Self::bank(self.cpsr)]
             };

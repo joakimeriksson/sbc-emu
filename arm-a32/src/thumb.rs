@@ -393,7 +393,18 @@ impl Cpu {
                     let mode = match (hw1 >> 7) & 3 {
                         1 => 0x0880_0000,
                         2 => 0x0900_0000,
-                        _ => return self.undefined(insn),
+                        op => {
+                            // RFEDB/RFEIA (L = 1) and SRSDB/SRSIA (L = 0): op 00 is DB, 11 IA.
+                            let increment = op == 3;
+                            let writeback = w != 0;
+                            return if l != 0 && hw2 == 0xc000 {
+                                self.return_from_exception(bus, insn, rn as usize, increment, !increment, writeback)
+                            } else if l == 0 && rn == 13 && hw2 & 0xffe0 == 0xc000 {
+                                self.store_return_state(bus, insn, hw2 & 0x1f, increment, !increment, writeback)
+                            } else {
+                                self.undefined(insn)
+                            };
+                        }
                     };
                     return self.a32(bus, mode | w << 21 | l << 20 | rn << 16 | hw2);
                 }
@@ -573,8 +584,35 @@ impl Cpu {
         let rt = hw2 >> 12;
         let rd = (hw2 >> 8) & 15;
         match hw1 & 0xfff0 {
-            0xe840 if hw2 & 0xff == 0 => self.a32(bus, 0x0180_0f90 | rn << 16 | rd << 12 | rt),
-            0xe850 if hw2 & 0xff == 0 => self.a32(bus, 0x0190_0f9f | rn << 16 | rt << 12),
+            // LDREX/STREX Rt, [Rn, #imm8*4]: T32 has an offset (Linux's Thumb-2 exception
+            // exit clears the monitor with `strex r2, r1, [sp, #S_LR]`).
+            0xe840 | 0xe850 if rt == 15 || rn == 15 || hw1 & 0xfff0 == 0xe840 && rd == 15 => self.undefined(insn),
+            0xe850 => {
+                let address = self.r[rn as usize].wrapping_add((hw2 & 0xff) << 2);
+                match self.mem_read32(bus, address, Access::Read) {
+                    Ok(value) => {
+                        self.r[rt as usize] = value;
+                        self.exclusive_addr = Some(address);
+                        self.exclusive_size = 4;
+                        Ok(())
+                    }
+                    Err((va, status)) => Err(self.data_abort(va, status, false)),
+                }
+            }
+            0xe840 => {
+                let address = self.r[rn as usize].wrapping_add((hw2 & 0xff) << 2);
+                let reserved = self.exclusive_addr == Some(address) && self.exclusive_size == 4;
+                self.exclusive_addr = None;
+                self.exclusive_size = 0;
+                if !reserved {
+                    self.r[rd as usize] = 1;
+                    return Ok(());
+                }
+                let value = self.r[rt as usize];
+                self.store(bus, address, 4, value)?;
+                self.r[rd as usize] = 0;
+                Ok(())
+            }
             0xe8c0 => {
                 let status = hw2 & 15;
                 match (hw2 >> 4) & 15 {
@@ -947,6 +985,10 @@ impl Cpu {
                 self.restore_spsr();
                 self.branch_to(target);
                 Ok(())
+            }
+            0x7f if hw2 & 0xf000 == 0x8000 => {
+                // SMC #imm4 (T32): the same firmware call as the A32 encoding.
+                self.a32(bus, 0x0160_0070 | hw1 & 0xf)
             }
             0x3e | 0x3f => {
                 // MRS
