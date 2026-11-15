@@ -31,6 +31,11 @@ thread_local! { static SEEN: std::cell::RefCell<std::collections::HashSet<String
 
 /// Diagnostics on stderr (`SBC_V3D_LOG=1`).
 pub fn log(s: &str) { if LOG_ON.load(std::sync::atomic::Ordering::Relaxed) { eprintln!("\r{s}\r"); } }
+/// `SBC_V3D_DRAWS=1`: one line per distinct draw state (targets, blend, depth) and store format.
+pub fn draws_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SBC_V3D_DRAWS").map_or(false, |v| v != "0"))
+}
 pub fn log_enabled() -> bool { LOG_ON.load(std::sync::atomic::Ordering::Relaxed) }
 /// A diagnostic printed once per message (always).
 pub fn log_once(s: &str) {

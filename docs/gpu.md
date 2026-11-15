@@ -59,6 +59,21 @@ places on llvmpipe in this guest (`scripts/gpu-glmark2-validate.txt` runs both).
 
 **Vulkan** (`vulkaninfo`, `tests/gpu/vktest.c`).
 
+**The Mesa that Ubuntu's snaps use** (`tests/gpu/run-snap-mesa.sh`): Ubuntu 26.04 runs GNOME on
+its own Mesa (26.0) but Firefox, a snap, on the `mesa-2404` snap's Mesa 25.2. The same scenes
+run in the Ubuntu guest against that Mesa and its llvmpipe; `tests/gpu/build.sh` builds the
+program in the Pi OS guest first (Ubuntu Desktop has no compiler), and
+`tests/gpu/dump-snap-mesa.sh` dumps that Mesa's QPU code for a scene (`V3D_DEBUG=qpu,fs`). Its
+compiler puts real work in all three branch delay slots, which caught the emulator running only
+two of them (scatter128 failed, Firefox lost rectangles and drew stray glyphs).
+
+Firefox also found what no scene did: the TMU cached each texture setup by the address of its
+records for the whole job, but Mesa's PBO uploads (a buffer-texture view per `glTexSubImage2D`
+from a pixel buffer, drawn into the glyph atlas) free and reuse that memory within one job, so
+later uploads read the first one's size and buffer and glyphs came out blank. Cached setups are
+now checked against the records' bytes. `SBC_V3D_DRAWS=1` also lists each distinct texture setup
+(format, size, tiling, swizzle, how it is sampled), which is how that showed up.
+
 ## Results (November 2026, Raspberry Pi OS Lite trixie, kernel 6.18.50, Mesa 26.2.6)
 
 ### Pixel comparison against llvmpipe / lavapipe (128×128 scenes)
@@ -74,6 +89,10 @@ places on llvmpipe in this guest (`scripts/gpu-glmark2-validate.txt` runs both).
 | derivatives_math (dFdx/dFdy, sin, exp2, log2, pow, inversesqrt) | GLES 3.1 | pass (max 1) |
 | cubemap, rgba16f_target (render to f16, sample back) | GLES 3.1 | pass |
 | compute (shared memory, barrier, SSBO) | GLES 3.1 | exact (256 of 256 values) |
+| text_dual_source, text_const_color, text_r8_alpha, tex_bgra (glyph masks: dual-source and constant-colour blending, R8 and BGRA textures, texture swizzles) | GLES 3.1 | pass (max 1) |
+| depth_ids, instanced_int, vs_fetch, tex_array, scatter128 (WebRender's habits: front-to-back depth ids 2^-22 apart, integer instance attributes, vertex texelFetch from RGBA32F/RGBA32I, array textures, 1-pixel points into RGBA32F/RGBA32I) | GLES 3.1 | pass (max 1) |
+| glyph_copies, big_tex_layout, render_big_targets (staged glyphs copied into atlases by copy-image, framebuffer blit and CopyTexSubImage; 2048² and 1024x4096 R8/RG8/RGBA8 textures read across their whole XOR-tiled area, after CPU upload and after rendering into them) | GLES 3.1 | pass (max 0–1) |
+| atlas_pbo (pixel-unpack uploads with row length and skips into 1024² RGBA8 and 2048² R8 atlases) | GLES 3.1 | texelFetch and RGBA8 exact; R8 with LINEAR at texel centres differs: llvmpipe returns the average of two neighbours there, V3D the texel |
 | vk_depth_tris (depth test, push constants) | Vulkan 1.1 | pass (max 1) |
 | vk_texture_blend (staging upload, vkCmdBlitImage mipmaps, trilinear, blending) | Vulkan 1.1 | pass (max 4) |
 | vk compute (shared memory, barrier, storage buffer) | Vulkan 1.1 | exact (1024 of 1024 values) |
@@ -186,4 +205,7 @@ filtering instead.
 - `SBC_V3D_TRACE=N`: trace the next N QPU instructions (decoded op, flags, lane-0 register
   changes); compare with Mesa's own disassembly from `V3D_DEBUG=qpu,vir` in the guest
   (`scripts/gpu-shaders.txt`).
+- `SBC_V3D_DRAWS=1`: one line per distinct draw state (render-target types, blend factors and
+  equations, depth and stencil, early Z, fragment shader address) and per distinct tile store
+  format: what an application asks of the GPU, without tracing every draw.
 - `SBC_GPU_TIME=X`: scale the guest time GPU jobs take (default 1: their host time; 0: instant).

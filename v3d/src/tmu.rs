@@ -107,6 +107,8 @@ struct Tex {
     one_d: bool,
     is_3d: bool,
     srgb: bool,
+    /// the texture and sampler records it was built from
+    raw: [u8; 48],
 }
 
 impl Tex {
@@ -182,11 +184,16 @@ pub fn texture(m: &mut Gmem, t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuRe
     let (off_s, off_t, off_r) = (sx4((p2 >> 8) & 0xf), sx4((p2 >> 12) & 0xf), sx4((p2 >> 16) & 0xf));
     let one_d = req.t.is_none() && kind != TmuKind::TexCube;
     let is_3d = req.r.is_some() && kind != TmuKind::TexCube;
-    // the parsed records and the mip chain, cached for the job (they cannot change during it)
+    // the parsed records and the mip chain, cached for the job by address and checked against
+    // the records' bytes: a job can reuse a record's memory for another texture (Mesa's PBO
+    // uploads create and free a buffer-texture view per upload, all in one job)
     let key = (ts_addr, ss_addr, one_d as u8 | (is_3d as u8) << 1);
-    let tex = TEX_CACHE.with(|c| c.borrow().get(&key).cloned()).unwrap_or_else(|| {
-        let ts = TextureShaderState::parse(&m.bytes(ts_addr, TextureShaderState::LEN));
-        let ss = if ss_addr != 0 { Some(SamplerState::parse(&m.bytes(ss_addr, SamplerState::LEN))) } else { None };
+    let mut raw = [0u8; 48];
+    raw[..24].copy_from_slice(&m.bytes(ts_addr, TextureShaderState::LEN));
+    if ss_addr != 0 { raw[24..].copy_from_slice(&m.bytes(ss_addr, SamplerState::LEN)); }
+    let tex = TEX_CACHE.with(|c| c.borrow().get(&key).filter(|t| t.raw == raw).cloned()).unwrap_or_else(|| {
+        let ts = TextureShaderState::parse(&raw[..24]);
+        let ss = if ss_addr != 0 { Some(SamplerState::parse(&raw[24..])) } else { None };
         let fmt = tex_fmt(ts.texture_type);
         let width = if one_d { ts.image_width | ts.image_height << 14 } else { ts.image_width };
         let height = if one_d { 1 } else { ts.image_height.max(1) };
@@ -198,7 +205,13 @@ pub fn texture(m: &mut Gmem, t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuRe
                               ts.level_0_is_strictly_uif, ts.level_0_xor_enable, ts.level_0_ub_pad)
         };
         let srgb = ts.srgb && !ss.map_or(false, |s| s.srgb_disable);
-        let t = std::rc::Rc::new(Tex { ts, ss, fmt, base: ts.texture_base_pointer & !0x3f, levels, one_d, is_3d, srgb });
+        if crate::draws_enabled() {
+            crate::log_once(&format!("v3d texture: type {} {}x{}x{} levels {} tiling {:?} xor {} ubpad {} swz {:?} {} {} srgb {} sampler {} kind {:?} out32 {} ret {:#x}",
+                ts.texture_type, width, height, depth, levels.len(), levels[0].tiling, ts.level_0_xor_enable as u8, ts.level_0_ub_pad,
+                [ts.swizzle_r, ts.swizzle_g, ts.swizzle_b, ts.swizzle_a], if fs { "fs" } else { "vs" }, if one_d { "1d" } else if is_3d { "3d" } else { "2d" },
+                srgb as u8, ss.is_some() as u8, kind, out32 as u8, ret_mask));
+        }
+        let t = std::rc::Rc::new(Tex { ts, ss, fmt, base: ts.texture_base_pointer & !0x3f, levels, one_d, is_3d, srgb, raw });
         TEX_CACHE.with(|c| c.borrow_mut().insert(key, t.clone()));
         t
     });

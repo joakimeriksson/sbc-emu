@@ -250,6 +250,10 @@ impl Render<'_> {
         let buf = c.buffer_to_store;
         if crate::log_enabled() && self.tile == (0, 0) { crate::log(&format!("v3d: store buf {buf} fmt {} mem {} addr {:#x} rb_swap {} stride {} dither {} type {:?}", c.output_image_format, c.memory_format, c.address, c.r_b_swap, c.height_in_ub_or_stride, c.dither_mode, self.rt.map(|r| (r.ty, r.bpp)))); }
         if buf == 8 { if c.clear_buffer_being_stored { self.clear(true, true); } return; }
+        if crate::draws_enabled() {
+            crate::log_once(&format!("v3d store: buf {buf} fmt {} mem {} rb_swap {} dither {} rt {:?} clear {}", c.output_image_format, c.memory_format, c.r_b_swap as u8, c.dither_mode,
+                self.rt.map(|r| (r.ty, r.bpp, r.clamp)), c.clear_buffer_being_stored as u8));
+        }
         let fmt = c.output_image_format;
         let cpp = formats::out_cpp(fmt);
         if cpp == 0 { formats::encode(fmt, [0; 4], &mut []); return; }
@@ -506,13 +510,22 @@ impl Render<'_> {
     /// Fragment shading of covered quads, four quads per QPU thread.
     fn shade(&mut self, d: &DrawState, p: &Prim, geo: &Geo<'_>, quads: &[Quad], m: &mut Gmem, code: &mut Code) {
         let rec = &d.rec;
+        if crate::draws_enabled() {
+            let b = &d.blend[0];
+            let c = &d.cfg;
+            crate::log_once(&format!("v3d draw: rt {:?} msaa {} blend {}/{:#x} c(m{} s{} d{}) a(m{} s{} d{}) k {:?} wmask {:#x} z(test {} f{} upd {} fsz {}) st {} ez {} fs {:#x}",
+                self.rt.map(|r| (r.ty, r.bpp, r.clamp)), self.msaa, c.blend_enable as u8, d.blend_enables, b.color_blend_mode, b.color_blend_src_factor, b.color_blend_dst_factor,
+                b.alpha_blend_mode, b.alpha_blend_src_factor, b.alpha_blend_dst_factor, d.blend_color, d.color_wmasks,
+                c.depth_test_function != 7, c.depth_test_function, c.z_updates_enable as u8, rec.fragment_shader_does_z_writes as u8, c.stencil_enable as u8,
+                c.early_z_enable as u8, rec.fragment_shader_code_address));
+        }
         let late_z = rec.fragment_shader_does_z_writes;
         let (tx0, ty0) = (self.tile.0 * self.tile_w, self.tile.1 * self.tile_h);
         for batch in quads.chunks(4) {
             let mut t = self.thread.take().unwrap_or_else(|| Box::new(Thread::new(0, 0, false)));
             t.reset(rec.fragment_shader_code_address, rec.fragment_shader_uniforms_address, rec.fragment_shader_start_in_final_thread_section);
             t.revf = p.reverse;
-            let mut fe = FsEnv { r: self, d, geo, m, bary: [[0.0; 3]; LANES], z: [0.0; LANES], vary_n: 0, tlb_cfg: !0, pending: Vec::new(), spec: 0, need: 0,
+            let mut fe = FsEnv { r: self, d, geo, m, bary: [[0.0; 3]; LANES], z: [0.0; LANES], vary_n: 0, tlb_cfg: !0, rd: 0, pending: Vec::new(), spec: 0, need: 0,
                                  tile0: (tx0, ty0), passed: 0, prim: p };
             t.valid = 0;
             for (qi, q) in batch.iter().enumerate() {
@@ -590,6 +603,8 @@ struct FsEnv<'a, 'r, 'm> {
     z: [f32; LANES],
     vary_n: usize,
     tlb_cfg: u32,
+    /// words read from the tile buffer since the last `ldtlbu` (which names what to read)
+    rd: usize,
     pending: Vec<(u16, V)>,
     spec: u32,
     need: usize,
@@ -866,29 +881,33 @@ impl Env for FsEnv<'_, '_, '_> {
     }
 
     fn tlb_read(&mut self, t: &mut Thread, cfg: Option<u32>) -> V {
-        if let Some(c) = cfg { self.tlb_cfg = c; }
+        // `ldtlbu` starts a read with its config; each `ldtlb` after it returns the next word:
+        // f16 colour two channels a word (RG then BA), f32/i32 one a word, depth/stencil one;
+        // per-sample mode returns every sample's words in turn.
+        if let Some(c) = cfg { self.tlb_cfg = c; self.rd = 0; }
         let spec = self.tlb_cfg & 0xff;
-        let mut out = [0u32; LANES];
+        let (w, rd) = (self.r.tb.ns, self.rd);
+        self.rd += 1;
+        let per_sample = spec & (1 << 2) == 0 && w > 1;
+        let words = match spec >> 6 { 2 => 1, 3 => if spec & 1 != 0 { 2 } else { 1 }, _ => (spec & 3) as usize + 1 };
+        let (sample, word) = if per_sample { ((rd / words) as u32 % w, rd % words) } else { (0, rd % words) };
         let rt = (7 - ((spec >> 3) & 7)) as usize;
-        let word = self.pending.len();
+        let mut out = [0u32; LANES];
         for l in 0..LANES {
             let Some((x, y)) = self.px(t, l) else { continue };
-            let i = self.r.tb.idx(x, y, 0);
+            let i = self.r.tb.idx(x, y, sample);
             match spec >> 6 {
                 2 => out[l] = if (spec >> 4) & 3 == 0 { self.r.tb.z[i].to_bits() } else { self.r.tb.s[i] as u32 },
                 3 => {
                     let p = self.r.tb.color[rt.min(3)][i];
                     let h = |k: usize| f32_to_f16(f32::from_bits(p[k])) as u32;
-                    let k = (self.need_read() % 2) * 2;
-                    out[l] = h(k) | h(k + 1) << 16;
+                    let k = word * 2;
+                    // SWAP_HI_LO: the first channel in the low half (as the write side reads it)
+                    out[l] = if spec & 2 != 0 { h(k) | h(k + 1) << 16 } else { h(k + 1) | h(k) << 16 };
                 }
                 _ => out[l] = self.r.tb.color[rt.min(3)][i][word.min(3)],
             }
         }
         out
     }
-}
-
-impl FsEnv<'_, '_, '_> {
-    fn need_read(&self) -> usize { 0 }
 }

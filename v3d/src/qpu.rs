@@ -506,6 +506,8 @@ pub struct Thread {
     pub tmu_cfg: Vec<u32>,
     pub tmu_req: TmuReq,
     pub tmu_out: std::collections::VecDeque<V>,
+    /// the last retired TMU request (kind, config words, words returned), for diagnostics
+    pub last_tmu: (TmuKind, [u32; 3], usize),
     /// VPM: input rows then (if separate) output rows
     pub vpm: Vec<V>,
     pub vpm_out_base: usize,
@@ -591,7 +593,7 @@ impl Thread {
         Thread {
             rf: Box::new([[0; LANES]; 64]), acc: [[0; LANES]; 6], fa: 0, fb: 0, msf: [0xf; LANES], revf: false,
             pc, unif, unifa: 0, lr: 0, rtop: [0; LANES], valid: 0xffff, tmu_cfg: Vec::new(), tmu_req: TmuReq::default(),
-            tmu_out: Default::default(), vpm: Vec::new(), vpm_out_base: 0, xcd: [0; LANES], ycd: [0; LANES],
+            tmu_out: Default::default(), last_tmu: (TmuKind::General, [0; 3], 0), vpm: Vec::new(), vpm_out_base: 0, xcd: [0; LANES], ycd: [0; LANES],
             fx: [0.0; LANES], fy: [0.0; LANES], tidx: 0, barrier_id: 0, final_section, prev_thrsw: false, end_in: None,
             branch: None, delayed: Vec::new(), insns: 0, done: false,
         }
@@ -726,7 +728,9 @@ impl Thread {
             _ => self.rf[b.raddr_a as usize][0],
         };
         self.lr = pc.wrapping_add(32);
-        self.branch = Some((2, target, ureload));
+        // three delay slots: the jump happens at the end of the third instruction after this one
+        // (counted down at the end of this instruction and of each slot)
+        self.branch = Some((3, target, ureload));
     }
 
     /// Execute one ALU instruction; true if it hit a barrier.
@@ -949,7 +953,14 @@ impl Thread {
 
         // ---- result-returning signals
         if sig.ldtmu {
-            let v = self.tmu_out.pop_front().unwrap_or_else(|| { crate::log_once("v3d: ldtmu with no TMU result"); [0; LANES] });
+            let v = match self.tmu_out.pop_front() {
+                Some(v) => v,
+                None => {
+                    let (k, c, n) = self.last_tmu;
+                    crate::log_once(&format!("v3d: ldtmu with no TMU result (pc {:#x}; last request {k:?} cfg {:#x} {:#x} {:#x} returned {n} words)", self.pc, c[0], c[1], c[2]));
+                    [0; LANES]
+                }
+            };
             self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, &mut barrier);
         }
         if sig.ldvary {
@@ -1008,6 +1019,7 @@ impl Thread {
                 req.s = Some(*v);
                 let lanes = mask & self.valid;
                 let out = env.tmu(self, TmuKind::General, &[cfg], &req, lanes);
+                self.last_tmu = (TmuKind::General, [cfg, 0, 0], out.len());
                 self.tmu_out.extend(out);
             }
             14 | 15 => { if waddr == 15 { self.next_uniform(env); } }
@@ -1029,6 +1041,7 @@ impl Thread {
                 let cfg = std::mem::take(&mut self.tmu_cfg);
                 let lanes = mask & self.valid;
                 let out = env.tmu(self, kind, &cfg, &req, lanes);
+                self.last_tmu = (kind, [0, 1, 2].map(|i| cfg.get(i).copied().unwrap_or(!0)), out.len());
                 self.tmu_out.extend(out);
             }
             34 => self.tmu_req.t = Some(*v),
@@ -1065,5 +1078,30 @@ mod tests {
             Inst::Alu(i) => { assert_eq!(i.add.op, AddOp::Nop); assert_eq!(i.mul.op, MulOp::Nop); }
             x => panic!("{x:?}"),
         }
+    }
+
+    /// A taken branch runs all three delay slots, then continues at the target (Mesa 25.2
+    /// puts real work in all three; dropping the third left a stale register).
+    #[test]
+    fn branch_runs_three_delay_slots() {
+        struct Mem(Vec<u64>);
+        impl Env for Mem {
+            fn read32(&mut self, va: u32) -> u32 { let w = self.0[(va / 8) as usize]; if va & 4 != 0 { (w >> 32) as u32 } else { w as u32 } }
+            fn write32(&mut self, _va: u32, _v: u32) {}
+            fn tmu(&mut self, _t: &Thread, _k: TmuKind, _c: &[u32], _r: &TmuReq, _l: u16) -> Vec<V> { Vec::new() }
+        }
+        // "mov rN, imm" on the mul ALU (Mesa's encoding of "nop ; mov r2, 0", destination swapped)
+        let mov = |acc: u64, imm: u64| (0x3de0_3086_bbfc_0000u64 & !(0x3f << 38)) | acc << 38 | imm;
+        let branch = |off: u64| 16u64 << 53 | 1 << 12 | (off >> 3) << 35; // always, relative to pc + 32
+        let nop_thrsw = 0x3c20_3186_bb80_0000u64;
+        let nop = 0x3c00_3186_bb80_0000u64;
+        let prog = vec![branch(16), mov(0, 1), mov(1, 2), mov(2, 3), mov(3, 9), mov(3, 9), mov(4, 5), nop_thrsw, nop, nop];
+        let mut env = Mem(prog);
+        let mut code = crate::Code::default();
+        let mut t = Thread::new(0, 0, true);
+        t.run(&mut code, &mut env, 100);
+        assert_eq!([t.acc[0][0], t.acc[1][0], t.acc[2][0]], [1, 2, 3], "all three delay slots run");
+        assert_eq!(t.acc[3][0], 0, "the instructions between the slots and the target are skipped");
+        assert_eq!(t.acc[4][0], 5, "execution continues at the target");
     }
 }

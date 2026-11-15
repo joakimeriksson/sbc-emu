@@ -9,6 +9,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
+#include <GLES2/gl2ext.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -336,13 +337,416 @@ static int s_compute(void) {
     return bad;
 }
 
+/* Text the way Firefox's WebRender draws it: a glyph mask texture and per-channel ("subpixel")
+ * coverage, over a white and a coloured background. */
+static GLuint glyph_tex(GLenum ifmt, GLenum fmt, int bgra) {
+    static unsigned char img[32 * 32 * 4];
+    for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) {
+        unsigned char *q = img + (y * 32 + x) * 4;
+        int on = (x > 8 && x < 14) || (y > 20 && y < 25) || ((x - y) > -3 && (x - y) < 3 && x > 14);
+        unsigned char r = on ? 255 : (x == 14 ? 128 : 0), g = on ? 230 : 0, b = on ? 200 : (x == 8 ? 90 : 0);
+        if (ifmt == GL_R8) { img[y * 32 + x] = on ? 255 : 0; continue; }
+        q[0] = bgra ? b : r; q[1] = g; q[2] = bgra ? r : b; q[3] = on ? 255 : 0;
+    }
+    GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, ifmt, 32, 32, 0, fmt, GL_UNSIGNED_BYTE, img);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    return t;
+}
+
+static void two_backgrounds(void) {
+    clear(1, 1, 1);
+    glEnable(GL_SCISSOR_TEST); glScissor(64, 0, 64, 128);
+    glClearColor(0.2f, 0.5f, 0.9f, 1); glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+static void glyph_quads(GLuint p) {
+    for (int k = 0; k < 4; k++) {
+        float x0 = -0.95f + 0.48f * k, y0 = -0.6f, s = 0.4f;
+        float pos[] = {x0, y0, 0, 1, x0 + s, y0, 0, 1, x0, y0 + 1.2f, 0, 1, x0 + s, y0 + 1.2f, 0, 1};
+        float uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
+        attr(p, "pos", 4, pos); attr(p, "uv", 2, uv);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+}
+
+static void s_text_dual_source(void) {
+    two_backgrounds();
+    if (!strstr((const char *)glGetString(GL_EXTENSIONS), "GL_EXT_blend_func_extended")) { printf("no EXT_blend_func_extended\n"); return; }
+    GLuint p = prog(VS_TEX,
+        "#version 300 es\n#extension GL_EXT_blend_func_extended : require\nprecision mediump float; in vec2 t; uniform sampler2D s;\n"
+        "layout(location = 0, index = 0) out vec4 o; layout(location = 0, index = 1) out vec4 m;\n"
+        "void main() { vec4 c = vec4(0.1, 0.05, 0.3, 1.0); vec3 k = texture(s, t).rgb; o = vec4(c.rgb * k, max(k.r, max(k.g, k.b))); m = vec4(k, 1.0) * c.a; }\n");
+    glyph_tex(GL_RGBA8, GL_RGBA, 0);
+    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC1_COLOR_EXT);
+    glyph_quads(p);
+    glDisable(GL_BLEND);
+}
+
+static void s_text_const_color(void) {
+    two_backgrounds();
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision mediump float; in vec2 t; uniform sampler2D s; out vec4 o;\n"
+                            "void main() { o = vec4(texture(s, t).rgb, 1.0); }\n");
+    glyph_tex(GL_RGBA8, GL_RGBA, 0);
+    glEnable(GL_BLEND); glBlendColor(0.1f, 0.05f, 0.3f, 1); glBlendFunc(GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_COLOR);
+    glyph_quads(p);
+    glDisable(GL_BLEND);
+}
+
+static void s_text_r8_alpha(void) {
+    two_backgrounds();
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision mediump float; in vec2 t; uniform sampler2D s; out vec4 o;\n"
+                            "void main() { float a = texture(s, t).r; o = vec4(0.6, 0.1, 0.1, 1.0) * a; }\n");
+    glyph_tex(GL_R8, GL_RED, 0);
+    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glyph_quads(p);
+    glDisable(GL_BLEND);
+}
+
+static void s_tex_bgra(void) {
+    two_backgrounds();
+    GLuint p = prog(VS_TEX, FS_TEX);
+    if (!strstr((const char *)glGetString(GL_EXTENSIONS), "GL_EXT_texture_format_BGRA8888")) { printf("no BGRA8888\n"); return; }
+    glyph_tex(GL_BGRA_EXT, GL_BGRA_EXT, 1);
+    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glyph_quads(p);
+    /* the same texture data through RGBA8 and a B/R texture swizzle */
+    glyph_tex(GL_RGBA8, GL_RGBA, 1);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    float pos[] = {-0.95f, -0.98f, 0, 1, 0.95f, -0.98f, 0, 1, -0.95f, -0.7f, 0, 1, 0.95f, -0.7f, 0, 1};
+    float uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
+    attr(p, "pos", 4, pos); attr(p, "uv", 2, uv);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_BLEND);
+}
+
+/* WebRender's other habits: a big glyph atlas filled through a pixel-unpack buffer with a row
+ * stride, vertex data fetched from float/int textures, and 2D array textures. */
+static void s_atlas_pbo(void) {
+    two_backgrounds();
+    GLuint t[2]; glGenTextures(2, t);
+    static unsigned char src[40 * 36 * 4];
+    for (int y = 0; y < 36; y++) for (int x = 0; x < 40; x++) {
+        int on = ((x / 5 + y / 5) & 1) && x >= 4 && y >= 2;
+        unsigned char *q = src + (y * 40 + x) * 4;
+        q[0] = on ? 40 : 0; q[1] = on ? 220 : 0; q[2] = on ? 255 : 0; q[3] = on ? 255 : 0;
+    }
+    GLuint pbo; glGenBuffers(1, &pbo); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, sizeof src, src, GL_STREAM_DRAW);
+    glBindTexture(GL_TEXTURE_2D, t[0]); glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1024, 1024);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 40); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 4); glPixelStorei(GL_UNPACK_SKIP_ROWS, 2);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 517, 301, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    glBindTexture(GL_TEXTURE_2D, t[1]); glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, 2048, 2048);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 160); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 16); glPixelStorei(GL_UNPACK_SKIP_ROWS, 2);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 1301, 777, 100, 32, GL_RED, GL_UNSIGNED_BYTE, 0);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0); glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    /* each 3x3 screen block shows one texel: left half by texelFetch, right half by texture()
+     * at the texel centre with LINEAR filtering (as glyph quads sample); top rows the RGBA8 atlas,
+     * bottom rows the R8 one */
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D s; uniform highp sampler2D r; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy) / 3; bool fetch = gl_FragCoord.x < 64.0; ivec2 k = ivec2(q.x % 21, q.y % 21);\n"
+                            " if (gl_FragCoord.y >= 64.0) { ivec2 c = ivec2(517, 301) + k + ivec2(0, 5);\n"
+                            "   o = fetch ? texelFetch(s, c, 0) : texture(s, (vec2(c) + 0.5) / 1024.0); }\n"
+                            " else { ivec2 c = ivec2(1301, 777) + k + ivec2(9, 3);\n"
+                            "   float b = fetch ? texelFetch(r, c, 0).r : texture(r, (vec2(c) + 0.5) / 2048.0).r; o = vec4(b, b * 0.5, 0.0, 1.0); } }\n");
+    glUniform1i(glGetUniformLocation(p, "s"), 0); glUniform1i(glGetUniformLocation(p, "r"), 1);
+    for (int i = 0; i < 2; i++) {
+        glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, t[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    quad(p, 1.0f, 1.0f);
+}
+
+static void s_vs_fetch(void) {
+    clear(0.05f, 0.05f, 0.05f);
+    static float f[1024 * 8 * 4]; static int iv[512 * 4 * 4];
+    for (int i = 0; i < 1024 * 8; i++) { f[i * 4] = -1; f[i * 4 + 1] = -1; f[i * 4 + 2] = 0; f[i * 4 + 3] = 1; }
+    /* six vertices (two triangles) in row 3 from x = 600; colours in an int texture row 2 from 300 */
+    float v[6][2] = {{-0.8f, -0.7f}, {0.7f, -0.8f}, {-0.6f, 0.8f}, {0.7f, -0.8f}, {0.8f, 0.7f}, {-0.6f, 0.8f}};
+    for (int k = 0; k < 6; k++) { float *q = f + ((3 * 1024) + 600 + k) * 4; q[0] = v[k][0]; q[1] = v[k][1]; q[2] = 0.25f * k; q[3] = 1; }
+    for (int k = 0; k < 6; k++) { int *q = iv + ((2 * 512) + 300 + k) * 4; q[0] = 40 * k; q[1] = 255 - 30 * k; q[2] = 100 + k; q[3] = -7; }
+    GLuint t[2]; glGenTextures(2, t);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, t[0]);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, 1024, 8); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 8, GL_RGBA, GL_FLOAT, f);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, t[1]);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32I, 512, 4); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 4, GL_RGBA_INTEGER, GL_INT, iv);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0);
+    GLuint p = prog("#version 300 es\nuniform highp sampler2D d; uniform highp isampler2D c; out vec4 v;\n"
+                    "void main() { vec4 a = texelFetch(d, ivec2(600 + gl_VertexID, 3), 0); ivec4 k = texelFetch(c, ivec2(300 + gl_VertexID, 2), 0);\n"
+                    " gl_Position = vec4(a.xy, 0.0, 1.0); v = vec4(vec3(k.xyz) / 255.0, a.z + (k.w == -7 ? 0.0 : 1.0)); }\n",
+                    "#version 300 es\nprecision mediump float; in vec4 v; out vec4 o; void main() { o = vec4(v.rgb, 1.0) + vec4(0.0, 0.0, v.a * 0.2, 0.0); }\n");
+    glUniform1i(glGetUniformLocation(p, "d"), 0); glUniform1i(glGetUniformLocation(p, "c"), 1);
+    GLuint vao; glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0); glDeleteVertexArrays(1, &vao);
+}
+
+static void s_tex_array(void) {
+    two_backgrounds();
+    static unsigned char img[4][64 * 64 * 4];
+    for (int l = 0; l < 4; l++) for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+        unsigned char *q = img[l] + (y * 64 + x) * 4;
+        q[0] = l * 60; q[1] = ((x / 8 + y / 8) & 1) ? 255 : 0; q[2] = x * 4; q[3] = 255;
+    }
+    GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D_ARRAY, t);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 64, 64, 4);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 64, 64, 4, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision mediump float; precision mediump sampler2DArray; in vec2 t; uniform sampler2DArray s; out vec4 o;\n"
+                            "void main() { o = texture(s, vec3(t, floor(t.x * 4.0))); }\n");
+    quad(p, 0.9f, 1.0f);
+}
+
+/* WebRender's opaque pass: front-to-back rectangles with depth write, z ids a hair apart
+ * (1 - id / 2^22), LEQUAL; then an alpha pass tested against them without depth writes. */
+static void s_depth_ids(void) {
+    clear(1, 1, 1);
+    glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE);
+    GLuint p = prog("#version 300 es\nin vec4 pos; in vec4 col; out vec4 v;\nvoid main() { gl_Position = pos; v = col; }\n", FS_COL);
+    for (int pass = 0; pass < 2; pass++) {
+        glDepthFunc(pass ? GL_LEQUAL : GL_LESS);
+        for (int i = 0; i < 24; i++) {
+            int id = 1000 + 24 - i + pass * 40;     /* front to back: higher id = nearer */
+            float z = 1.0f - (float)id / (1 << 22), zc = z * 2 - 1;
+            float x0 = -0.95f + 0.07f * i, y0 = pass ? 0.05f : -0.95f, x1 = x0 + 0.3f, y1 = y0 + 0.9f - 0.02f * i;
+            float pos[] = {x0, y0, zc, 1, x1, y0, zc, 1, x0, y1, zc, 1, x1, y1, zc, 1};
+            float c[16]; for (int k = 0; k < 4; k++) { c[k * 4] = (i * 37 % 255) / 255.0f; c[k * 4 + 1] = (i * 91 % 255) / 255.0f; c[k * 4 + 2] = pass ? 0.8f : 0.2f; c[k * 4 + 3] = 1; }
+            attr(p, "pos", 4, pos); attr(p, "col", 4, c);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+    }
+    /* alpha pass: a translucent band behind some rectangles and in front of others */
+    glDepthMask(GL_FALSE); glDepthFunc(GL_LEQUAL); glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    float z = 1.0f - 1012.0f / (1 << 22), zc = z * 2 - 1;
+    float pos[] = {-1, -0.3f, zc, 1, 1, -0.3f, zc, 1, -1, 0.3f, zc, 1, 1, 0.3f, zc, 1};
+    float c[] = {0.5f, 0.4f, 0, 0.5f, 0.5f, 0.4f, 0, 0.5f, 0.5f, 0.4f, 0, 0.5f, 0.5f, 0.4f, 0, 0.5f};
+    attr(p, "pos", 4, pos); attr(p, "col", 4, c);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_BLEND); glDepthMask(GL_TRUE); glDisable(GL_DEPTH_TEST);
+}
+
+/* Instanced rectangles from integer per-instance attributes (glVertexAttribIPointer + divisor),
+ * a unit-quad vertex buffer, flat integer varyings. */
+static void s_instanced_int(void) {
+    clear(0.95f, 0.95f, 0.9f);
+    GLuint p = prog("#version 300 es\nin vec2 corner; in ivec4 rect; in ivec4 colr; flat out ivec4 c; flat out int k;\n"
+                    "void main() { vec2 xy = vec2(rect.xy) + corner * vec2(rect.zw); gl_Position = vec4(xy / 64.0 - 1.0, 0.0, 1.0); c = colr; k = gl_InstanceID; }\n",
+                    "#version 300 es\nprecision mediump float; flat in ivec4 c; flat in int k; out vec4 o;\n"
+                    "void main() { o = vec4(vec3(c.rgb) / 255.0, 1.0); if ((k & 3) == 3) o.b = 1.0; }\n");
+    GLuint vao; glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    float corner[] = {0, 0, 1, 0, 0, 1, 1, 1};
+    static int inst[40][8];
+    for (int i = 0; i < 40; i++) {
+        inst[i][0] = 3 + (i % 8) * 15; inst[i][1] = 3 + (i / 8) * 25; inst[i][2] = 12 + i % 3; inst[i][3] = 20 - i % 5;
+        inst[i][4] = i * 6; inst[i][5] = 255 - i * 6; inst[i][6] = (i * 50) % 256; inst[i][7] = 0;
+    }
+    GLuint b[2]; glGenBuffers(2, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]); glBufferData(GL_ARRAY_BUFFER, sizeof corner, corner, GL_STATIC_DRAW);
+    GLint lc = glGetAttribLocation(p, "corner"), lr = glGetAttribLocation(p, "rect"), lk = glGetAttribLocation(p, "colr");
+    glEnableVertexAttribArray(lc); glVertexAttribPointer(lc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]); glBufferData(GL_ARRAY_BUFFER, sizeof inst, inst, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(lr); glVertexAttribIPointer(lr, 4, GL_INT, 32, (void *)0); glVertexAttribDivisor(lr, 1);
+    glEnableVertexAttribArray(lk); glVertexAttribIPointer(lk, 4, GL_INT, 32, (void *)16); glVertexAttribDivisor(lk, 1);
+    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, 40);
+    glBindVertexArray(0); glDeleteVertexArrays(1, &vao); glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+/* WebRender's GPU-cache updates: 1-pixel points scattered into RGBA32F and RGBA32I targets
+ * (1024 wide), then read back by texelFetch and shown. */
+static void s_scatter128(void) {
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    GLuint t[2], f[2]; glGenTextures(2, t); glGenFramebuffers(2, f);
+    GLenum ifmt[2] = {GL_RGBA32F, GL_RGBA32I};
+    for (int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, t[i]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[i], 1024, 64);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, f[i]); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t[i], 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) printf("scatter128: target %d incomplete\n", i);
+        glViewport(0, 0, 1024, 64);
+        if (i == 0) { float z[4] = {0.25f, 0.25f, 0.25f, 1}; glClearBufferfv(GL_COLOR, 0, z); }
+        else { int z[4] = {64, 64, 64, 255}; glClearBufferiv(GL_COLOR, 0, z); }
+        GLuint p = prog(i == 0
+            ? "#version 300 es\nin vec2 aPosition; in vec4 aValue; out vec4 v;\nvoid main() { v = aValue; gl_Position = vec4((aPosition + 0.5) / vec2(1024.0, 64.0) * 2.0 - 1.0, 0.0, 1.0); gl_PointSize = 1.0; }\n"
+            : "#version 300 es\nin vec2 aPosition; in vec4 aValue; flat out ivec4 v;\nvoid main() { v = ivec4(aValue); gl_Position = vec4((aPosition + 0.5) / vec2(1024.0, 64.0) * 2.0 - 1.0, 0.0, 1.0); gl_PointSize = 1.0; }\n",
+            i == 0 ? "#version 300 es\nprecision highp float; in vec4 v; out vec4 o; void main() { o = v; }\n"
+                   : "#version 300 es\nprecision highp float; precision highp int; flat in ivec4 v; out ivec4 o; void main() { o = v; }\n");
+        static float pos[2048 * 2], val[2048 * 4];
+        int n = 0;
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x++) {
+            int tx = 700 + x * 3 % 300, ty = 7 + y;   /* scattered, as cache rows fill */
+            pos[n * 2] = tx; pos[n * 2 + 1] = ty;
+            val[n * 4] = i ? (x * 4) : x / 63.0f; val[n * 4 + 1] = i ? (y * 8) : y / 31.0f; val[n * 4 + 2] = i ? ((x + y) & 1) * 255 : 0.5f + 0.5f * ((x ^ y) & 1); val[n * 4 + 3] = i ? 255 : 1;
+            n++;
+        }
+        attr(p, "aPosition", 2, pos); attr(p, "aValue", 4, val);
+        glDrawArrays(GL_POINTS, 0, n);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prev); glViewport(0, 0, W, H);
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a; uniform highp isampler2D b; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy) / 2; ivec2 c = ivec2(700 + q.x % 64 * 3 % 300, 7 + q.y % 32);\n"
+                            " o = gl_FragCoord.y < 64.0 ? texelFetch(a, c, 0) : vec4(texelFetch(b, c, 0)) / 255.0; }\n");
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, t[0]);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, t[1]); glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(p, "a"), 0); glUniform1i(glGetUniformLocation(p, "b"), 1);
+    quad(p, 1.0f, 1.0f);
+}
+
+/* WebRender's batched glyph uploads: glyphs land in a small staging texture first and are then
+ * copied into the big atlas at unaligned offsets, by glCopyImageSubData, glBlitFramebuffer or
+ * glCopyTexSubImage2D; R8 (alpha glyphs) and RGBA8 (colour/subpixel glyphs). */
+static void staged_copy(GLenum ifmt, GLenum fmt, int cpp, int method, int dx, int dy, GLuint atlas, int aw) {
+    static unsigned char img[64 * 64 * 4];
+    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
+        for (int c = 0; c < cpp; c++) img[(y * 64 + x) * cpp + c] = ((x / 3 + y / 4 + c) & 1) ? 230 - 40 * c - method * 30 : 20 + x;
+    GLuint st; glGenTextures(1, &st); glBindTexture(GL_TEXTURE_2D, st); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt, 64, 64);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 64, 64, fmt, GL_UNSIGNED_BYTE, img);
+    GLuint f[2]; glGenFramebuffers(2, f);
+    if (method == 0) {
+        typedef void (*copy_image_fn)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
+        copy_image_fn ci = (copy_image_fn)eglGetProcAddress("glCopyImageSubDataEXT");
+        if (!ci || !strstr((const char *)glGetString(GL_EXTENSIONS), "copy_image")) { printf("no copy_image\n"); }
+        else ci(st, GL_TEXTURE_2D, 0, 5, 3, 0, atlas, GL_TEXTURE_2D, 0, dx, dy, 0, 30, 21, 1);
+    } else if (method == 1) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, f[0]); glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, st, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, f[1]); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas, 0);
+        glBlitFramebuffer(5, 3, 35, 24, dx, dy, dx + 30, dy + 21, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, f[0]); glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, st, 0);
+        glBindTexture(GL_TEXTURE_2D, atlas);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dx, dy, 5, 3, 30, 21);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(2, f); glDeleteTextures(1, &st);
+    (void)aw;
+}
+
+static void s_glyph_copies(void) {
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    GLuint at[2]; glGenTextures(2, at);
+    GLenum ifmt[2] = {GL_R8, GL_RGBA8}, fmt[2] = {GL_RED, GL_RGBA};
+    int size[2] = {2048, 1024};
+    for (int k = 0; k < 2; k++) {
+        glBindTexture(GL_TEXTURE_2D, at[k]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], size[k], size[k]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        GLuint f; glGenFramebuffers(1, &f); glBindFramebuffer(GL_FRAMEBUFFER, f);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, at[k], 0);
+        glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, prev); glDeleteFramebuffers(1, &f);
+        for (int m = 0; m < 3; m++) staged_copy(ifmt[k], fmt[k], k ? 4 : 1, m, 301 + m * 37, 517 + k * 3, at[k], size[k]);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prev); glViewport(0, 0, W, H);
+    clear(0.1f, 0.1f, 0.1f);
+    /* 6 bands (2 formats x 3 methods), each a 2x-zoomed 32x21 window around its copy */
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a; uniform highp sampler2D b; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy) / 2; int band = q.y / 21; int m = band % 3; int k = band / 3;\n"
+                            " if (band > 5 || q.x > 33) { o = vec4(0.1); return; }\n"
+                            " ivec2 c = ivec2(301 + m * 37 - 1 + q.x, 517 + k * 3 - 1 + q.y % 21);\n"
+                            " o = k == 0 ? vec4(texelFetch(a, c, 0).r, 0.3, 0.0, 1.0) : texelFetch(b, c, 0); }\n");
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, at[0]);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, at[1]); glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(p, "a"), 0); glUniform1i(glGetUniformLocation(p, "b"), 1);
+    quad(p, 1.0f, 1.0f);
+}
+
+/* Large textures sampled across their whole area (glyph atlases grow to 2048x2048 and more):
+ * every tiling and XOR/padding case of the address layout, not just one window. Four
+ * quadrants: R8 2048², RGBA8 2048², R8 1024x4096, RG8 2048x512. */
+static unsigned char pat(int x, int y, int c) { unsigned h = (unsigned)(x * 73856093) ^ (unsigned)(y * 19349663) ^ (unsigned)(c * 83492791); h ^= h >> 13; h *= 0x5bd1e995; return (unsigned char)(h >> 24); }
+
+static void s_big_tex_layout(void) {
+    struct { GLenum ifmt, fmt; int cpp, w, h; } t[4] = {{GL_R8, GL_RED, 1, 2048, 2048}, {GL_RGBA8, GL_RGBA, 4, 2048, 2048}, {GL_R8, GL_RED, 1, 1024, 4096}, {GL_RG8, GL_RG, 2, 2048, 512}};
+    GLuint tex[4]; glGenTextures(4, tex);
+    unsigned char *img = malloc(2048 * 2048 * 4);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    for (int k = 0; k < 4; k++) {
+        for (int y = 0; y < t[k].h; y++) for (int x = 0; x < t[k].w; x++) for (int c = 0; c < t[k].cpp; c++) img[((size_t)y * t[k].w + x) * t[k].cpp + c] = pat(x, y, c + k);
+        glActiveTexture(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, tex[k]);
+        glTexStorage2D(GL_TEXTURE_2D, 1, t[k].ifmt, t[k].w, t[k].h);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, t[k].w, t[k].h, t[k].fmt, GL_UNSIGNED_BYTE, img);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    free(img);
+    glActiveTexture(GL_TEXTURE0);
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D s0, s1, s2, s3; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); int k = (q.x >= 64 ? 1 : 0) + (q.y >= 64 ? 2 : 0); ivec2 r = q % 64;\n"
+                            " if (k == 0) o = vec4(texelFetch(s0, r * 32 + ivec2(r.y % 32, (r.x * 7) % 32), 0).r, 0.0, 0.0, 1.0);\n"
+                            " else if (k == 1) o = texelFetch(s1, r * 32 + ivec2((r.y * 5) % 32, r.x % 32), 0);\n"
+                            " else if (k == 2) o = vec4(0.0, texelFetch(s2, r * ivec2(16, 64) + ivec2(r.y % 16, (r.x * 3) % 64), 0).r, 0.0, 1.0);\n"
+                            " else o = vec4(texelFetch(s3, r * ivec2(32, 8) + ivec2((r.y * 11) % 32, r.x % 8), 0).rg, 1.0, 1.0); }\n");
+    for (int k = 0; k < 4; k++) { char n[4] = {'s', (char)('0' + k), 0}; glUniform1i(glGetUniformLocation(p, n), k); }
+    quad(p, 1.0f, 1.0f);
+    for (int k = 0; k < 4; k++) { glActiveTexture(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, 0); }
+    glActiveTexture(GL_TEXTURE0); glDeleteTextures(4, tex);
+}
+
+/* Rendering into big XOR-tiled textures (glyph atlases are drawn into): small rectangles spread
+ * over the whole of an R8 2048², an RGBA8 2048² and an R8 1024x4096 target, read back by
+ * texelFetch. Each output pixel shows the centre of one rectangle. */
+static void s_render_big_targets(void) {
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    struct { GLenum ifmt; int w, h; } t[3] = {{GL_R8, 2048, 2048}, {GL_RGBA8, 2048, 2048}, {GL_R8, 1024, 4096}};
+    GLuint tex[3]; glGenTextures(3, tex);
+    GLuint pc = prog("#version 300 es\nin vec4 pos; in vec4 col; out vec4 v;\nvoid main() { gl_Position = pos; v = col; }\n", FS_COL);
+    for (int k = 0; k < 3; k++) {
+        glBindTexture(GL_TEXTURE_2D, tex[k]); glTexStorage2D(GL_TEXTURE_2D, 1, t[k].ifmt, t[k].w, t[k].h);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        GLuint f; glGenFramebuffers(1, &f); glBindFramebuffer(GL_FRAMEBUFFER, f);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[k], 0);
+        glViewport(0, 0, t[k].w, t[k].h); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(pc);
+        static float pos[64 * 64 * 6 * 4], col[64 * 64 * 6 * 4];
+        int n = 0;
+        for (int j = 0; j < 64; j++) for (int i = 0; i < 64; i++) {
+            /* a 6x6 rect near the centre of each (w/64 x h/64) cell, offset so it straddles tile edges */
+            float cx = (i + 0.5f) * t[k].w / 64 + (i % 5), cy = (j + 0.5f) * t[k].h / 64 + (j % 7);
+            float x0 = (cx - 3) / t[k].w * 2 - 1, x1 = (cx + 3) / t[k].w * 2 - 1, y0 = (cy - 3) / t[k].h * 2 - 1, y1 = (cy + 3) / t[k].h * 2 - 1;
+            float v[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
+            for (int q = 0; q < 6; q++) {
+                pos[n * 4] = v[q][0]; pos[n * 4 + 1] = v[q][1]; pos[n * 4 + 2] = 0; pos[n * 4 + 3] = 1;
+                col[n * 4] = pat(i, j, k) / 255.0f; col[n * 4 + 1] = pat(i, j, k + 1) / 255.0f; col[n * 4 + 2] = pat(i, j, k + 2) / 255.0f; col[n * 4 + 3] = 1;
+                n++;
+            }
+        }
+        attr(pc, "pos", 4, pos); attr(pc, "col", 4, col);
+        glDrawArrays(GL_TRIANGLES, 0, n);
+        glBindFramebuffer(GL_FRAMEBUFFER, prev); glDeleteFramebuffers(1, &f);
+    }
+    glViewport(0, 0, W, H);
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D s0, s1, s2; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); ivec2 r = q % 64; int k = (q.x >= 64 ? 1 : 0) + (q.y >= 64 ? 2 : 0);\n"
+                            " if (k == 0) o = vec4(texelFetch(s0, (r * 2 + 1) * 16 + ivec2(r.x % 5, r.y % 7), 0).r, 0.0, 0.0, 1.0);\n"
+                            " else if (k == 1) o = texelFetch(s1, (r * 2 + 1) * 16 + ivec2(r.x % 5, r.y % 7), 0);\n"
+                            " else if (k == 2) o = vec4(0.0, texelFetch(s2, (r * 2 + 1) * ivec2(8, 32) + ivec2(r.x % 5, r.y % 7), 0).r, 0.0, 1.0);\n"
+                            " else o = vec4(0.2, 0.2, 0.2, 1.0); }\n");
+    for (int k = 0; k < 3; k++) { glActiveTexture(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, tex[k]); char nm[4] = {'s', (char)('0' + k), 0}; glUniform1i(glGetUniformLocation(p, nm), k); }
+    glActiveTexture(GL_TEXTURE0);
+    quad(p, 1.0f, 1.0f);
+    for (int k = 0; k < 3; k++) { glActiveTexture(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, 0); }
+    glActiveTexture(GL_TEXTURE0); glDeleteTextures(3, tex);
+}
+
 struct scene { const char *name; void (*fn)(void); };
 static const struct scene scenes[] = {
     {"clear", s_clear}, {"tri_color", s_tri_color}, {"flat", s_flat}, {"depth", s_depth}, {"blend", s_blend},
     {"tex_nearest", s_tex_nearest}, {"tex_linear_mip", s_tex_linear_mip}, {"cube", s_cube}, {"stencil", s_stencil},
     {"points_lines", s_points_lines}, {"scissor", s_scissor}, {"instanced_indexed", s_instanced_indexed},
     {"discard_fragcoord", s_discard_fragcoord}, {"derivatives_math", s_derivatives_math}, {"cubemap", s_cubemap},
-    {"rgba16f_target", s_mrt_float},
+    {"rgba16f_target", s_mrt_float}, {"text_dual_source", s_text_dual_source}, {"text_const_color", s_text_const_color},
+    {"text_r8_alpha", s_text_r8_alpha}, {"tex_bgra", s_tex_bgra}, {"atlas_pbo", s_atlas_pbo}, {"vs_fetch", s_vs_fetch},
+    {"tex_array", s_tex_array}, {"depth_ids", s_depth_ids}, {"instanced_int", s_instanced_int},
+    {"scatter128", s_scatter128}, {"glyph_copies", s_glyph_copies},
+    {"big_tex_layout", s_big_tex_layout}, {"render_big_targets", s_render_big_targets},
 };
 #define NSCENES (sizeof scenes / sizeof scenes[0])
 
@@ -357,7 +761,7 @@ static int run(const char *dir, const char *only) {
     EGLContext ctx = eglCreateContext(d, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, cattr);
     if (!ctx) { fprintf(stderr, "no GLES 3.1 context\n"); return 1; }
     eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
-    printf("renderer: %s\n", glGetString(GL_RENDERER));
+    printf("renderer: %s / %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
     GLuint fb, rb[2];
     glGenFramebuffers(1, &fb); glBindFramebuffer(GL_FRAMEBUFFER, fb);
     glGenRenderbuffers(2, rb);
