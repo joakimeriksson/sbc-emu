@@ -63,6 +63,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rockchip-rk3288"
+version = "0.0.1"
+dependencies = [
+ "allwinner-h3",
+ "arm-a32",
+ "emu-core",
+]
+
+[[package]]
 name = "sbc-emu"
 version = "0.0.1"
 dependencies = [

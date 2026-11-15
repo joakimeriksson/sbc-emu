@@ -1,0 +1,11 @@
+[package]
+name = "rockchip-rk3288"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+emu-core = { path = "../emu-core" }
+arm-a32 = { path = "../arm-a32" }
+# GIC-400 and DesignWare APB UART models, shared with the H3 until they move to a common crate.
+allwinner-h3 = { path = "../allwinner-h3" }
