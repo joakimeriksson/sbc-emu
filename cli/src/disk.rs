@@ -25,6 +25,38 @@ impl CowFile {
     }
 }
 
+/// A disk shared by successive machines of one run, so the overlay survives a guest reboot
+/// (the serial runner builds a new machine on reset).
+#[derive(Clone)]
+pub struct SharedDisk(pub std::rc::Rc<std::cell::RefCell<CowFile>>);
+
+impl SharedDisk {
+    /// Open `--sd PATH` (copy-on-write) or, with `--sd-persist`, write-through.
+    /// The card is an SDHC card: 512 KiB to 2 TiB (its CSD counts 512 KiB units). A size
+    /// that is not a multiple of 512 KiB works; the guest does not see the partial tail.
+    pub fn open(path: &str, persist: bool) -> std::io::Result<Self> {
+        let disk = if persist { CowFile::open_persistent(path)? } else { CowFile::open(path)? };
+        let sectors = disk.sectors();
+        if !(1024..=(1u64 << 32)).contains(&sectors) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "an SD (SDHC) image must be between 512 KiB and 2 TiB"));
+        }
+        if sectors % 1024 != 0 {
+            eprintln!("[sd] {path}: not a multiple of 512 KiB; the last {} KiB are not visible to the guest", sectors % 1024 / 2);
+        }
+        Ok(SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(disk))))
+    }
+}
+
+impl Disk for SharedDisk {
+    fn sectors(&self) -> u64 { self.0.borrow().sectors() }
+    fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.borrow_mut().read(lba, out); }
+    fn write(&mut self, lba: u64, data: &[u8]) { self.0.borrow_mut().write(lba, data); }
+    fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.0.borrow().overlay() }
+    fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { self.0.borrow_mut().restore_overlay(sectors); }
+    fn snapshots_disk(&self) -> bool { self.0.borrow().snapshots_disk() }
+}
+
 fn in_use(_path: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::WouldBlock,
         "in use by another sbc-emu (--sd-persist needs the image to itself; copy it for a second run)")

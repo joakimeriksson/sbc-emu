@@ -1,5 +1,5 @@
 use crate::gic::NCPU;
-use crate::{Gic, Timer, Uart};
+use crate::{Gic, SunxiMmc, Timer, Uart};
 use arm_a32::Cpu;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
 
@@ -25,6 +25,10 @@ pub const CCU_BASE: u64 = 0x01c2_0000;
 const CCU_SIZE: u64 = 0x400;
 pub const TIMER_BASE: u64 = 0x01c2_0c00;
 const TIMER_SIZE: u64 = 0x40;
+/// SD card controller 0 (`mmc@1c0f000`), interrupt SPI 60.
+pub const MMC0_BASE: u64 = 0x01c0_f000;
+const MMC_SIZE: u64 = 0x1000;
+pub const MMC0_IRQ: usize = 32 + 60;
 /// Timer 0/1 interrupts: SPI 18/19.
 pub const TIMER_IRQS: [usize; 2] = [32 + 18, 32 + 19];
 const GICD_SIZE: u64 = 0x1000;
@@ -36,6 +40,7 @@ pub struct Soc {
     pub uart: Uart,
     pub gic: Gic,
     pub timer: Timer,
+    pub mmc: SunxiMmc,
     /// CCU registers (PLLs, bus gates, resets, module clocks), byte offset / 4.
     ccu: Vec<u32>,
     /// Current 24 MHz time, set by the machine before each step.
@@ -56,6 +61,7 @@ impl Soc {
             uart: Uart::default(),
             gic: Gic::default(),
             timer: Timer::default(),
+            mmc: SunxiMmc::default(),
             ccu: Self::ccu_reset(),
             now: 0,
             dirty: true,
@@ -142,6 +148,9 @@ impl Soc {
             if Self::in_region(addr, 4, TIMER_BASE, TIMER_SIZE) {
                 return Ok(self.timer.read(addr - TIMER_BASE, self.now));
             }
+            if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
+                return Ok(self.mmc.read(addr - MMC0_BASE));
+            }
         }
         match Self::uart_offset(addr, width) {
             Ok(offset) => return Ok(self.uart.read(offset)),
@@ -175,6 +184,10 @@ impl Soc {
             }
             if Self::in_region(addr, 4, TIMER_BASE, TIMER_SIZE) {
                 self.timer.write(addr - TIMER_BASE, value, self.now);
+                return Ok(());
+            }
+            if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
+                self.mmc.write(addr - MMC0_BASE, value, &mut self.ram);
                 return Ok(());
             }
         }
@@ -365,7 +378,12 @@ impl Machine {
     /// in WFI/WFE do not count, so a lone busy core still runs at 1 ns per instruction.
     fn tick(&mut self) {
         let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
-        self.subtick += 12 / running;
+        self.advance_subtick(12 / running);
+    }
+
+    /// Advance virtual time by `units` of 1/12 ns.
+    fn advance_subtick(&mut self, units: u64) {
+        self.subtick += units;
         if self.subtick >= 125 * 12 {
             self.subtick -= 125 * 12;
             let ticks = self.cpus[0].cntpct + 3;
@@ -388,6 +406,8 @@ impl Machine {
         }
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART0_IRQ, uart);
+        let mmc = self.soc.mmc.irq();
+        self.soc.gic.set_level(MMC0_IRQ, mmc);
         let mut next = u64::MAX;
         for k in 0..NCPU {
             let cpu = &self.cpus[k];
@@ -470,7 +490,8 @@ impl Machine {
             return Err(Trap::Wait);
         }
         let result = self.cpus[0].step(&mut self.soc);
-        self.tick();
+        // step() runs core 0 alone, so each instruction is a full 1 ns.
+        self.advance_subtick(12);
         if self.cpus[0].sent_event {
             self.send_event(0);
         }
@@ -488,7 +509,9 @@ impl Machine {
     /// when every online core waits for an interrupt and nothing is due before then.
     pub fn run(&mut self, budget: u64) -> Stop {
         let mut left = budget;
-        let mut storm = 0u32;
+        // Exception-storm detection per core: one core's progress must not hide another's
+        // abort loop.
+        let mut storm = [0u32; NCPU];
         while left > 0 {
             self.sync_irqs();
             let Some(k) = (1..=NCPU)
@@ -513,7 +536,7 @@ impl Machine {
                     self.broadcast_tlb_flush(k);
                 }
                 match result {
-                    Ok(()) => storm = 0,
+                    Ok(()) => storm[k] = 0,
                     Err(Trap::Wait) => {
                         self.state[k] = CoreState::Wait;
                         self.update_irqs();
@@ -521,12 +544,12 @@ impl Machine {
                     }
                     Err(Trap::Interrupt(..)) => {
                         self.irqs += 1;
-                        storm = 0;
+                        storm[k] = 0;
                     }
                     Err(Trap::Exception(..)) => {
                         self.exceptions += 1;
-                        storm += 1;
-                        if storm > 10_000 {
+                        storm[k] += 1;
+                        if storm[k] > 10_000 {
                             self.last_stop_core = k;
                             let c = &self.cpus[k];
                             return Stop::ExceptionStorm {
