@@ -1,0 +1,3 @@
+# Unmodified Armbian minimal image: serial getty/first-boot login.
+wait-serial orangepi5 login:
+quit

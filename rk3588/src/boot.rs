@@ -58,3 +58,53 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
     m.cpu.x=[0;31];m.cpu.x[0]=DTB;m.cpu.sys.cpacr_el1=3<<20;
     Ok(())
 }
+
+/// Boot inputs read by emulated firmware from a GPT/ext4 Armbian image.
+pub struct CardBoot {
+    pub kernel: Vec<u8>,
+    pub initrd: Option<Vec<u8>>,
+    pub cmdline: String,
+    pub notes: Vec<String>,
+}
+
+/// Implements the relevant Armbian `boot.cmd` inputs. The emulator generates its
+/// reduced DT; neither U-Boot nor DT overlays execute here.
+pub fn read_card(disk: &mut dyn emu_core::disk::Disk) -> Result<CardBoot, String> {
+    use emu_core::ext4::Ext4;
+    let parts=emu_core::gpt::partitions(disk)?;
+    for part in parts {
+        let Ok(mut fs)=Ext4::open(disk,part.first_lba) else {continue};
+        for prefix in ["/boot/", "/"] {
+            if !fs.exists(&format!("{prefix}Image")) {continue;}
+            let mut notes=Vec::new();
+            if fs.needs_recovery {notes.push("ext4 journal needs recovery; firmware does not replay it".to_string());}
+            let env_path=format!("{prefix}armbianEnv.txt");
+            let env_bytes=if fs.exists(&env_path){fs.read_file(&env_path)?}else{Vec::new()};
+            let env_text=std::str::from_utf8(&env_bytes).map_err(|_|"armbianEnv.txt is not UTF-8")?;
+            let mut env=std::collections::HashMap::new();
+            for line in env_text.lines() {
+                let line=line.trim();if line.is_empty()||line.starts_with('#'){continue;}
+                if let Some((k,v))=line.split_once('='){env.insert(k.trim(),v.trim());}
+            }
+            let get=|key:&str,default:&str|env.get(key).copied().unwrap_or(default).to_string();
+            if ["overlays","user_overlays"].iter().any(|k|env.get(k).is_some_and(|v|!v.is_empty())) {
+                notes.push("device-tree overlays are not applied".into());
+            }
+            let kernel=fs.read_file(&format!("{prefix}Image"))?;
+            let init_path=format!("{prefix}uInitrd");
+            let initrd=if fs.exists(&init_path) {
+                let data=fs.read_file(&init_path)?;
+                if data.len()<64 || data[..4]!=[0x27,0x05,0x19,0x56] {return Err("uInitrd has no U-Boot legacy header".into());}
+                let len=u32::from_be_bytes(data[12..16].try_into().unwrap()) as usize;
+                let end=64usize.checked_add(len).filter(|&v|v<=data.len()).ok_or("truncated uInitrd")?;
+                Some(data[64..end].to_vec())
+            }else{None};
+            let root_default=format!("UUID={}",fs.uuid_string());
+            let cmdline=format!("root={} rootwait rootfstype={} console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000 8250.nr_uarts=3 loglevel={} {} {}",
+                get("rootdev",&root_default),get("rootfstype","ext4"),get("verbosity","1"),get("extraargs",""),get("extraboardargs",""));
+            notes.push(format!("GPT partition {} at LBA {}; {}Image",part.number,part.first_lba,prefix));
+            return Ok(CardBoot{kernel,initrd,cmdline,notes});
+        }
+    }
+    Err("no GPT ext4 partition containing Image in /boot or /".into())
+}

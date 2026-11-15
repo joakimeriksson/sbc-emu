@@ -10,8 +10,23 @@ cargo build --release
 ./target/release/sbc-emu run --board orangepi5 --kernel /path/to/Image --initrd /tmp/orangepi-initramfs.cpio
 ```
 
-For an SD data disk, add `--sd /path/to/card.img` to the direct-boot command. The base image is opened read-only; guest writes go to a memory overlay that survives guest reboot and is discarded on exit. The kernel must include the DesignWare MMC, Rockchip glue and MMC block drivers, or the initramfs must load them. SD-card boot and persistent image writes are not implemented.
+For an SD data disk, add `--sd /path/to/card.img` to the direct-boot command. The base image is opened read-only; guest writes go to a memory overlay that survives guest reboot and is discarded on exit. The kernel must include the DesignWare MMC, Rockchip glue and MMC block drivers, or the initramfs must load them. For persistent writes, `--sd-persist` opens the image exclusively and writes directly to it.
 
 The tested Debian installer initramfs (`20250803+deb13u7/images/netboot/debian-installer/arm64/initrd.gz`, SHA-256 `f8f48fe31f84fca1a43c3d57c09cd1c2ee728549dd18a986463efd0305249451`) contains `dw_mmc.ko.xz`, `dw_mmc-pltfm.ko.xz`, and `dw_mmc-rockchip.ko.xz`. To reproduce the block I/O test, decompress those three modules into the root of the BusyBox initramfs as `/dw_mmc.ko`, `/dw_mmc-pltfm.ko` and `/dw_mmc-rockchip.ko`, create a scratch SD image of at least 1 MiB with `INPUT_SECTOR` at offset 0, then run with `--script scripts/orangepi-sd.txt --timeout 40`. The script loads the modules, reads the image, writes through the guest block device and reads the overlay back after a guest reboot. The model reports a 32-bit PIO interface; DMA, UHS, eMMC and vendor-image boot are not implemented. `SBC_MMC_TRACE=1` logs card commands.
 
 Ctrl-A x exits. `scripts/orangepi-shell.txt` automates shell input, timer sleep, RAM filesystem, reboot and power-off with `--script`. Use `--timeout 30` to bound a scripted run. This is a generic Debian kernel and custom initramfs, not an Orange Pi vendor image.
+
+## Armbian SD image boot
+
+With an Armbian GPT/ext4 SD image, `--sd` can supply the kernel and initramfs as well as the root filesystem. The emulator performs the relevant firmware loading steps: it reads `Image`, `uInitrd` and `armbianEnv.txt`, then generates its reduced device tree. U-Boot and the board's physical boot chain are not executed, and DT overlays are ignored. By default the SD image remains read-only on the host; guest writes go into a copy-on-write overlay. `--sd-persist` enables direct writes.
+
+Tested with Armbian 26.8.1 Orange Pi 5 Debian Trixie minimal, current 6.18.43 (`Armbian_26.8.1_Orangepi5_trixie_current_6.18.43_minimal.img.xz`, SHA-256 `a7633627a54b6d8c5f03294cbf1b3b998d55b8e1e15cfb5296a3c440b981fcb5`). After verifying and decompressing the image:
+
+```sh
+./target/release/sbc-emu run --board orangepi5 --sd /path/to/armbian.img \
+  --ram-mb 1024 --script scripts/orangepi5-armbian.txt --timeout 90
+```
+
+For SD image boot, `--append` adds options to the image-derived kernel command line; when using `--kernel`, it supplies the complete command line.
+
+The tested image reached `orangepi5 login: root (automatic login)`. The image's first-boot setup and peripheral features are not covered by that result. Direct kernel boot with `--kernel` remains available.
