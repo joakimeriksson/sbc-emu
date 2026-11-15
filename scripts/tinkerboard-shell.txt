@@ -1,5 +1,6 @@
-# Tinker Board S (RK3288) M2 acceptance: shell input, device tree, CPU identity, timer,
-# VFP userland, filesystem and the CRU global soft reset. A prompt alone is not enough.
+# Tinker Board S (RK3288) M3 acceptance: shell input, device tree, CPU identity, four cores
+# started through the boot ROM mailbox and kept busy in parallel, timer, VFP userland,
+# filesystem and the CRU global soft reset. A prompt alone is not enough.
 # Fixture: scripts/tinker-board-fixture.sh, then
 #   sbc-emu run --board tinkerboard --kernel cache/tinker-board/zImage \
 #     --dtb cache/tinker-board/rk3288-tinker-s.dtb --initrd cache/tinker-board/initramfs.cpio.gz \
@@ -11,6 +12,10 @@ wait-serial Asus Tinker Board S
 wait-serial tinker-board#
 serial grep -m1 'CPU part' /proc/cpuinfo | sed 's/.*: /PART_/'\r
 wait-serial PART_0xc0d
+serial printf 'CPUS_%s' $(nproc); echo\r
+wait-serial CPUS_4
+serial for i in 1 2 3 4; do (n=0; while [ $n -lt 3000 ]; do n=$((n+1)); done) & done; wait; printf 'PAR_%s' OK; echo\r
+wait-serial PAR_OK
 serial grep -q vfpv4 /proc/cpuinfo && awk 'BEGIN{printf "FP_%s %.3f", "OK", 2.5*1.5; print ""}'\r
 wait-serial FP_OK 3.750
 serial sleep 1; printf 'TIMER_%s' OK; echo; cat /proc/interrupts\r
@@ -20,6 +25,7 @@ serial echo rockchip-test > /tmp/probe; test "$(cat /tmp/probe)" = rockchip-test
 wait-serial FS_OK
 serial reboot -f\r
 wait-serial Booting Linux on physical CPU 0x500
+wait-serial smp: Brought up 1 node, 4 CPUs
 wait-serial tinker-board#
 serial printf 'REBOOT_%s' OK; echo\r
 wait-serial REBOOT_OK

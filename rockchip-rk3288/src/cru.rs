@@ -23,6 +23,9 @@ pub const fn clksel_con(n: u64) -> u64 {
 }
 pub const GLB_SRST_FST: u64 = 0x1b0;
 pub const GLB_SRST_SND: u64 = 0x1b4;
+/// `RK3288_SOFTRST_CON(0)` (hiword): bits 0-3 hold cores 0-3 in reset (`SRST_CORE0..3`,
+/// the `resets` of the cpu nodes; set = asserted).
+pub const SOFTRST_CON0: u64 = 0x1b8;
 /// Fractional dividers (`COMPOSITE_FRACMUX`): plain 32-bit numerator << 16 | denominator.
 const FRAC_CLKSEL: [u64; 8] = [7, 8, 9, 17, 18, 19, 20, 41];
 const OSC_HZ: u64 = 24_000_000;
@@ -85,6 +88,11 @@ impl Cru {
         } else {
             hiword_write(self.regs[index], value)
         };
+    }
+
+    /// Core `core` is held in soft reset (SOFTRST_CON0).
+    pub fn core_in_reset(&self, core: usize) -> bool {
+        self.regs[(SOFTRST_CON0 / 4) as usize] & (1 << core) != 0
     }
 
     /// Output rate of a PLL in Hz as Linux computes it (mode mux included).
@@ -158,6 +166,7 @@ pub const PMU_IDLE_ST: u64 = 0x14;
 /// PMU power domains (`rockchip,rk3288-pmu`). Power and idle transitions complete at once:
 /// PWRDN_ST follows PWRDN_CON (bit 14, HEVC, reports in bit 10) and IDLE_ST reports each
 /// IDLE_REQ bit as both idle (same bit) and acknowledged (bit + 16). Plain 32-bit registers.
+/// PWRDN_CON bits 0-3 are the A12 cores (`platsmp.c` powers cores 1-3 through them).
 pub struct Pmu {
     regs: Vec<u32>,
 }
@@ -165,7 +174,7 @@ pub struct Pmu {
 impl Default for Pmu {
     fn default() -> Self {
         let mut regs = vec![0; (PMU_SIZE / 4) as usize];
-        // Cores 1-3 powered down (no SMP model yet); every other domain on.
+        // Cores 1-3 powered down until Linux starts them; every other domain on.
         regs[(PMU_PWRDN_CON / 4) as usize] = 0b1110;
         Self { regs }
     }
@@ -185,6 +194,11 @@ impl Pmu {
             }
             _ => reg(offset),
         }
+    }
+
+    /// The power domain of core `core` is on.
+    pub fn core_powered(&self, core: usize) -> bool {
+        self.regs[(PMU_PWRDN_CON / 4) as usize] & (1 << core) == 0
     }
 
     pub fn write(&mut self, offset: u64, value: u32) {
