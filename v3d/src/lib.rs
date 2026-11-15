@@ -4,9 +4,12 @@
 //! * hub registers at 0x0000 (identification, interrupts, TFU, MMU) and core 0 at 0x4000
 //!   (control list executors, PTB, CSD, caches, performance counters);
 //! * the GPU's own MMU: one level of 4 KiB page table entries for a 4 GiB space;
-//! * jobs run to completion when the kernel starts them (writing the end address of a
-//!   control list, the TFU's ICFG or the CSD's CFG0), then raise their done interrupt:
-//!   binning (`bin`), rendering (`render`), texture formatting (`tfu`), compute (`csd`).
+//! * jobs start when the kernel writes the end address of a control list, the TFU's ICFG or
+//!   the CSD's CFG0: binning (`bin`), rendering (`render`), texture formatting (`tfu`),
+//!   compute (`csd`). With the cores on host threads (`--threads multi`) a job runs on a GPU
+//!   thread of its own, as the real GPU runs beside the CPUs, and its done interrupt comes when
+//!   it has finished; otherwise it runs to completion in the register write (repeatable runs,
+//!   the browser).
 
 pub mod bits;
 pub mod packets;
@@ -149,29 +152,107 @@ pub const SIZE: u64 = 0x8000;
 /// What one bin job left for the render job reading the same tile allocation memory.
 pub type BinResults = HashMap<u32, std::sync::Arc<bin::Binned>>;
 
-pub struct V3d {
-    hub: Vec<u32>,
-    core: Vec<u32>,
-    pub binned: BinResults,
+/// What runs jobs: the shader code cache, the tile lists bin jobs leave for render jobs,
+/// statistics. Shared with the GPU thread.
+pub struct Exec {
     pub code: Code,
+    pub binned: BinResults,
+    /// the bin jobs whose tile lists are live, to re-bin after a snapshot restore
+    bin_jobs: HashMap<u32, [u32; 5]>,
     /// statistics: jobs (bin, render, TFU, CSD), QPU instructions, host time in jobs (ns)
     pub jobs: [u64; 4],
     pub insns: u64,
     pub host_ns: [u64; 4],
+}
+
+/// A job as the kernel started it.
+#[derive(Clone)]
+enum Job {
+    Bin { start: u32, end: u32, qma: u32, qms: u32, qts: u32 },
+    Render { start: u32, end: u32 },
+    Csd { cfg: Vec<u32> },
+    Tfu { regs: Vec<u32>, irq: bool },
+}
+
+/// A finished job: its interrupt, the register that reports where it ended, the frame counter
+/// it advances, and the host time it took.
+struct Done { gen: u64, hub: bool, bits: u32, reg: Option<(usize, u32)>, counter: Option<usize>, ns: u64 }
+
+impl Exec {
+    fn run(&mut self, job: &Job, ram: &mut [u8], pt: u64, mmu: bool, gen: u64) -> Done {
+        let t0 = Clock::now();
+        let mut m = Gmem::new(ram, pt, mmu);
+        let (k, hub, bits, reg, counter) = match job {
+            &Job::Bin { start, end, qma, qms, qts } => {
+                self.code.clear();
+                let res = bin::run(start, end, qma, qms, qts, &mut m, &mut self.code, &mut self.insns);
+                if let Some(r) = res { self.binned.insert(qma, std::sync::Arc::new(r)); self.bin_jobs.insert(qma, [start, end, qma, qms, qts]); }
+                (0, false, if end != 0 { INT_FLDONE } else { 0 }, Some((CLE_CT0CA, end)), Some(CLE_BFC))
+            }
+            &Job::Render { start, end } => {
+                self.code.clear();
+                // after a snapshot restore: rebuild the tile lists the render job will read
+                if self.binned.len() < self.bin_jobs.len() {
+                    for (q, j) in self.bin_jobs.clone() {
+                        if self.binned.contains_key(&q) { continue; }
+                        if let Some(r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { self.binned.insert(q, std::sync::Arc::new(r)); }
+                    }
+                }
+                render::run(start, end, &self.binned, &mut m, &mut self.code, &mut self.insns);
+                (1, false, INT_FRDONE, Some((CLE_CT1CA, end)), Some(CLE_RFC))
+            }
+            Job::Csd { cfg } => {
+                self.code.clear();
+                csd::run(cfg, &mut m, &mut self.code, &mut self.insns);
+                (3, false, INT_CSDDONE, None, None)
+            }
+            Job::Tfu { regs, irq } => {
+                tfu::run(regs, &mut m);
+                (2, true, if *irq { HUB_INT_TFUC } else { 0 }, None, None)
+            }
+        };
+        self.jobs[k] += 1;
+        let ns = t0.elapsed().as_nanos() as u64;
+        self.host_ns[k] += ns;
+        Done { gen, hub, bits, reg, counter, ns }
+    }
+}
+
+/// The GPU thread: jobs in, finished jobs out.
+#[cfg(not(target_arch = "wasm32"))]
+struct Worker {
+    tx: std::sync::mpsc::Sender<(Job, RamPtr, u64, bool, u64)>,
+    done: std::sync::Arc<std::sync::Mutex<Vec<Done>>>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Guest RAM for the GPU thread. The cores already share it through raw pointers; the GPU
+/// reads and writes it as DMA does, beside them.
+#[cfg(not(target_arch = "wasm32"))]
+struct RamPtr(*mut u8, usize);
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for RamPtr {}
+
+pub struct V3d {
+    hub: Vec<u32>,
+    core: Vec<u32>,
+    pub exec: std::sync::Arc<std::sync::Mutex<Exec>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    worker: Option<Worker>,
+    /// bumped by a reset: jobs still running from before it are dropped when they finish
+    gen: u64,
     /// the PM block powered the GPU up (bcm2835-power, V3D domain)
     pub powered: bool,
     /// guest time (ns), as the SoC last told it
     pub now: u64,
-    /// done interrupts not yet raised: (guest time, hub?, bits). A job's results are computed when
-    /// it starts; its interrupt comes after the host time it took (scaled by `time_scale`), so the
-    /// guest sees the emulated GPU's real speed.
+    /// done interrupts not yet raised: (guest time, hub?, bits). A synchronous job's results are
+    /// computed when it starts; its interrupt comes after the host time it took (scaled by
+    /// `time_scale`), so the guest sees the emulated GPU's real speed.
     pending: Vec<(u64, bool, u32)>,
     pub time_scale: f64,
-    /// guest time follows the host's wall clock (cores on host threads): the host time a job took
-    /// has already passed for the guest while it ran, so the interrupt is not held back again
+    /// guest time follows the host's wall clock (cores on host threads): jobs go to the GPU
+    /// thread, and their interrupt comes when they finish
     pub wall_clock: bool,
-    /// the bin jobs whose tile lists are live, to re-bin after a snapshot restore
-    bin_jobs: HashMap<u32, [u32; 5]>,
 }
 
 impl Default for V3d { fn default() -> Self { Self::new() } }
@@ -180,8 +261,10 @@ impl V3d {
     pub fn new() -> V3d {
         LOG_ON.store(std::env::var_os("SBC_V3D_LOG").is_some(), std::sync::atomic::Ordering::Relaxed);
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
-        let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], binned: HashMap::new(), code: Code::default(), jobs: [0; 4], insns: 0, host_ns: [0; 4], powered: true, now: 0, pending: Vec::new(),
-            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false, bin_jobs: HashMap::new() };
+        let exec = Exec { code: Code::default(), binned: HashMap::new(), bin_jobs: HashMap::new(), jobs: [0; 4], insns: 0, host_ns: [0; 4] };
+        let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], exec: std::sync::Arc::new(std::sync::Mutex::new(exec)),
+            #[cfg(not(target_arch = "wasm32"))] worker: None, gen: 0, powered: true, now: 0, pending: Vec::new(),
+            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false };
         // (std::env is empty in the browser: the defaults apply)
         v.reset();
         v
@@ -193,9 +276,89 @@ impl V3d {
         self.hub[HUB_AXICFG / 4] = 0xf;
         self.hub[HUB_INT_MSK_STS / 4] = !0;
         self.core[CTL_INT_MSK_STS / 4] = !0;
-        self.binned.clear();
+        // jobs still on the GPU thread finish into nothing
+        self.gen += 1;
+        self.drain();
+        let mut e = self.exec();
+        e.binned.clear();
+        e.bin_jobs.clear();
+        drop(e);
         self.pending.clear();
-        self.bin_jobs.clear();
+    }
+
+    fn exec(&self) -> std::sync::MutexGuard<'_, Exec> { self.exec.lock().unwrap_or_else(|e| e.into_inner()) }
+
+    /// Statistics: (jobs per kind, QPU instructions, host ns per kind).
+    pub fn counters(&self) -> ([u64; 4], u64, [u64; 4]) { let e = self.exec(); (e.jobs, e.insns, e.host_ns) }
+
+    /// Wait for the GPU thread to finish its jobs, then take their results.
+    pub fn drain(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(w) = self.worker.as_ref() {
+            while w.busy.load(std::sync::atomic::Ordering::Acquire) != 0 { std::thread::sleep(std::time::Duration::from_micros(50)); }
+        }
+        self.collect();
+    }
+
+    /// Take the results of jobs the GPU thread has finished.
+    fn collect(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(w) = self.worker.as_ref() else { return };
+            let done: Vec<Done> = std::mem::take(&mut *w.done.lock().unwrap_or_else(|e| e.into_inner()));
+            for d in done { if d.gen == self.gen { self.finish(&d, true); } }
+        }
+    }
+
+    /// A job finished: where it ended, the frame counter, the interrupt (now if it ran on the
+    /// GPU thread, as its time has passed; else after its host time).
+    fn finish(&mut self, d: &Done, now: bool) {
+        if let Some((r, v)) = d.reg { self.core[r / 4] = v; }
+        if let Some(c) = d.counter { self.core[c / 4] = self.core[c / 4].wrapping_add(1); }
+        if d.bits == 0 { return; }
+        if now { if d.hub { self.hub[HUB_INT_STS / 4] |= d.bits } else { self.core[CTL_INT_STS / 4] |= d.bits } }
+        else { self.done(d.hub, d.bits, d.ns); }
+    }
+
+    /// Start a job: on the GPU thread while the cores run on host threads, else here.
+    fn submit(&mut self, job: Job, ram: &mut [u8]) {
+        let (pt, mmu, gen) = (self.pt_base(), self.mmu_on(), self.gen);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.wall_clock {
+            let w = self.worker.get_or_insert_with(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<(Job, RamPtr, u64, bool, u64)>();
+                let done = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let (exec, d2, b2) = (self.exec.clone(), done.clone(), busy.clone());
+                std::thread::Builder::new().name("v3d".into()).spawn(move || {
+                    for (job, ram, pt, mmu, gen) in rx {
+                        // SAFETY: guest RAM lives as long as the machine, which outlives its jobs
+                        let ram = unsafe { std::slice::from_raw_parts_mut(ram.0, ram.1) };
+                        let d = exec.lock().unwrap_or_else(|e| e.into_inner()).run(&job, ram, pt, mmu, gen);
+                        d2.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+                        b2.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    }
+                }).expect("v3d thread");
+                Worker { tx, done, busy }
+            });
+            w.busy.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            match w.tx.send((job, RamPtr(ram.as_mut_ptr(), ram.len()), pt, mmu, gen)) {
+                Ok(()) => return,
+                Err(e) => {
+                    // the GPU thread is gone (it panicked): run here from now on
+                    w.busy.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    self.worker = None;
+                    let (job, ..) = e.0;
+                    let d = self.exec().run(&job, ram, pt, mmu, gen);
+                    self.finish(&d, false);
+                    return;
+                }
+            }
+        }
+        // here: after anything still on the GPU thread, in order
+        self.drain();
+        let d = self.exec().run(&job, ram, pt, mmu, gen);
+        self.finish(&d, false);
     }
 
     /// Schedule a done interrupt after `ns` of host time.
@@ -210,6 +373,7 @@ impl V3d {
     /// Raise the interrupts that are due at `now`.
     pub fn tick(&mut self, now: u64) {
         self.now = now;
+        self.collect();
         if self.pending.is_empty() { return; }
         let (hub, core) = (&mut self.hub, &mut self.core);
         self.pending.retain(|&(t, h, bits)| {
@@ -272,14 +436,8 @@ impl V3d {
                 HUB_INT_MSK_CLR => self.hub[HUB_INT_MSK_STS / 4] &= !v,
                 TFU_ICFG => {
                     self.hub[o / 4] = v;
-                    let t0 = Clock::now();
                     let regs: Vec<u32> = (0..16).map(|k| self.hub[TFU_CS / 4 + k]).collect();
-                    let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
-                    tfu::run(&regs, &mut m);
-                    self.jobs[2] += 1;
-                    let ns = t0.elapsed().as_nanos() as u64;
-                    self.host_ns[2] += ns;
-                    if v & 1 != 0 { self.done(true, HUB_INT_TFUC, ns); }
+                    self.submit(Job::Tfu { regs, irq: v & 1 != 0 }, ram);
                 }
                 _ => self.hub[o / 4] = v,
             }
@@ -291,53 +449,22 @@ impl V3d {
                 CTL_INT_MSK_CLR => self.core[CTL_INT_MSK_STS / 4] &= !v,
                 CLE_CT0QEA => {
                     self.core[o / 4] = v;
-                    let t0 = Clock::now();
                     let (start, end) = (self.core[CLE_CT0QBA / 4], v);
                     let (qma, qms, qts) = (self.core[CLE_CT0QMA / 4], self.core[CLE_CT0QMS / 4], self.core[CLE_CT0QTS / 4]);
-                    self.code.clear();
-                    let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
-                    let res = bin::run(start, end, qma, qms, qts, &mut m, &mut self.code, &mut self.insns);
-                    if let Some(r) = res { self.binned.insert(qma, std::sync::Arc::new(r)); self.bin_jobs.insert(qma, [start, end, qma, qms, qts]); }
-                    self.core[CLE_CT0CA / 4] = end;
-                    self.core[CLE_BFC / 4] = self.core[CLE_BFC / 4].wrapping_add(1);
-                    self.jobs[0] += 1;
-                    let ns = t0.elapsed().as_nanos() as u64;
-                    self.host_ns[0] += ns;
-                    self.done(false, INT_FLDONE, ns);
+                    self.core[CLE_CT0CA / 4] = start;
+                    self.submit(Job::Bin { start, end, qma, qms, qts }, ram);
                 }
                 CLE_CT1QEA => {
                     self.core[o / 4] = v;
-                    let t0 = Clock::now();
-                    let (start, end) = (self.core[CLE_CT1QBA / 4], v);
-                    self.code.clear();
-                    let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
-                    // after a snapshot restore: rebuild the tile lists the render job will read
-                    if self.binned.len() < self.bin_jobs.len() {
-                        for (q, j) in self.bin_jobs.clone() {
-                            if self.binned.contains_key(&q) { continue; }
-                            if let Some(r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { self.binned.insert(q, std::sync::Arc::new(r)); }
-                        }
-                    }
-                    render::run(start, end, &self.binned, &mut m, &mut self.code, &mut self.insns);
-                    self.core[CLE_CT1CA / 4] = end;
-                    self.core[CLE_RFC / 4] = self.core[CLE_RFC / 4].wrapping_add(1);
-                    self.jobs[1] += 1;
-                    let ns = t0.elapsed().as_nanos() as u64;
-                    self.host_ns[1] += ns;
-                    self.done(false, INT_FRDONE, ns);
+                    let start = self.core[CLE_CT1QBA / 4];
+                    self.core[CLE_CT1CA / 4] = start;
+                    self.submit(Job::Render { start, end: v }, ram);
                 }
                 CSD_QUEUED_CFG0 => {
                     self.core[o / 4] = v;
-                    let t0 = Clock::now();
                     let cfg: Vec<u32> = (0..7).map(|k| self.core[CSD_QUEUED_CFG0 / 4 + k]).collect();
                     for k in 0..7 { self.core[CSD_CURRENT_CFG0 / 4 + k] = cfg[k]; }
-                    self.code.clear();
-                    let mut m = Gmem::new(ram, self.pt_base(), self.mmu_on());
-                    csd::run(&cfg, &mut m, &mut self.code, &mut self.insns);
-                    self.jobs[3] += 1;
-                    let ns = t0.elapsed().as_nanos() as u64;
-                    self.host_ns[3] += ns;
-                    self.done(false, INT_CSDDONE, ns);
+                    self.submit(Job::Csd { cfg }, ram);
                 }
                 _ => self.core[o / 4] = v,
             }
@@ -347,9 +474,10 @@ impl V3d {
     /// One-line job statistics.
     pub fn stats(&self) -> String {
 
-        let ms = |k: usize| self.host_ns[k] as f64 / 1e6;
+        let (jobs, insns, host_ns) = self.counters();
+        let ms = |k: usize| host_ns[k] as f64 / 1e6;
         format!("{} bin jobs ({:.0} ms), {} render jobs ({:.0} ms), {} TFU ({:.0} ms), {} compute ({:.0} ms); {} QPU instructions",
-                self.jobs[0], ms(0), self.jobs[1], ms(1), self.jobs[2], ms(2), self.jobs[3], ms(3), self.insns)
+                jobs[0], ms(0), jobs[1], ms(1), jobs[2], ms(2), jobs[3], ms(3), insns)
     }
 
     fn mmu_on(&self) -> bool { self.hub[MMU_CTL / 4] & 1 != 0 }
@@ -362,22 +490,38 @@ impl V3d {
     }
 
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
+        // finished-but-uncollected jobs count as finished: wait for the GPU thread, then fold
+        // its results into what is written (save takes the machine by shared reference)
+        let (mut hub, mut core) = (self.hub.clone(), self.core.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(wk) = self.worker.as_ref() {
+            while wk.busy.load(std::sync::atomic::Ordering::Acquire) != 0 { std::thread::sleep(std::time::Duration::from_micros(50)); }
+            for d in wk.done.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|d| d.gen == self.gen) {
+                if let Some((r, v)) = d.reg { core[r / 4] = v; }
+                if let Some(c) = d.counter { core[c / 4] = core[c / 4].wrapping_add(1); }
+                if d.hub { hub[HUB_INT_STS / 4] |= d.bits } else { core[CTL_INT_STS / 4] |= d.bits }
+            }
+        }
         w.tag("v3d-v1");
-        for r in self.hub.iter().chain(self.core.iter()) { w.u32(*r); }
+        for r in hub.iter().chain(core.iter()) { w.u32(*r); }
         w.u64(self.pending.len() as u64);
         for &(t, h, b) in &self.pending { w.u64(t); w.bool(h); w.u32(b); }
-        w.u64(self.bin_jobs.len() as u64);
-        for j in self.bin_jobs.values() { for &x in j { w.u32(x); } }
+        let e = self.exec();
+        w.u64(e.bin_jobs.len() as u64);
+        for j in e.bin_jobs.values() { for &x in j { w.u32(x); } }
     }
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
         r.tag("v3d-v1")?;
+        self.gen += 1;
+        self.drain();
         for k in 0..self.hub.len() { self.hub[k] = r.u32()?; }
         for k in 0..self.core.len() { self.core[k] = r.u32()?; }
-        self.binned.clear();
         self.pending.clear();
         for _ in 0..r.u64()? { let (t, h, b) = (r.u64()?, r.bool()?, r.u32()?); self.pending.push((t, h, b)); }
-        self.bin_jobs.clear();
-        for _ in 0..r.u64()? { let mut j = [0u32; 5]; for x in j.iter_mut() { *x = r.u32()?; } self.bin_jobs.insert(j[2], j); }
+        let mut e = self.exec();
+        e.binned.clear();
+        e.bin_jobs.clear();
+        for _ in 0..r.u64()? { let mut j = [0u32; 5]; for x in j.iter_mut() { *x = r.u32()?; } e.bin_jobs.insert(j[2], j); }
         Ok(())
     }
 }
