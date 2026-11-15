@@ -80,52 +80,56 @@ The next hardware slice is a separate Rockchip machine with UART/GICv3 and direc
 kernel/initramfs boot. Coordinate per-core CPU identity and system-register hooks
 before editing `arm-a64`. No empty Rockchip crate has been introduced here.
 
-## Orange Pi One adaptation (2026-11-15)
+## Orange Pi One (Allwinner H3), 2026-11-15
 
-Branch `orangepi-one` retains the Rockchip board identity and adds the distinct
-`orangepi-one` selector for the 1 GiB Allwinner H3 board. It is listed as not
-implemented and rejected before image resources are opened; `orangepi-pc` is not
-silently accepted as an alias. No Orange Pi hardware support is claimed yet.
+Started by an OpenCode session (bare-metal `arm-a32` and `allwinner-h3` slices), taken
+over and finished to a Linux shell by Claude Code. `orangepi-one` is a distinct board
+identity (`orangepi-pc` is not accepted as an alias).
 
-The H3 slice cannot reuse the AArch64 core or the Rockchip GICv3 work. The new
-interpreter-backed `arm-a32` crate implements an initial A32 subset: data processing,
-MOVW/MOVT, multiply, word/byte transfers, branches, basic exception entry, MRS and a
-small CP15 identity surface. The new `allwinner-h3` crate connects one core to based
-RAM and polled, four-byte-spaced 16550 UART0 registers. Its integration test executes
-real instructions at `0x4000_0000` which write `OK` to UART0 at `0x01c2_8000`.
+**What it is.** One Cortex-A7 on the interpreter-only `arm-a32` core (A32, VFPv4-D32,
+short-descriptor MMU with a TLB, physical and virtual architectural timers); the H3's
+GIC-400, DesignWare UART0 with interrupts, CCU (PLL lock bits, APB2 from OSC24M) and timer
+block. Every other address in the H3 device window (0x0100_0000-0x01ff_ffff) is a
+read-back register file, so the drivers of the distribution DTB probe without effect; the
+run summary lists the pages touched. Virtual time: 1 ns per instruction, the 24 MHz count
+advances 3 ticks per 125 instructions; `run` reports idle deadlines so the shared serial
+loop paces idle time against the wall clock.
 
-A second slice adds a one-CPU GIC-400 distributor/CPU interface with PPI/SPI priorities,
-level/edge inputs, acknowledge and EOI, plus the physical architectural timer's
-`CNTFRQ`, `CNTKCTL`, `CNTPCT`, `CNTP_TVAL/CVAL` and `CNTP_CTL` CP15 registers. The timer
-drives PPI 30 through the GIC. An integration test executes timer setup instructions,
-sleeps in WFI, enters the IRQ vector and acknowledges/ends the interrupt. Counter time
-currently advances one virtual tick per machine step, not at wall-clock 24 MHz.
+**Boot path.** Direct kernel boot with the distribution's DTB, adjusted as U-Boot adjusts
+it on the board: `/chosen` (bootargs, initrd), `/memory` (emulated DRAM size, 1 GiB by
+default) and a `/psci` node (SMC conduit) answered by the host (`PSCI 1.0`: version,
+features, system off/reset, affinity info; CPU_ON for secondaries is not offered yet).
+Load addresses are U-Boot's sunxi defaults. Unlike the Pi 4 (D2) no reduced DT is
+generated: the mainline H3 tree works unmodified because unmodelled devices read back.
 
-The Linux-oriented CPU slice adds MSR, LDM/STM in all four addressing modes,
-halfword/signed transfers, CLZ, bitfield extract, reverse/extend operations, BLX,
-long multiply, ARM divide, barrier/prefetch hints and the early CP15 identity/setup
-surface. Stock `multi_v7_defconfig` uses an A32 kernel with short descriptors rather
-than a Thumb-2 kernel or LPAE. The MMU walker implements sections, large/small pages,
-TTBR0/TTBR1/TTBCR selection, domains, AP/APX, XN/PXN and fault address/status registers.
-Tests cover execution through mappings, page-crossing accesses and translation,
-permission and instruction-fetch faults.
+**Fixture.** `scripts/orangepi-one-fixture.sh` downloads and verifies Alpine 3.24's
+`linux-lts-6.18.63-r0` (armv7) and `alpine-minirootfs-3.24.4-armhf`, extracts the zImage
+and `sun8i-h3-orangepi-one.dtb` unmodified and builds the initramfs (minirootfs + a
+serial-shell `/init`).
 
-This remains a bare-metal slice. Thumb, VFP/NEON, LPAE, exclusive synchronization,
-`zImage`/initramfs boot and a device tree are not implemented; the CLI still rejects
-`orangepi-one` as unimplemented. Remaining kernel instructions/direct boot, Sunxi MMC,
-native EMAC and four-core Sun8i CPUCFG/PRCM startup follow as separately tested
-increments. Threaded execution, snapshots, browser support, stock-image boot, USB,
-HDMI and Mali remain unsupported until their own evidence gates pass.
+| Artefact | SHA-256 |
+|---|---|
+| `zImage` (vmlinuz-lts) | `7bc559959b8eebc56c9417c92e5e4e50eb327ca43a2b78e40a691de3395f8a46` |
+| `sun8i-h3-orangepi-one.dtb` | `42e7943844553dd4c9b515ce762b290481eb33fecea08a3ddbf72a451463033e` |
+| `alpine-minirootfs-3.24.4-armhf.tar.gz` | `5d3c3debe55cbfca4f5b4252b0a3a7f75434bb6b6e3e1859fe917e02a4a326ed` |
+| `linux-lts-6.18.63-r0.apk` | `676ce55f608d0d19e18af783cadc70b80fd0da32dd01a85df589c2668daa485b` |
 
-After serial Linux boots, a reserved-RAM `simple-framebuffer` with fbcon can provide a
-visible generic firmware framebuffer; that is not native H3 HDMI. Native H3 DRM/KMS
-requires the display clocks/resets, DE2 mixer0 at `0x0110_0000`, TCON0 at `0x01c0_c000`,
-DW-HDMI at `0x01ee_0000` and its PHY at `0x01ef_0000`, plus virtual-monitor EDID/HPD,
-primary-plane scanout and vblank/page-flip behavior.
+**Evidence.** `scripts/orangepi-one-shell.txt` passes end to end: prompt, `uname`, DT model,
+VFPv4 in `/proc/cpuinfo` and `awk` floating point, `sleep 1` and `/proc/interrupts`, tmpfs
+write/read, `reboot -f` through PSCI to a second boot, `poweroff -f` through PSCI (two boots,
+41 s host time). `cargo test --release --workspace`: 124 passed, 0 failed.
+`tools/multi-board-smoke.py` on the Pi 4 fixtures: single and threaded runs pass.
 
-Validation on `orangepi-one`: `cargo test --release --workspace` passed all 92 tests,
-including 17 A32/MMU and five H3 integration tests; targeted rustfmt checks and
-`git diff --check` passed; and the existing smoke harness passed Pi boot, serial input
-and reset in both single-threaded and threaded modes.
-The fixture hashes are the same as above. A whole-workspace rustfmt check still reports
-pre-existing formatting drift in unrelated files, so no broad reformat was made.
+**Bugs found on the way** (each has a regression test in `arm-a32/tests/linux_userland.rs`):
+memory accesses with the MMU on were split into byte accesses with a table walk each
+(device registers broke, so the console stayed silent); post-indexed loads/stores wrote the
+base back when the access aborted (Linux's `__clear_user` retry then wrote one byte past
+the page and `execve` failed with EFAULT); `MLS`/`UMAAL` and the miscellaneous space
+(`SMC`, `QADD`, `SMLAxy`) fell through to data processing and executed as the wrong
+instruction; `CPS` decoded its A/I/F bits from the wrong positions.
+
+**Not yet.** SD/MMC, EMAC, USB, display, SMP (PSCI CPU_ON plus a second `arm-a32` core),
+Thumb-2 and NEON (both needed for Debian/Armbian armhf userlands and the RK3288 plan),
+a JIT, snapshots and the browser build. The RK3288 / panel board work builds on `arm-a32`;
+`arm-a32` needs a per-board CPU identity (MIDR, cache and feature ID registers) before a
+second board uses it.

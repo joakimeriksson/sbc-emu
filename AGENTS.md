@@ -41,8 +41,9 @@ Who is working where right now (update this table when you start or finish somet
 | Area | Crates / paths | Agent |
 |---|---|---|
 | Raspberry Pi 4: SoC, GPU (V3D), display, Ubuntu | `bcm2711/`, `v3d/`, `cli/src/vnc*.rs`, `web/` | Claude Code |
-| Multi-board foundation, Orange Pi 5 (RK3588S), Orange Pi One (H3, `arm-a32`, not merged yet) | `sbc-machine/`, `rk3588/`, `boards/` | Codex |
-| RK3288 / Tinker Board (plan: `docs/rk3288-tinker-board-plan.md`) | new `rk3288/` crate, `arm-a32` with Codex | unassigned |
+| Multi-board foundation, Orange Pi 5 (RK3588S) | `sbc-machine/`, `rk3588/`, `boards/` | Codex |
+| Orange Pi One (H3) and the 32-bit core | `allwinner-h3/`, `arm-a32/`, `cli/src/orangepi_one.rs` | Claude Code |
+| RK3288 / Tinker Board / RK3288 panel board (plan: `docs/rk3288-tinker-board-plan.md`) | new RK3288 crate; `arm-a32` changes go through its owner | Claude Code (separate session) |
 
 ## Never
 

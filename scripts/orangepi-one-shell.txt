@@ -6,7 +6,7 @@ wait-serial Xunlong Orange Pi One
 wait-serial orangepi-one#
 serial printf 'H3_%s' SHELL_OK; echo\r
 wait-serial H3_SHELL_OK
-serial grep -q vfpv4 /proc/cpuinfo && awk 'BEGIN{printf "FP_%s %.3f\n", "OK", 2.5*1.5}'\r
+serial grep -q vfpv4 /proc/cpuinfo && awk 'BEGIN{printf "FP_%s %.3f", "OK", 2.5*1.5}'; echo\r
 wait-serial FP_OK 3.750
 serial sleep 1; printf 'TIMER_%s' OK; echo; cat /proc/interrupts\r
 wait-serial TIMER_OK

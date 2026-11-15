@@ -58,14 +58,10 @@ fn execute(args: &[String]) -> Result<(), String> {
         Ok(m)
     };
     if let Some(path) = arg(args, "--dump-dtb") {
-        let blob = make_machine().and_then(|m| {
-            let range = initrd.as_ref().map(|d| {
-                (allwinner_h3::boot::INITRD_ADDR, allwinner_h3::boot::INITRD_ADDR + d.len() as u32)
-            });
-            drop(m);
-            allwinner_h3::boot::prepare_device_tree(&dtb, ram as u64, cmdline, range)
-        })?;
-        std::fs::write(path, blob).map_err(|e| e.to_string())?;
+        use allwinner_h3::boot::{prepare_device_tree, INITRD_ADDR};
+        let range = initrd.as_ref().map(|d| (INITRD_ADDR, INITRD_ADDR + d.len() as u32));
+        let blob = prepare_device_tree(&dtb, ram as u64, cmdline, range)?;
+        std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(
         "[orangepi-one] experimental Allwinner H3: one Cortex-A7 (interpreter), GIC-400, UART0, timers; \
