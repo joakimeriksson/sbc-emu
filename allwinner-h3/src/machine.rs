@@ -1,4 +1,5 @@
 use crate::display::{Display, HDMI_IRQ, TCON0_IRQ};
+use crate::emac::{Emac, EMAC_BASE, EMAC_IRQ, EMAC_SIZE};
 use crate::gic::NCPU;
 use crate::usb::{Dma, Ehci, Ohci};
 use emu_core::usb::{Keyboard, Tablet};
@@ -58,6 +59,10 @@ pub struct Soc {
     pub kbd: Keyboard,
     /// USB tablet (absolute pointer) on port 0 (the micro-USB OTG socket in host mode).
     pub tablet: Tablet,
+    /// Ethernet MAC with its internal PHY.
+    pub emac: Emac,
+    /// The network the Ethernet port is plugged into (None: no cable).
+    pub net: Option<sbc_net::net::VirtualNet>,
     /// CCU registers (PLLs, bus gates, resets, module clocks), byte offset / 4.
     ccu: Vec<u32>,
     /// Current 24 MHz time, set by the machine before each step.
@@ -82,6 +87,23 @@ impl Soc {
         let mut dma = Dma { mem: &mut self.ram.mem, base: self.ram.base };
         self.ohci[0].update(now, &mut dma, Some(&mut self.tablet));
         self.ohci[1].update(now, &mut dma, Some(&mut self.kbd));
+    }
+
+    /// Exchange frames between the Ethernet MAC and the network; true while the port
+    /// has to be polled: frames wait for descriptors, or the NAT has connections to serve.
+    fn pump_network(&mut self, now: u64) -> bool {
+        let now_us = crate::machine::ticks_to_ns(now) / 1000;
+        match self.net.as_mut() {
+            Some(net) => {
+                for frame in std::mem::take(&mut self.emac.tx_out) {
+                    self.emac.rx_queue.extend(net.handle(&frame, now_us));
+                }
+                self.emac.rx_queue.extend(net.poll(now_us));
+            }
+            None => self.emac.tx_out.clear(),
+        }
+        self.emac.receive(&mut Dma { mem: &mut self.ram.mem, base: self.ram.base });
+        self.emac.rx_pending() || self.net.as_ref().is_some_and(|net| net.nat.is_some())
     }
 
     /// The USB controller and register offset at `addr`: (port, is OHCI, offset).
@@ -109,6 +131,8 @@ impl Soc {
             ohci: [Ohci::new(true), Ohci::new(true)],
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
+            emac: Emac::default(),
+            net: None,
             ccu: Self::ccu_reset(),
             now: 0,
             dirty: true,
@@ -201,6 +225,9 @@ impl Soc {
             if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
                 return Ok(self.mmc.read(addr - MMC0_BASE));
             }
+            if Self::in_region(addr, 4, EMAC_BASE, EMAC_SIZE) {
+                return Ok(self.emac.read(addr - EMAC_BASE));
+            }
             if let Some((port, ohci, offset)) = Self::usb_register(addr) {
                 return Ok(if ohci { self.ohci[port].read(offset) } else { self.ehci[port].read(offset) });
             }
@@ -244,6 +271,11 @@ impl Soc {
             }
             if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
                 self.mmc.write(addr - MMC0_BASE, value, &mut self.ram);
+                return Ok(());
+            }
+            if Self::in_region(addr, 4, EMAC_BASE, EMAC_SIZE) {
+                let mut dma = Dma { mem: &mut self.ram.mem, base: self.ram.base };
+                self.emac.write(addr - EMAC_BASE, value, &mut dma);
                 return Ok(());
             }
             if let Some((port, ohci, offset)) = Self::usb_register(addr) {
@@ -420,6 +452,18 @@ impl Machine {
         self.soc.gic.reset_cpu_interface(index);
     }
 
+    /// Plug the Ethernet port into the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP);
+    /// `nat` also relays guest TCP/UDP to the host's network (native builds only).
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.net = Some(net);
+    }
+
     /// ARM32 Linux zImage entry on core 0: r0 = 0, r1 = ~0, r2 = the DTB address.
     /// Cores 1-3 stay off until PSCI CPU_ON.
     pub fn boot_linux(&mut self, entry: u32, dtb: u32) {
@@ -486,6 +530,12 @@ impl Machine {
         self.soc.gic.set_level(HDMI_IRQ, hdmi);
         let mut next = self.soc.display.next_deadline().unwrap_or(u64::MAX);
         self.soc.usb_update(now);
+        if self.soc.pump_network(now) {
+            // poll the network every millisecond while the interface receives
+            next = next.min(now + 24_000);
+        }
+        let emac = self.soc.emac.irq();
+        self.soc.gic.set_level(EMAC_IRQ, emac);
         for port in 0..2 {
             let (ehci, ohci) = (self.soc.ehci[port].irq(), self.soc.ohci[port].irq());
             self.soc.gic.set_level(EHCI_IRQS[port], ehci);

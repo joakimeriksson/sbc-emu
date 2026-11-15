@@ -29,13 +29,13 @@ impl Dma<'_> {
             self.mem[r].copy_from_slice(&value.to_le_bytes());
         }
     }
-    fn read(&self, addr: u32, out: &mut [u8]) {
+    pub fn read(&self, addr: u32, out: &mut [u8]) {
         match self.range(addr, out.len()) {
             Some(r) => out.copy_from_slice(&self.mem[r]),
             None => out.fill(0),
         }
     }
-    fn write(&mut self, addr: u32, data: &[u8]) {
+    pub fn write(&mut self, addr: u32, data: &[u8]) {
         if let Some(r) = self.range(addr, data.len()) {
             self.mem[r].copy_from_slice(data);
         }

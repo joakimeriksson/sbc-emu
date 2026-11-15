@@ -30,6 +30,9 @@ impl SerialBoard for allwinner_h3::Machine {
                 eprintln!("[{tag}] core {k}: last UNDEFINED instruction {insn:#010x} at {pc:#010x}");
             }
         }
+        if self.soc.emac.tx_frames + self.soc.emac.rx_frames > 0 {
+            eprintln!("[{tag}] Ethernet: {} frames sent, {} received", self.soc.emac.tx_frames, self.soc.emac.rx_frames);
+        }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames scanned out", self.soc.display.frames);
         }
@@ -79,7 +82,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode", "--net"])?;
+    let net = arg(args, "--net").unwrap_or("nat");
+    if !matches!(net, "nat" | "local" | "none") {
+        return Err("--net nat|local|none".into());
+    }
     let mode = match arg(args, "--hdmi-mode") {
         Some(spec) => {
             let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
@@ -122,6 +129,9 @@ fn execute(args: &[String]) -> Result<(), String> {
     let make_machine = || -> Result<allwinner_h3::Machine, String> {
         let mut m = allwinner_h3::Machine::with_ram_size(ram);
         m.soc.display = Display::new(mode);
+        if net != "none" {
+            m.connect_network(net == "nat", false);
+        }
         m.soc.mmc.card.disk = disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         if card_boot {
             let boot = allwinner_h3::boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
