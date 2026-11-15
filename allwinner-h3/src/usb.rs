@@ -228,6 +228,7 @@ impl Ohci {
         match index {
             HC_INTERRUPT_DISABLE => self.regs[HC_INTERRUPT_ENABLE],
             HC_FM_REMAINING => self.regs[HC_FM_INTERVAL] & 0x3fff,
+            HC_DONE_HEAD => self.done_head,
             HC_RH_PORT_STATUS => self.regs[index] | PPS,
             _ if index < OHCI_REGS => self.regs[index],
             _ => 0,
@@ -430,7 +431,8 @@ impl Ohci {
             };
             // data toggle: from the TD if its T bit 1 is set, else the endpoint's carry
             let toggle = if td_info & (1 << 25) != 0 { td_info >> 24 & 1 } else { head_word >> 1 & 1 };
-            let packets = done.div_ceil(mps).max(1) as u32;
+            // only acknowledged packets advance the toggle
+            let packets = if cc == CC_NO_ERROR { done.div_ceil(mps).max(1) as u32 } else { 0 };
             let toggle = (toggle + packets) & 1;
             let short = done < len;
             if cc == CC_NO_ERROR && short && td_info & (1 << 18) == 0 {

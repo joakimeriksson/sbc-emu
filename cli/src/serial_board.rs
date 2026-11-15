@@ -204,15 +204,18 @@ pub(crate) fn run<B: SerialBoard>(
                 }
                 "sleep" => {
                     let seconds: f64 = rest.trim().parse().map_err(|_| format!("script: {line}"))?;
-                    sleep_until = Some(m.now() + (seconds * 1e9) as u64);
+                    sleep_until = Some(m.now().saturating_add((seconds * 1e9) as u64));
                     true
                 }
                 // keystrokes on the board's USB keyboard (\n is Enter)
                 "type" => {
-                    if let Some(screen) = m.screen() {
-                        for b in rest.replace("\\n", "\r").bytes() {
-                            screen.type_byte(b);
+                    match m.screen() {
+                        Some(screen) => {
+                            for b in rest.replace("\\n", "\r").bytes() {
+                                screen.type_byte(b);
+                            }
                         }
+                        None => eprintln!("[{tag}] script: this board has no keyboard; 'type' ignored"),
                     }
                     true
                 }
