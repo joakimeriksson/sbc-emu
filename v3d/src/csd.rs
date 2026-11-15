@@ -37,6 +37,8 @@ pub fn run(cfg: &[u32], m: &mut Gmem, code: &mut Code, insns: &mut u64) {
     let mut env = CsEnv { m };
     let mut wg = 0u64;
     while wg < total_wgs {
+        // a shader in this job ran away: the remaining workgroups are not dispatched
+        if code.runaway { return; }
         let in_sg = (wgs_per_sg as u64).min(total_wgs - wg) as u32;
         let invocations = in_sg * wg_size;
         let batches = (invocations + 15) / 16;
@@ -93,8 +95,8 @@ mod tests {
         let branch = 16u64 << 53 | (0x1000u64 >> 3) << 35;
         let nop = 0x3c00_3186_bb80_0000u64;
         for (k, w) in [branch, nop, nop, nop].iter().enumerate() { ram[0x1000 + k * 8..0x1008 + k * 8].copy_from_slice(&w.to_le_bytes()); }
-        // one workgroup of 64 invocations: four batches of 16
-        let cfg = [1 << 16, 1 << 16, 1 << 16, 64 | 1 << 8, 0, 0x1000, 0x2000];
+        // 4096 workgroups of 64 invocations, one per supergroup: four batches of 16 each
+        let cfg = [4096 << 16, 1 << 16, 1 << 16, 64 | 1 << 8, 0, 0x1000, 0x2000];
         let mut m = Gmem::new(&mut ram, 0, false);
         let mut code = Code::default();
         let mut insns = 0;
