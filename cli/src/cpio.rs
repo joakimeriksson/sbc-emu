@@ -43,14 +43,22 @@ exec setsid -c /bin/sh -l <$I >$T 2>&1
 "#;
 
 pub fn busybox_initramfs(busybox: &[u8]) -> Vec<u8> {
+    initramfs(busybox, INIT, "pi4# ")
+}
+
+pub fn orangepi_initramfs(busybox: &[u8]) -> Vec<u8> {
+    initramfs(busybox, &INIT.replace("ttyAMA0", "ttyS2"), "orangepi5# ")
+}
+
+fn initramfs(busybox: &[u8], init: &str, prompt: &str) -> Vec<u8> {
     let mut c = Cpio { buf: Vec::new(), ino: 0 };
     for d in ["bin", "sbin", "dev", "proc", "sys", "tmp", "etc", "root"] { c.dir(d); }
     c.chardev("dev/console", 5, 1);
     c.chardev("dev/null", 1, 3);
     c.file("bin/busybox", 0o755, busybox);
     c.symlink("bin/sh", "busybox");
-    c.file("init", 0o755, INIT.as_bytes());
-    c.file("etc/profile", 0o644, b"export PS1='pi4# '\nexport PATH=/bin:/sbin\n");
+    c.file("init", 0o755, init.as_bytes());
+    c.file("etc/profile", 0o644, format!("export PS1='{prompt}'\nexport PATH=/bin:/sbin\n").as_bytes());
     c.entry("TRAILER!!!", 0, &[], (0, 0));
     c.buf
 }

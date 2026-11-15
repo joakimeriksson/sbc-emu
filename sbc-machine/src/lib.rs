@@ -7,13 +7,13 @@
 mod board;
 pub use board::Board;
 
-// Transitional compatibility alias: retain every existing stop payload. Move this
-// to a neutral definition when the second machine needs to produce these reasons.
-pub use bcm2711::Stop;
+// Both board implementations use the same neutral stop reasons.
+pub use emu_core::Stop;
 
 /// A borrowed host view; ownership and board-specific configuration stay with adapters.
 pub enum Machine<'a> {
     Pi4(&'a mut bcm2711::Machine),
+    OrangePi5(&'a mut rk3588::Machine),
 }
 
 impl Machine<'_> {
@@ -26,6 +26,7 @@ impl Machine<'_> {
     pub fn run(&mut self, budget: u64) -> Stop {
         match self {
             Self::Pi4(m) => m.run(budget),
+            Self::OrangePi5(m) => m.run(budget),
         }
     }
 
@@ -34,6 +35,7 @@ impl Machine<'_> {
     pub fn idle_until(&mut self, time_ns: u64) {
         match self {
             Self::Pi4(m) => m.idle_until(time_ns),
+            Self::OrangePi5(m) => m.idle_until(time_ns),
         }
     }
 
@@ -41,6 +43,7 @@ impl Machine<'_> {
     /// The adapter must retain an unaccepted byte and retry after guest progress.
     pub fn serial_input(&mut self, byte: u8) -> bool {
         match self {
+            Self::OrangePi5(m) => m.serial_input(byte),
             Self::Pi4(m) => {
                 if !m.soc.uart.rx_room() {
                     return false;
@@ -56,12 +59,14 @@ impl Machine<'_> {
     pub fn serial_output(&self) -> &[u8] {
         match self {
             Self::Pi4(m) => &m.soc.uart.out,
+            Self::OrangePi5(m) => &m.soc.uart.out,
         }
     }
 
     pub fn take_serial_output(&mut self) -> Vec<u8> {
         match self {
             Self::Pi4(m) => std::mem::take(&mut m.soc.uart.out),
+            Self::OrangePi5(m) => std::mem::take(&mut m.soc.uart.out),
         }
     }
 }

@@ -24,6 +24,18 @@ impl Exc {
 /// fields laid out after the tables with short immediate offsets (512 breaks that).
 pub(crate) const UT: usize = 256;
 
+/// Board-selected CPU identity. ISA feature registers still advertise implemented features only.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuProfile {
+    pub midr: u64,
+    pub gic_sysregs: bool,
+}
+impl CpuProfile {
+    pub const CORTEX_A72: Self = Self { midr: 0x410f_d083, gic_sysregs: false };
+    /// Reduced A55 profile: no LSE/FP16/RAS advertised until those features exist.
+    pub const CORTEX_A55: Self = Self { midr: 0x412f_d050, gic_sysregs: true };
+}
+
 pub struct Cpu {
     pub x: [u64; 31],
     /// SP_EL0..SP_EL3
@@ -123,6 +135,9 @@ pub struct Cpu {
     /// an inner-shareable TLBI ran: the other cores must do the same (`Cpu::tlb_invalidate`
     /// operand: a VA, or u64::MAX for everything); the machine takes it
     pub tlbi_bcast: Option<u64>,
+    /// Immutable board configuration; existing Pi snapshots retain their original format.
+    /// Boards must reconstruct this profile before loading architectural state.
+    pub profile: CpuProfile,
 }
 
 // SAFETY: `ram` is only dereferenced by the core that owns it; see the field documentation.
@@ -138,6 +153,7 @@ impl Cpu {
     /// A core out of reset at EL3, MMU off, all interrupts masked.
     pub fn new() -> Self {
         Cpu {
+            profile: CpuProfile::CORTEX_A72,
             x: [0; 31],
             sp: [0; 4],
             pc: 0,

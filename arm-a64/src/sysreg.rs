@@ -96,11 +96,11 @@ impl Cpu {
         if (k >> 7) & 15 == 14 { self.refresh_counter(); }
         let s = &self.sys;
         match k {
-            MIDR_EL1 => 0x410f_d083,
+            MIDR_EL1 => self.profile.midr,
             MPIDR_EL1 => 0x8000_0000 | s.mpidr,
             REVIDR_EL1 => 0,
             // EL0..EL3 AArch64 only, FP and AdvSIMD implemented, no GIC system registers
-            ID_AA64PFR0_EL1 => 0x1111,
+            ID_AA64PFR0_EL1 => 0x1111 | if self.profile.gic_sysregs { 1 << 24 } else { 0 },
             ID_AA64DFR0_EL1 => 0x0000_0006,
             // no AES/SHA/CRC32/atomics
             // CRC32 (as the Pi 4's Cortex-A72; no crypto extension on the BCM2711)

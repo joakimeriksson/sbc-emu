@@ -3,6 +3,9 @@
 //! step stopped). No dependencies, no chip knowledge.
 
 pub mod snap;
+pub mod fdt;
+mod stop;
+pub use stop::Stop;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
@@ -22,6 +25,10 @@ pub trait Bus {
     fn write16(&mut self, addr: u64, v: u16) -> Result<(), Fault>;
     fn write32(&mut self, addr: u64, v: u32) -> Result<(), Fault>;
     fn write64(&mut self, addr: u64, v: u64) -> Result<(), Fault>;
+    /// Optional CPU-interface devices addressed through architectural system registers.
+    /// Default buses have no such devices. The CPU checks access permissions first.
+    fn read_sysreg(&mut self, _key: u32) -> Option<u64> { None }
+    fn write_sysreg(&mut self, _key: u32, _value: u64) -> bool { false }
     /// Instruction fetch (4-byte aligned).
     fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
         self.read32(pc)

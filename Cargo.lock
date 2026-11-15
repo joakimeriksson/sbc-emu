@@ -40,12 +40,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk3588"
+version = "0.0.1"
+dependencies = [
+ "arm-a64",
+ "emu-core",
+]
+
+[[package]]
 name = "sbc-emu"
 version = "0.0.1"
 dependencies = [
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "rk3588",
  "sbc-machine",
  "v3d",
 ]
@@ -65,6 +74,8 @@ name = "sbc-machine"
 version = "0.0.1"
 dependencies = [
  "bcm2711",
+ "emu-core",
+ "rk3588",
 ]
 
 [[package]]

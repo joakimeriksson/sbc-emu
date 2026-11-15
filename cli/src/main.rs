@@ -12,6 +12,7 @@ mod vnc;
 mod vnc_des;
 mod wav;
 mod pi4;
+mod orangepi;
 
 use sbc_machine::Board;
 use std::io::Write;
@@ -31,7 +32,9 @@ fn main() -> ExitCode {
         Some("mkinitramfs") => {
             let (Some(bb), Some(out)) = (arg(&args, "--busybox"), arg(&args, "-o")) else { return usage() };
             let busybox = match std::fs::read(bb) { Ok(b) => b, Err(e) => { eprintln!("{bb}: {e}"); return ExitCode::FAILURE } };
-            std::fs::write(out, cpio::busybox_initramfs(&busybox)).unwrap();
+            let board = match Board::from_args(&args) { Ok(b) => b, Err(e) => {eprintln!("{e}");return ExitCode::from(2);} };
+            let image = if board == Board::OrangePi5 { cpio::orangepi_initramfs(&busybox) } else { cpio::busybox_initramfs(&busybox) };
+            std::fs::write(out, image).unwrap();
             ExitCode::SUCCESS
         }
         Some("run") => run(&args),
@@ -62,7 +65,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs [--board pi4b|orangepi5] --busybox PATH -o OUT.cpio\n  sbc-emu run [--board pi4b|orangepi5] --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--script FILE]\n  sbc-emu run [--board pi4b] --sd IMAGE.img [same options]");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs [--board pi4b|orangepi5] --busybox PATH -o OUT.cpio\n  sbc-emu run [--board pi4b] --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N[,password=PW]] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--hdmi-mode WxH] [--no-gpu] [--sd-persist]\n  sbc-emu run [--board pi4b] --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
     ExitCode::from(2)
 }
 
@@ -78,6 +81,7 @@ fn run(args: &[String]) -> ExitCode {
     }
     match board {
         Board::Pi4 => pi4::run(args),
-        Board::Pi3 | Board::OrangePi5 => unreachable!("checked above"),
+        Board::OrangePi5 => orangepi::run(args),
+        Board::Pi3 => unreachable!("checked above"),
     }
 }

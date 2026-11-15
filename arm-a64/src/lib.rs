@@ -12,4 +12,4 @@ mod neon;
 mod simd;
 pub mod sysreg;
 
-pub use cpu::{Cpu, Exc};
+pub use cpu::{Cpu, CpuProfile, Exc};

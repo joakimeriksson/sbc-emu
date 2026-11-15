@@ -731,6 +731,20 @@ impl Cpu {
                 if !self.sysreg_accessible(op1) {
                     return Err(self.sync_exception(Exc::SYSREG, 0, self.pc, None));
                 }
+                // GICv3 CPU interface belongs to the board bus. Both execution engines
+                // reach this path; stop chaining before re-evaluating the interrupt line.
+                if self.profile.gic_sysregs && op0 == 3 &&
+                    ((op1 == 0 && crn == 12 && matches!(crm, 8 | 9 | 11 | 12 | 13)) ||
+                     (op1 == 0 && crn == 4 && crm == 6 && op2 == 0) ||
+                     (matches!(op1, 4 | 6) && crn == 12 && crm == 9 && op2 == 5)) {
+                    self.chain_stop = true;
+                    // Device reads/writes cannot be replayed by JIT verification.
+                    if let Some(log) = self.store_log.as_mut() { log.push((usize::MAX, Vec::new())); }
+                    if l {
+                        if let Some(v) = bus.read_sysreg(key) { self.set_x(rt, v); return Ok(()); }
+                    } else if bus.write_sysreg(key, self.xr(rt)) { return Ok(()); }
+                    return Err(self.undefined());
+                }
                 if l {
                     let v = self.read_sysreg(key);
                     self.set_x(rt, v);

@@ -22,12 +22,12 @@ impl Board {
         match self {
             Self::Pi4 => "BCM2711 (4x Cortex-A72, GIC-400, UART, SD, USB keyboard, Ethernet, Wi-Fi, GPIO/I2C/SPI)",
             Self::Pi3 => "unverified: BCM2837 SoC model not yet implemented",
-            Self::OrangePi5 => "not implemented: Orange Pi 5 / RK3588S",
+            Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (one A55, GICv3, UART2, direct Linux boot)",
         }
     }
 
     pub fn require_implemented(self) -> Result<(), String> {
-        if self == Self::Pi4 {
+        if matches!(self, Self::Pi4 | Self::OrangePi5) {
             Ok(())
         } else {
             Err(format!(

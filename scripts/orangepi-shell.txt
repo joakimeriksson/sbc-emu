@@ -1,0 +1,17 @@
+# A shell marker alone is insufficient: prove input, filesystem, timer and reset.
+wait-serial orangepi5#
+serial uname -a; cat /proc/device-tree/model; echo\r
+wait-serial orangepi5#
+serial printf 'RK_%s' SHELL_OK; echo\r
+wait-serial RK_SHELL_OK
+serial sleep 1; printf 'TIMER_%s' OK; echo; cat /proc/interrupts\r
+wait-serial TIMER_OK
+wait-serial orangepi5#
+serial echo rockchip-test > /tmp/probe; test "$(cat /tmp/probe)" = rockchip-test && printf 'FS_%s' OK; echo\r
+wait-serial FS_OK
+serial reboot -f\r
+wait-serial Booting Linux on physical CPU
+wait-serial orangepi5#
+serial printf 'REBOOT_%s' OK; echo\r
+wait-serial REBOOT_OK
+serial poweroff -f\r

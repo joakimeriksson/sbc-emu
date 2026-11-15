@@ -14,9 +14,8 @@ fn lists_support_honestly_and_rejects_before_opening_images() {
     let listing = String::from_utf8(output.stdout).unwrap();
     assert!(listing
         .lines()
-        .any(|l| l.starts_with("orangepi5") && l.contains("not implemented")));
+        .any(|l| l.starts_with("orangepi5") && l.contains("experimental")));
     for (board, error) in [
-        ("orangepi5", "not implemented"),
         ("pi3b", "not implemented"),
         ("typo", "unknown board"),
     ] {
