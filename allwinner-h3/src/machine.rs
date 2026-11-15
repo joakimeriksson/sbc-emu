@@ -1,4 +1,7 @@
+use crate::display::{Display, HDMI_IRQ, TCON0_IRQ};
 use crate::gic::NCPU;
+use crate::usb::{Dma, Ehci, Ohci};
+use emu_core::usb::{Keyboard, Tablet};
 use crate::{Gic, SunxiMmc, Timer, Uart};
 use arm_a32::Cpu;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
@@ -29,6 +32,12 @@ const TIMER_SIZE: u64 = 0x40;
 pub const MMC0_BASE: u64 = 0x01c0_f000;
 const MMC_SIZE: u64 = 0x1000;
 pub const MMC0_IRQ: usize = 32 + 60;
+/// USB host ports 0 (shared with OTG) and 1: EHCI at +0, OHCI at +0x400; interrupts
+/// EHCI0 SPI 72, OHCI0 SPI 73, EHCI1 SPI 74, OHCI1 SPI 75.
+pub const USB_HOST_BASES: [u64; 2] = [0x01c1_a000, 0x01c1_b000];
+const OHCI_OFFSET: u64 = 0x400;
+pub const EHCI_IRQS: [usize; 2] = [32 + 72, 32 + 74];
+pub const OHCI_IRQS: [usize; 2] = [32 + 73, 32 + 75];
 /// Timer 0/1 interrupts: SPI 18/19.
 pub const TIMER_IRQS: [usize; 2] = [32 + 18, 32 + 19];
 const GICD_SIZE: u64 = 0x1000;
@@ -41,6 +50,14 @@ pub struct Soc {
     pub gic: Gic,
     pub timer: Timer,
     pub mmc: SunxiMmc,
+    /// DE2 mixer, TCON0 and HDMI.
+    pub display: Display,
+    pub ehci: [Ehci; 2],
+    pub ohci: [Ohci; 2],
+    /// USB keyboard on host port 1 (the board's USB-A socket).
+    pub kbd: Keyboard,
+    /// USB tablet (absolute pointer) on port 0 (the micro-USB OTG socket in host mode).
+    pub tablet: Tablet,
     /// CCU registers (PLLs, bus gates, resets, module clocks), byte offset / 4.
     ccu: Vec<u32>,
     /// Current 24 MHz time, set by the machine before each step.
@@ -55,6 +72,31 @@ pub struct Soc {
 }
 
 impl Soc {
+    /// What the HDMI output shows, as RGBA (None while the display is off).
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.display.render(&self.ram.mem, self.ram.base, out)
+    }
+
+    /// Run the USB frames due by tick `now`.
+    fn usb_update(&mut self, now: u64) {
+        let mut dma = Dma { mem: &mut self.ram.mem, base: self.ram.base };
+        self.ohci[0].update(now, &mut dma, Some(&mut self.tablet));
+        self.ohci[1].update(now, &mut dma, Some(&mut self.kbd));
+    }
+
+    /// The USB controller and register offset at `addr`: (port, is OHCI, offset).
+    fn usb_register(addr: u64) -> Option<(usize, bool, u64)> {
+        USB_HOST_BASES.iter().enumerate().find_map(|(port, &base)| {
+            if Self::in_region(addr, 4, base, Ehci::SIZE) {
+                Some((port, false, addr - base))
+            } else if Self::in_region(addr, 4, base + OHCI_OFFSET, Ohci::SIZE) {
+                Some((port, true, addr - base - OHCI_OFFSET))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn new(ram_size: usize) -> Self {
         Self {
             ram: FlatRam::new(RAM_BASE, ram_size),
@@ -62,6 +104,11 @@ impl Soc {
             gic: Gic::default(),
             timer: Timer::default(),
             mmc: SunxiMmc::default(),
+            display: Display::default(),
+            ehci: Default::default(),
+            ohci: [Ohci::new(true), Ohci::new(true)],
+            kbd: Keyboard::default(),
+            tablet: Tablet::default(),
             ccu: Self::ccu_reset(),
             now: 0,
             dirty: true,
@@ -141,6 +188,9 @@ impl Soc {
 
     fn mmio_read(&mut self, addr: u64, width: u64) -> Result<u32, Fault> {
         self.dirty = true;
+        if let Some(value) = self.display.read(addr, width) {
+            return Ok(value);
+        }
         if width == 4 && addr & 3 == 0 {
             if Self::in_region(addr, 4, CCU_BASE, CCU_SIZE) {
                 return Ok(self.ccu_read(addr - CCU_BASE));
@@ -150,6 +200,9 @@ impl Soc {
             }
             if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
                 return Ok(self.mmc.read(addr - MMC0_BASE));
+            }
+            if let Some((port, ohci, offset)) = Self::usb_register(addr) {
+                return Ok(if ohci { self.ohci[port].read(offset) } else { self.ehci[port].read(offset) });
             }
         }
         match Self::uart_offset(addr, width) {
@@ -177,6 +230,9 @@ impl Soc {
 
     fn mmio_write(&mut self, addr: u64, width: u64, value: u32) -> Result<(), Fault> {
         self.dirty = true;
+        if self.display.write(addr, width, value) {
+            return Ok(());
+        }
         if width == 4 && addr & 3 == 0 {
             if Self::in_region(addr, 4, CCU_BASE, CCU_SIZE) {
                 self.ccu[((addr - CCU_BASE) / 4) as usize] = value & !(1 << 28);
@@ -188,6 +244,14 @@ impl Soc {
             }
             if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
                 self.mmc.write(addr - MMC0_BASE, value, &mut self.ram);
+                return Ok(());
+            }
+            if let Some((port, ohci, offset)) = Self::usb_register(addr) {
+                if ohci {
+                    self.ohci[port].write(offset, value, self.now);
+                } else {
+                    self.ehci[port].write(offset, value);
+                }
                 return Ok(());
             }
         }
@@ -416,7 +480,20 @@ impl Machine {
         self.soc.gic.set_level(UART0_IRQ, uart);
         let mmc = self.soc.mmc.irq();
         self.soc.gic.set_level(MMC0_IRQ, mmc);
-        let mut next = u64::MAX;
+        self.soc.display.update(now);
+        let (tcon, hdmi) = (self.soc.display.tcon_irq(), self.soc.display.hdmi_irq());
+        self.soc.gic.set_level(TCON0_IRQ, tcon);
+        self.soc.gic.set_level(HDMI_IRQ, hdmi);
+        let mut next = self.soc.display.next_deadline().unwrap_or(u64::MAX);
+        self.soc.usb_update(now);
+        for port in 0..2 {
+            let (ehci, ohci) = (self.soc.ehci[port].irq(), self.soc.ohci[port].irq());
+            self.soc.gic.set_level(EHCI_IRQS[port], ehci);
+            self.soc.gic.set_level(OHCI_IRQS[port], ohci);
+            if let Some(frame) = self.soc.ohci[port].next_deadline() {
+                next = next.min(frame);
+            }
+        }
         for k in 0..NCPU {
             let cpu = &self.cpus[k];
             self.timer_state[k] = Self::timer_state_of(cpu);

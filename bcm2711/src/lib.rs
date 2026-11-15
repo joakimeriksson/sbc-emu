@@ -25,7 +25,8 @@ pub mod pcie;
 pub mod i2s;
 pub mod bluetooth;
 pub mod vc4;
-pub mod usbdev;
+/// USB devices (keyboard, tablet, storage, camera), shared with the other boards.
+pub use emu_core::usb as usbdev;
 pub mod xhci;
 
 pub use machine::{Machine, Stop};
