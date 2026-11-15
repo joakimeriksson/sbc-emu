@@ -113,3 +113,86 @@ mod tests {
         assert!(prepare_device_tree(&fdt.finish(), 1 << 30, "", None).is_err());
     }
 }
+
+/// What `boot_from_card` loaded, for the run banner.
+#[derive(Debug)]
+pub struct CardBoot {
+    pub cmdline: String,
+    pub kernel_bytes: usize,
+    pub initrd_bytes: usize,
+    pub notes: Vec<String>,
+}
+
+/// Emulated boot firmware for an Armbian (or similar) SD card: do what U-Boot and the
+/// image's `boot.scr` do, then boot the kernel directly. Reads `/boot/armbianEnv.txt`,
+/// `/boot/zImage`, `/boot/dtb/sun8i-h3-orangepi-one.dtb` and `/boot/uInitrd` (U-Boot
+/// legacy header stripped) from the first Linux partition of the card in mmc0.
+pub fn boot_from_card(machine: &mut Machine, extra_args: &str) -> Result<CardBoot, String> {
+    use emu_core::ext4::{mbr_partitions, Ext4};
+    let disk = machine.soc.mmc.card.disk.as_mut().ok_or("no SD card (--sd IMAGE)")?;
+    let mut mbr = [0u8; 512];
+    disk.read(0, &mut mbr);
+    let disk_id = u32::from_le_bytes(mbr[440..444].try_into().unwrap());
+    let (index, part) = mbr_partitions(disk.as_mut())
+        .into_iter()
+        .enumerate()
+        .find(|(_, (ty, _, _))| *ty == 0x83)
+        .ok_or("no Linux partition on the SD card")?;
+    let mut fs = Ext4::open(disk.as_mut(), part.1)?;
+    let mut notes = Vec::new();
+    let mut env = std::collections::HashMap::new();
+    if let Ok(text) = fs.read_file("/boot/armbianEnv.txt") {
+        for line in String::from_utf8_lossy(&text).lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                env.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+    } else {
+        notes.push("no /boot/armbianEnv.txt: defaults".into());
+    }
+    let get = |key: &str, default: &str| env.get(key).cloned().unwrap_or_else(|| default.to_string());
+    if env.get("overlays").is_some_and(|o| !o.is_empty()) || env.get("user_overlays").is_some_and(|o| !o.is_empty()) {
+        notes.push("device tree overlays in armbianEnv.txt are not applied".into());
+    }
+    let kernel = fs.read_file("/boot/zImage")?;
+    let dtb = fs
+        .read_file("/boot/dtb/sun8i-h3-orangepi-one.dtb")
+        .or_else(|_| fs.read_file("/boot/dtb/allwinner/sun8i-h3-orangepi-one.dtb"))?;
+    let mut initrd = fs.read_file("/boot/uInitrd").ok();
+    if let Some(data) = initrd.as_mut() {
+        // U-Boot legacy image: 64-byte header (magic 0x27051956), then the payload.
+        if data.len() > 64 && data[..4] == [0x27, 0x05, 0x19, 0x56] {
+            let size = u32::from_be_bytes(data[12..16].try_into().unwrap()) as usize;
+            *data = data[64..(64 + size).min(data.len())].to_vec();
+        }
+    }
+    // boot.cmd: root, consoles (serial last, so /dev/console is the serial port: there
+    // is no display model), log level, the partition U-Boot booted from.
+    let consoles = match get("console", "both").as_str() {
+        "display" => "console=tty1",
+        "serial" => "console=ttyS0,115200",
+        _ => "console=tty1 console=ttyS0,115200",
+    };
+    let cmdline = format!(
+        "root={} rootwait rootfstype={} splash=verbose {} consoleblank=0 loglevel={} ubootpart={:08x}-{:02x} ubootsource=mmc {} {}",
+        get("rootdev", &format!("UUID={}", fs.uuid_string())),
+        get("rootfstype", "ext4"),
+        consoles,
+        get("verbosity", "1"),
+        disk_id,
+        index + 1,
+        get("extraargs", ""),
+        extra_args
+    )
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let boot = CardBoot {
+        cmdline: cmdline.clone(),
+        kernel_bytes: kernel.len(),
+        initrd_bytes: initrd.as_ref().map_or(0, |d| d.len()),
+        notes,
+    };
+    boot_linux(machine, &kernel, &dtb, initrd.as_deref(), &cmdline)?;
+    Ok(boot)
+}
