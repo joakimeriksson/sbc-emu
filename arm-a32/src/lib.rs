@@ -12,6 +12,7 @@
 mod cpu;
 mod media;
 mod mmu;
+mod neon;
 mod thumb;
 mod vfp;
 

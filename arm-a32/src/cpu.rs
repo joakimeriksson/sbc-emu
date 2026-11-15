@@ -455,6 +455,9 @@ impl Cpu {
     pub(crate) fn execute(&mut self, bus: &mut dyn Bus, pc: u64, insn: u32) -> Result<(), Trap> {
         let unimplemented = || Trap::Unimplemented(pc, insn);
         if insn >> 28 == 15 {
+            if let Some(result) = self.execute_neon(bus, pc, insn) {
+                return result;
+            }
             if insn == 0xf57f_f01f {
                 self.exclusive_addr = None;
                 self.exclusive_size = 0;
