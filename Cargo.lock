@@ -46,6 +46,7 @@ dependencies = [
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "sbc-machine",
  "v3d",
 ]
 
@@ -57,6 +58,13 @@ dependencies = [
  "bcm2711",
  "emu-core",
  "v3d",
+]
+
+[[package]]
+name = "sbc-machine"
+version = "0.0.1"
+dependencies = [
+ "bcm2711",
 ]
 
 [[package]]

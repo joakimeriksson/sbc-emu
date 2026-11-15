@@ -1,0 +1,9 @@
+# Used by tools/multi-board-smoke.py: serial round trip before and after reset.
+wait-serial pi4#
+serial printf 'MULTI_%s' READY; echo\r
+wait-serial MULTI_READY
+monitor system_reset
+wait-serial pi4#
+serial printf 'RESET_%s' READY; echo\r
+wait-serial RESET_READY
+quit
