@@ -1,9 +1,10 @@
 # Plan: Rockchip RK3288 and the ASUS Tinker Board
 
-Status: M2 reached on 2026-11-15 (one core, Debian armmp kernel to a BusyBox shell; see "State"
-below). It follows the project's own-core decision (pure Rust, no QEMU, `docs/decisions.md`
-D1) and the multi-board foundation in `docs/multi-board-foundation.md`; where they disagree,
-that document governs the shared crates and this one only the RK3288.
+Status: M3 reached on 2026-11-15 (four Cortex-A12 cores started through the boot ROM mailbox,
+Debian armmp kernel to a BusyBox shell; see "State" below). It follows the project's own-core
+decision (pure Rust, no QEMU, `docs/decisions.md` D1) and the multi-board foundation in
+`docs/multi-board-foundation.md`; where they disagree, that document governs the shared crates
+and this one only the RK3288.
 
 ## Why this board
 
@@ -29,7 +30,7 @@ Tinker Board on a mainline kernel (exact release and sha256 recorded when first 
 |---|---|---|---|
 | CPU | 4x Cortex-A12 r0p1 (MIDR 0x410fc0d1; Arm renamed the A12 the Cortex-A17, part 0xc0e), ARMv7-A, Thumb-2, VFPv4 + NEON, LPAE, generic timer | DT `arm,cortex-a12`, `arm,cortex-a12-pmu` | `arm-a32` (Orange Pi One), extended |
 | Interrupts | GIC-400 (GICv2) at 0xffc01000 | `arm,gic-400` | `allwinner_h3::Gic` (in use), Pi 4's GIC for SGIs/multi-CPU |
-| SMP bring-up | `enable-method = "rockchip,rk3066-smp"`: PMU power domains, CRU core resets, boot ROM mailbox in SRAM (no PSCI) | `arch/arm/mach-rockchip/platsmp.c` | new (see M3) |
+| SMP bring-up | `enable-method = "rockchip,rk3066-smp"`: PMU power domains, CRU core resets, boot ROM mailbox in SRAM (no PSCI) | `arch/arm/mach-rockchip/platsmp.c` | `rockchip-rk3288::Machine` (M3; SMP scheduling copied from the H3 machine) |
 | Clocks, resets | CRU (rk3066-type PLLs, hiword-masked dividers and gates), GRF/SGRF, PMU syscons | `rk3288-cru`, syscon | `rockchip-rk3288::cru` (PLLs with lock in GRF_SOC_STATUS1) |
 | Console | UART2 at 0xff690000, Synopsys DesignWare APB UART (8250) | `snps,dw-apb-uart` | `allwinner_h3::Uart` (in use) |
 | Timers | arch timer (24 MHz; DT `arm,cpu-registers-not-fw-configured`, so Linux uses the secure physical timer, PPI 13) + Rockchip timers (Linux restarts timer7 itself) | `arm,armv7-timer`, `rockchip,rk3288-timer` | arch timer from the CPU |
@@ -59,9 +60,9 @@ stated output on the serial console, and a README table row with its evidence.
 - **M0: board plumbing.** `--board tinkerboard` through `sbc-machine`'s board selection
   (`Board::TinkerBoard`, `cli/src/tinkerboard.rs` on the shared `serial_board` runner). Done.
 - **M1: the 32-bit core, complete enough for Linux.** `arm-a32` boots the Debian armmp kernel
-  in ARM mode already. Still missing for the RK3288 (owned by the Orange Pi One session; the
-  list is in "Core changes needed" below): Thumb-2, NEON, LPAE, A12/A17 ID and cache
-  registers, the CP15 c15 errata registers, SMP (SGIs, exclusives across cores).
+  in ARM mode, has Thumb-2, SMP support (per-core state, WFE/SEV) and, since M3, the
+  Cortex-A12 identity (`arm_a32::CORTEX_A12`) with the CP15 c15 errata registers. Still
+  missing (list in "Core changes needed" below): NEON, LPAE.
 - **M2: kernel to a serial shell.** Done (2026-11-15).
   - Boot: Debian `zImage` + stock `rk3288-tinker-s.dtb` + a BusyBox initramfs, loaded
     directly at U-Boot's rk3288 addresses, one core, `nosmp`.
@@ -71,7 +72,7 @@ stated output on the serial console, and a README table row with its evidence.
     reads "Rockchip RK3288 Asus Tinker Board S", `/proc/cpuinfo` shows **`CPU part: 0xc0d`**
     (Cortex-A12; the kernel names the PMU `armv7_cortex_a12`), VFP userland, timer sleep, tmpfs,
     and `reboot -f` through the CRU global soft reset.
-- **M3: four cores.** Mainline `rockchip,rk3066-smp` on a non-A9 core:
+- **M3: four cores.** Done (2026-11-15). Mainline `rockchip,rk3066-smp` on a non-A9 core:
   1. `smp_prepare_cpus` reads L2CTLR (`mrc p15, 1, rX, c9, c0, 2`, bits 25:24 + 1) for the core
      count, maps the `rockchip,rk3066-smp-sram` node (first 16 bytes of `sram@ff700000`) and
      the PMU syscon, gets each core's reset from the CRU (`resets` in the cpu nodes), and powers
@@ -82,9 +83,20 @@ stated output on the serial console, and a README table row with its evidence.
   3. The boot ROM on the released core (not Linux) waits in WFE until SRAM+4 holds the magic
      and jumps to SRAM+8. The model emulates that ROM loop on the host: a powered, out-of-reset
      core with the magic set starts at the SRAM+8 address in SVC mode, MMU off.
-  `nproc` = 4 with `--threads single`, then `--threads multi` once `arm-a32` has the
-  parallel-memory semantics `arm-a64` has. The panel board's kernel runs with `isolcpus=2-3` and
-  PREEMPT_RT, so its audio engine expects all four cores.
+  The model: `CoreState::BootRom` is a core whose PMU domain is on and whose CRU soft reset
+  (SOFTRST_CON0 bits 0-3, `SRST_CORE0..3`, hiword) is released; it checks the mailbox when it
+  enters the ROM and on every SEV, as the ROM's WFE loop would. Turning the domain off or
+  asserting the reset stops the core (hotplug `cpu_kill`). The cores run in round-robin
+  quanta of 1000 instructions on one host thread, as on the Orange Pi One; a parallel
+  (`--threads multi`) mode waits for `arm-a32` to get the parallel-memory semantics `arm-a64`
+  has. The panel board's kernel runs with `isolcpus=2-3` and PREEMPT_RT, so its audio engine
+  expects all four cores.
+  - Pass (`scripts/tinkerboard-shell.txt`): `smp: Brought up 1 node, 4 CPUs` (also after
+    `reboot -f`), `nproc` = 4, four parallel shell loops finish, plus everything M2 checked.
+    The kernel log shows the A12 identity end to end: `CPU: PIPT / VIPT nonaliasing data
+    cache, VIPT aliasing instruction cache`, `VFP support v0.3: implementor 41 architecture 3
+    part 30 variant d rev 0` (the line RK3288 hardware prints) and the `armv7_cortex_a12`
+    PMU driver.
 - **M4: storage and a real image.**
   - Devices: dw_mmc for SD and eMMC; RK808 on I²C (Linux will not finish probing the SD
     regulators without it; it is also the system power controller for `poweroff`).
@@ -158,18 +170,29 @@ M8 and M9 are independent of each other and of M5–M7.
 
 ## State (2026-11-15)
 
-`rockchip-rk3288` crate: `Machine`, `Soc`, `cru` (CRU, GRF lock, PMU), `boot`; probe binary
-`rk3288-boot`; `sbc-emu run --board tinkerboard`. The Debian 6.12.107 armmp kernel reaches the
-initramfs shell after about 3.7 G instructions (3.7 s virtual, about 80 s on an M-series host).
-Unmodelled pages Linux touches on the way: timer 0xff810000, PMU SRAM 0xff720000, DMA
-0xff250000/0xffb20000, GPIO banks 0xff750000-0xff7f0000, UART0/1/3/4, QoS 0xffaa0000-0xffaf0000.
+`rockchip-rk3288` crate: `Machine` (four cores), `Soc` (with the 96 KiB on-chip SRAM at
+0xff700000), `cru` (CRU with core resets, GRF lock, PMU), `boot`; probe binary `rk3288-boot`;
+`sbc-emu run --board tinkerboard`. The Debian 6.12.107 armmp kernel brings up four cores and
+reaches the initramfs shell after about 4.3 G instructions summed over the cores (3.5 s
+virtual, about 100 s on an M-series host; one host thread). Unmodelled pages Linux touches on
+the way: timer 0xff810000, PMU SRAM 0xff720000, DMA 0xff250000/0xffb20000, GPIO banks
+0xff750000-0xff7f0000, UART0/1/3/4, QoS 0xffaa0000-0xffaf0000.
+
+The Cortex-A12 identity (`arm_a32::CORTEX_A12`) comes from the Cortex-A17 r1p1 TRM (Arm
+publishes no A12 TRM; the A17 TRM still lists A12 values for FPSID and PMCR) and RK3288 boot
+logs. Not verified for the A12 itself: the ID_*/CLIDR/CCSIDR values (A17 r1p1 values, consistent
+with everything RK3288 Linux prints) and CTR's IminLine (the TRM's IMINLN input; 0x84448004 is
+used). Deliberately not advertised: CP14 debug (ID_DFR0 debug fields 0; the kernel reports
+`hw-breakpoint: debug architecture 0x0 unsupported`), PMU event counters (PMCR.N = 0) and
+Advanced SIMD (MVFR1, until NEON lands).
 
 ## Core changes needed (arm-a32, owned by the Orange Pi One session)
 
-Listed precisely in the session report; in short: Cortex-A12 values for FPSID, CTR, CLIDR,
-CCSIDR, PMCR (IDCODE and six counters) and ID_DFR0/DBGDIDR; CP15 c15 diagnostic (op2 1) and
-internal feature (op2 2) registers as read/write; Thumb-2 and NEON for userland; LPAE for
-`armmp-lpae` kernels; SGIs and per-core state for M3.
+Done: the Cortex-A12 identity as an `arm_a32::CpuModel` preset (CTR, CLIDR, CCSIDR, ID
+registers, L2CTLR, PMCR IDCODE, FPSID, MVFR0/1) and the CP15 c15 diagnostic (op2 1) and internal
+feature (op2 2) registers; Thumb-2; per-core state and WFE/SEV for SMP. Still needed: NEON for
+userland (then MVFR1's Advanced SIMD fields), LPAE for `armmp-lpae` kernels, CP14 debug and PMU
+event counters if a guest needs them (both are hidden in the ID registers today).
 
 ## Risks
 
