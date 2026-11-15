@@ -182,7 +182,7 @@ fn compare(func: u32, dref: f32, d: f32) -> f32 {
 }
 
 /// A texture lookup for every lane in `lanes`.
-pub fn texture(m: &mut Gmem, t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuReq, lanes: u16, fs: bool) -> Vec<V> {
+pub fn texture(m: &mut Gmem, _t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuReq, lanes: u16, fs: bool) -> Vec<V> {
     let p0 = cfg.first().copied().unwrap_or(0);
     let p1 = cfg.get(1).copied().unwrap_or(1 << 2);
     let p2 = cfg.get(2).copied().unwrap_or(15 << 20);

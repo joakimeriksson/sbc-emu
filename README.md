@@ -1,15 +1,36 @@
-# sbc-emu: a Raspberry Pi 4 emulator in Rust
+# sbc-emu: single-board computers, emulated in Rust
 
-**Real boards. Virtual hardware.** An instruction-level emulator of the Raspberry Pi 4 Model B
-in the style of [esp32sim](https://github.com/mikroverk/esp32sim): its own ARMv8-A CPU core,
-register-level BCM2711 peripherals, one deterministic virtual clock, no QEMU. It boots the
-unmodified **Raspberry Pi OS Lite (trixie, arm64) SD-card image**, natively and in the browser
-(WebAssembly).
+[![CI](https://github.com/joakimeriksson/sbc-emu/actions/workflows/ci.yml/badge.svg)](https://github.com/joakimeriksson/sbc-emu/actions/workflows/ci.yml)
 
-See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based, and
-[SBC-EMUPLAN.md](SBC-EMUPLAN.md) for the overall plan.
+**Real boards. Virtual hardware.** sbc-emu emulates single-board computers instruction by
+instruction, in the style of [esp32sim](https://github.com/mikroverk/esp32sim):
+- its own CPU cores and register-level models of each board's SoC peripherals;
+- one deterministic virtual clock, and no QEMU;
+- the goal on every board is the stock operating-system image, booted unmodified, natively and
+  (where it is far enough) in the browser.
 
-## What runs today
+## Boards
+
+| Board | SoC | Status | Details |
+|---|---|---|---|
+| Raspberry Pi 4 Model B | Broadcom BCM2711, 4× Cortex-A72 | **complete enough for real use**: unmodified Raspberry Pi OS and Ubuntu 26.04 Desktop, V3D GPU (OpenGL ES 3.1, Vulkan 1.3), HDMI, USB, Ethernet, Wi-Fi, Bluetooth, audio, a JIT, and a WebAssembly build | [below](#raspberry-pi-4-model-b) |
+| Orange Pi 5 | Rockchip RK3588S | **experimental**: one Cortex-A55, GICv3, UART; a Debian kernel to a BusyBox shell by direct boot | [docs/orangepi5.md](docs/orangepi5.md) |
+| Orange Pi One | Allwinner H3, 4× Cortex-A7 | **in progress**: the 32-bit ARM core (`arm-a32`) | — |
+| ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A17 | **planned**; the same SoC as the vendor's first panel board generation | [docs/rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
+
+`sbc-emu boards list` shows what the build knows; `--board NAME` picks one (the Pi 4 is the
+default). See [docs/decisions.md](docs/decisions.md) for why this is not QEMU-based,
+[SBC-EMUPLAN.md](SBC-EMUPLAN.md) for the overall plan and [docs/multi-board-foundation.md](docs/multi-board-foundation.md)
+for how boards share the machine layer. Contributions, human or agent, go through pull requests
+([AGENTS.md](AGENTS.md)).
+
+## Raspberry Pi 4 Model B
+
+The first board, and the furthest along: an instruction-level BCM2711 that boots the unmodified
+**Raspberry Pi OS Lite (trixie, arm64) SD-card image** and Ubuntu 26.04 Desktop, natively and in
+the browser (WebAssembly). The [sbc-emu page](web/index.html) runs its 3D demos in a browser tab.
+
+### What runs today
 
 | | Status | Evidence |
 |---|---|---|
@@ -47,7 +68,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
   (virtual time is deterministic per run; wall-clock pacing only governs idle time).
 - **tested_cpu_count**: 4, as on the Pi 4 (`--smp 1..4`).
 
-## The emulated hardware
+### The emulated hardware
 
 | Block | Model | Linux driver |
 |---|---|---|
@@ -81,7 +102,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | System timer | 1 MHz counter, four compare channels | `bcm2835-system-timer` |
 | Mini UART | AUX + mini UART as a 16550: the Bluetooth controller's UART, or `ttyS0` with `--serial1 FILE` (script step `serial1 TEXT`) | `8250_bcm2835aux` |
 
-## Running it
+### Running it
 
 ```sh
 cargo build --release
@@ -151,7 +172,7 @@ More options, mostly after QEMU's:
   `mouse_button`, `hostfwd_add`, `gdbserver`, `system_reset`, `quit`); scripts can run them with
   `monitor CMD`.
 
-### Ubuntu Desktop
+#### Ubuntu Desktop
 
 ```sh
 # the pristine image from cdimage.ubuntu.com (sha256-checked), then a seeded 16 GiB working copy
@@ -173,7 +194,7 @@ frozen copy of the image (`cache/os/ubuntu-desktop-base.img`, never written), lo
 `raspberry`). Changes live in memory and are gone at exit. Firefox (the snap, on its own Mesa
 25.2) renders pages on the V3D.
 
-### In the browser
+#### In the browser
 
 ```sh
 tools/wasm-build.sh                               # web/wasm/sbc-emu.wasm + web/assets
@@ -198,6 +219,12 @@ library rebuilt with atomics (a nightly-only `-Z build-std`), and this project b
 cargo test --release --workspace
 ```
 
+GitHub Actions runs the suite on every pull request and push to `main` ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
+- macOS on Apple silicon: everything, including the JIT and the differential tests against the
+  host CPU;
+- Linux x86-64: the interpreter, as a portability check;
+- the WebAssembly build.
+
 - `arm-a64/tests/diff_host.rs`, `diff_neon.rs`, `diff_fp.rs`: **differential tests against the
   host CPU** (Apple silicon is AArch64): integer (incl. CRC32), FP and NEON snippets run natively
   and on the emulator from the same random states; registers, flags, NaN payloads and FPSR must
@@ -221,13 +248,16 @@ arm-a64/    the ARMv8-A core: decode+execute, system registers, MMU, FP/NEON
 v3d/        the V3D 4.2 3D GPU (packets generated from Mesa's v3d_packet.xml by tools/gen_v3d_packets.py)
 bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2, PCIe + xHCI, USB devices, I²S, Bluetooth,
             GENET, device tree, boot, FAT
+rk3588/     the experimental Orange Pi 5 machine (RK3588S): GICv3, UART2, timer
+sbc-machine/ the board catalogue and the host-facing machine layer the boards share
+boards/     board descriptions
 sbc-net/    virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP (from esp32sim)
 cli/        the sbc-emu command
 wasm/       C ABI for the browser; web/ is the page and worker
-scripts/    action scripts (first boot of Raspberry Pi OS)
+scripts/    action scripts (boots, demos, GPU tests, Ubuntu)
 ```
 
-## Known gaps
+## Known gaps (Raspberry Pi 4)
 
 The 3D GPU's shader cores are interpreted (glmark2 runs at 1–45 fps at 1080p; no ASTC, transform feedback or
 geometry shaders), no HDMI1 (the second port has
