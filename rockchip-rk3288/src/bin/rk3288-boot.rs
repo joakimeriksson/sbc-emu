@@ -43,7 +43,12 @@ fn args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("invalid step budget: {value}"))?
             }
-            "--stop-on" => parsed.stop_on = Some(value),
+            "--stop-on" => {
+                if value.is_empty() {
+                    return Err("--stop-on needs a non-empty marker".into());
+                }
+                parsed.stop_on = Some(value)
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -105,6 +110,10 @@ fn run() -> Result<(), String> {
             Stop::Idle(deadline) => {
                 let target = if deadline == u64::MAX { machine.now() + 1_000_000 } else { deadline };
                 machine.idle_until(target);
+            }
+            Stop::Reset => {
+                eprintln!("\n[rk3288-boot] guest reset (CRU global soft reset)");
+                return Ok(());
             }
             Stop::PowerOff => {
                 eprintln!("\n[rk3288-boot] guest powered off");

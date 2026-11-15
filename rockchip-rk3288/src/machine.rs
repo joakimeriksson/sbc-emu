@@ -416,14 +416,8 @@ impl Machine {
     }
 }
 
-/// 24 MHz ticks to nanoseconds and back.
-pub fn ticks_to_ns(ticks: u64) -> u64 {
-    (ticks as u128 * 125 / 3) as u64
-}
-
-pub fn ns_to_ticks(ns: u64) -> u64 {
-    (ns as u128 * 3 / 125) as u64
-}
+// Shared with the H3: rounds idle deadlines up so ns -> ticks reaches the compare value.
+pub use allwinner_h3::{ns_to_ticks, ticks_to_ns};
 
 impl Default for Machine {
     fn default() -> Self {

@@ -24,6 +24,7 @@ KERNEL_URL=$DEBIAN/pool/main/l/linux/$KERNEL_DEB
 KERNEL_SHA=9db6efc15fcc408acdc417911bdb7ac2c3ee0dd04fd1535a16b34744293a4380
 
 mkdir -p "$OUT/downloads"
+OUT=$(cd "$OUT" && pwd)   # absolute: the script changes directory below
 
 fetch() { # file url sha256
     if [ ! -f "$OUT/downloads/$1" ]; then
@@ -46,7 +47,7 @@ trap 'rm -rf "$work"' EXIT
 
 # A .deb is an ar archive; the kernel and device trees are in data.tar.xz.
 mkdir "$work/deb"
-(cd "$work/deb" && ar x "$OLDPWD/$OUT/downloads/$KERNEL_DEB" data.tar.xz)
+(cd "$work/deb" && ar x "$OUT/downloads/$KERNEL_DEB" data.tar.xz)
 tar -xJf "$work/deb/data.tar.xz" -C "$work/deb" "./boot/vmlinuz-$KVER" \
     "./usr/lib/linux-image-$KVER/rk3288-tinker-s.dtb"
 cp "$work/deb/boot/vmlinuz-$KVER" "$OUT/zImage"

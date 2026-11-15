@@ -10,13 +10,14 @@ URL=${DEBIAN_MIRROR:-https://deb.debian.org/debian}/pool/main/b/busybox/$DEB
 SHA=8b35210e08d559ecc0ddb660dd96f6f9694f69eb27f1dc608f5eeda56d94509e
 
 mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)   # absolute: the script changes directory below
 [ -f "$OUT/$DEB" ] || curl -fL --retry 3 -o "$OUT/$DEB" "$URL"
 actual=$(shasum -a 256 "$OUT/$DEB" | cut -d' ' -f1)
 [ "$actual" = "$SHA" ] || { echo "$DEB: sha256 $actual, expected $SHA" >&2; exit 1; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-(cd "$work" && ar x "$OLDPWD/$OUT/$DEB" && tar -xf data.tar.*)
+(cd "$work" && ar x "$OUT/$DEB" && tar -xf data.tar.*)
 root="$work/root"
 mkdir -p "$root/bin" "$root/dev" "$root/proc" "$root/sys" "$root/tmp"
 cp "$work/usr/bin/busybox" "$root/bin/busybox"
