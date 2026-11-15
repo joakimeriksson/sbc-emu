@@ -66,6 +66,7 @@ dependencies = [
 name = "sbc-emu"
 version = "0.0.1"
 dependencies = [
+ "allwinner-h3",
  "arm-a64",
  "bcm2711",
  "emu-core",
@@ -88,6 +89,7 @@ dependencies = [
 name = "sbc-machine"
 version = "0.0.1"
 dependencies = [
+ "allwinner-h3",
  "bcm2711",
  "emu-core",
  "rk3588",

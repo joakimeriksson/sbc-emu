@@ -1,15 +1,19 @@
-//! Initial Allwinner H3 machine: Cortex-A7/A32 execution, based RAM, UART0 and GICv2.
-//!
-//! This is a bare-metal bring-up slice, not a Linux-capable H3 implementation yet.
-//! The physical architectural timer is connected to the one-CPU GIC. Storage,
-//! networking, display and SMP are not modelled.
+//! Allwinner H3 (Orange Pi One) machine: one Cortex-A7 (`arm-a32`), GIC-400, UART0,
+//! CCU, the H3 timers and the architectural timers, enough for a mainline ARM32 kernel
+//! and a BusyBox initramfs on the serial console. Other H3 devices in the distribution
+//! device tree are read-back register stubs. Storage, networking, display and SMP are
+//! not modelled yet.
 
+pub mod boot;
 mod gic;
 mod machine;
+mod timer;
 mod uart;
 
 pub use gic::{Gic, SPURIOUS};
+pub use timer::Timer;
 pub use machine::{
-    Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI, RAM_BASE, RAM_SIZE, UART0_BASE,
+    ns_to_ticks, ticks_to_ns, Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI,
+    RAM_BASE, RAM_SIZE, UART0_BASE,
 };
 pub use uart::Uart;

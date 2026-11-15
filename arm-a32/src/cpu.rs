@@ -1,4 +1,4 @@
-use crate::mmu::Access;
+use crate::mmu::{Access, TlbEntry, TLB_ENTRIES};
 use emu_core::{Bus, Core, Trap};
 
 pub const MODE_USR: u32 = 0x10;
@@ -29,6 +29,7 @@ pub struct Cpu {
     pub fiq: bool,
     pub instret: u64,
     pub last_wfe: bool,
+    /// Route SMC to the host as a firmware call (`Trap::HostCall`).
     pub firmware_calls_to_host: bool,
     pub midr: u32,
     pub mpidr: u32,
@@ -38,6 +39,11 @@ pub struct Cpu {
     pub cntpct: u64,
     pub cntp_ctl: u32,
     pub cntp_cval: u64,
+    pub cntv_ctl: u32,
+    pub cntv_cval: u64,
+    /// FIQ-banked r8-r12 and the r8-r12 shared by every other mode.
+    banked_fiq_r8: [u32; 5],
+    banked_usr_r8: [u32; 5],
     pub exclusive_addr: Option<u32>,
     pub exclusive_size: u32,
     pub sctlr: u32,
@@ -61,6 +67,13 @@ pub struct Cpu {
     pub csselr: u32,
     pub teecr: u32,
     pub teehbr: u32,
+    pub(crate) tlb: Vec<TlbEntry>,
+    pub vfp: crate::vfp::Vfp,
+    /// Take the architectural undefined-instruction exception for encodings the
+    /// emulator does not implement (Linux), instead of stopping with `Trap::Unimplemented`.
+    pub undef_to_guest: bool,
+    /// The last encoding that was delivered to the guest as UNDEFINED: (pc, insn).
+    pub last_undef: Option<(u32, u32)>,
 }
 
 impl Default for Cpu {
@@ -91,6 +104,10 @@ impl Cpu {
             cntpct: 0,
             cntp_ctl: 0,
             cntp_cval: 0,
+            cntv_ctl: 0,
+            cntv_cval: 0,
+            banked_fiq_r8: [0; 5],
+            banked_usr_r8: [0; 5],
             exclusive_addr: None,
             exclusive_size: 0,
             sctlr: 0x00c5_0078,
@@ -114,7 +131,16 @@ impl Cpu {
             csselr: 0,
             teecr: 0,
             teehbr: 0,
+            tlb: vec![TlbEntry::INVALID; TLB_ENTRIES],
+            vfp: Default::default(),
+            undef_to_guest: false,
+            last_undef: None,
         }
+    }
+
+    /// The SPSR of the current mode (diagnostics).
+    pub fn spsr(&self) -> u32 {
+        self.banked_spsr[Self::bank(self.cpsr)]
     }
 
     /// Advance the architectural counter by virtual 24 MHz ticks.
@@ -128,6 +154,18 @@ impl Cpu {
 
     fn physical_timer_control(&self) -> u32 {
         self.cntp_ctl | u32::from(self.physical_timer_reached()) << 2
+    }
+
+    fn virtual_timer_control(&self) -> u32 {
+        let reached = self.cntpct.wrapping_sub(self.cntv_cval) as i64 >= 0;
+        self.cntv_ctl | u32::from(reached) << 2
+    }
+
+    /// Virtual timer output (CNTVOFF is zero: the virtual count equals the physical one).
+    pub fn virtual_timer_irq(&self) -> bool {
+        self.cntv_ctl & 1 != 0
+            && self.cntv_ctl & 2 == 0
+            && self.cntpct.wrapping_sub(self.cntv_cval) as i64 >= 0
     }
 
     pub fn physical_timer_irq(&self) -> bool {
@@ -157,11 +195,41 @@ impl Cpu {
             return;
         }
         let (ob, nb) = (Self::bank(old), Self::bank(new));
+        if (old == MODE_FIQ) != (new == MODE_FIQ) {
+            let (save, load) = if old == MODE_FIQ {
+                (&mut self.banked_fiq_r8, &self.banked_usr_r8)
+            } else {
+                (&mut self.banked_usr_r8, &self.banked_fiq_r8)
+            };
+            save.copy_from_slice(&self.r[8..13]);
+            self.r[8..13].copy_from_slice(load);
+        }
         self.banked_sp[ob] = self.r[13];
         self.banked_lr[ob] = self.r[14];
         self.r[13] = self.banked_sp[nb];
         self.r[14] = self.banked_lr[nb];
         self.cpsr = (self.cpsr & !0x1f) | new;
+    }
+
+    /// User-mode view of r8-r14 for LDM/STM with the S bit and no PC.
+    fn user_reg(&self, n: usize) -> u32 {
+        let mode = self.cpsr & 0x1f;
+        match n {
+            8..=12 if mode == MODE_FIQ => self.banked_usr_r8[n - 8],
+            13 if !matches!(mode, MODE_USR | MODE_SYS) => self.banked_sp[MODE_SYS as usize],
+            14 if !matches!(mode, MODE_USR | MODE_SYS) => self.banked_lr[MODE_SYS as usize],
+            _ => self.r[n],
+        }
+    }
+
+    fn set_user_reg(&mut self, n: usize, value: u32) {
+        let mode = self.cpsr & 0x1f;
+        match n {
+            8..=12 if mode == MODE_FIQ => self.banked_usr_r8[n - 8] = value,
+            13 if !matches!(mode, MODE_USR | MODE_SYS) => self.banked_sp[MODE_SYS as usize] = value,
+            14 if !matches!(mode, MODE_USR | MODE_SYS) => self.banked_lr[MODE_SYS as usize] = value,
+            _ => self.r[n] = value,
+        }
     }
 
     fn read_reg(&self, n: u32) -> u32 {
@@ -239,6 +307,9 @@ impl Cpu {
             let old = self.banked_spsr[bank];
             self.banked_spsr[bank] = (old & !mask) | (value & mask);
             return true;
+        }
+        if self.cpsr & 0x1f == MODE_USR {
+            mask &= 0xf80f_0000; // User mode may only write NZCVQ and GE.
         }
         let updated = (self.cpsr & !mask) | (value & mask);
         if updated & T != 0 {
@@ -323,7 +394,7 @@ impl Cpu {
         Trap::Exception(0x21, 1)
     }
 
-    fn data_abort(&mut self, va: u32, status: u32, write: bool) -> Trap {
+    pub(crate) fn data_abort(&mut self, va: u32, status: u32, write: bool) -> Trap {
         self.dfsr = status | u32::from(write) << 11;
         self.dfar = va;
         self.enter_exception(0x10, self.r[15].wrapping_add(4), MODE_ABT, true);
@@ -338,13 +409,14 @@ impl Cpu {
                 self.exclusive_size = 0;
                 return Ok(());
             }
-            // CPS/CPSIE/CPSID: interrupt-mask and optional processor-mode writes.
-            if insn & 0x0ff0_ff00 == 0x0100_0000 {
+            // CPS/CPSIE/CPSID: cccc=1111 0001 0000 imod M 0 0000000 A I F 0 mode.
+            if insn & 0x0ff1_fe20 == 0x0100_0000 {
                 let imod = (insn >> 18) & 3;
+                let change_mode = insn & (1 << 17) != 0;
                 let mode = insn & 0x1f;
                 if imod == 1
-                    || imod == 0 && insn & 0xe0 != 0
-                    || mode != 0
+                    || imod == 0 && !change_mode
+                    || change_mode
                         && !matches!(
                             mode,
                             MODE_USR | MODE_FIQ | MODE_IRQ | MODE_SVC | MODE_ABT | MODE_UND | MODE_SYS
@@ -352,23 +424,16 @@ impl Cpu {
                 {
                     return Err(unimplemented());
                 }
-                let flags = (insn >> 5) & 7;
-                let mut mask = 0;
-                if flags & 1 != 0 {
-                    mask |= 1 << 8;
+                if self.cpsr & 0x1f == MODE_USR {
+                    return Ok(()); // CPS is a NOP in User mode.
                 }
-                if flags & 2 != 0 {
-                    mask |= 1 << 6;
-                }
-                if flags & 4 != 0 {
-                    mask |= 1 << 7;
-                }
+                let mask = insn & 0x1c0; // A, I, F map onto CPSR bits 8:6
                 if imod == 2 {
                     self.cpsr &= !mask;
                 } else if imod == 3 {
                     self.cpsr |= mask;
                 }
-                if mode != 0 {
+                if change_mode {
                     self.change_mode(mode);
                 }
                 return Ok(());
@@ -384,6 +449,12 @@ impl Cpu {
             if insn & 0x0f70_f000 == 0x0550_f000 || insn & 0x0f70_f000 == 0x0510_f000 {
                 return Ok(());
             }
+            // Register PLD/PLDW and both PLI forms.
+            if matches!(insn & 0x0f70_f010, 0x0750_f000 | 0x0710_f000 | 0x0650_f000)
+                || insn & 0x0f70_f000 == 0x0450_f000
+            {
+                return Ok(());
+            }
             return Err(unimplemented());
         }
         if !self.condition(insn >> 28) {
@@ -392,6 +463,12 @@ impl Cpu {
 
         if insn & 0x0ff0_00f0 == 0x07f0_00f0 {
             return Err(unimplemented()); // permanently undefined (UDF)
+        }
+        if let Some(result) = self.execute_media(bus, pc, insn) {
+            return result;
+        }
+        if let Some(result) = self.execute_vfp(bus, pc, insn) {
+            return result;
         }
 
         // Hints and wait instructions.
@@ -407,6 +484,14 @@ impl Cpu {
                 }
                 _ => return Ok(()),
             }
+        }
+        // SMC: a firmware (PSCI) call answered by the host, as on boards where the boot
+        // loader installs a secure monitor. Without host firmware it is UNDEFINED.
+        if insn & 0x0fff_fff0 == 0x0160_0070 {
+            if self.firmware_calls_to_host && self.cpsr & 0x1f != MODE_USR {
+                return Err(Trap::HostCall((insn & 0xf) as u16));
+            }
+            return Err(unimplemented());
         }
         if insn & 0x0ff0_00f0 == 0x0120_0070 {
             return Err(Trap::Brk((((insn >> 4) & 0xfff0) | (insn & 0xf)) as u16));
@@ -658,11 +743,8 @@ impl Cpu {
             return Ok(());
         }
 
-        // SVC, optionally treated as a host firmware call like the AArch64 machine.
+        // SVC always enters the guest's supervisor call handler.
         if insn & 0x0f00_0000 == 0x0f00_0000 {
-            if self.firmware_calls_to_host {
-                return Err(Trap::HostCall((insn & 0x00ff_ffff) as u16));
-            }
             self.enter_exception(0x08, self.r[15], MODE_SVC, false);
             return Err(Trap::Exception(0x15, 1));
         }
@@ -680,8 +762,12 @@ impl Cpu {
                 return Err(unimplemented());
             }
             let value = match (read, opc1, crm) {
-                (true, 0, 14) => Some(self.cntpct),
+                (true, 0 | 1, 14) => Some(self.cntpct), // CNTPCT, CNTVCT (CNTVOFF = 0)
                 (true, 2, 14) => Some(self.cntp_cval),
+                (true, 3, 14) => Some(self.cntv_cval),
+                (true, 4, 14) => Some(0), // CNTVOFF
+                (true, 0, 2) => Some(self.ttbr0 as u64),
+                (true, 1, 2) => Some(self.ttbr1 as u64),
                 _ => None,
             };
             if read {
@@ -694,6 +780,8 @@ impl Cpu {
                 let value = self.r[rt as usize] as u64 | (self.r[rt2 as usize] as u64) << 32;
                 match (opc1, crm) {
                     (2, 14) => self.cntp_cval = value,
+                    (3, 14) => self.cntv_cval = value,
+                    (4, 14) => {} // CNTVOFF: fixed at zero
                     _ => return Err(unimplemented()),
                 }
             }
@@ -720,7 +808,8 @@ impl Cpu {
                 (0, 0, 0, 6) => Some(0), // REVIDR
                 (0, 0, 1, 0) => Some(0x0000_1131), // ID_PFR0
                 (0, 0, 1, 1) => Some(0x0001_1011), // ID_PFR1
-                (0, 0, 1, 2) => Some(0x0201_0555), // ID_DFR0
+                (0, 0, 1, 2) => Some(0x0200_0000), // ID_DFR0: PMUv2, no CP14 debug
+                (0, 0, 0, 2 | 3 | 4 | 7) => Some(0), // TCMTR, TLBTR, aliases
                 (0, 0, 1, 3) => Some(0),           // ID_AFR0
                 (0, 0, 1, 4) => Some(0x1010_1105), // ID_MMFR0
                 (0, 0, 1, 5) => Some(0x4000_0000), // ID_MMFR1
@@ -759,6 +848,13 @@ impl Cpu {
                 (0, 14, 1, 0) => Some(self.cntkctl),
                 (0, 14, 2, 0) => Some(self.cntp_cval.wrapping_sub(self.cntpct) as u32),
                 (0, 14, 2, 1) => Some(self.physical_timer_control()),
+                (0, 14, 3, 0) => Some(self.cntv_cval.wrapping_sub(self.cntpct) as u32),
+                (0, 14, 3, 1) => Some(self.virtual_timer_control()),
+                (0, 1, 1, 0..=2) => Some(0), // SCR, SDER, NSACR (secure configuration)
+                (0, 9, 12, 0) => Some(0x4107_0000), // PMCR: Cortex-A7, no event counters
+                (0, 9, 12..=14, _) => Some(0),       // other PMU registers read as zero
+                (1, 9, 0, 2) => Some(0x0300_0000),   // L2CTLR: four cores
+                (0, 12, 1, 0) => Some(u32::from(self.irq) << 7 | u32::from(self.fiq) << 6), // ISR
                 _ => None,
             };
             if read {
@@ -769,24 +865,39 @@ impl Cpu {
             } else {
                 let value = self.r[rd as usize];
                 match (opc1, crn, crm, opc2) {
-                    (0, 1, 0, 0) => self.sctlr = value,
+                    (0, 1, 0, 0) => {
+                        self.sctlr = value;
+                        self.tlb_flush();
+                    }
                     (0, 1, 0, 1) => self.actlr = value,
                     (0, 1, 0, 2) => self.cpacr = value,
-                    (0, 2, 0, 0) => self.ttbr0 = value,
-                    (0, 2, 0, 1) => self.ttbr1 = value,
-                    (0, 2, 0, 2) => self.ttbcr = value,
+                    (0, 2, 0, 0) => {
+                        self.ttbr0 = value;
+                        self.tlb_flush();
+                    }
+                    (0, 2, 0, 1) => {
+                        self.ttbr1 = value;
+                        self.tlb_flush();
+                    }
+                    (0, 2, 0, 2) => {
+                        self.ttbcr = value;
+                        self.tlb_flush();
+                    }
                     (0, 3, 0, 0) => self.dacr = value,
                     (0, 5, 0, 0) => self.dfsr = value,
                     (0, 5, 0, 1) => self.ifsr = value,
                     (0, 6, 0, 0) => self.dfar = value,
                     (0, 6, 0, 2) => self.ifar = value,
                     (0, 7, 1 | 5 | 6 | 10 | 11 | 14, _) => {}
-                    (0, 8, 1 | 3 | 5 | 7, _) => {}
+                    (0, 8, 3 | 5 | 6 | 7, _) => self.tlb_flush(),
                     (0, 10, 2, 0) => self.prrr = value,
                     (0, 10, 2, 1) => self.nmrr = value,
                     (0, 12, 0, 0) => self.vbar = value & 0xffff_ffe0,
                     (0, 13, 0, 0) => self.fcseidr = value,
-                    (0, 13, 0, 1) => self.contextidr = value,
+                    (0, 13, 0, 1) => {
+                        self.contextidr = value;
+                        self.tlb_flush();
+                    }
                     (0, 13, 0, 2) => self.tpidrurw = value,
                     (0, 13, 0, 3) => self.tpidrro = value,
                     (0, 13, 0, 4) => self.tpidrprw = value,
@@ -797,6 +908,14 @@ impl Cpu {
                         self.cntp_cval = self.cntpct.wrapping_add(delta);
                     }
                     (0, 14, 2, 1) => self.cntp_ctl = value & 3,
+                    (0, 14, 3, 0) => {
+                        let delta = value as i32 as i64 as u64;
+                        self.cntv_cval = self.cntpct.wrapping_add(delta);
+                    }
+                    (0, 14, 3, 1) => self.cntv_ctl = value & 3,
+                    (0, 1, 1, 0..=2) => {}         // secure configuration: no TrustZone model
+                    (0, 9, 12..=14, _) => {}       // PMU writes ignored
+                    (0, 7, 0, 4) | (0, 7, 13, 1) => {} // legacy WFI/prefetch encodings
                     (2, 0, 0, 0) => self.csselr = value & 0xf,
                     _ => return Err(unimplemented()),
                 }
@@ -814,7 +933,18 @@ impl Cpu {
                 insn & 0xf,
                 (insn >> 5) & 7,
             );
-            if rd == 15 || opc1 != 6 || crm != 0 || opc2 != 0 {
+            if rd == 15 {
+                return Err(unimplemented());
+            }
+            if opc1 <= 1 {
+                // CP14 debug (opc1 0) and trace (opc1 1): no debug architecture is
+                // advertised, so DBGDIDR and the rest read as zero and ignore writes.
+                if read {
+                    self.r[rd as usize] = 0;
+                }
+                return Ok(());
+            }
+            if opc1 != 6 || crm != 0 || opc2 != 0 {
                 return Err(unimplemented());
             }
             let value = match crn {
@@ -938,12 +1068,12 @@ impl Cpu {
             if rn == 15
                 || list == 0
                 || (!load && list & 0x8000 != 0)
-                || (spsr && !loads_pc)
+                || (spsr && !loads_pc && writeback)
                 || (load && writeback && list & (1 << rn) != 0)
             {
                 return Err(unimplemented());
             }
-            if spsr && self.banked_spsr[Self::bank(self.cpsr)] & T != 0 {
+            if spsr && loads_pc && self.banked_spsr[Self::bank(self.cpsr)] & T != 0 {
                 return Err(unimplemented());
             }
             let base = self.r[rn as usize];
@@ -976,21 +1106,27 @@ impl Cpu {
                 if writeback {
                     self.r[rn as usize] = new_base;
                 }
+                let user_bank = spsr && !loads_pc;
                 for register in 0..15 {
                     if list & (1 << register) != 0 {
-                        self.r[register] = values[register];
+                        if user_bank {
+                            self.set_user_reg(register, values[register]);
+                        } else {
+                            self.r[register] = values[register];
+                        }
                     }
                 }
                 if loads_pc {
                     self.r[15] = values[15];
                 }
-                if spsr && !self.restore_spsr() {
+                if spsr && loads_pc && !self.restore_spsr() {
                     return Err(unimplemented());
                 }
             } else {
                 for register in 0..15 {
                     if list & (1 << register) != 0 {
-                        if let Err((va, status)) = self.mem_write32(bus, address, self.r[register])
+                        let value = if spsr { self.user_reg(register) } else { self.r[register] };
+                        if let Err((va, status)) = self.mem_write32(bus, address, value)
                         {
                             return Err(self.data_abort(va, status, true));
                         }
@@ -1090,8 +1226,9 @@ impl Cpu {
                     Err((va, status)) => Err(self.data_abort(va, status, true)),
                 }
             };
-            if !pre || insn & (1 << 21) != 0 {
-                if rn == 15 || rn == rd || pair && rn == rd + 1 {
+            // Base-restored abort model: an aborted transfer leaves the base unchanged.
+            if result.is_ok() && (!pre || insn & (1 << 21) != 0) {
+                if rn == 15 || load && (rn == rd || pair && rn == rd + 1) {
                     return Err(unimplemented());
                 }
                 self.r[rn as usize] = adjusted;
@@ -1159,8 +1296,9 @@ impl Cpu {
                     Err((va, status)) => Err(self.data_abort(va, status, true)),
                 }
             };
-            if !pre || insn & (1 << 21) != 0 {
-                if rn == 15 || rn == rd {
+            // Base-restored abort model: an aborted transfer leaves the base unchanged.
+            if result.is_ok() && (!pre || insn & (1 << 21) != 0) {
+                if rn == 15 || load && rn == rd {
                     return Err(unimplemented());
                 }
                 self.r[rn as usize] = adjusted;
@@ -1171,6 +1309,13 @@ impl Cpu {
         // A32 data processing with immediate or shifted-register operand two.
         if insn & 0x0c00_0000 == 0 {
             let immediate = insn & (1 << 25) != 0;
+            // Not data processing: multiply/extra load-store space (bits 7 and 4 set) and
+            // the miscellaneous space (TST/TEQ/CMP/CMN encodings without S).
+            if !immediate && insn & 0x90 == 0x90
+                || insn & 0x0190_0000 == 0x0100_0000
+            {
+                return Err(unimplemented());
+            }
             let (opcode, set_flags, rn, rd) = (
                 (insn >> 21) & 0xf,
                 insn & (1 << 20) != 0,
@@ -1305,6 +1450,11 @@ impl Core for Cpu {
         match result {
             Ok(()) | Err(Trap::Wait | Trap::HostCall(_) | Trap::Brk(_) | Trap::Hlt(_)) => {
                 self.instret = self.instret.wrapping_add(1);
+            }
+            Err(Trap::Unimplemented(..)) if self.undef_to_guest => {
+                self.last_undef = Some((pc as u32, insn));
+                self.enter_exception(0x04, pc as u32 + 4, MODE_UND, false);
+                return Err(Trap::Exception(0x00, 1));
             }
             Err(Trap::Unimplemented(..)) => self.r[15] = pc as u32,
             _ => {}

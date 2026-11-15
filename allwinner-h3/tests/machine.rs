@@ -42,16 +42,17 @@ fn uart_uses_four_byte_register_spacing_and_bounded_input() {
     assert_eq!(soc.read32(UART0_BASE + 0x14), Ok(0x61));
     assert_eq!(soc.read8(UART0_BASE), Ok(b'R'));
     assert_eq!(soc.read8(UART0_BASE), Ok(0));
-    assert_eq!(soc.read8(UART0_BASE + 1), Err(Fault::Unmapped));
+    assert_eq!(soc.read8(UART0_BASE + 1), Err(Fault::Prohibited));
     assert_eq!(soc.read64(UART0_BASE), Err(Fault::Prohibited));
-    assert_eq!(soc.read32(UART0_BASE - 4), Err(Fault::Unmapped));
+    // Outside the H3 device window nothing answers.
+    assert_eq!(soc.read32(0x0200_0000), Err(Fault::Unmapped));
 
-    for byte in 0..32 {
+    for byte in 0..64 {
         assert!(soc.uart.push_rx(byte));
     }
-    assert!(!soc.uart.push_rx(32));
+    assert!(!soc.uart.push_rx(64));
     assert_eq!(soc.read8(UART0_BASE), Ok(0));
-    assert!(soc.uart.push_rx(32));
+    assert!(soc.uart.push_rx(64));
 }
 
 #[test]

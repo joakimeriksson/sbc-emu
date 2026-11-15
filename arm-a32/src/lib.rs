@@ -6,6 +6,10 @@
 //! VFP/NEON, LPAE and SMP/exclusive synchronization are not implemented yet.
 
 mod cpu;
+mod media;
 mod mmu;
+mod vfp;
+
+pub use vfp::Vfp;
 
 pub use cpu::{Cpu, MODE_ABT, MODE_FIQ, MODE_IRQ, MODE_SVC, MODE_SYS, MODE_UND, MODE_USR};

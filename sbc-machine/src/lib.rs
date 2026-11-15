@@ -14,6 +14,7 @@ pub use emu_core::Stop;
 pub enum Machine<'a> {
     Pi4(&'a mut bcm2711::Machine),
     OrangePi5(&'a mut rk3588::Machine),
+    OrangePiOne(&'a mut allwinner_h3::Machine),
 }
 
 impl Machine<'_> {
@@ -27,6 +28,7 @@ impl Machine<'_> {
         match self {
             Self::Pi4(m) => m.run(budget),
             Self::OrangePi5(m) => m.run(budget),
+            Self::OrangePiOne(m) => m.run(budget),
         }
     }
 
@@ -36,6 +38,7 @@ impl Machine<'_> {
         match self {
             Self::Pi4(m) => m.idle_until(time_ns),
             Self::OrangePi5(m) => m.idle_until(time_ns),
+            Self::OrangePiOne(m) => m.idle_until(time_ns),
         }
     }
 
@@ -44,6 +47,7 @@ impl Machine<'_> {
     pub fn serial_input(&mut self, byte: u8) -> bool {
         match self {
             Self::OrangePi5(m) => m.serial_input(byte),
+            Self::OrangePiOne(m) => m.serial_input(byte),
             Self::Pi4(m) => {
                 if !m.soc.uart.rx_room() {
                     return false;
@@ -60,6 +64,7 @@ impl Machine<'_> {
         match self {
             Self::Pi4(m) => &m.soc.uart.out,
             Self::OrangePi5(m) => &m.soc.uart.out,
+            Self::OrangePiOne(m) => m.serial_output(),
         }
     }
 
@@ -67,6 +72,7 @@ impl Machine<'_> {
         match self {
             Self::Pi4(m) => std::mem::take(&mut m.soc.uart.out),
             Self::OrangePi5(m) => std::mem::take(&mut m.soc.uart.out),
+            Self::OrangePiOne(m) => m.take_serial_output(),
         }
     }
 }
