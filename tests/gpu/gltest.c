@@ -891,6 +891,53 @@ static void s_small_cache(void) {
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0); glActiveTexture(GL_TEXTURE0); glDeleteTextures(2, t);
 }
 
+/* WebRender's GPU cache growing: data rows in a 1024x4 RGBA32F texture (and RGBA32I), copied
+ * whole into a 1024x16 one (copy-image, else framebuffer blit), as the cache does when it needs
+ * more rows; then read back. Each GL call's error is reported. */
+#define GLCHK(what) do { GLenum e_ = glGetError(); if (e_) printf("cache_grow: %s -> GL error %#x\n", what, e_); } while (0)
+static void s_cache_grow(void) {
+    typedef void (*copy_image_fn)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
+    copy_image_fn ci = strstr((const char *)glGetString(GL_EXTENSIONS), "GL_EXT_copy_image") ? (copy_image_fn)eglGetProcAddress("glCopyImageSubDataEXT") : NULL;
+    printf("cache_grow: copy_image %s\n", ci ? "yes" : "no");
+    GLenum ifmt[2] = {GL_RGBA32F, GL_RGBA32I}, fmt[2] = {GL_RGBA, GL_RGBA_INTEGER}, ty[2] = {GL_FLOAT, GL_INT};
+    static float fd[1024 * 4 * 4]; static int id[1024 * 4 * 4];
+    for (int i = 0; i < 4096; i++) for (int c = 0; c < 4; c++) { fd[i * 4 + c] = ((i * 11 + c * 7) % 101) / 100.0f; id[i * 4 + c] = (i * 3 + c * 41) % 253; }
+    GLuint big[2][2] = {{0, 0}, {0, 0}};
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    for (int k = 0; k < 2; k++) {
+        GLuint small; glGenTextures(1, &small); glBindTexture(GL_TEXTURE_2D, small);
+        glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 1024, 4); GLCHK("storage small");
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 4, fmt[k], ty[k], k ? (void *)id : (void *)fd); GLCHK("upload small");
+        for (int m = 0; m < 2; m++) {
+            glGenTextures(1, &big[k][m]); glBindTexture(GL_TEXTURE_2D, big[k][m]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 1024, 16); GLCHK("storage big");
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            if (m == 0) {
+                if (ci) { ci(small, GL_TEXTURE_2D, 0, 0, 0, 0, big[k][m], GL_TEXTURE_2D, 0, 0, 0, 0, 1024, 4, 1); GLCHK("copy_image"); }
+            } else {
+                GLuint f[2]; glGenFramebuffers(2, f);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, f[0]); glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, small, 0);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, f[1]); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, big[k][m], 0);
+                glBlitFramebuffer(0, 0, 1024, 4, 0, 0, 1024, 4, GL_COLOR_BUFFER_BIT, GL_NEAREST); GLCHK("blit");
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); glDeleteFramebuffers(2, f);
+            }
+        }
+        glDeleteTextures(1, &small);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prev);
+    clear(0, 0, 0);
+    /* quadrants: float copy-image, float blit, int copy-image, int blit; texel (x * 16 + y % 16, y % 4) */
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a0, a1; uniform highp isampler2D b0, b1; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); ivec2 r = q % 64; ivec2 c = ivec2(r.x * 16 + r.y % 16, r.y % 4);\n"
+                            " if (q.y < 64) o = q.x < 64 ? texelFetch(a0, c, 0) : texelFetch(a1, c, 0);\n"
+                            " else o = vec4(q.x < 64 ? texelFetch(b0, c, 0) : texelFetch(b1, c, 0)) / 255.0; }\n");
+    GLuint all[4] = {big[0][0], big[0][1], big[1][0], big[1][1]}; const char *nm[4] = {"a0", "a1", "b0", "b1"};
+    for (int i = 0; i < 4; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, all[i]); glUniform1i(glGetUniformLocation(p, nm[i]), i); }
+    glActiveTexture(GL_TEXTURE0);
+    quad(p, 1.0f, 1.0f); GLCHK("draw");
+    for (int i = 0; i < 4; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, 0); }
+    glActiveTexture(GL_TEXTURE0); glDeleteTextures(4, all);
+}
+
 struct scene { const char *name; void (*fn)(void); };
 static const struct scene scenes[] = {
     {"clear", s_clear}, {"tri_color", s_tri_color}, {"flat", s_flat}, {"depth", s_depth}, {"blend", s_blend},
@@ -903,7 +950,7 @@ static const struct scene scenes[] = {
     {"scatter128", s_scatter128}, {"glyph_copies", s_glyph_copies},
     {"big_tex_layout", s_big_tex_layout}, {"render_big_targets", s_render_big_targets},
     {"row_uploads", s_row_uploads}, {"many_instances", s_many_instances}, {"partial_update", s_partial_update},
-    {"small_cache", s_small_cache},
+    {"small_cache", s_small_cache}, {"cache_grow", s_cache_grow},
 };
 #define NSCENES (sizeof scenes / sizeof scenes[0])
 

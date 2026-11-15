@@ -271,10 +271,10 @@ pub extern "C" fn sbc_fb_h() -> u32 { with(|s| s.fb_h).unwrap_or(0) }
 
 /// Render jobs the 3D GPU has finished (one per frame for most programs), 0 without a GPU.
 #[no_mangle]
-pub extern "C" fn sbc_gpu_frames() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.jobs[1] as f64)).unwrap_or(0.0) }
+pub extern "C" fn sbc_gpu_frames() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.counters().0[1] as f64)).unwrap_or(0.0) }
 /// Host milliseconds spent in GPU jobs.
 #[no_mangle]
-pub extern "C" fn sbc_gpu_ms() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.host_ns.iter().sum::<u64>() as f64 / 1e6)).unwrap_or(0.0) }
+pub extern "C" fn sbc_gpu_ms() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.counters().2.iter().sum::<u64>() as f64 / 1e6)).unwrap_or(0.0) }
 
 #[no_mangle]
 pub extern "C" fn sbc_insns() -> f64 { with(|s| s.m.instret() as f64).unwrap_or(0.0) }
