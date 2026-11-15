@@ -32,8 +32,18 @@ pub struct SharedDisk(pub std::rc::Rc<std::cell::RefCell<CowFile>>);
 
 impl SharedDisk {
     /// Open `--sd PATH` (copy-on-write) or, with `--sd-persist`, write-through.
+    /// The card is an SDHC card: 512 KiB to 2 TiB (its CSD counts 512 KiB units). A size
+    /// that is not a multiple of 512 KiB works; the guest does not see the partial tail.
     pub fn open(path: &str, persist: bool) -> std::io::Result<Self> {
         let disk = if persist { CowFile::open_persistent(path)? } else { CowFile::open(path)? };
+        let sectors = disk.sectors();
+        if !(1024..=(1u64 << 32)).contains(&sectors) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "an SD (SDHC) image must be between 512 KiB and 2 TiB"));
+        }
+        if sectors % 1024 != 0 {
+            eprintln!("[sd] {path}: not a multiple of 512 KiB; the last {} KiB are not visible to the guest", sectors % 1024 / 2);
+        }
         Ok(SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(disk))))
     }
 }

@@ -50,10 +50,14 @@ test -s "$OUT/sun8i-h3-orangepi-one.dtb"
 mkdir "$work/rootfs"
 tar -xzf "$OUT/downloads/$ROOTFS" -C "$work/rootfs"
 # Kernel modules for SD cards and ext4 (built as modules in linux-lts), with modules.dep.
-tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" 2>/dev/null \
+# GNU tar needs --wildcards for member patterns; bsdtar (macOS) matches them by default.
+wildcards=
+tar --version 2>/dev/null | grep -q 'GNU tar' && wildcards=--wildcards
+tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
     'lib/modules/*/modules.*' 'lib/modules/*/kernel/drivers/mmc/*' \
     'lib/modules/*/kernel/fs/ext4/*' 'lib/modules/*/kernel/fs/jbd2/*' \
-    'lib/modules/*/kernel/fs/mbcache.ko.gz' 'lib/modules/*/kernel/lib/crc/*' || true
+    'lib/modules/*/kernel/fs/mbcache.ko.gz' 'lib/modules/*/kernel/lib/crc/*'
+ls "$work"/rootfs/lib/modules/*/kernel/drivers/mmc/host/sunxi-mmc.ko* > /dev/null
 cat > "$work/rootfs/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev

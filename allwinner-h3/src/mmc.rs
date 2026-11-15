@@ -20,9 +20,14 @@ const SOFT_RESET: u32 = 1 << 0;
 const FIFO_RESET: u32 = 1 << 1;
 const DMA_RESET: u32 = 1 << 2;
 const INT_ENABLE: u32 = 1 << 4;
+const DMA_ENABLE: u32 = 1 << 5;
+// DMAC
+const IDMA_ON: u32 = 1 << 7;
+/// Largest transfer Linux issues (the driver's max request size); larger byte counts
+/// are refused instead of sizing a host buffer from a guest register.
+const MAX_TRANSFER: usize = 16 << 20;
 // CMDR
 const RESP_EXPIRE: u32 = 1 << 6;
-const LONG_RESPONSE: u32 = 1 << 7;
 const DATA_EXPIRE: u32 = 1 << 9;
 const WRITE: u32 = 1 << 10;
 const SEND_AUTO_STOP: u32 = 1 << 12;
@@ -80,7 +85,11 @@ impl SunxiMmc {
     pub fn write(&mut self, offset: u64, value: u32, ram: &mut FlatRam) {
         match offset as usize {
             GCTRL => {
-                // Reset bits complete at once.
+                // Reset bits complete at once; a soft reset clears the interrupt state.
+                if value & SOFT_RESET != 0 {
+                    self.raw = 0;
+                    self.idst = 0;
+                }
                 self.regs[GCTRL / 4] = value & !(SOFT_RESET | FIFO_RESET | DMA_RESET);
             }
             0x38 => self.raw &= !value,
@@ -115,13 +124,14 @@ impl SunxiMmc {
                 }
             }
         }
-        let _ = cmd & LONG_RESPONSE;
         if cmd & DATA_EXPIRE == 0 {
             self.raw |= COMMAND_DONE;
             return;
         }
         let bytes = self.regs[BYTCNT / 4] as usize;
-        let ok = match reply.data {
+        // Only the internal DMA moves data (Linux enables it; there is no PIO FIFO model).
+        let dma = self.regs[GCTRL / 4] & DMA_ENABLE != 0 && self.regs[DMAC / 4] & IDMA_ON != 0;
+        let ok = dma && bytes <= MAX_TRANSFER && match reply.data {
             Data::Bytes(mut data) if cmd & WRITE == 0 => {
                 data.resize(bytes, 0);
                 self.dma_to_memory(&data, ram)
@@ -237,7 +247,8 @@ mod tests {
         let mut disk = MemDisk::new(2048);
         disk.0[512..516].copy_from_slice(b"SECT");
         mmc.card.disk = Some(Box::new(disk));
-        mmc.regs[GCTRL / 4] = INT_ENABLE;
+        mmc.regs[GCTRL / 4] = INT_ENABLE | DMA_ENABLE;
+        mmc.regs[DMAC / 4] = IDMA_ON;
         mmc.regs[IMASK / 4] = u32::MAX;
         mmc.regs[IDIE / 4] = IDMAC_RX | IDMAC_TX | IDMAC_NORMAL;
         (mmc, FlatRam::new(RAM, 0x10000))
@@ -276,6 +287,23 @@ mod tests {
         assert_eq!(ram.read32(RAM + 0x100).unwrap() & DESC_OWN, 0, "descriptor returned");
         assert!(mmc.irq());
         assert_eq!(mmc.read(CMDR as u64) & START, 0);
+    }
+
+    #[test]
+    fn no_transfer_without_dma_or_with_an_oversized_byte_count() {
+        let (mut mmc, mut ram) = setup();
+        descriptors(&mut ram);
+        mmc.write(DLBA as u64, RAM as u32 + 0x100, &mut ram);
+        mmc.write(BYTCNT as u64, 1024, &mut ram);
+        mmc.regs[DMAC / 4] = 0; // IDMAC off
+        issue(&mut mmc, &mut ram, 18 | DATA_EXPIRE, 1);
+        assert_ne!(mmc.read(0x38) & DATA_TIMEOUT, 0);
+        assert_eq!(&ram.mem[0x1000..0x1004], &[0; 4], "no DMA into guest memory");
+        mmc.regs[DMAC / 4] = IDMA_ON;
+        mmc.write(0x38, u32::MAX, &mut ram);
+        mmc.write(BYTCNT as u64, 0xffff_fe00, &mut ram);
+        issue(&mut mmc, &mut ram, 18 | DATA_EXPIRE, 1);
+        assert_ne!(mmc.read(0x38) & DATA_TIMEOUT, 0, "refused, no 4 GiB host buffer");
     }
 
     #[test]
