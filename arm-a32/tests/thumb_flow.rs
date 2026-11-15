@@ -174,3 +174,19 @@ fn mrs_cpsr_reads_execution_state_as_zero() {
     assert_ne!(cpu.r[0] & (1 << 30), 0, "flags are read");
     assert_eq!(cpu.r[0] & 0x1f, MODE_SVC);
 }
+
+#[test]
+fn thumb_ldrex_strex_with_offset() {
+    // ldrex r0, [r1, #8]; strex r2, r3, [r1, #8]; strex r2, r3, [r1, #56] (no reservation)
+    let (mut cpu, mut ram) = thumb_machine(&[0xe851, 0x0f02, 0xe841, 0x3202, 0xe841, 0x320e]);
+    cpu.r[1] = 0x3000;
+    cpu.r[3] = 0xfeed;
+    ram.write32(0x3008, 0x77).unwrap();
+    cpu.step(&mut ram).unwrap();
+    assert_eq!(cpu.r[0], 0x77);
+    cpu.step(&mut ram).unwrap();
+    assert_eq!((cpu.r[2], ram.read32(0x3008).unwrap()), (0, 0xfeed));
+    cpu.step(&mut ram).unwrap();
+    assert_eq!(cpu.r[2], 1, "no reservation: the store fails (Linux uses this to clear the monitor)");
+    assert_eq!(ram.read32(0x3038).unwrap(), 0);
+}

@@ -584,8 +584,34 @@ impl Cpu {
         let rt = hw2 >> 12;
         let rd = (hw2 >> 8) & 15;
         match hw1 & 0xfff0 {
-            0xe840 if hw2 & 0xff == 0 => self.a32(bus, 0x0180_0f90 | rn << 16 | rd << 12 | rt),
-            0xe850 if hw2 & 0xff == 0 => self.a32(bus, 0x0190_0f9f | rn << 16 | rt << 12),
+            // LDREX/STREX Rt, [Rn, #imm8*4]: T32 has an offset (Linux's Thumb-2 exception
+            // exit clears the monitor with `strex r2, r1, [sp, #S_LR]`).
+            0xe850 => {
+                let address = self.r[rn as usize].wrapping_add((hw2 & 0xff) << 2);
+                match self.mem_read32(bus, address, Access::Read) {
+                    Ok(value) => {
+                        self.r[rt as usize] = value;
+                        self.exclusive_addr = Some(address);
+                        self.exclusive_size = 4;
+                        Ok(())
+                    }
+                    Err((va, status)) => Err(self.data_abort(va, status, false)),
+                }
+            }
+            0xe840 => {
+                let address = self.r[rn as usize].wrapping_add((hw2 & 0xff) << 2);
+                let reserved = self.exclusive_addr == Some(address) && self.exclusive_size == 4;
+                self.exclusive_addr = None;
+                self.exclusive_size = 0;
+                if !reserved {
+                    self.r[rd as usize] = 1;
+                    return Ok(());
+                }
+                let value = self.r[rt as usize];
+                self.store(bus, address, 4, value)?;
+                self.r[rd as usize] = 0;
+                Ok(())
+            }
             0xe8c0 => {
                 let status = hw2 & 15;
                 match (hw2 >> 4) & 15 {
