@@ -40,7 +40,7 @@ pub struct CpuModel {
 
 /// ARM Cortex-A7 MPCore r0p5 as the Allwinner H3 has it (the values `arm-a32` always used).
 /// Deviations from the silicon: ID_DFR0 reports no CP14 debug, PMCR no event counters,
-/// MVFR1 no Advanced SIMD or half-precision, and the L2 geometry is a placeholder.
+/// the L2 geometry is a placeholder.
 pub const CORTEX_A7: CpuModel = CpuModel {
     midr: 0x410f_c075,
     revidr: 0,
@@ -61,7 +61,7 @@ pub const CORTEX_A7: CpuModel = CpuModel {
     pmcr: 0x4107_0000,   // Cortex-A7, no event counters
     fpsid: 0x4102_3075,  // VFPv4
     mvfr0: 0x1011_0222,  // 32 double registers, single/double, divide, sqrt
-    mvfr1: 0x1000_0011,  // fused multiply-add; no Advanced SIMD
+    mvfr1: 0x1111_1111, // Advanced SIMD (integer, single, load/store, half), FMA, half-precision VFP
     c15_diagnostic: false,
 };
 
@@ -107,8 +107,6 @@ pub const CORTEX_A12: CpuModel = CpuModel {
     // d rev 0" (TRM Table 13-2).
     fpsid: 0x4103_30d0,
     mvfr0: 0x1011_0222,
-    // TRM: 0x11111111. Advanced SIMD and half-precision fields stay "not implemented"
-    // until `arm-a32` implements NEON (same value as the A7 preset).
-    mvfr1: 0x1000_0011,
+    mvfr1: 0x1111_1111, // as the A7: NEON, FMA, half precision
     c15_diagnostic: true,
 };

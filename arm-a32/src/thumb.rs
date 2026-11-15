@@ -404,10 +404,10 @@ impl Cpu {
                     return self.thumb32_dp_shifted(bus, hw1, hw2);
                 }
                 // Coprocessor space (VFP, CP15, CP14): the A32 encoding with an AL
-                // condition. 111x 1111 is Advanced SIMD data processing: UNDEFINED here
-                // (no NEON), and it must not reach the A32 path, where 0xEFxxxxxx is SVC.
+                // condition. 1110 1111 is Advanced SIMD data processing (U=0), which must
+                // not reach the A32 path as 0xEFxxxxxx (SVC): it becomes 1111 0010.
                 if hw1 & 0x0300 == 0x0300 {
-                    return self.undefined(insn);
+                    return self.thumb32_simd(bus, hw1, hw2);
                 }
                 self.a32(bus, insn)
             }
@@ -459,6 +459,11 @@ impl Cpu {
                 }
             }
             _ => {
+                // Advanced SIMD: 1111 1111 data processing (U=1), 1111 1001 xxx0 element
+                // and structure loads/stores.
+                if hw1 & 0xff00 == 0xff00 || hw1 & 0xff10 == 0xf900 {
+                    return self.thumb32_simd(bus, hw1, hw2);
+                }
                 if op2 & 0x71 == 0x00 || op2 & 0x67 == 0x01 || op2 & 0x67 == 0x03 || op2 & 0x67 == 0x05 {
                     return self.thumb32_load_store(bus, hw1, hw2);
                 }
@@ -474,6 +479,18 @@ impl Cpu {
                 self.undefined(insn)
             }
         }
+    }
+
+    /// Advanced SIMD: the T32 forms are the A32 ones with 111U 1111 in place of 1111 001U
+    /// (data processing) and 1111 1001 in place of 1111 0100 (loads/stores).
+    fn thumb32_simd(&mut self, bus: &mut dyn Bus, hw1: u32, hw2: u32) -> Result<(), Trap> {
+        let low = (hw1 & 0xff) << 16 | hw2;
+        let word = if hw1 & 0xef00 == 0xef00 {
+            0xf200_0000 | (hw1 >> 12 & 1) << 24 | low
+        } else {
+            0xf400_0000 | low
+        };
+        self.execute(bus, self.cur_pc as u64, word)
     }
 
     /// Data processing with a modified immediate or shifted register (native: ORN and
