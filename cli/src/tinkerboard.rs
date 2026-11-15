@@ -13,16 +13,18 @@ impl SerialBoard for Machine {
         Machine::now(self)
     }
     fn instret(&self) -> u64 {
-        self.cpu.instret
+        Machine::instret(self)
     }
     fn report(&self, tag: &str) {
         eprintln!(
-            "[{tag}] pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={}",
-            self.cpu.r[15],
-            self.cpu.instret,
+            "[{tag}] core {} pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
+            self.last_stop_core,
+            self.cpus[self.last_stop_core].r[15],
+            Machine::instret(self),
             self.now() as f64 / 1e9,
             self.irqs,
-            self.exceptions
+            self.exceptions,
+            self.state
         );
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
@@ -66,8 +68,8 @@ fn execute(args: &[String]) -> Result<(), String> {
         std::fs::write(path, blob).map_err(|e| e.to_string())?;
     }
     eprintln!(
-        "[tinkerboard] experimental Rockchip RK3288: one Cortex-A12/A17 (interpreter), GIC-400, UART2, \
-         CRU/GRF/PMU; direct kernel boot with the stock DTB, no SMP yet; other devices are stubs"
+        "[tinkerboard] experimental Rockchip RK3288: four Cortex-A12 (interpreter), GIC-400, UART2, \
+         CRU/GRF/PMU, boot ROM SMP mailbox; direct kernel boot with the stock DTB; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }

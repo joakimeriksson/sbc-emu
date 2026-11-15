@@ -172,10 +172,19 @@ fn fp_mul_add(acc: u32, a: u32, b: u32) -> u32 {
         return DEFAULT_NAN;
     }
     if r.abs() <= f32::MIN_POSITIVE {
-        // Flushing looks at the value before rounding.
-        let exact = (x as f64).mul_add(y as f64, z as f64);
-        if exact != 0.0 && exact.abs() < f32::MIN_POSITIVE as f64 {
-            return (exact.is_sign_negative() as u32) << 31;
+        // Flushing looks at the exact value before rounding. The product of two singles is
+        // exact in double precision; TwoSum gives the exact error of the addition, so the
+        // test does not depend on the double-precision rounding of the sum.
+        let p = x as f64 * y as f64;
+        let c = z as f64;
+        let sum = p + c;
+        let bb = sum - p;
+        let err = (p - (sum - bb)) + (c - bb);
+        let min = f32::MIN_POSITIVE as f64;
+        let below = sum.abs() < min || sum.abs() == min && err != 0.0 && (err < 0.0) != (sum < 0.0);
+        if (sum != 0.0 || err != 0.0) && below {
+            let negative = if sum != 0.0 { sum < 0.0 } else { err < 0.0 };
+            return (negative as u32) << 31;
         }
     }
     r.to_bits()
@@ -1325,7 +1334,7 @@ impl Cpu {
                 let src = self.dregs(m, 2);
                 let mut out = [0u64];
                 for i in 0..4 {
-                    set_elem(&mut out, i, 16, f32_to_f16(elem(&src, i, 32) as u32, 0, false, true, true) as u64);
+                    set_elem(&mut out, i, 16, f32_to_f16(elem(&src, i, 32) as u32, 0, self.vfp.fpscr & (1 << 26) != 0, true, true) as u64);
                 }
                 self.vfp.d[d] = out[0];
             }
@@ -1337,7 +1346,7 @@ impl Cpu {
                 let src = [self.vfp.d[m]];
                 let mut out = [0u64; 4];
                 for i in 0..4 {
-                    set_elem(&mut out, i, 32, f16_to_f32(elem(&src, i, 16) as u16, false, true) as u64);
+                    set_elem(&mut out, i, 32, f16_to_f32(elem(&src, i, 16) as u16, self.vfp.fpscr & (1 << 26) != 0, true) as u64);
                 }
                 self.set_dregs(d, 2, &out);
             }
@@ -1529,7 +1538,8 @@ impl Cpu {
             // ((r * elements + e) * structure + s) * ebytes.
             let place = |r: usize, s: usize, e: usize| ((r * elements + e) * structure + s) * ebytes;
             if load {
-                self.neon_read(bus, address, buffer, 4)?;
+                // Element-sized accesses, as the hardware issues them (device memory).
+                self.neon_read(bus, address, buffer, ebytes.min(4))?;
                 for r in 0..regs {
                     for s in 0..structure {
                         let mut value = [0u8; 8];
@@ -1550,7 +1560,7 @@ impl Cpu {
                         }
                     }
                 }
-                self.neon_write(bus, address, buffer, 4)?;
+                self.neon_write(bus, address, buffer, ebytes.min(4))?;
             }
         } else {
             let size = (insn >> 10) & 3;

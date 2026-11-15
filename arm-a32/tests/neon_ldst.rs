@@ -349,3 +349,26 @@ fn undefined_neon_reaches_the_guest_handler_in_thumb() {
     assert_eq!(cpu.cpsr & 0x1f, 0x1b, "undefined mode");
     assert_eq!(cpu.r[14], CODE as u32 + 2);
 }
+
+/// Review regressions: FMA flush-to-zero on the exact value, AHP in NEON f16 conversions.
+#[test]
+fn vfma_flushes_on_the_exact_result_and_vcvt_f16_honours_ahp() {
+    let mut ram = emu_core::FlatRam::new(0, 0x10000);
+    ram.write32(0x1000, 0xf201_0c12).unwrap(); // vfma.f32 d0, d1, d2
+    let mut cpu = arm_a32::Cpu::new();
+    cpu.cpacr = 0xf << 20;
+    cpu.vfp.fpexc = 1 << 30;
+    cpu.r[15] = 0x1000;
+    cpu.vfp.d[0] = 0x0080_0000_0080_0000; // 2^-126
+    cpu.vfp.d[1] = 0x0d80_0000_0d80_0000; // 2^-100
+    cpu.vfp.d[2] = 0x8d80_0000_8d80_0000; // -2^-100
+    emu_core::Core::step(&mut cpu, &mut ram).unwrap();
+    assert_eq!(cpu.vfp.d[0], 0, "2^-126 - 2^-200 is below the normal range: flushed to +0");
+
+    ram.write32(0x1004, 0xf3b6_0602).unwrap(); // vcvt.f16.f32 d0, q1
+    cpu.vfp.d[2] = 0x7f80_0000_7f80_0000; // +inf
+    cpu.vfp.d[3] = 0x7f80_0000_7f80_0000;
+    cpu.vfp.fpscr |= 1 << 26; // AHP
+    emu_core::Core::step(&mut cpu, &mut ram).unwrap();
+    assert_eq!(cpu.vfp.d[0] & 0xffff, 0x7fff, "alternative half precision saturates infinity");
+}

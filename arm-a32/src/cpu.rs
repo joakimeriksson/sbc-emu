@@ -1,4 +1,5 @@
 use crate::mmu::{Access, TlbEntry, TLB_ENTRIES};
+use crate::model::{CpuModel, CORTEX_A7};
 use emu_core::{Bus, Core, Trap};
 
 pub const MODE_USR: u32 = 0x10;
@@ -48,6 +49,12 @@ pub struct Cpu {
     pub firmware_calls_to_host: bool,
     pub midr: u32,
     pub mpidr: u32,
+    /// Identification registers other than MIDR/MPIDR (see `set_model`).
+    pub model: CpuModel,
+    /// Cortex-A12/A17 diagnostic and internal feature registers (`c15, c0, 1` and `2`),
+    /// present when `model.c15_diagnostic` is set.
+    pub diagnostic: u32,
+    pub internal_feature: u32,
     pub vbar: u32,
     pub cntfrq: u32,
     pub cntkctl: u32,
@@ -118,8 +125,11 @@ impl Cpu {
             psr_restored: false,
             sent_event: false,
             firmware_calls_to_host: false,
-            midr: 0x410f_c075,
+            midr: CORTEX_A7.midr,
             mpidr: 0x8000_0000,
+            model: CORTEX_A7,
+            diagnostic: 0,
+            internal_feature: 0,
             vbar: 0,
             cntfrq: 24_000_000,
             cntkctl: 0,
@@ -194,11 +204,17 @@ impl Cpu {
         self.cntp_ctl & 1 != 0 && self.cntp_ctl & 2 == 0 && self.physical_timer_reached()
     }
 
+    /// Replace the processor identity (MIDR included) with `model`'s.
+    pub fn set_model(&mut self, model: CpuModel) {
+        self.model = model;
+        self.midr = model.midr;
+    }
+
     fn ccsidr(&self) -> u32 {
         match self.csselr & 0xf {
-            0 => 0x701f_e00a,     // 32 KiB L1 data cache
-            1 => 0x201f_e00a,     // 32 KiB L1 instruction cache
-            2 | 3 => 0x711f_e07a, // 4 MiB L2 unified cache
+            0 => self.model.ccsidr[0],
+            1 => self.model.ccsidr[1],
+            2 | 3 => self.model.ccsidr[2],
             _ => 0,
         }
     }
@@ -871,27 +887,20 @@ impl Cpu {
             }
             let value = match (opc1, crn, crm, opc2) {
                 (0, 0, 0, 0) => Some(self.midr),
-                (0, 0, 0, 1) => Some(0x8444_8003), // CTR
+                (0, 0, 0, 1) => Some(self.model.ctr),
                 (0, 0, 0, 5) => Some(self.mpidr),
-                (0, 0, 0, 6) => Some(0), // REVIDR
-                (0, 0, 1, 0) => Some(0x0000_1131), // ID_PFR0
-                (0, 0, 1, 1) => Some(0x0001_1011), // ID_PFR1
-                (0, 0, 1, 2) => Some(0x0200_0000), // ID_DFR0: PMUv2, no CP14 debug
+                (0, 0, 0, 6) => Some(self.model.revidr),
+                (0, 0, 1, 0) => Some(self.model.id_pfr0),
+                (0, 0, 1, 1) => Some(self.model.id_pfr1),
+                (0, 0, 1, 2) => Some(self.model.id_dfr0),
                 (0, 0, 0, 2 | 3 | 4 | 7) => Some(0), // TCMTR, TLBTR, aliases
-                (0, 0, 1, 3) => Some(0),           // ID_AFR0
-                (0, 0, 1, 4) => Some(0x1010_1105), // ID_MMFR0
-                (0, 0, 1, 5) => Some(0x4000_0000), // ID_MMFR1
-                (0, 0, 1, 6) => Some(0x0124_0000), // ID_MMFR2
-                (0, 0, 1, 7) => Some(0x0210_2211), // ID_MMFR3
-                (0, 0, 2, 0) => Some(0x0210_1110), // ID_ISAR0, including ARM divide
-                (0, 0, 2, 1) => Some(0x1311_2111), // ID_ISAR1
-                (0, 0, 2, 2) => Some(0x2123_2041), // ID_ISAR2
-                (0, 0, 2, 3) => Some(0x1111_2131), // ID_ISAR3
-                (0, 0, 2, 4) => Some(0x1001_1142), // ID_ISAR4
-                (0, 0, 2, 5 | 6 | 7) => Some(0),   // ID_ISAR5, ID_MMFR4, ID_ISAR6
+                (0, 0, 1, 3) => Some(self.model.id_afr0),
+                (0, 0, 1, 4..=7) => Some(self.model.id_mmfr[(opc2 - 4) as usize]),
+                (0, 0, 2, 0..=5) => Some(self.model.id_isar[opc2 as usize]),
+                (0, 0, 2, 6 | 7) => Some(0), // ID_MMFR4, ID_ISAR6
                 (0, 0, 3, 4) => Some(0),           // ID_PFR2
                 (1, 0, 0, 0) => Some(self.ccsidr()),
-                (1, 0, 0, 1) => Some(0x0a20_0023), // CLIDR
+                (1, 0, 0, 1) => Some(self.model.clidr),
                 (2, 0, 0, 0) => Some(self.csselr),
                 (0, 1, 0, 0) => Some(self.sctlr),
                 (0, 1, 0, 1) => Some(self.actlr),
@@ -919,9 +928,11 @@ impl Cpu {
                 (0, 14, 3, 0) => Some(self.cntv_cval.wrapping_sub(self.cntpct) as u32),
                 (0, 14, 3, 1) => Some(self.virtual_timer_control()),
                 (0, 1, 1, 0..=2) => Some(0), // SCR, SDER, NSACR (secure configuration)
-                (0, 9, 12, 0) => Some(0x4107_0000), // PMCR: Cortex-A7, no event counters
-                (0, 9, 12..=14, _) => Some(0),       // other PMU registers read as zero
-                (1, 9, 0, 2) => Some(0x0300_0000),   // L2CTLR: four cores
+                (0, 9, 12, 0) => Some(self.model.pmcr),
+                (0, 9, 12..=14, _) => Some(0), // other PMU registers read as zero
+                (1, 9, 0, 2) => Some(self.model.l2ctlr),
+                (0, 15, 0, 1) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => Some(self.diagnostic),
+                (0, 15, 0, 2) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => Some(self.internal_feature),
                 (0, 12, 1, 0) => Some(u32::from(self.irq) << 7 | u32::from(self.fiq) << 6), // ISR
                 _ => None,
             };
@@ -991,6 +1002,9 @@ impl Cpu {
                     (0, 9, 12..=14, _) => {}       // PMU writes ignored
                     (0, 7, 0, 4) | (0, 7, 13, 1) => {} // legacy WFI/prefetch encodings
                     (2, 0, 0, 0) => self.csselr = value & 0xf,
+                    // PL1 only: UNDEFINED from user mode, as on hardware.
+                    (0, 15, 0, 1) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => self.diagnostic = value,
+                    (0, 15, 0, 2) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => self.internal_feature = value,
                     _ => return Err(unimplemented()),
                 }
             }

@@ -9,7 +9,7 @@ pub const KERNEL_ADDR: u32 = 0x0200_0000;
 pub const DTB_ADDR: u32 = 0x01f0_0000;
 pub const INITRD_ADDR: u32 = 0x0400_0000;
 pub const DEFAULT_CMDLINE: &str =
-    "earlycon=uart8250,mmio32,0xff690000 console=ttyS2,115200 rdinit=/init nosmp";
+    "earlycon=uart8250,mmio32,0xff690000 console=ttyS2,115200 rdinit=/init";
 
 /// Patch a stock DTB for direct boot.
 pub fn prepare_device_tree(
