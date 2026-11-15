@@ -474,6 +474,9 @@ impl Machine {
         if self.cpus[0].sent_event {
             self.send_event(0);
         }
+        if self.cpus[0].tlb_broadcast {
+            self.broadcast_tlb_flush(0);
+        }
         if result == Err(Trap::Wait) {
             self.state[0] = CoreState::Wait;
             self.update_irqs();
@@ -505,6 +508,9 @@ impl Machine {
                 self.tick();
                 if self.cpus[k].sent_event {
                     self.send_event(k);
+                }
+                if self.cpus[k].tlb_broadcast {
+                    self.broadcast_tlb_flush(k);
                 }
                 match result {
                     Ok(()) => storm = 0,
@@ -565,6 +571,18 @@ impl Machine {
             }
         }
         Stop::Budget
+    }
+
+    /// Inner-shareable TLB maintenance on core `k` reaches every core (DVM broadcast).
+    /// Without it, another core kept stale translations of unmapped vmalloc pages and
+    /// wrote into freed memory.
+    fn broadcast_tlb_flush(&mut self, k: usize) {
+        self.cpus[k].tlb_broadcast = false;
+        for (j, cpu) in self.cpus.iter_mut().enumerate() {
+            if j != k {
+                cpu.tlb_flush();
+            }
+        }
     }
 
     /// SEV from core `k`: every core's event register is set; cores sleeping in WFE

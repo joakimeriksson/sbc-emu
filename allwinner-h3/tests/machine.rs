@@ -235,3 +235,34 @@ fn idle_until_the_reported_deadline_fires_the_timer() {
     }
     assert!(woke, "timer never fired: count {}", machine.cpu().cntpct);
 }
+
+/// TLBIALLIS on one core invalidates every core's TLB: core 1 must not keep using a
+/// translation that core 0 removed (stale entries let Linux write into freed vmalloc pages).
+#[test]
+fn inner_shareable_tlb_invalidate_reaches_other_cores() {
+    let mut machine = Machine::with_ram_size(64 << 10);
+    let table = RAM_BASE + 0x4000;
+    // VA 1 MiB -> RAM (the page under test) and an identity map for the code.
+    machine.soc.write32(table + 4, 0x4000_0c02).unwrap();
+    machine.soc.write32(table + 0x400 * 4, 0x4000_0c02).unwrap();
+    machine.soc.write32(RAM_BASE, 0xee08_0f13).unwrap(); // mcr p15, 0, r0, c8, c3, 0
+    machine.soc.write32(RAM_BASE + 0x100, 0xe591_0000).unwrap(); // ldr r0, [r1]
+    machine.soc.write32(RAM_BASE + 0x104, 0xe591_0000).unwrap(); // ldr r0, [r1]
+    machine.soc.write32(RAM_BASE + 0x200, 0x1234_5678).unwrap();
+    for (k, pc) in [(0, RAM_BASE), (1, RAM_BASE + 0x100)] {
+        let cpu = &mut machine.cpus[k];
+        cpu.ttbr0 = table as u32;
+        cpu.dacr = 1;
+        cpu.sctlr |= 1;
+        cpu.tlb_flush();
+        cpu.r[15] = pc as u32;
+        cpu.r[1] = 0x0010_0200;
+    }
+    machine.state[1] = CoreState::Run;
+    machine.cpus[1].step(&mut machine.soc).unwrap();
+    assert_eq!(machine.cpus[1].r[0], 0x1234_5678);
+    machine.soc.write32(table + 4, 0).unwrap(); // unmap
+    machine.step().unwrap(); // core 0: TLBIALLIS
+    assert!(matches!(machine.cpus[1].step(&mut machine.soc), Err(Trap::Exception(..))));
+    assert_eq!(machine.cpus[1].dfsr & 0x40f, 0x05, "translation fault, not a stale hit");
+}

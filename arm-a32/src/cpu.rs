@@ -33,6 +33,9 @@ pub struct Cpu {
     /// addresses are computed from these in both instruction sets.
     pub(crate) cur_pc: u32,
     pub(crate) cur_size: u32,
+    /// Set by inner-shareable TLB maintenance; the machine flushes the other cores' TLBs
+    /// and clears it.
+    pub tlb_broadcast: bool,
     /// Set by any PC write while executing a Thumb instruction.
     pub(crate) pc_written: bool,
     /// Set when an instruction restored CPSR from SPSR (exception return).
@@ -111,6 +114,7 @@ impl Cpu {
             cur_pc: 0,
             cur_size: 4,
             pc_written: false,
+            tlb_broadcast: false,
             psr_restored: false,
             sent_event: false,
             firmware_calls_to_host: false,
@@ -950,7 +954,13 @@ impl Cpu {
                     (0, 6, 0, 0) => self.dfar = value,
                     (0, 6, 0, 2) => self.ifar = value,
                     (0, 7, 1 | 5 | 6 | 10 | 11 | 14, _) => {}
-                    (0, 8, 3 | 5 | 6 | 7, _) => self.tlb_flush(),
+                    // Inner-shareable TLB maintenance (c8, c3) applies to every core: the
+                    // machine flushes the other cores' TLBs when it sees `tlb_broadcast`.
+                    (0, 8, 3, _) => {
+                        self.tlb_flush();
+                        self.tlb_broadcast = true;
+                    }
+                    (0, 8, 5 | 6 | 7, _) => self.tlb_flush(),
                     (0, 10, 2, 0) => self.prrr = value,
                     (0, 10, 2, 1) => self.nmrr = value,
                     (0, 12, 0, 0) => self.vbar = value & 0xffff_ffe0,
