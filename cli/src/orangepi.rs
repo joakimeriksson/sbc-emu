@@ -41,8 +41,8 @@ fn execute(args:&[String])->Result<(),String> {
         } else {
             let card=rk3588::boot::read_card(m.soc.mmc.card.disk.as_mut().ok_or("no SD image")?.as_mut())?;
             for note in &card.notes {eprintln!("[orangepi5 firmware] {note}");}
-            let bootargs=arg(args,"--append").unwrap_or(&card.cmdline);
-            rk3588::boot::boot_linux(&mut m,&card.kernel,card.initrd.as_deref(),bootargs)?;
+            let bootargs=image_cmdline(&card.cmdline,arg(args,"--append"));
+            rk3588::boot::boot_linux(&mut m,&card.kernel,card.initrd.as_deref(),&bootargs)?;
         }
         if !args.iter().any(|a|a=="--no-jit") {m.cpu.enable_jit();}
         Ok(m)
@@ -53,4 +53,23 @@ fn execute(args:&[String])->Result<(),String> {
     }
     eprintln!("[orangepi5] experimental RK3588S: one reduced Cortex-A55, GICv3, UART2; emulated firmware, reduced DT");
     serial_board::run(config, make_machine)
+}
+
+/// For SD image boots keep the image's root and console settings and append extra options.
+fn image_cmdline(base: &str, extra: Option<&str>) -> String {
+    match extra.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(extra) => format!("{base} {extra}"),
+        None => base.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn image_arguments_preserve_root_and_console() {
+        let base = "root=UUID=example rootwait console=ttyS2";
+        assert_eq!(super::image_cmdline(base, Some("  loglevel=7  ")), format!("{base} loglevel=7"));
+        assert_eq!(super::image_cmdline(base, Some("  ")), base);
+        assert_eq!(super::image_cmdline(base, None), base);
+    }
 }
