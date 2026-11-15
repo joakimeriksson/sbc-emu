@@ -1,0 +1,26 @@
+# Tinker Board S (RK3288) M2 acceptance: shell input, device tree, CPU identity, timer,
+# VFP userland, filesystem and the CRU global soft reset. A prompt alone is not enough.
+# Fixture: scripts/tinker-board-fixture.sh, then
+#   sbc-emu run --board tinkerboard --kernel cache/tinker-board/zImage \
+#     --dtb cache/tinker-board/rk3288-tinker-s.dtb --initrd cache/tinker-board/initramfs.cpio.gz \
+#     --script scripts/tinkerboard-shell.txt --timeout 600
+# Power-off is not tested: the RK808 PMIC (the system power controller) is not modelled.
+wait-serial tinker-board#
+serial uname -a; cat /proc/device-tree/model; echo\r
+wait-serial Asus Tinker Board S
+wait-serial tinker-board#
+serial grep -m1 'CPU part' /proc/cpuinfo | sed 's/.*: /PART_/'\r
+wait-serial PART_0xc0d
+serial grep -q vfpv4 /proc/cpuinfo && awk 'BEGIN{printf "FP_%s %.3f", "OK", 2.5*1.5; print ""}'\r
+wait-serial FP_OK 3.750
+serial sleep 1; printf 'TIMER_%s' OK; echo; cat /proc/interrupts\r
+wait-serial TIMER_OK
+wait-serial tinker-board#
+serial echo rockchip-test > /tmp/probe; test "$(cat /tmp/probe)" = rockchip-test && printf 'FS_%s' OK; echo\r
+wait-serial FS_OK
+serial reboot -f\r
+wait-serial Booting Linux on physical CPU 0x500
+wait-serial tinker-board#
+serial printf 'REBOOT_%s' OK; echo\r
+wait-serial REBOOT_OK
+quit

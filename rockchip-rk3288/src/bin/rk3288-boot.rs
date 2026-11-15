@@ -91,6 +91,10 @@ fn run() -> Result<(), String> {
                     machine.cpu.instret,
                     machine.now() as f64 / 1e9
                 );
+                eprintln!(
+                    "[rk3288-boot] irqs={} exceptions={} last undefined instruction (pc, word)={:x?}",
+                    machine.irqs, machine.exceptions, machine.cpu.last_undef
+                );
                 dump_kernel_image(&machine);
                 return Ok(());
             }

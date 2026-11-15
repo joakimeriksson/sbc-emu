@@ -15,6 +15,7 @@ pub enum Machine<'a> {
     Pi4(&'a mut bcm2711::Machine),
     OrangePi5(&'a mut rk3588::Machine),
     OrangePiOne(&'a mut allwinner_h3::Machine),
+    TinkerBoard(&'a mut rockchip_rk3288::Machine),
 }
 
 impl Machine<'_> {
@@ -29,6 +30,7 @@ impl Machine<'_> {
             Self::Pi4(m) => m.run(budget),
             Self::OrangePi5(m) => m.run(budget),
             Self::OrangePiOne(m) => m.run(budget),
+            Self::TinkerBoard(m) => m.run(budget),
         }
     }
 
@@ -39,6 +41,7 @@ impl Machine<'_> {
             Self::Pi4(m) => m.idle_until(time_ns),
             Self::OrangePi5(m) => m.idle_until(time_ns),
             Self::OrangePiOne(m) => m.idle_until(time_ns),
+            Self::TinkerBoard(m) => m.idle_until(time_ns),
         }
     }
 
@@ -48,6 +51,7 @@ impl Machine<'_> {
         match self {
             Self::OrangePi5(m) => m.serial_input(byte),
             Self::OrangePiOne(m) => m.serial_input(byte),
+            Self::TinkerBoard(m) => m.serial_input(byte),
             Self::Pi4(m) => {
                 if !m.soc.uart.rx_room() {
                     return false;
@@ -65,6 +69,7 @@ impl Machine<'_> {
             Self::Pi4(m) => &m.soc.uart.out,
             Self::OrangePi5(m) => &m.soc.uart.out,
             Self::OrangePiOne(m) => m.serial_output(),
+            Self::TinkerBoard(m) => m.serial_output(),
         }
     }
 
@@ -73,6 +78,7 @@ impl Machine<'_> {
             Self::Pi4(m) => std::mem::take(&mut m.soc.uart.out),
             Self::OrangePi5(m) => std::mem::take(&mut m.soc.uart.out),
             Self::OrangePiOne(m) => m.take_serial_output(),
+            Self::TinkerBoard(m) => m.take_serial_output(),
         }
     }
 }

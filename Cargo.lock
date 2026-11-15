@@ -80,6 +80,7 @@ dependencies = [
  "bcm2711",
  "emu-core",
  "rk3588",
+ "rockchip-rk3288",
  "sbc-machine",
  "v3d",
 ]
@@ -102,6 +103,7 @@ dependencies = [
  "bcm2711",
  "emu-core",
  "rk3588",
+ "rockchip-rk3288",
 ]
 
 [[package]]
