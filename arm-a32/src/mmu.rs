@@ -148,17 +148,28 @@ impl Cpu {
         self.mem_read_array(bus, va, access).map(u32::from_le_bytes)
     }
 
+    fn invalidate_exclusive(&mut self, va: u32) {
+        if self
+            .exclusive_addr
+            .is_some_and(|base| va.wrapping_sub(base) < self.exclusive_size)
+        {
+            self.exclusive_addr = None;
+            self.exclusive_size = 0;
+        }
+    }
+
     pub(crate) fn mem_write8(
-        &self,
+        &mut self,
         bus: &mut dyn Bus,
         va: u32,
         value: u8,
     ) -> Result<(), (u32, u32)> {
         let physical = self.translate(bus, va, Access::Write)?;
+        self.invalidate_exclusive(va);
         bus.write8(physical as u64, value).map_err(|_| (va, 0x08))
     }
 
-    fn mem_write_array(&self, bus: &mut dyn Bus, va: u32, bytes: &[u8]) -> Result<(), (u32, u32)> {
+    fn mem_write_array(&mut self, bus: &mut dyn Bus, va: u32, bytes: &[u8]) -> Result<(), (u32, u32)> {
         for (index, byte) in bytes.iter().enumerate() {
             self.mem_write8(bus, va.wrapping_add(index as u32), *byte)?;
         }
@@ -166,24 +177,26 @@ impl Cpu {
     }
 
     pub(crate) fn mem_write16(
-        &self,
+        &mut self,
         bus: &mut dyn Bus,
         va: u32,
         value: u16,
     ) -> Result<(), (u32, u32)> {
         if self.sctlr & 1 == 0 {
+            self.invalidate_exclusive(va);
             return bus.write16(va as u64, value).map_err(|_| (va, 0x08));
         }
         self.mem_write_array(bus, va, &value.to_le_bytes())
     }
 
     pub(crate) fn mem_write32(
-        &self,
+        &mut self,
         bus: &mut dyn Bus,
         va: u32,
         value: u32,
     ) -> Result<(), (u32, u32)> {
         if self.sctlr & 1 == 0 {
+            self.invalidate_exclusive(va);
             return bus.write32(va as u64, value).map_err(|_| (va, 0x08));
         }
         self.mem_write_array(bus, va, &value.to_le_bytes())

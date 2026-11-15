@@ -38,6 +38,8 @@ pub struct Cpu {
     pub cntpct: u64,
     pub cntp_ctl: u32,
     pub cntp_cval: u64,
+    pub exclusive_addr: Option<u32>,
+    pub exclusive_size: u32,
     pub sctlr: u32,
     pub actlr: u32,
     pub cpacr: u32,
@@ -89,6 +91,8 @@ impl Cpu {
             cntpct: 0,
             cntp_ctl: 0,
             cntp_cval: 0,
+            exclusive_addr: None,
+            exclusive_size: 0,
             sctlr: 0x00c5_0078,
             actlr: 0,
             cpacr: 0,
@@ -329,6 +333,46 @@ impl Cpu {
     fn execute(&mut self, bus: &mut dyn Bus, pc: u64, insn: u32) -> Result<(), Trap> {
         let unimplemented = || Trap::Unimplemented(pc, insn);
         if insn >> 28 == 15 {
+            if insn == 0xf57f_f01f {
+                self.exclusive_addr = None;
+                self.exclusive_size = 0;
+                return Ok(());
+            }
+            // CPS/CPSIE/CPSID: interrupt-mask and optional processor-mode writes.
+            if insn & 0x0ff0_ff00 == 0x0100_0000 {
+                let imod = (insn >> 18) & 3;
+                let mode = insn & 0x1f;
+                if imod == 1
+                    || imod == 0 && insn & 0xe0 != 0
+                    || mode != 0
+                        && !matches!(
+                            mode,
+                            MODE_USR | MODE_FIQ | MODE_IRQ | MODE_SVC | MODE_ABT | MODE_UND | MODE_SYS
+                        )
+                {
+                    return Err(unimplemented());
+                }
+                let flags = (insn >> 5) & 7;
+                let mut mask = 0;
+                if flags & 1 != 0 {
+                    mask |= 1 << 8;
+                }
+                if flags & 2 != 0 {
+                    mask |= 1 << 6;
+                }
+                if flags & 4 != 0 {
+                    mask |= 1 << 7;
+                }
+                if imod == 2 {
+                    self.cpsr &= !mask;
+                } else if imod == 3 {
+                    self.cpsr |= mask;
+                }
+                if mode != 0 {
+                    self.change_mode(mode);
+                }
+                return Ok(());
+            }
             // DMB/DSB/ISB are no-ops with synchronous devices and direct instruction fetch.
             if insn & 0x0fff_fff0 == 0x057f_f040
                 || insn & 0x0fff_fff0 == 0x057f_f050
@@ -518,6 +562,26 @@ impl Cpu {
             return Ok(());
         }
 
+        // Bitfield insert/clear. Rn = 15 encodes BFC with a zero source.
+        if insn & 0x0fe0_0070 == 0x07c0_0010 {
+            let (rd, rn) = ((insn >> 12) & 0xf, insn & 0xf);
+            let msb = (insn >> 16) & 0x1f;
+            let lsb = (insn >> 7) & 0x1f;
+            if rd == 15 || msb < lsb {
+                return Err(unimplemented());
+            }
+            let width = msb - lsb + 1;
+            let mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1 << width) - 1
+            };
+            let source = if rn == 15 { 0 } else { self.r[rn as usize] };
+            let old = self.r[rd as usize];
+            self.r[rd as usize] = (old & !(mask << lsb)) | (source & mask) << lsb;
+            return Ok(());
+        }
+
         // Unsigned/signed bitfield extracts.
         if matches!(insn & 0x0fe0_0070, 0x07e0_0050 | 0x07a0_0050) {
             let signed = insn & 0x0fe0_0070 == 0x07a0_0050;
@@ -557,24 +621,29 @@ impl Cpu {
         }
 
         // Zero/sign-extending byte and halfword operations, with optional rotation.
-        let extend = match insn & 0x0fff_03f0 {
-            0x06ef_0070 => Some(0),
-            0x06ff_0070 => Some(1),
-            0x06af_0070 => Some(2),
-            0x06bf_0070 => Some(3),
+        let extend = match insn & 0x0ff0_03f0 {
+            0x06e0_0070 => Some(0),
+            0x06f0_0070 => Some(1),
+            0x06a0_0070 => Some(2),
+            0x06b0_0070 => Some(3),
             _ => None,
         };
         if let Some(kind) = extend {
-            let (rd, rm) = ((insn >> 12) & 0xf, insn & 0xf);
+            let (rd, rn, rm) = ((insn >> 12) & 0xf, (insn >> 16) & 0xf, insn & 0xf);
             if rd == 15 || rm == 15 {
                 return Err(unimplemented());
             }
             let value = self.r[rm as usize].rotate_right(((insn >> 10) & 3) * 8);
-            self.r[rd as usize] = match kind {
+            let extended = match kind {
                 0 => value & 0xff,
                 1 => value & 0xffff,
                 2 => value as u8 as i8 as i32 as u32,
                 _ => value as u16 as i16 as i32 as u32,
+            };
+            self.r[rd as usize] = if rn == 15 {
+                extended
+            } else {
+                self.r[rn as usize].wrapping_add(extended)
             };
             return Ok(());
         }
@@ -648,6 +717,7 @@ impl Cpu {
                 (0, 0, 0, 0) => Some(self.midr),
                 (0, 0, 0, 1) => Some(0x8444_8003), // CTR
                 (0, 0, 0, 5) => Some(self.mpidr),
+                (0, 0, 0, 6) => Some(0), // REVIDR
                 (0, 0, 1, 0) => Some(0x0000_1131), // ID_PFR0
                 (0, 0, 1, 1) => Some(0x0001_1011), // ID_PFR1
                 (0, 0, 1, 2) => Some(0x0201_0555), // ID_DFR0
@@ -711,7 +781,7 @@ impl Cpu {
                     (0, 6, 0, 0) => self.dfar = value,
                     (0, 6, 0, 2) => self.ifar = value,
                     (0, 7, 1 | 5 | 6 | 10 | 11 | 14, _) => {}
-                    (0, 8, 5 | 7, _) => {}
+                    (0, 8, 1 | 3 | 5 | 7, _) => {}
                     (0, 10, 2, 0) => self.prrr = value,
                     (0, 10, 2, 1) => self.nmrr = value,
                     (0, 12, 0, 0) => self.vbar = value & 0xffff_ffe0,
@@ -764,6 +834,92 @@ impl Cpu {
                     _ => return Err(unimplemented()),
                 }
             }
+            return Ok(());
+        }
+
+        // Load/store exclusive and the local reservation monitor.
+        let load_exclusive = match insn & 0x0ff0_0fff {
+            0x0190_0f9f => Some(4),
+            0x01b0_0f9f => Some(8),
+            0x01d0_0f9f => Some(1),
+            0x01f0_0f9f => Some(2),
+            _ => None,
+        };
+        if let Some(size) = load_exclusive {
+            let (rn, rd) = ((insn >> 16) & 0xf, (insn >> 12) & 0xf);
+            if rn == 15 || rd == 15 || size == 8 && (rd & 1 != 0 || rd >= 14) {
+                return Err(unimplemented());
+            }
+            let address = self.r[rn as usize];
+            let first = match size {
+                1 => self.mem_read8(bus, address, Access::Read).map(u32::from),
+                2 => self.mem_read16(bus, address).map(u32::from),
+                _ => self.mem_read32(bus, address, Access::Read),
+            };
+            let first = match first {
+                Ok(value) => value,
+                Err((va, status)) => return Err(self.data_abort(va, status, false)),
+            };
+            self.r[rd as usize] = first;
+            if size == 8 {
+                match self.mem_read32(bus, address.wrapping_add(4), Access::Read) {
+                    Ok(value) => self.r[rd as usize + 1] = value,
+                    Err((va, status)) => return Err(self.data_abort(va, status, false)),
+                }
+            }
+            self.exclusive_addr = Some(address);
+            self.exclusive_size = size;
+            return Ok(());
+        }
+        let store_exclusive = match insn & 0x0ff0_0ff0 {
+            0x0180_0f90 => Some(4),
+            0x01a0_0f90 => Some(8),
+            0x01c0_0f90 => Some(1),
+            0x01e0_0f90 => Some(2),
+            _ => None,
+        };
+        if let Some(size) = store_exclusive {
+            let (rn, rd, rm) = (
+                (insn >> 16) & 0xf,
+                (insn >> 12) & 0xf,
+                insn & 0xf,
+            );
+            if rn == 15
+                || rd == 15
+                || rm == 15
+                || size == 8 && (rm & 1 != 0 || rm >= 14)
+            {
+                return Err(unimplemented());
+            }
+            let address = self.r[rn as usize];
+            let reserved = self.exclusive_addr == Some(address) && self.exclusive_size == size;
+            if !reserved {
+                self.r[rd as usize] = 1;
+                self.exclusive_addr = None;
+                self.exclusive_size = 0;
+                return Ok(());
+            }
+            let value = self.r[rm as usize];
+            let result = match size {
+                1 => self.mem_write8(bus, address, value as u8),
+                2 => self.mem_write16(bus, address, value as u16),
+                _ => self.mem_write32(bus, address, value),
+            };
+            if let Err((va, status)) = result {
+                return Err(self.data_abort(va, status, true));
+            }
+            if size == 8 {
+                if let Err((va, status)) = self.mem_write32(
+                    bus,
+                    address.wrapping_add(4),
+                    self.r[rm as usize + 1],
+                ) {
+                    return Err(self.data_abort(va, status, true));
+                }
+            }
+            self.r[rd as usize] = 0;
+            self.exclusive_addr = None;
+            self.exclusive_size = 0;
             return Ok(());
         }
 
@@ -856,7 +1012,8 @@ impl Cpu {
                 insn & (1 << 6) != 0,
                 insn & (1 << 5) != 0,
             );
-            if !load && signed || load && rd == 15 {
+            let pair = !load && signed;
+            if pair && (rd & 1 != 0 || rd >= 14) || !pair && load && rd == 15 {
                 return Err(unimplemented());
             }
             let offset = if insn & (1 << 22) != 0 {
@@ -875,7 +1032,41 @@ impl Cpu {
             };
             let pre = insn & (1 << 24) != 0;
             let address = if pre { adjusted } else { base };
-            let result = if load {
+            let result = if pair {
+                if halfword {
+                    // STRD stores the even register first, then its odd partner.
+                    if let Err((va, status)) =
+                        self.mem_write32(bus, address, self.r[rd as usize])
+                    {
+                        return Err(self.data_abort(va, status, true));
+                    }
+                    if let Err((va, status)) = self.mem_write32(
+                        bus,
+                        address.wrapping_add(4),
+                        self.r[rd as usize + 1],
+                    ) {
+                        return Err(self.data_abort(va, status, true));
+                    }
+                    Ok(())
+                } else {
+                    // LDRD commits both registers after both reads succeed.
+                    let low = match self.mem_read32(bus, address, Access::Read) {
+                        Ok(value) => value,
+                        Err((va, status)) => return Err(self.data_abort(va, status, false)),
+                    };
+                    let high = match self.mem_read32(
+                        bus,
+                        address.wrapping_add(4),
+                        Access::Read,
+                    ) {
+                        Ok(value) => value,
+                        Err((va, status)) => return Err(self.data_abort(va, status, false)),
+                    };
+                    self.r[rd as usize] = low;
+                    self.r[rd as usize + 1] = high;
+                    Ok(())
+                }
+            } else if load {
                 let value = match (signed, halfword) {
                     (false, true) => self.mem_read16(bus, address).map(u32::from),
                     (true, false) => self
@@ -900,7 +1091,7 @@ impl Cpu {
                 }
             };
             if !pre || insn & (1 << 21) != 0 {
-                if rn == 15 || rn == rd {
+                if rn == 15 || rn == rd || pair && rn == rd + 1 {
                     return Err(unimplemented());
                 }
                 self.r[rn as usize] = adjusted;

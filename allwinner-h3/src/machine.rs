@@ -123,6 +123,19 @@ impl Machine {
         self.soc.ram.load(addr, bytes)
     }
 
+    /// ARM32 Linux zImage entry: SVC/A32, MMU and caches off, IRQ/FIQ masked,
+    /// r0 = 0, r1 = ~0 and r2 = the DTB physical address.
+    pub fn boot_linux(&mut self, entry: u32, dtb: u32) {
+        self.cpu = Cpu::new();
+        self.cpu.r[0] = 0;
+        self.cpu.r[1] = u32::MAX;
+        self.cpu.r[2] = dtb;
+        self.cpu.r[15] = entry;
+        self.cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
+        self.waiting = false;
+        self.update_irqs();
+    }
+
     fn update_irqs(&mut self) {
         self.soc
             .gic
@@ -142,7 +155,12 @@ impl Machine {
     pub fn step(&mut self) -> Result<(), Trap> {
         self.update_irqs();
         if self.waiting && !self.cpu.irq {
-            self.cpu.advance_time(1);
+            let ticks = if self.cpu.cntp_ctl & 3 == 1 && self.cpu.cntp_cval > self.cpu.cntpct {
+                self.cpu.cntp_cval - self.cpu.cntpct
+            } else {
+                1
+            };
+            self.cpu.advance_time(ticks);
             self.update_irqs();
             return Err(Trap::Wait);
         }
