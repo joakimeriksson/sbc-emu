@@ -191,10 +191,12 @@ impl Exec {
             }
             &Job::Render { start, end } => {
                 self.code.clear();
-                // after a snapshot restore: rebuild the tile lists the render job will read
+                // after a snapshot restore: rebuild the tile lists this render job reads (only
+                // those: older bin jobs' control lists may have been reused since)
                 if self.binned.len() < self.bin_jobs.len() {
-                    for (q, j) in self.bin_jobs.clone() {
+                    for q in render::tile_list_bases(start, end, &mut m) {
                         if self.binned.contains_key(&q) { continue; }
+                        let Some(j) = self.bin_jobs.get(&q).copied() else { continue };
                         if let Some(r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { self.binned.insert(q, std::sync::Arc::new(r)); }
                     }
                 }
@@ -241,6 +243,9 @@ pub struct V3d {
     worker: Option<Worker>,
     /// bumped by a reset: jobs still running from before it are dropped when they finish
     gen: u64,
+    /// the same, for the GPU thread: jobs still queued from before a reset are not run at all
+    /// (their control lists and buffers may already be freed and reused)
+    gen_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// the PM block powered the GPU up (bcm2835-power, V3D domain)
     pub powered: bool,
     /// guest time (ns), as the SoC last told it
@@ -263,7 +268,7 @@ impl V3d {
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
         let exec = Exec { code: Code::default(), binned: HashMap::new(), bin_jobs: HashMap::new(), jobs: [0; 4], insns: 0, host_ns: [0; 4] };
         let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], exec: std::sync::Arc::new(std::sync::Mutex::new(exec)),
-            #[cfg(not(target_arch = "wasm32"))] worker: None, gen: 0, powered: true, now: 0, pending: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))] worker: None, gen: 0, gen_now: Default::default(), powered: true, now: 0, pending: Vec::new(),
             time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false };
         // (std::env is empty in the browser: the defaults apply)
         v.reset();
@@ -278,6 +283,7 @@ impl V3d {
         self.core[CTL_INT_MSK_STS / 4] = !0;
         // jobs still on the GPU thread finish into nothing
         self.gen += 1;
+        self.gen_now.store(self.gen, std::sync::atomic::Ordering::Release);
         self.drain();
         let mut e = self.exec();
         e.binned.clear();
@@ -329,13 +335,15 @@ impl V3d {
                 let (tx, rx) = std::sync::mpsc::channel::<(Job, RamPtr, u64, bool, u64)>();
                 let done = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                 let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let (exec, d2, b2) = (self.exec.clone(), done.clone(), busy.clone());
+                let (exec, d2, b2, g2) = (self.exec.clone(), done.clone(), busy.clone(), self.gen_now.clone());
                 std::thread::Builder::new().name("v3d".into()).spawn(move || {
                     for (job, ram, pt, mmu, gen) in rx {
                         // SAFETY: guest RAM lives as long as the machine, which outlives its jobs
                         let ram = unsafe { std::slice::from_raw_parts_mut(ram.0, ram.1) };
-                        let d = exec.lock().unwrap_or_else(|e| e.into_inner()).run(&job, ram, pt, mmu, gen);
-                        d2.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+                        if gen == g2.load(std::sync::atomic::Ordering::Acquire) {
+                            let d = exec.lock().unwrap_or_else(|e| e.into_inner()).run(&job, ram, pt, mmu, gen);
+                            d2.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+                        }
                         b2.fetch_sub(1, std::sync::atomic::Ordering::Release);
                     }
                 }).expect("v3d thread");
@@ -513,6 +521,7 @@ impl V3d {
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
         r.tag("v3d-v1")?;
         self.gen += 1;
+        self.gen_now.store(self.gen, std::sync::atomic::Ordering::Release);
         self.drain();
         for k in 0..self.hub.len() { self.hub[k] = r.u32()?; }
         for k in 0..self.core.len() { self.core[k] = r.u32()?; }

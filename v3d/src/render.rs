@@ -61,6 +61,17 @@ struct Render<'r> {
     thread: Option<Box<Thread>>,
 }
 
+/// The tile-list base addresses a render control list points at (the binning results it reads).
+pub fn tile_list_bases(start: u32, end: u32, m: &mut Gmem) -> Vec<u32> {
+    let mut v = Vec::new();
+    let mut cl = bin::Cl::new(start, end);
+    while let Some((op, b)) = cl.next(m) {
+        if op == 13 { break; }
+        if op == 123 { let a = MulticoreRenderingTileListSetBase::parse(&b).address; if !v.contains(&a) { v.push(a); } }
+    }
+    v
+}
+
 pub fn run(start: u32, end: u32, binned: &BinResults, m: &mut Gmem, code: &mut Code, insns: &mut u64) {
     let mut r = Render {
         binned, cur: None, width: 0, height: 0, msaa: false, nrt: 1, rt: [RtCfg::default(); 4], depth_type: 0, early_ds_clear: false,
