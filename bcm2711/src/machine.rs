@@ -513,7 +513,7 @@ impl Machine {
     /// A Pi 4 with `ncpu` Cortex-A72 cores (the board has 4); only core 0 starts.
     pub fn with_cpus(ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
-        let fb_base = ram as u64 - GPU_MEM;
+        let fb_base = (ram as u64).saturating_sub(GPU_MEM); // tiny test machines have less RAM than that
         let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, vc4: None, v3d: None, net: None, unknown: Vec::new(), dirty: true };
         let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
