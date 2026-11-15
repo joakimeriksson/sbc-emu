@@ -147,8 +147,31 @@ ARM/Thumb program. One kernel-visible detail: the UNDEFINED return address in Th
 is the instruction + 2 even for 32-bit encodings (Linux reads the halfwords at LR - 2 and
 LR); with + 4 the lazy VFP enable failed and Thumb programs died with SIGILL.
 
+**NEON (follow-up PR).** ARMv7 Advanced SIMD with the VFPv4 fused multiply-add in
+`arm-a32/src/neon.rs`: all A32 data-processing groups (three same/different lengths, by
+scalar, shift by immediate incl. narrowing/widening and fixed-point VCVT, modified
+immediates, two-register misc incl. VRECPE/VRSQRTE and VCVT f16<->f32, VEXT, VTBL/VTBX,
+VDUP), every VLD1-4/VST1-4 form with alignment faults and writeback, and in `vfp.rs` the
+8/16-bit VMOV core<->scalar, VDUP from a core register and VFP VCVTB/VCVTT. Floating point
+follows ARMv7 exactly: the Standard FPSCR value (flush-to-zero in and out, default NaN,
+round to nearest) whatever FPSCR holds, VMLA/VMLS/VRECPS/VRSQRTS round the product
+separately (only VFMA/VFMS fuse); saturation sets FPSCR.QC. T32 maps `111U 1111` and
+`1111 1001` onto the A32 decoder. Access follows CPACR (CP10/CP11, ASEDIS) and FPEXC.EN
+like VFP, so Linux's lazy enable traps the first NEON instruction of a task; MVFR1 is now
+the Cortex-A7 value 0x11111111 and Linux sets `HWCAP_NEON`.
+Tests: `neon_diff.rs` runs 407 instructions (A32 and T32 encodings from `arm-none-eabi-as`,
+`tools/gen_neon_cases.py`) against AArch64 equivalents executed natively with FPCR.FZ/DN
+(256 random states each, about 208,000 emulated runs; registers, QC, memory and writeback
+must match); `neon_ldst.rs` checks every load/store encoding against a reference model
+(15,150 executions) plus alignment faults and gating; `vfp_half.rs` checks 160,000 VCVTB/
+VCVTT conversions against the host's FCVT in every rounding mode with FZ/DN/AHP;
+`neon_decode_sweep.rs` (opt-in, `tools/neon_decode_sweep.py`) sweeps 134,144 encodings
+against `arm-none-eabi-objdump`, and nothing objdump calls UNDEFINED executes. Real code:
+`scripts/orangepi-one-neon.txt` (Debian armhf OpenSSL and libjpeg-turbo on their NEON
+paths, results equal to the host's). Not modelled: cumulative floating-point exception
+flags (as in VFP), big-endian data (CPSR.E) for element accesses.
+
 **Not yet.** SD/MMC, EMAC, USB, display,
-NEON (Armbian userlands and the panel board application),
 a JIT, snapshots and the browser build. The RK3288 / panel board work builds on `arm-a32`;
 `arm-a32` needs a per-board CPU identity (MIDR, cache and feature ID registers) before a
 second board uses it.

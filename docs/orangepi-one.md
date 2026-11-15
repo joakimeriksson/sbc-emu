@@ -2,7 +2,7 @@
 
 `--board orangepi-one`, experimental.
 
-A 32-bit machine on its own ARMv7 core (`arm-a32`, interpreter only): four Cortex-A7 cores with VFPv4 (started through PSCI CPU_ON, as U-Boot's secure monitor does on the board), the H3's GIC-400 with inter-processor interrupts, UART0
+A 32-bit machine on its own ARMv7 core (`arm-a32`, interpreter only): four Cortex-A7 cores with VFPv4 and NEON (started through PSCI CPU_ON, as U-Boot's secure monitor does on the board), the H3's GIC-400 with inter-processor interrupts, UART0
 (DesignWare), CCU, timers and the architectural timers. It boots an unmodified Alpine Linux
 kernel (6.18 `linux-lts`, armv7) with the unmodified mainline `sun8i-h3-orangepi-one.dtb`:
 like U-Boot on the real board, the emulator fills in `/chosen` and `/memory` and adds a
@@ -16,6 +16,14 @@ sbc-emu run --board orangepi-one --kernel $F/zImage --dtb $F/sun8i-h3-orangepi-o
     --initrd $F/initramfs.cpio.gz           # Ctrl-A x quits
 ```
 
+The NEON check (Debian armhf glibc, OpenSSL and libjpeg-turbo; about 80 s on an M-series Mac):
+
+```sh
+scripts/debian-armhf-neon-fixture.sh       # pinned Debian 13 packages -> cache/debian-armhf-neon/
+sbc-emu run --board orangepi-one --kernel $F/zImage --dtb $F/sun8i-h3-orangepi-one.dtb \
+    --initrd cache/debian-armhf-neon/initramfs.cpio.gz --script scripts/orangepi-one-neon.txt
+```
+
 | | Status | Evidence |
 |---|---|---|
 | Boot | kernel to the `orangepi-one#` BusyBox prompt on four cores (`smp: Brought up 1 node, 4 CPUs`) in 0.67 s of guest time (about 1 G instructions, ~23 s on an M-series Mac) | `scripts/orangepi-one-shell.txt` |
@@ -23,8 +31,9 @@ sbc-emu run --board orangepi-one --kernel $F/zImage --dtb $F/sun8i-h3-orangepi-o
 | Userland | shell input on `ttyS0`, `/proc/device-tree/model` = `Xunlong Orange Pi One`, VFPv4 floating point (`awk` arithmetic), `sleep`, tmpfs I/O | same script |
 | Firmware | PSCI 1.0 over SMC from the host: `reboot -f` boots again, `poweroff -f` ends the run | same script |
 | Thumb-2 userland | Debian 13's armhf `busybox-static` (Thumb-2, hard float): SHA-256 and MD5 of known strings, `sort`, floating-point `awk`, a gzip round trip of 256 KiB, on four cores | `scripts/debian-armhf-busybox-fixture.sh`, `scripts/orangepi-one-thumb.txt` |
+| NEON | Linux sets `HWCAP_NEON` (`neon` in `/proc/cpuinfo`); Debian 13's armhf glibc, OpenSSL 3.5 (`OPENSSL_armcap=0x1`) and libjpeg-turbo 2.1 run their NEON code: SHA-1/256/512, ChaCha20 and Poly1305 of 1.2 MB, a JPEG encode and decode, all equal to the host's native OpenSSL 3 / libjpeg-turbo 3 results and to the guest's scalar paths | `scripts/debian-armhf-neon-fixture.sh`, `scripts/orangepi-one-neon.txt` |
 
-Not modelled yet: SD/MMC, Ethernet (EMAC), USB, HDMI/display and NEON. The cores
+Not modelled yet: SD/MMC, Ethernet (EMAC), USB and HDMI/display. The cores
 take turns on one host thread (round-robin quanta of 1000 instructions). Every other device node in the
 distribution DTB is a plain read-back register file, so its driver probes without effect;
 the run summary lists the pages that were touched. Virtual time is 1 ns per instruction.

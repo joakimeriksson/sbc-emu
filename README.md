@@ -15,7 +15,7 @@ instruction, in the style of [esp32sim](https://github.com/mikroverk/esp32sim):
 |---|---|---|---|
 | Raspberry Pi 4 Model B | Broadcom BCM2711, 4× Cortex-A72 | **complete enough for real use**: unmodified Raspberry Pi OS and Ubuntu 26.04 Desktop, V3D GPU (OpenGL ES 3.1, Vulkan 1.3), HDMI, USB, Ethernet, Wi-Fi, Bluetooth, audio, a JIT, and a WebAssembly build | [below](#raspberry-pi-4-model-b) |
 | Orange Pi 5 | Rockchip RK3588S | **experimental**: one Cortex-A55, GICv3, UART; a Debian kernel to a BusyBox shell by direct boot | [docs/orangepi5.md](docs/orangepi5.md) |
-| Orange Pi One | Allwinner H3, 4× Cortex-A7 | **experimental**: four Cortex-A7s on the 32-bit core (`arm-a32`), Thumb-2, VFPv4; an unmodified Alpine kernel and DTB to a BusyBox shell by direct boot | [docs/orangepi-one.md](docs/orangepi-one.md) |
+| Orange Pi One | Allwinner H3, 4× Cortex-A7 | **experimental**: four Cortex-A7s on the 32-bit core (`arm-a32`), Thumb-2, VFPv4, NEON; an unmodified Alpine kernel and DTB to a BusyBox shell by direct boot | [docs/orangepi-one.md](docs/orangepi-one.md) |
 | ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A17 | **planned**; the same SoC as the vendor's first panel board generation | [docs/rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
 
 `sbc-emu boards list` shows what the build knows; `--board NAME` picks one (the Pi 4 is the
@@ -230,6 +230,10 @@ GitHub Actions runs the suite on every pull request and push to `main` ([.github
   and on the emulator from the same random states; registers, flags, NaN payloads and FPSR must
   match bit for bit. `diff_fp.rs` draws a random FPCR (rounding mode, FZ, DN) per case and
   operands from the hard classes (subnormals, overflow, ties, NaNs).
+- `arm-a32/tests/neon_diff.rs`: the same for the 32-bit core's NEON: 407 A32 instructions (and
+  their T32 encodings, from `arm-none-eabi-as`) against AArch64 equivalents run natively with
+  FPCR.FZ/DN (ARMv7's Standard FPSCR value); `neon_ldst.rs` checks every VLD/VST encoding
+  against a reference model.
 - `bcm2711` unit tests: GPIO edges, BME280 compensation against the Linux driver's formula, MCP3008
   framing against `mcp320x`'s decode, GIC SGI/SPI routing between cores, DMA control-block chains,
   and `smp.rs`: four cores add to one counter with LDXR/STXR, one thread and a thread per core,
@@ -245,7 +249,7 @@ GitHub Actions runs the suite on every pull request and push to `main` ([.github
 ```
 emu-core/   Bus / Core / Trap, the snapshot serializer and a device tree reader/writer
 arm-a64/    the ARMv8-A core: decode+execute, system registers, MMU, FP/NEON
-arm-a32/    the ARMv7-A core for 32-bit boards: A32, Thumb-2, VFPv4, short-descriptor MMU
+arm-a32/    the ARMv7-A core for 32-bit boards: A32, Thumb-2, VFPv4, NEON, short-descriptor MMU
 allwinner-h3/ the experimental Orange Pi One machine (H3): four cores, GIC-400, UART0, CCU, timers, host PSCI, U-Boot-style DTB patching
 v3d/        the V3D 4.2 3D GPU (packets generated from Mesa's v3d_packet.xml by tools/gen_v3d_packets.py)
 bcm2711/    the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2, PCIe + xHCI, USB devices, I²S, Bluetooth,
