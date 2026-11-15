@@ -772,6 +772,39 @@ static void s_row_uploads(void) {
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0); glActiveTexture(GL_TEXTURE0); glDeleteTextures(2, t);
 }
 
+/* WebRender's text batches: one glDrawElementsInstanced of a 6-index quad with ~1000 instances,
+ * each fetching its rectangle from an RGBA32F data texture by gl_InstanceID and carrying an
+ * integer instance attribute. */
+static void s_many_instances(void) {
+    clear(1, 1, 1);
+    enum { N = 1024 };
+    static float data[N * 4]; static int attr_i[N * 4];
+    for (int i = 0; i < N; i++) {
+        int gx = i % 32, gy = i / 32;
+        data[i * 4] = gx * 4; data[i * 4 + 1] = gy * 4; data[i * 4 + 2] = 3; data[i * 4 + 3] = 3;
+        attr_i[i * 4] = (i * 37) % 256; attr_i[i * 4 + 1] = (i * 91) % 256; attr_i[i * 4 + 2] = (i * 13) % 256; attr_i[i * 4 + 3] = i;
+    }
+    GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, 1024, 1); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 1, GL_RGBA, GL_FLOAT, data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    GLuint p = prog("#version 300 es\nuniform highp sampler2D d; in vec2 corner; in ivec4 inst; flat out ivec4 c;\n"
+                    "void main() { vec4 r = texelFetch(d, ivec2(gl_InstanceID % 1024, 0), 0); vec2 xy = r.xy + corner * r.zw;\n"
+                    " gl_Position = vec4(xy / 64.0 - 1.0, 0.0, 1.0); c = inst; }\n",
+                    "#version 300 es\nprecision mediump float; flat in ivec4 c; out vec4 o; void main() { o = vec4(vec3(c.rgb) / 255.0, 1.0); if (c.w > 1023) o = vec4(1, 0, 1, 1); }\n");
+    glUniform1i(glGetUniformLocation(p, "d"), 0);
+    GLuint vao; glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    float corner[] = {0, 0, 1, 0, 1, 1, 0, 1}; unsigned short idx[] = {0, 1, 2, 0, 2, 3};
+    GLuint b[3]; glGenBuffers(3, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]); glBufferData(GL_ARRAY_BUFFER, sizeof corner, corner, GL_STATIC_DRAW);
+    GLint lc = glGetAttribLocation(p, "corner"), li = glGetAttribLocation(p, "inst");
+    glEnableVertexAttribArray(lc); glVertexAttribPointer(lc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]); glBufferData(GL_ARRAY_BUFFER, sizeof attr_i, attr_i, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(li); glVertexAttribIPointer(li, 4, GL_INT, 16, 0); glVertexAttribDivisor(li, 1);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]); glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, N);
+    glBindVertexArray(0); glDeleteVertexArrays(1, &vao); glBindBuffer(GL_ARRAY_BUFFER, 0); glDeleteTextures(1, &t);
+}
+
 struct scene { const char *name; void (*fn)(void); };
 static const struct scene scenes[] = {
     {"clear", s_clear}, {"tri_color", s_tri_color}, {"flat", s_flat}, {"depth", s_depth}, {"blend", s_blend},
@@ -783,7 +816,7 @@ static const struct scene scenes[] = {
     {"tex_array", s_tex_array}, {"depth_ids", s_depth_ids}, {"instanced_int", s_instanced_int},
     {"scatter128", s_scatter128}, {"glyph_copies", s_glyph_copies},
     {"big_tex_layout", s_big_tex_layout}, {"render_big_targets", s_render_big_targets},
-    {"row_uploads", s_row_uploads},
+    {"row_uploads", s_row_uploads}, {"many_instances", s_many_instances},
 };
 #define NSCENES (sizeof scenes / sizeof scenes[0])
 
