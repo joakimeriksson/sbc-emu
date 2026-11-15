@@ -1,0 +1,12 @@
+# USB keyboard on the HDMI console of the unmodified Armbian image: the OHCI controllers
+# enumerate the emulated keyboard (USB-A host port) and tablet (OTG port); on tty1
+# Armbian's first-run wizard asks for a root password, and typed keys answer it. The
+# screenshot shows "Create root password: ****" and the next prompt.
+#   sbc-emu run --board orangepi-one --sd cache/armbian/Armbian_26.8.1_Orangepione_trixie_current_6.18.44_minimal.img \
+#       --script scripts/orangepi-one-usb.txt --timeout 2400
+wait-serial getty@tty1.service
+sleep 3
+type root\n
+sleep 15
+screenshot out/orangepi-one-usb.png
+quit

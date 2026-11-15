@@ -1,4 +1,5 @@
 use crate::mmu::{Access, TlbEntry, TLB_ENTRIES};
+use crate::model::{CpuModel, CORTEX_A7};
 use emu_core::{Bus, Core, Trap};
 
 pub const MODE_USR: u32 = 0x10;
@@ -33,6 +34,9 @@ pub struct Cpu {
     /// addresses are computed from these in both instruction sets.
     pub(crate) cur_pc: u32,
     pub(crate) cur_size: u32,
+    /// Set by inner-shareable TLB maintenance; the machine flushes the other cores' TLBs
+    /// and clears it.
+    pub tlb_broadcast: bool,
     /// Set by any PC write while executing a Thumb instruction.
     pub(crate) pc_written: bool,
     /// Set when an instruction restored CPSR from SPSR (exception return).
@@ -45,6 +49,12 @@ pub struct Cpu {
     pub firmware_calls_to_host: bool,
     pub midr: u32,
     pub mpidr: u32,
+    /// Identification registers other than MIDR/MPIDR (see `set_model`).
+    pub model: CpuModel,
+    /// Cortex-A12/A17 diagnostic and internal feature registers (`c15, c0, 1` and `2`),
+    /// present when `model.c15_diagnostic` is set.
+    pub diagnostic: u32,
+    pub internal_feature: u32,
     pub vbar: u32,
     pub cntfrq: u32,
     pub cntkctl: u32,
@@ -111,11 +121,15 @@ impl Cpu {
             cur_pc: 0,
             cur_size: 4,
             pc_written: false,
+            tlb_broadcast: false,
             psr_restored: false,
             sent_event: false,
             firmware_calls_to_host: false,
-            midr: 0x410f_c075,
+            midr: CORTEX_A7.midr,
             mpidr: 0x8000_0000,
+            model: CORTEX_A7,
+            diagnostic: 0,
+            internal_feature: 0,
             vbar: 0,
             cntfrq: 24_000_000,
             cntkctl: 0,
@@ -156,6 +170,12 @@ impl Cpu {
         }
     }
 
+    /// Set the current mode's SPSR (tests).
+    #[doc(hidden)]
+    pub fn write_spsr_for_test(&mut self, value: u32) {
+        self.banked_spsr[Self::bank(self.cpsr)] = value;
+    }
+
     /// The SPSR of the current mode (diagnostics).
     pub fn spsr(&self) -> u32 {
         self.banked_spsr[Self::bank(self.cpsr)]
@@ -190,11 +210,17 @@ impl Cpu {
         self.cntp_ctl & 1 != 0 && self.cntp_ctl & 2 == 0 && self.physical_timer_reached()
     }
 
+    /// Replace the processor identity (MIDR included) with `model`'s.
+    pub fn set_model(&mut self, model: CpuModel) {
+        self.model = model;
+        self.midr = model.midr;
+    }
+
     fn ccsidr(&self) -> u32 {
         match self.csselr & 0xf {
-            0 => 0x701f_e00a,     // 32 KiB L1 data cache
-            1 => 0x201f_e00a,     // 32 KiB L1 instruction cache
-            2 | 3 => 0x711f_e07a, // 4 MiB L2 unified cache
+            0 => self.model.ccsidr[0],
+            1 => self.model.ccsidr[1],
+            2 | 3 => self.model.ccsidr[2],
             _ => 0,
         }
     }
@@ -345,6 +371,100 @@ impl Cpu {
         self.psr_restored = true;
     }
 
+    /// Start address and written-back base of a two-word transfer (RFE, SRS).
+    fn two_word_address(base: u32, increment: bool, before: bool) -> (u32, u32) {
+        let start = match (increment, before) {
+            (true, false) => base,
+            (true, true) => base.wrapping_add(4),
+            (false, false) => base.wrapping_sub(4),
+            (false, true) => base.wrapping_sub(8),
+        };
+        (start, if increment { base.wrapping_add(8) } else { base.wrapping_sub(8) })
+    }
+
+    /// A processor mode with its own registers (not Hyp/Monitor/reserved).
+    fn valid_mode(mode: u32) -> bool {
+        matches!(mode, MODE_USR | MODE_FIQ | MODE_IRQ | MODE_SVC | MODE_ABT | MODE_UND | MODE_SYS)
+    }
+
+    /// RFE: load PC and CPSR from memory (exception return used by Thumb-2 kernels).
+    /// `increment`/`before` select IA, IB, DA or DB; `insn` is reported if UNDEFINED.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn return_from_exception(
+        &mut self,
+        bus: &mut dyn Bus,
+        insn: u32,
+        rn: usize,
+        increment: bool,
+        before: bool,
+        writeback: bool,
+    ) -> Result<(), Trap> {
+        if self.cpsr & 0x1f == MODE_USR || rn == 15 {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        }
+        let (address, new_base) = Self::two_word_address(self.r[rn], increment, before);
+        let pc = self.mem_read32(bus, address, Access::Read);
+        let psr = pc.and_then(|_| self.mem_read32(bus, address.wrapping_add(4), Access::Read));
+        let (pc, psr) = match (pc, psr) {
+            (Ok(pc), Ok(psr)) => (pc, psr),
+            (Err((va, status)), _) | (_, Err((va, status))) => return Err(self.data_abort(va, status, false)),
+        };
+        if !Self::valid_mode(psr & 0x1f) {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        }
+        if writeback {
+            self.r[rn] = new_base;
+        }
+        self.change_mode(psr & 0x1f);
+        self.cpsr = psr;
+        self.psr_restored = true;
+        self.branch_to(pc);
+        Ok(())
+    }
+
+    /// SRS: store LR and SPSR of the current mode on the stack of `mode`.
+    pub(crate) fn store_return_state(
+        &mut self,
+        bus: &mut dyn Bus,
+        insn: u32,
+        mode: u32,
+        increment: bool,
+        before: bool,
+        writeback: bool,
+    ) -> Result<(), Trap> {
+        let current = self.cpsr & 0x1f;
+        if matches!(current, MODE_USR | MODE_SYS) || !Self::valid_mode(mode) || mode == MODE_USR {
+            return Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        }
+        let bank = Self::bank(mode);
+        let base = if Self::bank(current) == bank { self.r[13] } else { self.banked_sp[bank] };
+        let (address, new_base) = Self::two_word_address(base, increment, before);
+        let (lr, spsr) = (self.r[14], self.banked_spsr[Self::bank(current)]);
+        for (offset, value) in [(0, lr), (4, spsr)] {
+            if let Err((va, status)) = self.mem_write32(bus, address.wrapping_add(offset), value) {
+                return Err(self.data_abort(va, status, true));
+            }
+        }
+        if writeback {
+            if Self::bank(current) == bank {
+                self.r[13] = new_base;
+            } else {
+                self.banked_sp[bank] = new_base;
+            }
+        }
+        Ok(())
+    }
+
+    /// Start a core at a boot or PSCI entry point: bit 0 selects Thumb state.
+    pub fn set_entry(&mut self, entry: u32) {
+        self.r[15] = entry & !1;
+        if entry & 1 != 0 {
+            self.cpsr |= T;
+        } else {
+            self.cpsr &= !T;
+        }
+    }
+
     /// BranchWritePC: stay in the current instruction set.
     pub(crate) fn branch_to(&mut self, target: u32) {
         self.r[15] = if self.cpsr & T != 0 { target & !1 } else { target & !3 };
@@ -451,6 +571,9 @@ impl Cpu {
     pub(crate) fn execute(&mut self, bus: &mut dyn Bus, pc: u64, insn: u32) -> Result<(), Trap> {
         let unimplemented = || Trap::Unimplemented(pc, insn);
         if insn >> 28 == 15 {
+            if let Some(result) = self.execute_neon(bus, pc, insn) {
+                return result;
+            }
             if insn == 0xf57f_f01f {
                 self.exclusive_addr = None;
                 self.exclusive_size = 0;
@@ -484,6 +607,15 @@ impl Cpu {
                     self.change_mode(mode);
                 }
                 return Ok(());
+            }
+            // RFE{IA,IB,DA,DB} Rn{!} and SRS{IA,IB,DA,DB} SP{!}, #mode.
+            if insn & 0x0e50_ffff == 0x0810_0a00 {
+                let (p, u, w) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+                return self.return_from_exception(bus, insn, ((insn >> 16) & 0xf) as usize, u, p, w);
+            }
+            if insn & 0x0e5f_ffe0 == 0x084d_0500 {
+                let (p, u, w) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+                return self.store_return_state(bus, insn, insn & 0x1f, u, p, w);
             }
             // BLX immediate: call into Thumb code.
             if insn & 0x0e00_0000 == 0x0a00_0000 {
@@ -689,8 +821,10 @@ impl Cpu {
             if rd == 15 {
                 return Err(unimplemented());
             }
+            // MRS reads the CPSR's execution state bits (J, IT, T) as zero (ARMv7). Linux's
+            // Thumb-2 exception stubs depend on it: they XOR PSR_T_BIT into the value read.
             self.r[rd as usize] = if insn & (1 << 22) == 0 {
-                self.cpsr
+                self.cpsr & !(0x0100_0000 | 0x0600_fc00 | T)
             } else {
                 self.banked_spsr[Self::bank(self.cpsr)]
             };
@@ -864,27 +998,20 @@ impl Cpu {
             }
             let value = match (opc1, crn, crm, opc2) {
                 (0, 0, 0, 0) => Some(self.midr),
-                (0, 0, 0, 1) => Some(0x8444_8003), // CTR
+                (0, 0, 0, 1) => Some(self.model.ctr),
                 (0, 0, 0, 5) => Some(self.mpidr),
-                (0, 0, 0, 6) => Some(0), // REVIDR
-                (0, 0, 1, 0) => Some(0x0000_1131), // ID_PFR0
-                (0, 0, 1, 1) => Some(0x0001_1011), // ID_PFR1
-                (0, 0, 1, 2) => Some(0x0200_0000), // ID_DFR0: PMUv2, no CP14 debug
+                (0, 0, 0, 6) => Some(self.model.revidr),
+                (0, 0, 1, 0) => Some(self.model.id_pfr0),
+                (0, 0, 1, 1) => Some(self.model.id_pfr1),
+                (0, 0, 1, 2) => Some(self.model.id_dfr0),
                 (0, 0, 0, 2 | 3 | 4 | 7) => Some(0), // TCMTR, TLBTR, aliases
-                (0, 0, 1, 3) => Some(0),           // ID_AFR0
-                (0, 0, 1, 4) => Some(0x1010_1105), // ID_MMFR0
-                (0, 0, 1, 5) => Some(0x4000_0000), // ID_MMFR1
-                (0, 0, 1, 6) => Some(0x0124_0000), // ID_MMFR2
-                (0, 0, 1, 7) => Some(0x0210_2211), // ID_MMFR3
-                (0, 0, 2, 0) => Some(0x0210_1110), // ID_ISAR0, including ARM divide
-                (0, 0, 2, 1) => Some(0x1311_2111), // ID_ISAR1
-                (0, 0, 2, 2) => Some(0x2123_2041), // ID_ISAR2
-                (0, 0, 2, 3) => Some(0x1111_2131), // ID_ISAR3
-                (0, 0, 2, 4) => Some(0x1001_1142), // ID_ISAR4
-                (0, 0, 2, 5 | 6 | 7) => Some(0),   // ID_ISAR5, ID_MMFR4, ID_ISAR6
+                (0, 0, 1, 3) => Some(self.model.id_afr0),
+                (0, 0, 1, 4..=7) => Some(self.model.id_mmfr[(opc2 - 4) as usize]),
+                (0, 0, 2, 0..=5) => Some(self.model.id_isar[opc2 as usize]),
+                (0, 0, 2, 6 | 7) => Some(0), // ID_MMFR4, ID_ISAR6
                 (0, 0, 3, 4) => Some(0),           // ID_PFR2
                 (1, 0, 0, 0) => Some(self.ccsidr()),
-                (1, 0, 0, 1) => Some(0x0a20_0023), // CLIDR
+                (1, 0, 0, 1) => Some(self.model.clidr),
                 (2, 0, 0, 0) => Some(self.csselr),
                 (0, 1, 0, 0) => Some(self.sctlr),
                 (0, 1, 0, 1) => Some(self.actlr),
@@ -912,9 +1039,11 @@ impl Cpu {
                 (0, 14, 3, 0) => Some(self.cntv_cval.wrapping_sub(self.cntpct) as u32),
                 (0, 14, 3, 1) => Some(self.virtual_timer_control()),
                 (0, 1, 1, 0..=2) => Some(0), // SCR, SDER, NSACR (secure configuration)
-                (0, 9, 12, 0) => Some(0x4107_0000), // PMCR: Cortex-A7, no event counters
-                (0, 9, 12..=14, _) => Some(0),       // other PMU registers read as zero
-                (1, 9, 0, 2) => Some(0x0300_0000),   // L2CTLR: four cores
+                (0, 9, 12, 0) => Some(self.model.pmcr),
+                (0, 9, 12..=14, _) => Some(0), // other PMU registers read as zero
+                (1, 9, 0, 2) => Some(self.model.l2ctlr),
+                (0, 15, 0, 1) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => Some(self.diagnostic),
+                (0, 15, 0, 2) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => Some(self.internal_feature),
                 (0, 12, 1, 0) => Some(u32::from(self.irq) << 7 | u32::from(self.fiq) << 6), // ISR
                 _ => None,
             };
@@ -950,7 +1079,13 @@ impl Cpu {
                     (0, 6, 0, 0) => self.dfar = value,
                     (0, 6, 0, 2) => self.ifar = value,
                     (0, 7, 1 | 5 | 6 | 10 | 11 | 14, _) => {}
-                    (0, 8, 3 | 5 | 6 | 7, _) => self.tlb_flush(),
+                    // Inner-shareable TLB maintenance (c8, c3) applies to every core: the
+                    // machine flushes the other cores' TLBs when it sees `tlb_broadcast`.
+                    (0, 8, 3, _) => {
+                        self.tlb_flush();
+                        self.tlb_broadcast = true;
+                    }
+                    (0, 8, 5 | 6 | 7, _) => self.tlb_flush(),
                     (0, 10, 2, 0) => self.prrr = value,
                     (0, 10, 2, 1) => self.nmrr = value,
                     (0, 12, 0, 0) => self.vbar = value & 0xffff_ffe0,
@@ -978,6 +1113,9 @@ impl Cpu {
                     (0, 9, 12..=14, _) => {}       // PMU writes ignored
                     (0, 7, 0, 4) | (0, 7, 13, 1) => {} // legacy WFI/prefetch encodings
                     (2, 0, 0, 0) => self.csselr = value & 0xf,
+                    // PL1 only: UNDEFINED from user mode, as on hardware.
+                    (0, 15, 0, 1) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => self.diagnostic = value,
+                    (0, 15, 0, 2) if self.model.c15_diagnostic && self.cpsr & 0x1f != MODE_USR => self.internal_feature = value,
                     _ => return Err(unimplemented()),
                 }
             }

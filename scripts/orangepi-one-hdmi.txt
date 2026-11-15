@@ -1,0 +1,10 @@
+# HDMI on the unmodified Armbian image: sun4i-drm binds the DE2 mixer, TCON0 and the
+# DesignWare HDMI controller, reads the emulated monitor's EDID, and fbcon draws the boot
+# log on tty1. Needs the kernel log on the serial port:
+#   sbc-emu run --board orangepi-one --sd cache/armbian/Armbian_26.8.1_Orangepione_trixie_current_6.18.44_minimal.img \
+#       --append loglevel=7 --script scripts/orangepi-one-hdmi.txt --timeout 900
+wait-serial Detected HDMI TX controller v1.32a
+wait-serial [drm] Initialized sun4i-drm
+wait-serial Freeing unused kernel
+screenshot out/orangepi-one-hdmi.png
+quit

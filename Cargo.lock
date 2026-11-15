@@ -44,6 +44,9 @@ dependencies = [
 [[package]]
 name = "emu-core"
 version = "0.0.1"
+dependencies = [
+ "miniz_oxide",
+]
 
 [[package]]
 name = "miniz_oxide"

@@ -1,11 +1,11 @@
-//! USB devices, shared by the two host controllers (the DWC2 OTG port and the VL805 xHCI
-//! behind PCIe): a HID boot keyboard, a HID tablet (absolute pointer, what a VNC viewer
+//! USB devices, shared by the host controllers of every board (the Pi 4's DWC2 OTG port
+//! and VL805 xHCI behind PCIe, the H3's OHCI): a HID boot keyboard, a HID tablet (absolute pointer, what a VNC viewer
 //! needs, like QEMU's `usb-tablet`) and a bulk-only mass-storage stick with a SCSI disk.
 //!
 //! A controller talks to a device in transactions, not packets: a SETUP, then the data stage
 //! (`control_in`/`control_out`), and whole transfers on the other endpoints (`data_in`, where
 //! `None` is a NAK: nothing to send yet).
-use crate::sdhci::Disk;
+use crate::disk::Disk;
 use std::collections::VecDeque;
 
 /// The standard part of a device: address, configuration, the reply being read.
@@ -134,12 +134,12 @@ const KBD_REPORT: [u8; 63] = [
 pub struct Keyboard {
     pub st: Std,
     /// keys currently held (HID usages) and modifier bits
-    pub(crate) held: Vec<u8>,
-    pub(crate) modifiers: u8,
+    pub held: Vec<u8>,
+    pub modifiers: u8,
     /// queued state changes, each producing one report
-    pub(crate) events: VecDeque<(u8, bool)>,
+    pub events: VecDeque<(u8, bool)>,
     /// the last report sent (GET_REPORT)
-    pub(crate) last: Option<[u8; 8]>,
+    pub last: Option<[u8; 8]>,
     pub leds: u8,
 }
 
@@ -473,17 +473,17 @@ impl Devices {
 
 // ---------------------------------------------------------------------- snapshots
 
-fn save_std(w: &mut emu_core::snap::W, s: &Std) {
+fn save_std(w: &mut crate::snap::W, s: &Std) {
     w.u8(s.address); w.bool(s.pending_address.is_some()); w.u8(s.pending_address.unwrap_or(0));
     w.bool(s.configured); w.bytes(&s.pending_in);
 }
-fn load_std(r: &mut emu_core::snap::R) -> Result<Std, emu_core::snap::SnapError> {
+fn load_std(r: &mut crate::snap::R) -> Result<Std, crate::snap::SnapError> {
     let address = r.u8()?; let pa = r.bool()?; let a = r.u8()?;
     Ok(Std { address, pending_address: pa.then_some(a), configured: r.bool()?, pending_in: r.bytes()?.to_vec() })
 }
 
 impl Devices {
-    pub fn save_state(&self, w: &mut emu_core::snap::W) {
+    pub fn save_state(&self, w: &mut crate::snap::W) {
         w.tag("usbdev-v1");
         let k = &self.kbd;
         save_std(w, &k.st); w.bytes(&k.held); w.u8(k.modifiers); w.u8(k.leds);
@@ -501,7 +501,7 @@ impl Devices {
             for (lba, data) in ov { w.u64(lba); w.bytes(&data); }
         }
     }
-    pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+    pub fn load_state(&mut self, r: &mut crate::snap::R) -> Result<(), crate::snap::SnapError> {
         r.tag("usbdev-v1")?;
         let k = &mut self.kbd;
         k.st = load_std(r)?; k.held = r.bytes()?.to_vec(); k.modifiers = r.u8()?; k.leds = r.u8()?;
@@ -518,7 +518,8 @@ impl Devices {
             for _ in 0..n_ov { ov.push((r.u64()?, r.bytes()?.to_vec())); }
             if let Some(s) = self.storage.as_mut() {
                 s.st = st; s.data = data; s.csw = has.then_some(c); s.write = hw.then_some((t, l, n)); s.sense = sense;
-                for (lba, d) in ov { s.disk.write(lba, &d); }
+                // Exactly the snapshot's sectors: writes made after it was taken are dropped.
+                s.disk.restore_overlay(ov);
             }
         }
         Ok(())

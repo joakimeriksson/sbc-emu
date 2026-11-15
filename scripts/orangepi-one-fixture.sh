@@ -49,6 +49,15 @@ test -s "$OUT/sun8i-h3-orangepi-one.dtb"
 
 mkdir "$work/rootfs"
 tar -xzf "$OUT/downloads/$ROOTFS" -C "$work/rootfs"
+# Kernel modules for SD cards and ext4 (built as modules in linux-lts), with modules.dep.
+# GNU tar needs --wildcards for member patterns; bsdtar (macOS) matches them by default.
+wildcards=
+tar --version 2>/dev/null | grep -q 'GNU tar' && wildcards=--wildcards
+tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
+    'lib/modules/*/modules.*' 'lib/modules/*/kernel/drivers/mmc/*' \
+    'lib/modules/*/kernel/fs/ext4/*' 'lib/modules/*/kernel/fs/jbd2/*' \
+    'lib/modules/*/kernel/fs/mbcache.ko.gz' 'lib/modules/*/kernel/lib/crc/*'
+ls "$work"/rootfs/lib/modules/*/kernel/drivers/mmc/host/sunxi-mmc.ko* > /dev/null
 cat > "$work/rootfs/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev
@@ -57,6 +66,8 @@ exec </dev/console >/dev/console 2>&1
 /bin/busybox mount -t sysfs sysfs /sys
 /bin/busybox mount -t tmpfs tmpfs /tmp
 export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin PS1='orangepi-one# '
+# SD card: the controller driver and the block layer are modules.
+modprobe sunxi-mmc 2>/dev/null; modprobe mmc_block 2>/dev/null
 echo "H3_BOOT_OK: ARM32 Linux BusyBox shell"
 # setsid -c makes the console the shell's controlling terminal (job control, ^C).
 exec /bin/busybox setsid -c /bin/sh

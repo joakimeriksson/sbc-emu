@@ -4,7 +4,6 @@
 use emu_core::disk::Disk;
 use bcm2711::{Machine, Stop};
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
@@ -17,27 +16,22 @@ unsafe fn sbc_disk_read(_lba: f64, count: u32, out: *mut u8) { std::ptr::write_b
 
 /// The SD card image as the page serves it (read lazily by HTTP range requests in the worker);
 /// writes stay in this overlay, so the served image is never modified.
-struct WebDisk { sectors: u64, overlay: HashMap<u64, Box<[u8; 512]>> }
+struct WebDisk { sectors: u64, overlay: emu_core::disk::Overlay }
 
 impl Disk for WebDisk {
     fn sectors(&self) -> u64 { self.sectors }
     fn read(&mut self, lba: u64, out: &mut [u8]) {
-        // SAFETY: `out` is a valid buffer of whole sectors; the import writes exactly that many
-        unsafe { sbc_disk_read(lba as f64, (out.len() / 512) as u32, out.as_mut_ptr()) };
-        if !self.overlay.is_empty() {
-            for (k, chunk) in out.chunks_mut(512).enumerate() {
-                if let Some(s) = self.overlay.get(&(lba + k as u64)) { chunk.copy_from_slice(&s[..chunk.len()]); }
-            }
+        let valid = (self.sectors.saturating_sub(lba).saturating_mul(512)).min(out.len() as u64) as usize;
+        out[valid..].fill(0);
+        if valid > 0 {
+            // SAFETY: `out[..valid]` is a buffer of whole sectors; the import writes exactly that many
+            unsafe { sbc_disk_read(lba as f64, (valid / 512) as u32, out.as_mut_ptr()) };
         }
+        self.overlay.apply(lba, out);
     }
-    fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.overlay.iter().map(|(k, s)| (*k, s.to_vec())).collect() }
-    fn write(&mut self, lba: u64, data: &[u8]) {
-        for (k, chunk) in data.chunks(512).enumerate() {
-            let mut s = Box::new([0u8; 512]);
-            s[..chunk.len()].copy_from_slice(chunk);
-            self.overlay.insert(lba + k as u64, s);
-        }
-    }
+    fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.overlay.sorted() }
+    fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { self.overlay.replace(sectors, self.sectors); }
+    fn write(&mut self, lba: u64, data: &[u8]) { self.overlay.store(lba, data, self.sectors); }
 }
 
 struct State {
@@ -102,7 +96,7 @@ pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *co
 /// Pi firmware does (config.txt, cmdline.txt, kernel8.img, initramfs). Returns 0 on success.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
-    let mut disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: HashMap::new() });
+    let mut disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
     let b = match bcm2711::boot::read_sd_boot(disk.as_mut()) { Ok(b) => b, Err(_) => return -2 };
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
@@ -233,7 +227,7 @@ pub extern "C" fn sbc_wake(wall_ns: f64) { with(|s| { let t = ((wall_ns + s.wall
 /// Resume a snapshot (made natively with the same SD image) instead of cold-booting.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8, len: usize) -> i32 {
-    let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: HashMap::new() });
+    let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);

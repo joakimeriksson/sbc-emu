@@ -1,5 +1,8 @@
+use crate::display::{Display, HDMI_IRQ, TCON0_IRQ};
 use crate::gic::NCPU;
-use crate::{Gic, Timer, Uart};
+use crate::usb::{Dma, Ehci, Ohci};
+use emu_core::usb::{Keyboard, Tablet};
+use crate::{Gic, SunxiMmc, Timer, Uart};
 use arm_a32::Cpu;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
 
@@ -25,6 +28,16 @@ pub const CCU_BASE: u64 = 0x01c2_0000;
 const CCU_SIZE: u64 = 0x400;
 pub const TIMER_BASE: u64 = 0x01c2_0c00;
 const TIMER_SIZE: u64 = 0x40;
+/// SD card controller 0 (`mmc@1c0f000`), interrupt SPI 60.
+pub const MMC0_BASE: u64 = 0x01c0_f000;
+const MMC_SIZE: u64 = 0x1000;
+pub const MMC0_IRQ: usize = 32 + 60;
+/// USB host ports 0 (shared with OTG) and 1: EHCI at +0, OHCI at +0x400; interrupts
+/// EHCI0 SPI 72, OHCI0 SPI 73, EHCI1 SPI 74, OHCI1 SPI 75.
+pub const USB_HOST_BASES: [u64; 2] = [0x01c1_a000, 0x01c1_b000];
+const OHCI_OFFSET: u64 = 0x400;
+pub const EHCI_IRQS: [usize; 2] = [32 + 72, 32 + 74];
+pub const OHCI_IRQS: [usize; 2] = [32 + 73, 32 + 75];
 /// Timer 0/1 interrupts: SPI 18/19.
 pub const TIMER_IRQS: [usize; 2] = [32 + 18, 32 + 19];
 const GICD_SIZE: u64 = 0x1000;
@@ -36,6 +49,15 @@ pub struct Soc {
     pub uart: Uart,
     pub gic: Gic,
     pub timer: Timer,
+    pub mmc: SunxiMmc,
+    /// DE2 mixer, TCON0 and HDMI.
+    pub display: Display,
+    pub ehci: [Ehci; 2],
+    pub ohci: [Ohci; 2],
+    /// USB keyboard on host port 1 (the board's USB-A socket).
+    pub kbd: Keyboard,
+    /// USB tablet (absolute pointer) on port 0 (the micro-USB OTG socket in host mode).
+    pub tablet: Tablet,
     /// CCU registers (PLLs, bus gates, resets, module clocks), byte offset / 4.
     ccu: Vec<u32>,
     /// Current 24 MHz time, set by the machine before each step.
@@ -50,12 +72,43 @@ pub struct Soc {
 }
 
 impl Soc {
+    /// What the HDMI output shows, as RGBA (None while the display is off).
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.display.render(&self.ram.mem, self.ram.base, out)
+    }
+
+    /// Run the USB frames due by tick `now`.
+    fn usb_update(&mut self, now: u64) {
+        let mut dma = Dma { mem: &mut self.ram.mem, base: self.ram.base };
+        self.ohci[0].update(now, &mut dma, Some(&mut self.tablet));
+        self.ohci[1].update(now, &mut dma, Some(&mut self.kbd));
+    }
+
+    /// The USB controller and register offset at `addr`: (port, is OHCI, offset).
+    fn usb_register(addr: u64) -> Option<(usize, bool, u64)> {
+        USB_HOST_BASES.iter().enumerate().find_map(|(port, &base)| {
+            if Self::in_region(addr, 4, base, Ehci::SIZE) {
+                Some((port, false, addr - base))
+            } else if Self::in_region(addr, 4, base + OHCI_OFFSET, Ohci::SIZE) {
+                Some((port, true, addr - base - OHCI_OFFSET))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn new(ram_size: usize) -> Self {
         Self {
             ram: FlatRam::new(RAM_BASE, ram_size),
             uart: Uart::default(),
             gic: Gic::default(),
             timer: Timer::default(),
+            mmc: SunxiMmc::default(),
+            display: Display::default(),
+            ehci: Default::default(),
+            ohci: [Ohci::new(true), Ohci::new(true)],
+            kbd: Keyboard::default(),
+            tablet: Tablet::default(),
             ccu: Self::ccu_reset(),
             now: 0,
             dirty: true,
@@ -135,12 +188,21 @@ impl Soc {
 
     fn mmio_read(&mut self, addr: u64, width: u64) -> Result<u32, Fault> {
         self.dirty = true;
+        if let Some(value) = self.display.read(addr, width) {
+            return Ok(value);
+        }
         if width == 4 && addr & 3 == 0 {
             if Self::in_region(addr, 4, CCU_BASE, CCU_SIZE) {
                 return Ok(self.ccu_read(addr - CCU_BASE));
             }
             if Self::in_region(addr, 4, TIMER_BASE, TIMER_SIZE) {
                 return Ok(self.timer.read(addr - TIMER_BASE, self.now));
+            }
+            if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
+                return Ok(self.mmc.read(addr - MMC0_BASE));
+            }
+            if let Some((port, ohci, offset)) = Self::usb_register(addr) {
+                return Ok(if ohci { self.ohci[port].read(offset) } else { self.ehci[port].read(offset) });
             }
         }
         match Self::uart_offset(addr, width) {
@@ -168,6 +230,9 @@ impl Soc {
 
     fn mmio_write(&mut self, addr: u64, width: u64, value: u32) -> Result<(), Fault> {
         self.dirty = true;
+        if self.display.write(addr, width, value) {
+            return Ok(());
+        }
         if width == 4 && addr & 3 == 0 {
             if Self::in_region(addr, 4, CCU_BASE, CCU_SIZE) {
                 self.ccu[((addr - CCU_BASE) / 4) as usize] = value & !(1 << 28);
@@ -175,6 +240,18 @@ impl Soc {
             }
             if Self::in_region(addr, 4, TIMER_BASE, TIMER_SIZE) {
                 self.timer.write(addr - TIMER_BASE, value, self.now);
+                return Ok(());
+            }
+            if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
+                self.mmc.write(addr - MMC0_BASE, value, &mut self.ram);
+                return Ok(());
+            }
+            if let Some((port, ohci, offset)) = Self::usb_register(addr) {
+                if ohci {
+                    self.ohci[port].write(offset, value, self.now);
+                } else {
+                    self.ehci[port].write(offset, value);
+                }
                 return Ok(());
             }
         }
@@ -267,6 +344,10 @@ pub struct Machine {
     subtick: u64,
     /// The core that caused the last non-budget, non-idle stop (diagnostics).
     pub last_stop_core: usize,
+    /// Debugging: print this many exceptions (vector, LR, SPSR, fault registers) to
+    /// stderr once `trace_from` instructions have run (env `H3_TRACE_EXC`, `H3_TRACE_FROM`).
+    pub trace_exceptions: u32,
+    pub trace_from: u64,
 }
 
 impl Machine {
@@ -296,6 +377,8 @@ impl Machine {
             exceptions: 0,
             subtick: 0,
             last_stop_core: 0,
+            trace_exceptions: std::env::var("H3_TRACE_EXC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            trace_from: std::env::var("H3_TRACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         }
     }
 
@@ -325,7 +408,9 @@ impl Machine {
         let mut cpu = Cpu::new();
         cpu.instret = instret;
         cpu.mpidr = 0x8000_0000 | index as u32;
-        cpu.r[15] = entry;
+        // Bit 0 of an entry point selects Thumb state (Thumb-2 kernels pass a Thumb
+        // secondary_startup).
+        cpu.set_entry(entry);
         cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
         cpu.undef_to_guest = true;
         cpu.firmware_calls_to_host = true;
@@ -365,7 +450,12 @@ impl Machine {
     /// in WFI/WFE do not count, so a lone busy core still runs at 1 ns per instruction.
     fn tick(&mut self) {
         let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
-        self.subtick += 12 / running;
+        self.advance_subtick(12 / running);
+    }
+
+    /// Advance virtual time by `units` of 1/12 ns.
+    fn advance_subtick(&mut self, units: u64) {
+        self.subtick += units;
         if self.subtick >= 125 * 12 {
             self.subtick -= 125 * 12;
             let ticks = self.cpus[0].cntpct + 3;
@@ -388,7 +478,22 @@ impl Machine {
         }
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART0_IRQ, uart);
-        let mut next = u64::MAX;
+        let mmc = self.soc.mmc.irq();
+        self.soc.gic.set_level(MMC0_IRQ, mmc);
+        self.soc.display.update(now);
+        let (tcon, hdmi) = (self.soc.display.tcon_irq(), self.soc.display.hdmi_irq());
+        self.soc.gic.set_level(TCON0_IRQ, tcon);
+        self.soc.gic.set_level(HDMI_IRQ, hdmi);
+        let mut next = self.soc.display.next_deadline().unwrap_or(u64::MAX);
+        self.soc.usb_update(now);
+        for port in 0..2 {
+            let (ehci, ohci) = (self.soc.ehci[port].irq(), self.soc.ohci[port].irq());
+            self.soc.gic.set_level(EHCI_IRQS[port], ehci);
+            self.soc.gic.set_level(OHCI_IRQS[port], ohci);
+            if let Some(frame) = self.soc.ohci[port].next_deadline() {
+                next = next.min(frame);
+            }
+        }
         for k in 0..NCPU {
             let cpu = &self.cpus[k];
             self.timer_state[k] = Self::timer_state_of(cpu);
@@ -470,9 +575,13 @@ impl Machine {
             return Err(Trap::Wait);
         }
         let result = self.cpus[0].step(&mut self.soc);
-        self.tick();
+        // step() runs core 0 alone, so each instruction is a full 1 ns.
+        self.advance_subtick(12);
         if self.cpus[0].sent_event {
             self.send_event(0);
+        }
+        if self.cpus[0].tlb_broadcast {
+            self.broadcast_tlb_flush(0);
         }
         if result == Err(Trap::Wait) {
             self.state[0] = CoreState::Wait;
@@ -485,7 +594,9 @@ impl Machine {
     /// when every online core waits for an interrupt and nothing is due before then.
     pub fn run(&mut self, budget: u64) -> Stop {
         let mut left = budget;
-        let mut storm = 0u32;
+        // Exception-storm detection per core: one core's progress must not hide another's
+        // abort loop.
+        let mut storm = [0u32; NCPU];
         while left > 0 {
             self.sync_irqs();
             let Some(k) = (1..=NCPU)
@@ -506,8 +617,11 @@ impl Machine {
                 if self.cpus[k].sent_event {
                     self.send_event(k);
                 }
+                if self.cpus[k].tlb_broadcast {
+                    self.broadcast_tlb_flush(k);
+                }
                 match result {
-                    Ok(()) => storm = 0,
+                    Ok(()) => storm[k] = 0,
                     Err(Trap::Wait) => {
                         self.state[k] = CoreState::Wait;
                         self.update_irqs();
@@ -515,12 +629,24 @@ impl Machine {
                     }
                     Err(Trap::Interrupt(..)) => {
                         self.irqs += 1;
-                        storm = 0;
+                        storm[k] = 0;
                     }
-                    Err(Trap::Exception(..)) => {
+                    Err(Trap::Exception(class, _)) => {
                         self.exceptions += 1;
-                        storm += 1;
-                        if storm > 10_000 {
+                        if self.trace_exceptions > 0 && self.cpus[k].instret >= self.trace_from {
+                            self.trace_exceptions -= 1;
+                            let c = &self.cpus[k];
+                            let va = if class == 0x21 { c.ifar } else { c.dfar };
+                            let n = c.ttbcr & 7;
+                            let table = if n != 0 && (va as u64) >= (1u64 << 32 >> n) { c.ttbr1 & !0x3fff } else { c.ttbr0 & !((1u32 << (14 - n)) - 1) };
+                            let l1 = self.soc.ram.read32(table as u64 + (va >> 20) as u64 * 4).unwrap_or(0xdead);
+                            eprintln!(
+                                "[h3 exc] core {k} class {class:#x} vector {:#010x} lr {:#010x} spsr {:#010x} dfsr {:#x} dfar {:#010x} ifsr {:#x} ifar {:#010x} insns {} ttbcr {:#x} l1 {l1:#010x} dacr {:#x} sctlr {:#x}",
+                                c.r[15], c.r[14], c.spsr(), c.dfsr, c.dfar, c.ifsr, c.ifar, c.instret, c.ttbcr, c.dacr, c.sctlr
+                            );
+                        }
+                        storm[k] += 1;
+                        if storm[k] > 10_000 {
                             self.last_stop_core = k;
                             let c = &self.cpus[k];
                             return Stop::ExceptionStorm {
@@ -565,6 +691,18 @@ impl Machine {
             }
         }
         Stop::Budget
+    }
+
+    /// Inner-shareable TLB maintenance on core `k` reaches every core (DVM broadcast).
+    /// Without it, another core kept stale translations of unmapped vmalloc pages and
+    /// wrote into freed memory.
+    fn broadcast_tlb_flush(&mut self, k: usize) {
+        self.cpus[k].tlb_broadcast = false;
+        for (j, cpu) in self.cpus.iter_mut().enumerate() {
+            if j != k {
+                cpu.tlb_flush();
+            }
+        }
     }
 
     /// SEV from core `k`: every core's event register is set; cores sleeping in WFE

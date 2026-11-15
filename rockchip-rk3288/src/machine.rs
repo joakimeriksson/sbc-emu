@@ -1,6 +1,6 @@
 use crate::cru::{Cru, Grf, Pmu, CRU_SIZE, GRF_SIZE, PMU_SIZE};
-use allwinner_h3::{Gic, Uart};
-use arm_a32::Cpu;
+use allwinner_h3::{Gic, Uart, NCPU};
+use arm_a32::{Cpu, CORTEX_A12};
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
 
 pub const RAM_BASE: u64 = 0;
@@ -8,7 +8,7 @@ pub const RAM_BASE: u64 = 0;
 pub const RAM_SIZE: usize = 1024 << 20;
 /// MIDR of the RK3288's cores: ARM Cortex-A12 r0p1 (part 0xc0d; Arm later renamed the A12
 /// the Cortex-A17, part 0xc0e). The device tree says `arm,cortex-a12`.
-pub const RK3288_MIDR: u32 = 0x410f_c0d1;
+pub const RK3288_MIDR: u32 = CORTEX_A12.midr;
 /// Cluster 5 in MPIDR (`cpu@500`..`cpu@503`).
 pub const RK3288_MPIDR: u32 = 0x8000_0500;
 pub const UART2_BASE: u64 = 0xff69_0000;
@@ -28,15 +28,22 @@ const GICC_SIZE: u64 = 0x2000;
 pub const SECURE_PHYSICAL_TIMER_PPI: usize = 29;
 pub const PHYSICAL_TIMER_PPI: usize = 30;
 pub const VIRTUAL_TIMER_PPI: usize = 27;
-/// RK3288 peripheral window (APB/AHB devices, on-chip SRAM, GIC, boot ROM). Addresses no
-/// model claims behave as plain read-back registers so unmodelled drivers probe without
-/// external aborts; on-chip SRAM (0xff70_0000, 0xff72_0000) works through the same store.
-/// Every first touch of a 4 KiB page is recorded in `Soc::stub_pages`.
+/// On-chip SRAM (`bus_intmem`, 96 KiB). Its first 16 bytes are the SMP mailbox the boot ROM
+/// polls (`rockchip,rk3066-smp-sram`).
+pub const SRAM_BASE: u64 = 0xff70_0000;
+pub const SRAM_SIZE: usize = 0x1_8000;
+pub const SMP_MAILBOX: u64 = SRAM_BASE;
+/// Written to SMP_MAILBOX + 4 by `rockchip_boot_secondary` (the entry is at + 8).
+pub const BOOT_MAGIC: u32 = 0xdead_beaf;
+/// RK3288 peripheral window (APB/AHB devices, PMU SRAM, GIC, boot ROM). Addresses no model
+/// claims behave as plain read-back registers so unmodelled drivers probe without external
+/// aborts. Every first touch of a 4 KiB page is recorded in `Soc::stub_pages`.
 const DEVICE_WINDOW: (u64, u64) = (0xff00_0000, 0x1_0000_0000);
 
-/// Physical devices visible to the boot core.
+/// Physical devices shared by the cores.
 pub struct Soc {
     pub ram: FlatRam,
+    pub sram: FlatRam,
     pub uart: Uart,
     pub gic: Gic,
     pub cru: Cru,
@@ -58,6 +65,7 @@ impl Soc {
         assert!(ram_size as u64 <= DEVICE_WINDOW.0, "DRAM overlaps the device window");
         Self {
             ram: FlatRam::new(RAM_BASE, ram_size),
+            sram: FlatRam::new(SRAM_BASE, SRAM_SIZE),
             uart: Uart::default(),
             gic: Gic::default(),
             cru: Cru::new(),
@@ -97,6 +105,15 @@ impl Soc {
 
     fn has_ram(&self, addr: u64, width: u64) -> bool {
         Self::in_region(addr, width, self.ram.base, self.ram.mem.len() as u64)
+    }
+
+    fn has_sram(addr: u64, width: u64) -> bool {
+        Self::in_region(addr, width, SRAM_BASE, SRAM_SIZE as u64)
+    }
+
+    /// A word of on-chip SRAM (the boot ROM's view of the SMP mailbox).
+    pub fn sram_word(&mut self, addr: u64) -> u32 {
+        self.sram.read32(addr).unwrap_or(0)
     }
 
     fn in_region(addr: u64, width: u64, base: u64, size: u64) -> bool {
@@ -193,24 +210,55 @@ impl Soc {
     }
 }
 
-/// One-core RK3288 machine: Cortex-A12/A17 identity on `arm-a32`, GIC-400, UART2, CRU,
-/// GRF PLL lock, PMU power domains and the architectural timers.
+/// Instructions a core runs before the next core gets its turn.
+const QUANTUM: u64 = 1000;
+
+/// SMC without secure firmware: PSCI NOT_SUPPORTED in r0.
+const PSCI_NOT_SUPPORTED: u32 = -1i32 as u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreState {
+    /// Power domain off or held in soft reset.
+    Off,
+    /// Powered and out of reset, in the boot ROM's wait loop: the ROM sleeps in WFE until
+    /// the SMP mailbox (SRAM+4) holds `BOOT_MAGIC`, then jumps to the address at SRAM+8.
+    /// The host emulates the loop; the core executes no instructions.
+    BootRom,
+    Run,
+    /// In WFI/WFE until an interrupt or event.
+    Wait,
+}
+
+/// The RK3288: four Cortex-A12 cores on `arm-a32`, GIC-400, UART2, CRU, GRF PLL lock,
+/// PMU power domains and the architectural timers.
 ///
-/// Time is the 24 MHz architectural count; each instruction takes 1 ns of virtual time, so
-/// the count advances 3 ticks every 125 instructions (deterministic). `step` fast-forwards
-/// idle time to the next timer event; `run` returns `Stop::Idle` so a host loop can pace idle
-/// time against the wall clock. The RK3288 has no secure monitor under mainline Linux (no
-/// PSCI); secondary cores start through the boot ROM mailbox, which is not modelled yet, so
-/// the kernel runs with `nosmp`.
+/// Time is the 24 MHz architectural count shared by the cores. Each executed instruction is
+/// 1 ns of one core's time; with several cores running they take round-robin quanta and
+/// time advances as if they ran in parallel (cores asleep in WFI/WFE do not count).
+/// `step` (core 0 only) fast-forwards idle time to the next timer event; `run` returns
+/// `Stop::Idle` so a host loop can pace idle time against the wall clock.
+///
+/// Secondary cores start as on real hardware under mainline Linux (`rockchip,rk3066-smp`,
+/// no PSCI): the kernel powers a core up in the PMU (PWRDN_CON), releases its CRU soft
+/// reset, writes the entry point to SRAM+8 and `BOOT_MAGIC` to SRAM+4, and executes SEV.
+/// The boot ROM part (wait for the magic, jump to the entry in ARM state, SVC mode, MMU
+/// off) is emulated by the host.
 pub struct Machine {
-    pub cpu: Cpu,
+    pub cpus: Vec<Cpu>,
+    pub state: Vec<CoreState>,
     pub soc: Soc,
-    waiting: bool,
+    /// The core whose turn it is.
+    cur: usize,
+    /// Tick at which interrupt state must next be re-evaluated.
     next_event: u64,
-    timer_state: (u32, u64, u32, u64),
+    timer_state: Vec<(u32, u64, u32, u64)>,
     pub irqs: u64,
     pub exceptions: u64,
-    subtick: u32,
+    /// Time since the counter last advanced, in 1/12 ns. An instruction is 12 units
+    /// divided by the number of running cores (they run in parallel on real hardware).
+    subtick: u64,
+    /// The core that caused the last non-budget, non-idle stop (diagnostics).
+    pub last_stop_core: usize,
 }
 
 impl Machine {
@@ -219,186 +267,377 @@ impl Machine {
     }
 
     pub fn with_ram_size(ram_size: usize) -> Self {
+        let cpus = (0..NCPU)
+            .map(|index| {
+                let mut cpu = Self::new_cpu(index);
+                cpu.r[15] = RAM_BASE as u32;
+                cpu
+            })
+            .collect();
+        let mut state = vec![CoreState::Off; NCPU];
+        state[0] = CoreState::Run;
         let mut machine = Self {
-            cpu: Self::new_cpu(),
+            cpus,
+            state,
             soc: Soc::new(ram_size),
-            waiting: false,
+            cur: 0,
             next_event: 0,
-            timer_state: (0, 0, 0, 0),
+            timer_state: vec![(0, 0, 0, 0); NCPU],
             irqs: 0,
             exceptions: 0,
             subtick: 0,
+            last_stop_core: 0,
         };
-        machine.cpu.r[15] = RAM_BASE as u32;
+        machine.update_irqs();
         machine
     }
 
-    fn new_cpu() -> Cpu {
+    fn new_cpu(index: usize) -> Cpu {
         let mut cpu = Cpu::new();
-        cpu.midr = RK3288_MIDR;
-        cpu.mpidr = RK3288_MPIDR;
+        cpu.set_model(CORTEX_A12);
+        cpu.mpidr = RK3288_MPIDR | index as u32;
         cpu
+    }
+
+    /// The boot core (core 0).
+    pub fn cpu(&self) -> &Cpu {
+        &self.cpus[0]
+    }
+
+    pub fn cpu_mut(&mut self) -> &mut Cpu {
+        &mut self.cpus[0]
+    }
+
+    /// Instructions retired by all cores.
+    pub fn instret(&self) -> u64 {
+        self.cpus.iter().map(|c| c.instret).sum()
     }
 
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Fault> {
         self.soc.ram.load(addr, bytes)
     }
 
-    /// ARM32 Linux zImage entry: SVC/A32, MMU and caches off, IRQ/FIQ masked, r0 = 0,
-    /// r1 = ~0 (device-tree boot) and r2 = the DTB physical address.
+    /// Reset state of a core entering the kernel or leaving the boot ROM: SVC/A32, MMU and
+    /// caches off, IRQ/FIQ masked.
+    fn reset_core(&mut self, index: usize, entry: u32) {
+        let now = self.cpus[0].cntpct.max(self.cpus[index].cntpct);
+        let instret = self.cpus[index].instret;
+        let mut cpu = Self::new_cpu(index);
+        cpu.instret = instret;
+        // Bit 0 of an entry point selects Thumb state.
+        cpu.set_entry(entry);
+        cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
+        cpu.undef_to_guest = true;
+        cpu.firmware_calls_to_host = true;
+        cpu.cntpct = now;
+        self.cpus[index] = cpu;
+        self.state[index] = CoreState::Run;
+        self.soc.gic.reset_cpu_interface(index);
+    }
+
+    /// ARM32 Linux zImage entry on core 0: r0 = 0, r1 = ~0 (device-tree boot) and r2 = the
+    /// DTB physical address. Cores 1-3 stay off until Linux powers them up.
     pub fn boot_linux(&mut self, entry: u32, dtb: u32) {
-        self.cpu = Self::new_cpu();
-        self.cpu.r[0] = 0;
-        self.cpu.r[1] = u32::MAX;
-        self.cpu.r[2] = dtb;
-        self.cpu.r[15] = entry;
-        self.cpu.sctlr &= !(1 | 1 << 2 | 1 << 12);
-        self.cpu.undef_to_guest = true;
-        self.cpu.firmware_calls_to_host = true;
-        self.waiting = false;
+        for index in 0..NCPU {
+            self.state[index] = CoreState::Off;
+        }
+        self.reset_core(0, entry);
+        let cpu = &mut self.cpus[0];
+        cpu.r[0] = 0;
+        cpu.r[1] = u32::MAX;
+        cpu.r[2] = dtb;
+        self.cur = 0;
         self.update_irqs();
     }
 
     /// Virtual time in nanoseconds.
     pub fn now(&self) -> u64 {
-        ticks_to_ns(self.cpu.cntpct) + self.subtick as u64
+        ticks_to_ns(self.cpus[0].cntpct) + self.subtick / 12
     }
 
-    fn tick(&mut self) {
-        self.subtick += 1;
-        if self.subtick == 125 {
-            self.subtick = 0;
-            self.cpu.cntpct += 3;
+    fn set_time(&mut self, ticks: u64) {
+        for cpu in &mut self.cpus {
+            cpu.cntpct = ticks;
         }
     }
 
-    fn timer_state(&self) -> (u32, u64, u32, u64) {
-        (self.cpu.cntp_ctl, self.cpu.cntp_cval, self.cpu.cntv_ctl, self.cpu.cntv_cval)
+    /// One instruction of one core: 1 ns divided among the running cores. Cores asleep in
+    /// WFI/WFE (or in the boot ROM) do not count, so a lone busy core runs at 1 ns per
+    /// instruction.
+    fn tick(&mut self) {
+        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        self.advance_subtick(12 / running);
+    }
+
+    /// Advance virtual time by `units` of 1/12 ns.
+    fn advance_subtick(&mut self, units: u64) {
+        self.subtick += units;
+        if self.subtick >= 125 * 12 {
+            self.subtick -= 125 * 12;
+            let ticks = self.cpus[0].cntpct + 3;
+            self.set_time(ticks);
+        }
+    }
+
+    /// Inner-shareable TLB maintenance on core `k` reaches every core (DVM broadcast);
+    /// see the H3 machine.
+    fn broadcast_tlb_flush(&mut self, k: usize) {
+        self.cpus[k].tlb_broadcast = false;
+        for (j, cpu) in self.cpus.iter_mut().enumerate() {
+            if j != k {
+                cpu.tlb_flush();
+            }
+        }
+    }
+
+    fn timer_state_of(cpu: &Cpu) -> (u32, u64, u32, u64) {
+        (cpu.cntp_ctl, cpu.cntp_cval, cpu.cntv_ctl, cpu.cntv_cval)
+    }
+
+    /// Follow the PMU core power domains and the CRU core resets: a core whose domain is
+    /// off or whose reset is asserted stops; one that is powered and released enters the
+    /// boot ROM. Core 0 is the boot core and is not switched (Linux never powers it down).
+    fn sync_power(&mut self) {
+        for k in 1..NCPU {
+            let up = self.soc.pmu.core_powered(k) && !self.soc.cru.core_in_reset(k);
+            match self.state[k] {
+                CoreState::Off if up => {
+                    self.state[k] = CoreState::BootRom;
+                    self.boot_rom_check(k);
+                }
+                CoreState::Off => {}
+                _ if !up => {
+                    self.state[k] = CoreState::Off;
+                    self.cpus[k].set_irq(false, false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The boot ROM's mailbox check on core `k` (run when it enters the ROM and on every
+    /// event): with `BOOT_MAGIC` at SRAM+4 it jumps to the address at SRAM+8.
+    fn boot_rom_check(&mut self, k: usize) {
+        if self.soc.sram_word(SMP_MAILBOX + 4) == BOOT_MAGIC {
+            let entry = self.soc.sram_word(SMP_MAILBOX + 8);
+            self.reset_core(k, entry);
+        }
     }
 
     fn update_irqs(&mut self) {
-        let now = self.cpu.cntpct;
+        self.sync_power();
+        let now = self.cpus[0].cntpct;
         self.soc.now = now;
         self.soc.dirty = false;
-        self.timer_state = self.timer_state();
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART2_IRQ, uart);
-        let physical = self.cpu.physical_timer_irq();
-        self.soc.gic.set_level(PHYSICAL_TIMER_PPI, physical);
-        self.soc.gic.set_level(SECURE_PHYSICAL_TIMER_PPI, physical);
-        self.soc.gic.set_level(VIRTUAL_TIMER_PPI, self.cpu.virtual_timer_irq());
-        let irq = self.soc.gic.irq_out();
-        self.cpu.set_irq(irq, false);
-        if irq {
-            self.waiting = false;
+        let mut next = u64::MAX;
+        for k in 0..NCPU {
+            let cpu = &self.cpus[k];
+            self.timer_state[k] = Self::timer_state_of(cpu);
+            let physical = cpu.physical_timer_irq();
+            let virtual_ = cpu.virtual_timer_irq();
+            if matches!(self.state[k], CoreState::Run | CoreState::Wait) {
+                for (ctl, cval) in [(cpu.cntp_ctl, cpu.cntp_cval), (cpu.cntv_ctl, cpu.cntv_cval)] {
+                    if ctl & 1 != 0 && cval > now {
+                        next = next.min(cval);
+                    }
+                }
+            }
+            self.soc.gic.set_ppi(k, PHYSICAL_TIMER_PPI, physical);
+            self.soc.gic.set_ppi(k, SECURE_PHYSICAL_TIMER_PPI, physical);
+            self.soc.gic.set_ppi(k, VIRTUAL_TIMER_PPI, virtual_);
         }
-        self.next_event = self.next_timer_event(now);
-    }
-
-    fn next_timer_event(&self, now: u64) -> u64 {
-        [(self.cpu.cntp_ctl, self.cpu.cntp_cval), (self.cpu.cntv_ctl, self.cpu.cntv_cval)]
-            .into_iter()
-            .filter(|&(ctl, cval)| ctl & 1 != 0 && cval > now)
-            .map(|(_, cval)| cval)
-            .min()
-            .unwrap_or(u64::MAX)
+        for k in 0..NCPU {
+            if !matches!(self.state[k], CoreState::Run | CoreState::Wait) {
+                continue;
+            }
+            let irq = self.soc.gic.irq_out_for(k);
+            self.cpus[k].set_irq(irq, false);
+            if irq && self.state[k] == CoreState::Wait {
+                self.state[k] = CoreState::Run;
+            }
+        }
+        self.next_event = next;
     }
 
     fn sync_irqs(&mut self) {
-        if self.soc.dirty
-            || self.cpu.cntpct >= self.next_event
-            || self.timer_state != self.timer_state()
-        {
+        let changed = self
+            .cpus
+            .iter()
+            .zip(&self.timer_state)
+            .any(|(cpu, state)| Self::timer_state_of(cpu) != *state);
+        if self.soc.dirty || changed || self.cpus[0].cntpct >= self.next_event {
             self.update_irqs();
         }
     }
 
     pub fn advance_time(&mut self, ticks: u64) {
-        self.cpu.advance_time(ticks);
+        let now = self.cpus[0].cntpct + ticks;
+        self.set_time(now);
         self.update_irqs();
     }
 
     /// Advance idle virtual time toward an absolute deadline in nanoseconds.
     pub fn idle_until(&mut self, time_ns: u64) {
         let ticks = ns_to_ticks(time_ns);
-        if ticks > self.cpu.cntpct {
-            self.cpu.cntpct = ticks;
+        if ticks > self.cpus[0].cntpct {
+            self.set_time(ticks);
             self.subtick = 0;
         }
         self.update_irqs();
     }
 
-    /// Execute one instruction, fast-forwarding idle time to the next timer event.
+    /// Hand the machine to core `k`: the core that stops running loses its exclusive
+    /// reservation (another core may now write the location), and the GIC's banked
+    /// registers present core `k`'s view.
+    fn switch_to(&mut self, k: usize) {
+        if k != self.cur {
+            self.cpus[self.cur].exclusive_addr = None;
+            self.cur = k;
+        }
+        self.soc.gic.current = k;
+    }
+
+    /// Execute one instruction on core 0, fast-forwarding idle time to the next timer
+    /// event (single-core tests and probes).
     pub fn step(&mut self) -> Result<(), Trap> {
+        self.switch_to(0);
         self.sync_irqs();
-        if self.waiting && !self.cpu.irq {
+        if self.state[0] == CoreState::Wait {
             let ticks = match self.next_event {
                 u64::MAX => 1,
-                event => event.saturating_sub(self.cpu.cntpct).max(1),
+                event => event.saturating_sub(self.cpus[0].cntpct).max(1),
             };
-            self.cpu.advance_time(ticks);
-            self.update_irqs();
+            self.advance_time(ticks);
             return Err(Trap::Wait);
         }
-        let result = self.cpu.step(&mut self.soc);
-        self.tick();
-        if result == Err(Trap::Wait) {
-            self.waiting = true;
-            self.update_irqs();
+        let result = self.cpus[0].step(&mut self.soc);
+        // step() runs core 0 alone, so each instruction is a full 1 ns.
+        self.advance_subtick(12);
+        if self.cpus[0].sent_event {
+            self.send_event(0);
+        }
+        if self.cpus[0].tlb_broadcast {
+            self.broadcast_tlb_flush(0);
+        }
+        match result {
+            Err(Trap::Wait) => {
+                self.state[0] = CoreState::Wait;
+                self.update_irqs();
+            }
+            Err(Trap::HostCall(_)) => self.cpus[0].r[0] = PSCI_NOT_SUPPORTED,
+            _ => {}
         }
         result
     }
 
-    /// Run up to `budget` instructions. Returns `Stop::Idle(deadline_ns)` when the core
-    /// waits for an interrupt and nothing is due before the deadline.
+    /// Run up to `budget` instructions across the cores. Returns `Stop::Idle(deadline_ns)`
+    /// when every running core waits for an interrupt and nothing is due before then.
     pub fn run(&mut self, budget: u64) -> Stop {
-        let mut storm = 0u32;
-        for _ in 0..budget {
+        let mut left = budget;
+        // Exception-storm detection per core: one core's progress must not hide another's
+        // abort loop.
+        let mut storm = [0u32; NCPU];
+        while left > 0 {
             self.sync_irqs();
             if self.soc.cru.reset_requested {
                 self.soc.cru.reset_requested = false;
                 return Stop::Reset;
             }
-            if self.waiting {
+            let Some(k) = (1..=NCPU)
+                .map(|offset| (self.cur + offset) % NCPU)
+                .find(|&k| self.state[k] == CoreState::Run)
+            else {
                 return Stop::Idle(match self.next_event {
                     u64::MAX => u64::MAX,
                     event => ticks_to_ns(event),
                 });
-            }
-            let result = self.cpu.step(&mut self.soc);
-            self.tick();
-            match result {
-                Ok(()) => storm = 0,
-                Err(Trap::Wait) => {
-                    self.waiting = true;
-                    self.update_irqs();
+            };
+            self.switch_to(k);
+            let quantum = left.min(QUANTUM);
+            for _ in 0..quantum {
+                left -= 1;
+                let result = self.cpus[k].step(&mut self.soc);
+                self.tick();
+                if self.cpus[k].sent_event {
+                    self.send_event(k);
                 }
-                Err(Trap::Interrupt(..)) => {
-                    self.irqs += 1;
-                    storm = 0;
+                if self.cpus[k].tlb_broadcast {
+                    self.broadcast_tlb_flush(k);
                 }
-                Err(Trap::Exception(..)) => {
-                    self.exceptions += 1;
-                    storm += 1;
-                    if storm > 10_000 {
-                        let c = &self.cpu;
-                        return Stop::ExceptionStorm {
-                            pc: c.r[15] as u64,
-                            esr: (c.dfsr as u64) << 32 | c.ifsr as u64,
-                            elr: c.r[14] as u64,
-                            far: c.dfar as u64,
-                            el: 1,
-                        };
+                match result {
+                    Ok(()) => storm[k] = 0,
+                    Err(Trap::Wait) => {
+                        self.state[k] = CoreState::Wait;
+                        self.update_irqs();
+                        break;
+                    }
+                    Err(Trap::Interrupt(..)) => {
+                        self.irqs += 1;
+                        storm[k] = 0;
+                    }
+                    Err(Trap::Exception(..)) => {
+                        self.exceptions += 1;
+                        storm[k] += 1;
+                        if storm[k] > 10_000 {
+                            self.last_stop_core = k;
+                            let c = &self.cpus[k];
+                            return Stop::ExceptionStorm {
+                                pc: c.r[15] as u64,
+                                esr: (c.dfsr as u64) << 32 | c.ifsr as u64,
+                                elr: c.r[14] as u64,
+                                far: c.dfar as u64,
+                                el: 1,
+                            };
+                        }
+                    }
+                    // No secure firmware on the RK3288: SMC returns PSCI NOT_SUPPORTED.
+                    Err(Trap::HostCall(_)) => self.cpus[k].r[0] = PSCI_NOT_SUPPORTED,
+                    Err(Trap::Unimplemented(pc, word)) => {
+                        self.last_stop_core = k;
+                        return Stop::Unimplemented(pc, word);
+                    }
+                    Err(Trap::Brk(n)) => {
+                        self.last_stop_core = k;
+                        return Stop::Brk(n);
+                    }
+                    Err(Trap::Hlt(n)) => {
+                        self.last_stop_core = k;
+                        return Stop::Hlt(n);
                     }
                 }
-                // No secure firmware on the RK3288: SMC returns PSCI NOT_SUPPORTED.
-                Err(Trap::HostCall(_)) => self.cpu.r[0] = -1i32 as u32,
-                Err(Trap::Unimplemented(pc, word)) => return Stop::Unimplemented(pc, word),
-                Err(Trap::Brk(n)) => return Stop::Brk(n),
-                Err(Trap::Hlt(n)) => return Stop::Hlt(n),
+                // A device access (an IPI, a core power or reset change, a global reset), a
+                // timer deadline or this core's own timer registers may change the machine.
+                if self.soc.dirty
+                    || self.cpus[0].cntpct >= self.next_event
+                    || Self::timer_state_of(&self.cpus[k]) != self.timer_state[k]
+                {
+                    self.update_irqs();
+                    if self.soc.cru.reset_requested || self.state[k] != CoreState::Run {
+                        break;
+                    }
+                }
             }
         }
         Stop::Budget
+    }
+
+    /// SEV from core `k`: every other core's event register is set; cores sleeping in WFE
+    /// wake (consuming the event), and cores in the boot ROM check the mailbox.
+    fn send_event(&mut self, k: usize) {
+        self.cpus[k].sent_event = false;
+        for j in 0..NCPU {
+            if j == k {
+                continue;
+            }
+            match self.state[j] {
+                CoreState::Off => {}
+                CoreState::BootRom => self.boot_rom_check(j),
+                CoreState::Wait if self.cpus[j].last_wfe => self.state[j] = CoreState::Run,
+                CoreState::Run | CoreState::Wait => self.cpus[j].event = true,
+            }
+        }
     }
 
     pub fn serial_output(&self) -> &[u8] {
@@ -430,6 +669,8 @@ macro_rules! mmio_read {
         fn $name(&mut self, addr: u64) -> Result<$type, Fault> {
             if self.has_ram(addr, $width) {
                 self.ram.$name(addr)
+            } else if Self::has_sram(addr, $width) {
+                self.sram.$name(addr)
             } else {
                 self.mmio_read(addr, $width).map(|value| value as $type)
             }
@@ -442,6 +683,8 @@ macro_rules! mmio_write {
         fn $name(&mut self, addr: u64, value: $type) -> Result<(), Fault> {
             if self.has_ram(addr, $width) {
                 self.ram.$name(addr, value)
+            } else if Self::has_sram(addr, $width) {
+                self.sram.$name(addr, value)
             } else {
                 self.mmio_write(addr, $width, value as u32)
             }
@@ -457,10 +700,12 @@ impl Bus for Soc {
     mmio_write!(write16, u16, 2);
     mmio_write!(write32, u32, 4);
 
-    /// Doubleword device accesses (LDRD/STRD to on-chip SRAM) are two word accesses.
+    /// Doubleword device accesses (LDRD/STRD) are two word accesses.
     fn read64(&mut self, addr: u64) -> Result<u64, Fault> {
         if self.has_ram(addr, 8) {
             self.ram.read64(addr)
+        } else if Self::has_sram(addr, 8) {
+            self.sram.read64(addr)
         } else {
             let low = self.mmio_read(addr, 4)?;
             let high = self.mmio_read(addr + 4, 4)?;
@@ -471,6 +716,8 @@ impl Bus for Soc {
     fn write64(&mut self, addr: u64, value: u64) -> Result<(), Fault> {
         if self.has_ram(addr, 8) {
             self.ram.write64(addr, value)
+        } else if Self::has_sram(addr, 8) {
+            self.sram.write64(addr, value)
         } else {
             self.mmio_write(addr, 4, value as u32)?;
             self.mmio_write(addr + 4, 4, (value >> 32) as u32)

@@ -29,7 +29,7 @@ impl Board {
             Self::Pi3 => "unverified: BCM2837 SoC model not yet implemented",
             Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (one A55, GICv3, UART2, direct Linux boot)",
             Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (one A7, GIC-400, UART0, direct Linux boot)",
-            Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (one A12/A17, GIC-400, UART2, direct Linux boot)",
+            Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (four Cortex-A12s, GIC-400, UART2, direct Linux boot)",
         }
     }
 

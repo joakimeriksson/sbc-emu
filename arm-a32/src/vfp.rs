@@ -1,4 +1,4 @@
-//! VFPv4-D32 floating point (Cortex-A7 without Advanced SIMD).
+//! VFPv4-D32 floating point (Cortex-A7); Advanced SIMD data processing is in `neon.rs`.
 //!
 //! Arithmetic uses the host's IEEE operations in round-to-nearest; on an AArch64 host
 //! these follow the same NaN propagation rules as the guest. FPSCR rounding modes are
@@ -8,9 +8,6 @@ use crate::cpu::{Cpu, MODE_USR};
 use crate::mmu::Access;
 use emu_core::{Bus, Trap};
 
-pub const FPSID: u32 = 0x4102_3075; // Cortex-A7 VFPv4
-pub const MVFR0: u32 = 0x1011_0222; // 32 double registers, single/double, divide, sqrt
-pub const MVFR1: u32 = 0x1000_0011; // fused multiply-add; no Advanced SIMD
 const FPEXC_EN: u32 = 1 << 30;
 
 #[derive(Clone)]
@@ -84,7 +81,7 @@ fn compare_flags(a: f64, b: f64) -> u32 {
 
 impl Cpu {
     /// CPACR grants access to CP10/CP11 at the current privilege level.
-    fn vfp_accessible(&self) -> bool {
+    pub(crate) fn vfp_accessible(&self) -> bool {
         let access = (self.cpacr >> 20) & 0xf;
         let privileged = self.cpsr & 0x1f != MODE_USR;
         let cp10 = access & 3;
@@ -127,10 +124,10 @@ impl Cpu {
             }
             if read {
                 let value = match reg {
-                    0 => FPSID,
+                    0 => self.model.fpsid,
                     1 => self.vfp.fpscr,
-                    6 => MVFR1,
-                    7 => MVFR0,
+                    6 => self.model.mvfr1,
+                    7 => self.model.mvfr0,
                     8 => self.vfp.fpexc,
                     9 => self.vfp.fpinst,
                     10 => self.vfp.fpinst2,
@@ -189,23 +186,64 @@ impl Cpu {
             return Some(Ok(()));
         }
 
-        // VMOV between a core register and half of a double register (32-bit scalar).
-        if insn & 0x0f90_0f7f == 0x0e00_0b10 || insn & 0x0f90_0f7f == 0x0e10_0b10 {
+        // VMOV between a core register and a scalar (8, 16 or 32-bit lane of a double
+        // register), and VDUP from a core register. The 8/16-bit forms and VDUP are
+        // Advanced SIMD.
+        if insn & 0x0f00_0f1f == 0x0e00_0b10 {
             let to_core = insn & (1 << 20) != 0;
-            if insn & (1 << 22) != 0 || insn & 0x60 != 0 {
-                return undefined; // 8/16-bit scalars are Advanced SIMD
-            }
             let rt = ((insn >> 12) & 0xf) as usize;
             if rt == 15 {
                 return undefined;
             }
             let reg = dreg(vn, n_bit);
-            let half = (insn >> 21) & 1;
-            let s = reg * 2 + half as usize;
-            if to_core {
-                self.r[rt] = self.vfp.s(s);
+            let opc1 = (insn >> 21) & 3;
+            let opc2 = (insn >> 5) & 3;
+            let unsigned = insn & (1 << 23) != 0;
+            if !to_core && unsigned {
+                // VDUP: B (bit 22) and E (bit 5) select the size, bit 21 is Q.
+                let esize = match ((insn >> 22) & 1, (insn >> 5) & 1) {
+                    (0, 0) => 32,
+                    (0, 1) => 16,
+                    (1, 0) => 8,
+                    _ => return undefined,
+                };
+                let q = insn & (1 << 21) != 0;
+                if insn & (1 << 6) != 0 || q && reg & 1 != 0 || self.cpacr & (1 << 31) != 0 {
+                    return undefined;
+                }
+                let mut value = 0u64;
+                for i in 0..64 / esize {
+                    value |= (self.r[rt] as u64 & (u64::MAX >> (64 - esize))) << (i * esize);
+                }
+                self.vfp.d[reg] = value;
+                if q {
+                    self.vfp.d[reg + 1] = value;
+                }
+                return Some(Ok(()));
+            }
+            let (esize, index) = if opc1 & 2 != 0 {
+                (8, (opc1 & 1) << 2 | opc2)
+            } else if opc2 & 1 != 0 {
+                (16, (opc1 & 1) << 1 | opc2 >> 1)
+            } else if opc2 == 0 && !unsigned {
+                (32, opc1 & 1)
             } else {
-                self.vfp.set_s(s, self.r[rt]);
+                return undefined;
+            };
+            if esize < 32 && self.cpacr & (1 << 31) != 0 {
+                return undefined; // CPACR.ASEDIS
+            }
+            let shift = index * esize;
+            let mask = (u64::MAX >> (64 - esize)) << shift;
+            if to_core {
+                let lane = (self.vfp.d[reg] & mask) >> shift;
+                self.r[rt] = if unsigned || esize == 32 {
+                    lane as u32
+                } else {
+                    ((lane << (64 - esize)) as i64 >> (64 - esize)) as u32
+                };
+            } else {
+                self.vfp.d[reg] = self.vfp.d[reg] & !mask | ((self.r[rt] as u64) << shift) & mask;
             }
             return Some(Ok(()));
         }
@@ -456,7 +494,24 @@ impl Cpu {
                     }
                 }
             }
-            _ => return undefined, // half-precision conversions are not advertised
+            (2, _) | (3, _) if !double => {
+                // VCVTB/VCVTT between half precision (bottom or top of Sm/Sd) and single.
+                let top = opc3 & 2 != 0;
+                let ahp = self.vfp.fpscr & (1 << 26) != 0;
+                let dn = self.vfp.fpscr & (1 << 25) != 0;
+                if opc2 == 2 {
+                    let half = (self.vfp.s(m) >> if top { 16 } else { 0 }) as u16;
+                    self.vfp.set_s(d, crate::neon::f16_to_f32(half, ahp, dn));
+                } else {
+                    let fz = self.vfp.fpscr & (1 << 24) != 0;
+                    let rmode = (self.vfp.fpscr >> 22) & 3;
+                    let half = crate::neon::f32_to_f16(self.vfp.s(m), rmode, ahp, dn, fz) as u32;
+                    let old = self.vfp.s(d);
+                    let value = if top { old & 0xffff | half << 16 } else { old & 0xffff_0000 | half };
+                    self.vfp.set_s(d, value);
+                }
+            }
+            _ => return undefined,
         }
         Ok(())
     }

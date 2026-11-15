@@ -4,13 +4,7 @@ use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
 
 // Reboots reconstruct the SoC while preserving the same locked image and COW overlay.
-struct SharedDisk(std::rc::Rc<std::cell::RefCell<crate::disk::CowFile>>);
-impl emu_core::disk::Disk for SharedDisk {
-    fn sectors(&self)->u64 { self.0.borrow().sectors() }
-    fn read(&mut self,lba:u64,out:&mut [u8]) { self.0.borrow_mut().read(lba,out); }
-    fn write(&mut self,lba:u64,data:&[u8]) { self.0.borrow_mut().write(lba,data); }
-    fn overlay(&self)->Vec<(u64,Vec<u8>)> { self.0.borrow().overlay() }
-}
+use crate::disk::SharedDisk;
 
 impl SerialBoard for rk3588::Machine {
     fn host(&mut self) -> HostMachine<'_> { HostMachine::OrangePi5(self) }
@@ -35,18 +29,11 @@ fn execute(args:&[String])->Result<(),String> {
     let cmdline=arg(args,"--append").unwrap_or(rk3588::boot::DEFAULT_CMDLINE);
     let ram=serial_board::ram_bytes(args, 256)?;
     let config=RunConfig::from_args("orangepi5", args)?;
-    let disk=arg(args,"--sd").map(|p|crate::disk::CowFile::open(p)
-        .map(|d|std::rc::Rc::new(std::cell::RefCell::new(d)))
-        .map_err(|e|format!("{p}: {e}"))).transpose()?;
-    if let Some(d)=disk.as_ref() {
-        let sectors=emu_core::disk::Disk::sectors(&*d.borrow());
-        if sectors < 1024 || sectors % 1024 != 0 || sectors > (1u64 << 32) {
-            return Err("SDHC image size must be a multiple of 512 KiB between 512 KiB and 2 TiB".into());
-        }
-    }
+    let persist=args.iter().any(|a|a=="--sd-persist");
+    let disk=arg(args,"--sd").map(|p|SharedDisk::open(p,persist).map_err(|e|format!("{p}: {e}"))).transpose()?;
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::new(ram)?;
-        m.soc.mmc.disk=disk.as_ref().map(|d|Box::new(SharedDisk(d.clone())) as Box<dyn emu_core::disk::Disk>);
+        m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
         rk3588::boot::boot_linux(&mut m,&kernel,initrd.as_deref(),cmdline)?;
         if !args.iter().any(|a|a=="--no-jit") {m.cpu.enable_jit();}
         Ok(m)
