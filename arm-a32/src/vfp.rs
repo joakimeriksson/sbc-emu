@@ -8,9 +8,6 @@ use crate::cpu::{Cpu, MODE_USR};
 use crate::mmu::Access;
 use emu_core::{Bus, Trap};
 
-pub const FPSID: u32 = 0x4102_3075; // Cortex-A7 VFPv4
-pub const MVFR0: u32 = 0x1011_0222; // 32 double registers, single/double, divide, sqrt
-pub const MVFR1: u32 = 0x1000_0011; // fused multiply-add; no Advanced SIMD
 const FPEXC_EN: u32 = 1 << 30;
 
 #[derive(Clone)]
@@ -127,10 +124,10 @@ impl Cpu {
             }
             if read {
                 let value = match reg {
-                    0 => FPSID,
+                    0 => self.model.fpsid,
                     1 => self.vfp.fpscr,
-                    6 => MVFR1,
-                    7 => MVFR0,
+                    6 => self.model.mvfr1,
+                    7 => self.model.mvfr0,
                     8 => self.vfp.fpexc,
                     9 => self.vfp.fpinst,
                     10 => self.vfp.fpinst2,
