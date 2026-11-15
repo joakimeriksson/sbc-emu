@@ -8,4 +8,5 @@ license.workspace = true
 bcm2711 = { path = "../bcm2711" }
 rk3588 = { path = "../rk3588" }
 allwinner-h3 = { path = "../allwinner-h3" }
+rockchip-rk3288 = { path = "../rockchip-rk3288" }
 emu-core = { path = "../emu-core" }
