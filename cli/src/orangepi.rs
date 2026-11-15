@@ -46,7 +46,7 @@ fn execute(args:&[String])->Result<(),String> {
     }
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::new(ram)?;
-        m.soc.mmc.disk=disk.as_ref().map(|d|Box::new(SharedDisk(d.clone())) as Box<dyn emu_core::disk::Disk>);
+        m.soc.mmc.card.disk=disk.as_ref().map(|d|Box::new(SharedDisk(d.clone())) as Box<dyn emu_core::disk::Disk>);
         rk3588::boot::boot_linux(&mut m,&kernel,initrd.as_deref(),cmdline)?;
         if !args.iter().any(|a|a=="--no-jit") {m.cpu.enable_jit();}
         Ok(m)

@@ -560,6 +560,9 @@ impl Sdhci {
         w.bool(self.special.is_some()); w.bytes(self.special.as_deref().unwrap_or(&[]));
         w.opt_u32(self.pre_count);
         if let Some(c) = self.sdio.as_ref() { c.save_state(w); }
+        if self.disk.as_ref().is_some_and(|d| !d.snapshots_disk()) {
+            eprintln!("[sd] snapshot does not include the SD card: --sd-persist writes go to the image");
+        }
         let ov = self.disk.as_ref().map(|d| d.overlay()).unwrap_or_default();
         w.u64(ov.len() as u64);
         for (lba, data) in ov { w.u64(lba); w.bytes(&data); }
@@ -575,11 +578,13 @@ impl Sdhci {
         self.pre_count = r.opt_u32()?;
         if let Some(c) = self.sdio.as_mut() { c.load_state(r)?; }
         let n = r.u64()?;
+        let mut sectors = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let lba = r.u64()?;
-            let data = r.bytes()?;
-            if let Some(d) = self.disk.as_mut() { d.write(lba, data); }
+            sectors.push((lba, r.bytes()?.to_vec()));
         }
+        // Exactly the snapshot's sectors: writes made after it was taken are dropped.
+        if let Some(d) = self.disk.as_mut() { d.restore_overlay(sectors); }
         Ok(())
     }
 }
