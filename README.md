@@ -50,7 +50,7 @@ the browser (WebAssembly). The [sbc-emu page](web/index.html) runs its 3D demos 
 | Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core, breakpoints and watchpoints), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
 | Port forwarding | `--hostfwd tcp::2222-:22` (QEMU's syntax) through the user-mode NAT | `ssh-keyscan -p 2222 127.0.0.1` reads the Pi OS host keys |
 | HDMI | the vc4 KMS pipeline the image's `config.txt` asks for (`dtoverlay=vc4-kms-v3d`): HVS compositor, pixel valve, HDMI0 encoder + PHY, DDC with a 1080p monitor's EDID, HDMI audio; `--display fb` keeps the firmware's `simple-framebuffer` (1024×768) instead | stock `vc4`: `HDMI-A-1` connected, modes from the EDID, the console at 1920×1080; `kmstest` switches to 1024×768 and page-flips at 60.00 fps; `speaker-test -D hdmi:…`: a 440.0 Hz tone at 48 kHz on the host; screenshots via `--screenshot` / `shot` |
-| 3D GPU | V3D 4.2 (VideoCore VI) for the stock `v3d` kernel driver and Mesa's `v3d` (OpenGL ES 3.1) and `v3dv` (Vulkan 1.3) drivers: QPU shader cores, binner, rasterizer, tile buffer, texture unit, TFU, compute dispatch, GPU MMU ([docs/gpu.md](docs/gpu.md)) | `kmscube` on HDMI; 16 GLES scenes (depth, stencil, blending, mipmapped/cube/float textures, points/lines, instancing, discard, derivatives, a lit cube) match llvmpipe pixel for pixel in the guest, and a compute shader with shared memory and a barrier is exact; all 33 `glmark2-es2-drm` benchmark scenes run at 1920×1080 (score 12) |
+| 3D GPU | V3D 4.2 (VideoCore VI) for the stock `v3d` kernel driver and Mesa's `v3d` (OpenGL ES 3.1) and `v3dv` (Vulkan 1.3) drivers: QPU shader cores, binner, rasterizer, tile buffer, texture unit, TFU, compute dispatch, GPU MMU ([docs/gpu.md](docs/gpu.md)) | `kmscube` on HDMI; 33 GLES scenes (depth, stencil, blending, mipmapped/cube/float textures, points/lines, instancing, discard, derivatives, a lit cube, and the habits of Firefox's WebRender) match llvmpipe pixel for pixel in the guest, also under the Mesa that Ubuntu's snaps use, and a compute shader with shared memory and a barrier is exact; all 33 `glmark2-es2-drm` benchmark scenes run at 1920×1080 (score 12) |
 | Browser | the same machine as WebAssembly; SD image read lazily over HTTP range requests | `tools/wasm-smoke-sd.mjs`: login prompt in ~2.7 min (JIT on), ~200 MiB of the image read |
 
 Compatibility labels in the plan's terms (per-feature evidence above; nothing else is claimed):
@@ -259,7 +259,9 @@ scripts/    action scripts (boots, demos, GPU tests, Ubuntu)
 
 ## Known gaps (Raspberry Pi 4)
 
-The 3D GPU's shader cores are interpreted (glmark2 runs at 1–45 fps at 1080p; no ASTC, transform feedback or
+Firefox (the Ubuntu snap) drops some glyphs on text-heavy pages such as GitHub's: the glyphs reach
+the atlas and the text shader samples them, but some never reach the page tiles (under
+investigation). The 3D GPU's shader cores are interpreted (glmark2 runs at 1–45 fps at 1080p; no ASTC, transform feedback or
 geometry shaders), no HDMI1 (the second port has
 no monitor), no CEC devices; the HVS draws RGB planes only (no YUV video planes, no tiled
 formats) and scales with nearest neighbour;
