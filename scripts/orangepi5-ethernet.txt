@@ -1,0 +1,10 @@
+# Stock Armbian minimal image, booted with init=/bin/bash: exercise the actual
+# Linux DWMAC and YT8531 PHY drivers against the emulator's virtual gateway.
+# sbc-emu run --board orangepi5 --sd cache/orangepi/armbian.img \
+#   --append init=/bin/bash --script scripts/orangepi5-ethernet.txt --timeout 600
+# The marker is computed so the echoed command cannot satisfy the wait.
+wait-serial root@
+serial ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; sleep 2; ping -c 2 -W 2 10.0.2.2; echo PING-$((6*7))\n
+wait-serial 2 packets transmitted, 2 received
+wait-serial PING-42
+quit
