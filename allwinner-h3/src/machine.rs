@@ -42,6 +42,18 @@ pub const EHCI_IRQS: [usize; 2] = [32 + 72, 32 + 74];
 pub const OHCI_IRQS: [usize; 2] = [32 + 73, 32 + 75];
 /// Timer 0/1 interrupts: SPI 18/19.
 pub const TIMER_IRQS: [usize; 2] = [32 + 18, 32 + 19];
+/// Mali-400 MP2 GPU (`gpu@1c40000`); interrupts gp, gpmmu, pp0, ppmmu0, pmu, pp1, ppmmu1
+/// are SPI 97-103.
+pub const MALI_BASE: u64 = 0x01c4_0000;
+pub const MALI_IRQS: [(mali400::Irq, usize); 7] = [
+    (mali400::Irq::Gp, 32 + 97),
+    (mali400::Irq::GpMmu, 32 + 98),
+    (mali400::Irq::Pp0, 32 + 99),
+    (mali400::Irq::PpMmu0, 32 + 100),
+    (mali400::Irq::Pmu, 32 + 101),
+    (mali400::Irq::Pp1, 32 + 102),
+    (mali400::Irq::PpMmu1, 32 + 103),
+];
 const GICD_SIZE: u64 = 0x1000;
 const GICC_SIZE: u64 = 0x2000;
 
@@ -62,6 +74,8 @@ pub struct Soc {
     pub tablet: Tablet,
     /// Ethernet MAC with its internal PHY.
     pub emac: Emac,
+    /// The Mali-400 GPU.
+    pub gpu: mali400::Mali400,
     /// The network the Ethernet port is plugged into (None: no cable).
     pub net: Option<sbc_net::net::VirtualNet>,
     /// CCU registers (PLLs, bus gates, resets, module clocks), byte offset / 4.
@@ -135,6 +149,7 @@ impl Soc {
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
             emac: Emac::default(),
+            gpu: mali400::Mali400::new(std::env::var("SBC_MALI_LOG").is_ok_and(|v| v != "0")),
             net: None,
             ccu: Self::ccu_reset(),
             now: 0,
@@ -232,6 +247,9 @@ impl Soc {
             if Self::in_region(addr, 4, EMAC_BASE, EMAC_SIZE) {
                 return Ok(self.emac.read(addr - EMAC_BASE));
             }
+            if Self::in_region(addr, 4, MALI_BASE, mali400::SIZE) {
+                return Ok(self.gpu.read(addr - MALI_BASE));
+            }
             if let Some((port, ohci, offset)) = Self::usb_register(addr) {
                 return Ok(if ohci { self.ohci[port].read(offset) } else { self.ehci[port].read(offset) });
             }
@@ -285,6 +303,15 @@ impl Soc {
                 self.emac.write(addr - EMAC_BASE, value, &mut dma);
                 return Ok(());
             }
+            if Self::in_region(addr, 4, MALI_BASE, mali400::SIZE) {
+                self.gpu.now = self.now;
+                let mut mem = GpuRam { ram: &mut self.ram, written: Vec::new() };
+                self.gpu.write(addr - MALI_BASE, value, &mut mem);
+                for (address, len) in mem.written {
+                    self.code_watch.dma_write(address, len);
+                }
+                return Ok(());
+            }
             if let Some((port, ohci, offset)) = Self::usb_register(addr) {
                 if ohci {
                     self.ohci[port].write(offset, value, self.now);
@@ -328,6 +355,32 @@ impl Soc {
             return Ok(());
         }
         self.stub_access(addr, Some((width, value))).map(|_| ())
+    }
+}
+
+/// RAM as the GPU sees it (physical addresses); records the pages it writes so compiled
+/// code there is dropped.
+struct GpuRam<'a> {
+    ram: &'a mut FlatRam,
+    written: Vec<(u64, usize)>,
+}
+
+impl mali400::Memory for GpuRam<'_> {
+    fn read_u32(&self, pa: u32) -> Option<u32> {
+        let offset = (pa as u64).checked_sub(self.ram.base)? as usize;
+        let bytes = self.ram.mem.get(offset..offset + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn write_u32(&mut self, pa: u32, value: u32) -> bool {
+        let Some(offset) = (pa as u64).checked_sub(self.ram.base).map(|o| o as usize) else { return false };
+        let Some(bytes) = self.ram.mem.get_mut(offset..offset + 4) else { return false };
+        bytes.copy_from_slice(&value.to_le_bytes());
+        match self.written.last_mut() {
+            Some((start, len)) if *start + *len as u64 == pa as u64 => *len += 4,
+            _ => self.written.push((pa as u64, 4)),
+        }
+        true
     }
 }
 
@@ -592,6 +645,14 @@ impl Machine {
         }
         let emac = self.soc.emac.irq();
         self.soc.gic.set_level(EMAC_IRQ, emac);
+        self.soc.gpu.update(now);
+        if let Some(due) = self.soc.gpu.next_deadline() {
+            next = next.min(due.max(now + 1));
+        }
+        for (line, irq) in MALI_IRQS {
+            let level = self.soc.gpu.irq(line);
+            self.soc.gic.set_level(irq, level);
+        }
         for port in 0..2 {
             let (ehci, ohci) = (self.soc.ehci[port].irq(), self.soc.ohci[port].irq());
             self.soc.gic.set_level(EHCI_IRQS[port], ehci);

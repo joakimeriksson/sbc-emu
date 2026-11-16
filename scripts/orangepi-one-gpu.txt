@@ -1,0 +1,19 @@
+# The Mali-400 GPU on Armbian: Mesa's lima driver renders kmscube's spinning cube through
+# the emulated GP (vertex shader, polygon lists) and PPs (fragment shading, tiles) and
+# shows it on HDMI. Needs the image from scripts/armbian-gpu-fixture.sh:
+#   sbc-emu run --board orangepi-one --sd cache/mali/armbian-gpu.img --append init=/bin/bash \
+#       --script scripts/orangepi-one-gpu.txt --timeout 900
+# (the second kmscube's stdin is an idle pipe: in the background it would get /dev/null,
+# read EOF and stop after a frame)
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp; modprobe lima; sleep 1; dmesg | grep -E 'mali400 version|Initialized [l]ima'; echo READY-$((6*7))\n
+wait-serial Initialized lima
+wait-serial READY-42
+serial kmscube -c 30 2>&1 | grep -E 'renderer|version|Rendered'; echo GL-$((6*7))\n
+wait-serial renderer: "Mali400"
+wait-serial Rendered 29 frames
+wait-serial GL-42
+serial sleep 1000 | kmscube -c 100000 > /dev/null 2>&1 &\n
+sleep 10
+screenshot out/orangepi-one-kmscube.png
+quit

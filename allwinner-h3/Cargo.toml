@@ -8,3 +8,4 @@ license.workspace = true
 emu-core = { path = "../emu-core" }
 arm-a32 = { path = "../arm-a32" }
 sbc-net = { path = "../sbc-net" }
+mali400 = { path = "../mali400" }

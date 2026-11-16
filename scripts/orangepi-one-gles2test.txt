@@ -1,0 +1,12 @@
+# GLES 2 test scenes on the Mali-400 vs softpipe (tests/gpu/gles2test.c). Start the file
+# server on the host first (tools/gpu_server.py), then, with the image from
+# scripts/armbian-gpu-fixture.sh:
+#   sbc-emu run --board orangepi-one --sd cache/mali/armbian-gpu.img --append init=/bin/bash \
+#       --script scripts/orangepi-one-gles2test.txt --timeout 3600
+# Results (cmp.txt, side-by-side PPMs) land in out/gpu-results/.
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp; mount -t tmpfs run /run; modprobe lima; ip link set end0 up; ip addr add 10.0.2.15/24 dev end0; ip route add default via 10.0.2.2; sleep 2; echo READY-$((6*7))\n
+wait-serial READY-42
+serial wget -q -O /tmp/run.sh http://10.0.2.2:8800/run-gles2.sh && sh /tmp/run.sh; echo GLES2TEST-""END\n
+wait-serial GLES2TEST-END
+quit

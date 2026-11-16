@@ -1,0 +1,8 @@
+[package]
+name = "mali400"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ARM Mali-400 (Utgard) GPU as driven by Linux's lima driver and Mesa's lima driver"
+
+[dependencies]

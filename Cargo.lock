@@ -14,6 +14,7 @@ version = "0.0.1"
 dependencies = [
  "arm-a32",
  "emu-core",
+ "mali400",
  "sbc-net",
 ]
 
@@ -48,6 +49,10 @@ version = "0.0.1"
 dependencies = [
  "miniz_oxide",
 ]
+
+[[package]]
+name = "mali400"
+version = "0.0.1"
 
 [[package]]
 name = "miniz_oxide"

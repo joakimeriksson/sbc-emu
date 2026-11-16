@@ -63,12 +63,50 @@ sbc-emu run --board orangepi-one --kernel $F/zImage --dtb $F/sun8i-h3-orangepi-o
 | USB | Armbian enumerates "sbc-emu Virtual USB Keyboard" on `usb4` (OHCI1, USB-A port) and the tablet on `usb1` (OHCI0, OTG port), both `hid-generic`; the EHCIs start ("USB 2.0 started, EHCI 1.00"). Keys typed on the keyboard answer Armbian's first-run wizard on the HDMI console (tty1) | `scripts/orangepi-one-usb.txt` |
 | Thumb-2 userland | Debian 13's armhf `busybox-static` (Thumb-2, hard float): SHA-256 and MD5 of known strings, `sort`, floating-point `awk`, a gzip round trip of 256 KiB, on four cores | `scripts/debian-armhf-busybox-fixture.sh`, `scripts/orangepi-one-thumb.txt` |
 | NEON | Linux sets `HWCAP_NEON` (`neon` in `/proc/cpuinfo`); Debian 13's armhf glibc, OpenSSL 3.5 (`OPENSSL_armcap=0x1`) and libjpeg-turbo 2.1 run their NEON code: SHA-1/256/512, ChaCha20 and Poly1305 of 1.2 MB, a JPEG encode and decode, all equal to the host's native OpenSSL 3 / libjpeg-turbo 3 results and to the guest's scalar paths | `scripts/debian-armhf-neon-fixture.sh`, `scripts/orangepi-one-neon.txt` |
+| GPU | the Mali-400 MP2 (`mali400/`): Armbian's `lima` driver binds ("gp - mali400 version major 1 minor 1", pp0/pp1, 64K L2, `/dev/dri/renderD128`) and Mesa 25's lima driver ("renderer: Mali400", OpenGL ES 2.0) renders kmscube (plain and textured) to the HDMI output; 25 GLES 2 test scenes match Mesa's softpipe | `scripts/armbian-gpu-fixture.sh`, `scripts/orangepi-one-gpu.txt`, `scripts/orangepi-one-gles2test.txt` |
 
 Not modelled yet: USB high speed (EHCI transfers), isochronous transfers, the OTG controller (MUSB), HDMI audio and CEC, YUV video layers. The SD boot does what U-Boot and Armbian's boot.scr do, without running U-Boot (no DRAM controller, no secure monitor model); the serial console is put last on the command line so `/dev/console` is the serial port, and DT overlays from armbianEnv.txt are not applied. The cores
 take turns on one host thread (round-robin quanta of 1000 instructions). Every other device node in the
 distribution DTB is a plain read-back register file, so its driver probes without effect;
 the run summary lists the pages that were touched. Virtual time is 1 ns per instruction.
 
+
+## The GPU
+
+`mali400/` models the H3's Mali-400 MP2 behind the same interface the real one has, so the
+stock kernel (`lima`) and Mesa (`lima` Gallium driver) drive it unmodified:
+
+- one 64 KiB register window (`gpu@1c40000`) with the GP, two PPs, the L2 cache, the PMU and
+  three MMUs, each with its own interrupt; jobs start when the driver writes a GP or PP
+  command register and complete within that write;
+- the GPU MMUs: two-level 4 KiB page tables, page faults reported to the driver;
+- the GP: the vertex shader command list and an interpreter for Mesa `gpir`'s 128-bit VLIW
+  instructions (two multipliers, two adders, the pass and complex units, stores to
+  varyings), then the PLBU command list: primitive assembly from the shader's screen
+  positions, clipping of triangles that cross w = 0, culling, scissors, indexed and
+  non-indexed draws; when the tile heap is full the PLBU stops with OUT_OF_MEM and
+  continues once the driver has grown it, as the hardware does;
+- the PPs: the PP stream's tile list, a rasteriser for 16x16 tiles (fixed-point edges with
+  the top-left rule, GL's line rule, perspective-correct varyings), an interpreter for Mesa
+  `ppir`'s variable-length VLIW instructions run on 2x2 quads (varyings, textures with
+  mipmaps, wrap modes, cube maps and ETC1, fp16 uniforms, vec4 and scalar pipelines,
+  rcp/rsqrt/exp2/log2/sin/cos, derivatives, discard, branches and loops, gl_FragDepth),
+  depth, stencil, alpha test and blending, and the write-back units (linear and 16x16
+  u-interleaved tiled, RGBA8888/565/5551/4444/fp16, Z24S8);
+- jobs take virtual time as on the real GPU at 432 MHz (cycles from the fragments shaded,
+  the tiles written and the vertices processed) and complete with their interrupt then;
+- the polygon lists between the PLBU and the PPs are internal to the GPU, so the model uses
+  its own record format inside the buffers the driver allocates for them.
+
+`tests/gpu/gles2test.c` renders 25 GLES 2 scenes on the GPU and on Mesa's softpipe in the
+same guest and compares them per pixel (`scripts/orangepi-one-gles2test.txt`, with
+`tools/gpu_server.py` serving the files): all pass. llvmpipe is not used as the reference:
+LLVM's code for it calls a helper through an unresolved stub on this armhf image.
+
+`SBC_MALI_LOG=1` prints a line per GP and PP job; `SBC_MALI_DUMP=1` dumps the first
+primitive's render state, varyings and decoded fragment shader of each frame.
+
+Known gaps: multisampling is not modelled, and the timing model is a rough cycle count.
 
 ## The JIT
 
