@@ -1,8 +1,10 @@
-//! Mali-G610 control registers. CSF firmware execution is still unsupported.
+//! Mali-G610 control registers and host-modeled CSF management.
+//! MCU instructions and graphics queue execution remain unsupported.
 use crate::gpu_mmu::AddressSpace;
 #[derive(Default)]
 pub struct Gpu {
     raw: [u32; 3],
+    firmware: crate::gpu_fw::Firmware,
     mask: [u32; 3],
     ready: [u64; 3],
     regs: std::collections::BTreeMap<u64, u32>,
@@ -41,6 +43,33 @@ impl Gpu {
             0x110 | 0x120 => 1,
             0x300 => 1, // ACE-lite
             _ => *self.regs.get(&off).unwrap_or(&0),
+        }
+    }
+    pub fn write_memory(&mut self, off: u64, v: u32, ram: &mut [u8]) {
+        self.write(off, v);
+        if off == 0x700 && v != 0 {
+            if self.firmware.boot(&self.spaces[0], ram).is_ok() {
+                self.regs.insert(0x704, 1);
+                self.raw[0] |= 1 << 31;
+            }
+        } else if off == 0x700 {
+            self.firmware.running = false;
+        } else if off == 0x80000 {
+            match self.firmware.doorbell(&self.spaces[0], ram) {
+                Ok((irq, halt)) => {
+                    if irq {
+                        self.raw[0] |= 1 << 31;
+                    }
+                    if halt {
+                        self.regs.insert(0x704, 2);
+                    }
+                }
+                Err(_) => {
+                    self.firmware.running = false;
+                    self.regs.insert(0x704, 3);
+                    self.raw[2] |= 1 << 19;
+                }
+            }
         }
     }
     pub fn write(&mut self, off: u64, v: u32) {

@@ -1,9 +1,9 @@
-# Experimental control-interface test; expected MCU failure, not a rendering test.
+# Management-interface test, not a rendering test.
 # --board orangepi5 --gpu probe --sd Armbian.img --append init=/bin/bash
 wait-serial root@
-serial mount -t proc proc /proc; mount -t sysfs sys /sys; modprobe fixed; modprobe panthor; dmesg; echo PROBE-$((7*8))\n
-wait-serial Mali-G610 id 0xa867
-wait-serial Firmware git sha:
-wait-serial Failed to boot MCU
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; modprobe fixed; modprobe panthor; dmesg; ls /dev/dri; python3 -c 'import os,fcntl,struct,ctypes; f=os.open("/dev/dri/renderD128",os.O_RDWR); b=ctypes.create_string_buffer(128); a=bytearray(struct.pack("IIQ",0,128,ctypes.addressof(b))); fcntl.ioctl(f,0xc0106440,a,True); v=struct.unpack_from("I",b)[0]; assert v==0xa8670000,hex(v); print("GPU_QUERY_"+hex(v))'; sleep 15; dmesg | tail -15; echo PROBE-$((7*8))\n
+wait-serial Initialized panthor
+wait-serial renderD128
+wait-serial GPU_QUERY_0xa8670000
 wait-serial PROBE-56
 quit
