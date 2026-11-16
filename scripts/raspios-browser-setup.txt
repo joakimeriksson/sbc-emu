@@ -1,0 +1,19 @@
+# One-time setup of a persistent Pi OS image for browser tests on the emulated GPU: Firefox and
+# Chromium (Pi OS packages, on the system Mesa) and cage, a kiosk Wayland compositor, so a
+# browser runs full-screen on HDMI without a desktop. The guest has no RTC, so the clock is set
+# from the mirror's Date header first (apt rejects signatures "from the future" otherwise), and
+# everything runs in one sudo so the 15-minute sudo timeout cannot stop it at a password prompt. Starts from the GPU test image:
+#   cp -c cache/os/raspios-gpu.img cache/os/raspios-browser.img
+#   sbc-emu run --sd cache/os/raspios-browser.img --sd-persist --script scripts/raspios-browser-setup.txt
+wait-serial raspberrypi login:
+sleep 2
+serial pi\n
+sleep 2
+wait-idle 4
+serial raspberry\n
+sleep 3
+wait-idle 6
+serial echo raspberry | sudo -S sh -c 'date -u -s "$(curl -sI http://deb.debian.org/debian/ | tr -d "\015" | sed -n "s/^[Dd]ate: //p")"; apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends firefox chromium cage seatd fonts-dejavu-core fonts-liberation2; echo APT-""DONE $?; usermod -aG video,render pi; df -h /; dpkg -l firefox chromium cage | tail -3; sync; echo SYNC-""DONE'\n
+wait-serial SYNC-DONE
+sleep 3
+quit

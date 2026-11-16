@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #define W 128
 #define H 128
@@ -938,7 +939,481 @@ static void s_cache_grow(void) {
     glActiveTexture(GL_TEXTURE0); glDeleteTextures(4, all);
 }
 
+/* WebRender's batched texture uploads: a 512x512 staging texture filled through a pixel buffer,
+ * then many small regions copied into a 2048x2048 atlas at other offsets (by drawing textured
+ * quads into the atlas, and by copy-image), the staging texture refilled with new data, and
+ * copied again; finally the atlas is sampled. R8 (glyph masks) and RGBA8. */
+static void batch_round(GLuint staging, GLenum ifmt, GLenum fmt, int cpp, int round, GLuint atlas_fbo, GLuint copy_prog, GLuint atlas, int use_ci) {
+    static unsigned char data[512 * 512 * 4];
+    for (int y = 0; y < 512; y++) for (int x = 0; x < 512; x++) for (int c = 0; c < cpp; c++)
+        data[((size_t)y * 512 + x) * cpp + c] = (unsigned char)(((x / 7 + y / 5 + c + round * 3) & 1) ? 40 + round * 60 + c * 20 : 0);
+    GLuint pbo; glGenBuffers(1, &pbo); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, 512 * 512 * cpp, NULL, GL_STREAM_DRAW);
+    void *p = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, 512 * 512 * cpp, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    memcpy(p, data, 512 * 512 * cpp); glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    glBindTexture(GL_TEXTURE_2D, staging);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, fmt, GL_UNSIGNED_BYTE, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); glDeleteBuffers(1, &pbo);
+    typedef void (*copy_image_fn)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
+    copy_image_fn ci = (copy_image_fn)eglGetProcAddress("glCopyImageSubDataEXT");
+    /* 24 regions of 20x24 from the staging texture into atlas cells */
+    for (int k = 0; k < 24; k++) {
+        int sx = (k % 8) * 60 + 3, sy = (k / 8) * 70 + 5;
+        int dx = ((k + round * 24) % 32) * 64 + 2, dy = ((k + round * 24) / 32) * 32 + 1;
+        if (use_ci && ci) ci(staging, GL_TEXTURE_2D, 0, sx, sy, 0, atlas, GL_TEXTURE_2D, 0, dx, dy, 0, 20, 24, 1);
+        else {
+            glBindFramebuffer(GL_FRAMEBUFFER, atlas_fbo); glViewport(0, 0, 2048, 2048);
+            glUseProgram(copy_prog);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, staging);
+            float x0 = dx / 1024.0f - 1, x1 = (dx + 20) / 1024.0f - 1, y0 = dy / 1024.0f - 1, y1 = (dy + 24) / 1024.0f - 1;
+            float u0 = sx / 512.0f, u1 = (sx + 20) / 512.0f, v0 = sy / 512.0f, v1 = (sy + 24) / 512.0f;
+            float pos[] = {x0, y0, 0, 1, x1, y0, 0, 1, x0, y1, 0, 1, x1, y1, 0, 1};
+            float uv[] = {u0, v0, u1, v0, u0, v1, u1, v1};
+            attr(copy_prog, "pos", 4, pos); attr(copy_prog, "uv", 2, uv);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+    }
+}
+
+static void s_batched_uploads(void) {
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    GLenum ifmt[2] = {GL_R8, GL_RGBA8}, fmt[2] = {GL_RED, GL_RGBA};
+    GLuint atlas[2][2];
+    GLuint copy_prog = prog(VS_TEX, FS_TEX);
+    for (int k = 0; k < 2; k++) for (int m = 0; m < 2; m++) {
+        glGenTextures(1, &atlas[k][m]); glBindTexture(GL_TEXTURE_2D, atlas[k][m]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 2048, 2048);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        GLuint f; glGenFramebuffers(1, &f); glBindFramebuffer(GL_FRAMEBUFFER, f);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas[k][m], 0);
+        glViewport(0, 0, 2048, 2048); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+        GLuint st; glGenTextures(1, &st); glBindTexture(GL_TEXTURE_2D, st); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 512, 512);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        for (int round = 0; round < 3; round++) batch_round(st, ifmt[k], fmt[k], k ? 4 : 1, round, f, copy_prog, atlas[k][m], m);
+        glBindFramebuffer(GL_FRAMEBUFFER, prev); glDeleteFramebuffers(1, &f); glDeleteTextures(1, &st);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prev); glViewport(0, 0, W, H);
+    clear(0, 0, 0);
+    /* quadrants: R8 by draw, R8 by copy-image, RGBA8 by draw, RGBA8 by copy-image; each output
+     * pixel shows atlas texel (2 + 64 * (x/8) + x%8 * 3, 1 + 32 * (y/16) + y%16) */
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a0, a1, b0, b1; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); ivec2 r = q % 64; ivec2 c = ivec2(2 + 64 * (r.x / 2) + (r.x % 2) * 9, 1 + 32 * (r.y / 16) + (r.y % 16));\n"
+                            " if (q.y < 64) o = q.x < 64 ? vec4(texelFetch(a0, c, 0).r, 0.2, 0.0, 1.0) : vec4(texelFetch(a1, c, 0).r, 0.0, 0.2, 1.0);\n"
+                            " else o = q.x < 64 ? texelFetch(b0, c, 0) : texelFetch(b1, c, 0); }\n");
+    GLuint all[4] = {atlas[0][0], atlas[0][1], atlas[1][0], atlas[1][1]}; const char *nm[4] = {"a0", "a1", "b0", "b1"};
+    for (int i = 0; i < 4; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, all[i]); glUniform1i(glGetUniformLocation(p, nm[i]), i); }
+    glActiveTexture(GL_TEXTURE0);
+    quad(p, 1.0f, 1.0f);
+    for (int i = 0; i < 4; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, 0); }
+    glActiveTexture(GL_TEXTURE0); glDeleteTextures(4, all);
+}
+
+/* WebRender's staging uploads as it really does them: a persistently mapped pixel buffer
+ * (glBufferStorage + MAP_PERSISTENT | MAP_FLUSH_EXPLICIT), staging data written at an offset into
+ * it and flushed, then a whole 512x512 staging texture uploaded from that offset (R8, BGRA8 and
+ * RGBA8), and regions copied from staging into a 2048x2048 atlas. Three rounds reuse the mapping. */
+#define PSCHK(what) do { GLenum e_ = glGetError(); if (e_) printf("persistent_staging: %s k=%d -> GL error %#x\n", what, k, e_); } while (0)
+static void s_persistent_staging(void) {
+    typedef void (*buffer_storage_fn)(GLenum, GLsizeiptr, const void *, GLbitfield);
+    buffer_storage_fn bs = strstr((const char *)glGetString(GL_EXTENSIONS), "GL_EXT_buffer_storage") ? (buffer_storage_fn)eglGetProcAddress("glBufferStorageEXT") : NULL;
+    typedef void (*copy_image_fn)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
+    copy_image_fn ci = (copy_image_fn)eglGetProcAddress("glCopyImageSubDataEXT");
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    printf("persistent_staging: buffer_storage %s copy_image %s\n", bs ? "yes" : "no", ci ? "yes" : "no");
+    if (!bs || !ci) return;
+    GLenum ifmt[3] = {GL_R8, GL_BGRA8_EXT, GL_RGBA8}, fmt[3] = {GL_RED, GL_BGRA_EXT, GL_RGBA};
+    int cpp[3] = {1, 4, 4};
+    GLuint atlas[3];
+    for (int k = 0; k < 3; k++) {
+        glGenTextures(1, &atlas[k]); glBindTexture(GL_TEXTURE_2D, atlas[k]);
+        if (k == 1) glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, 2048, 2048, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+        else glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 2048, 2048);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        static unsigned char zero[2048 * 2048 * 4];
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2048, 2048, fmt[k], GL_UNSIGNED_BYTE, zero); PSCHK("zero-fill");
+        GLuint st; glGenTextures(1, &st); glBindTexture(GL_TEXTURE_2D, st);
+        if (k == 1) glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, 512, 512, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, NULL);
+        else glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 512, 512);
+        /* without these the BGRA (glTexImage2D) staging texture is incomplete and copy-image may refuse it */
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        GLuint stf; glGenFramebuffers(1, &stf); glBindFramebuffer(GL_FRAMEBUFFER, stf);  /* staging is a render target in WebRender */
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, st, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, prev);
+        PSCHK("staging fbo"); size_t slice = 512 * 512 * cpp[k], size = slice * 3 + 4096;
+        GLuint pbo; glGenBuffers(1, &pbo); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        bs(GL_PIXEL_UNPACK_BUFFER, size, NULL, GL_MAP_WRITE_BIT | 0x0040 /* PERSISTENT */);
+        unsigned char *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, size, GL_MAP_WRITE_BIT | 0x0040 | GL_MAP_FLUSH_EXPLICIT_BIT); PSCHK("storage+map");
+        for (int round = 0; round < 3; round++) {
+            size_t off = 4096 + round * slice;
+            for (int y = 0; y < 512; y++) for (int x = 0; x < 512; x++) for (int c = 0; c < cpp[k]; c++)
+                map[off + ((size_t)y * 512 + x) * cpp[k] + c] = (unsigned char)(((x / 6 + y / 5 + c + round) & 1) ? 50 + round * 60 + c * 25 : 0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, off, slice); PSCHK("flush");
+            glBindTexture(GL_TEXTURE_2D, st);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, fmt[k], GL_UNSIGNED_BYTE, (void *)(intptr_t)off); PSCHK("pbo upload");
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            for (int q = 0; q < 24; q++) {
+                int sx = (q % 8) * 60 + 3, sy = (q / 8) * 70 + 5, dx = ((q + round * 24) % 32) * 64 + 2, dy = ((q + round * 24) / 32) * 32 + 1;
+                ci(st, GL_TEXTURE_2D, 0, sx, sy, 0, atlas[k], GL_TEXTURE_2D, 0, dx, dy, 0, 20, 24, 1); PSCHK("copy image");
+            }
+            GLsync f = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glClientWaitSync(f, GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull); glDeleteSync(f);
+        }
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo); glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glDeleteBuffers(1, &pbo); glDeleteFramebuffers(1, &stf); glDeleteTextures(1, &st);
+    }
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a, b, c; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); ivec2 r = q % 64; ivec2 t = ivec2(2 + 64 * (r.x / 2) + (r.x % 2) * 9, 1 + 32 * (r.y / 16) + (r.y % 16));\n"
+                            " if (q.y < 64) o = q.x < 64 ? vec4(texelFetch(a, t, 0).r, 0.2, 0.0, 1.0) : texelFetch(b, t, 0); else o = texelFetch(c, t, 0); }\n");
+    const char *nm[3] = {"a", "b", "c"};
+    for (int i = 0; i < 3; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, atlas[i]); glUniform1i(glGetUniformLocation(p, nm[i]), i); }
+    glActiveTexture(GL_TEXTURE0);
+    quad(p, 1.0f, 1.0f);
+    for (int i = 0; i < 3; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, 0); }
+    glActiveTexture(GL_TEXTURE0); glDeleteTextures(3, atlas);
+}
+
+/* Firefox's batched uploads, closer still: ONE persistently mapped pixel buffer reused every
+ * round at offset 0 once the previous round's fence has signalled (polled with timeout 0, as
+ * WebRender does), a 512x512 staging render target rotated from a pool of three, and regions
+ * copied into the atlas with glBlitFramebuffer (what WebRender uses without GL_EXT_copy_image). */
+static void s_wr_staging(void) {
+    typedef void (*buffer_storage_fn)(GLenum, GLsizeiptr, const void *, GLbitfield);
+    const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+    buffer_storage_fn bs = strstr(ext, "GL_EXT_buffer_storage") ? (buffer_storage_fn)eglGetProcAddress("glBufferStorageEXT") : NULL;
+    printf("wr_staging: buffer_storage %s, EXT_copy_image %s, OES_copy_image %s\n", bs ? "yes" : "no",
+           strstr(ext, "GL_EXT_copy_image") ? "yes" : "no", strstr(ext, "GL_OES_copy_image") ? "yes" : "no");
+    if (!bs) return;
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    GLenum ifmt[3] = {GL_R8, GL_RGBA8, GL_BGRA8_EXT}, fmt[3] = {GL_RED, GL_RGBA, GL_BGRA_EXT};
+    int cpp[3] = {1, 4, 4};
+    typedef void (*copy_image_fn)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
+    copy_image_fn ci = strstr(ext, "GL_EXT_copy_image") ? (copy_image_fn)eglGetProcAddress("glCopyImageSubDataEXT") : NULL;
+    GLuint atlas[3];
+    for (int k = 0; k < 3; k++) {
+        glGenTextures(1, &atlas[k]); glBindTexture(GL_TEXTURE_2D, atlas[k]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 2048, 2048);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        GLuint af; glGenFramebuffers(1, &af); glBindFramebuffer(GL_FRAMEBUFFER, af);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas[k], 0);
+        glViewport(0, 0, 2048, 2048); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+        GLuint st[3], sf[3];
+        glGenTextures(3, st); glGenFramebuffers(3, sf);
+        for (int i = 0; i < 3; i++) {
+            glBindTexture(GL_TEXTURE_2D, st[i]); glTexStorage2D(GL_TEXTURE_2D, 1, ifmt[k], 512, 512);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glBindFramebuffer(GL_FRAMEBUFFER, sf[i]); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, st[i], 0);
+        }
+        size_t slice = 512 * 512 * cpp[k];
+        GLuint pbo; glGenBuffers(1, &pbo); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        bs(GL_PIXEL_UNPACK_BUFFER, slice, NULL, GL_MAP_WRITE_BIT | 0x0040);
+        unsigned char *map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, slice, GL_MAP_WRITE_BIT | 0x0040 | GL_MAP_FLUSH_EXPLICIT_BIT);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        GLsync fence = 0;
+        int polls = 0;
+        for (int round = 0; round < 5; round++) {
+            if (fence) {
+                while (glClientWaitSync(fence, 0, 0) == GL_TIMEOUT_EXPIRED) { polls++; usleep(200); }
+                glDeleteSync(fence);
+            }
+            /* only the 24 source regions are written; everything else in the slice is zero, so
+             * data from the wrong round shows up as missing or wrong cells */
+            memset(map, 0, slice);
+            for (int q = 0; q < 24; q++) {
+                int sx = (q % 8) * 60 + 3, sy = (q / 8) * 70 + 5 + round * 2;
+                for (int y = 0; y < 24; y++) for (int x = 0; x < 20; x++) for (int c = 0; c < cpp[k]; c++)
+                    map[((size_t)(sy + y) * 512 + sx + x) * cpp[k] + c] = (unsigned char)(((x / 3 + y / 4 + c) & 1) ? 60 + round * 40 + c * 10 : 20);
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, slice);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glBindTexture(GL_TEXTURE_2D, st[round % 3]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, fmt[k], GL_UNSIGNED_BYTE, 0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, sf[round % 3]); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, af);
+            for (int q = 0; q < 24; q++) {
+                int sx = (q % 8) * 60 + 3, sy = (q / 8) * 70 + 5 + round * 2, dx = ((q + round * 24) % 32) * 64 + 2, dy = ((q + round * 24) / 32) * 32 + 1;
+                if (k == 2 && ci) ci(st[round % 3], GL_TEXTURE_2D, 0, sx, sy, 0, atlas[k], GL_TEXTURE_2D, 0, dx, dy, 0, 20, 24, 1);
+                else glBlitFramebuffer(sx, sy, sx + 20, sy + 24, dx, dy, dx + 20, dy + 24, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            }
+            { GLenum e = glGetError(); if (e) printf("wr_staging: k=%d round %d GL error %#x\n", k, round, e); }
+            fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            glFlush();
+        }
+        printf("wr_staging: k=%d fence polls %d\n", k, polls);
+        if (fence) { glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull); glDeleteSync(fence); }
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo); glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER); glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glDeleteBuffers(1, &pbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, prev);
+        glDeleteFramebuffers(3, sf); glDeleteTextures(3, st); glDeleteFramebuffers(1, &af);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prev); glViewport(0, 0, W, H);
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a, b, c; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); ivec2 r = q % 64; ivec2 t = ivec2(2 + 64 * (r.x / 2) + (r.x % 2) * 9, 1 + 32 * (r.y / 16) + (r.y % 16) + (q.y / 64) * 128);\n"
+                            " o = q.y >= 64 ? texelFetch(c, t - ivec2(0, 128), 0) : q.x < 64 ? vec4(texelFetch(a, t, 0).r, 0.2, 0.0, 1.0) : texelFetch(b, t, 0); }\n");
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, atlas[0]); glUniform1i(glGetUniformLocation(p, "a"), 0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, atlas[1]); glUniform1i(glGetUniformLocation(p, "b"), 1);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, atlas[2]); glUniform1i(glGetUniformLocation(p, "c"), 2);
+    glActiveTexture(GL_TEXTURE0);
+    quad(p, 1.0f, 1.0f);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0); glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    glDeleteTextures(3, atlas);
+}
+
+/* The glyph atlas written from both sides, as Firefox does with batched + PBO uploads: larger
+ * glyphs go GPU-side (glTexSubImage2D from a pixel buffer, a render job into the atlas), small
+ * ones are copied in from a staging texture (glCopyImageSubData, a CPU map of the atlas in
+ * Mesa's V3D driver), and the atlas is sampled to the screen in between. */
+static void s_mixed_atlas(void) {
+    typedef void (*copy_image_fn)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
+    copy_image_fn ci = (copy_image_fn)eglGetProcAddress("glCopyImageSubDataEXT");
+    GLint prev; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+    GLuint atlas, st;
+    glGenTextures(1, &atlas); glBindTexture(GL_TEXTURE_2D, atlas); glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, 2048, 2048);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    GLuint af; glGenFramebuffers(1, &af); glBindFramebuffer(GL_FRAMEBUFFER, af);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas, 0);
+    glViewport(0, 0, 2048, 2048); glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, prev);
+    glGenTextures(1, &st); glBindTexture(GL_TEXTURE_2D, st); glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, 512, 512);
+    static unsigned char stage[512 * 512], big[64 * 64];
+    GLuint pbo; glGenBuffers(1, &pbo);
+    GLuint sp = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a; in vec2 t; out vec4 o;\n"
+                             "void main() { o = vec4(texture(a, t).r, 0.0, 0.0, 1.0); }\n");
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    for (int i = 0; i < 48; i++) {
+        /* a 64x64 "large glyph" through a pixel buffer: cells along row 0..2 of 64x64 slots */
+        for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) big[y * 64 + x] = (unsigned char)(((x / 8 + y / 8 + i) & 1) ? 100 + (i % 5) * 30 : 30);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo); glBufferData(GL_PIXEL_UNPACK_BUFFER, sizeof big, big, GL_STREAM_DRAW);
+        glBindTexture(GL_TEXTURE_2D, atlas);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, (i % 16) * 128, (i / 16) * 64, 64, 64, GL_RED, GL_UNSIGNED_BYTE, 0);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        /* four small glyphs through the staging texture (client memory), copied next to it */
+        memset(stage, 0, sizeof stage);
+        for (int q = 0; q < 4; q++) for (int y = 0; y < 16; y++) for (int x = 0; x < 12; x++)
+            stage[(q * 20 + y) * 512 + x] = (unsigned char)(((x / 3 + y / 4 + q + i) & 1) ? 120 + q * 30 : 40);
+        glBindTexture(GL_TEXTURE_2D, st); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, GL_RED, GL_UNSIGNED_BYTE, stage);
+        for (int q = 0; q < 4; q++) ci(st, GL_TEXTURE_2D, 0, 0, q * 20, 0, atlas, GL_TEXTURE_2D, 0, (i % 16) * 128 + 64 + (q % 2) * 16, (i / 16) * 64 + (q / 2) * 20, 0, 12, 16, 1);
+        /* sample the atlas (a "text draw") into the scene's framebuffer every few rounds */
+        if (i % 3 == 2) {
+            glBindFramebuffer(GL_FRAMEBUFFER, prev); glViewport(0, 0, W, H);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, atlas); glUniform1i(glGetUniformLocation(sp, "a"), 0);
+            quad(sp, 0.1f, 0.1f);
+            glFlush();
+        }
+    }
+    glDeleteBuffers(1, &pbo); glDeleteTextures(1, &st); glDeleteFramebuffers(1, &af);
+    glBindFramebuffer(GL_FRAMEBUFFER, prev); glViewport(0, 0, W, H);
+    clear(0, 0, 0);
+    /* show the used part of the atlas, (0,0)-(2048,192), scaled to the whole scene: 2048/W x 192/H */
+    GLuint p = prog(VS_TEX, "#version 300 es\nprecision highp float; uniform highp sampler2D a; out vec4 o;\n"
+                            "void main() { ivec2 q = ivec2(gl_FragCoord.xy); ivec2 t = ivec2(q.x * 16, q.y * 3 / 2);\n"
+                            " o = vec4(texelFetch(a, t, 0).r, texelFetch(a, t + ivec2(2, 0), 0).r, texelFetch(a, t + ivec2(0, 1), 0).r, 1.0); }\n");
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, atlas); glUniform1i(glGetUniformLocation(p, "a"), 0);
+    quad(p, 1.0f, 1.0f);
+    glBindTexture(GL_TEXTURE_2D, 0); glDeleteTextures(1, &atlas);
+}
+
 struct scene { const char *name; void (*fn)(void); };
+/* ---- shader control flow: loops reading uniform arrays / uniform blocks at computed indices and
+ * sampling textures inside loops (Skia-style gradients in Chromium). On V3D each loop iteration
+ * rewinds the uniform stream with a branch uniform, and non-constant uniform indices become TMU
+ * general loads with a config uniform. */
+static void ubo_stops(GLuint p, int n) {
+    float b[16 * 4 * 2 + 4] = {0};
+    for (int i = 0; i < 16; i++) {
+        b[i * 4] = i < n ? (float)i / (n - 1) : 2.0f;
+        b[64 + i * 4] = (i * 53 % 17) / 16.0f; b[64 + i * 4 + 1] = (i * 29 % 13) / 12.0f; b[64 + i * 4 + 2] = (i * 7 % 5) / 4.0f; b[64 + i * 4 + 3] = 1;
+    }
+    memcpy(&b[128], &n, 4);
+    GLuint ub; glGenBuffers(1, &ub); glBindBuffer(GL_UNIFORM_BUFFER, ub);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof b, b, GL_STATIC_DRAW);
+    glUniformBlockBinding(p, glGetUniformBlockIndex(p, "Stops"), 1);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 1, ub);
+}
+#define STOPS_BLOCK "layout(std140) uniform Stops { vec4 sp[16]; vec4 sc[16]; int sn; };\n"
+
+static void s_sh_ubo_gradient(void) {
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX,
+        "#version 300 es\nprecision highp float; in vec2 t; out vec4 o;\n" STOPS_BLOCK
+        "void main() { float x = t.x; vec4 c = sc[0];\n"
+        "  for (int i = 1; i < sn; i++) { if (x <= sp[i].x) { c = mix(sc[i - 1], sc[i], (x - sp[i - 1].x) / (sp[i].x - sp[i - 1].x)); break; } c = sc[i]; }\n"
+        "  o = vec4(c.rgb * (0.4 + 0.6 * t.y), 1.0); }\n");
+    ubo_stops(p, 7);
+    quad(p, 1, 1);
+}
+
+static void s_sh_uarray_loop(void) {
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX,
+        "#version 300 es\nprecision highp float; in vec2 t; out vec4 o; uniform vec4 k[24]; uniform int n; uniform float g;\n"
+        "void main() { int j = int(t.x * 23.0) % n; vec4 a = vec4(0.0);\n"
+        "  for (int i = 0; i <= j; i++) { if (i == 3 && t.y > 0.5) continue; a += k[i] * g; if (a.r > 2.5) break; }\n"
+        "  int m = int(t.y * 7.0); for (int i = 0; i < m; i++) a.b += k[(i + j) % n].g * 0.1;\n"
+        "  o = vec4(fract(a.rgb), 1.0); }\n");
+    float k[24 * 4]; for (int i = 0; i < 24 * 4; i++) k[i] = ((i * 37) % 23) / 40.0f;
+    glUniform4fv(glGetUniformLocation(p, "k"), 24, k);
+    glUniform1i(glGetUniformLocation(p, "n"), 19);
+    glUniform1f(glGetUniformLocation(p, "g"), 0.7f);
+    quad(p, 1, 1);
+}
+
+static GLuint loop_tex(void) {
+    unsigned char img[16 * 16 * 4];
+    for (int i = 0; i < 256; i++) { img[i * 4] = i * 7; img[i * 4 + 1] = (i / 16) * 16; img[i * 4 + 2] = (i % 16) * 16; img[i * 4 + 3] = 255; }
+    GLuint tx; glGenTextures(1, &tx); glBindTexture(GL_TEXTURE_2D, tx);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    return tx;
+}
+
+static void s_sh_tex_loop(void) {
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX,
+        "#version 300 es\nprecision highp float; in vec2 t; out vec4 o; uniform sampler2D s; uniform int n; uniform vec2 d[8];\n" STOPS_BLOCK
+        "void main() { vec4 a = vec4(0.0); int m = 1 + int(t.y * float(n));\n"
+        "  for (int i = 0; i < m; i++) { vec2 q = t + d[i % 8] * sp[i % sn].x; if (q.x > 1.0) break; a += texture(s, q) * sc[i % sn]; }\n"
+        "  o = vec4(a.rgb / float(m), 1.0); }\n");
+    GLuint tx = loop_tex();
+    glUniform1i(glGetUniformLocation(p, "s"), 0);
+    glUniform1i(glGetUniformLocation(p, "n"), 6);
+    float d[16]; for (int i = 0; i < 8; i++) { d[i * 2] = 0.03f * i; d[i * 2 + 1] = 0.05f * (i % 3); }
+    glUniform2fv(glGetUniformLocation(p, "d"), 8, d);
+    ubo_stops(p, 5);
+    quad(p, 1, 1);
+    glDeleteTextures(1, &tx);
+}
+
+/* the same in a vertex shader: 64 small quads placed by loops over a uniform array and a block */
+static void vs_loop_grid(GLuint p) {
+    float pos[64 * 6 * 2], id[64 * 6];
+    static const float cx[6] = {0, 1, 0, 0, 1, 1}, cy[6] = {0, 0, 1, 1, 0, 1};
+    for (int q = 0; q < 64; q++) for (int v = 0; v < 6; v++) { pos[(q * 6 + v) * 2] = cx[v]; pos[(q * 6 + v) * 2 + 1] = cy[v]; id[q * 6 + v] = q; }
+    attr(p, "c", 2, pos); attr(p, "id", 1, id);
+    glDrawArrays(GL_TRIANGLES, 0, 64 * 6);
+}
+
+static void s_sh_vs_loops(void) {
+    clear(0.1f, 0.1f, 0.1f);
+    GLuint p = prog(
+        "#version 300 es\nprecision highp float; in vec2 c; in float id; out vec4 v; uniform vec4 k[16]; uniform int n;\n" STOPS_BLOCK
+        "void main() { int q = int(id); vec2 o = vec2(float(q % 8), float(q / 8)) * 0.25 - 1.0; vec4 col = vec4(0.0);\n"
+        "  for (int i = 0; i < n; i++) { if (i > q % 11) break; col += k[(q + i) % 16] * 0.3; }\n"
+        "  for (int i = 1; i < sn; i++) { if (float(q) / 64.0 <= sp[i].x) { col.b += sc[i].b * 0.5; break; } }\n"
+        "  gl_Position = vec4(o + c * 0.22, 0.0, 1.0); v = vec4(fract(col.rgb), 1.0); }\n",
+        "#version 300 es\nprecision mediump float; in vec4 v; out vec4 o; void main() { o = v; }\n");
+    float k[64]; for (int i = 0; i < 64; i++) k[i] = ((i * 41) % 29) / 28.0f;
+    glUniform4fv(glGetUniformLocation(p, "k"), 16, k);
+    glUniform1i(glGetUniformLocation(p, "n"), 9);
+    ubo_stops(p, 6);
+    vs_loop_grid(p);
+}
+
+static void s_sh_vs_tex_loop(void) {
+    clear(0.1f, 0.1f, 0.1f);
+    GLuint p = prog(
+        "#version 300 es\nprecision highp float; in vec2 c; in float id; out vec4 v; uniform sampler2D s; uniform int n;\n" STOPS_BLOCK
+        "void main() { int q = int(id); vec2 o = vec2(float(q % 8), float(q / 8)) * 0.25 - 1.0; vec4 a = vec4(0.0);\n"
+        "  for (int i = 0; i <= q % n; i++) a += textureLod(s, vec2(float(q % 16) + 0.5, float(i) + 0.5) / 16.0, 0.0) * sc[(q + i) % sn];\n"
+        "  gl_Position = vec4(o + c * 0.22, 0.0, 1.0); v = vec4(fract(a.rgb), 1.0); }\n",
+        "#version 300 es\nprecision mediump float; in vec4 v; out vec4 o; void main() { o = v; }\n");
+    GLuint tx = loop_tex();
+    glUniform1i(glGetUniformLocation(p, "s"), 0);
+    glUniform1i(glGetUniformLocation(p, "n"), 7);
+    ubo_stops(p, 9);
+    vs_loop_grid(p);
+    glDeleteTextures(1, &tx);
+}
+
+/* ---- register spills and scratch memory: a chain of values that all stay live until the end
+ * (more than the register file holds, so the compiler spills them through the TMU), and a local
+ * array indexed at run time (lowered to scratch loads and stores). Large ANGLE/Skia shaders do both. */
+#define SPILL_N 56
+/* loop: 0 = straight line; 1 = the values are also used inside a loop whose trip count differs
+ * per pixel/vertex (non-uniform control flow, so the spills there are conditional) */
+static char *spill_src(int vertex, int loop) {
+    static char b[32768]; int o = 0;
+    o += sprintf(b + o, vertex
+        ? "#version 300 es\nprecision highp float; in vec2 c; in float id; out vec4 v; uniform vec4 k[8]; uniform int n;\nvoid main() { int q = int(id);\n"
+          "  vec2 t = vec2(float(q % 8), float(q / 8)) / 8.0 + c * 0.1;\n"
+        : "#version 300 es\nprecision highp float; in vec2 t; out vec4 o; uniform vec4 k[8]; uniform int n;\nvoid main() {\n");
+    o += sprintf(b + o, "  vec4 a0 = sin(t.xyxy * k[0] + 0.3);\n");
+    for (int i = 1; i < SPILL_N; i++) o += sprintf(b + o, "  vec4 a%d = sin(a%d * k[%d] + t.yxyx * %.2f);\n", i, i - 1, i % 8, 0.37 * i);
+    o += sprintf(b + o, "  vec4 r = vec4(0.0);\n");
+    if (loop) {
+        o += sprintf(b + o, "  int m = n + int(t.x * 4.0 + t.y * 3.0);\n  for (int it = 0; it < m; it++) {\n    if (r.x > 3.0 + t.y) break;\n");
+        for (int i = 0; i < SPILL_N / 2; i++) o += sprintf(b + o, "    r += a%d * a%d * 0.2;\n", i, SPILL_N - 1 - i);
+        o += sprintf(b + o, "    if (t.x > 0.5) { r = r.yzwx; continue; }\n    r.w += a%d.x;\n  }\n", SPILL_N / 3);
+    }
+    for (int i = 0; i < SPILL_N / 2; i++) o += sprintf(b + o, "  r += a%d * a%d;\n", i, SPILL_N - 1 - i);
+    o += sprintf(b + o, vertex
+        ? "  gl_Position = vec4(vec2(float(q % 8), float(q / 8)) * 0.25 - 1.0 + c * 0.22, 0.0, 1.0); v = vec4(0.5 + 0.5 * sin(r.rgb * 3.0), 1.0); }\n"
+        : "  o = vec4(0.5 + 0.5 * sin(r.rgb * 3.0), 1.0); }\n");
+    return b;
+}
+static const char *FS_V = "#version 300 es\nprecision mediump float; in vec4 v; out vec4 o; void main() { o = v; }\n";
+
+static void spill_uniforms(GLuint p) {
+    float k[32]; for (int i = 0; i < 32; i++) k[i] = 0.5f + ((i * 13) % 11) / 7.0f;
+    glUniform4fv(glGetUniformLocation(p, "k"), 8, k);
+    glUniform1i(glGetUniformLocation(p, "n"), 3);
+}
+
+static void s_sh_spill_fs(void) {
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, spill_src(0, 0));
+    spill_uniforms(p);
+    quad(p, 1, 1);
+}
+
+static void s_sh_spill_vs(void) {
+    clear(0.1f, 0.1f, 0.1f);
+    GLuint p = prog(spill_src(1, 0), FS_V);
+    spill_uniforms(p);
+    vs_loop_grid(p);
+}
+
+static void s_sh_spill_loop_fs(void) {
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX, spill_src(0, 1));
+    spill_uniforms(p);
+    quad(p, 1, 1);
+}
+
+static void s_sh_spill_loop_vs(void) {
+    clear(0.1f, 0.1f, 0.1f);
+    GLuint p = prog(spill_src(1, 1), FS_V);
+    spill_uniforms(p);
+    vs_loop_grid(p);
+}
+
+#define SCRATCH_BODY \
+    "  vec4 arr[96]; for (int i = 0; i < 96; i++) arr[i] = k[i % 8] * (float(i) * 0.01 + t.x);\n" \
+    "  int j = int(t.y * 95.0); for (int i = 0; i < n + int(t.x * 5.0); i++) { arr[(j + i) % 96] += arr[(j * 7 + i) % 96] * 0.25; }\n" \
+    "  vec4 r = arr[j] + arr[(j * 5 + 3) % 96];\n"
+static void s_sh_scratch_fs(void) {
+    clear(0, 0, 0);
+    GLuint p = prog(VS_TEX,
+        "#version 300 es\nprecision highp float; in vec2 t; out vec4 o; uniform vec4 k[8]; uniform int n;\nvoid main() {\n"
+        SCRATCH_BODY "  o = vec4(0.5 + 0.5 * sin(r.rgb * 3.0), 1.0); }\n");
+    spill_uniforms(p);
+    glUniform1i(glGetUniformLocation(p, "n"), 5);
+    quad(p, 1, 1);
+}
+
+static void s_sh_scratch_vs(void) {
+    clear(0.1f, 0.1f, 0.1f);
+    GLuint p = prog(
+        "#version 300 es\nprecision highp float; in vec2 c; in float id; out vec4 v; uniform vec4 k[8]; uniform int n;\nvoid main() { int q = int(id);\n"
+        "  vec2 t = vec2(float(q % 8), float(q / 8)) / 8.0;\n" SCRATCH_BODY
+        "  gl_Position = vec4(vec2(float(q % 8), float(q / 8)) * 0.25 - 1.0 + c * 0.22, 0.0, 1.0); v = vec4(0.5 + 0.5 * sin(r.rgb * 3.0), 1.0); }\n", FS_V);
+    spill_uniforms(p);
+    glUniform1i(glGetUniformLocation(p, "n"), 5);
+    vs_loop_grid(p);
+}
+
 static const struct scene scenes[] = {
     {"clear", s_clear}, {"tri_color", s_tri_color}, {"flat", s_flat}, {"depth", s_depth}, {"blend", s_blend},
     {"tex_nearest", s_tex_nearest}, {"tex_linear_mip", s_tex_linear_mip}, {"cube", s_cube}, {"stencil", s_stencil},
@@ -951,6 +1426,11 @@ static const struct scene scenes[] = {
     {"big_tex_layout", s_big_tex_layout}, {"render_big_targets", s_render_big_targets},
     {"row_uploads", s_row_uploads}, {"many_instances", s_many_instances}, {"partial_update", s_partial_update},
     {"small_cache", s_small_cache}, {"cache_grow", s_cache_grow},
+    {"batched_uploads", s_batched_uploads}, {"persistent_staging", s_persistent_staging}, {"wr_staging", s_wr_staging}, {"mixed_atlas", s_mixed_atlas},
+    {"sh_ubo_gradient", s_sh_ubo_gradient}, {"sh_uarray_loop", s_sh_uarray_loop}, {"sh_tex_loop", s_sh_tex_loop},
+    {"sh_vs_loops", s_sh_vs_loops}, {"sh_vs_tex_loop", s_sh_vs_tex_loop},
+    {"sh_spill_fs", s_sh_spill_fs}, {"sh_spill_vs", s_sh_spill_vs}, {"sh_scratch_fs", s_sh_scratch_fs}, {"sh_scratch_vs", s_sh_scratch_vs},
+    {"sh_spill_loop_fs", s_sh_spill_loop_fs}, {"sh_spill_loop_vs", s_sh_spill_loop_vs},
 };
 #define NSCENES (sizeof scenes / sizeof scenes[0])
 
@@ -976,7 +1456,7 @@ static int run(const char *dir, const char *only) {
     glViewport(0, 0, W, H);
     static unsigned char px[W * H * 4];
     for (unsigned i = 0; i < NSCENES; i++) {
-        if (only && strcmp(only, scenes[i].name)) continue;
+        if (only && strncmp(only, scenes[i].name, strlen(only))) continue; /* a prefix picks several */
         scenes[i].fn();
         glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
         char path[512]; snprintf(path, sizeof path, "%s/%s.rgba", dir, scenes[i].name);
