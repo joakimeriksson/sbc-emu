@@ -304,6 +304,7 @@ impl Soc {
                 return Ok(());
             }
             if Self::in_region(addr, 4, MALI_BASE, mali400::SIZE) {
+                self.gpu.now = self.now;
                 let mut mem = GpuRam { ram: &mut self.ram, written: Vec::new() };
                 self.gpu.write(addr - MALI_BASE, value, &mut mem);
                 for (address, len) in mem.written {
@@ -644,6 +645,10 @@ impl Machine {
         }
         let emac = self.soc.emac.irq();
         self.soc.gic.set_level(EMAC_IRQ, emac);
+        self.soc.gpu.update(now);
+        if let Some(due) = self.soc.gpu.next_deadline() {
+            next = next.min(due.max(now + 1));
+        }
         for (line, irq) in MALI_IRQS {
             let level = self.soc.gpu.irq(line);
             self.soc.gic.set_level(irq, level);

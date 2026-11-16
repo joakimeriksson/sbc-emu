@@ -52,6 +52,16 @@ pub enum Irq {
     Pmu,
 }
 
+/// The GPU clock (Hz) and the machine's tick rate, for job durations.
+const GPU_HZ: u64 = 432_000_000;
+const TICK_HZ: u64 = 24_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Gp,
+    Pp(usize),
+}
+
 /// Physical memory the GPU reads and writes (through its MMUs).
 pub trait Memory {
     fn read_u32(&self, pa: u32) -> Option<u32>;
@@ -75,6 +85,9 @@ mod gp_reg {
 
     pub const CMD_START_VS: u32 = 1 << 0;
     pub const CMD_START_PLBU: u32 = 1 << 1;
+    pub const CMD_UPDATE_PLBU_ALLOC: u32 = 1 << 4;
+    pub const IRQ_PLBU_OUT_OF_MEM: u32 = 1 << 2;
+    pub const STATUS_PLBU_ACTIVE: u32 = 1 << 3;
     pub const CMD_RESET: u32 = 1 << 5;
     pub const CMD_STOP_BUS: u32 = 1 << 9;
     pub const CMD_SOFT_RESET: u32 = 1 << 10;
@@ -84,6 +97,7 @@ mod gp_reg {
     pub const IRQ_RESET_COMPLETED: u32 = 1 << 19;
 
     pub const STATUS_BUS_STOPPED: u32 = 1 << 2;
+    pub const STATUS_VS_ACTIVE: u32 = 1 << 1;
 }
 
 mod pp_reg {
@@ -107,6 +121,7 @@ mod pp_reg {
     pub const IRQ_RESET_COMPLETED: u32 = 1 << 12;
 
     pub const STATUS_BUS_STOPPED: u32 = 1 << 4;
+    pub const STATUS_RENDERING_ACTIVE: u32 = 1 << 0;
 }
 
 /// The geometry processor.
@@ -119,6 +134,12 @@ pub struct Gp {
     status: u32,
     /// Jobs run (vertex and PLBU command lists).
     pub jobs: u64,
+    /// A PLBU list stopped by OUT_OF_MEM, waiting for more heap.
+    plbu: Option<plbu::Plbu>,
+    /// The last vertex shader's (gl_Position, gl_PointSize) arrays.
+    point_sizes: Vec<(u32, u32)>,
+    /// The current job ran a vertex shader (its end is reported with the PLBU's).
+    vs_ran: bool,
 }
 
 /// A pixel processor.
@@ -167,6 +188,10 @@ pub struct Mali400 {
     l2: L2,
     /// diagnostics already printed
     logged: HashSet<String>,
+    /// Current time (24 MHz ticks), set by the machine before register accesses.
+    pub now: u64,
+    /// Jobs whose completion interrupt is still to come: (due tick, unit, raw status bits).
+    pending: Vec<(u64, Unit, u32)>,
     /// print every job (`SBC_MALI_LOG=1`)
     pub trace: bool,
 }
@@ -209,6 +234,46 @@ impl Mali400 {
         }
     }
 
+    /// Deliver the completions due by `now`.
+    pub fn update(&mut self, now: u64) {
+        self.now = now;
+        let mut k = 0;
+        while k < self.pending.len() {
+            let (due, unit, bits) = self.pending[k];
+            if due <= now {
+                self.pending.swap_remove(k);
+                match unit {
+                    Unit::Gp => {
+                        self.gp.rawstat |= bits;
+                        self.gp.status &= !(gp_reg::STATUS_VS_ACTIVE | gp_reg::STATUS_PLBU_ACTIVE);
+                    }
+                    Unit::Pp(n) => {
+                        self.pp[n].rawstat |= bits;
+                        self.pp[n].status &= !pp_reg::STATUS_RENDERING_ACTIVE;
+                    }
+                }
+            } else {
+                k += 1;
+            }
+        }
+    }
+
+    /// When the next job completes.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.pending.iter().map(|p| p.0).min()
+    }
+
+    /// Finish a job after the time its work takes on the real GPU.
+    fn complete(&mut self, unit: Unit, bits: u32) {
+        let cycles = pp::take_cycles();
+        let due = self.now + (cycles * TICK_HZ / GPU_HZ).max(1);
+        match unit {
+            Unit::Gp => self.gp.status |= gp_reg::STATUS_VS_ACTIVE | gp_reg::STATUS_PLBU_ACTIVE,
+            Unit::Pp(n) => self.pp[n].status |= pp_reg::STATUS_RENDERING_ACTIVE,
+        }
+        self.pending.push((due, unit, bits));
+    }
+
     /// Level of an interrupt line.
     pub fn irq(&self, irq: Irq) -> bool {
         match irq {
@@ -242,13 +307,21 @@ impl Mali400 {
         use gp_reg::*;
         match offset {
             CMD => {
+                if value & (CMD_SOFT_RESET | CMD_RESET) != 0 {
+                    self.pending.retain(|p| p.1 != Unit::Gp);
+                }
                 if value & CMD_SOFT_RESET != 0 {
                     self.gp.status = 0;
+                    self.gp.plbu = None;
                     self.gp.rawstat |= IRQ_RESET_COMPLETED;
                 }
                 if value & CMD_RESET != 0 {
                     self.gp.status = 0;
+                    self.gp.plbu = None;
                     self.gp.rawstat = 0;
+                }
+                if value & CMD_UPDATE_PLBU_ALLOC != 0 && self.gp.plbu.is_some() {
+                    self.plbu_resume(mem);
                 }
                 if value & CMD_STOP_BUS != 0 {
                     self.gp.status |= STATUS_BUS_STOPPED;
@@ -272,22 +345,67 @@ impl Mali400 {
         use gp_reg::*;
         self.gp.jobs += 1;
         let r = self.gp.regs;
-        let logged = &mut self.logged;
-        let mut log = |m: String| log_to(logged, m);
-        let mut vm = Vm::new(mem, &mut self.mmu[0]);
-        if vs {
-            gp::run_vscl(&mut vm, r[(VSCL_START / 4) as usize], r[(VSCL_END / 4) as usize], &mut log);
-            self.gp.rawstat |= IRQ_VS_END;
+        {
+            let logged = &mut self.logged;
+            let mut log = |m: String| log_to(logged, m);
+            let mut vm = Vm::new(mem, &mut self.mmu[0]);
+            if vs {
+                self.gp.point_sizes = gp::run_vscl(&mut vm, r[(VSCL_START / 4) as usize], r[(VSCL_END / 4) as usize], &mut log);
+            }
+            if vm.faults != 0 {
+                log(format!("[mali] GP: {} accesses hit unmapped GPU pages", vm.faults));
+            }
+        }
+        if !plbu {
+            self.complete(Unit::Gp, IRQ_VS_END);
         }
         if plbu {
-            let prims = plbu::run(&mut vm, r[(PLBUCL_START / 4) as usize], r[(PLBUCL_END / 4) as usize], (r[4], r[5]), &mut log);
-            if self.trace {
-                eprintln!("\r[mali] GP job {}: {} primitives\r", self.gp.jobs, prims);
-            }
-            self.gp.rawstat |= IRQ_PLBU_END;
+            self.gp.vs_ran = vs;
+            let sizes = std::mem::take(&mut self.gp.point_sizes);
+            self.gp.plbu = Some(plbu::Plbu::new(r[(PLBUCL_START / 4) as usize], r[(PLBUCL_END / 4) as usize], (r[4], r[5]), sizes));
+            self.plbu_run(mem, false);
         }
-        if vm.faults != 0 {
-            log(format!("[mali] GP: {} accesses hit unmapped GPU pages", vm.faults));
+    }
+
+    /// The driver grew the tile heap after OUT_OF_MEM: continue the PLBU list there.
+    fn plbu_resume(&mut self, mem: &mut dyn Memory) {
+        self.plbu_run(mem, true);
+    }
+
+    fn plbu_run(&mut self, mem: &mut dyn Memory, grow: bool) {
+        use gp_reg::*;
+        let Some(mut p) = self.gp.plbu.take() else { return };
+        let heap = (self.gp.regs[4], self.gp.regs[5]);
+        let done = {
+            let logged = &mut self.logged;
+            let mut log = |m: String| log_to(logged, m);
+            let mut vm = Vm::new(mem, &mut self.mmu[0]);
+            if grow {
+                p.grow(&mut vm, heap);
+            }
+            let outcome = p.run(&mut vm, &mut log);
+            if vm.faults != 0 {
+                log(format!("[mali] PLBU: {} accesses hit unmapped GPU pages", vm.faults));
+            }
+            matches!(outcome, plbu::Outcome::Done)
+        };
+        if done {
+            if self.trace {
+                eprintln!("\r[mali] GP job {}: {} primitives\r", self.gp.jobs, p.prims);
+            }
+            let vs = if self.gp.vs_ran { IRQ_VS_END } else { 0 };
+            self.complete(Unit::Gp, vs | IRQ_PLBU_END);
+        } else {
+            if self.trace {
+                eprintln!("\r[mali] GP job {}: tile heap full at {} primitives\r", self.gp.jobs, p.prims);
+            }
+            self.gp.status |= STATUS_PLBU_ACTIVE;
+            if self.gp.vs_ran {
+                self.gp.rawstat |= IRQ_VS_END;
+                self.gp.vs_ran = false;
+            }
+            self.gp.rawstat |= IRQ_PLBU_OUT_OF_MEM;
+            self.gp.plbu = Some(p);
         }
     }
 
@@ -318,6 +436,10 @@ impl Mali400 {
             0x000..=0x05c if offset / 4 < FRAME_REGS => pp.frame[(offset / 4) as usize] = value,
             0x100..=0x3ff if offset & 0xff < WB_REGS * 4 => pp.wb[(offset / 0x100 - 1) as usize][(offset as usize & 0xff) / 4] = value,
             CTRL => {
+                if value & (CTRL_SOFT_RESET | CTRL_FORCE_RESET) != 0 {
+                    self.pending.retain(|p| p.1 != Unit::Pp(n));
+                }
+                let pp = &mut self.pp[n];
                 if value & CTRL_SOFT_RESET != 0 {
                     pp.status = 0;
                     pp.rawstat = IRQ_RESET_COMPLETED;
@@ -353,16 +475,12 @@ impl Mali400 {
         let mut programs = std::collections::HashMap::new();
         let tiles = pp::render(&mut vm, &frame, &wb, &mut programs, &mut log);
         if self.trace {
-            let pa = vm.mmu.translate(&*vm.mem, wb[0][1], false);
-            let px = |vm: &mut Vm, x: u32, y: u32| vm.read_u32(wb[0][1] + y * wb[0][5] * 8 + x * 4);
-            let (a, b) = (px(&mut vm, 0, 0), px(&mut vm, 640, 360));
-            eprintln!("\r[mali] PP{n} wb0 va {:#x} -> pa {:x?} pixels {a:08x} {b:08x}\r", wb[0][1], pa);
             eprintln!("\r[mali] PP{n} frame {}: {tiles} tiles {}x{} clear {:08x} wb0 {:08x?}\r", self.pp[n].jobs, frame[10] + 1, frame[11] + 1, frame[6], &wb[0][..7]);
         }
         if vm.faults != 0 {
             log(format!("[mali] PP{n}: {} accesses hit unmapped GPU pages", vm.faults));
         }
-        self.pp[n].rawstat |= pp_reg::IRQ_END_OF_FRAME;
+        self.complete(Unit::Pp(n), pp_reg::IRQ_END_OF_FRAME);
     }
 
     fn l2_read(&self, offset: u64) -> u32 {

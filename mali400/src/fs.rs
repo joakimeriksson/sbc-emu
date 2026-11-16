@@ -295,7 +295,8 @@ impl Instr {
                     i.branch = Some(if lo as u32 == 0x007f_0003 && (lo >> 32) == 0 && hi == 0 {
                         Branch::Discard
                     } else {
-                        let target = (lo >> 41) as u32 & 0x7ff_ffff;
+                        // 27 bits at 41..67: 23 from the first 64 bits, 4 from the rest
+                        let target = ((lo >> 41) as u32 | (hi as u32 & 0xf) << 23) & 0x7ff_ffff;
                         Branch::Jump {
                             b: (lo >> 4 & 0x3f) as u8,
                             a: (lo >> 10 & 0x3f) as u8,
@@ -539,6 +540,8 @@ impl Quad {
                     let r = match a.op {
                         0x10 => [x[0] + x[1] + x[2]; 4],
                         0x11 => [x[0] + x[1] + x[2] + x[3]; 4],
+                        // ppir_lower_ddxy gives both ops two operands, (v, -v) for dFdx
+                        // and (-v, v) for dFdy: the un-negated copy is arg0 resp. arg1
                         0x14 => [0, 1, 2, 3].map(|c| deriv(&xs, l, c, true)),
                         0x15 => [0, 1, 2, 3].map(|c| deriv(&ys, l, c, false)),
                         0x17 => {
@@ -680,7 +683,7 @@ impl Quad {
         match *v {
             Varying::Imm { perspective, source_type, alignment, offset, index, dest, mask } => {
                 let value = match source_type {
-                    2 => inputs.frag_coord(l),
+                    2 if perspective == 3 => inputs.frag_coord(l),
                     3 if perspective != 0 => [b2f(inputs.front_facing()); 4],
                     3 => {
                         let pc = inputs.point_coord(l);

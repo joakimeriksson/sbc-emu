@@ -366,8 +366,10 @@ pub fn store_varying(vm: &mut Vm, s: &Stream, n: u32, v: &[f32; 4]) {
     }
 }
 
-/// Execute a vertex shader command list.
-pub fn run_vscl(vm: &mut Vm, start: u32, end: u32, log: &mut dyn FnMut(String)) {
+/// Execute a vertex shader command list. Returns, per draw, the gl_Position array and the
+/// gl_PointSize array the shader wrote (the PLBU reads point sizes from there).
+pub fn run_vscl(vm: &mut Vm, start: u32, end: u32, log: &mut dyn FnMut(String)) -> Vec<(u32, u32)> {
+    let mut point_sizes = Vec::new();
     let mut shader: Option<VertexShader> = None;
     let (mut shader_addr, mut shader_size) = (0u32, 0u32);
     let (mut uniforms_addr, mut uniforms_size) = (0u32, 0u32);
@@ -384,7 +386,7 @@ pub fn run_vscl(vm: &mut Vm, start: u32, end: u32, log: &mut dyn FnMut(String)) 
                 if v1 == 0 && v2 == 0 {
                     continue;
                 }
-                let num = (v1 >> 24) | (v2 & 0xff) << 8;
+                let num = (v1 >> 24) | (v2 & 0xffff) << 8;
                 let sh = match &mut shader {
                     Some(s) => s,
                     None => {
@@ -406,6 +408,12 @@ pub fn run_vscl(vm: &mut Vm, start: u32, end: u32, log: &mut dyn FnMut(String)) 
                 };
                 let attrs: Vec<Stream> = (0..nattr).map(|k| Stream { address: vm.read_u32(attr_addr + k * 8), desc: vm.read_u32(attr_addr + k * 8 + 4) }).collect();
                 let varys: Vec<Stream> = (0..nvary).map(|k| Stream { address: vm.read_u32(vary_addr + k * 8), desc: vm.read_u32(vary_addr + k * 8 + 4) }).collect();
+                let pos = varys.iter().find(|s| s.kind() == 8 && s.stride() == 16).map(|s| s.address);
+                let size = varys.iter().find(|s| s.kind() == 8 && s.stride() == 4).map(|s| s.address);
+                if let (Some(p), Some(s)) = (pos, size) {
+                    point_sizes.push((p, s));
+                }
+                crate::pp::spend_gp(num as u64 * (sh.code.len() as u64 + 4));
                 for n in 0..num {
                     let mut a = [[0.0, 0.0, 0.0, 1.0]; 16];
                     for (k, s) in attrs.iter().enumerate().take(16) {
@@ -452,4 +460,5 @@ pub fn run_vscl(vm: &mut Vm, start: u32, end: u32, log: &mut dyn FnMut(String)) 
             _ => log(format!("[mali] VS: unknown command {v1:08x} {v2:08x}")),
         }
     }
+    point_sizes
 }
