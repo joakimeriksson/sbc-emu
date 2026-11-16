@@ -149,7 +149,7 @@ impl Soc {
             kbd: Keyboard::default(),
             tablet: Tablet::default(),
             emac: Emac::default(),
-            gpu: mali400::Mali400::default(),
+            gpu: mali400::Mali400::new(std::env::var("SBC_MALI_LOG").is_ok_and(|v| v != "0")),
             net: None,
             ccu: Self::ccu_reset(),
             now: 0,

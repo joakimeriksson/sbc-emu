@@ -15,9 +15,19 @@
 //! Each unit has its own interrupt line. Jobs start when the driver writes a GP or PP
 //! command register and finish within that write.
 
+#![allow(clippy::needless_range_loop)]
+
+pub mod fs;
+pub mod gp;
+pub mod half;
 pub mod mmu;
+pub mod plbu;
+pub mod pp;
+pub mod vm;
 
 use mmu::Mmu;
+use std::collections::HashSet;
+use vm::Vm;
 
 /// Number of pixel processors (the H3 has an MP2).
 pub const NUM_PP: usize = 2;
@@ -155,9 +165,24 @@ pub struct Mali400 {
     pub mmu: [Mmu; 1 + NUM_PP],
     pmu: Pmu,
     l2: L2,
+    /// diagnostics already printed
+    logged: HashSet<String>,
+    /// print every job (`SBC_MALI_LOG=1`)
+    pub trace: bool,
+}
+
+fn log_to(logged: &mut HashSet<String>, msg: String) {
+    if logged.insert(msg.clone()) {
+        eprintln!("\r{msg}\r");
+    }
 }
 
 impl Mali400 {
+    /// `trace`: print a line per job.
+    pub fn new(trace: bool) -> Self {
+        Self { trace, ..Default::default() }
+    }
+
     /// Read a register at `offset` in the window (word accesses).
     pub fn read(&mut self, offset: u64) -> u32 {
         let offset = offset & !3;
@@ -243,16 +268,27 @@ impl Mali400 {
     }
 
     /// Run the vertex and/or PLBU command lists of a GP job.
-    fn gp_run(&mut self, vs: bool, plbu: bool, _mem: &mut dyn Memory) {
+    fn gp_run(&mut self, vs: bool, plbu: bool, mem: &mut dyn Memory) {
         use gp_reg::*;
         self.gp.jobs += 1;
+        let r = self.gp.regs;
+        let logged = &mut self.logged;
+        let mut log = |m: String| log_to(logged, m);
+        let mut vm = Vm::new(mem, &mut self.mmu[0]);
         if vs {
+            gp::run_vscl(&mut vm, r[(VSCL_START / 4) as usize], r[(VSCL_END / 4) as usize], &mut log);
             self.gp.rawstat |= IRQ_VS_END;
         }
         if plbu {
+            let prims = plbu::run(&mut vm, r[(PLBUCL_START / 4) as usize], r[(PLBUCL_END / 4) as usize], (r[4], r[5]), &mut log);
+            if self.trace {
+                eprintln!("\r[mali] GP job {}: {} primitives\r", self.gp.jobs, prims);
+            }
             self.gp.rawstat |= IRQ_PLBU_END;
         }
-        let _ = (VSCL_END, PLBUCL_END);
+        if vm.faults != 0 {
+            log(format!("[mali] GP: {} accesses hit unmapped GPU pages", vm.faults));
+        }
     }
 
     fn pp_read(&self, n: usize, offset: u64) -> u32 {
@@ -267,7 +303,7 @@ impl Mali400 {
             INT_RAWSTAT => pp.rawstat,
             INT_MASK => pp.mask,
             INT_STATUS => pp.rawstat & pp.mask,
-            0x1000..=0x10ff => pp.regs[((offset - 0x1000) / 4) as usize],
+            0x1010..=0x101c | 0x1030..=0x10ff => pp.regs[((offset - 0x1000) / 4) as usize],
             _ => 0,
         }
     }
@@ -307,10 +343,26 @@ impl Mali400 {
     }
 
     /// Render the frame PP `n` was given.
-    fn pp_run(&mut self, n: usize, _mem: &mut dyn Memory) {
+    fn pp_run(&mut self, n: usize, mem: &mut dyn Memory) {
         let pp = &mut self.pp[n];
         pp.jobs += 1;
-        pp.rawstat |= pp_reg::IRQ_END_OF_FRAME;
+        let (frame, wb) = (pp.frame, pp.wb);
+        let logged = &mut self.logged;
+        let mut log = |m: String| log_to(logged, m);
+        let mut vm = Vm::new(mem, &mut self.mmu[1 + n]);
+        let mut programs = std::collections::HashMap::new();
+        let tiles = pp::render(&mut vm, &frame, &wb, &mut programs, &mut log);
+        if self.trace {
+            let pa = vm.mmu.translate(&*vm.mem, wb[0][1], false);
+            let px = |vm: &mut Vm, x: u32, y: u32| vm.read_u32(wb[0][1] + y * wb[0][5] * 8 + x * 4);
+            let (a, b) = (px(&mut vm, 0, 0), px(&mut vm, 640, 360));
+            eprintln!("\r[mali] PP{n} wb0 va {:#x} -> pa {:x?} pixels {a:08x} {b:08x}\r", wb[0][1], pa);
+            eprintln!("\r[mali] PP{n} frame {}: {tiles} tiles {}x{} clear {:08x} wb0 {:08x?}\r", self.pp[n].jobs, frame[10] + 1, frame[11] + 1, frame[6], &wb[0][..7]);
+        }
+        if vm.faults != 0 {
+            log(format!("[mali] PP{n}: {} accesses hit unmapped GPU pages", vm.faults));
+        }
+        self.pp[n].rawstat |= pp_reg::IRQ_END_OF_FRAME;
     }
 
     fn l2_read(&self, offset: u64) -> u32 {
