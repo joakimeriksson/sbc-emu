@@ -139,7 +139,11 @@ impl Render<'_> {
             },
             123 => {
                 let c = MulticoreRenderingTileListSetBase::parse(b);
-                self.cur = self.binned.get(&c.address).cloned();
+                // the lists a bin job made, if they are still in memory: a job with no bin job of
+                // its own (Mesa's TLB blits) reads a fresh, zeroed buffer, empty lists on hardware,
+                // where another job's old results would draw primitives whose state is gone
+                let mark = m.r32(c.address);
+                self.cur = self.binned.get(&c.address).filter(|b| b.marker == mark).cloned();
                 self.vs_cache.clear();
                 if self.cur.is_none() { crate::log(&format!("v3d: render job: no binned primitives for tile lists at {:#x}", c.address)); }
             }
@@ -573,6 +577,7 @@ impl Render<'_> {
             }
             let before = t.insns;
             let stop = t.run(code, &mut fe, 5_000_000);
+            crate::progress();
             if stop != crate::qpu::Stop::Done { crate::log_once(&format!("v3d: fragment shader stopped: {stop:?}")); }
             if stop == crate::qpu::Stop::Budget { code.runaway = true; }
             if d.occlusion != 0 { *fe.r.occlusion.entry(d.occlusion).or_default() += fe.passed; }

@@ -64,7 +64,9 @@ pub fn run(cfg: &[u32], m: &mut Gmem, code: &mut Code, insns: &mut u64) {
             for t in threads.iter_mut().filter(|t| !t.done) {
                 if code.runaway { t.done = true; continue; }
                 let before = t.insns;
-                match t.run(code, &mut env, 50_000_000) {
+                let stop = t.run(code, &mut env, 50_000_000);
+                crate::progress();
+                match stop {
                     Stop::Barrier => live = true,
                     Stop::Done => {}
                     s @ (Stop::Budget | Stop::Fault) => {

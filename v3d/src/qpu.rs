@@ -666,7 +666,7 @@ impl Thread {
             let mut thrsw = false;
             match inst {
                 Inst::Invalid(w) => {
-                    crate::log(&format!("v3d: invalid QPU instruction {w:#018x} at {this_pc:#x}"));
+                    if crate::log_first(&format!("v3d: invalid QPU instruction {w:#018x} at {this_pc:#x} (shader {:#x})", self.start.0)) { self.dump_shader(env); }
                     self.done = true;
                     return Stop::Fault;
                 }
