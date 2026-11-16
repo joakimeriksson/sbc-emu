@@ -348,3 +348,17 @@ mod tests {
         assert_eq!(checksum(&reply[0][34..], 0), 0);
     }
 }
+
+/// Bound pending Ethernet frames consistently across board adapters. New arrivals
+/// are dropped when the queue is full, retaining packets already accepted.
+pub fn enqueue_bounded(queue: &mut std::collections::VecDeque<Vec<u8>>, frames: impl IntoIterator<Item=Vec<u8>>) {
+    for frame in frames { if queue.len()<512 {queue.push_back(frame);} }
+}
+
+#[cfg(test)] mod queue_tests {
+    #[test] fn pending_frames_are_bounded() {
+        let mut q=std::collections::VecDeque::new();
+        super::enqueue_bounded(&mut q,(0..1000).map(|_|vec![1;64]));
+        assert_eq!(q.len(),512);
+    }
+}

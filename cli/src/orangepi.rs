@@ -26,7 +26,7 @@ fn execute(args:&[String])->Result<(),String> {
     if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
     let gpu=arg(args,"--gpu").unwrap_or("none");
     if !["none","probe"].contains(&gpu) {return Err("--gpu accepts none or probe (experimental, no rendering)".into());}
-    let net=arg(args,"--net").unwrap_or("local");
+    let net=arg(args,"--net").unwrap_or("nat");
     if !["none","local","nat"].contains(&net) {return Err("--net must be none, local or nat".into());}
     let kernel=arg(args,"--kernel").map(std::fs::read).transpose().map_err(|e|e.to_string())?;
     if kernel.is_none() && arg(args,"--sd").is_none() { return Err("provide --kernel Image or --sd IMAGE".into()); }

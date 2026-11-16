@@ -9,6 +9,8 @@ const LAST: u32 = 1 << 28;
 const TI: u32 = 1;
 const RI: u32 = 1 << 6;
 const NIS: u32 = 1 << 15;
+const FBE: u32 = 1 << 12;
+const AIS: u32 = 1 << 14;
 
 #[derive(Default)]
 pub struct Gmac {
@@ -17,12 +19,19 @@ pub struct Gmac {
     tx_index: u32,
     rx_index: u32,
     tx_partial: Vec<u8>,
+    tx_dropping: bool,
+    tx_active: bool,
     pub tx_out: Vec<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
 }
 impl Gmac {
     pub fn read(&self, off: u64) -> u32 {
         match off {
+            0x1160 => {
+                let status=self.read_raw(off) & !(NIS|AIS);
+                status | if status & self.read_raw(0x1134) & (TI|RI)!=0 {NIS}else{0}
+                    | if status & self.read_raw(0x1134) & FBE!=0 {AIS}else{0}
+            }
             0x110 => 0x42, // GMAC 4.20
             0x1008 => u32::from(self.irq()), // channel interrupt summary
             _ => *self.regs.get(&off).unwrap_or(&0),
@@ -31,7 +40,7 @@ impl Gmac {
     pub fn write(&mut self, off: u64, mut value: u32) {
         match off {
             0x1000 if value & 1 != 0 => { // DMA software reset, PHY is external
-                self.regs.clear(); self.tx_index = 0; self.rx_index = 0; self.tx_partial.clear();
+                self.regs.clear(); self.tx_index = 0; self.rx_index = 0; self.tx_partial.clear(); self.tx_dropping=false; self.tx_active=false; self.rx_queue.clear(); self.tx_out.clear();
                 value &= !1;
             }
             0x200 if value & 1 != 0 => {
@@ -44,7 +53,8 @@ impl Gmac {
                 }
                 value &= !1;
             }
-            0x1160 => { let old = self.read(off); value = old & !value; }
+            0x1108 if value & 1 == 0 => {self.rx_queue.clear();}
+            0x1160 => { let old = self.read_raw(off); value = old & !value; }
             0x1114 => self.tx_index = 0,
             0x111c => self.rx_index = 0,
             _ => {}
@@ -54,10 +64,11 @@ impl Gmac {
     pub fn irq(&self) -> bool {
         let status = self.read_raw(0x1160);
         let enabled = self.read_raw(0x1134);
-        status & NIS != 0 && enabled & NIS != 0 && status & enabled & (TI | RI) != 0
+        (enabled & NIS != 0 && status & enabled & (TI | RI) != 0) ||
+        (enabled & AIS != 0 && status & enabled & FBE != 0)
     }
     fn read_raw(&self, off: u64) -> u32 { *self.regs.get(&off).unwrap_or(&0) }
-    fn signal(&mut self, flag: u32) { let v = self.read_raw(0x1160) | flag | NIS; self.regs.insert(0x1160, v); }
+    fn signal(&mut self, flag: u32) { let v = self.read_raw(0x1160) | flag; self.regs.insert(0x1160, v); }
     fn descriptor_addr(&self, base: u64, index: u32) -> Option<usize> {
         let lo = self.read_raw(base) as u64;
         let hi = self.read_raw(base - 4) as u64;
@@ -71,22 +82,32 @@ impl Gmac {
         let Some(slice) = ram.get_mut(addr..end) else { return false };
         slice.copy_from_slice(&value.to_le_bytes()); true
     }
+    pub fn receiving(&self)->bool {self.read_raw(0x1108)&1!=0}
+    fn bus_error(&mut self) {self.signal(FBE); self.regs.insert(0x1104,self.read_raw(0x1104)&!1);self.regs.insert(0x1108,self.read_raw(0x1108)&!1);self.rx_queue.clear();}
     /// Service owned TX descriptors and queued received frames.
     pub fn service(&mut self, ram: &mut [u8]) {
         if self.read_raw(0x1104) & 1 != 0 {
             let count = (self.read_raw(0x112c) & 0x3ff) + 1;
             for _ in 0..count {
-                let Some(d) = self.descriptor_addr(0x1114, self.tx_index) else { break };
-                let Some(flags) = Self::word(ram, d.saturating_add(12)) else { break };
+                let Some(d) = self.descriptor_addr(0x1114, self.tx_index) else { self.bus_error(); break };
+                let Some(flags) = Self::word(ram, d.saturating_add(12)) else { self.bus_error(); break };
                 if flags & OWN == 0 { break }
-                let Some(ptr) = Self::word(ram, d) else { break };
-                let Some(len) = Self::word(ram, d.saturating_add(8)).map(|v| (v & 0x3fff) as usize) else { break };
-                let Some(data) = ram.get(ptr as usize..(ptr as usize).saturating_add(len)) else { break };
-                if flags & FIRST != 0 { self.tx_partial.clear(); }
-                if self.tx_partial.len().saturating_add(len) > 65536 { self.tx_partial.clear(); break }
-                self.tx_partial.extend_from_slice(data);
-                if flags & LAST != 0 { self.tx_out.push(std::mem::take(&mut self.tx_partial)); }
-                Self::put_word(ram, d + 12, flags & !OWN);
+                if flags & (1<<30) != 0 {
+                    // Context descriptors have no data buffer; unsupported offloads are not advertised.
+                    Self::put_word(ram,d+12,1<<30);
+                    self.tx_index=(self.tx_index+1)%count;
+                    continue;
+                }
+                let Some(ptr) = Self::word(ram, d) else { self.bus_error(); break };
+                let Some(len) = Self::word(ram, d.saturating_add(8)).map(|v| (v & 0x3fff) as usize) else { self.bus_error(); break };
+                let Some(data) = ram.get(ptr as usize..(ptr as usize).saturating_add(len)) else { self.bus_error(); break };
+                if flags & FIRST != 0 { self.tx_partial.clear();self.tx_dropping=false;self.tx_active=true; }
+                else if !self.tx_active {self.tx_dropping=true;}
+                if self.tx_partial.len().saturating_add(len) > 65536 { self.tx_partial.clear();self.tx_dropping=true; }
+                if !self.tx_dropping {self.tx_partial.extend_from_slice(data);}
+                if flags & LAST != 0 && !self.tx_dropping { self.tx_out.push(std::mem::take(&mut self.tx_partial)); }
+                if flags & LAST != 0 {self.tx_active=false;}
+                Self::put_word(ram, d + 12, flags & (FIRST|LAST));
                 self.tx_index = (self.tx_index + 1) % count;
                 self.signal(TI);
             }
@@ -95,14 +116,14 @@ impl Gmac {
             let count = (self.read_raw(0x1130) & 0x3ff) + 1;
             for _ in 0..count {
                 let Some(frame) = self.rx_queue.front() else { break };
-                let Some(d) = self.descriptor_addr(0x111c, self.rx_index) else { break };
-                let Some(flags) = Self::word(ram, d.saturating_add(12)) else { break };
+                let Some(d) = self.descriptor_addr(0x111c, self.rx_index) else { self.bus_error(); break };
+                let Some(flags) = Self::word(ram, d.saturating_add(12)) else { self.bus_error(); break };
                 if flags & OWN == 0 { break }
-                let Some(ptr) = Self::word(ram, d) else { break };
+                let Some(ptr) = Self::word(ram, d) else { self.bus_error(); break };
                 let capacity = ((self.read_raw(0x1108) >> 1) & 0x3fff) as usize;
                 if frame.len() + 4 > capacity || frame.len() + 4 > 0x7fff { self.rx_queue.pop_front(); continue }
                 let start = ptr as usize;
-                let Some(out) = ram.get_mut(start..start.saturating_add(frame.len() + 4)) else { break };
+                let Some(out) = ram.get_mut(start..start.saturating_add(frame.len() + 4)) else { self.bus_error(); break };
                 out[..frame.len()].copy_from_slice(frame); out[frame.len()..].fill(0);
                 let len = frame.len() as u32 + 4;
                 Self::put_word(ram, d + 12, FIRST | LAST | len);
@@ -140,6 +161,32 @@ mod tests {
         assert_eq!(&ram[1024..1029], b"reply"); assert_eq!(Gmac::word(&ram, 108), Some(FIRST | LAST | 9));
         put(&mut ram, 96, u32::MAX); put(&mut ram, 108, OWN);
         g.rx_queue.push_back(b"bad address".to_vec()); g.service(&mut ram);
-        assert_eq!(g.rx_queue.len(), 1);
+        assert!(g.rx_queue.is_empty());
+        assert_ne!(g.read(0x1160)&FBE,0);
     }
+    #[test]
+    fn masked_receive_is_reasserted_after_transmit_ack() {
+        let mut g=Gmac::default();g.signal(RI|TI);g.write(0x1134,NIS|TI);
+        g.write(0x1160,TI|NIS);assert!(!g.irq());
+        g.write(0x1134,NIS|RI);assert!(g.irq());assert_ne!(g.read(0x1160)&NIS,0);
+    }
+    #[test]
+    fn reset_discards_frames_and_context_does_not_dma() {
+        let mut g=Gmac::default();g.rx_queue.push_back(vec![1]);g.tx_out.push(vec![2]);
+        g.write(0x1000,1);assert!(g.rx_queue.is_empty()&&g.tx_out.is_empty());
+        let mut ram=vec![0;128];put(&mut ram,64,u32::MAX);put(&mut ram,76,OWN|(1<<30));
+        g.write(0x1114,64);g.write(0x1104,1);g.service(&mut ram);
+        assert_eq!(Gmac::word(&ram,76),Some(1<<30));assert_eq!(g.read(0x1160)&FBE,0);
+    }
+    #[test]
+    fn oversized_chain_is_consumed_without_emitting_a_suffix() {
+        let mut g=Gmac::default();let mut ram=vec![0;100000];
+        for i in 0..6 {
+            put(&mut ram,64+i*16,1024);put(&mut ram,72+i*16,14000);
+            put(&mut ram,76+i*16,OWN|if i==0 {FIRST}else{0}|if i==5 {LAST}else{0});
+        }
+        g.write(0x1114,64);g.write(0x112c,5);g.write(0x1104,1);g.service(&mut ram);
+        assert!(g.tx_out.is_empty());for i in 0..6 {assert_eq!(Gmac::word(&ram,76+i*16).unwrap()&OWN,0);}
+    }
+
 }

@@ -60,7 +60,7 @@ impl Soc {
             let shift=(addr&3)*8; let mask=((1u32<<(size*8))-1)<<shift;
             let off = if (GICD..GICD+0x10000).contains(&addr) { addr-GICD } else { addr.saturating_sub(GICR+0x10000) };
             let is_write_one = (0x100..0x400).contains(&off);
-            let old=if is_write_one { 0 } else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
+            let old=if (GMAC..GMAC+0x10000).contains(&addr) {if (addr-GMAC)&!3==0x1160 {0}else{self.gmac.read((addr-GMAC)&!3)}} else if is_write_one { 0 } else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
                 else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)} else {0};
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};
@@ -133,10 +133,12 @@ impl Machine {
         if let Some(net) = &mut self.soc.net {
             let now_us = self.cpu.now_ns() / 1000;
             for frame in std::mem::take(&mut self.soc.gmac.tx_out) {
-                self.soc.gmac.rx_queue.extend(net.handle(&frame, now_us));
+                let replies=net.handle(&frame, now_us);
+                if self.soc.gmac.receiving() {sbc_net::net::enqueue_bounded(&mut self.soc.gmac.rx_queue,replies); }
             }
             if self.cpu.now_ns() >= self.next_net_poll {
-                self.soc.gmac.rx_queue.extend(net.poll(now_us));
+                let replies=net.poll(now_us);
+                if self.soc.gmac.receiving() {sbc_net::net::enqueue_bounded(&mut self.soc.gmac.rx_queue,replies); }
                 self.next_net_poll = self.cpu.now_ns().saturating_add(1_000_000);
             }
             self.soc.gmac.service(&mut self.soc.ram);
@@ -164,7 +166,10 @@ impl Machine {
         for _ in 0..budget {
             if self.cpu.instret>=end {return Stop::Budget;}
             if self.soc.dirty || self.cpu.sys.timers_changed || self.now()>=self.next_check {self.update();}
-            if self.waiting {return Stop::Idle(self.deadline().min(self.next_check));}
+            if self.waiting {
+                let poll=self.soc.net.as_ref().is_some_and(|n|n.nat.is_some()) || !self.soc.gmac.rx_queue.is_empty();
+                return Stop::Idle(if poll {self.deadline().min(self.next_check)}else{self.deadline()});
+            }
             self.cpu.chain_until=self.cpu.instret.saturating_add(self.next_check.saturating_sub(self.now())).min(end);
             match self.cpu.step(&mut self.soc) {
                 Ok(())=>storm=0,

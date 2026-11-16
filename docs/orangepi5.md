@@ -51,7 +51,7 @@ The tested image reached `orangepi5 login: root (automatic login)`. The image's 
 
 ## Ethernet
 
-The reduced device tree exposes GMAC1 and an emulated YT8531 PHY. The default `--net local` connects the port to the virtual network; `--net nat` also enables host network access, and `--net none` disconnects the cable. With the pinned Armbian image, the following exercises the Linux driver and pings the virtual gateway at `10.0.2.2`:
+The reduced device tree exposes GMAC1 and an emulated YT8531 PHY. `--net local` connects the port to the virtual network; the default `--net nat` also enables host network access, and `--net none` disconnects the cable. With the pinned Armbian image, the following exercises the Linux driver and pings the virtual gateway at `10.0.2.2`:
 
 ```sh
 ./target/release/sbc-emu run --board orangepi5 --sd /path/to/armbian.img \

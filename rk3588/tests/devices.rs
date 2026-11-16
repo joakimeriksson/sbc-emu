@@ -119,3 +119,16 @@ fn uart_reset_preserves_unread_output() {
     let mut u=Uart::default();u.write(0,b'A' as u32);u.write(0x88,1);u.write(0,b'B' as u32);
     assert_eq!(u.out,b"AB");
 }
+
+#[test]
+fn gmac_partial_writes_preserve_neighbors_and_idle_does_not_poll_local_network() {
+    let mut m=Machine::new(128<<20).unwrap();
+    m.soc.write32(rk3588::GMAC+0x1134,0x12345678).unwrap();
+    m.soc.write8(rk3588::GMAC+0x1135,0xab).unwrap();
+    assert_eq!(m.soc.read32(rk3588::GMAC+0x1134).unwrap(),0x1234ab78);
+    m.connect_network(false,false);
+    m.soc.ram[..4].copy_from_slice(&0xd503207fu32.to_le_bytes());
+    m.cpu.pc=0;
+    let Stop::Idle(deadline)=m.run(10) else {panic!("expected WFI")};
+    assert!(deadline-m.now()>1_000_000);
+}
