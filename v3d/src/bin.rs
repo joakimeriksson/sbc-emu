@@ -19,19 +19,26 @@ use crate::{Code, Gmem};
 pub struct Cl {
     pub pc: u32,
     pub end: u32,
+    /// where the last packet started
+    prev: u32,
     stack: Vec<u32>,
     pub steps: u64,
 }
 
 impl Cl {
-    pub fn new(start: u32, end: u32) -> Cl { Cl { pc: start, end, stack: Vec::new(), steps: 0 } }
+    pub fn new(start: u32, end: u32) -> Cl { Cl { pc: start, end, prev: start, stack: Vec::new(), steps: 0 } }
 
     /// The next packet (opcode, bytes including the opcode); None at the end of the list.
     pub fn next(&mut self, m: &mut Gmem) -> Option<(u8, [u8; 32])> {
         loop {
-            if self.stack.is_empty() && self.pc >= self.end { return None; }
+            // The list ends where the current address meets the end address, as on hardware, not
+            // once it passes it: Mesa grows a list by branching to a new buffer, which can lie
+            // below the first one, so the end of a long list is often below its start. A last
+            // packet that steps over the end (a sloppy end address) ends it too.
+            if self.stack.is_empty() && (self.end == 0 || self.pc == self.end || (self.prev < self.end && self.pc > self.end && self.pc - self.prev <= 32)) { return None; }
             self.steps += 1;
             if self.steps > 50_000_000 { crate::log_once("v3d: runaway control list"); return None; }
+            self.prev = self.pc;
             let op = m.r8(self.pc);
             let len = PACKET_LEN[op as usize] as usize;
             if len == 0 {
@@ -123,6 +130,8 @@ pub struct Binned {
     pub prims: Vec<Prim>,
     /// per tile (row-major): primitive indices in order
     pub lists: Vec<Vec<u32>>,
+    /// the word the bin job left at the start of its tile list memory (see `Exec::run`)
+    pub marker: u32,
 }
 
 pub fn tile_size(num_rts: u32, max_bpp: u32, msaa: bool, double_buffer: bool) -> (u32, u32) {
@@ -233,7 +242,8 @@ pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coo
         for (l, row) in rows.iter().enumerate() { for (k, &v) in row.iter().enumerate() { t.vpm[k][l] = v; } }
         t.vpm_out_base = in_seg;
         let before = t.insns;
-        match t.run(code, &mut env, 20_000_000) {
+        let stop = t.run(code, &mut env, 20_000_000);
+        match stop {
             Stop::Done => {}
             s => {
                 crate::log_once(&format!("v3d: {} shader stopped: {s:?}", if coord { "coordinate" } else { "vertex" }));
@@ -596,4 +606,33 @@ fn lerp(a: &ClipVert, b: &ClipVert, t: f32) -> ClipVert {
     for k in 0..4 { c.pos[k] = a.pos[k] + (b.pos[k] - a.pos[k]) * t; }
     for k in 0..3 { c.bary[k] = a.bary[k] + (b.bary[k] - a.bary[k]) * t; }
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mesa grows a control list by branching to a new buffer, which may lie below the first:
+    /// the list runs until it reaches its end address, even when that is below its start.
+    #[test]
+    fn list_continued_in_a_lower_buffer() {
+        let mut ram = vec![0u8; 0x4000];
+        let op = (19..=255u8).find(|&o| PACKET_LEN[o as usize] != 0).unwrap();
+        let len = PACKET_LEN[op as usize] as u32;
+        // at 0x3000: a packet, then "branch to 0x1000"; at 0x1000: two packets, the list's end
+        ram[0x3000] = op;
+        let b = 0x3000 + len as usize;
+        ram[b] = 16;
+        ram[b + 1..b + 5].copy_from_slice(&0x1000u32.to_le_bytes());
+        ram[0x1000] = op;
+        ram[0x1000 + len as usize] = op;
+        let end = 0x1000 + 2 * len;
+        // after the end: a packet that must not be read
+        ram[end as usize] = op;
+        let mut m = Gmem::new(&mut ram, 0, false);
+        let mut cl = Cl::new(0x3000, end);
+        let mut seen = Vec::new();
+        while let Some((o, _)) = cl.next(&mut m) { assert_eq!(o, op); seen.push(cl.pc - len); }
+        assert_eq!(seen, vec![0x3000, 0x1000, 0x1000 + len], "every packet up to the end, none after it");
+    }
 }
