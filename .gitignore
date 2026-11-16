@@ -6,3 +6,4 @@
 web/wasm/
 web/assets/
 out/
+tests/gpu/gltest

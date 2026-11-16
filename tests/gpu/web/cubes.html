@@ -1,0 +1,60 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>cubes</title>
+<style>body { margin: 0; background: #000; color: #8cf; font: 14px monospace; } canvas { width: 640px; height: 400px; display: block; } #status { position: absolute; top: 4px; left: 8px; }</style>
+</head><body><canvas id="c" width="320" height="200"></canvas><div id="status"></div>
+<script src="gl.js"></script>
+<script>
+// 400 instanced cubes: per-instance data from a vertex attribute and from a texture fetched in
+// the vertex shader, a loop over point lights in a uniform array with a run-time count, depth
+// testing and a textured fragment shader.
+const gl = glDemo(document.getElementById('c'));
+const p = gl && gl.prog(`#version 300 es
+precision highp float;
+in vec3 pos; in vec3 nrm; in vec4 inst; uniform float t; uniform mat4 proj; uniform highp sampler2D data;
+uniform vec4 lights[8]; uniform int nlights;
+out vec3 col; out vec2 tc;
+mat3 rot(vec3 a) { vec3 s = sin(a), c = cos(a);
+  return mat3(c.y * c.z, c.y * s.z, -s.y, s.x * s.y * c.z - c.x * s.z, s.x * s.y * s.z + c.x * c.z, s.x * c.y, c.x * s.y * c.z + s.x * s.z, c.x * s.y * s.z - s.x * c.z, c.x * c.y); }
+void main() {
+  int id = gl_InstanceID;
+  vec4 d = texelFetch(data, ivec2(id % 20, id / 20), 0);
+  mat3 r = rot(vec3(t * d.x, t * d.y, 0.3 * float(id)));
+  vec3 wp = r * pos * 0.18 + inst.xyz + vec3(0.0, 0.2 * sin(t * 2.0 + d.z * 6.0), 0.0);
+  vec3 n = r * nrm, c = vec3(0.08);
+  for (int i = 0; i < nlights; i++) {
+    vec3 l = lights[i].xyz - wp; float k = max(dot(n, normalize(l)), 0.0) / (1.0 + dot(l, l) * 0.1);
+    c += k * (0.5 + 0.5 * cos(vec3(0.0, 2.0, 4.0) + lights[i].w));
+  }
+  col = c * (0.6 + 0.4 * d.rgb); tc = pos.xy + 0.5;
+  gl_Position = proj * vec4(wp, 1.0);
+}`, `#version 300 es
+precision mediump float; in vec3 col; in vec2 tc; out vec4 o;
+void main() { float g = step(0.1, fract(tc.x * 4.0)) * step(0.1, fract(tc.y * 4.0)); o = vec4(col * (0.5 + 0.5 * g), 1.0); }`);
+if (p) {
+  gl.useProgram(p);
+  const F = [[0,0,1],[0,0,-1],[0,1,0],[0,-1,0],[1,0,0],[-1,0,0]], v = [], nr = [];
+  for (const f of F) {
+    const [a, b] = f[2] ? [[1,0,0],[0,1,0]] : f[1] ? [[1,0,0],[0,0,1]] : [[0,1,0],[0,0,1]];
+    for (const [s, u] of [[-1,-1],[1,-1],[1,1],[-1,-1],[1,1],[-1,1]])
+      for (let k = 0; k < 3; k++) { v.push(0.5 * (f[k] + s * a[k] + u * b[k])); nr.push(f[k]); }
+  }
+  const buf = (data, name, n, div) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+    const l = gl.getAttribLocation(p, name); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, n, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(l, div); };
+  buf(v, 'pos', 3, 0); buf(nr, 'nrm', 3, 0);
+  const inst = []; for (let i = 0; i < 400; i++) inst.push(((i % 20) - 9.5) * 0.35, (Math.floor(i / 20) - 9.5) * 0.25, -5 - (i % 7) * 0.1, 0);
+  buf(inst, 'inst', 4, 1);
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  const td = new Float32Array(20 * 20 * 4); for (let i = 0; i < td.length; i++) td[i] = ((i * 7919) % 101) / 100;
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 20, 20, 0, gl.RGBA, gl.FLOAT, td);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  const L = []; for (let i = 0; i < 8; i++) L.push(Math.cos(i) * 3, Math.sin(i * 1.7) * 2, -3 - i * 0.3, i);
+  gl.uniform4fv(gl.getUniformLocation(p, 'lights'), L); gl.uniform1i(gl.getUniformLocation(p, 'nlights'), 6);
+  const f = 1 / Math.tan(0.6), a = 320 / 200, nn = 0.1, ff = 50;
+  gl.uniformMatrix4fv(gl.getUniformLocation(p, 'proj'), false, [f / a,0,0,0, 0,f,0,0, 0,0,(ff+nn)/(nn-ff),-1, 0,0,2*ff*nn/(nn-ff),0]);
+  gl.enable(gl.DEPTH_TEST);
+  const tl = gl.getUniformLocation(p, 't'), tick = fpsMeter(gl);
+  const frame = (ms) => { gl.clearColor(0.02, 0.02, 0.05, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniform1f(tl, demoTime(ms)); gl.drawArraysInstanced(gl.TRIANGLES, 0, 36, 400); tick(); requestAnimationFrame(frame); };
+  requestAnimationFrame(frame);
+}
+</script></body></html>
