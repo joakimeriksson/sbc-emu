@@ -1,4 +1,4 @@
-use crate::mmu::{Access, TlbEntry, TLB_ENTRIES};
+use crate::mmu::{Access, TlbEntry, Utlb, TLB_ENTRIES, UT};
 use crate::model::{CpuModel, CORTEX_A7};
 use emu_core::{Bus, Core, Trap};
 
@@ -96,7 +96,34 @@ pub struct Cpu {
     pub undef_to_guest: bool,
     /// The last encoding that was delivered to the guest as UNDEFINED: (pc, insn).
     pub last_undef: Option<(u32, u32)>,
+    /// Guest RAM as host memory (`set_ram`): the micro-TLBs map virtual pages straight
+    /// into it. Null until a machine provides it (every access then goes through the bus).
+    pub(crate) ram: *mut u8,
+    pub(crate) ram_base: u32,
+    pub(crate) ram_len: u32,
+    /// Micro-TLBs (see `mmu::Utlb`), boxed so compiled code reaches them through one pointer.
+    pub(crate) utlb: Box<[Utlb; 6 * UT]>,
+    /// Set when a slow-path access reached something other than RAM (a device).
+    pub(crate) io: bool,
+    /// The block JIT (`enable_jit`), compiled code and its bookkeeping.
+    pub(crate) jit: Option<Box<crate::jit::Jit>>,
+    /// The bus while compiled code runs (interpreter fallbacks need it).
+    pub(crate) jit_bus: Option<*mut dyn Bus>,
+    pub(crate) jit_trap: Option<Trap>,
+    /// Compiled blocks may chain into each other while `instret < chain_until`; the machine
+    /// sets it to its next deadline before each step (0 = return after one block).
+    pub chain_until: u64,
+    /// The interpreter is finishing a block that is not hot yet (see `jit_step`).
+    pub(crate) interp_run: bool,
+    /// For compiled code while it runs: the dispatcher that chains blocks, and the JIT's
+    /// front cache it looks blocks up in.
+    pub(crate) jit_disp: usize,
+    pub(crate) jit_front: *const crate::jit::Front,
 }
+
+// SAFETY: the raw pointers (guest RAM, the bus during a step) are only dereferenced by the
+// thread that is running the core.
+unsafe impl Send for Cpu {}
 
 impl Default for Cpu {
     fn default() -> Self {
@@ -167,7 +194,31 @@ impl Cpu {
             vfp: Default::default(),
             undef_to_guest: false,
             last_undef: None,
+            ram: std::ptr::null_mut(),
+            ram_base: 0,
+            ram_len: 0,
+            utlb: Box::new([Utlb::INVALID; 6 * UT]),
+            io: false,
+            jit: None,
+            jit_bus: None,
+            jit_trap: None,
+            chain_until: 0,
+            interp_run: false,
+            jit_disp: 0,
+            jit_front: std::ptr::null(),
         }
+    }
+
+    /// Give the core direct access to guest RAM at physical `base` (`len` bytes). The
+    /// memory must stay allocated, and in place, for the life of the core.
+    ///
+    /// # Safety
+    /// `ram` must point to `len` writable bytes that outlive this `Cpu`.
+    pub unsafe fn set_ram(&mut self, ram: *mut u8, base: u32, len: u32) {
+        self.ram = ram;
+        self.ram_base = base;
+        self.ram_len = len;
+        self.utlb_flush();
     }
 
     /// Set the current mode's SPSR (tests).
@@ -1073,7 +1124,11 @@ impl Cpu {
                         self.ttbcr = value;
                         self.tlb_flush();
                     }
-                    (0, 3, 0, 0) => self.dacr = value,
+                    (0, 3, 0, 0) => {
+                        // micro-TLB entries hold permissions checked under the old domains
+                        self.dacr = value;
+                        self.utlb_flush();
+                    }
                     (0, 5, 0, 0) => self.dfsr = value,
                     (0, 5, 0, 1) => self.ifsr = value,
                     (0, 6, 0, 0) => self.dfar = value,
@@ -1081,10 +1136,16 @@ impl Cpu {
                     (0, 7, 1 | 5 | 6 | 10 | 11 | 14, _) => {}
                     // Inner-shareable TLB maintenance (c8, c3) applies to every core: the
                     // machine flushes the other cores' TLBs when it sees `tlb_broadcast`.
+                    // by MVA (TLBIMVA, TLBIMVAA): this page only
+                    (0, 8, 3, 1 | 3) => {
+                        self.tlb_invalidate_page(value);
+                        self.tlb_broadcast = true;
+                    }
                     (0, 8, 3, _) => {
                         self.tlb_flush();
                         self.tlb_broadcast = true;
                     }
+                    (0, 8, 5 | 6 | 7, 1 | 3) => self.tlb_invalidate_page(value),
                     (0, 8, 5 | 6 | 7, _) => self.tlb_flush(),
                     (0, 10, 2, 0) => self.prrr = value,
                     (0, 10, 2, 1) => self.nmrr = value,
@@ -1631,6 +1692,24 @@ impl Cpu {
 }
 
 impl Cpu {
+    /// Fetch and execute one instruction (no interrupt check).
+    pub(crate) fn exec_one(&mut self, bus: &mut dyn Bus) -> Result<(), Trap> {
+        let pc = self.r[15];
+        self.cur_pc = pc;
+        self.pc_written = false;
+        if self.thumb() {
+            return self.step_thumb(bus, pc);
+        }
+        self.cur_size = 4;
+        let insn = match self.mem_read32(bus, pc, Access::Execute) {
+            Ok(insn) => insn,
+            Err((va, status)) => return Err(self.prefetch_abort(va, status)),
+        };
+        self.r[15] = pc.wrapping_add(4);
+        let result = self.execute(bus, pc as u64, insn);
+        self.finish(pc, insn, result)
+    }
+
     /// Retire an instruction or turn an unimplemented encoding into UNDEFINED.
     pub(crate) fn finish(&mut self, pc: u32, insn: u32, result: Result<(), Trap>) -> Result<(), Trap> {
         match result {
@@ -1655,27 +1734,32 @@ impl Cpu {
 impl Core for Cpu {
     fn step(&mut self, bus: &mut dyn Bus) -> Result<(), Trap> {
         if self.irq && self.cpsr & I == 0 {
+            self.interp_run = false;
             self.enter_exception(0x18, self.r[15].wrapping_add(4), MODE_IRQ, true);
             return Err(Trap::Interrupt(0, 1));
         }
         if self.fiq && self.cpsr & F == 0 {
+            self.interp_run = false;
             self.enter_exception(0x1c, self.r[15].wrapping_add(4), MODE_FIQ, true);
             return Err(Trap::Interrupt(1, 1));
         }
-        let pc = self.r[15];
-        self.cur_pc = pc;
-        self.pc_written = false;
-        if self.thumb() {
-            return self.step_thumb(bus, pc);
+        if self.jit.is_some() {
+            self.jit_poll();
+            if !self.interp_run {
+                if let Some(result) = self.jit_step(bus) {
+                    return result;
+                }
+            }
+            // interpreting a block that is not hot yet: up to its end (a taken branch or an
+            // exception), so only block starts count towards compiling
+            let pc = self.r[15];
+            let result = self.exec_one(bus);
+            if self.r[15] != pc.wrapping_add(self.cur_size) || result.is_err() {
+                self.interp_run = false;
+            }
+            return result;
         }
-        self.cur_size = 4;
-        let insn = match self.mem_read32(bus, pc, Access::Execute) {
-            Ok(insn) => insn,
-            Err((va, status)) => return Err(self.prefetch_abort(va, status)),
-        };
-        self.r[15] = pc.wrapping_add(4);
-        let result = self.execute(bus, pc as u64, insn);
-        self.finish(pc, insn, result)
+        self.exec_one(bus)
     }
 
     fn pc(&self) -> u64 {

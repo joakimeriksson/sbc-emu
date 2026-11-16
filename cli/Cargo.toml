@@ -12,4 +12,5 @@ v3d = { path = "../v3d" }
 sbc-machine = { path = "../sbc-machine" }
 rk3588 = { path = "../rk3588" }
 allwinner-h3 = { path = "../allwinner-h3" }
+arm-a32 = { path = "../arm-a32" }
 rockchip-rk3288 = { path = "../rockchip-rk3288" }

@@ -4,7 +4,8 @@ use crate::gic::NCPU;
 use crate::usb::{Dma, Ehci, Ohci};
 use emu_core::usb::{Keyboard, Tablet};
 use crate::{Gic, SunxiMmc, Timer, Uart};
-use arm_a32::Cpu;
+use arm_a32::{CodeWatch, Cpu};
+use std::sync::Arc;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
 
 pub const RAM_BASE: u64 = 0x4000_0000;
@@ -74,6 +75,8 @@ pub struct Soc {
     pub stub_pages: Vec<u64>,
     /// Print each newly touched unmodelled device page to stderr.
     pub log_stub_pages: bool,
+    /// RAM pages holding compiled code (shared by the cores' JITs).
+    pub code_watch: Arc<CodeWatch>,
 }
 
 impl Soc {
@@ -139,6 +142,7 @@ impl Soc {
             stub_regs: Default::default(),
             stub_pages: Vec::new(),
             log_stub_pages: false,
+            code_watch: CodeWatch::new(RAM_BASE as u32, ram_size as u32),
         }
     }
 
@@ -271,6 +275,9 @@ impl Soc {
             }
             if Self::in_region(addr, 4, MMC0_BASE, MMC_SIZE) {
                 self.mmc.write(addr - MMC0_BASE, value, &mut self.ram);
+                for (address, len) in self.mmc.dma_written.drain(..) {
+                    self.code_watch.dma_write(address, len);
+                }
                 return Ok(());
             }
             if Self::in_region(addr, 4, EMAC_BASE, EMAC_SIZE) {
@@ -376,6 +383,8 @@ pub struct Machine {
     subtick: u64,
     /// The core that caused the last non-budget, non-idle stop (diagnostics).
     pub last_stop_core: usize,
+    /// Compile hot code (the A32 JIT) on hosts that can run it.
+    jit: bool,
     /// Debugging: print this many exceptions (vector, LR, SPSR, fault registers) to
     /// stderr once `trace_from` instructions have run (env `H3_TRACE_EXC`, `H3_TRACE_FROM`).
     pub trace_exceptions: u32,
@@ -398,7 +407,7 @@ impl Machine {
             .collect();
         let mut state = vec![CoreState::Off; NCPU];
         state[0] = CoreState::Run;
-        Self {
+        let mut machine = Self {
             cpus,
             state,
             soc: Soc::new(ram_size),
@@ -409,9 +418,41 @@ impl Machine {
             exceptions: 0,
             subtick: 0,
             last_stop_core: 0,
+            jit: arm_a32::jit::available() && std::env::var("SBC_JIT").map_or(true, |v| v != "0"),
             trace_exceptions: std::env::var("H3_TRACE_EXC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             trace_from: std::env::var("H3_TRACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        };
+        for k in 0..NCPU {
+            machine.attach(k);
         }
+        machine
+    }
+
+    /// Give core `k` direct access to RAM and, if enabled, its JIT.
+    fn attach(&mut self, k: usize) {
+        let ram = &mut self.soc.ram.mem;
+        // SAFETY: the RAM vector is allocated once with the machine and never resized; the
+        // cores are dropped with it
+        unsafe { self.cpus[k].set_ram(ram.as_mut_ptr(), RAM_BASE as u32, ram.len() as u32) };
+        if self.jit {
+            self.cpus[k].enable_jit(self.soc.code_watch.clone());
+        }
+    }
+
+    /// Turn the JIT on or off (it is on by default where the host supports it).
+    pub fn set_jit(&mut self, on: bool) {
+        self.jit = on && arm_a32::jit::available();
+        for k in 0..NCPU {
+            if self.jit {
+                self.cpus[k].enable_jit(self.soc.code_watch.clone());
+            } else {
+                self.cpus[k].disable_jit();
+            }
+        }
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.jit
     }
 
     /// The boot core (core 0).
@@ -429,6 +470,7 @@ impl Machine {
     }
 
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Fault> {
+        self.soc.code_watch.dma_write(addr, bytes.len());
         self.soc.ram.load(addr, bytes)
     }
 
@@ -448,6 +490,7 @@ impl Machine {
         cpu.firmware_calls_to_host = true;
         cpu.cntpct = now;
         self.cpus[index] = cpu;
+        self.attach(index);
         self.state[index] = CoreState::Run;
         self.soc.gic.reset_cpu_interface(index);
     }
@@ -492,19 +535,32 @@ impl Machine {
 
     /// One instruction of one core: 1 ns divided among the running cores. Cores asleep
     /// in WFI/WFE do not count, so a lone busy core still runs at 1 ns per instruction.
-    fn tick(&mut self) {
+    fn tick(&mut self, instructions: u64) {
         let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
-        self.advance_subtick(12 / running);
+        self.advance_subtick(instructions * (12 / running));
     }
 
     /// Advance virtual time by `units` of 1/12 ns.
     fn advance_subtick(&mut self, units: u64) {
         self.subtick += units;
         if self.subtick >= 125 * 12 {
-            self.subtick -= 125 * 12;
-            let ticks = self.cpus[0].cntpct + 3;
+            let periods = self.subtick / (125 * 12);
+            self.subtick -= periods * 125 * 12;
+            let ticks = self.cpus[0].cntpct + 3 * periods;
             self.set_time(ticks);
         }
+    }
+
+    /// Instructions core `k` may run before the next device deadline (compiled blocks
+    /// chain until then).
+    fn instructions_to_deadline(&self) -> u64 {
+        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        let now = self.cpus[0].cntpct;
+        if self.next_event <= now {
+            return 1;
+        }
+        let units = (self.next_event - now).saturating_mul(500).saturating_sub(self.subtick);
+        units.div_ceil(12 / running).max(1)
     }
 
     fn timer_state_of(cpu: &Cpu) -> (u32, u64, u32, u64) {
@@ -624,9 +680,11 @@ impl Machine {
             self.advance_time(ticks);
             return Err(Trap::Wait);
         }
+        let i0 = self.cpus[0].instret;
+        self.cpus[0].chain_until = 0;
         let result = self.cpus[0].step(&mut self.soc);
         // step() runs core 0 alone, so each instruction is a full 1 ns.
-        self.advance_subtick(12);
+        self.advance_subtick(12 * (self.cpus[0].instret - i0).max(1));
         if self.cpus[0].sent_event {
             self.send_event(0);
         }
@@ -659,11 +717,17 @@ impl Machine {
                 });
             };
             self.switch_to(k);
-            let quantum = left.min(QUANTUM);
-            for _ in 0..quantum {
-                left -= 1;
+            let mut quantum = left.min(QUANTUM);
+            while quantum > 0 {
+                let i0 = self.cpus[k].instret;
+                self.cpus[k].chain_until = i0 + quantum.min(self.instructions_to_deadline());
                 let result = self.cpus[k].step(&mut self.soc);
-                self.tick();
+                // a compiled block runs several instructions; a trap that retired nothing
+                // still takes a tick
+                let n = (self.cpus[k].instret - i0).max(1);
+                quantum = quantum.saturating_sub(n);
+                left = left.saturating_sub(n);
+                self.tick(n);
                 if self.cpus[k].sent_event {
                     self.send_event(k);
                 }

@@ -36,6 +36,21 @@ impl SerialBoard for allwinner_h3::Machine {
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames scanned out", self.soc.display.frames);
         }
+        let stats: Vec<(u64, u64, u64)> = self.cpus.iter().filter_map(|c| c.jit_stats()).collect();
+        if !stats.is_empty() {
+            let sum = |f: fn(&(u64, u64, u64)) -> u64| stats.iter().map(f).sum::<u64>();
+            eprintln!(
+                "[{tag}] JIT: {} blocks compiled, {} runs, {} dropped by code writes",
+                sum(|s| s.0),
+                sum(|s| s.1),
+                sum(|s| s.2)
+            );
+        }
+        if std::env::var("SBC_JIT_PROFILE").is_ok_and(|v| v == "1") {
+            for (word, slow, n) in arm_a32::jit::profile_fallbacks().into_iter().take(40) {
+                eprintln!("[{tag}]   interpreted {word:#010x}{} x{n}", if slow { " (micro-TLB miss)" } else { "" });
+            }
+        }
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));
@@ -72,6 +87,7 @@ impl Screen for allwinner_h3::Machine {
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    arm_a32::jit::set_profile(std::env::var("SBC_JIT_PROFILE").is_ok_and(|v| v == "1"));
     match execute(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -128,6 +144,9 @@ fn execute(args: &[String]) -> Result<(), String> {
         .transpose()?;
     let make_machine = || -> Result<allwinner_h3::Machine, String> {
         let mut m = allwinner_h3::Machine::with_ram_size(ram);
+        if args.iter().any(|a| a == "--no-jit") {
+            m.set_jit(false);
+        }
         m.soc.display = Display::new(mode);
         if net != "none" {
             m.connect_network(net == "nat", false);
