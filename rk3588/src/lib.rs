@@ -2,6 +2,9 @@
 //! Direct Linux boot, generated reduced DT, firmware PSCI services handled by host.
 pub mod boot;
 pub mod gic;
+pub mod gpu_mmu;
+pub mod gpu_cs;
+pub mod gpu;
 pub mod uart;
 pub mod mmc;
 
@@ -19,6 +22,7 @@ pub struct Soc {
     pub ram: Vec<u8>,
     pub uart: uart::Uart,
     pub mmc: mmc::Mmc,
+    pub gpu: gpu::Gpu,
     pub gic: gic::Gic,
     pub dirty: bool,
     pub unknown: Vec<u64>,
@@ -31,7 +35,8 @@ impl Soc {
         }
         if size == 8 { return Ok(self.read(addr,4)? | (self.read(addr+4,4)? << 32)); }
         self.dirty = true;
-        let word = if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
+        let word = if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.read((addr-0xfb000000)&!3)}
+        else if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
         else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
         else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)}
@@ -53,7 +58,8 @@ impl Soc {
                 else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)} else {0};
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};
-        if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
+        if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.write((addr-0xfb000000)&!3,v);}
+        else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
         else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_write((addr-GICR)&!3,v);}
@@ -78,6 +84,7 @@ impl Bus for Soc {
 
 pub struct Machine {
     pub cpu: Cpu,
+    pub gpu_probe: bool,
     pub soc: Soc,
     waiting: bool,
     next_check: u64,
@@ -87,14 +94,14 @@ pub struct Machine {
 impl Machine {
     pub fn new(ram_bytes: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
-        let mut soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gic:Default::default(),dirty:true,unknown:Vec::new()};
+        let mut soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gic:Default::default(),dirty:true,unknown:Vec::new()};
         let mut cpu=Cpu::new();
         cpu.profile=CpuProfile::CORTEX_A55;
         cpu.sys.cntfrq=CNTFRQ;
         cpu.sys.mpidr=0;
         cpu.ram=soc.ram.as_mut_ptr(); cpu.ram_len=ram_bytes as u64;
         cpu.firmware_calls_to_host=true;
-        Ok(Self{cpu,soc,waiting:false,next_check:0,irqs:0,exceptions:0})
+        Ok(Self{cpu,soc,gpu_probe:false,waiting:false,next_check:0,irqs:0,exceptions:0})
     }
     pub fn now(&self)->u64 {self.cpu.now_ns()}
     pub fn serial_input(&mut self,b:u8)->bool {self.soc.dirty=true;self.soc.uart.input(b)}
@@ -112,6 +119,7 @@ impl Machine {
         self.soc.gic.set_line(27,s.vtimer.firing(s.cnt.wrapping_sub(s.cntvoff)));
         self.soc.gic.set_line(UART_IRQ,self.soc.uart.irq());
         self.soc.gic.set_line(32+203,self.soc.mmc.irq());
+        for (i,spi) in [92,93,94].into_iter().enumerate() { self.soc.gic.set_line(32+spi,self.soc.gpu.irq(i)); }
         let irq=self.soc.gic.irq(); self.cpu.set_irq(irq,false);
         if irq {self.waiting=false;}
         self.soc.dirty=false; self.cpu.sys.timers_changed=false;

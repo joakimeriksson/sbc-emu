@@ -1,0 +1,9 @@
+# Experimental control-interface test; expected MCU failure, not a rendering test.
+# --board orangepi5 --gpu probe --sd Armbian.img --append init=/bin/bash
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; modprobe fixed; modprobe panthor; dmesg; echo PROBE-$((7*8))\n
+wait-serial Mali-G610 id 0xa867
+wait-serial Firmware git sha:
+wait-serial Failed to boot MCU
+wait-serial PROBE-56
+quit
