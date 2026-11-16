@@ -113,9 +113,9 @@ impl Soc {
         match self.net.as_mut() {
             Some(net) => {
                 for frame in std::mem::take(&mut self.emac.tx_out) {
-                    self.emac.rx_queue.extend(net.handle(&frame, now_us));
+                    self.emac.deliver(net.handle(&frame, now_us));
                 }
-                self.emac.rx_queue.extend(net.poll(now_us));
+                self.emac.deliver(net.poll(now_us));
             }
             None => self.emac.tx_out.clear(),
         }
