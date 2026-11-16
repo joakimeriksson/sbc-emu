@@ -577,7 +577,6 @@ impl Render<'_> {
             }
             let before = t.insns;
             let stop = t.run(code, &mut fe, 5_000_000);
-            crate::progress();
             if stop != crate::qpu::Stop::Done { crate::log_once(&format!("v3d: fragment shader stopped: {stop:?}")); }
             if stop == crate::qpu::Stop::Budget { code.runaway = true; }
             if d.occlusion != 0 { *fe.r.occlusion.entry(d.occlusion).or_default() += fe.passed; }

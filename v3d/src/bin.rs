@@ -35,7 +35,7 @@ impl Cl {
             // once it passes it: Mesa grows a list by branching to a new buffer, which can lie
             // below the first one, so the end of a long list is often below its start. A last
             // packet that steps over the end (a sloppy end address) ends it too.
-            if self.stack.is_empty() && (self.pc == self.end || (self.prev < self.end && self.pc > self.end && self.pc - self.prev <= 32)) { return None; }
+            if self.stack.is_empty() && (self.end == 0 || self.pc == self.end || (self.prev < self.end && self.pc > self.end && self.pc - self.prev <= 32)) { return None; }
             self.steps += 1;
             if self.steps > 50_000_000 { crate::log_once("v3d: runaway control list"); return None; }
             self.prev = self.pc;
@@ -243,7 +243,6 @@ pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coo
         t.vpm_out_base = in_seg;
         let before = t.insns;
         let stop = t.run(code, &mut env, 20_000_000);
-        crate::progress();
         match stop {
             Stop::Done => {}
             s => {

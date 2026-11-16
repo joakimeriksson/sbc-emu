@@ -65,7 +65,6 @@ pub fn run(cfg: &[u32], m: &mut Gmem, code: &mut Code, insns: &mut u64) {
                 if code.runaway { t.done = true; continue; }
                 let before = t.insns;
                 let stop = t.run(code, &mut env, 50_000_000);
-                crate::progress();
                 match stop {
                     Stop::Barrier => live = true,
                     Stop::Done => {}

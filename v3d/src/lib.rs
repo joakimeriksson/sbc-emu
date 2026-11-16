@@ -43,7 +43,10 @@ pub fn log_enabled() -> bool { LOG_ON.load(std::sync::atomic::Ordering::Relaxed)
 /// A diagnostic printed once per message (always).
 pub fn log_once(s: &str) { log_first(s); }
 
-/// Work done by jobs, counted as shader invocations finish. On hardware the registers Linux
+/// The top byte of the word a bin job leaves at the start of its tile-list memory.
+const MARK: u32 = 0xb100_0000;
+
+/// Work done by jobs, counted by `Thread::run` as shaders run. On hardware the registers Linux
 /// polls when a job overruns its 500 ms timeout (CTnCA for bin and render, CSD_CURRENT_CFG4 for
 /// compute) move as the job advances, and the kernel extends the timeout while they do. Here a
 /// job runs on the GPU thread and sets them only when it ends, so while one runs, reads show this
@@ -55,10 +58,17 @@ static PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 pub(crate) fn progress() { PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
 
 /// Log a message the first time it is seen; true if it was new.
+/// At most 256 distinct messages are kept (and printed), so a guest that faults at ever new
+/// addresses neither floods the terminal nor grows the set without bound.
 pub fn log_first(s: &str) -> bool {
-    let first = SEEN.with(|h| h.borrow_mut().insert(s.to_string()));
-    if first { eprintln!("\r{s}\r"); }
-    first
+    const MAX: usize = 256;
+    SEEN.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.len() >= MAX || h.contains(s) { return false; }
+        h.insert(s.to_string());
+        if h.len() == MAX { eprintln!("\r{s}\r\n\rv3d: further diagnostics suppressed\r"); } else { eprintln!("\r{s}\r"); }
+        true
+    })
 }
 
 /// Host time for job costs: `Instant` natively, the page's `performance.now()` in the browser.
@@ -218,10 +228,14 @@ impl Exec {
                     // place: a render job uses them only while it is still there, not after the
                     // buffer was freed and reused.
                     self.bins = self.bins.wrapping_add(1);
-                    r.marker = 0xb100_0000 | (self.bins & 0x00ff_ffff);
+                    r.marker = MARK | (self.bins & 0x00ff_ffff);
                     m.w32(qma, r.marker);
                     self.binned.insert(qma, std::sync::Arc::new(r));
                     self.bin_jobs.insert(qma, [start, end, qma, qms, qts]);
+                } else {
+                    // nothing binned: a render job must not find an earlier job's lists here
+                    self.binned.remove(&qma);
+                    self.bin_jobs.remove(&qma);
                 }
                 (0, false, if end != 0 { INT_FLDONE } else { 0 }, Some((CLE_CT0CA, end)), Some(CLE_BFC))
             }
@@ -233,7 +247,11 @@ impl Exec {
                     for q in render::tile_list_bases(start, end, &mut m) {
                         if self.binned.contains_key(&q) { continue; }
                         let Some(j) = self.bin_jobs.get(&q).copied() else { continue };
-                        if let Some(mut r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { r.marker = m.r32(q); self.binned.insert(q, std::sync::Arc::new(r)); }
+                        // only while the bin job's mark is still there: a buffer reused since
+                        // (zeroed, or holding other data) has no tile lists to replay
+                        let mark = m.r32(q);
+                        if mark >> 24 != MARK >> 24 { continue; }
+                        if let Some(mut r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { r.marker = mark; self.binned.insert(q, std::sync::Arc::new(r)); }
                     }
                 }
                 render::run(start, end, &self.binned, &mut m, &mut self.code, &mut self.insns);

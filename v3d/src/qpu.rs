@@ -651,14 +651,23 @@ impl Thread {
 
     fn msf_mask(&self) -> u16 { let mut m = 0; for l in 0..LANES { if self.msf[l] != 0 { m |= 1 << l; } } m }
 
-    /// Run until the program ends, hits a barrier or uses up `budget` instructions.
+    /// Run until the program ends, hits a barrier or uses up `budget` instructions. Counts as
+    /// GPU progress (see `crate::progress`) when it returns and every 2^20 instructions, so even
+    /// one long invocation keeps the kernel's job timeout from firing.
     pub fn run(&mut self, code: &mut crate::Code, env: &mut dyn Env, budget: u64) -> Stop {
+        let s = self.run_inner(code, env, budget);
+        crate::progress();
+        s
+    }
+
+    fn run_inner(&mut self, code: &mut crate::Code, env: &mut dyn Env, budget: u64) -> Stop {
         let stop_at = self.insns + budget;
         let tracing = crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0;
         while !self.done {
             if self.insns >= stop_at { return Stop::Budget; }
             let inst = code.fetch(self.pc, env);
             self.insns += 1;
+            if self.insns & 0xf_ffff == 0 { crate::progress(); }
             let snap = if tracing { Some((self.rf.clone(), self.acc)) } else { None };
             let this_pc = self.pc;
             self.pc = self.pc.wrapping_add(8);
