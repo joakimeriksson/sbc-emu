@@ -1,5 +1,5 @@
 #!/bin/sh
-# A writable copy of the Armbian image with Mesa (the lima driver), kmscube and a compiler,
+# A writable copy of the Armbian image with Mesa (the lima driver), kmscube, glmark2 and a compiler,
 # for the Mali-400 GPU: the root filesystem is grown to 4 GiB and the packages are
 # installed by the emulated board itself (Debian's armhf archive through the NAT, about
 # ten minutes with the JIT). Needs e2fsprogs (e2fsck, resize2fs; Homebrew: e2fsprogs).
@@ -33,7 +33,7 @@ cat > "$OUT/install.txt" <<SCRIPT
 wait-serial root@
 serial mount -o remount,rw /; mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp; mount -t tmpfs run /run; ip link set end0 up; ip addr add 10.0.2.15/24 dev end0; ip route add default via 10.0.2.2; [ -e /etc/resolv.conf.orig ] || mv /etc/resolv.conf /etc/resolv.conf.orig; echo nameserver 10.0.2.3 > /etc/resolv.conf; date -s @$NOW; echo NET-\$((6*7))\\n
 wait-serial NET-42
-serial apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends kmscube mesa-utils-bin libgl1-mesa-dri libegl-mesa0 libgles2 gcc libc6-dev libgles-dev libegl-dev libgbm-dev libdrm-dev pkg-config; echo APT-\$((6*7))-\$?\\n
+serial apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends kmscube glmark2-es2-drm mesa-utils-bin libgl1-mesa-dri libegl-mesa0 libgles2 gcc libc6-dev libgles-dev libegl-dev libgbm-dev libdrm-dev pkg-config; echo APT-\$((6*7))-\$?\\n
 wait-serial APT-42-
 serial mv /etc/resolv.conf.orig /etc/resolv.conf; sync; echo SYNC-\$((6*7))\\n
 wait-serial SYNC-42
