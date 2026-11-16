@@ -7,10 +7,13 @@ pub mod gpu_cs;
 pub mod gpu;
 pub mod uart;
 pub mod mmc;
+pub mod phy;
+pub mod gmac;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
 
+pub const GMAC: u64 = 0xfe1c_0000;
 pub const MMC: u64 = 0xfe2c_0000;
 pub const UART2: u64 = 0xfeb5_0000;
 pub const GICD: u64 = 0xfe60_0000;
@@ -23,6 +26,8 @@ pub struct Soc {
     pub uart: uart::Uart,
     pub mmc: mmc::Mmc,
     pub gpu: gpu::Gpu,
+    pub gmac: gmac::Gmac,
+    pub net: Option<sbc_net::net::VirtualNet>,
     pub gic: gic::Gic,
     pub dirty: bool,
     pub unknown: Vec<u64>,
@@ -36,6 +41,7 @@ impl Soc {
         if size == 8 { return Ok(self.read(addr,4)? | (self.read(addr+4,4)? << 32)); }
         self.dirty = true;
         let word = if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.read((addr-0xfb000000)&!3)}
+        else if (GMAC..GMAC+0x10000).contains(&addr) { self.gmac.read((addr-GMAC)&!3) }
         else if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
         else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
@@ -59,6 +65,7 @@ impl Soc {
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};
         if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.write((addr-0xfb000000)&!3,v);}
+        else if (GMAC..GMAC+0x10000).contains(&addr) {self.gmac.write((addr-GMAC)&!3,v);}
         else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
@@ -88,20 +95,29 @@ pub struct Machine {
     pub soc: Soc,
     waiting: bool,
     next_check: u64,
+    next_net_poll: u64,
     pub irqs: u64,
     pub exceptions: u64,
 }
 impl Machine {
     pub fn new(ram_bytes: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
-        let mut soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gic:Default::default(),dirty:true,unknown:Vec::new()};
+        let mut soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:Default::default(),dirty:true,unknown:Vec::new()};
         let mut cpu=Cpu::new();
         cpu.profile=CpuProfile::CORTEX_A55;
         cpu.sys.cntfrq=CNTFRQ;
         cpu.sys.mpidr=0;
         cpu.ram=soc.ram.as_mut_ptr(); cpu.ram_len=ram_bytes as u64;
         cpu.firmware_calls_to_host=true;
-        Ok(Self{cpu,soc,gpu_probe:false,waiting:false,next_check:0,irqs:0,exceptions:0})
+        Ok(Self{cpu,soc,gpu_probe:false,waiting:false,next_check:0,next_net_poll:0,irqs:0,exceptions:0})
+    }
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat { net.nat = Some(sbc_net::nat::Nat::new(log)); }
+        let _ = nat;
+        self.soc.gmac.phy.set_link(true);
+        self.soc.net = Some(net);
     }
     pub fn now(&self)->u64 {self.cpu.now_ns()}
     pub fn serial_input(&mut self,b:u8)->bool {self.soc.dirty=true;self.soc.uart.input(b)}
@@ -113,10 +129,23 @@ impl Machine {
             .filter(|&t|t>now).min().unwrap_or(now.saturating_add(10_000_000))
     }
     fn update(&mut self) {
+        self.soc.gmac.service(&mut self.soc.ram);
+        if let Some(net) = &mut self.soc.net {
+            let now_us = self.cpu.now_ns() / 1000;
+            for frame in std::mem::take(&mut self.soc.gmac.tx_out) {
+                self.soc.gmac.rx_queue.extend(net.handle(&frame, now_us));
+            }
+            if self.cpu.now_ns() >= self.next_net_poll {
+                self.soc.gmac.rx_queue.extend(net.poll(now_us));
+                self.next_net_poll = self.cpu.now_ns().saturating_add(1_000_000);
+            }
+            self.soc.gmac.service(&mut self.soc.ram);
+        } else { self.soc.gmac.tx_out.clear(); }
         self.cpu.refresh_counter();
         let s=&self.cpu.sys;
         self.soc.gic.set_line(30,s.ptimer.firing(s.cnt));
         self.soc.gic.set_line(27,s.vtimer.firing(s.cnt.wrapping_sub(s.cntvoff)));
+        self.soc.gic.set_line(32+234,self.soc.gmac.irq());
         self.soc.gic.set_line(UART_IRQ,self.soc.uart.irq());
         self.soc.gic.set_line(32+203,self.soc.mmc.irq());
         for (i,spi) in [92,93,94].into_iter().enumerate() { self.soc.gic.set_line(32+spi,self.soc.gpu.irq(i)); }
@@ -135,7 +164,7 @@ impl Machine {
         for _ in 0..budget {
             if self.cpu.instret>=end {return Stop::Budget;}
             if self.soc.dirty || self.cpu.sys.timers_changed || self.now()>=self.next_check {self.update();}
-            if self.waiting {return Stop::Idle(self.deadline());}
+            if self.waiting {return Stop::Idle(self.deadline().min(self.next_check));}
             self.cpu.chain_until=self.cpu.instret.saturating_add(self.next_check.saturating_sub(self.now())).min(end);
             match self.cpu.step(&mut self.soc) {
                 Ok(())=>storm=0,

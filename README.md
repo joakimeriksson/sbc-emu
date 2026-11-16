@@ -14,7 +14,7 @@ instruction, in the style of [esp32sim](https://github.com/mikroverk/esp32sim):
 | Board | SoC | Status | Details |
 |---|---|---|---|
 | Raspberry Pi 4 Model B | Broadcom BCM2711, 4× Cortex-A72 | **complete enough for real use**: unmodified Raspberry Pi OS and Ubuntu 26.04 Desktop, V3D GPU (OpenGL ES 3.1, Vulkan 1.3), HDMI, USB, Ethernet, Wi-Fi, Bluetooth, audio, a JIT, and a WebAssembly build | [below](#raspberry-pi-4-model-b) |
-| Orange Pi 5 | Rockchip RK3588S | **experimental**: one Cortex-A55, GICv3, UART; a Debian kernel to a BusyBox shell by direct boot | [docs/orangepi5.md](docs/orangepi5.md) |
+| Orange Pi 5 | Rockchip RK3588S | **experimental**: one Cortex-A55, GICv3, UART, Ethernet; a Debian kernel to a BusyBox shell by direct boot | [docs/orangepi5.md](docs/orangepi5.md) |
 | Orange Pi One | Allwinner H3, 4× Cortex-A7 | **experimental**: four Cortex-A7s on the 32-bit core (`arm-a32`, with a JIT to AArch64), Thumb-2, VFPv4, NEON; the unmodified Armbian 26.8.1 SD image to its login prompt (Thumb-2 kernel, systemd), HDMI console over VNC with a USB keyboard and tablet, Ethernet with NAT, or Alpine by direct boot | [docs/orangepi-one.md](docs/orangepi-one.md) |
 | ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12/A17 | **experimental**: four Cortex-A12s on `arm-a32` started through the boot ROM mailbox (`rockchip,rk3066-smp`); a Debian armmp kernel and the stock DTB to a BusyBox shell by direct boot (`scripts/tinkerboard-shell.txt`); the same SoC as the vendor's first panel board generation | [docs/rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
 

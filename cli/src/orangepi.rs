@@ -22,10 +22,12 @@ pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu"])?;
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net"])?;
     if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
     let gpu=arg(args,"--gpu").unwrap_or("none");
     if !["none","probe"].contains(&gpu) {return Err("--gpu accepts none or probe (experimental, no rendering)".into());}
+    let net=arg(args,"--net").unwrap_or("local");
+    if !["none","local","nat"].contains(&net) {return Err("--net must be none, local or nat".into());}
     let kernel=arg(args,"--kernel").map(std::fs::read).transpose().map_err(|e|e.to_string())?;
     if kernel.is_none() && arg(args,"--sd").is_none() { return Err("provide --kernel Image or --sd IMAGE".into()); }
     if kernel.is_none() && arg(args,"--initrd").is_some() { return Err("--initrd requires --kernel".into()); }
@@ -38,6 +40,7 @@ fn execute(args:&[String])->Result<(),String> {
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::new(ram)?;
         m.gpu_probe=gpu=="probe";
+        if net != "none" { m.connect_network(net == "nat", false); }
         m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
         if let Some(kernel)=kernel.as_ref() {
             rk3588::boot::boot_linux(&mut m,kernel,initrd.as_deref(),cmdline)?;
