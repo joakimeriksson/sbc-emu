@@ -44,9 +44,10 @@ pub(crate) const U_READ: usize = 0;
 pub(crate) const U_WRITE: usize = 1;
 pub(crate) const U_EXEC: usize = 2;
 
-/// One micro-TLB entry: `tag` is the virtual page (`va & !0xfff`; 1 = invalid, which no
-/// masked address equals) and `delta` is added to a virtual address in that page to give
-/// the host address of its byte.
+/// One micro-TLB entry: `tag` is the virtual page (`va & !0xfff`; 0x800 = invalid: probes
+/// compare it with the address masked to its page and alignment bits, which never has bit
+/// 11 set) and `delta` is added to a virtual address in that page to give the host address
+/// of its byte.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct Utlb {
@@ -55,7 +56,7 @@ pub(crate) struct Utlb {
 }
 
 impl Utlb {
-    pub(crate) const INVALID: Self = Self { tag: 1, delta: 0 };
+    pub(crate) const INVALID: Self = Self { tag: 0x800, delta: 0 };
 }
 
 pub(crate) fn utlb_table(privileged: bool, kind: usize) -> usize {

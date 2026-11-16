@@ -225,8 +225,8 @@ const FRONT: usize = 1 << 14;
 const HOTC: usize = 1 << 14;
 
 /// Block key beyond the virtual PC: physical PC and privilege.
-fn key(pa: u32, privileged: bool) -> u64 {
-    pa as u64 | (privileged as u64) << 32
+fn key(pa: u32, privileged: bool, thumb: bool) -> u64 {
+    pa as u64 | (privileged as u64) << 32 | (thumb as u64) << 33
 }
 
 pub struct Jit {
@@ -371,7 +371,8 @@ impl Cpu {
     }
 
     pub(crate) fn jit_step(&mut self, bus: &mut dyn Bus) -> Option<Result<(), Trap>> {
-        if self.thumb() {
+        // inside an IT block: the interpreter runs it out
+        if self.cpsr & 0x0600_fc00 != 0 {
             return None;
         }
         let pc = self.r[15];
@@ -386,7 +387,8 @@ impl Cpu {
         }
         let host = self.utlb[slot].delta.wrapping_add(pc as u64);
         let pa = (host - self.ram as u64) as u32 + self.ram_base;
-        let k = (pc, key(pa, privileged));
+        let thumb = self.thumb();
+        let k = (pc, key(pa, privileged, thumb));
         let jit = self.jit.as_mut()?;
         let fs = front_slot(pc);
         let f: BlockFn = if jit.front[fs].pc == k.0 && jit.front[fs].key == k.1 {
@@ -406,7 +408,7 @@ impl Cpu {
                 self.interp_run = true;
                 return None;
             }
-            let f = self.compile(pc, pa, privileged, host as *const u8)?;
+            let f = self.compile(pc, pa, privileged, thumb, host as *const u8)?;
             let jit = self.jit.as_mut()?;
             jit.blocks.insert(k, f);
             jit.pages.entry(pa >> 12).or_default().push(k);
@@ -444,14 +446,44 @@ impl Cpu {
     }
 
     /// Translate the block at virtual `pc` (physical `pa`, host address `code`).
-    fn compile(&mut self, pc: u32, pa: u32, privileged: bool, code: *const u8) -> Option<BlockFn> {
+    fn compile(&mut self, pc: u32, pa: u32, privileged: bool, thumb: bool, code: *const u8) -> Option<BlockFn> {
         let c = ctx();
         let mut e = Emit::new(&c);
         e.chain = self.jit.as_ref().is_some_and(|j| j.disp != 0);
         e.prologue(privileged);
         assert_eq!(e.out.len(), PROLOGUE_WORDS + 3);
         let mut n = 0u32;
-        loop {
+        if thumb {
+            e.thumb = true;
+            let mut at = pc;
+            loop {
+                let off = at.wrapping_sub(pc) as usize;
+                // SAFETY: `code` maps the rest of this RAM page; the loop stops at its end
+                let hw1 = unsafe { (code.add(off) as *const u16).read() } as u32;
+                let wide = hw1 >> 11 >= 0b11101;
+                if wide && at & 0xfff == 0xffe {
+                    // straddles the page: leave it to the interpreter
+                    if n == 0 {
+                        return None;
+                    }
+                    e.exit_const(at, n);
+                    break;
+                }
+                // SAFETY: as above (the second halfword is in the same page)
+                let hw2 = if wide { u32::from(unsafe { (code.add(off + 2) as *const u16).read() }) } else { 0 };
+                let end = e.thumb_insn(hw1, hw2, at, n);
+                n += 1;
+                at = at.wrapping_add(if wide { 4 } else { 2 });
+                if end {
+                    break;
+                }
+                if n >= MAX_INSNS || at & 0xfff == 0 {
+                    e.exit_const(at, n);
+                    break;
+                }
+            }
+        }
+        while !thumb {
             let at = pc.wrapping_add(4 * n);
             // SAFETY: `code` maps the rest of this RAM page; the loop stops at its end
             let insn = unsafe { (code.add(4 * n as usize) as *const u32).read() };
@@ -490,8 +522,9 @@ unsafe extern "C" fn h_step(cpu: *mut Cpu, pc: u32, before: u32, flags: u32) -> 
     let cpu = &mut *cpu;
     let bus = &mut *cpu.jit_bus.expect("bus");
     let last = flags & 1;
+    let next = pc.wrapping_add(if flags & 8 != 0 { 2 } else { 4 });
     if PROFILE.load(Relaxed) {
-        profile(cpu, pc, flags >> 1);
+        profile(cpu, pc, (flags >> 1) & 1);
     }
     let start = cpu.instret;
     cpu.instret = start.wrapping_add(before as u64);
@@ -501,7 +534,7 @@ unsafe extern "C" fn h_step(cpu: *mut Cpu, pc: u32, before: u32, flags: u32) -> 
     cpu.io = false;
     match cpu.exec_one(bus) {
         Ok(()) => {
-            let same = cpu.r[15] == pc.wrapping_add(4)
+            let same = cpu.r[15] == next
                 && cpu.cpsr & !0xf80f_0000 == state
                 && !cpu.io
                 && !cpu.tlb_broadcast
@@ -546,8 +579,14 @@ fn profile(cpu: &Cpu, pc: u32, why: u32) {
         .filter(|e| e.tag == (pc & !0xfff) as u64)
         // SAFETY: the entry maps this page of RAM
         .map_or(0, |e| unsafe { (e.delta.wrapping_add(pc as u64) as *const u32).read() });
+    let (word, class) = if cpu.thumb() {
+        let w = word << 16 | word >> 16;
+        if w >> 27 >= 0b11101 { (w, w & 0xfff0_f000) } else { (w >> 16, w >> 16 & 0xff00 | 1) }
+    } else {
+        (word, word & 0x0ff0_00f0)
+    };
     let mut map = FALLBACKS.lock().unwrap();
-    let e = map.get_or_insert_with(HashMap::new).entry((word & 0x0ff0_00f0, why)).or_insert((0, word));
+    let e = map.get_or_insert_with(HashMap::new).entry((class, why)).or_insert((0, word));
     e.0 += 1;
 }
 
@@ -700,6 +739,7 @@ struct Slow {
     pc: u32,
     before: u32,
     resume: usize,
+    size: u32,
 }
 
 struct Emit<'a> {
@@ -712,11 +752,15 @@ struct Emit<'a> {
     exit_h: usize,
     /// native exits continue through the dispatcher
     chain: bool,
+    /// compiling Thumb code (PC reads are the address + 4, literal bases are aligned)
+    thumb: bool,
+    /// size of the instruction being emitted (2 or 4)
+    size: u32,
 }
 
 impl<'a> Emit<'a> {
     fn new(c: &'a Ctx) -> Self {
-        let mut e = Emit { out: Vec::with_capacity(512), c, labels: Vec::new(), fixes: Vec::new(), slow: Vec::new(), exit_h: 0, chain: false };
+        let mut e = Emit { out: Vec::with_capacity(512), c, labels: Vec::new(), fixes: Vec::new(), slow: Vec::new(), exit_h: 0, chain: false, thumb: false, size: 4 };
         e.exit_h = e.label();
         e
     }
@@ -763,7 +807,7 @@ impl<'a> Emit<'a> {
     /// Guest register `n` (PC reads give `pc + 8`) into host `rd`.
     fn load(&mut self, rd: u32, n: u32, pc: u32) {
         if n == 15 {
-            self.mov32(rd, pc.wrapping_add(8));
+            self.mov32(rd, pc.wrapping_add(if self.thumb { 4 } else { 8 }));
         } else {
             self.p(ldr_w(rd, X_CPU, self.reg_off(n)));
         }
@@ -839,13 +883,21 @@ impl<'a> Emit<'a> {
         self.br(0x3700_0000 | r, thumb); // tbnz wr, #0, thumb
         self.p(and_imm(r, r, 0xffff_fffc));
         self.p(str_w(r, X_CPU, self.reg_off(15)));
+        if self.thumb {
+            // to ARM state
+            self.p(ldr_w(15, X_CPU, self.c.cpsr));
+            self.p(and_imm(15, 15, !(1 << 5)));
+            self.p(str_w(15, X_CPU, self.c.cpsr));
+        }
         self.save_flags();
         self.add_instret(count);
         self.leave();
         self.bind(thumb);
         self.p(and_imm(r, r, 0xffff_fffe));
         self.p(str_w(r, X_CPU, self.reg_off(15)));
-        self.set_thumb();
+        if !self.thumb {
+            self.set_thumb();
+        }
         self.save_flags();
         self.add_instret(count);
         self.epilogue(0);
@@ -863,7 +915,7 @@ impl<'a> Emit<'a> {
         self.p(0xaa13_03e0); // mov x0, x19
         self.mov32(1, pc);
         self.mov32(2, before);
-        self.mov32(3, last as u32 | why << 1);
+        self.mov32(3, last as u32 | why << 1 | u32::from(self.size == 2) << 3);
         self.mov64(16, h_step as *const () as usize as u64);
         self.p(0xd63f_0200); // blr x16
         if last {
@@ -888,11 +940,21 @@ impl<'a> Emit<'a> {
         self.br(0xb500_000f, slow); // cbnz x15, slow
     }
 
+    /// Probe for two words at the 4-aligned address in host `a` (LDRD/STRD): both in one
+    /// page; on a hit x16 holds the delta.
+    fn probe_pair(&mut self, a: u32, write: bool, slow: usize) {
+        self.p(addi_w(15, a, 4, false));
+        self.p(rrr(0x4a00_0000, 15, 15, a)); // eor w15, w15, wa
+        self.p(lsr_w(15, 15, 12));
+        self.br(0x3500_000f, slow); // cbnz w15, slow
+        self.probe(a, 4, write, slow);
+    }
+
     /// A slow path for the current instruction: interpret it, then resume after it.
     fn slow_path(&mut self, pc: u32, before: u32) -> (usize, usize) {
         let label = self.label();
         let resume = self.label();
-        self.slow.push(Slow { label, pc, before, resume });
+        self.slow.push(Slow { label, pc, before, resume, size: self.size });
         (label, resume)
     }
 
@@ -900,6 +962,7 @@ impl<'a> Emit<'a> {
         let slow = std::mem::take(&mut self.slow);
         for s in slow {
             self.bind(s.label);
+            self.size = s.size;
             self.call_interp(s.pc, s.before, false, 1);
             self.br(0x1400_0000, s.resume);
         }
@@ -1392,7 +1455,11 @@ impl<'a> Emit<'a> {
     /// Base (into w9) and the offset-applied address (into `W_ADDR`) of a load/store; the
     /// accessed address is in the returned register.
     fn address(&mut self, rn: u32, pc: u32, pre: bool, up: bool, offset: Option<u32>) -> u32 {
-        self.load(W_RN, rn, pc);
+        if self.thumb && rn == 15 {
+            self.mov32(W_RN, pc.wrapping_add(4) & !3); // Align(PC, 4)
+        } else {
+            self.load(W_RN, rn, pc);
+        }
         match offset {
             Some(0) => self.p(mov_w(W_ADDR, W_RN)),
             Some(imm) if imm < 4096 => self.p(addi_w(W_ADDR, W_RN, imm, !up)),
@@ -1466,7 +1533,7 @@ impl<'a> Emit<'a> {
     fn after_pc_load(&mut self, resume: usize, insn: u32, pc: u32, n: u32) -> bool {
         self.bind(resume);
         if insn >> 28 == 14 {
-            self.exit_const(pc.wrapping_add(4), n + 1);
+            self.exit_const(pc.wrapping_add(self.size), n + 1);
             return true;
         }
         false
@@ -1497,9 +1564,13 @@ impl<'a> Emit<'a> {
             None
         };
         let a = self.address(rn, pc, pre, up, offset);
-        let size = if pair { 8 } else if half { 2 } else { 1 };
+        let size = if half { 2 } else { 1 };
         let (slow, resume) = self.slow_path(pc, n);
-        self.probe(a, size, pair && half || !pair && !load, slow);
+        if pair {
+            self.probe_pair(a, half, slow);
+        } else {
+            self.probe(a, size, !load, slow);
+        }
         if pair {
             self.p(0x8b20_4000 | a << 16 | 16 << 5 | 16); // add x16, x16, wa, uxtw
             if half {
@@ -1609,7 +1680,9 @@ fn dispatcher(c: &Ctx) -> Vec<u32> {
     e.p(0xeb0a_013f); // cmp x9, x10
     e.br(0x5400_0002, ret); // b.hs ret
     e.p(ldr_w(9, X_CPU, c.cpsr));
-    e.br(0x3728_0009, ret); // tbnz w9, #5, ret (Thumb)
+    e.mov32(12, 0x0600_fc00);
+    e.p(0x6a0c_013f); // tst w9, w12 (ITSTATE)
+    e.br(0x5400_0001, ret); // b.ne ret: the interpreter runs IT blocks
     e.p(and_imm(10, 9, 0x1f));
     e.p(0x7100_415f); // cmp w10, #0x10
     e.p(0x1a9f_07ea); // cset w10, ne (privileged)
@@ -1630,6 +1703,8 @@ fn dispatcher(c: &Ctx) -> Vec<u32> {
     e.p(ldr_w(17, X_CPU, c.ram_base));
     e.p(0x0b11_0210); // add w16, w16, w17 (physical pc, upper half zero)
     e.p(0xaa0a_8210); // orr x16, x16, x10, lsl #32 (key)
+    e.p(ubfm_w(12, 9, 5, 5)); // ubfx w12, w9, #5, #1 (Thumb)
+    e.p(0xaa0c_8610); // orr x16, x16, x12, lsl #33
     // front cache slot ((pc ^ pc >> 14) >> 2) & (FRONT - 1), 24-byte entries
     e.p(0x4a4b_396c); // eor w12, w11, w11, lsr #14
     e.p(ubfm_w(12, 12, 2, 15)); // ubfx w12, w12, #2, #14
@@ -1650,6 +1725,9 @@ fn dispatcher(c: &Ctx) -> Vec<u32> {
     // finish() appends the (unused) h_step exit and patches the branches
     e.finish()
 }
+
+#[path = "jit_t32.rs"]
+mod t32;
 
 /// Does this (conditional-space, interpreted) instruction always write the PC?
 fn writes_pc(insn: u32) -> bool {
