@@ -409,7 +409,29 @@ fn random_thumb_blocks_match_the_interpreter() {
         let len = 1 + rng.below(30) as usize;
         let mut code: Vec<u16> = Vec::new();
         for _ in 0..len {
-            code.extend(gen_thumb(&mut rng));
+            if rng.below(6) == 0 {
+                // an IT block of 1-4 single instructions
+                let firstcond = rng.below(14);
+                let k = 1 + rng.below(4);
+                let mut mask = 1 << (4 - k);
+                for i in 1..k {
+                    let then = rng.below(2) == 0;
+                    let bit = (firstcond & 1) ^ u32::from(!then);
+                    mask |= bit << (4 - i);
+                }
+                code.push((0xbf00 | firstcond << 4 | mask) as u16);
+                let mut done = 0;
+                while done < k {
+                    let v = gen_thumb(&mut rng);
+                    let single = v.len() == 1 || v.len() == 2 && v[0] >> 11 >= 0b11101;
+                    if single {
+                        code.extend(v);
+                        done += 1;
+                    }
+                }
+            } else {
+                code.extend(gen_thumb(&mut rng));
+            }
         }
         code.push(0xbe00); // bkpt #0
         let seed = rng.next() as u64 | 1;

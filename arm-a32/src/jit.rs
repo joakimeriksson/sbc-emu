@@ -466,6 +466,10 @@ impl Cpu {
                     if n == 0 {
                         return None;
                     }
+                    if e.it != 0 {
+                        let it = e.it;
+                        e.write_itstate(it);
+                    }
                     e.exit_const(at, n);
                     break;
                 }
@@ -477,7 +481,11 @@ impl Cpu {
                 if end {
                     break;
                 }
-                if n >= MAX_INSNS || at & 0xfff == 0 {
+                if n >= MAX_INSNS && e.it == 0 || at & 0xfff == 0 {
+                    if e.it != 0 {
+                        let it = e.it;
+                        e.write_itstate(it);
+                    }
                     e.exit_const(at, n);
                     break;
                 }
@@ -534,8 +542,12 @@ unsafe extern "C" fn h_step(cpu: *mut Cpu, pc: u32, before: u32, flags: u32) -> 
     cpu.io = false;
     match cpu.exec_one(bus) {
         Ok(()) => {
+            // the block tracks IT blocks itself (ITSTATE is only in the CPSR while the
+            // interpreter runs one of their instructions): continue only once it is clear
+            const IT: u32 = 0x0600_fc00;
             let same = cpu.r[15] == next
-                && cpu.cpsr & !0xf80f_0000 == state
+                && cpu.cpsr & !0xf80f_0000 & !IT == state & !IT
+                && cpu.cpsr & IT == 0
                 && !cpu.io
                 && !cpu.tlb_broadcast
                 && !cpu.sent_event
@@ -726,6 +738,8 @@ enum Carry {
     Const(bool),
     /// bit `.1` of host register `.0`
     Bit(u32, u32),
+    /// bit 0 of host w17
+    W17,
 }
 
 #[derive(Clone, Copy)]
@@ -740,6 +754,7 @@ struct Slow {
     before: u32,
     resume: usize,
     size: u32,
+    it: u32,
 }
 
 struct Emit<'a> {
@@ -756,11 +771,13 @@ struct Emit<'a> {
     thumb: bool,
     /// size of the instruction being emitted (2 or 4)
     size: u32,
+    /// Thumb ITSTATE of the instruction being emitted (0: not in an IT block)
+    it: u32,
 }
 
 impl<'a> Emit<'a> {
     fn new(c: &'a Ctx) -> Self {
-        let mut e = Emit { out: Vec::with_capacity(512), c, labels: Vec::new(), fixes: Vec::new(), slow: Vec::new(), exit_h: 0, chain: false, thumb: false, size: 4 };
+        let mut e = Emit { out: Vec::with_capacity(512), c, labels: Vec::new(), fixes: Vec::new(), slow: Vec::new(), exit_h: 0, chain: false, thumb: false, size: 4, it: 0 };
         e.exit_h = e.label();
         e
     }
@@ -912,6 +929,10 @@ impl<'a> Emit<'a> {
     /// Call the interpreter for the instruction at `pc` (see `h_step`).
     fn call_interp(&mut self, pc: u32, before: u32, last: bool, why: u32) {
         self.save_flags();
+        if self.it != 0 {
+            let it = self.it;
+            self.write_itstate(it);
+        }
         self.p(0xaa13_03e0); // mov x0, x19
         self.mov32(1, pc);
         self.mov32(2, before);
@@ -926,6 +947,20 @@ impl<'a> Emit<'a> {
             self.br(0x3500_0000, l); // cbnz w0, exit_h
             self.load_flags();
         }
+    }
+
+    /// Put ITSTATE `it` into the CPSR (for the interpreter, or when leaving inside an IT
+    /// block).
+    fn write_itstate(&mut self, it: u32) {
+        self.p(ldr_w(15, X_CPU, self.c.cpsr));
+        self.mov32(16, !0x0600_fc00);
+        self.p(rrr(0x0a00_0000, 15, 15, 16));
+        let bits = (it & 3) << 25 | (it >> 2) << 10;
+        if bits != 0 {
+            self.mov32(16, bits);
+            self.p(rrr(0x2a00_0000, 15, 15, 16));
+        }
+        self.p(str_w(15, X_CPU, self.c.cpsr));
     }
 
     /// Probe the micro-TLB for an aligned `size`-byte access at the address in host `a`;
@@ -954,7 +989,7 @@ impl<'a> Emit<'a> {
     fn slow_path(&mut self, pc: u32, before: u32) -> (usize, usize) {
         let label = self.label();
         let resume = self.label();
-        self.slow.push(Slow { label, pc, before, resume, size: self.size });
+        self.slow.push(Slow { label, pc, before, resume, size: self.size, it: self.it });
         (label, resume)
     }
 
@@ -963,6 +998,7 @@ impl<'a> Emit<'a> {
         for s in slow {
             self.bind(s.label);
             self.size = s.size;
+            self.it = s.it;
             self.call_interp(s.pc, s.before, false, 1);
             self.br(0x1400_0000, s.resume);
         }
@@ -1118,9 +1154,16 @@ impl<'a> Emit<'a> {
             self.load(15, rs, pc);
             self.p(and_imm(15, 15, 0xff));
             let kind = (insn >> 5) & 3;
+            if insn & (1 << 20) != 0 {
+                // S: the shifter carry into w17 (the caller needs it for logical operations)
+                self.shift_carry(kind);
+            }
             if kind == 3 {
                 self.p(rrr(0x1ac0_2c00, dst, W_SRC, 15)); // rorv: amount mod 32
-                return Some(Carry::Unchanged);
+                if insn & (1 << 20) != 0 {
+                    self.ror_carry(dst);
+                }
+                return Some(Carry::W17);
             }
             // amounts of 32 and more: force bit 5 so the 64-bit shift by (amount mod 64)
             // sees 32-63 (0, or the sign for ASR)
@@ -1136,7 +1179,7 @@ impl<'a> Emit<'a> {
                 }
             };
             self.p(rrr(op, dst, W_SRC, 15));
-            return Some(Carry::Unchanged);
+            return Some(Carry::W17);
         }
         let rm = insn & 0xf;
         let (kind, amount) = ((insn >> 5) & 3, (insn >> 7) & 0x1f);
@@ -1176,6 +1219,50 @@ impl<'a> Emit<'a> {
         })
     }
 
+    /// The carry of a register-specified LSL/LSR/ASR (amount in w15, value in w14) into
+    /// w17: amounts of 33 and more behave like 33; amount 0 keeps C. The guest flags are
+    /// restored afterwards.
+    fn shift_carry(&mut self, kind: u32) {
+        if kind == 3 {
+            return; // ROR: from the result (ror_carry)
+        }
+        self.p(MRS_NZCV | 8); // mrs x8, nzcv
+        self.p(0x7100_85ff); // cmp w15, #33
+        self.mov32(16, 33);
+        self.p(0x1a90_31f0); // csel w16, w15, w16, lo (min(amount, 33))
+        match kind {
+            0 => {
+                self.p(rrr(0x9ac0_2000, 17, W_SRC, 16)); // lslv x17, x14, x16
+                self.p(0xd360_fe31); // lsr x17, x17, #32
+            }
+            1 => {
+                self.p(0xd37f_f9d1); // lsl x17, x14, #1
+                self.p(rrr(0x9ac0_2400, 17, 17, 16)); // lsrv x17, x17, x16
+            }
+            _ => {
+                self.p(0x9340_7dd1); // sxtw x17, w14
+                self.p(0xd37f_fa31); // lsl x17, x17, #1
+                self.p(rrr(0x9ac0_2800, 17, 17, 16)); // asrv x17, x17, x16
+            }
+        }
+        self.p(and_imm(17, 17, 1));
+        self.keep_c_if_zero_amount();
+    }
+
+    /// ROR by register: C = bit 31 of the result (in `dst`), unchanged for amount 0.
+    fn ror_carry(&mut self, dst: u32) {
+        self.p(MRS_NZCV | 8);
+        self.p(lsr_w(17, dst, 31));
+        self.keep_c_if_zero_amount();
+    }
+
+    fn keep_c_if_zero_amount(&mut self) {
+        self.p(0x7100_01ff); // cmp w15, #0
+        self.p(ubfm_w(16, 8, 29, 29)); // ubfx w16, w8, #29, #1 (old C)
+        self.p(0x1a91_0211); // csel w17, w16, w17, eq
+        self.p(MSR_NZCV | 8); // msr nzcv, x8
+    }
+
     /// NZ from host `res`, C from `carry`, V unchanged (A32 logical operations with S).
     fn logic_flags(&mut self, res: u32, carry: Carry) {
         self.p(MRS_NZCV | 15);
@@ -1190,6 +1277,7 @@ impl<'a> Emit<'a> {
                 self.p(ubfm_w(17, src, bit, bit)); // ubfx w17, wsrc, #bit, #1
                 self.p(bfm_w(16, 17, 3, 0)); // bfi w16, w17, #29, #1
             }
+            Carry::W17 => self.p(bfm_w(16, 17, 3, 0)),
         }
         self.p(MSR_NZCV | 16);
     }
@@ -1201,7 +1289,7 @@ impl<'a> Emit<'a> {
         let reg_shift = insn & (1 << 25) == 0 && insn & 0x10 != 0;
         // SUBS PC etc. return from exceptions; a register shift has no native carry; PC
         // reads with a register shift are unpredictable
-        if rd == 15 && !test && s || reg_shift && (s && logical || rn == 15) {
+        if rd == 15 && !test && s || reg_shift && rn == 15 {
             return None;
         }
         let carry = self.operand2(insn, pc, W_OP)?;

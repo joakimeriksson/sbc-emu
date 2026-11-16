@@ -1,8 +1,10 @@
 //! Thumb (T16/T32) for the block JIT. Most encodings are the A32 instruction the
 //! interpreter's Thumb decoder (`thumb.rs`) maps them to, emitted through the A32 paths with
 //! Thumb PC reads; branches, CBZ/CBNZ, modified immediates, ORN, 12-bit offsets, literal
-//! loads and LDRD with any register pair are translated here. Instructions inside IT
-//! blocks are never compiled: IT leaves the block and the interpreter runs the block out.
+//! loads and LDRD with any register pair are translated here. IT blocks are compiled with
+//! their ITSTATE tracked statically: each instruction is guarded by its condition (16-bit
+//! ALU operations then do not set flags), and ITSTATE reaches the CPSR only when the
+//! interpreter runs one of them or the block leaves inside the IT block.
 use super::*;
 
 /// How a Thumb instruction is emitted.
@@ -25,6 +27,37 @@ impl Emit<'_> {
     pub(super) fn thumb_insn(&mut self, hw1: u32, hw2: u32, pc: u32, n: u32) -> bool {
         let wide = hw1 >> 11 >= 0b11101;
         self.size = if wide { 4 } else { 2 };
+        let it = self.it;
+        let is_it = !wide && hw1 & 0xff00 == 0xbf00 && hw1 & 0xf != 0;
+        if is_it {
+            if it != 0 || (hw1 >> 4) & 0xf == 15 {
+                // IT inside an IT block, or firstcond 1111: unpredictable, interpret
+                self.call_interp(pc, n, true, 0);
+                return true;
+            }
+            self.it = hw1 & 0xff;
+            return false;
+        }
+        let guard = (it != 0 && it >> 4 != 14).then(|| {
+            let l = self.label();
+            self.br(0x5400_0000 | ((it >> 4) ^ 1), l); // b.<inverse> skip
+            l
+        });
+        let end = self.thumb_body(hw1, hw2, wide, pc, n);
+        if it != 0 {
+            // ITAdvance
+            self.it = if it & 7 == 0 { 0 } else { it & 0xe0 | (it << 1) & 0x1f };
+        }
+        match guard {
+            Some(l) => {
+                self.bind(l);
+                false
+            }
+            None => end,
+        }
+    }
+
+    fn thumb_body(&mut self, hw1: u32, hw2: u32, wide: bool, pc: u32, n: u32) -> bool {
         let t = if wide { self.t32(hw1, hw2, pc, n) } else { self.t16(hw1, pc, n) };
         match t {
             T::A32(word) => match self.native(word, pc, n) {
@@ -62,7 +95,8 @@ impl Emit<'_> {
     }
 
     fn t16(&mut self, hw: u32, pc: u32, n: u32) -> T {
-        let s = 1 << 20; // never compiled inside an IT block: 16-bit ALU operations set flags
+        // 16-bit ALU operations set the flags outside IT blocks only
+        let s = if self.it == 0 { 1 << 20 } else { 0 };
         let (r0, r3, r6, r8) = (hw & 7, (hw >> 3) & 7, (hw >> 6) & 7, (hw >> 8) & 7);
         let imm8 = hw & 0xff;
         let pc4 = pc.wrapping_add(4);
