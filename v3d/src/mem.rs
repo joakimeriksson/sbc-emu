@@ -26,7 +26,9 @@ impl<'a> Gmem<'a> {
             let pte = u32::from_le_bytes(self.ram.get(e..e + 4)?.try_into().ok()?);
             if pte & PTE_VALID == 0 {
                 self.faults += 1;
-                if self.faults <= 8 { crate::log(&format!("v3d: MMU fault at {va:#010x} (pte {pte:#x})")); }
+                // always reported (each distinct one once): a read of an unmapped page returns zeros, which
+                // shows up much later as a wrong uniform, texture state or vertex
+                if self.faults <= 8 { crate::log_once(&format!("v3d: MMU fault at {va:#010x} (pte {pte:#x})")); }
                 return None;
             }
             ((pte & 0x00ff_ffff) as usize) << 12

@@ -43,11 +43,32 @@ pub fn log_enabled() -> bool { LOG_ON.load(std::sync::atomic::Ordering::Relaxed)
 /// A diagnostic printed once per message (always).
 pub fn log_once(s: &str) { log_first(s); }
 
+/// The top byte of the word a bin job leaves at the start of its tile-list memory.
+const MARK: u32 = 0xb100_0000;
+
+/// Work done by jobs, counted by `Thread::run` as shaders run. On hardware the registers Linux
+/// polls when a job overruns its 500 ms timeout (CTnCA for bin and render, CSD_CURRENT_CFG4 for
+/// compute) move as the job advances, and the kernel extends the timeout while they do. Here a
+/// job runs on the GPU thread and sets them only when it ends, so while one runs, reads show this
+/// count mixed in: otherwise a job taking more than about a second of host time (a ray-marching
+/// WebGL demo, say) looks hung, the kernel resets the GPU and the frame is lost. A shader that
+/// really never ends is still stopped by its instruction budget.
+static PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn progress() { PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+
 /// Log a message the first time it is seen; true if it was new.
+/// At most 256 distinct messages are kept (and printed), so a guest that faults at ever new
+/// addresses neither floods the terminal nor grows the set without bound.
 pub fn log_first(s: &str) -> bool {
-    let first = SEEN.with(|h| h.borrow_mut().insert(s.to_string()));
-    if first { eprintln!("\r{s}\r"); }
-    first
+    const MAX: usize = 256;
+    SEEN.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.len() >= MAX || h.contains(s) { return false; }
+        h.insert(s.to_string());
+        if h.len() == MAX { eprintln!("\r{s}\r\n\rv3d: further diagnostics suppressed\r"); } else { eprintln!("\r{s}\r"); }
+        true
+    })
 }
 
 /// Host time for job costs: `Instant` natively, the page's `performance.now()` in the browser.
@@ -150,6 +171,7 @@ const GMP_STATUS: usize = 0x800;
 const CSD_STATUS: usize = 0x900;
 const CSD_QUEUED_CFG0: usize = 0x904;
 const CSD_CURRENT_CFG0: usize = 0x920;
+const CSD_CURRENT_CFG4: usize = 0x930;
 pub const INT_FRDONE: u32 = 1 << 0;
 pub const INT_FLDONE: u32 = 1 << 1;
 pub const INT_OUTOMEM: u32 = 1 << 2;
@@ -175,6 +197,8 @@ pub struct Exec {
     pub jobs: [u64; 4],
     pub insns: u64,
     pub host_ns: [u64; 4],
+    /// bin jobs run, for the marks they leave in tile list memory
+    bins: u32,
 }
 
 /// A job as the kernel started it.
@@ -198,7 +222,21 @@ impl Exec {
             &Job::Bin { start, end, qma, qms, qts } => {
                 self.code.clear();
                 let res = bin::run(start, end, qma, qms, qts, &mut m, &mut self.code, &mut self.insns);
-                if let Some(r) = res { self.binned.insert(qma, std::sync::Arc::new(r)); self.bin_jobs.insert(qma, [start, end, qma, qms, qts]); }
+                if let Some(mut r) = res {
+                    // Hardware writes the tile lists into this memory, and a render job reads
+                    // whatever is there. Here they stay on the host, so leave a mark in their
+                    // place: a render job uses them only while it is still there, not after the
+                    // buffer was freed and reused.
+                    self.bins = self.bins.wrapping_add(1);
+                    r.marker = MARK | (self.bins & 0x00ff_ffff);
+                    m.w32(qma, r.marker);
+                    self.binned.insert(qma, std::sync::Arc::new(r));
+                    self.bin_jobs.insert(qma, [start, end, qma, qms, qts]);
+                } else {
+                    // nothing binned: a render job must not find an earlier job's lists here
+                    self.binned.remove(&qma);
+                    self.bin_jobs.remove(&qma);
+                }
                 (0, false, if end != 0 { INT_FLDONE } else { 0 }, Some((CLE_CT0CA, end)), Some(CLE_BFC))
             }
             &Job::Render { start, end } => {
@@ -209,7 +247,11 @@ impl Exec {
                     for q in render::tile_list_bases(start, end, &mut m) {
                         if self.binned.contains_key(&q) { continue; }
                         let Some(j) = self.bin_jobs.get(&q).copied() else { continue };
-                        if let Some(r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { self.binned.insert(q, std::sync::Arc::new(r)); }
+                        // only while the bin job's mark is still there: a buffer reused since
+                        // (zeroed, or holding other data) has no tile lists to replay
+                        let mark = m.r32(q);
+                        if mark >> 24 != MARK >> 24 { continue; }
+                        if let Some(mut r) = bin::run(j[0], j[1], j[2], j[3], j[4], &mut m, &mut self.code, &mut self.insns) { r.marker = mark; self.binned.insert(q, std::sync::Arc::new(r)); }
                     }
                 }
                 render::run(start, end, &self.binned, &mut m, &mut self.code, &mut self.insns);
@@ -278,7 +320,7 @@ impl V3d {
     pub fn new() -> V3d {
         LOG_ON.store(std::env::var_os("SBC_V3D_LOG").is_some(), std::sync::atomic::Ordering::Relaxed);
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
-        let exec = Exec { code: Code::default(), binned: HashMap::new(), bin_jobs: HashMap::new(), jobs: [0; 4], insns: 0, host_ns: [0; 4] };
+        let exec = Exec { code: Code::default(), binned: HashMap::new(), bin_jobs: HashMap::new(), jobs: [0; 4], insns: 0, host_ns: [0; 4], bins: 0 };
         let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], exec: std::sync::Arc::new(std::sync::Mutex::new(exec)),
             #[cfg(not(target_arch = "wasm32"))] worker: None, gen: 0, gen_now: Default::default(), powered: true, now: 0, pending: Vec::new(),
             time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false };
@@ -308,6 +350,13 @@ impl V3d {
 
     /// Statistics: (jobs per kind, QPU instructions, host ns per kind).
     pub fn counters(&self) -> ([u64; 4], u64, [u64; 4]) { let e = self.exec(); (e.jobs, e.insns, e.host_ns) }
+
+    /// Whether the GPU thread has a job in hand.
+    fn running(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(w) = self.worker.as_ref() { return w.busy.load(std::sync::atomic::Ordering::Acquire) != 0; }
+        false
+    }
 
     /// Wait for the GPU thread to finish its jobs, then take their results.
     pub fn drain(&mut self) {
@@ -439,6 +488,9 @@ impl V3d {
                 CLE_CT0CS | 0x104 => 0,  // not running
                 GMP_STATUS => 0,
                 CSD_STATUS => 0,
+                CLE_CT0CA | CLE_CT1CA | CSD_CURRENT_CFG4 if self.running() => {
+                    self.core[o / 4] ^ (PROGRESS.load(std::sync::atomic::Ordering::Relaxed) << 4)
+                }
                 _ => self.core[o / 4],
             }
         }
@@ -544,5 +596,33 @@ impl V3d {
         e.bin_jobs.clear();
         for _ in 0..r.u64()? { let mut j = [0u32; 5]; for x in j.iter_mut() { *x = r.u32()?; } e.bin_jobs.insert(j[2], j); }
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// While a job runs on the GPU thread, the register Linux polls on a timeout moves, so a long
+    /// job is not taken for a hung GPU; once it ends, the register reads as written.
+    #[test]
+    fn long_job_shows_progress() {
+        let mut ram = vec![0u8; 0x4000];
+        // at 0x1000, a shader that ends at once: two thread switches mark the final section, the
+        // next one ends the thread after its two delay slots
+        let nop = 0x3c00_3186_bb80_0000u64;
+        let thrsw = nop | 1 << 53;
+        for (k, w) in [thrsw, thrsw, nop, thrsw, nop, nop].iter().enumerate() { ram[0x1000 + k * 8..0x1008 + k * 8].copy_from_slice(&w.to_le_bytes()); }
+        let mut v = V3d::new();
+        v.wall_clock = true;
+        // 65535 x 8 workgroups of 16 invocations: half a million short batches
+        let cfg = [65535u32 << 16, 8 << 16, 1 << 16, 16 | 1 << 8, 7, 0x1000, 0x2000];
+        for k in (1..7).rev() { v.write(0x4000 + (CSD_QUEUED_CFG0 + 4 * k) as u64, cfg[k], &mut ram); }
+        v.write(0x4000 + CSD_QUEUED_CFG0 as u64, cfg[0], &mut ram);
+        let mut seen = std::collections::HashSet::new();
+        while v.running() { seen.insert(v.read(0x4000 + CSD_CURRENT_CFG4 as u64)); }
+        v.drain();
+        assert!(seen.len() > 1, "the batch register did not move while the job ran: {seen:?}");
+        assert_eq!(v.read(0x4000 + CSD_CURRENT_CFG4 as u64), 7, "after the job it reads as written");
     }
 }

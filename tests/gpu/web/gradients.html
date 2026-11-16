@@ -1,0 +1,56 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>gradients</title>
+<style>body { margin: 0; background: #222; color: #ff8; font: 14px monospace; } canvas { width: 640px; height: 400px; display: block; } #status { position: absolute; top: 4px; left: 8px; }</style>
+</head><body><canvas id="c" width="320" height="200"></canvas><div id="status"></div>
+<script src="gl.js"></script>
+<script>
+// Skia-style gradients: stops in a uniform block and in a plain uniform array, found by loops
+// with run-time indices and early exits, per pixel; four gradient kinds in one shader with a
+// branch on a uniform, and a texture lookup inside the stop loop.
+const gl = glDemo(document.getElementById('c'));
+const p = gl && gl.prog(FULLSCREEN_VS, `#version 300 es
+precision highp float; in vec2 uv; out vec4 o; uniform float t; uniform sampler2D noise;
+layout(std140) uniform Stops { vec4 pos[16]; vec4 col[16]; ivec4 n; };
+uniform vec4 extra[12]; uniform int nextra;
+vec4 lookup(float x) {
+  x = clamp(x, 0.0, 1.0); vec4 c = col[0];
+  for (int i = 1; i < n.x; i++) {
+    if (x <= pos[i].x) { float f = (x - pos[i - 1].x) / max(pos[i].x - pos[i - 1].x, 1e-5); c = mix(col[i - 1], col[i], f); break; }
+    c = col[i];
+  }
+  return c;
+}
+void main() {
+  int kind = int(uv.x * 2.0) + 2 * int(uv.y * 2.0);
+  vec2 q = fract(uv * 2.0) - 0.5;
+  float x;
+  if (kind == 0) x = q.x + 0.5 + 0.1 * sin(t);
+  else if (kind == 1) x = length(q) * 1.6;
+  else if (kind == 2) x = fract(atan(q.y, q.x) / 6.2831 + t * 0.05);
+  else { x = 0.0; for (int i = 0; i < nextra; i++) { x += extra[i].x * texture(noise, q * extra[i].yz + t * 0.02).r; if (x > 1.0) break; } }
+  vec4 c = lookup(x);
+  for (int i = 0; i < nextra; i++) if (int(extra[i].w) == kind) c.rgb *= 0.9 + 0.1 * extra[i].y;
+  o = vec4(c.rgb, 1.0);
+}`);
+if (p) {
+  gl.useProgram(p); fullscreenQuad(gl, p);
+  const n = 11, data = new Float32Array(16 * 4 * 2 + 4);
+  for (let i = 0; i < 16; i++) {
+    data[i * 4] = i < n ? i / (n - 1) : 2;
+    const h = i * 0.6;
+    data[64 + i * 4] = 0.5 + 0.5 * Math.cos(h); data[64 + i * 4 + 1] = 0.5 + 0.5 * Math.cos(h + 2); data[64 + i * 4 + 2] = 0.5 + 0.5 * Math.cos(h + 4); data[64 + i * 4 + 3] = 1;
+  }
+  new Int32Array(data.buffer)[128] = n;
+  const ub = gl.createBuffer(); gl.bindBuffer(gl.UNIFORM_BUFFER, ub); gl.bufferData(gl.UNIFORM_BUFFER, data, gl.STATIC_DRAW);
+  gl.uniformBlockBinding(p, gl.getUniformBlockIndex(p, 'Stops'), 0); gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, ub);
+  const extra = []; for (let i = 0; i < 12; i++) extra.push(0.04 + 0.006 * i, 1 + i * 0.3, 1 + (i % 4) * 0.5, i % 4);
+  gl.uniform4fv(gl.getUniformLocation(p, 'extra'), extra); gl.uniform1i(gl.getUniformLocation(p, 'nextra'), 12);
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  const px = new Uint8Array(64 * 64); for (let i = 0; i < px.length; i++) px[i] = (Math.sin(i * 12.9898) * 43758.5453 % 1 + 1) % 1 * 255;
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 64, 64, 0, gl.RED, gl.UNSIGNED_BYTE, px);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  const tl = gl.getUniformLocation(p, 't'), tick = fpsMeter(gl);
+  const frame = (ms) => { gl.uniform1f(tl, demoTime(ms)); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); tick(); requestAnimationFrame(frame); };
+  requestAnimationFrame(frame);
+}
+</script></body></html>
