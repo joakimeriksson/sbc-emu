@@ -1,5 +1,7 @@
 use crate::cru::{Cru, Grf, Pmu, CRU_SIZE, GRF_SIZE, PMU_SIZE};
 use crate::devices::Peripherals;
+use crate::dsi::{Dsi, DSI_SIZE};
+use crate::vop::{Vop, VOP_SIZE};
 use allwinner_h3::{Gic, Uart, NCPU};
 use arm_a32::{Cpu, CORTEX_A12};
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
@@ -19,6 +21,12 @@ pub const UART2_IRQ: usize = 32 + 57;
 pub const CRU_BASE: u64 = 0xff76_0000;
 pub const GRF_BASE: u64 = 0xff77_0000;
 pub const PMU_BASE: u64 = 0xff73_0000;
+/// The two display controllers, VOP-big and VOP-little (SPI 15 and 16, each shared with the
+/// VOP's IOMMU).
+pub const VOP_BASES: [u64; 2] = [0xff93_0000, 0xff94_0000];
+pub const VOP_IRQS: [usize; 2] = [32 + 15, 32 + 16];
+/// MIPI DSI host 0 (the panel board's panel).
+pub const DSI0_BASE: u64 = 0xff96_0000;
 pub const GICD_BASE: u64 = 0xffc0_1000;
 pub const GICC_BASE: u64 = 0xffc0_2000;
 const GICD_SIZE: u64 = 0x1000;
@@ -52,6 +60,14 @@ pub struct Soc {
     pub pmu: Pmu,
     /// SD/eMMC/SDIO hosts, I²C controllers and GPIO banks (`devices.rs`).
     pub periph: Peripherals,
+    /// VOP-big and VOP-little.
+    pub vop: [Vop; 2],
+    pub dsi: Dsi,
+    /// How the panel is mounted, in degrees counter-clockwise (the panel node's `rotation`):
+    /// the picture is turned the same way for screenshots and VNC, as the user sees it.
+    pub display_rotation: u32,
+    /// Desktop name for VNC viewers.
+    pub display_name: &'static str,
     /// Current 24 MHz time, set by the machine before each step.
     pub now: u64,
     /// A device register was accessed: interrupt lines must be re-evaluated.
@@ -75,6 +91,10 @@ impl Soc {
             grf: Grf::default(),
             pmu: Pmu::default(),
             periph: Peripherals::default(),
+            vop: Default::default(),
+            dsi: Dsi::default(),
+            display_rotation: 0,
+            display_name: "sbc-emu: RK3288",
             now: 0,
             dirty: true,
             stub_regs: Default::default(),
@@ -115,6 +135,41 @@ impl Soc {
         Self::in_region(addr, width, SRAM_BASE, SRAM_SIZE as u64)
     }
 
+    /// The running VOP (VOP-little first: it drives the panel board's panel).
+    fn active_vop(&self) -> Option<&Vop> {
+        [&self.vop[1], &self.vop[0]].into_iter().find(|v| v.shown_size().is_some())
+    }
+
+    /// What the display shows, as the user sees it (after the panel's mounting rotation).
+    pub fn shown_size(&self) -> Option<(u32, u32)> {
+        let (w, h) = self.active_vop()?.shown_size()?;
+        Some(if self.display_rotation % 180 == 90 { (h, w) } else { (w, h) })
+    }
+
+    /// The display as RGBA, turned by the panel's mounting rotation.
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let (w, h) = self.active_vop()?.render(&self.ram.mem, self.ram.base, out)?;
+        if self.display_rotation % 360 == 0 {
+            return Some((w, h));
+        }
+        let src = std::mem::take(out);
+        let (rw, rh) = if self.display_rotation % 180 == 90 { (h, w) } else { (w, h) };
+        out.resize(src.len(), 0);
+        for y in 0..h {
+            for x in 0..w {
+                // A panel turned `rotation` degrees counter-clockwise.
+                let (dx, dy) = match self.display_rotation % 360 {
+                    90 => (y, w - 1 - x),
+                    180 => (w - 1 - x, h - 1 - y),
+                    _ => (h - 1 - y, x),
+                };
+                let (s, d) = (((y * w + x) * 4) as usize, ((dy * rw + dx) * 4) as usize);
+                out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+            }
+        }
+        Some((rw, rh))
+    }
+
     /// A word of on-chip SRAM (the boot ROM's view of the SMP mailbox).
     pub fn sram_word(&mut self, addr: u64) -> u32 {
         self.sram.read32(addr).unwrap_or(0)
@@ -149,6 +204,14 @@ impl Soc {
         }
         if let Some(offset) = Self::word_offset(addr, width, PMU_BASE, PMU_SIZE)? {
             return Ok(self.pmu.read(offset));
+        }
+        for (k, &base) in VOP_BASES.iter().enumerate() {
+            if let Some(offset) = Self::word_offset(addr, width, base, VOP_SIZE)? {
+                return Ok(self.vop[k].read(offset));
+            }
+        }
+        if let Some(offset) = Self::word_offset(addr, width, DSI0_BASE, DSI_SIZE)? {
+            return Ok(self.dsi.read(offset));
         }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
         let interface = Self::in_region(addr, width, GICC_BASE, GICC_SIZE);
@@ -186,6 +249,16 @@ impl Soc {
         }
         if let Some(offset) = Self::word_offset(addr, width, PMU_BASE, PMU_SIZE)? {
             self.pmu.write(offset, value);
+            return Ok(());
+        }
+        for (k, &base) in VOP_BASES.iter().enumerate() {
+            if let Some(offset) = Self::word_offset(addr, width, base, VOP_SIZE)? {
+                self.vop[k].write(offset, value, self.now);
+                return Ok(());
+            }
+        }
+        if let Some(offset) = Self::word_offset(addr, width, DSI0_BASE, DSI_SIZE)? {
+            self.dsi.write(offset, value);
             return Ok(());
         }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
@@ -446,6 +519,14 @@ impl Machine {
             gic.set_level(irq, level);
         }
         let mut next = u64::MAX;
+        for k in 0..2 {
+            self.soc.vop[k].update(now);
+            let irq = self.soc.vop[k].irq();
+            self.soc.gic.set_level(VOP_IRQS[k], irq);
+            if let Some(due) = self.soc.vop[k].next_deadline() {
+                next = next.min(due);
+            }
+        }
         for k in 0..NCPU {
             let cpu = &self.cpus[k];
             self.timer_state[k] = Self::timer_state_of(cpu);

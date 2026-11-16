@@ -1,7 +1,7 @@
 //! ASUS Tinker Board S (Rockchip RK3288) serial bring-up adapter: direct boot of an ARM32
 //! zImage with the stock device tree, patched as U-Boot's distro boot would patch it, or
 //! firmware-style boot of an SD card or eMMC image (Armbian's /boot).
-use crate::{arg, serial_board::{self, RunConfig, SerialBoard}};
+use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use rockchip_rk3288::{boot, devices, Machine};
 use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
@@ -32,6 +32,24 @@ impl SerialBoard for Machine {
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));
         }
     }
+    fn screen(&mut self) -> Option<&mut dyn Screen> {
+        Some(self)
+    }
+}
+
+impl Screen for Machine {
+    fn shown_size(&self) -> Option<(u32, u32)> {
+        self.soc.shown_size()
+    }
+    fn display_size(&self) -> (u32, u32) {
+        self.soc.shown_size().unwrap_or((1280, 800))
+    }
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.soc.render(out)
+    }
+    fn name(&self) -> &'static str {
+        self.soc.display_name
+    }
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -45,7 +63,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--emmc"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc"])?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     // Without --kernel, a card (--sd, else --emmc) is booted the way the board's firmware
     // would: armbianEnv.txt, zImage, the board DTB and uInitrd from the card's /boot.

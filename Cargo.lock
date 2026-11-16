@@ -79,6 +79,7 @@ dependencies = [
  "allwinner-h3",
  "arm-a32",
  "emu-core",
+ "mali400",
 ]
 
 [[package]]
