@@ -2,6 +2,8 @@
 //! Direct Linux boot, generated reduced DT, firmware PSCI services handled by host.
 pub mod boot;
 pub mod gic;
+pub mod gpu_mmu;
+pub mod gpu_cs;
 pub mod uart;
 pub mod mmc;
 
