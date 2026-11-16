@@ -30,8 +30,12 @@ function fpsMeter(gl) {
   return () => {
     n++;
     const t = performance.now();
-    if (t - last > 3000) { gl.say('fps ' + (n * 1000 / (t - last)).toFixed(1) + ' frames ' + n); n = 0; last = t; }
-    const e = gl.getError(); if (e) gl.say('GL error ' + e);
+    if (t - last > 3000) {
+      // getError waits for the GPU process, so it is checked only here, not every frame
+      const e = gl.getError();
+      gl.say('fps ' + (n * 1000 / (t - last)).toFixed(1) + ' frames ' + n + (e ? ' GL error ' + e : ''));
+      n = 0; last = t;
+    }
   };
 }
 
