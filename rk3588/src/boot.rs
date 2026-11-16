@@ -44,6 +44,13 @@ pub fn device_tree_gpu(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,sd:bool,gpu
         f.strs("interrupt-names",&["job","mmu","gpu"]);f.cells("clocks",&[2,2,2]);
         f.strs("clock-names",&["core","coregroup","stacks"]);f.end();
     }
+    f.begin("ethernet@fe1c0000"); f.strs("compatible",&["snps,dwmac-4.20a","snps,dwmac"]);
+    f.cells("reg",&[0,0xfe1c0000,0,0x10000]); f.cells("interrupts",&[0,234,4]);
+    f.str("interrupt-names","macirq"); f.cells("clocks",&[2,2]); f.strs("clock-names",&["stmmaceth","pclk"]);
+    f.prop("local-mac-address",&[0x52,0x54,0x00,0x12,0x34,0x56]);
+    f.str("phy-mode","rgmii-rxid"); f.cells("phy-handle",&[3]);
+    f.begin("mdio"); f.str("compatible","snps,dwmac-mdio"); f.cells("#address-cells",&[1]); f.cells("#size-cells",&[0]);
+    f.begin("ethernet-phy@1"); f.cells("reg",&[1]); f.cells("phandle",&[3]); f.end(); f.end(); f.end();
     if sd {
         f.begin("mmc@fe2c0000");f.strs("compatible",&["rockchip,rk3588-dw-mshc","rockchip,rk3288-dw-mshc"]);
         f.cells("reg",&[0,0xfe2c0000,0,0x4000]);f.cells("interrupts",&[0,203,4]);

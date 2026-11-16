@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 emu-core = { path = "../emu-core" }
 arm-a64 = { path = "../arm-a64" }
+sbc-net = { path = "../sbc-net" }
