@@ -46,7 +46,11 @@ impl Emit<'_> {
         let end = self.thumb_body(hw1, hw2, wide, pc, n);
         if it != 0 {
             // ITAdvance
-            self.it = if it & 7 == 0 { 0 } else { it & 0xe0 | (it << 1) & 0x1f };
+            self.it = if it & 7 == 0 {
+                0
+            } else {
+                it & 0xe0 | (it << 1) & 0x1f
+            };
         }
         match guard {
             Some(l) => {
@@ -58,7 +62,11 @@ impl Emit<'_> {
     }
 
     fn thumb_body(&mut self, hw1: u32, hw2: u32, wide: bool, pc: u32, n: u32) -> bool {
-        let t = if wide { self.t32(hw1, hw2, pc, n) } else { self.t16(hw1, pc, n) };
+        let t = if wide {
+            self.t32(hw1, hw2, pc, n)
+        } else {
+            self.t16(hw1, pc, n)
+        };
         match t {
             T::A32(word) => match self.native(word, pc, n) {
                 Some(end) => end,
@@ -206,12 +214,21 @@ impl Emit<'_> {
                 let imm5 = (hw >> 6) & 31;
                 let offset = if byte { imm5 } else { imm5 * 4 };
                 let load = (hw >> 11) & 1;
-                T::A32(0xe580_0000 | u32::from(byte) << 22 | load << 20 | r3 << 16 | r0 << 12 | offset)
+                T::A32(
+                    0xe580_0000 | u32::from(byte) << 22 | load << 20 | r3 << 16 | r0 << 12 | offset,
+                )
             }
             0b1000 => {
                 let offset = ((hw >> 6) & 31) * 2;
                 let load = (hw >> 11) & 1;
-                T::A32(0xe1c0_00b0 | load << 20 | r3 << 16 | r0 << 12 | (offset >> 4) << 8 | offset & 15)
+                T::A32(
+                    0xe1c0_00b0
+                        | load << 20
+                        | r3 << 16
+                        | r0 << 12
+                        | (offset >> 4) << 8
+                        | offset & 15,
+                )
             }
             0b1001 => T::A32(0xe58d_0000 | ((hw >> 11) & 1) << 20 | r8 << 12 | imm8 * 4),
             0b1010 => {
@@ -228,7 +245,13 @@ impl Emit<'_> {
             0b1100 => {
                 let load = hw & (1 << 11) != 0;
                 let writeback = !load || imm8 & (1 << r8) == 0;
-                T::A32(0xe880_0000 | u32::from(writeback) << 21 | u32::from(load) << 20 | r8 << 16 | imm8)
+                T::A32(
+                    0xe880_0000
+                        | u32::from(writeback) << 21
+                        | u32::from(load) << 20
+                        | r8 << 16
+                        | imm8,
+                )
             }
             0b1101 => match (hw >> 8) & 15 {
                 14 | 15 => T::Interp(true), // UDF, SVC
@@ -260,7 +283,10 @@ impl Emit<'_> {
                 let skip = self.label();
                 let nonzero = hw & (1 << 11) != 0;
                 // CBZ is taken on zero: skip on non-zero (cbnz), and the reverse for CBNZ
-                self.br(if nonzero { 0x3400_0000 } else { 0x3500_0000 } | W_DATA, skip);
+                self.br(
+                    if nonzero { 0x3400_0000 } else { 0x3500_0000 } | W_DATA,
+                    skip,
+                );
                 self.exit_const(target, n + 1);
                 self.bind(skip);
                 T::Done(false)
@@ -316,7 +342,9 @@ impl Emit<'_> {
                     let imm5 = ((hw2 >> 12) & 7) << 2 | (hw2 >> 6) & 3;
                     let kind = (hw2 >> 4) & 3;
                     if op == 6 {
-                        return T::A32(0xe680_0010 | rn << 16 | rd << 12 | imm5 << 7 | (kind & 2) << 5 | rm);
+                        return T::A32(
+                            0xe680_0010 | rn << 16 | rd << 12 | imm5 << 7 | (kind & 2) << 5 | rm,
+                        );
                     }
                     // the A32 shifted-register operand form computes the same value and carry
                     let Some(carry) = self.operand2(imm5 << 7 | kind << 5 | rm, pc, W_OP) else {
@@ -344,7 +372,11 @@ impl Emit<'_> {
                     // modified immediate
                     let (value, carry) = crate::thumb::expand_imm(imm12, false);
                     self.mov32(W_OP, value);
-                    let carry = if imm12 >> 10 == 0 { Carry::Unchanged } else { Carry::Const(carry) };
+                    let carry = if imm12 >> 10 == 0 {
+                        Carry::Unchanged
+                    } else {
+                        Carry::Const(carry)
+                    };
                     return self.t_dp((hw1 >> 5) & 15, hw1 & 0x10 != 0, rn, rd, carry, pc);
                 }
                 let imm16 = (hw1 & 15) << 12 | imm12;
@@ -359,7 +391,14 @@ impl Emit<'_> {
                         let sub = op == 0x0a;
                         if rn == 15 {
                             let base = pc.wrapping_add(4) & !3;
-                            self.mov32(W_RES, if sub { base.wrapping_sub(imm12) } else { base.wrapping_add(imm12) });
+                            self.mov32(
+                                W_RES,
+                                if sub {
+                                    base.wrapping_sub(imm12)
+                                } else {
+                                    base.wrapping_add(imm12)
+                                },
+                            );
                         } else {
                             self.load(W_RN, rn, pc);
                             self.p(addi_w(W_RES, W_RN, imm12, sub));
@@ -379,7 +418,11 @@ impl Emit<'_> {
                 if hw1 & 0xff00 == 0xff00 || hw1 & 0xff10 == 0xf900 {
                     return T::Interp(false); // Advanced SIMD
                 }
-                if op2 & 0x71 == 0x00 || op2 & 0x67 == 0x01 || op2 & 0x67 == 0x03 || op2 & 0x67 == 0x05 {
+                if op2 & 0x71 == 0x00
+                    || op2 & 0x67 == 0x01
+                    || op2 & 0x67 == 0x03
+                    || op2 & 0x67 == 0x05
+                {
                     return self.t_ldst(hw1, hw2, pc, n);
                 }
                 if op2 & 0x70 == 0x20 {
@@ -449,7 +492,9 @@ impl Emit<'_> {
                 0x3b if matches!((hw2 >> 4) & 15, 4..=6) => T::Done(false),
                 0x3b => T::Interp(false), // CLREX
                 // MRS
-                0x3e | 0x3f => T::A32(0xe10f_0000 | ((hw1 >> 4) & 1) << 22 | ((hw2 >> 8) & 15) << 12),
+                0x3e | 0x3f => {
+                    T::A32(0xe10f_0000 | ((hw1 >> 4) & 1) << 22 | ((hw2 >> 8) & 15) << 12)
+                }
                 _ => T::Interp(true), // MSR, CPS, SUBS PC, LR, SMC
             };
         }
@@ -511,7 +556,14 @@ impl Emit<'_> {
             }
             let base = pc.wrapping_add(4) & !3;
             let imm = hw2 & 0xfff;
-            self.mov32(W_ADDR, if hw1 & 0x80 != 0 { base.wrapping_add(imm) } else { base.wrapping_sub(imm) });
+            self.mov32(
+                W_ADDR,
+                if hw1 & 0x80 != 0 {
+                    base.wrapping_add(imm)
+                } else {
+                    base.wrapping_sub(imm)
+                },
+            );
             (W_ADDR, false)
         } else if hw1 & 0x80 != 0 {
             self.load(W_RN, rn, pc);
@@ -574,7 +626,12 @@ impl Emit<'_> {
 
     /// LDRD/STRD (immediate) with any register pair.
     fn t_ldrd(&mut self, hw1: u32, hw2: u32, pc: u32, n: u32) -> T {
-        let (p, u, w, l) = (hw1 & 0x100 != 0, hw1 & 0x80 != 0, hw1 & 0x20 != 0, hw1 & 0x10 != 0);
+        let (p, u, w, l) = (
+            hw1 & 0x100 != 0,
+            hw1 & 0x80 != 0,
+            hw1 & 0x20 != 0,
+            hw1 & 0x10 != 0,
+        );
         let (rn, rt, rt2) = (hw1 & 15, hw2 >> 12, (hw2 >> 8) & 15);
         if !p && !w || rt == 15 || rt2 == 15 || w && rn == 15 || !l && rn == 15 {
             return T::Interp(true);
@@ -623,7 +680,9 @@ impl Emit<'_> {
                 5 => 0x6e,
                 _ => return T::Interp(true),
             };
-            return T::A32(0xe000_0000 | kind << 20 | 0x70 | rn << 16 | rd << 12 | (op2 & 3) << 10 | rm);
+            return T::A32(
+                0xe000_0000 | kind << 20 | 0x70 | rn << 16 | rd << 12 | (op2 & 3) << 10 | rm,
+            );
         }
         if op1 & 0xc == 8 && op2 & 0xc == 8 {
             return match (op1 & 3, op2 & 3) {

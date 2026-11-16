@@ -172,9 +172,11 @@ fn execute(args: &[String]) -> Result<(), String> {
         let blob = prepare_device_tree(&dtb, ram as u64, cmdline, range)?;
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
+    let jit = arm_a32::jit::available() && !args.iter().any(|a| a == "--no-jit") && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
     eprintln!(
-        "[orangepi-one] experimental Allwinner H3: four Cortex-A7s (interpreter, A32 + Thumb-2 + VFPv4), GIC-400, UART0, timers, SD card, HDMI \
-         (DE2 mixer, TCON, DW-HDMI); PSCI by the host; other devices are stubs"
+        "[orangepi-one] experimental Allwinner H3: four Cortex-A7s ({}, A32 + Thumb-2 + VFPv4 + NEON), GIC-400, UART0, timers, SD card, \
+         HDMI (DE2 mixer, TCON, DW-HDMI), USB, Ethernet; PSCI by the host; other devices are stubs",
+        if jit { "JIT to AArch64" } else { "interpreter" }
     );
     serial_board::run(config, make_machine)
 }

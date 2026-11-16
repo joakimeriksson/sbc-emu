@@ -23,7 +23,7 @@
 //! every core (`CodeWatch`); devices that write RAM report it through `CodeWatch::dma_write`.
 //! Thumb state is interpreted for now.
 use crate::cpu::Cpu;
-use crate::mmu::{utlb_table, Access, U_EXEC, U_READ, U_WRITE, UT};
+use crate::mmu::{utlb_table, Access, UT, U_EXEC, U_READ, U_WRITE};
 use emu_core::{Bus, Trap};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
@@ -33,7 +33,14 @@ use std::sync::{Arc, Mutex};
 mod host {
     use std::ffi::{c_int, c_void};
     extern "C" {
-        fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            off: i64,
+        ) -> *mut c_void;
         fn munmap(addr: *mut c_void, len: usize) -> c_int;
         #[cfg(target_os = "macos")]
         fn pthread_jit_write_protect_np(enabled: c_int);
@@ -56,12 +63,16 @@ mod host {
             let flags = 0x0002 | 0x1000 | 0x0800; // PRIVATE | ANON | JIT
             #[cfg(target_os = "linux")]
             let flags = 0x0002 | 0x0020; // PRIVATE | ANONYMOUS
-            // SAFETY: anonymous mapping chosen by the OS; failure is checked
+                                         // SAFETY: anonymous mapping chosen by the OS; failure is checked
             let p = unsafe { mmap(std::ptr::null_mut(), size, 7, flags, -1, 0) };
             if p as isize == -1 || p.is_null() {
                 return None;
             }
-            Some(CodeCache { base: p as *mut u8, size, used: 0 })
+            Some(CodeCache {
+                base: p as *mut u8,
+                size,
+                used: 0,
+            })
         }
         pub fn reset(&mut self) {
             self.used = 0;
@@ -78,13 +89,20 @@ mod host {
             unsafe {
                 #[cfg(target_os = "macos")]
                 pthread_jit_write_protect_np(0);
-                std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, self.base.add(off), bytes);
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr() as *const u8,
+                    self.base.add(off),
+                    bytes,
+                );
                 #[cfg(target_os = "macos")]
                 pthread_jit_write_protect_np(1);
                 #[cfg(target_os = "macos")]
                 sys_icache_invalidate(self.base.add(off) as *mut c_void, bytes);
                 #[cfg(target_os = "linux")]
-                __clear_cache(self.base.add(off) as *mut c_void, self.base.add(off + bytes) as *mut c_void);
+                __clear_cache(
+                    self.base.add(off) as *mut c_void,
+                    self.base.add(off + bytes) as *mut c_void,
+                );
             }
             self.used += bytes;
             Some(self.base.wrapping_add(off))
@@ -140,7 +158,12 @@ impl CodeWatch {
     /// Watch `len` bytes of RAM at physical `base`.
     pub fn new(base: u32, len: u32) -> Arc<CodeWatch> {
         let pages = (0..len.div_ceil(4096)).map(|_| AtomicU8::new(0)).collect();
-        Arc::new(CodeWatch { base, pages, epoch: AtomicU64::new(0), dirty: Mutex::new(Vec::new()) })
+        Arc::new(CodeWatch {
+            base,
+            pages,
+            epoch: AtomicU64::new(0),
+            dirty: Mutex::new(Vec::new()),
+        })
     }
 
     fn index(&self, pa: u32) -> Option<usize> {
@@ -149,7 +172,8 @@ impl CodeWatch {
     }
 
     pub(crate) fn is_code(&self, pa: u32) -> bool {
-        self.index(pa).is_some_and(|i| self.pages[i].load(Relaxed) != 0)
+        self.index(pa)
+            .is_some_and(|i| self.pages[i].load(Relaxed) != 0)
     }
 
     /// Record that the page holding `pa` has compiled code.
@@ -214,7 +238,11 @@ pub struct Front {
     entry: usize,
 }
 
-const NO_FRONT: Front = Front { pc: u32::MAX, key: 0, entry: 0 };
+const NO_FRONT: Front = Front {
+    pc: u32::MAX,
+    key: 0,
+    entry: 0,
+};
 
 /// Words of the block prologue; chained entries start after it.
 const PROLOGUE_WORDS: usize = 7;
@@ -254,7 +282,10 @@ impl Jit {
     fn new(watch: Arc<CodeWatch>) -> Option<Box<Jit>> {
         let code = host::CodeCache::new(CODE_BYTES)?;
         let slot = watch.register();
-        let hot = std::env::var("SBC_JIT_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let hot = std::env::var("SBC_JIT_HOT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         let mut jit = Box::new(Jit {
             code,
             blocks: HashMap::new(),
@@ -277,7 +308,13 @@ impl Jit {
 
     /// (Re)write the dispatcher at the start of the code buffer.
     fn write_dispatcher(&mut self) {
-        self.disp = if self.chain { self.code.write(&dispatcher(&ctx())).map_or(0, |p| p as usize) } else { 0 };
+        self.disp = if self.chain {
+            self.code
+                .write(&dispatcher(&ctx()))
+                .map_or(0, |p| p as usize)
+        } else {
+            0
+        };
     }
 
     fn flush(&mut self) {
@@ -337,7 +374,9 @@ impl Cpu {
 
     /// (blocks compiled, blocks run, blocks invalidated by writes).
     pub fn jit_stats(&self) -> Option<(u64, u64, u64)> {
-        self.jit.as_ref().map(|j| (j.compiled, j.execs, j.invalidated))
+        self.jit
+            .as_ref()
+            .map(|j| (j.compiled, j.execs, j.invalidated))
     }
 
     /// Apply other cores' (and devices') code invalidations.
@@ -395,7 +434,11 @@ impl Cpu {
             // SAFETY: front entries are only filled from `blocks`, which hold published code
             unsafe { std::mem::transmute::<usize, BlockFn>(jit.front[fs].entry) }
         } else if let Some(&f) = jit.blocks.get(&k) {
-            jit.front[fs] = Front { pc: k.0, key: k.1, entry: f as usize };
+            jit.front[fs] = Front {
+                pc: k.0,
+                key: k.1,
+                entry: f as usize,
+            };
             f
         } else {
             let h = &mut jit.hotc[hot_slot(pc)];
@@ -412,7 +455,11 @@ impl Cpu {
             let jit = self.jit.as_mut()?;
             jit.blocks.insert(k, f);
             jit.pages.entry(pa >> 12).or_default().push(k);
-            jit.front[fs] = Front { pc: k.0, key: k.1, entry: f as usize };
+            jit.front[fs] = Front {
+                pc: k.0,
+                key: k.1,
+                entry: f as usize,
+            };
             jit.compiled += 1;
             if !jit.watch.is_code(pa) {
                 jit.watch.mark(pa);
@@ -427,7 +474,11 @@ impl Cpu {
 
     fn jit_run(&mut self, f: BlockFn, bus: &mut dyn Bus) -> Result<(), Trap> {
         // SAFETY: the bus outlives the call; compiled code reaches it only through h_step
-        self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
+        self.jit_bus =
+            Some(
+                unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) }
+                    as *mut dyn Bus,
+            );
         // SAFETY: `f` is published code generated for this Cpu layout
         if let Some(j) = self.jit.as_ref() {
             self.jit_disp = j.disp;
@@ -446,7 +497,14 @@ impl Cpu {
     }
 
     /// Translate the block at virtual `pc` (physical `pa`, host address `code`).
-    fn compile(&mut self, pc: u32, pa: u32, privileged: bool, thumb: bool, code: *const u8) -> Option<BlockFn> {
+    fn compile(
+        &mut self,
+        pc: u32,
+        pa: u32,
+        privileged: bool,
+        thumb: bool,
+        code: *const u8,
+    ) -> Option<BlockFn> {
         let c = ctx();
         let mut e = Emit::new(&c);
         e.chain = self.jit.as_ref().is_some_and(|j| j.disp != 0);
@@ -474,7 +532,11 @@ impl Cpu {
                     break;
                 }
                 // SAFETY: as above (the second halfword is in the same page)
-                let hw2 = if wide { u32::from(unsafe { (code.add(off + 2) as *const u16).read() }) } else { 0 };
+                let hw2 = if wide {
+                    u32::from(unsafe { (code.add(off + 2) as *const u16).read() })
+                } else {
+                    0
+                };
                 let end = e.thumb_insn(hw1, hw2, at, n);
                 n += 1;
                 at = at.wrapping_add(if wide { 4 } else { 2 });
@@ -491,18 +553,18 @@ impl Cpu {
                 }
             }
         }
+        #[allow(clippy::while_immutable_condition)] // the body always breaks
         while !thumb {
             let at = pc.wrapping_add(4 * n);
             // SAFETY: `code` maps the rest of this RAM page; the loop stops at its end
             let insn = unsafe { (code.add(4 * n as usize) as *const u32).read() };
             let end = e.insn(insn, at, n);
             n += 1;
-            if end {
-                break;
-            }
             let next = at.wrapping_add(4);
-            if n >= MAX_INSNS || next & 0xfff == 0 {
+            if !end && (n >= MAX_INSNS || next & 0xfff == 0) {
                 e.exit_const(next, n);
+            }
+            if end || n >= MAX_INSNS || next & 0xfff == 0 {
                 break;
             }
         }
@@ -578,7 +640,11 @@ pub fn set_profile(on: bool) {
 /// The most frequent interpreted instructions: (example word, micro-TLB miss, count).
 pub fn profile_fallbacks() -> Vec<(u32, bool, u64)> {
     let map = FALLBACKS.lock().unwrap();
-    let mut v: Vec<_> = map.iter().flatten().map(|(&(_, slow), &(n, w))| (w, slow == 1, n)).collect();
+    let mut v: Vec<_> = map
+        .iter()
+        .flatten()
+        .map(|(&(_, slow), &(n, w))| (w, slow == 1, n))
+        .collect();
     v.sort_by(|a, b| b.2.cmp(&a.2));
     v
 }
@@ -590,15 +656,24 @@ fn profile(cpu: &Cpu, pc: u32, why: u32) {
         .get(utlb_table(cpu.privileged(), U_EXEC) * UT + (pc >> 12) as usize % UT)
         .filter(|e| e.tag == (pc & !0xfff) as u64)
         // SAFETY: the entry maps this page of RAM
-        .map_or(0, |e| unsafe { (e.delta.wrapping_add(pc as u64) as *const u32).read() });
+        .map_or(0, |e| unsafe {
+            (e.delta.wrapping_add(pc as u64) as *const u32).read()
+        });
     let (word, class) = if cpu.thumb() {
         let w = word << 16 | word >> 16;
-        if w >> 27 >= 0b11101 { (w, w & 0xfff0_f000) } else { (w >> 16, w >> 16 & 0xff00 | 1) }
+        if w >> 27 >= 0b11101 {
+            (w, w & 0xfff0_f000)
+        } else {
+            (w >> 16, w >> 16 & 0xff00 | 1)
+        }
     } else {
         (word, word & 0x0ff0_00f0)
     };
     let mut map = FALLBACKS.lock().unwrap();
-    let e = map.get_or_insert_with(HashMap::new).entry((class, why)).or_insert((0, word));
+    let e = map
+        .get_or_insert_with(HashMap::new)
+        .entry((class, why))
+        .or_insert((0, word));
     e.0 += 1;
 }
 
@@ -707,13 +782,21 @@ fn logic_imm32(v: u32) -> Option<u32> {
         return None;
     }
     for size in [32u32, 16, 8, 4, 2] {
-        let mask = if size == 32 { u32::MAX } else { (1 << size) - 1 };
+        let mask = if size == 32 {
+            u32::MAX
+        } else {
+            (1 << size) - 1
+        };
         let elem = v & mask;
         if (0..32 / size).any(|i| (v >> (i * size)) & mask != elem) {
             continue;
         }
         for r in 0..size {
-            let rot = if r == 0 { elem } else { ((elem >> r) | (elem << (size - r))) & mask };
+            let rot = if r == 0 {
+                elem
+            } else {
+                ((elem >> r) | (elem << (size - r))) & mask
+            };
             if rot & rot.wrapping_add(1) == 0 && rot != 0 {
                 let ones = rot.count_ones();
                 let immr = (size - r) % size;
@@ -777,7 +860,18 @@ struct Emit<'a> {
 
 impl<'a> Emit<'a> {
     fn new(c: &'a Ctx) -> Self {
-        let mut e = Emit { out: Vec::with_capacity(512), c, labels: Vec::new(), fixes: Vec::new(), slow: Vec::new(), exit_h: 0, chain: false, thumb: false, size: 4, it: 0 };
+        let mut e = Emit {
+            out: Vec::with_capacity(512),
+            c,
+            labels: Vec::new(),
+            fixes: Vec::new(),
+            slow: Vec::new(),
+            exit_h: 0,
+            chain: false,
+            thumb: false,
+            size: 4,
+            it: 0,
+        };
         e.exit_h = e.label();
         e
     }
@@ -989,7 +1083,14 @@ impl<'a> Emit<'a> {
     fn slow_path(&mut self, pc: u32, before: u32) -> (usize, usize) {
         let label = self.label();
         let resume = self.label();
-        self.slow.push(Slow { label, pc, before, resume, size: self.size, it: self.it });
+        self.slow.push(Slow {
+            label,
+            pc,
+            before,
+            resume,
+            size: self.size,
+            it: self.it,
+        });
         (label, resume)
     }
 
@@ -1141,7 +1242,11 @@ impl<'a> Emit<'a> {
             let rotation = (insn >> 8) & 0xf;
             let value = (insn & 0xff).rotate_right(2 * rotation);
             self.mov32(dst, value);
-            return Some(if rotation == 0 { Carry::Unchanged } else { Carry::Const(value >> 31 != 0) });
+            return Some(if rotation == 0 {
+                Carry::Unchanged
+            } else {
+                Carry::Const(value >> 31 != 0)
+            });
         }
         if insn & 0x10 != 0 {
             // register-specified shift (amount = Rs[7:0]); the carry is not computed, so
@@ -1283,7 +1388,12 @@ impl<'a> Emit<'a> {
     }
 
     fn data_processing(&mut self, insn: u32, pc: u32, n: u32) -> Option<bool> {
-        let (opcode, s, rn, rd) = ((insn >> 21) & 0xf, insn & (1 << 20) != 0, (insn >> 16) & 0xf, (insn >> 12) & 0xf);
+        let (opcode, s, rn, rd) = (
+            (insn >> 21) & 0xf,
+            insn & (1 << 20) != 0,
+            (insn >> 16) & 0xf,
+            (insn >> 12) & 0xf,
+        );
         let test = matches!(opcode, 8..=11);
         let logical = matches!(opcode, 0 | 1 | 8 | 9 | 12..=15);
         let reg_shift = insn & (1 << 25) == 0 && insn & 0x10 != 0;
@@ -1329,7 +1439,12 @@ impl<'a> Emit<'a> {
     }
 
     fn mul(&mut self, insn: u32) -> bool {
-        let (rd, ra, rs, rm) = ((insn >> 16) & 0xf, (insn >> 12) & 0xf, (insn >> 8) & 0xf, insn & 0xf);
+        let (rd, ra, rs, rm) = (
+            (insn >> 16) & 0xf,
+            (insn >> 12) & 0xf,
+            (insn >> 8) & 0xf,
+            insn & 0xf,
+        );
         if [rd, ra, rs, rm].contains(&15) {
             return false;
         }
@@ -1351,7 +1466,12 @@ impl<'a> Emit<'a> {
     }
 
     fn mul_long(&mut self, insn: u32) -> bool {
-        let (hi, lo, rs, rm) = ((insn >> 16) & 0xf, (insn >> 12) & 0xf, (insn >> 8) & 0xf, insn & 0xf);
+        let (hi, lo, rs, rm) = (
+            (insn >> 16) & 0xf,
+            (insn >> 12) & 0xf,
+            (insn >> 8) & 0xf,
+            insn & 0xf,
+        );
         if [hi, lo, rs, rm].contains(&15) || hi == lo || insn & (1 << 20) != 0 {
             return false;
         }
@@ -1365,7 +1485,11 @@ impl<'a> Emit<'a> {
         } else {
             ZR
         };
-        let base = if insn & (1 << 22) != 0 { 0x9b20_0000 } else { 0x9ba0_0000 }; // smaddl / umaddl
+        let base = if insn & (1 << 22) != 0 {
+            0x9b20_0000
+        } else {
+            0x9ba0_0000
+        }; // smaddl / umaddl
         self.p(base | W_OP << 16 | a << 10 | W_RN << 5 | W_DATA);
         self.store(W_DATA, lo);
         self.p(0xd360_fc00 | W_DATA << 5 | W_DATA); // lsr x13, x13, #32
@@ -1389,7 +1513,7 @@ impl<'a> Emit<'a> {
             return Some(true);
         }
         // MOVW / MOVT
-        if insn & 0x0fb0_0000 == 0x0300_0000 || insn & 0x0fb0_0000 == 0x0340_0000 {
+        if insn & 0x0fb0_0000 == 0x0300_0000 {
             let rd = (insn >> 12) & 0xf;
             if rd == 15 {
                 return None;
@@ -1440,8 +1564,14 @@ impl<'a> Emit<'a> {
         if insn & 0x0f00_0f10 != 0x0e00_0f10 {
             return false;
         }
-        let (read, opc1, crn, rd, crm, opc2) =
-            (insn & (1 << 20) != 0, (insn >> 21) & 7, (insn >> 16) & 0xf, (insn >> 12) & 0xf, insn & 0xf, (insn >> 5) & 7);
+        let (read, opc1, crn, rd, crm, opc2) = (
+            insn & (1 << 20) != 0,
+            (insn >> 21) & 7,
+            (insn >> 16) & 0xf,
+            (insn >> 12) & 0xf,
+            insn & 0xf,
+            (insn >> 5) & 7,
+        );
         if rd == 15 || opc1 != 0 {
             return false;
         }
@@ -1463,7 +1593,12 @@ impl<'a> Emit<'a> {
                 return false;
             }
             self.load(W_RN, rm, 0);
-            self.p((if insn & 0x80 == 0 { 0x5ac0_0800 } else { 0x5ac0_0400 }) | W_RN << 5 | W_RES);
+            self.p((if insn & 0x80 == 0 {
+                0x5ac0_0800
+            } else {
+                0x5ac0_0400
+            }) | W_RN << 5
+                | W_RES);
             self.store(W_RES, rd);
             return true;
         }
@@ -1520,7 +1655,11 @@ impl<'a> Emit<'a> {
             }
             self.load(W_RN, rm, 0);
             let signed = insn & 0x0fe0_0070 == 0x07a0_0050;
-            self.p(if signed { sbfm_w(W_RES, W_RN, lsb, lsb + width - 1) } else { ubfm_w(W_RES, W_RN, lsb, lsb + width - 1) });
+            self.p(if signed {
+                sbfm_w(W_RES, W_RN, lsb, lsb + width - 1)
+            } else {
+                ubfm_w(W_RES, W_RN, lsb, lsb + width - 1)
+            });
             self.store(W_RES, rd);
             return true;
         }
@@ -1532,7 +1671,11 @@ impl<'a> Emit<'a> {
             }
             self.load(W_RN, dividend, 0);
             self.load(W_OP, divisor, 0);
-            let base = if insn & (1 << 21) == 0 { 0x1ac0_0c00 } else { 0x1ac0_0800 };
+            let base = if insn & (1 << 21) == 0 {
+                0x1ac0_0c00
+            } else {
+                0x1ac0_0800
+            };
             self.p(rrr(base, W_RES, W_RN, W_OP));
             self.store(W_RES, rd);
             return true;
@@ -1553,9 +1696,19 @@ impl<'a> Emit<'a> {
             Some(imm) if imm < 4096 => self.p(addi_w(W_ADDR, W_RN, imm, !up)),
             Some(imm) => {
                 self.mov32(W_OP, imm);
-                self.p(rrr(if up { 0x0b00_0000 } else { 0x4b00_0000 }, W_ADDR, W_RN, W_OP));
+                self.p(rrr(
+                    if up { 0x0b00_0000 } else { 0x4b00_0000 },
+                    W_ADDR,
+                    W_RN,
+                    W_OP,
+                ));
             }
-            None => self.p(rrr(if up { 0x0b00_0000 } else { 0x4b00_0000 }, W_ADDR, W_RN, W_OP)),
+            None => self.p(rrr(
+                if up { 0x0b00_0000 } else { 0x4b00_0000 },
+                W_ADDR,
+                W_RN,
+                W_OP,
+            )),
         }
         if pre {
             W_ADDR
@@ -1566,7 +1719,13 @@ impl<'a> Emit<'a> {
 
     /// LDR, STR, LDRB, STRB.
     fn ldst(&mut self, insn: u32, pc: u32, n: u32) -> Option<bool> {
-        let (pre, up, byte, wb, load) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 22) != 0, insn & (1 << 21) != 0, insn & (1 << 20) != 0);
+        let (pre, up, byte, wb, load) = (
+            insn & (1 << 24) != 0,
+            insn & (1 << 23) != 0,
+            insn & (1 << 22) != 0,
+            insn & (1 << 21) != 0,
+            insn & (1 << 20) != 0,
+        );
         let (rn, rd) = ((insn >> 16) & 0xf, (insn >> 12) & 0xf);
         let writeback = !pre || wb;
         if !pre && wb || load && rd == 15 && byte || writeback && (rn == 15 || load && rn == rd) {
@@ -1629,15 +1788,24 @@ impl<'a> Emit<'a> {
 
     /// LDRH, STRH, LDRSB, LDRSH, LDRD, STRD.
     fn ldst_extra(&mut self, insn: u32, pc: u32, n: u32) -> bool {
-        let (pre, up, wb) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 21) != 0);
+        let (pre, up, wb) = (
+            insn & (1 << 24) != 0,
+            insn & (1 << 23) != 0,
+            insn & (1 << 21) != 0,
+        );
         let (rn, rd) = ((insn >> 16) & 0xf, (insn >> 12) & 0xf);
-        let (load, signed, half) = (insn & (1 << 20) != 0, insn & (1 << 6) != 0, insn & (1 << 5) != 0);
+        let (load, signed, half) = (
+            insn & (1 << 20) != 0,
+            insn & (1 << 6) != 0,
+            insn & (1 << 5) != 0,
+        );
         let pair = !load && signed;
         let writeback = !pre || wb;
         if !pre && wb
             || pair && (rd & 1 != 0 || rd >= 14)
             || !pair && load && rd == 15
-            || writeback && (rn == 15 || load && rn == rd || pair && !half && (rn == rd || rn == rd + 1))
+            || writeback
+                && (rn == 15 || load && rn == rd || pair && !half && (rn == rd || rn == rd + 1))
         {
             return false;
         }
@@ -1700,10 +1868,20 @@ impl<'a> Emit<'a> {
 
     /// LDM/STM without the S bit: Some(block ends) or None.
     fn ldm_stm(&mut self, insn: u32, pc: u32, n: u32) -> Option<bool> {
-        let (pre, up, s, wb, load) = (insn & (1 << 24) != 0, insn & (1 << 23) != 0, insn & (1 << 22) != 0, insn & (1 << 21) != 0, insn & (1 << 20) != 0);
+        let (pre, up, s, wb, load) = (
+            insn & (1 << 24) != 0,
+            insn & (1 << 23) != 0,
+            insn & (1 << 22) != 0,
+            insn & (1 << 21) != 0,
+            insn & (1 << 20) != 0,
+        );
         let rn = (insn >> 16) & 0xf;
         let list = insn & 0xffff;
-        if s || rn == 15 || list == 0 || !load && list & 0x8000 != 0 || load && wb && list & (1 << rn) != 0 {
+        if s || rn == 15
+            || list == 0
+            || !load && list & 0x8000 != 0
+            || load && wb && list & (1 << rn) != 0
+        {
             return None;
         }
         let count = list.count_ones();
@@ -1793,7 +1971,7 @@ fn dispatcher(c: &Ctx) -> Vec<u32> {
     e.p(0xaa0a_8210); // orr x16, x16, x10, lsl #32 (key)
     e.p(ubfm_w(12, 9, 5, 5)); // ubfx w12, w9, #5, #1 (Thumb)
     e.p(0xaa0c_8610); // orr x16, x16, x12, lsl #33
-    // front cache slot ((pc ^ pc >> 14) >> 2) & (FRONT - 1), 24-byte entries
+                      // front cache slot ((pc ^ pc >> 14) >> 2) & (FRONT - 1), 24-byte entries
     e.p(0x4a4b_396c); // eor w12, w11, w11, lsr #14
     e.p(ubfm_w(12, 12, 2, 15)); // ubfx w12, w12, #2, #14
     e.p(ldr_x(13, X_CPU, c.front));
@@ -1821,7 +1999,11 @@ mod t32;
 fn writes_pc(insn: u32) -> bool {
     let rd = (insn >> 12) & 0xf;
     // data processing with Rd = PC (not TST/TEQ/CMP/CMN)
-    if insn & 0x0c00_0000 == 0 && rd == 15 && !(insn & 0x0190_0000 == 0x0100_0000) && insn & 0x0180_0000 != 0x0100_0000 {
+    if insn & 0x0c00_0000 == 0
+        && rd == 15
+        && !(insn & 0x0190_0000 == 0x0100_0000)
+        && insn & 0x0180_0000 != 0x0100_0000
+    {
         return true;
     }
     // LDR PC
@@ -1848,7 +2030,14 @@ mod tests {
         assert!(logic_imm32(0xffff_f007).is_some());
         assert_eq!(logic_imm32(0x1234_5678), None);
         // every encodable value decodes back
-        for v in [0x2000_0000u32, 0xdfff_ffff, 0x20, 0xffff_fffe, 0xffff_f001, 0x0f0f_0f0f] {
+        for v in [
+            0x2000_0000u32,
+            0xdfff_ffff,
+            0x20,
+            0xffff_fffe,
+            0xffff_f001,
+            0x0f0f_0f0f,
+        ] {
             let e = logic_imm32(v).unwrap();
             let (immr, imms) = ((e >> 16) & 0x3f, (e >> 10) & 0x3f);
             let size = match imms {
@@ -1859,9 +2048,21 @@ mod tests {
                 _ => 2,
             };
             let ones = (imms & (size - 1)) + 1;
-            let mask = if size == 32 { u32::MAX } else { (1 << size) - 1 };
-            let run = if ones == 32 { u32::MAX } else { (1u32 << ones) - 1 };
-            let elem = if immr == 0 { run } else { ((run >> immr) | (run << (size - immr))) & mask };
+            let mask = if size == 32 {
+                u32::MAX
+            } else {
+                (1 << size) - 1
+            };
+            let run = if ones == 32 {
+                u32::MAX
+            } else {
+                (1u32 << ones) - 1
+            };
+            let elem = if immr == 0 {
+                run
+            } else {
+                ((run >> immr) | (run << (size - immr))) & mask
+            };
             let mut back = 0;
             for i in 0..32 / size {
                 back |= elem << (i * size);

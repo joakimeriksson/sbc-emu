@@ -2,7 +2,7 @@
 
 `--board orangepi-one`, experimental.
 
-A 32-bit machine on its own ARMv7 core (`arm-a32`, interpreter only): four Cortex-A7 cores with VFPv4 and NEON (started through PSCI CPU_ON, as U-Boot's secure monitor does on the board), the H3's GIC-400 with inter-processor interrupts, UART0
+A 32-bit machine on its own ARMv7 core (`arm-a32`, an interpreter with a block JIT to AArch64, see [below](#the-jit)): four Cortex-A7 cores with VFPv4 and NEON (started through PSCI CPU_ON, as U-Boot's secure monitor does on the board), the H3's GIC-400 with inter-processor interrupts, UART0
 (DesignWare), CCU, timers and the architectural timers. It boots an unmodified Alpine Linux
 kernel (6.18 `linux-lts`, armv7) with the unmodified mainline `sun8i-h3-orangepi-one.dtb`:
 like U-Boot on the real board, the emulator fills in `/chosen` and `/memory` and adds a
@@ -52,7 +52,7 @@ sbc-emu run --board orangepi-one --kernel $F/zImage --dtb $F/sun8i-h3-orangepi-o
 
 | | Status | Evidence |
 |---|---|---|
-| Boot | kernel to the `orangepi-one#` BusyBox prompt on four cores (`smp: Brought up 1 node, 4 CPUs`) in 0.67 s of guest time (about 1 G instructions, ~23 s on an M-series Mac) | `scripts/orangepi-one-shell.txt` |
+| Boot | kernel to the `orangepi-one#` BusyBox prompt on four cores (`smp: Brought up 1 node, 4 CPUs`) in 0.67 s of guest time (about 1 G instructions); the whole script in 7.3 s on an M5 Mac with the JIT, 70 s interpreted | `scripts/orangepi-one-shell.txt` |
 | SMP | `nproc` = 4; four parallel shell loops; rescheduling and function-call IPIs on all four CPUs in `/proc/interrupts` | same script |
 | Userland | shell input on `ttyS0`, `/proc/device-tree/model` = `Xunlong Orange Pi One`, VFPv4 floating point (`awk` arithmetic), `sleep`, tmpfs I/O | same script |
 | Firmware | PSCI 1.0 over SMC from the host: `reboot -f` boots again, `poweroff -f` ends the run | same script |
@@ -69,5 +69,50 @@ take turns on one host thread (round-robin quanta of 1000 instructions). Every o
 distribution DTB is a plain read-back register file, so its driver probes without effect;
 the run summary lists the pages that were touched. Virtual time is 1 ns per instruction.
 
+
+## The JIT
+
+`arm-a32/src/jit.rs` (ARM state) and `jit_t32.rs` (Thumb). On AArch64 hosts (macOS, Linux)
+hot blocks are translated to host code; `--no-jit` or `SBC_JIT=0` runs the interpreter alone.
+
+- A32 and A64 share the NZCV layout, the condition codes and the add/subtract carry and
+  overflow rules, so the guest flags live in the host flags inside a block: `ADDS`, `SUBS`,
+  `ADCS`, `SBCS` and `B.cond` give the architected result. Logical operations with S take
+  their carry from the shifter (immediate and register-specified shifts), computed
+  separately.
+- Native: data processing in every operand form, MOVW/MOVT, multiplies, divides, CLZ,
+  bitfields, extends, REV, loads and stores of every size (with writeback, LDRD/STRD,
+  LDM/STM, PUSH/POP), branches, BL/BLX/BX and returns through the PC with interworking,
+  CBZ/CBNZ, MRS, the thread-ID MRCs, cache-maintenance MCRs, barriers and hints. Thumb
+  instructions are mostly the A32 instruction the interpreter maps them to, plus the
+  Thumb-only forms (modified immediates, ORN, ADDW/SUBW, 12-bit and indexed offsets,
+  literal loads). IT blocks compile with their ITSTATE tracked at compile time.
+- Everything else (VFP/NEON, exclusives, CPS/MSR, system registers, TBB/TBH, parallel
+  arithmetic) runs one instruction in the interpreter; the block ends there if the PC, the
+  mode, the interrupt masks or ITSTATE changed, a device was touched or an exception taken.
+- Loads and stores probe a 256-entry micro-TLB per privilege and access type inline (the
+  interpreter uses the same tables); a miss, a misaligned access or a page crossing runs
+  the instruction in the interpreter.
+- Blocks are keyed by virtual and physical PC, privilege and instruction set, and chain
+  through a dispatcher until the machine's next device deadline.
+- Code is invalidated by writes, not by cache maintenance: pages holding compiled code never
+  enter the write micro-TLB, so every store to them (from any core) takes the slow path and
+  drops their blocks on all cores; the SD controller's DMA and image loads report the RAM
+  they write.
+- TLB maintenance by MVA drops one page (or the whole MiB if it came from a section) instead
+  of the whole TLB, which the interpreter benefits from too.
+
+`arm-a32/tests/jit_diff.rs` runs random A32 and Thumb blocks (every operand form and
+condition, IT blocks, all load/store forms) once interpreted and once compiled from the same
+state and compares registers, flags, memory and the instruction count; `JIT_DIFF_CASES=N`
+runs more. `SBC_JIT_PROFILE=1` lists the instructions compiled code still hands to the
+interpreter, `SBC_JIT_CHAIN=0` turns chaining off and `SBC_JIT_HOT=N` sets how often a block
+starts before it is compiled (default 8).
+
+| Workload (M5 Mac) | Interpreter | JIT |
+|---|---|---|
+| Alpine: `scripts/orangepi-one-shell.txt` (boot, SMP, reboot, power-off) | 70 s | 7.3 s |
+| Debian Thumb-2 userland: `scripts/orangepi-one-thumb.txt` | 22.4 s | 1.3 s |
+| Armbian 26.8.1 (Thumb-2 kernel and userland) to the first-run wizard: `scripts/orangepi-one-armbian.txt` | 22 min | 5.4 min |
 
 Design notes, fixture hashes and the bugs found during bring-up: [multi-board-foundation.md](multi-board-foundation.md#orange-pi-one-allwinner-h3-2026-11-15).
