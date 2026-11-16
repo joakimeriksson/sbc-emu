@@ -50,8 +50,6 @@ const RX_FRAME_TYPE: u32 = 1 << 5;
 /// MDIO address of the internal PHY.
 const PHY_ADDRESS: u32 = 1;
 const MAX_FRAME: usize = 9018;
-/// Receive frames waiting for descriptors beyond this are dropped (a full FIFO).
-const RX_QUEUE_LIMIT: usize = 512;
 
 pub struct Emac {
     regs: [u32; REGS],
@@ -243,12 +241,16 @@ impl Emac {
         }
     }
 
+    /// Frames arriving from the network: dropped while receive DMA is stopped, as the
+    /// MAC drops them, and beyond the shared queue cap, as a full FIFO does.
+    pub fn deliver(&mut self, frames: impl IntoIterator<Item = Vec<u8>>) {
+        if self.rx_running() {
+            sbc_net::net::enqueue_bounded(&mut self.rx_queue, frames);
+        }
+    }
+
     /// Write waiting frames into the receive descriptors the guest owns.
     pub fn receive(&mut self, dma: &mut Dma) {
-        if self.rx_queue.len() > RX_QUEUE_LIMIT {
-            let excess = self.rx_queue.len() - RX_QUEUE_LIMIT;
-            self.rx_queue.drain(..excess);
-        }
         if !self.rx_running() {
             return;
         }
@@ -483,5 +485,17 @@ mod tests {
         assert_eq!((e.rx_dropped, e.rx_queue.len()), (1, 0));
         assert_ne!(dma(&mut mem).read32(d0) & OWN, 0, "descriptor still the guest's");
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn delivered_frames_are_dropped_while_stopped_and_bounded() {
+        let mut mem = vec![0u8; 0x100];
+        let mut e = Emac::default();
+        e.deliver([vec![1; 64]]);
+        assert!(e.rx_queue.is_empty(), "receive DMA is stopped");
+        start(&mut e, &mut mem);
+        e.write(0x28, DMA_EN | DMA_START, &mut dma(&mut mem));
+        e.deliver((0..1000).map(|_| vec![1; 64]));
+        assert_eq!(e.rx_queue.len(), 512);
     }
 }
