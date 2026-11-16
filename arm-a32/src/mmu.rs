@@ -36,10 +36,119 @@ impl TlbEntry {
     };
 }
 
+/// Micro-TLB tables (one per privilege and access kind) of host pointers into guest RAM:
+/// index `utlb_table(privileged, kind) * UT + (va >> 12) % UT`. Shared by the interpreter
+/// and compiled code (which probes the read/write tables inline).
+pub(crate) const UT: usize = 256;
+pub(crate) const U_READ: usize = 0;
+pub(crate) const U_WRITE: usize = 1;
+pub(crate) const U_EXEC: usize = 2;
+
+/// One micro-TLB entry: `tag` is the virtual page (`va & !0xfff`; 0x800 = invalid: probes
+/// compare it with the address masked to its page and alignment bits, which never has bit
+/// 11 set) and `delta` is added to a virtual address in that page to give the host address
+/// of its byte.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct Utlb {
+    pub tag: u64,
+    pub delta: u64,
+}
+
+impl Utlb {
+    pub(crate) const INVALID: Self = Self { tag: 0x800, delta: 0 };
+}
+
+pub(crate) fn utlb_table(privileged: bool, kind: usize) -> usize {
+    privileged as usize * 3 + kind
+}
+
 impl Cpu {
     /// Drop every cached translation (TLB maintenance, TTBR/TTBCR/SCTLR/CONTEXTIDR writes).
     pub fn tlb_flush(&mut self) {
         self.tlb.fill(TlbEntry::INVALID);
+        self.utlb_flush();
+    }
+
+    /// TLB maintenance by virtual address: the cached translations of `va`'s page, and of
+    /// every page of its MiB if they came from a section (the guest may be changing it).
+    pub(crate) fn tlb_invalidate_page(&mut self, va: u32) {
+        let page = va >> 12;
+        let mut section = false;
+        for p in page & !0xff..(page & !0xff) + 256 {
+            let e = &mut self.tlb[p as usize % TLB_ENTRIES];
+            if e.tag == p && (p == page || e.section) {
+                section |= e.section;
+                *e = TlbEntry::INVALID;
+            }
+        }
+        if section {
+            self.utlb_flush();
+            return;
+        }
+        for t in 0..6 {
+            let e = &mut self.utlb[t * UT + page as usize % UT];
+            if e.tag == (va & !0xfff) as u64 {
+                *e = Utlb::INVALID;
+            }
+        }
+    }
+
+    /// Drop the micro-TLBs (also needed when DACR changes: permissions were checked at fill).
+    pub(crate) fn utlb_flush(&mut self) {
+        self.utlb.fill(Utlb::INVALID);
+    }
+
+    /// Drop the write micro-TLBs (a page became code: its stores must take the slow path).
+    pub(crate) fn utlb_flush_writes(&mut self) {
+        for privileged in [false, true] {
+            let t = utlb_table(privileged, U_WRITE) * UT;
+            self.utlb[t..t + UT].fill(Utlb::INVALID);
+        }
+    }
+
+    pub(crate) fn privileged(&self) -> bool {
+        self.cpsr & 0x1f != MODE_USR
+    }
+
+    /// Host address of `size` bytes at `va` if the micro-TLB maps them (same page).
+    #[inline(always)]
+    fn host(&self, va: u32, size: u32, kind: usize) -> Option<*mut u8> {
+        if (va & 0xfff) + size > 0x1000 {
+            return None;
+        }
+        let e = &self.utlb[utlb_table(self.privileged(), kind) * UT + (va >> 12) as usize % UT];
+        (e.tag == (va & !0xfff) as u64).then(|| e.delta.wrapping_add(va as u64) as *mut u8)
+    }
+
+    /// Is `pa` (physical) in the RAM the host pointer covers?
+    #[inline(always)]
+    pub(crate) fn in_ram(&self, pa: u32) -> bool {
+        !self.ram.is_null() && pa.wrapping_sub(self.ram_base) < self.ram_len
+    }
+
+    /// Remember a checked translation of RAM in the micro-TLB. Pages holding compiled
+    /// code never enter the write table, so every store to them reaches `code_written`.
+    fn utlb_fill(&mut self, va: u32, pa: u32, kind: usize) {
+        if !self.in_ram(pa) {
+            self.io = true;
+            return;
+        }
+        if kind == U_WRITE && self.jit.as_ref().is_some_and(|j| j.watch.is_code(pa)) {
+            return;
+        }
+        let host = self.ram as u64 + (pa & !0xfff).wrapping_sub(self.ram_base) as u64;
+        self.utlb[utlb_table(self.privileged(), kind) * UT + (va >> 12) as usize % UT] =
+            Utlb { tag: (va & !0xfff) as u64, delta: host.wrapping_sub((va & !0xfff) as u64) };
+    }
+
+    /// A store reached physical `pa` through the slow path: drop compiled code there.
+    fn code_written(&mut self, pa: u32) {
+        if let Some(j) = self.jit.as_ref() {
+            if j.watch.is_code(pa) {
+                j.watch.invalidate(pa);
+            }
+        }
     }
 
     fn permission(ap: u8, privileged: bool, write: bool) -> bool {
@@ -154,13 +263,35 @@ impl Cpu {
         Ok(entry.pa_page | (va & 0xfff))
     }
 
+    /// `translate` that also fills the micro-TLB (and notes device accesses).
+    pub(crate) fn translate_fill(
+        &mut self,
+        bus: &mut dyn Bus,
+        va: u32,
+        access: Access,
+    ) -> Result<u32, (u32, u32)> {
+        let pa = self.translate(bus, va, access)?;
+        let kind = match access {
+            Access::Read => U_READ,
+            Access::Write => U_WRITE,
+            Access::Execute => U_EXEC,
+        };
+        self.utlb_fill(va, pa, kind);
+        Ok(pa)
+    }
+
     pub(crate) fn mem_read8(
         &mut self,
         bus: &mut dyn Bus,
         va: u32,
         access: Access,
     ) -> Result<u8, (u32, u32)> {
-        let physical = self.translate(bus, va, access)?;
+        let kind = if access == Access::Execute { U_EXEC } else { U_READ };
+        if let Some(p) = self.host(va, 1, kind) {
+            // SAFETY: micro-TLB entries point into the guest RAM mapping
+            return Ok(unsafe { p.read() });
+        }
+        let physical = self.translate_fill(bus, va, access)?;
         bus.read8(physical as u64).map_err(|_| (va, 0x08))
     }
 
@@ -169,12 +300,16 @@ impl Cpu {
     }
 
     pub(crate) fn mem_read16(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u16, (u32, u32)> {
+        if let Some(p) = self.host(va, 2, U_READ) {
+            // SAFETY: as in mem_read8; the two bytes are in the same page
+            return Ok(unsafe { (p as *const u16).read_unaligned() });
+        }
         if self.crosses_page(va, 2) {
             let lo = self.mem_read8(bus, va, Access::Read)?;
             let hi = self.mem_read8(bus, va.wrapping_add(1), Access::Read)?;
             return Ok(u16::from_le_bytes([lo, hi]));
         }
-        let physical = self.translate(bus, va, Access::Read)?;
+        let physical = self.translate_fill(bus, va, Access::Read)?;
         bus.read16(physical as u64).map_err(|_| (va, 0x08))
     }
 
@@ -184,6 +319,11 @@ impl Cpu {
         va: u32,
         access: Access,
     ) -> Result<u32, (u32, u32)> {
+        let kind = if access == Access::Execute { U_EXEC } else { U_READ };
+        if let Some(p) = self.host(va, 4, kind) {
+            // SAFETY: as in mem_read8; the four bytes are in the same page
+            return Ok(unsafe { (p as *const u32).read_unaligned() });
+        }
         if self.crosses_page(va, 4) {
             let mut bytes = [0; 4];
             for (index, byte) in bytes.iter_mut().enumerate() {
@@ -191,7 +331,7 @@ impl Cpu {
             }
             return Ok(u32::from_le_bytes(bytes));
         }
-        let physical = self.translate(bus, va, access)?;
+        let physical = self.translate_fill(bus, va, access)?;
         bus.read32(physical as u64).map_err(|_| (va, 0x08))
     }
 
@@ -211,8 +351,15 @@ impl Cpu {
         va: u32,
         value: u8,
     ) -> Result<(), (u32, u32)> {
-        let physical = self.translate(bus, va, Access::Write)?;
+        if let Some(p) = self.host(va, 1, U_WRITE) {
+            self.invalidate_exclusive(va);
+            // SAFETY: as in mem_read8 (write entries never map pages holding compiled code)
+            unsafe { p.write(value) };
+            return Ok(());
+        }
+        let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
+        self.code_written(physical);
         bus.write8(physical as u64, value).map_err(|_| (va, 0x08))
     }
 
@@ -222,6 +369,12 @@ impl Cpu {
         va: u32,
         value: u16,
     ) -> Result<(), (u32, u32)> {
+        if let Some(p) = self.host(va, 2, U_WRITE) {
+            self.invalidate_exclusive(va);
+            // SAFETY: as in mem_write8
+            unsafe { (p as *mut u16).write_unaligned(value) };
+            return Ok(());
+        }
         if self.crosses_page(va, 2) {
             // Check both pages before writing either byte.
             self.translate(bus, va.wrapping_add(1), Access::Write)?;
@@ -230,8 +383,9 @@ impl Cpu {
             }
             return Ok(());
         }
-        let physical = self.translate(bus, va, Access::Write)?;
+        let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
+        self.code_written(physical);
         bus.write16(physical as u64, value).map_err(|_| (va, 0x08))
     }
 
@@ -241,6 +395,12 @@ impl Cpu {
         va: u32,
         value: u32,
     ) -> Result<(), (u32, u32)> {
+        if let Some(p) = self.host(va, 4, U_WRITE) {
+            self.invalidate_exclusive(va);
+            // SAFETY: as in mem_write8
+            unsafe { (p as *mut u32).write_unaligned(value) };
+            return Ok(());
+        }
         if self.crosses_page(va, 4) {
             self.translate(bus, va, Access::Write)?;
             self.translate(bus, va.wrapping_add(3), Access::Write)?;
@@ -249,8 +409,9 @@ impl Cpu {
             }
             return Ok(());
         }
-        let physical = self.translate(bus, va, Access::Write)?;
+        let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
+        self.code_written(physical);
         bus.write32(physical as u64, value).map_err(|_| (va, 0x08))
     }
 }

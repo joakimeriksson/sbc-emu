@@ -54,13 +54,16 @@ pub struct SunxiMmc {
     raw: u32,
     /// IDMAC status (IDST).
     idst: u32,
+    /// RAM ranges written by DMA since the machine last looked (compiled code there is
+    /// stale).
+    pub dma_written: Vec<(u64, usize)>,
 }
 
 impl Default for SunxiMmc {
     fn default() -> Self {
         let mut card = SdCard::new(None);
         card.trace = std::env::var_os("SBC_MMC_TRACE").is_some();
-        SunxiMmc { card, regs: [0; 64], raw: 0, idst: 0 }
+        SunxiMmc { card, regs: [0; 64], raw: 0, idst: 0, dma_written: Vec::new() }
     }
 }
 
@@ -212,11 +215,15 @@ impl SunxiMmc {
 
     fn dma_to_memory(&mut self, data: &[u8], ram: &mut FlatRam) -> bool {
         let mut pos = 0;
-        self.walk(data.len(), ram, |ram, address, n| {
+        let mut written = std::mem::take(&mut self.dma_written);
+        let ok = self.walk(data.len(), ram, |ram, address, n| {
             let ok = ram.load(address, &data[pos..pos + n]).is_ok();
+            written.push((address, n));
             pos += n;
             ok
-        })
+        });
+        self.dma_written = written;
+        ok
     }
 
     fn dma_from_memory(&mut self, bytes: usize, ram: &mut FlatRam) -> Option<Vec<u8>> {

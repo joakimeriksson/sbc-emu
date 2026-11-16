@@ -57,7 +57,7 @@ impl Cpu {
     }
 
     fn fetch_pa(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u32, Trap> {
-        self.translate(bus, va, Access::Execute)
+        self.translate_fill(bus, va, Access::Execute)
             .map_err(|(va, status)| self.prefetch_abort(va, status))
     }
 

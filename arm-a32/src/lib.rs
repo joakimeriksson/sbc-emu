@@ -12,6 +12,7 @@
 //! hypervisor mode, and multiple cores.
 
 mod cpu;
+pub mod jit;
 mod media;
 mod mmu;
 pub mod model;
@@ -21,5 +22,6 @@ mod vfp;
 
 pub use model::{CpuModel, CORTEX_A12, CORTEX_A7};
 pub use vfp::Vfp;
+pub use jit::CodeWatch;
 
 pub use cpu::{Cpu, MODE_ABT, MODE_FIQ, MODE_IRQ, MODE_SVC, MODE_SYS, MODE_UND, MODE_USR};
