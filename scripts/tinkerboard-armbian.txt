@@ -1,0 +1,37 @@
+# Tinker Board S (RK3288) M4 acceptance: Armbian 26.8.1 (trixie, mainline 6.18.43, armhf) from an
+# unmodified SD image. Emulated firmware boot (armbianEnv.txt, zImage, rk3288-tinker-s.dtb and
+# uInitrd from the card's ext4 /boot), four cores, the initramfs finds the root partition by UUID
+# on the dw_mmc SD card (RK808 regulators probed over I2C), systemd to the serial console login.
+# The first login runs Armbian's first-run wizard (root password, shell; the user account is
+# skipped with Ctrl-C), then the shell checks the board, the card, the SD regulators and
+# the PMIC's RTC. Power-off is not tested: mainline 6.18 registers the RK808 power-off as a
+# POWER_OFF_PREPARE handler only, so systemd's poweroff ends in "System halted".
+# Fixture: scripts/armbian-tinkerboard-fixture.sh, then
+#   sbc-emu run --board tinkerboard \
+#     --sd cache/tinker-board-armbian/Armbian_26.8.1_Tinkerboard_trixie_current_6.18.43_minimal.img \
+#     --script scripts/tinkerboard-armbian.txt --timeout 3600
+# Without --sd-persist the card is copy-on-write: the image stays unmodified.
+# systemd colours its messages, so the waits match text between its escape sequences.
+wait-serial Armbian 26.8.1 trixie
+wait-serial multi-user.target
+wait-serial tinkerboard login:
+wait-serial Create root password:
+serial sbc-emu-Root1\r
+wait-serial Repeat root password:
+serial sbc-emu-Root1\r
+wait-serial Choose default system command shell:
+serial 1\r
+wait-serial Press <Ctrl-C> to abort
+serial \x03
+wait-serial Disabling user account creation procedure
+wait-serial root@tinkerboard
+serial cat /proc/device-tree/model; echo\r
+wait-serial Asus Tinker Board S
+serial lsblk -o NAME,SIZE,MOUNTPOINTS /dev/mmcblk0; findmnt -n -o SOURCE / | sed 's,/dev/,ROOT_,'\r
+wait-serial ROOT_mmcblk0p1
+serial printf 'RTC_%s_%s\n' "$(cut -d' ' -f1 /sys/class/rtc/rtc0/name)" $(date +%Y)\r
+wait-serial RTC_rk808-rtc_20
+serial printf 'CPUS_%s\n' $(nproc); grep -c . /proc/device-tree/model >/dev/null && cat /sys/class/regulator/*/name | grep -c -e vccio_sd -e vcc33_sd | sed 's/^/SDREG_/'\r
+wait-serial CPUS_4
+wait-serial SDREG_2
+quit
