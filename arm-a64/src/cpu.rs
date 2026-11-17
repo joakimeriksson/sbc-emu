@@ -61,9 +61,10 @@ pub struct Cpu {
     pub irq: bool,
     pub fiq: bool,
     pub instret: u64,
-    /// exclusive monitor: Some(address) after LDXR
-    pub excl: Option<u64>,
-    /// 1 while `excl` holds a reservation (read by JIT-generated stores)
+    /// exclusive monitor: the address of the last LDXR while `excl_armed` is 1 (plain fields,
+    /// so JIT-generated code can read and write the reservation; see `excl()`)
+    pub(crate) excl_addr: u64,
+    /// 1 while the monitor holds a reservation (read by JIT-generated stores)
     pub excl_armed: u64,
     /// `brk` returns Trap::Brk instead of taking an exception (bare-metal tests)
     pub brk_to_host: bool,
@@ -174,7 +175,7 @@ impl Cpu {
             irq: false,
             fiq: false,
             instret: 0,
-            excl: None,
+            excl_addr: 0,
             excl_armed: 0,
             brk_to_host: false,
             firmware_calls_to_host: false,
@@ -361,7 +362,7 @@ impl Cpu {
         for a in [&self.elr, &self.spsr, &self.esr, &self.far, &self.vbar, &self.sctlr] { for v in a { w.u64(*v); } }
         for v in self.v { w.u128(v); }
         w.u64(self.fpcr); w.u64(self.fpsr);
-        w.bool(self.irq); w.bool(self.fiq); w.u64(self.instret); w.opt_u64(self.excl);
+        w.bool(self.irq); w.bool(self.fiq); w.u64(self.instret); w.opt_u64(self.excl());
         w.bool(self.brk_to_host); w.bool(self.firmware_calls_to_host);
         let s = &self.sys;
         for v in [s.mpidr, s.cpacr_el1, s.hcr_el2, s.scr_el3, s.ttbr1_el1, s.par_el1, s.cntfrq, s.cnt, s.time_base_ns, s.time_base_instret, s.cntvoff,
@@ -455,5 +456,8 @@ impl Cpu {
     }
 
     #[inline]
-    pub(crate) fn set_excl(&mut self, e: Option<u64>) { self.excl = e; self.excl_armed = e.is_some() as u64; }
+    pub(crate) fn set_excl(&mut self, e: Option<u64>) { self.excl_addr = e.unwrap_or(0); self.excl_armed = e.is_some() as u64; }
+    /// The exclusive monitor's reservation: Some(address) after LDXR.
+    #[inline]
+    pub fn excl(&self) -> Option<u64> { (self.excl_armed != 0).then_some(self.excl_addr) }
 }
