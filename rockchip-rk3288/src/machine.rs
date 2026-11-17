@@ -65,6 +65,7 @@ pub struct Soc {
     pub dsi: Dsi,
     /// How the panel is mounted, in degrees counter-clockwise (the panel node's `rotation`):
     /// the picture is turned the same way for screenshots and VNC, as the user sees it.
+    /// 0, 90, 180 or 270; other values show the picture unturned.
     pub display_rotation: u32,
     /// Desktop name for VNC viewers.
     pub display_name: &'static str,
@@ -148,26 +149,7 @@ impl Soc {
 
     /// The display as RGBA, turned by the panel's mounting rotation.
     pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        let (w, h) = self.active_vop()?.render(&self.ram.mem, self.ram.base, out)?;
-        if self.display_rotation % 360 == 0 {
-            return Some((w, h));
-        }
-        let src = std::mem::take(out);
-        let (rw, rh) = if self.display_rotation % 180 == 90 { (h, w) } else { (w, h) };
-        out.resize(src.len(), 0);
-        for y in 0..h {
-            for x in 0..w {
-                // A panel turned `rotation` degrees counter-clockwise.
-                let (dx, dy) = match self.display_rotation % 360 {
-                    90 => (y, w - 1 - x),
-                    180 => (w - 1 - x, h - 1 - y),
-                    _ => (h - 1 - y, x),
-                };
-                let (s, d) = (((y * w + x) * 4) as usize, ((dy * rw + dx) * 4) as usize);
-                out[d..d + 4].copy_from_slice(&src[s..s + 4]);
-            }
-        }
-        Some((rw, rh))
+        self.active_vop()?.render(&self.ram.mem, self.ram.base, self.display_rotation, out)
     }
 
     /// A word of on-chip SRAM (the boot ROM's view of the SMP mailbox).

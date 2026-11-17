@@ -3,8 +3,9 @@
 //!
 //! The picture itself reaches the panel from the VOP over DPI, so the model only has to
 //! satisfy the driver: the PHY reports lock and stop state, the generic command FIFO is
-//! always ready, and commands the panel driver sends (DCS and generic writes) are kept in a
-//! log. Reads get a short reply from a cooperative panel: the power mode reads back as "on",
+//! always ready, and commands the panel driver sends (DCS and generic writes) are counted
+//! and, with `SBC_VOP_LOG=1`, printed with every register write. (The panel board's panel
+//! driver sends none: it takes over the panel the vendor's U-Boot initialised for its splash.) Reads get a short reply from a cooperative panel: the power mode reads back as "on",
 //! anything else as zeros.
 
 pub const DSI_SIZE: u64 = 0x4000;
@@ -31,7 +32,6 @@ const MAX_RETURN_SIZE: u8 = 0x37;
 const DCS_GET_POWER_MODE: u8 = 0x0a;
 const POWER_MODE_ON: u8 = 0x9c;
 
-#[derive(Default)]
 pub struct Dsi {
     regs: Vec<u32>,
     /// Payload words written before the header that sends them.
@@ -39,8 +39,29 @@ pub struct Dsi {
     /// Bytes of the pending read response.
     reply: std::collections::VecDeque<u8>,
     max_return: usize,
-    /// Packets sent to the panel: (data type, payload).
-    pub log: Vec<(u8, Vec<u8>)>,
+    /// Packets sent to the panel.
+    pub packets: u64,
+    /// Print each packet to stderr (`SBC_VOP_LOG=1`).
+    pub log: bool,
+}
+
+impl Default for Dsi {
+    fn default() -> Self {
+        Self {
+            regs: Vec::new(),
+            payload: Vec::new(),
+            reply: Default::default(),
+            max_return: 0,
+            packets: 0,
+            log: std::env::var_os("SBC_VOP_LOG").is_some(),
+        }
+    }
+}
+
+/// Long packets (a word count and a payload) have data type low nibbles 9, A, C, D and E
+/// (null, blanking, generic and DCS long writes, PPS, pixel streams); the rest are short.
+fn is_long(data_type: u8) -> bool {
+    matches!(data_type & 0xf, 0x9 | 0xa | 0xc | 0xd | 0xe)
 }
 
 impl Dsi {
@@ -65,9 +86,14 @@ impl Dsi {
     }
 
     pub fn write(&mut self, offset: u64, value: u32) {
+        if self.log {
+            eprintln!("[dsi] write {offset:#05x} = {value:#010x}");
+        }
         match offset {
             GEN_PLD_DATA => self.payload.extend_from_slice(&value.to_le_bytes()),
-            GEN_HDR => self.packet(value),
+            GEN_HDR => {
+                self.packet(value);
+            }
             o if o < 0x100 => {
                 let index = o as usize / 4;
                 if self.regs.len() <= index {
@@ -80,16 +106,17 @@ impl Dsi {
     }
 
     /// A packet header: data type in bits 0-5, then either two parameter bytes (short
-    /// packet) or the payload word count (long packet, payload already in the FIFO).
-    fn packet(&mut self, header: u32) {
+    /// packet) or the payload byte count (long packet, payload already in the FIFO). A long
+    /// packet takes the whole FIFO: the driver pads the last word, and nothing written for
+    /// one packet may lead the next. Returns the packet (data type, payload) as sent.
+    fn packet(&mut self, header: u32) -> (u8, Vec<u8>) {
         let data_type = (header & 0x3f) as u8;
         let (lo, hi) = ((header >> 8) as u8, (header >> 16) as u8);
-        // Commands use generic (0x29) and DCS (0x39) long writes; the other long types are
-        // video stream packets the host generates itself.
-        let long = matches!(data_type, 0x29 | 0x39);
-        let bytes = if long {
-            let count = (lo as usize | (hi as usize) << 8).min(self.payload.len());
-            self.payload.drain(..).take(count).collect()
+        let bytes: Vec<u8> = if is_long(data_type) {
+            let count = lo as usize | (hi as usize) << 8;
+            let mut fifo = std::mem::take(&mut self.payload);
+            fifo.truncate(count);
+            fifo
         } else {
             vec![lo, hi]
         };
@@ -100,9 +127,11 @@ impl Dsi {
             let first = if data_type == DCS_READ && lo == DCS_GET_POWER_MODE { POWER_MODE_ON } else { 0 };
             self.reply = std::iter::once(first).chain(std::iter::repeat_n(0, len - 1)).collect();
         }
-        if self.log.len() < 4096 {
-            self.log.push((data_type, bytes));
+        self.packets += 1;
+        if self.log {
+            eprintln!("[dsi] packet {data_type:#04x} {bytes:02x?}");
         }
+        (data_type, bytes)
     }
 }
 
@@ -111,12 +140,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn long_writes_are_logged_and_power_mode_reads_on() {
+    fn long_writes_take_their_payload_and_power_mode_reads_on() {
         let mut dsi = Dsi::default();
         assert_eq!(dsi.read(PHY_STATUS) & 1, 1);
         dsi.write(GEN_PLD_DATA, 0x0403_02b0);
-        dsi.write(GEN_HDR, 4 << 8 | 0x39);
-        assert_eq!(dsi.log[0], (0x39, vec![0xb0, 2, 3, 4]));
+        assert_eq!(dsi.packet(4 << 8 | 0x39), (0x39, vec![0xb0, 2, 3, 4]));
+        // Another long type (PPS, 0x0a) and a padded word leave nothing behind.
+        dsi.write(GEN_PLD_DATA, 0x1111_1111);
+        dsi.write(GEN_PLD_DATA, 0x2222_2222);
+        assert_eq!(dsi.packet(5 << 8 | 0x0a).1.len(), 5);
+        dsi.write(GEN_PLD_DATA, 0x0000_2911);
+        assert_eq!(dsi.packet(2 << 8 | 0x39), (0x39, vec![0x11, 0x29]));
+        assert_eq!(dsi.packets, 3);
         dsi.write(GEN_HDR, 1 << 8 | MAX_RETURN_SIZE as u32);
         dsi.write(GEN_HDR, (DCS_GET_POWER_MODE as u32) << 8 | DCS_READ as u32);
         assert_eq!(dsi.read(CMD_PKT_STATUS) & GEN_PLD_R_EMPTY, 0);

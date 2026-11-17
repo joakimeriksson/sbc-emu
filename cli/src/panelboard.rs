@@ -3,23 +3,13 @@
 //! U-Boot's distro boot script does (`bootz` with the board DTB). The firmware is not part
 //! of sbc-emu; see docs/panel-board.md for extracting it locally.
 //!
-//! The board shares the RK3288 machine with the Tinker Board; what differs is the device
-//! tree and the panel: a MIPI-DSI panel behind VOP-little, mounted rotated (the panel node's
-//! `rotation`), which screenshots and VNC show the way the user sees it.
-use crate::{arg, serial_board::{self, RunConfig}};
+//! The board shares the RK3288 machine and run loop with the Tinker Board
+//! (`tinkerboard::run_board`); what differs is the device tree and the panel: a MIPI-DSI
+//! panel behind VOP-little, mounted rotated (the panel node's `rotation`), which
+//! screenshots and VNC show the way the user sees it.
+use crate::{arg, tinkerboard::{self, Profile}};
 use emu_core::fdt::Node;
-use rockchip_rk3288::{boot, Machine};
 use std::process::ExitCode;
-
-pub(crate) fn run(args: &[String]) -> ExitCode {
-    match execute(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("[panel-board] {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
 
 /// The `rotation` of the first panel node in the tree (degrees counter-clockwise).
 fn panel_rotation(node: &Node) -> Option<u32> {
@@ -31,40 +21,69 @@ fn panel_rotation(node: &Node) -> Option<u32> {
     node.children.iter().find_map(panel_rotation)
 }
 
-fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--screenshot", "--vnc"])?;
-    let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
-    let kernel = read(arg(args, "--kernel").ok_or("--kernel zImage is required (the firmware's /boot/zImage)")?)?;
-    let dtb = read(arg(args, "--dtb").ok_or("--dtb rk3288-panel.dtb is required (the firmware's /boot)")?)?;
-    let tree = Node::parse(&dtb)?;
+/// The panel's mounting rotation from the device tree, if it is one the display can show
+/// (a right angle); anything else is reported and shown unturned.
+fn mounting_rotation(dtb: &[u8]) -> Result<u32, String> {
+    let tree = Node::parse(dtb)?;
     let compatible = tree.prop("compatible").unwrap_or_default();
     if !compatible.split(|&b| b == 0).any(|c| c.starts_with(b"vendor,")) {
         eprintln!("[panel-board] note: the device tree is not a vendor board's");
     }
-    let rotation = panel_rotation(&tree).unwrap_or(0);
-    let initrd = arg(args, "--initrd").map(read).transpose()?;
-    let cmdline = arg(args, "--append").unwrap_or(boot::DEFAULT_CMDLINE);
-    // The panel board has 2 GiB of DRAM.
-    let ram = serial_board::ram_bytes(args, 2048)?;
-    if ram == 0 || ram > 0xfe00_0000 {
-        return Err("--ram-mb must be between 1 and 4064 (DRAM ends below the RK3288 device window)".into());
-    }
-    let config = RunConfig::from_args("panel-board", args)?;
-    let make_machine = || -> Result<Machine, String> {
-        let mut m = Machine::with_ram_size(ram);
-        m.soc.display_rotation = rotation;
-        m.soc.display_name = "sbc-emu: RK3288 panel board";
-        boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), cmdline)?;
-        Ok(m)
+    Ok(match panel_rotation(&tree).unwrap_or(0) {
+        r @ (0 | 90 | 180 | 270) => r,
+        r => {
+            eprintln!("[panel-board] note: panel rotation {r} is not a right angle; the display is shown unturned");
+            0
+        }
+    })
+}
+
+pub(crate) fn run(args: &[String]) -> ExitCode {
+    // The DTB is read again by the shared loader; it is small.
+    let rotation = match arg(args, "--dtb").map(|path| std::fs::read(path).map_err(|e| format!("{path}: {e}"))) {
+        Some(Ok(dtb)) => match mounting_rotation(&dtb) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[panel-board] {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        // A missing or unreadable --dtb is reported by the shared loader.
+        _ => 0,
     };
-    if let Some(path) = arg(args, "--dump-dtb") {
-        let range = initrd.as_ref().map(|d| (boot::INITRD_ADDR, boot::INITRD_ADDR + d.len() as u32));
-        let blob = boot::prepare_device_tree(&dtb, ram as u64, cmdline, range)?;
-        std::fs::write(path, blob).map_err(|e| e.to_string())?;
+    tinkerboard::run_board(
+        args,
+        &Profile {
+            tag: "panel-board",
+            // The panel board has 2 GiB of DRAM.
+            default_ram_mb: 2048,
+            kernel_hint: "--kernel zImage is required (the firmware's /boot/zImage)",
+            dtb_hint: "--dtb rk3288-panel.dtb is required (the firmware's /boot)",
+            card_boot: false,
+            rk808: false,
+            banner: "experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12 (interpreter), GIC-400, UART2, \
+                     CRU/GRF/PMU, VOP + MIPI DSI panel; the power chips, audio, touch, pads and the GPU are not modelled yet",
+            setup: &|m| {
+                m.soc.display_rotation = rotation;
+                m.soc.display_name = "sbc-emu: RK3288 panel board";
+            },
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_right_angle_rotations_are_used() {
+        let tree = |rotation: u32| {
+            let mut root = Node::new("");
+            root.set_str("compatible", "vendor,panel");
+            root.child_mut("dsi@ff960000").child_mut("panel@0").set_cells("rotation", &[rotation]);
+            root.to_blob()
+        };
+        assert_eq!(mounting_rotation(&tree(270)).unwrap(), 270);
+        assert_eq!(mounting_rotation(&tree(45)).unwrap(), 0);
     }
-    eprintln!(
-        "[panel-board] experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12 (interpreter), GIC-400, UART2, \
-         CRU/GRF/PMU, VOP + MIPI DSI panel (rotation {rotation}); storage, audio, touch, pads and the GPU are not modelled yet"
-    );
-    serial_board::run(config, make_machine)
 }
