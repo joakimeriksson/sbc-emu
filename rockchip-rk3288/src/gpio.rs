@@ -2,8 +2,9 @@
 //! 32 pins with output data and direction registers, interrupt configuration that reads
 //! back, and the input level register EXT_PORT. Outputs read back what is driven; inputs
 //! read the level the board puts on them, high by default (pull-ups, released buttons,
-//! inactive-low interrupt lines such as the RK808's). No input changes yet, so the bank
-//! raises no interrupts.
+//! inactive-low interrupt lines such as the RK808's). Inputs the board changes (the panel
+//! board's touch controller) raise edge or level interrupts as INTEN/INTMASK/INTTYPE_LEVEL/
+//! INT_POLARITY configure them; PORTA_EOI clears edge interrupts.
 //!
 //! The level matters: the Tinker Board's power button (`gpio-keys`, GPIO0_A5, active low)
 //! read as pressed at probe makes systemd-logind power the board off.
@@ -18,6 +19,10 @@ pub const BANKS: [u64; 9] = [
 
 const SWPORT_DR: usize = 0x00;
 const SWPORT_DDR: usize = 0x04;
+const INTEN: usize = 0x30;
+const INTMASK: usize = 0x34;
+const INTTYPE_LEVEL: usize = 0x38;
+const INT_POLARITY: usize = 0x3c;
 const INT_STATUS: usize = 0x40;
 const INT_RAWSTATUS: usize = 0x44;
 const PORTA_EOI: usize = 0x4c;
@@ -27,11 +32,13 @@ pub struct GpioBank {
     regs: [u32; 0x20],
     /// Levels the board drives onto pins configured as inputs.
     pub inputs: u32,
+    /// Latched edge interrupts.
+    edges: u32,
 }
 
 impl Default for GpioBank {
     fn default() -> Self {
-        Self { regs: [0; 0x20], inputs: u32::MAX }
+        Self { regs: [0; 0x20], inputs: u32::MAX, edges: 0 }
     }
 }
 
@@ -43,7 +50,9 @@ impl GpioBank {
                 let output = self.regs[SWPORT_DDR / 4];
                 self.regs[SWPORT_DR / 4] & output | self.inputs & !output
             }
-            INT_STATUS | INT_RAWSTATUS | PORTA_EOI => 0,
+            INT_RAWSTATUS => self.raw(),
+            INT_STATUS => self.raw() & !self.regs[INTMASK / 4],
+            PORTA_EOI => 0,
             _ if offset < 0x80 => self.regs[offset / 4],
             _ => 0,
         }
@@ -52,9 +61,42 @@ impl GpioBank {
     pub fn write(&mut self, offset: u64, value: u32) {
         let offset = offset as usize;
         match offset {
-            INT_STATUS | INT_RAWSTATUS | PORTA_EOI | EXT_PORT => {}
+            PORTA_EOI => self.edges &= !value,
+            INT_STATUS | INT_RAWSTATUS | EXT_PORT => {}
             _ if offset < 0x80 => self.regs[offset / 4] = value,
             _ => {}
+        }
+    }
+}
+
+impl GpioBank {
+    /// Pending interrupts before masking: latched edges, and level-triggered pins at their
+    /// active level.
+    fn raw(&self) -> u32 {
+        let en = self.regs[INTEN / 4];
+        let edge = self.regs[INTTYPE_LEVEL / 4];
+        let high = self.regs[INT_POLARITY / 4];
+        let level = !(self.inputs ^ high) & !edge;
+        (self.edges & edge | level) & en
+    }
+
+    /// The bank's interrupt line.
+    pub fn irq(&self) -> bool {
+        self.raw() & !self.regs[INTMASK / 4] != 0
+    }
+
+    /// The board drives input `pin` to `level`; an edge in the configured direction latches
+    /// an edge interrupt.
+    pub fn set_input(&mut self, pin: u32, level: bool) {
+        let bit = 1u32 << pin;
+        let old = self.inputs & bit != 0;
+        if old == level {
+            return;
+        }
+        if level { self.inputs |= bit } else { self.inputs &= !bit }
+        let rising = self.regs[INT_POLARITY / 4] & bit != 0;
+        if self.regs[INTEN / 4] & self.regs[INTTYPE_LEVEL / 4] & bit != 0 && level == rising {
+            self.edges |= bit;
         }
     }
 }
@@ -72,5 +114,19 @@ mod tests {
         assert_eq!(bank.read(EXT_PORT as u64) & (1 << 11 | 1 << 5), 1 << 5);
         bank.inputs &= !(1 << 5);
         assert_eq!(bank.read(EXT_PORT as u64) & 1 << 5, 0, "pressed");
+    }
+
+    #[test]
+    fn falling_edge_interrupt() {
+        let mut bank = GpioBank::default();
+        bank.write(INTTYPE_LEVEL as u64, 1 << 6);
+        bank.write(INTEN as u64, 1 << 6);
+        assert!(!bank.irq());
+        bank.set_input(6, false);
+        assert!(bank.irq());
+        bank.write(PORTA_EOI as u64, 1 << 6);
+        assert!(!bank.irq());
+        bank.set_input(6, true);
+        assert!(!bank.irq(), "rising edge with falling polarity");
     }
 }

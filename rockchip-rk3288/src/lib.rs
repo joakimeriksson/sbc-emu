@@ -20,6 +20,7 @@ pub mod emmc;
 pub mod gpio;
 pub mod hym8563;
 pub mod i2c;
+pub mod ili2116;
 mod machine;
 pub mod rga;
 pub mod rk808;

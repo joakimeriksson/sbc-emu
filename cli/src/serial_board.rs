@@ -100,7 +100,7 @@ impl RunConfig {
             None => VecDeque::new(),
         };
         for line in &script {
-            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep")) {
+            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep" | "pointer")) {
                 return Err(format!("unsupported script command: {line}"));
             }
         }
@@ -206,6 +206,15 @@ pub(crate) fn run<B: SerialBoard>(
                 "sleep" => {
                     let seconds: f64 = rest.trim().parse().map_err(|_| format!("script: {line}"))?;
                     sleep_until = Some(m.now().saturating_add((seconds * 1e9) as u64));
+                    true
+                }
+                // the pointer (a touch on touchscreen boards): "pointer BUTTONS X Y"
+                "pointer" => {
+                    let v: Vec<u16> = rest.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                    match (m.screen(), v.as_slice()) {
+                        (Some(screen), [b, x, y]) => screen.pointer(*b as u8, *x, *y, 0),
+                        _ => return Err(format!("script: {line}")),
+                    }
                     true
                 }
                 // keystrokes on the board's USB keyboard (\n is Enter)

@@ -171,6 +171,21 @@ impl Soc {
         self.active_vop()?.render(&self.ram.mem, self.ram.base, self.display_rotation, out)
     }
 
+    /// A touch at (`x`, `y`) on the display as the user sees it: turned back by the panel's
+    /// mounting rotation to the touch layer's own coordinates.
+    pub fn touch(&mut self, down: bool, x: u16, y: u16) {
+        let (w, h) = self.active_vop().and_then(|v| v.shown_size()).unwrap_or((800, 1280));
+        let (w, h) = (w as u16, h as u16);
+        let (px, py) = match self.display_rotation % 360 {
+            90 => (w.saturating_sub(1).saturating_sub(y), x),
+            180 => (w.saturating_sub(1).saturating_sub(x), h.saturating_sub(1).saturating_sub(y)),
+            270 => (y, h.saturating_sub(1).saturating_sub(x)),
+            _ => (x, y),
+        };
+        self.periph.touch(down, px, py);
+        self.dirty = true;
+    }
+
     /// A word of on-chip SRAM (the boot ROM's view of the SMP mailbox).
     pub fn sram_word(&mut self, addr: u64) -> u32 {
         self.sram.read32(addr).unwrap_or(0)
