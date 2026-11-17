@@ -13,17 +13,19 @@
 pub mod boot;
 pub mod cru;
 pub mod devices;
+pub mod dsi;
 pub mod dwmmc;
 pub mod emmc;
 pub mod gpio;
 pub mod i2c;
 mod machine;
 pub mod rk808;
+pub mod vop;
 
 pub use allwinner_h3::{Gic, Uart, NCPU, SPURIOUS};
 pub use machine::{
     ns_to_ticks, ticks_to_ns, CoreState, Machine, Soc, BOOT_MAGIC, CRU_BASE, GICC_BASE,
     GICD_BASE, GRF_BASE, PHYSICAL_TIMER_PPI, PMU_BASE, RAM_BASE, RAM_SIZE, RK3288_MIDR,
-    RK3288_MPIDR, SECURE_PHYSICAL_TIMER_PPI, SMP_MAILBOX, SRAM_BASE, SRAM_SIZE, UART2_BASE,
+    RK3288_MPIDR, DSI0_BASE, VOP_BASES, VOP_IRQS, SECURE_PHYSICAL_TIMER_PPI, SMP_MAILBOX, SRAM_BASE, SRAM_SIZE, UART2_BASE,
     UART2_IRQ, VIRTUAL_TIMER_PPI,
 };

@@ -7,11 +7,12 @@ pub enum Board {
     OrangePi5,
     OrangePiOne,
     TinkerBoard,
+    PanelBoard,
 }
 
 impl Board {
-    pub const ALL: [Self; 5] =
-        [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne, Self::TinkerBoard];
+    pub const ALL: [Self; 6] =
+        [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne, Self::TinkerBoard, Self::PanelBoard];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -20,6 +21,7 @@ impl Board {
             Self::OrangePi5 => "orangepi5",
             Self::OrangePiOne => "orangepi-one",
             Self::TinkerBoard => "tinkerboard",
+            Self::PanelBoard => "panel-board",
         }
     }
 
@@ -30,11 +32,12 @@ impl Board {
             Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (one A55, GICv3, UART2, direct Linux boot)",
             Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (one A7, GIC-400, UART0, direct Linux boot)",
             Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (four Cortex-A12s, GIC-400, UART2, direct Linux boot)",
+            Self::PanelBoard => "experimental: RK3288 panel board / RK3288 (the vendor's own kernel and device tree, MIPI-DSI panel)",
         }
     }
 
     pub fn require_implemented(self) -> Result<(), String> {
-        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard) {
+        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::PanelBoard) {
             Ok(())
         } else {
             Err(format!(

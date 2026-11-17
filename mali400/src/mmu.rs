@@ -85,23 +85,31 @@ impl Mmu {
         self.rawstat & self.mask != 0
     }
 
-    /// Translate a GPU virtual address. A missing or forbidden page raises a page fault
-    /// (the first one is kept) and returns None.
-    pub fn translate(&mut self, mem: &dyn Memory, va: u32, write: bool) -> Option<u32> {
+    /// Whether paging is on (COMMAND 0 enables it).
+    pub fn paging(&self) -> bool {
+        self.paging
+    }
+
+    /// Walk the page tables for `va` without side effects: the physical address, or None
+    /// for a missing or forbidden page. Identity while paging is off.
+    pub fn lookup(&self, mem: &dyn Memory, va: u32, write: bool) -> Option<u32> {
         if !self.paging {
             return Some(va);
         }
         let pde = mem.read_u32(self.dte + (va >> 22) * 4).unwrap_or(0);
         let pte = if pde & PRESENT != 0 { mem.read_u32((pde & !0xfff) + (va >> 12 & 0x3ff) * 4).unwrap_or(0) } else { 0 };
         let allowed = pte & PRESENT != 0 && pte & if write { WRITE } else { READ } != 0;
-        if allowed {
-            Some(pte & !0xfff | va & 0xfff)
-        } else {
-            if self.fault.is_none() {
-                self.fault = Some((va, write));
-                self.rawstat |= INT_PAGE_FAULT;
-            }
-            None
+        allowed.then_some(pte & !0xfff | va & 0xfff)
+    }
+
+    /// Translate a GPU virtual address. A missing or forbidden page raises a page fault
+    /// (the first one is kept) and returns None.
+    pub fn translate(&mut self, mem: &dyn Memory, va: u32, write: bool) -> Option<u32> {
+        let pa = self.lookup(mem, va, write);
+        if pa.is_none() && self.fault.is_none() {
+            self.fault = Some((va, write));
+            self.rawstat |= INT_PAGE_FAULT;
         }
+        pa
     }
 }
