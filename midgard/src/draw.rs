@@ -265,11 +265,9 @@ pub fn common_ldst(vm: &mut Vm, dcd: &Dcd, ins: &LdSt, a: LdStArgs, data: u128, 
     let op = ins.op;
     match op {
         0xa0..=0xb3 => {
-            let index = if ins.offset & 1 != 0 {
-                ins.arg_comp | ins.arg_reg << 2 | (ins.bitsize_toggle as u32) << 5 | ins.index_format << 6
-            } else {
-                a.arg as u32
-            };
+            // The buffer index is an immediate in the argument fields (Mesa's
+            // midgard_pack_ubo_index_imm); Mesa never selects it by register.
+            let index = ins.arg_comp | ins.arg_reg << 2 | (ins.bitsize_toggle as u32) << 5 | ins.index_format << 6;
             let base = ubo_pointer(vm, dcd.ubos, index);
             let off = ((ins.offset >> 2) as i64 as u64).wrapping_add(a.index << ins.index_shift);
             let len = match op & 0x1c {
@@ -476,9 +474,56 @@ pub struct Prim {
     pub kind: u8,
     /// Varying indices of the vertices.
     pub v: [u32; 3],
-    /// Screen positions (x, y, z, 1/w).
+    /// Screen positions (x, y, z, 1/w) of the corners.
     pub pos: [[f32; 4]; 3],
+    /// Each corner as clip-space weights of the vertices `v` (the identity unless the
+    /// triangle was clipped at the near plane).
+    pub corner: [[f32; 3]; 3],
     pub draw: Rc<DrawState>,
+}
+
+const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Clip a triangle at the near plane (window z = `znear`). Positions hold window x, y, z
+/// and 1/w; in clip space (x w, y w, (z - znear) w, w) is linear along edges, and
+/// (z - znear) w is the distance to the near plane. Returns the corners of the clipped
+/// polygon with their clip-space weights of the original vertices.
+pub fn clip_near(pos: [[f32; 4]; 3], znear: f32) -> Vec<([f32; 4], [f32; 3])> {
+    let h: Vec<([f32; 4], [f32; 3])> = (0..3)
+        .map(|i| {
+            let w = 1.0 / pos[i][3];
+            ([pos[i][0] * w, pos[i][1] * w, (pos[i][2] - znear) * w, w], IDENTITY[i])
+        })
+        .collect();
+    if h.iter().all(|(c, _)| c[2] >= 0.0 && c[3] > 0.0 && c[3].is_finite()) {
+        return (0..3).map(|i| (pos[i], IDENTITY[i])).collect();
+    }
+    let mut out: Vec<([f32; 4], [f32; 3])> = Vec::new();
+    for i in 0..3 {
+        let (a, wa) = h[i];
+        let (b, wb) = h[(i + 1) % 3];
+        let (ia, ib) = (a[2] >= 0.0, b[2] >= 0.0);
+        if ia {
+            out.push((a, wa));
+        }
+        if ia != ib {
+            let t = a[2] / (a[2] - b[2]);
+            let mut c = [0f32; 4];
+            let mut wc = [0f32; 3];
+            for k in 0..4 {
+                c[k] = a[k] + t * (b[k] - a[k]);
+            }
+            for k in 0..3 {
+                wc[k] = wa[k] + t * (wb[k] - wa[k]);
+            }
+            c[2] = 0.0;
+            out.push((c, wc));
+        }
+    }
+    out.into_iter()
+        .filter(|(c, _)| c[3] > 0.0)
+        .map(|(c, w)| ([c[0] / c[3], c[1] / c[3], c[2] / c[3] + znear, 1.0 / c[3]], w))
+        .collect()
 }
 
 /// Per-draw state a fragment job needs.
@@ -521,6 +566,7 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
         _ => None,
     };
     let mut prims = 0u64;
+    let znear = if dcd.viewport != 0 { vm.rf32(dcd.viewport + 16) } else { 0.0 };
     for inst in 0..instances {
         let mut idx: Vec<Option<u32>> = Vec::with_capacity(count as usize);
         for k in 0..count {
@@ -551,7 +597,22 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
                     let w: [u32; 4] = vm.words(dcd.position + 16 * v[i] as u64);
                     pos[i] = w.map(f32::from_bits);
                 }
-                list.push(Prim { kind, v, pos, draw: draw.clone() });
+                if kind == TRIS {
+                    let poly = clip_near(pos, znear);
+                    for k in 2..poly.len() {
+                        let c = [poly[0], poly[k - 1], poly[k]];
+                        list.push(Prim {
+                            kind,
+                            v,
+                            pos: [c[0].0, c[1].0, c[2].0],
+                            corner: [c[0].1, c[1].1, c[2].1],
+                            draw: draw.clone(),
+                        });
+                        prims += 1;
+                    }
+                    return;
+                }
+                list.push(Prim { kind, v, pos, corner: IDENTITY, draw: draw.clone() });
                 prims += 1;
             };
             let n = run.len();

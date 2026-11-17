@@ -169,7 +169,9 @@ pub fn sample(vm: &mut Vm, dcd: &Dcd, w: &TexWord, coords: &[[f32; 4]; 4], lod: 
             let f = (c[0] / 4.0).floor().clamp(0.0, 5.0);
             face[k] = f as u32;
             uv[k] = [c[0] - 4.0 * f, c[1], 0.0];
-            layer[k] = if c[3].is_finite() { c[3].max(0.0) as u32 } else { 0 };
+            if t.array > 1 && c[3].is_finite() {
+                layer[k] = (c[3].round().max(0.0) as u32).min(t.array - 1);
+            }
         } else {
             uv[k] = [c[0], c[1], c[2]];
             if t.array > 1 {

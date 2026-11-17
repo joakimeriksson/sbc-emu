@@ -463,9 +463,16 @@ impl FragEnv<'_, '_> {
                 }
             }
         }
+        // corner weights to weights of the original vertices (clipped triangles)
+        let mut ow = [0f32; 3];
+        for k in 0..n {
+            for j in 0..n {
+                ow[j] += wgt[k] * self.prim.corner[k][j];
+            }
+        }
         let mut o = [0f32; 4];
         for c in 0..4 {
-            o[c] = (0..n).map(|i| wgt[i] * f32::from_bits(vals[i][c])).sum();
+            o[c] = (0..n).map(|i| ow[i] * f32::from_bits(vals[i][c])).sum();
         }
         // perspective division modifiers
         match params & 7 {
@@ -1047,6 +1054,22 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                     let rt = &fb.rts[o.rt as usize];
                     let bd = blend[o.rt as usize];
                     let raw = internal_bits(rt.internal).is_none();
+                    if bd[0] & 2 != 0 && bd[0] & (1 << 9) != 0 {
+                        // blend shader: it reads the destination from the tile buffer and
+                        // writes the final value out (no fixed-function blending after)
+                        let pc = (bd[2] as u64 | (bd[3] as u64) << 32) & !0xf;
+                        let (x, y) = (pix[k].x, pix[k].y);
+                        if let Some((c, half)) = run_blend(core.env.vm, &dcd, tbp, x, y, o.rt as usize, pc, o.color, o.half) {
+                            let tbm = unsafe { &mut *tbp };
+                            if raw {
+                                tbm.raw[o.rt as usize][i] = c;
+                            } else {
+                                let out = Output { rt: o.rt, color: c, half, depth: None, stencil: None };
+                                tbm.color[o.rt as usize][i] = quantize(rt.internal, color_of(&out));
+                            }
+                        }
+                        continue;
+                    }
                     if raw {
                         tbm.raw[o.rt as usize][i] = o.color;
                         continue;
@@ -1057,12 +1080,7 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                     if !enable {
                         continue;
                     }
-                    let (eq, k) = if bd[0] & 2 != 0 {
-                        // blend shader: not modelled, replace
-                        (0xf000_0000 | 0x122 | 0x122 << 12, 0.0)
-                    } else {
-                        (bd[2], f32::from_bits(bd[3]))
-                    };
+                    let (eq, k) = (bd[2], f32::from_bits(bd[3]));
                     let mut src = src;
                     if bd[0] & (1 << 8) != 0 {
                         src[3] = 1.0;
@@ -1095,6 +1113,63 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
         }
     }
     cycles
+}
+
+/// A blend shader's environment: the destination pixel in the tile buffer.
+struct BlendEnv<'a, 'b> {
+    vm: &'a mut Vm<'b>,
+    dcd: Dcd,
+    tb: *mut TileBuf,
+    x: u32,
+    y: u32,
+    rt: usize,
+    out: Option<(u128, bool)>,
+}
+
+impl Env for BlendEnv<'_, '_> {
+    fn code(&mut self, va: u64) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        self.vm.read_bytes(va, &mut b);
+        b
+    }
+
+    fn ldst(&mut self, _t: usize, ins: &LdSt, a: LdStArgs, data: u128) -> u128 {
+        match ins.op {
+            0xb8..=0xba | 0x9c..=0x9f => {
+                let tb = unsafe { &*self.tb };
+                let i = tb.idx(self.x, self.y);
+                if ins.op == 0xba || ins.op == 0x9e || ins.op == 0x9f {
+                    return tb.raw.get(self.rt).map_or(0, |r| r[i]);
+                }
+                let v = tb.color.get(self.rt).map_or([0.0; 4], |c| c[i]).map(f32::to_bits);
+                if ins.op == 0xb9 || ins.op == 0x9d { draw::to_half_lanes(v) } else { draw::to_u128(v) }
+            }
+            _ => draw::common_ldst(self.vm, &self.dcd, ins, a, data, 0).unwrap_or(0),
+        }
+    }
+
+    fn texture(&mut self, _w: &TexWord, _c: &[[f32; 4]; 4], _l: &[f32; 4], _a: u8) -> [[u32; 4]; 4] {
+        [[0; 4]; 4]
+    }
+
+    fn writeout(&mut self, _t: usize, r0: u128, half: bool, _r1: u128, _w: u8) {
+        if self.out.is_none() {
+            self.out = Some((r0, half));
+        }
+    }
+}
+
+/// Run a blend shader for one pixel: the source colour in r0, the shader's write-out is
+/// the value to store.
+#[allow(clippy::too_many_arguments)]
+fn run_blend(vm: &mut Vm, dcd: &Dcd, tb: *mut TileBuf, x: u32, y: u32, rt: usize, pc: u64, src: u128, half: bool) -> Option<(u128, bool)> {
+    let mut env = BlendEnv { vm, dcd: *dcd, tb, x, y, rt, out: None };
+    let mut t = Thread::new(pc);
+    t.r[0] = src;
+    t.r0_half = half;
+    let mut core = Core::new(&mut env);
+    core.run(std::slice::from_mut(&mut t));
+    env.out
 }
 
 fn color_of(o: &Output) -> [f32; 4] {

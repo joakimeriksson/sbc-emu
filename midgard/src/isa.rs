@@ -37,6 +37,10 @@ pub enum State {
 #[derive(Clone, Copy)]
 pub struct Thread {
     pub r: [u128; 32],
+    /// The texture unit's inputs. Register numbers 28/29 name two different registers
+    /// by direction: ALU and load/store writes go to the texture unit's inputs ("AT"),
+    /// ALU reads see its results ("TA").
+    pub tex_in: [u128; 2],
     pub pc: u64,
     pub state: State,
     /// The condition in r31 was written at 16-bit width.
@@ -48,7 +52,7 @@ pub struct Thread {
 
 impl Thread {
     pub fn new(pc: u64) -> Self {
-        Self { r: [0; 32], pc, state: State::Run, r31_half: false, r0_half: false, steps: 0 }
+        Self { r: [0; 32], tex_in: [0; 2], pc, state: State::Run, r31_half: false, r0_half: false, steps: 0 }
     }
 }
 
@@ -748,7 +752,7 @@ impl<'e, E: Env> Core<'e, E> {
             o
         };
         let write_dest = |t: &mut Thread, v: u128, mask: u32| {
-            let r = &mut t.r[i.reg as usize];
+            let r = if i.reg == 28 || i.reg == 29 { &mut t.tex_in[i.reg as usize - 28] } else { &mut t.r[i.reg as usize] };
             for c in 0..4 {
                 if mask & (1 << c) != 0 {
                     set_lane(r, 32, c, lane(v, 32, c));
@@ -847,7 +851,7 @@ impl<'e, E: Env> Core<'e, E> {
         let mut coords = [[0f32; 4]; 4];
         let mut lod = [0f32; 4];
         for (k, t) in threads.iter().enumerate() {
-            let r = t.r[28 + w.in_select as usize];
+            let r = t.tex_in[w.in_select as usize];
             for c in 0..4u32 {
                 let s = (w.in_swizzle >> (2 * c)) & 3;
                 coords[k][c as usize] = if w.in_full {
@@ -858,7 +862,7 @@ impl<'e, E: Env> Core<'e, E> {
             }
             if w.lod_register {
                 let sel = w.bias;
-                let reg = t.r[28 + ((sel >> 1) & 1) as usize];
+                let reg = t.tex_in[((sel >> 1) & 1) as usize];
                 let comp = (sel >> 3) & 3;
                 lod[k] = if sel & 1 != 0 {
                     f32::from_bits(lane(reg, 32, comp) as u32)
@@ -954,7 +958,7 @@ fn exec_alu(t: &mut Thread, ins: &[AluIns], consts: u128) {
 }
 
 fn commit(t: &mut Thread, reg: u32, value: u128, mask: u128, half: bool) {
-    let r = &mut t.r[reg as usize];
+    let r = if reg == 28 || reg == 29 { &mut t.tex_in[reg as usize - 28] } else { &mut t.r[reg as usize] };
     *r = (*r & !mask) | (value & mask);
     if reg == 31 {
         t.r31_half = half;
