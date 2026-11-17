@@ -10,6 +10,7 @@ pub enum Stop {
     Complete,
     Budget,
     Memory(Fault),
+    Shader(crate::gpu_shader::Error),
     InvalidRegister,
     Unsupported { pc: u64, opcode: u8 },
     InvalidStream,
@@ -87,6 +88,7 @@ impl Stream {
                     Ok(())
                 }
                 3 if (insn >> 32) & 1 == 0 => Ok(()),
+                4 => crate::gpu_compute::dispatch(mmu,ram,&self.regs,insn),
                 7 if insn & 0x00ff_ffff_ffff_ffff == 0 => {
                     crate::gpu_render::fragment(mmu, ram, &self.regs)
                 }

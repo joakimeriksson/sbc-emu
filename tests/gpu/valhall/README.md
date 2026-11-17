@@ -1,0 +1,12 @@
+# Valhall shader fixtures
+
+`triangle.asm` is assembled using Mesa's Valhall `asm.py` and `ISA.xml` from commit
+`06efd8542f442e701685e26abe4d73c4ddf7b249` (under
+`src/panfrost/compiler/bifrost/valhall`). `triangle.json` contains its little-endian
+64-bit instruction words, reproduced in `panthor-shader.py` so the guest needs no
+external assembler. Shader unit tests use the same Mesa-assembled words.
+
+The shader receives output address, coordinates, edge coefficients and background
+color through FAU uniforms. It calculates barycentric coverage and color itself.
+The guest submits one single-invocation compute dispatch per pixel; this exercises
+actual Valhall shader execution rather than the fixed-function triangle pipeline.
