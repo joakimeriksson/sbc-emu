@@ -7,10 +7,9 @@
 //! Other devices in the RK3288 window are read-back register stubs. Networking and display
 //! are not modelled.
 //!
-//! The GIC-400 and the DesignWare APB UART are the Allwinner H3 crate's models (same IP);
-//! they move to a shared crate once both boards are merged.
+//! The GIC-400, the DesignWare APB UART and the I²C chips (RK808, ACT8846, SYR827/828,
+//! HYM8563, ILI2116) are the shared `peripherals` crate's models.
 
-pub mod act8846;
 pub mod boot;
 pub mod cru;
 pub mod devices;
@@ -18,16 +17,14 @@ pub mod dsi;
 pub mod dwmmc;
 pub mod emmc;
 pub mod gpio;
-pub mod hym8563;
 pub mod i2c;
-pub mod ili2116;
 mod machine;
 pub mod rga;
-pub mod rk808;
-pub mod syr82x;
 pub mod vop;
 
-pub use allwinner_h3::{Gic, Uart, NCPU, SPURIOUS};
+pub use peripherals::{Gic, Uart, NCPU, SPURIOUS};
+// The I²C chips live in the shared `peripherals` crate; re-exported for existing paths.
+pub use peripherals::{act8846, hym8563, ili2116, rk808, syr82x};
 pub use machine::{
     ns_to_ticks, ticks_to_ns, CoreState, Machine, Soc, BOOT_MAGIC, CRU_BASE, GICC_BASE,
     GICD_BASE, GRF_BASE, PHYSICAL_TIMER_PPI, PMU_BASE, RAM_BASE, RAM_SIZE, RK3288_MIDR,

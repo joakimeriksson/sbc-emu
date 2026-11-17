@@ -8,17 +8,15 @@ pub mod boot;
 pub mod display;
 pub mod emac;
 pub mod usb;
-mod gic;
 mod machine;
 mod mmc;
 mod timer;
-mod uart;
 
-pub use gic::{Gic, NCPU, SPURIOUS};
+pub use peripherals::{Gic, NCPU, SPURIOUS};
 pub use mmc::SunxiMmc;
 pub use timer::Timer;
 pub use machine::{
     ns_to_ticks, ticks_to_ns, CoreState, Machine, Soc, GICC_BASE, GICD_BASE, PHYSICAL_TIMER_PPI,
     RAM_BASE, RAM_SIZE, UART0_BASE,
 };
-pub use uart::Uart;
+pub use peripherals::Uart;

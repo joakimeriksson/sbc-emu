@@ -5,11 +5,11 @@
 use crate::dwmmc::{CardKind, DwMmc};
 use crate::gpio::{self, GpioBank};
 use crate::i2c::Rk3xI2c;
-use crate::act8846::{self, Act8846};
-use crate::hym8563::{self, Hym8563};
-use crate::ili2116::{self, Ili2116};
-use crate::rk808::{self, Rk808};
-use crate::syr82x::{self, Syr82x};
+use peripherals::act8846::{self, Act8846};
+use peripherals::hym8563::{self, Hym8563};
+use peripherals::ili2116::{self, Ili2116};
+use peripherals::rk808::{self, Rk808};
+use peripherals::syr82x::{self, Syr82x};
 use emu_core::{Fault, FlatRam};
 
 /// SD card slot (`sdmmc`, SPI 32).
