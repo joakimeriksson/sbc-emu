@@ -254,7 +254,8 @@ impl DwMmc {
             HCON => HCONFIG,
             IDSTS => self.idsts,
             DATA.. => self.fifo.pop_front().unwrap_or(0),
-            _ => self.regs[offset / 4],
+            _ if offset < 0x100 => self.regs[offset / 4],
+            _ => 0,
         }
     }
 
@@ -394,7 +395,7 @@ impl DwMmc {
         let mut data = Vec::with_capacity(bytes);
         let ok = self.walk(bytes, ram, |ram, address, n| {
             let start = address.checked_sub(ram.base).map(|o| o as usize);
-            match start.filter(|&s| s + n <= ram.mem.len()) {
+            match start.filter(|&s| s.checked_add(n).is_some_and(|e| e <= ram.mem.len())) {
                 Some(s) => {
                     data.extend_from_slice(&ram.mem[s..s + n]);
                     true
@@ -502,6 +503,15 @@ mod tests {
         mmc.write(BMOD as u64, BMOD_ENABLE, &mut ram);
         mmc.write(IDINTEN as u64, IDMAC_NI | IDMAC_RI | IDMAC_TI, &mut ram);
         (mmc, ram)
+    }
+
+    #[test]
+    fn registers_above_the_array_read_as_zero() {
+        // CDTHRCTL (0x100), UHS_REG_EXT (0x108) and the rest of 0x100..0x200 must not panic.
+        let (mut mmc, _) = setup(CardKind::Sd);
+        for offset in (0x100..0x200).step_by(4) {
+            assert_eq!(mmc.read(offset), 0);
+        }
     }
 
     fn issue(mmc: &mut DwMmc, ram: &mut FlatRam, cmd: u32, arg: u32) {

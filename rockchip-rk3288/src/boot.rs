@@ -161,7 +161,7 @@ pub fn boot_from_card(machine: &mut Machine, extra_args: &str) -> Result<CardBoo
         // U-Boot legacy image: 64-byte header (magic 0x27051956), then the payload.
         if data.len() > 64 && data[..4] == [0x27, 0x05, 0x19, 0x56] {
             let size = u32::from_be_bytes(data[12..16].try_into().unwrap()) as usize;
-            *data = data[64..(64 + size).min(data.len())].to_vec();
+            *data = data[64..size.saturating_add(64).min(data.len())].to_vec();
         }
     }
     // boot.cmd: `console=both` gives "console=ttyS2,115200n8 console=tty1". The serial
