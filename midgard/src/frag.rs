@@ -1059,13 +1059,14 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                         // writes the final value out (no fixed-function blending after)
                         let pc = (bd[2] as u64 | (bd[3] as u64) << 32) & !0xf;
                         let (x, y) = (pix[k].x, pix[k].y);
-                        if let Some((c, half)) = run_blend(core.env.vm, &dcd, tbp, x, y, o.rt as usize, pc, o.color, o.half) {
+                        // Its write-out is the raw tile-buffer value: packed in the internal
+                        // format as clear colours are (Mesa's pan_lower_framebuffer).
+                        if let Some((c, _)) = run_blend(core.env.vm, &dcd, tbp, x, y, o.rt as usize, pc, o.color, o.half) {
                             let tbm = unsafe { &mut *tbp };
                             if raw {
                                 tbm.raw[o.rt as usize][i] = c;
                             } else {
-                                let out = Output { rt: o.rt, color: c, half, depth: None, stencil: None };
-                                tbm.color[o.rt as usize][i] = quantize(rt.internal, color_of(&out));
+                                tbm.color[o.rt as usize][i] = unpack_clear(rt.internal, c as u32);
                             }
                         }
                         continue;
