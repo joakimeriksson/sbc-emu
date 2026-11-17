@@ -48,7 +48,7 @@ impl Firmware {
             for s in 0..streams as u64 {
                 let cs = c + 0x40 + s * ss;
                 read(m, ram, cs + 8)?;
-                write(m, ram, cs, 255 | (8 << 8) | (1 << 17))?;
+                write(m, ram, cs, 255 | (8 << 8) | (3 << 16))?;
             }
         }
         read(m, ram, input)?;

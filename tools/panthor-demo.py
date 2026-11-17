@@ -3,16 +3,18 @@
 import argparse, base64, pathlib, subprocess, tempfile, zlib, re
 root=pathlib.Path(__file__).resolve().parent.parent
 p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--shader',action='store_true',help='Run the compute-shader triangle demo')
 p.add_argument('--image',type=pathlib.Path,required=True)
 p.add_argument('--emulator',type=pathlib.Path,default=root/'target/release/sbc-emu')
 p.add_argument('--output',type=pathlib.Path,default=root/'out/panthor-clear-demo.png')
 p.add_argument('--timeout',type=int,default=180)
 a=p.parse_args()
-source=root/'tests/gpu/panthor-clear.py'
+source=root/('tests/gpu/panthor-shader.py' if a.shader else 'tests/gpu/panthor-clear.py')
+marker='PANTHOR_SHADER_OK' if a.shader else 'PANTHOR_CLEAR_OK'
 payload=base64.b64encode(zlib.compress(source.read_bytes())).decode()
 lines=['wait-serial root@','serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs none /tmp; modprobe fixed; modprobe panthor; stty -echo\\n','serial : > /tmp/demo.b64\\n']
 for i in range(0,len(payload),500):lines.append('serial printf %s '+payload[i:i+500]+' >> /tmp/demo.b64\\n')
-lines+=['serial python3 -c \'import base64,zlib;exec(zlib.decompress(base64.b64decode(open("/tmp/demo.b64").read())))\'\\n','wait-serial PANTHOR_CLEAR_OK','wait-serial IMAGE_END','quit']
+lines+=['serial python3 -c \'import base64,zlib;exec(zlib.decompress(base64.b64decode(open("/tmp/demo.b64").read())))\'\\n','wait-serial '+marker,'wait-serial IMAGE_END','quit']
 with tempfile.TemporaryDirectory(prefix='panthor-demo-') as d:
     script=pathlib.Path(d)/'script.txt';script.write_text('\n'.join(lines)+'\n')
     cmd=[str(a.emulator),'run','--board','orangepi5','--gpu','probe','--net','none','--sd',str(a.image.resolve()),'--append','init=/bin/bash','--script',str(script),'--timeout',str(a.timeout)]
@@ -21,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='panthor-demo-') as d:
     a.output.parent.mkdir(parents=True,exist_ok=True)
     logpath=a.output.with_suffix('.log');logpath.write_text(log)
     match=re.search(r'PNG_BASE64=([A-Za-z0-9+/=]+)',log)
-    if result.returncode or not match or 'PANTHOR_CLEAR_OK' not in log or 'IMAGE_END' not in log:
+    if result.returncode or not match or marker not in log or 'IMAGE_END' not in log:
         raise SystemExit('Demo failed; see '+str(logpath))
     png=base64.b64decode(match[1],validate=True)
     if not png.startswith(b'\x89PNG\r\n\x1a\n'):raise SystemExit('Invalid PNG output')

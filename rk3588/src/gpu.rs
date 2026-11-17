@@ -1,5 +1,5 @@
 //! Mali-G610 control registers and host-modeled CSF management.
-//! MCU instructions and shader execution remain unsupported; clear passes run synchronously.
+//! MCU instructions remain unsupported; supported clear and scalar compute work runs synchronously.
 use crate::gpu_mmu::AddressSpace;
 #[derive(Default)]
 pub struct Gpu {
