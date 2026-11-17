@@ -64,6 +64,7 @@ impl Cpu {
         self.tlb_blocks = [(u64::MAX, 0); 2];
         self.utlb_asid = self.asid();
         self.utlb_unpriv = 0;
+        if let Some(a) = self.a32.as_mut() { a.utlb_invalidate_all(); }
         if let Some(t) = self.tlb.as_mut() {
             t.iter_mut().for_each(|e| e.tag = 0);
         }
@@ -77,6 +78,7 @@ impl Cpu {
         if va >= lo && va < hi { return self.tlb_flush(); }
         let u = (va >> 12) as usize & (UT - 1);
         for t in self.utlb.iter_mut() { t[u] = (0, 0); }
+        if let Some(a) = self.a32.as_mut() { a.utlb_invalidate(va & ((1 << 56) - 1)); }
         if let Some(t) = self.tlb.as_mut() { t[(va >> 12) as usize & (TLB_SIZE - 1)].tag = 0; }
     }
 
@@ -153,7 +155,11 @@ impl Cpu {
     pub(crate) fn utlb_ttbr_written(&mut self) {
         let a = self.asid();
         let other_space = a != 0 && a != self.utlb_asid;
-        if other_space { self.utlb_asid = a; }
+        if other_space {
+            self.utlb_asid = a;
+            // a 32-bit program's cached pages belong to the address space that was left
+            if let Some(a) = self.a32.as_mut() { a.utlb_invalidate_all(); }
+        }
         self.utlb_unpriv = if a == self.utlb_asid { 0 } else { 1 << 59 };
         for t in self.utlb.iter_mut() {
             for e in t.iter_mut() {

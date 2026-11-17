@@ -139,6 +139,10 @@ pub struct Cpu {
     /// Immutable board configuration; existing Pi snapshots retain their original format.
     /// Boards must reconstruct this profile before loading architectural state.
     pub profile: CpuProfile,
+    /// PSTATE.nRW: a 32-bit program runs at EL0 (its state is in `a32`, see `aarch32.rs`)
+    pub aarch32: bool,
+    /// the AArch32 EL0 core, created at the first return to a 32-bit program
+    pub(crate) a32: Option<Box<arm_a32::Cpu>>,
 }
 
 // SAFETY: `ram` is only dereferenced by the core that owns it; see the field documentation.
@@ -180,7 +184,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
         }
     }
 
@@ -253,14 +257,16 @@ impl Cpu {
     /// vector offset within a group (0 sync, 0x80 IRQ, 0x100 FIQ, 0x180 SError).
     pub fn take_exception(&mut self, target: u8, vec: u64, ret: u64) {
         let t = target as usize;
+        // from a 32-bit program: its registers return to their AArch64 places first
+        let (pstate, lower) = if self.aarch32 { (self.leave_aarch32(), 0x600) } else { (self.pstate(), 0x400) };
         let group = if target > self.el {
-            0x400
+            lower
         } else if self.spsel {
             0x200
         } else {
             0
         };
-        self.spsr[t] = self.pstate();
+        self.spsr[t] = pstate;
         self.elr[t] = ret;
         self.el = target;
         self.spsel = true;
@@ -326,6 +332,9 @@ impl Core for Cpu {
                 return Err(t);
             }
         }
+        if self.aarch32 {
+            return self.step_aarch32(bus);
+        }
         if self.jit.is_some() && !self.jit_off {
             if !self.interp_run {
                 if let Some(r) = self.jit_step(bus) {
@@ -356,12 +365,23 @@ impl Cpu {
     /// Architectural state for a snapshot (TLBs are rebuilt on demand and not saved).
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
         w.tag("cpu-v1");
-        for v in self.x { w.u64(v); }
+        // a 32-bit program running: its registers in their AArch64 places, its CPSR in `other`
+        let (mut x, mut v, mut fpsr, mut fpcr, mut pc) = (self.x, self.v, self.fpsr, self.fpcr, self.pc);
+        let mut cpsr = None;
+        if let (true, Some(a)) = (self.aarch32, self.a32.as_ref()) {
+            for (x, r) in x.iter_mut().zip(a.r.iter()).take(15) { *x = *r as u64; }
+            for n in 0..16 { v[n] = a.vfp.d[2 * n] as u128 | (a.vfp.d[2 * n + 1] as u128) << 64; }
+            fpsr = a.vfp.fpscr as u64 & 0xf800_009f;
+            fpcr = a.vfp.fpscr as u64 & 0x07ff_9f00;
+            pc = a.r[15] as u64;
+            cpsr = Some(a.cpsr as u64);
+        }
+        for v in x { w.u64(v); }
         for v in self.sp { w.u64(v); }
-        w.u64(self.pc); w.u32(self.nzcv); w.u32(self.daif); w.u8(self.el); w.bool(self.spsel);
+        w.u64(pc); w.u32(self.nzcv); w.u32(self.daif); w.u8(self.el); w.bool(self.spsel);
         for a in [&self.elr, &self.spsr, &self.esr, &self.far, &self.vbar, &self.sctlr] { for v in a { w.u64(*v); } }
-        for v in self.v { w.u128(v); }
-        w.u64(self.fpcr); w.u64(self.fpsr);
+        for v in v { w.u128(v); }
+        w.u64(fpcr); w.u64(fpsr);
         w.bool(self.irq); w.bool(self.fiq); w.u64(self.instret); w.opt_u64(self.excl());
         w.bool(self.brk_to_host); w.bool(self.firmware_calls_to_host);
         let s = &self.sys;
@@ -371,6 +391,7 @@ impl Cpu {
         for v in s.tcr { w.u64(v); }
         let mut other = s.other.clone();
         for (k, v) in [crate::sysreg::TPIDR_EL0, crate::sysreg::TPIDRRO_EL0, crate::sysreg::TPIDR_EL1].into_iter().zip(s.tpidr) { other.insert(k, v); }
+        if let Some(c) = cpsr { other.insert(crate::aarch32::SNAP_AARCH32_CPSR, c); }
         w.u64(other.len() as u64);
         for (k, v) in &other { w.u32(*k); w.u64(*v); }
     }
@@ -394,6 +415,11 @@ impl Cpu {
         for _ in 0..r.u64()? { let k = r.u32()?; let v = r.u64()?; s.other.insert(k, v); }
         for (n, k) in [crate::sysreg::TPIDR_EL0, crate::sysreg::TPIDRRO_EL0, crate::sysreg::TPIDR_EL1].into_iter().enumerate() { s.tpidr[n] = s.other.remove(&k).unwrap_or(0); }
         s.timers_changed = true;
+        self.aarch32 = false;
+        if let Some(cpsr) = self.sys.other.remove(&crate::aarch32::SNAP_AARCH32_CPSR) {
+            let pc = self.pc;
+            self.enter_aarch32(cpsr, pc);
+        }
         self.tlb_flush();
         if let Some(j) = self.jit.as_mut() { j.flush(); }
         Ok(())
@@ -415,7 +441,10 @@ impl Cpu {
 
 impl Cpu {
     /// Drop the exclusive monitor's reservation (another core may have written the location).
-    pub fn clear_exclusive(&mut self) { self.set_excl(None); }
+    pub fn clear_exclusive(&mut self) {
+        self.set_excl(None);
+        if let Some(a) = self.a32.as_mut() { a.exclusive_addr = None; }
+    }
 
     /// Hand the JIT (code cache and dispatcher) to another core of the same machine: compiled
     /// code only reaches core state through the pointer it is called with, so one cache serves

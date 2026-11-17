@@ -118,3 +118,38 @@ impl Run {
         self.ram.read64(a).unwrap()
     }
 }
+
+/// Assemble A32/T32 (`.arm`/`.thumb` sections of one `.text`) with the host clang for an ARMv7-A
+/// core with VFPv4 and Advanced SIMD; returns `.text` (no relocations allowed).
+pub fn assemble_a32(src: &str) -> Vec<u8> {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!("arm-a32-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (s, o) = (dir.join("t.s"), dir.join("t.o"));
+    std::fs::write(&s, format!(".syntax unified\n.text\n.arm\n{src}\n")).unwrap();
+    let out = Command::new("clang")
+        .args(["--target=armv7a-none-eabi", "-mfpu=neon-vfpv4", "-mfloat-abi=hard", "-c"])
+        .arg(&s)
+        .arg("-o")
+        .arg(&o)
+        .output()
+        .expect("clang");
+    assert!(out.status.success(), "assembler failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let elf = std::fs::read(&o).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // ELF32 section headers
+    let shoff = u32_at(&elf, 0x20);
+    let (shentsize, shnum, shstrndx) = (u16_at(&elf, 0x2e), u16_at(&elf, 0x30), u16_at(&elf, 0x32));
+    let sh = |i: usize| shoff + i * shentsize;
+    let stroff = u32_at(&elf, sh(shstrndx) + 0x10);
+    for i in 0..shnum {
+        let h = sh(i);
+        let n = stroff + u32_at(&elf, h);
+        let end = elf[n..].iter().position(|&c| c == 0).unwrap() + n;
+        if &elf[n..end] == b".text" {
+            let (off, size) = (u32_at(&elf, h + 0x10), u32_at(&elf, h + 0x14));
+            return elf[off..off + size].to_vec();
+        }
+    }
+    panic!("no .text");
+}

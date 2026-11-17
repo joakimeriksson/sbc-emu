@@ -121,6 +121,11 @@ impl Cpu {
         (e.tag == (va & !0xfff) as u64).then(|| e.delta.wrapping_add(va as u64) as *mut u8)
     }
 
+    /// Host address of `size` bytes at `va` in the write micro-TLB.
+    pub(crate) fn host_ptr(&self, va: u32, size: u32) -> Option<*mut u8> {
+        self.host(va, size, U_WRITE)
+    }
+
     /// Is `pa` (physical) in the RAM the host pointer covers?
     #[inline(always)]
     pub(crate) fn in_ram(&self, pa: u32) -> bool {
@@ -248,6 +253,14 @@ impl Cpu {
         va: u32,
         access: Access,
     ) -> Result<u32, (u32, u32)> {
+        if self.el1.is_some() {
+            let access = match access {
+                Access::Read => crate::el0::El0Access::Read,
+                Access::Write => crate::el0::El0Access::Write,
+                Access::Execute => crate::el0::El0Access::Exec,
+            };
+            return self.el0_translate(bus, va, access);
+        }
         if self.sctlr & 1 == 0 {
             return Ok(va);
         }

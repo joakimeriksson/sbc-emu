@@ -625,6 +625,11 @@ impl Cpu {
                     let e = self.el as usize;
                     let (elr, spsr) = (self.elr[e], self.spsr[e]);
                     let target = ((spsr >> 2) & 3) as u8;
+                    if spsr & 0x10 != 0 && spsr & 0x1f == 0x10 && self.el == 1 {
+                        // to a 32-bit program at EL0 (AArch32 User mode)
+                        self.enter_aarch32(spsr, elr);
+                        return Ok(Some(self.pc));
+                    }
                     if spsr & 0x10 != 0 || target > self.el {
                         // illegal return: stay, set PSTATE.IL (approximated by undefined)
                         return Err(self.sync_exception(Exc::ILLEGAL, 0, pc, None));

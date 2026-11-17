@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 emu-core = { path = "../emu-core" }
+arm-a32 = { path = "../arm-a32" }
