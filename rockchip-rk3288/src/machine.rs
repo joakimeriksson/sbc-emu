@@ -1,4 +1,5 @@
 use crate::cru::{Cru, Grf, Pmu, CRU_SIZE, GRF_SIZE, PMU_SIZE};
+use crate::devices::Peripherals;
 use allwinner_h3::{Gic, Uart, NCPU};
 use arm_a32::{Cpu, CORTEX_A12};
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
@@ -49,6 +50,8 @@ pub struct Soc {
     pub cru: Cru,
     pub grf: Grf,
     pub pmu: Pmu,
+    /// SD/eMMC/SDIO hosts, I²C controllers and GPIO banks (`devices.rs`).
+    pub periph: Peripherals,
     /// Current 24 MHz time, set by the machine before each step.
     pub now: u64,
     /// A device register was accessed: interrupt lines must be re-evaluated.
@@ -71,6 +74,7 @@ impl Soc {
             cru: Cru::new(),
             grf: Grf::default(),
             pmu: Pmu::default(),
+            periph: Peripherals::default(),
             now: 0,
             dirty: true,
             stub_regs: Default::default(),
@@ -160,6 +164,9 @@ impl Soc {
                 self.gic.cpu_read(addr - GICC_BASE)
             });
         }
+        if let Some(result) = self.periph.read(addr, width, ticks_to_ns(self.now)) {
+            return result;
+        }
         self.stub_access(addr, width, None)
     }
 
@@ -205,6 +212,9 @@ impl Soc {
                 self.gic.cpu_write(addr - GICC_BASE, value);
             }
             return Ok(());
+        }
+        if let Some(result) = self.periph.write(addr, width, value, &mut self.ram, ticks_to_ns(self.now)) {
+            return result;
         }
         self.stub_access(addr, width, Some(value)).map(|_| ())
     }
@@ -431,6 +441,10 @@ impl Machine {
         self.soc.dirty = false;
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART2_IRQ, uart);
+        let Soc { periph, gic, .. } = &mut self.soc;
+        for (irq, level) in periph.irq_lines() {
+            gic.set_level(irq, level);
+        }
         let mut next = u64::MAX;
         for k in 0..NCPU {
             let cpu = &self.cpus[k];
@@ -544,6 +558,9 @@ impl Machine {
             if self.soc.cru.reset_requested {
                 self.soc.cru.reset_requested = false;
                 return Stop::Reset;
+            }
+            if self.soc.periph.power_off_requested() {
+                return Stop::PowerOff;
             }
             let Some(k) = (1..=NCPU)
                 .map(|offset| (self.cur + offset) % NCPU)

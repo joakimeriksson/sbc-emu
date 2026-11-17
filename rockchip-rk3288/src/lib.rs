@@ -2,15 +2,23 @@
 //! with the Cortex-A12 identity on `arm-a32`, GIC-400, UART2, CRU with locked PLLs and core
 //! resets, the GRF PLL lock status, PMU power domains, on-chip SRAM with the boot ROM's SMP
 //! mailbox and the architectural timers, enough for a mainline ARM32 SMP kernel on the
-//! serial console. Other devices in the RK3288 window are read-back register stubs.
-//! Storage, networking and display are not modelled.
+//! serial console; the DesignWare MMC hosts (SD, SDIO, eMMC), the rk3x I²C controllers with
+//! the RK808 PMIC and the GPIO input levels (`devices`), enough for Armbian from an SD card.
+//! Other devices in the RK3288 window are read-back register stubs. Networking and display
+//! are not modelled.
 //!
 //! The GIC-400 and the DesignWare APB UART are the Allwinner H3 crate's models (same IP);
 //! they move to a shared crate once both boards are merged.
 
 pub mod boot;
 pub mod cru;
+pub mod devices;
+pub mod dwmmc;
+pub mod emmc;
+pub mod gpio;
+pub mod i2c;
 mod machine;
+pub mod rk808;
 
 pub use allwinner_h3::{Gic, Uart, NCPU, SPURIOUS};
 pub use machine::{

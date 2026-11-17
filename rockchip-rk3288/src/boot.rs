@@ -82,6 +82,132 @@ pub fn boot_linux(
     Ok(dtb)
 }
 
+/// What `boot_from_card` loaded, for the run banner.
+#[derive(Debug)]
+pub struct CardBoot {
+    /// The controller the boot files came from (`devices::SDMMC` or `devices::EMMC`).
+    pub controller: usize,
+    pub dtb: String,
+    pub cmdline: String,
+    pub kernel_bytes: usize,
+    pub initrd_bytes: usize,
+    pub notes: Vec<String>,
+}
+
+/// Default device tree: the board this machine models (the Tinker Board S).
+pub const DEFAULT_FDTFILE: &str = "rk3288-tinker-s.dtb";
+
+/// Emulated boot firmware for an Armbian (or similar) card: what U-Boot and the image's
+/// `boot.scr` (Armbian's `boot-rockchip.cmd`) do, then a direct kernel boot. Reads
+/// `armbianEnv.txt`, `zImage`, `dtb/<fdtfile>` and `uInitrd` (legacy header stripped) from
+/// `/boot` of the first Linux partition holding a zImage, on the SD card if one is
+/// inserted, otherwise on the eMMC.
+pub fn boot_from_card(machine: &mut Machine, extra_args: &str) -> Result<CardBoot, String> {
+    use crate::devices::{EMMC, SDMMC};
+    use emu_core::ext4::Ext4;
+    let controller = [SDMMC, EMMC]
+        .into_iter()
+        .find(|&c| machine.soc.periph.mmc[c].card.present())
+        .ok_or("no SD card or eMMC image (--sd IMAGE or --emmc IMAGE)")?;
+    let disk = machine.soc.periph.mmc[controller].card.disk_mut().expect("present card");
+    let mut mbr = [0u8; 512];
+    disk.read(0, &mut mbr);
+    if mbr[510..512] != [0x55, 0xaa] {
+        return Err("the card has no MBR partition table".into());
+    }
+    let disk_id = u32::from_le_bytes(mbr[440..444].try_into().unwrap());
+    let mut found = None;
+    for slot in 0..4 {
+        let entry = &mbr[446 + 16 * slot..462 + 16 * slot];
+        let lba = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as u64;
+        if entry[4] != 0x83 {
+            continue;
+        }
+        let Ok(mut fs) = Ext4::open(disk.as_mut(), lba) else { continue };
+        if let Some(prefix) = ["/boot/", "/"].into_iter().find(|p| fs.exists(&format!("{p}zImage"))) {
+            found = Some((slot, lba, prefix));
+            break;
+        }
+    }
+    let (slot, lba, prefix) = found.ok_or("no ext2/3/4 partition with zImage in / or /boot on the card")?;
+    let mut fs = Ext4::open(disk.as_mut(), lba)?;
+    let mut notes = Vec::new();
+    if fs.needs_recovery {
+        notes.push("the card's filesystem was not cleanly unmounted; its journal is not replayed, recent changes to /boot may be missing".into());
+    }
+    let mut env = std::collections::HashMap::new();
+    match fs.read_file(&format!("{prefix}armbianEnv.txt")) {
+        Ok(text) => {
+            for line in String::from_utf8_lossy(&text).lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    env.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+        Err(_) => notes.push("no armbianEnv.txt: defaults".into()),
+    }
+    let get = |key: &str, default: &str| env.get(key).cloned().unwrap_or_else(|| default.to_string());
+    if ["overlays", "user_overlays"].iter().any(|k| env.get(*k).is_some_and(|o| !o.is_empty())) {
+        notes.push(format!("device tree overlays are not applied (overlays={})", get("overlays", "")));
+    }
+    let kernel = fs.read_file(&format!("{prefix}zImage"))?;
+    let fdtfile = get("fdtfile", DEFAULT_FDTFILE);
+    let fdtfile = fdtfile.trim_start_matches("rockchip/").to_string();
+    let dtb = fs
+        .read_file(&format!("{prefix}dtb/{fdtfile}"))
+        .or_else(|_| fs.read_file(&format!("{prefix}dtb/rockchip/{fdtfile}")))?;
+    let mut initrd = fs.read_file(&format!("{prefix}uInitrd")).ok();
+    if let Some(data) = initrd.as_mut() {
+        // U-Boot legacy image: 64-byte header (magic 0x27051956), then the payload.
+        if data.len() > 64 && data[..4] == [0x27, 0x05, 0x19, 0x56] {
+            let size = u32::from_be_bytes(data[12..16].try_into().unwrap()) as usize;
+            *data = data[64..size.saturating_add(64).min(data.len())].to_vec();
+        }
+    }
+    // boot.cmd: `console=both` gives "console=ttyS2,115200n8 console=tty1". The serial
+    // console goes last here so /dev/console is the serial port (no display model yet).
+    let consoles = match get("console", "both").as_str() {
+        "serial" | "ttyS2,115200n8" => "console=ttyS2,115200n8",
+        other => {
+            if other == "display" {
+                notes.push("console=display: the serial console is added (no display model)".into());
+            }
+            "console=tty1 console=ttyS2,115200n8"
+        }
+    };
+    let earlycon = if get("earlycon", "off") == "on" { "earlycon" } else { "" };
+    let splash = if get("bootlogo", "false") == "true" { "splash plymouth.ignore-serial-consoles" } else { "splash=verbose" };
+    let docker = if get("docker_optimizations", "on") == "on" {
+        "cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory"
+    } else {
+        ""
+    };
+    let cmdline = format!(
+        "earlyprintk root={} rootwait rootfstype={} {earlycon} {splash} {consoles} consoleblank=0 loglevel={} \
+         ubootpart={disk_id:08x}-{:02x} usb-storage.quirks={} {} {} {docker} {extra_args}",
+        get("rootdev", &format!("UUID={}", fs.uuid_string())),
+        get("rootfstype", "ext4"),
+        get("verbosity", "1"),
+        slot + 1,
+        get("usbstoragequirks", ""),
+        get("extraargs", ""),
+        get("extraboardargs", ""),
+    )
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let boot = CardBoot {
+        controller,
+        dtb: fdtfile,
+        cmdline: cmdline.clone(),
+        kernel_bytes: kernel.len(),
+        initrd_bytes: initrd.as_ref().map_or(0, |d| d.len()),
+        notes,
+    };
+    boot_linux(machine, &kernel, &dtb, initrd.as_deref(), &cmdline)?;
+    Ok(boot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

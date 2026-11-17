@@ -186,8 +186,9 @@ pub(crate) fn run<B: SerialBoard>(
                     None => false,
                 },
                 "serial" => {
+                    // \x03 is Ctrl-C (SIGINT through the guest's tty)
                     pending.extend(
-                        rest.replace("\\n", "\r").replace("\\r", "\r").replace("\\t", "\t").bytes(),
+                        rest.replace("\\n", "\r").replace("\\r", "\r").replace("\\t", "\t").replace("\\x03", "\x03").bytes(),
                     );
                     true
                 }

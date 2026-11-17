@@ -1327,7 +1327,6 @@ impl Cpu {
             let loads_pc = load && list & 0x8000 != 0;
             if rn == 15
                 || list == 0
-                || (!load && list & 0x8000 != 0)
                 || (spsr && !loads_pc && writeback)
                 || (load && writeback && list & (1 << rn) != 0)
             {
@@ -1381,9 +1380,17 @@ impl Cpu {
                     self.bx_to(values[15]);
                 }
             } else {
-                for register in 0..15 {
+                // STM with the PC in the list (APCS frames: `stmdb sp!, {fp, ip, lr, pc}`)
+                // stores the instruction address + 8 (ARMv7 PCStoreValue).
+                for register in 0..16 {
                     if list & (1 << register) != 0 {
-                        let value = if spsr { self.user_reg(register) } else { self.r[register] };
+                        let value = if register == 15 {
+                            self.read_reg(15)
+                        } else if spsr {
+                            self.user_reg(register)
+                        } else {
+                            self.r[register]
+                        };
                         if let Err((va, status)) = self.mem_write32(bus, address, value)
                         {
                             return Err(self.data_abort(va, status, true));

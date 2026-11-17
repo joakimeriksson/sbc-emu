@@ -176,3 +176,24 @@ fn physical_timer_cp15_accesses_counter_compare_and_mask() {
     cpu.step(&mut ram).unwrap();
     assert_eq!((cpu.r[7], cpu.r[6]), (0, 0x80));
 }
+
+#[test]
+fn stm_with_the_pc_in_the_list_stores_the_instruction_address_plus_8() {
+    // APCS frame prologue of Linux kernels built with frame pointers.
+    let (mut cpu, mut ram) = machine(&[
+        0xe1a0_c00d, // mov ip, sp
+        0xe92d_d800, // push {fp, ip, lr, pc}
+        0xe120_0070, // bkpt #0
+    ]);
+    cpu.r[13] = 0x3000;
+    cpu.r[11] = 0x11;
+    cpu.r[14] = 0x14;
+    cpu.step(&mut ram).unwrap();
+    cpu.step(&mut ram).unwrap();
+    assert_eq!(cpu.r[13], 0x3000 - 16);
+    assert_eq!(ram.read32(0x2ff0).unwrap(), 0x11, "fp");
+    assert_eq!(ram.read32(0x2ff4).unwrap(), 0x3000, "ip");
+    assert_eq!(ram.read32(0x2ff8).unwrap(), 0x14, "lr");
+    assert_eq!(ram.read32(0x2ffc).unwrap(), 0x1004 + 8, "pc");
+    assert_eq!(cpu.step(&mut ram), Err(Trap::Brk(0)));
+}
