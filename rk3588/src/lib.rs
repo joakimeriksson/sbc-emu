@@ -5,6 +5,8 @@ pub mod gic;
 pub mod gpu_mmu;
 pub mod gpu_cs;
 pub mod gpu;
+pub mod gpu_fw;
+pub mod gpu_render;
 pub mod uart;
 pub mod mmc;
 pub mod phy;
@@ -64,7 +66,7 @@ impl Soc {
                 else if (GICR..GICR+0x20000).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)} else {0};
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};
-        if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.write((addr-0xfb000000)&!3,v);}
+        if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.write_memory((addr-0xfb000000)&!3,v,&mut self.ram);}
         else if (GMAC..GMAC+0x10000).contains(&addr) {self.gmac.write((addr-GMAC)&!3,v);}
         else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}

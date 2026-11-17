@@ -1,7 +1,7 @@
 //! Initial Mali Valhall command-stream interpreter.
 //!
 //! This implements a small synchronous subset used to move data and prepare
-//! commands. Graphics, compute, scheduling and the CSF firmware interface are
+//! commands. Only linear RGBA8 clear passes are supported; shader execution is
 //! not implemented; unknown commands stop explicitly rather than succeeding.
 use crate::gpu_mmu::{AddressSpace, Fault};
 
@@ -20,6 +20,7 @@ pub struct Stream {
     pub start: u64,
     pub pc: u64,
     pub end: u64,
+    stack: Vec<(u64, u64, u64)>,
 }
 impl Stream {
     pub fn new(start: u64, size: u64) -> Result<Self, Stop> {
@@ -29,6 +30,7 @@ impl Stream {
         let end = start.checked_add(size).ok_or(Stop::InvalidStream)?;
         Ok(Self {
             regs: [0; 256],
+            stack: Vec::new(),
             start,
             pc: start,
             end,
@@ -48,9 +50,20 @@ impl Stream {
         self.regs[reg + 1] = (value >> 32) as u32;
         Ok(())
     }
+    fn unwind(&mut self) {
+        while self.pc == self.end {
+            let Some((start, end, pc)) = self.stack.pop() else {
+                break;
+            };
+            self.start = start;
+            self.end = end;
+            self.pc = pc;
+        }
+    }
     /// Execute at most `budget` instructions, leaving PC on an unhandled or faulting instruction.
     pub fn run(&mut self, mmu: &AddressSpace, ram: &mut [u8], budget: usize) -> Stop {
         for _ in 0..budget {
+            self.unwind();
             if self.pc == self.end {
                 return Stop::Complete;
             }
@@ -73,7 +86,10 @@ impl Stream {
                     self.regs[dst] = insn as u32;
                     Ok(())
                 }
-                3 if (insn >> 16) & 0xffff == 0 && (insn >> 32) & 1 == 0 => Ok(()),
+                3 if (insn >> 32) & 1 == 0 => Ok(()),
+                7 if insn & 0x00ff_ffff_ffff_ffff == 0 => {
+                    crate::gpu_render::fragment(mmu, ram, &self.regs)
+                }
                 16 => {
                     self.regs[dst] = self.regs[src].wrapping_add(insn as u32);
                     Ok(())
@@ -81,6 +97,46 @@ impl Stream {
                 17 => self.pair(src).and_then(|v| {
                     self.set_pair(dst, v.wrapping_add(insn as u32 as i32 as i64 as u64))
                 }),
+                32 => {
+                    let addr = match self.pair(src) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let len = self.regs[((insn >> 32) & 255) as usize] as u64;
+                    if addr & 7 != 0 || len & 7 != 0 || self.stack.len() >= 16 {
+                        return Stop::InvalidStream;
+                    }
+                    let Some(end) = addr.checked_add(len) else {
+                        return Stop::InvalidStream;
+                    };
+                    self.stack.push((self.start, self.end, next));
+                    self.start = addr;
+                    self.end = end;
+                    next = addr;
+                    Ok(())
+                }
+                34 | 36 | 47 => Ok(()), // synchronous resources/cache; no in-flight operations
+                51 => {
+                    let a = match self.pair(src) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let v = match self.pair(((insn >> 32) & 255) as usize) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let mut b = [0; 8];
+                    if let Err(f) = mmu.read(ram, a, &mut b, true) {
+                        return Stop::Memory(f);
+                    }
+                    mmu.write(
+                        ram,
+                        a,
+                        &u64::from_le_bytes(b).wrapping_add(v).to_le_bytes(),
+                        true,
+                    )
+                    .map_err(Stop::Memory)
+                }
                 20 | 21 => self.multiple(mmu, ram, insn, opcode == 21),
                 22 => {
                     let val = self.regs[src] as i32;
@@ -123,6 +179,7 @@ impl Stream {
             }
             self.pc = next;
         }
+        self.unwind();
         if self.pc == self.end {
             Stop::Complete
         } else {
@@ -283,5 +340,29 @@ mod tests {
         assert_eq!(stream.regs[1], 2);
         assert_eq!(stream.run(&mmu, &mut ram, 8), Stop::Complete);
         assert_eq!(stream.regs[1], 0);
+    }
+    #[test]
+    fn call_returns_to_kernel_stream_and_sync_signals_completion() {
+        let mmu = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0u8; 1024];
+        let code = [
+            ins(1, 0, 0, 128),
+            ins(2, 2, 0, 8),
+            ins(32, 0, 0, 2 << 32),
+            ins(1, 0, 0, 512),
+            ins(1, 2, 0, 1),
+            ins(51, 0, 0, 2 << 32),
+        ];
+        for (i, v) in code.into_iter().enumerate() {
+            ram[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        ram[128..136].copy_from_slice(&ins(2, 4, 0, 42).to_le_bytes());
+        let mut s = Stream::new(0, 48).unwrap();
+        assert_eq!(s.run(&mmu, &mut ram, 64), Stop::Complete);
+        assert_eq!(s.regs[4], 42);
+        assert_eq!(u64::from_le_bytes(ram[512..520].try_into().unwrap()), 1);
     }
 }
