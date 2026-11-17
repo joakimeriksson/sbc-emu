@@ -7,6 +7,8 @@ pub struct Firmware {
     pub running: bool,
     input: u64,
     output: u64,
+    groups: u32,
+    stride: u64,
 }
 fn read(m: &AddressSpace, ram: &[u8], addr: u64) -> Result<u32, Fault> {
     let mut b = [0; 4];
@@ -23,7 +25,7 @@ impl Firmware {
         let output = read(m, ram, SHARED + 12)? as u64;
         let groups = read(m, ram, SHARED + 16)?;
         let stride = read(m, ram, SHARED + 20)? as u64;
-        if !(3..=32).contains(&groups)
+        if !(3..=31).contains(&groups)
             || stride < 32
             || !(SHARED..SHARED + 0x4000000).contains(&input)
             || !(SHARED..SHARED + 0x4000000).contains(&output)
@@ -33,6 +35,8 @@ impl Firmware {
         // Validate the firmware-provided layout before publishing a boot-complete event.
         for g in 0..groups as u64 {
             let c = SHARED + 0x1000 + g * stride;
+            write(m, ram, c + 12, 4096)?;
+            write(m, ram, c + 16, 4096)?;
             let streams = read(m, ram, c + 20)?;
             let ss = read(m, ram, c + 24)? as u64;
             if !(8..=32).contains(&streams) || ss < 12 {
@@ -44,16 +48,125 @@ impl Firmware {
             for s in 0..streams as u64 {
                 let cs = c + 0x40 + s * ss;
                 read(m, ram, cs + 8)?;
+                write(m, ram, cs, 255 | (8 << 8) | (1 << 17))?;
             }
         }
         read(m, ram, input)?;
         write(m, ram, output, 0)?;
         // Implemented protocol version, independent of the binary's build version.
         write(m, ram, SHARED, 0x01000000)?;
+        self.groups = groups;
+        self.stride = stride;
         self.input = input;
         self.output = output;
         self.running = true;
         Ok(())
+    }
+    pub fn queues(&mut self, spaces: &[AddressSpace; 16], ram: &mut [u8]) -> Result<u32, Fault> {
+        if !self.running {
+            return Ok(0);
+        }
+        let m = &spaces[0];
+        let mut irq = 0;
+        for g in 0..self.groups {
+            let ctrl = SHARED + 0x1000 + g as u64 * self.stride;
+            let input = read(m, ram, ctrl + 4)? as u64;
+            let output = read(m, ram, ctrl + 8)? as u64;
+            let req = read(m, ram, input)?;
+            let old = read(m, ram, output)?;
+            let ack = (old & !0x37) | (req & 0x37);
+            write(m, ram, output, ack)?;
+            if (old ^ ack) & read(m, ram, input + 4)? != 0 {
+                irq |= 1 << g;
+            }
+            if req & 7 != 1 && req & 7 != 3 {
+                continue;
+            }
+            let asid = read(m, ram, input + 80)? as usize;
+            if asid == 0 || asid >= 16 {
+                return Err(Fault::UnsupportedConfiguration);
+            }
+            let count = read(m, ram, ctrl + 20)?;
+            let stride = read(m, ram, ctrl + 24)? as u64;
+            if count > 32 || stride < 12 || stride > 4096 {
+                return Err(Fault::UnsupportedConfiguration);
+            }
+            let mut completed = false;
+            let mut failed = false;
+            for q in 0..count {
+                let mut queue_completed = false;
+                let cs = ctrl + 0x40 + q as u64 * stride;
+                let ci = read(m, ram, cs + 4)? as u64;
+                let co = read(m, ram, cs + 8)? as u64;
+                let cr = read(m, ram, ci)?;
+                write(m, ram, co, cr & 0xf17)?;
+                if cr & 7 != 1 {
+                    continue;
+                }
+                let r64 = |r: &[u8], a: u64| -> Result<u64, Fault> {
+                    Ok(read(m, r, a)? as u64 | ((read(m, r, a + 4)? as u64) << 32))
+                };
+                let base = r64(ram, ci + 16)?;
+                let size = read(m, ram, ci + 24)? as u64;
+                let ri = r64(ram, ci + 48)?;
+                let ro = r64(ram, ci + 56)?;
+                let insert = r64(ram, ri)?;
+                let mut extract = r64(ram, ro)?;
+                if size == 0
+                    || size > 1 << 20
+                    || !size.is_power_of_two()
+                    || insert < extract
+                    || insert - extract > size
+                    || insert & 7 != 0
+                    || extract & 7 != 0
+                {
+                    return Err(Fault::UnsupportedConfiguration);
+                }
+                let mut regs = [0; 256];
+                while extract < insert {
+                    let offset = extract % size;
+                    let len = (insert - extract).min(size - offset);
+                    let addr = base.checked_add(offset).ok_or(Fault::AddressSize)?;
+                    let mut stream = crate::gpu_cs::Stream::new(addr, len)
+                        .map_err(|_| Fault::UnsupportedConfiguration)?;
+                    stream.regs = regs;
+                    let stop = stream.run(&spaces[asid], ram, 65536);
+                    if stop != crate::gpu_cs::Stop::Complete {
+                        eprintln!("[mali] queue stopped: {:?}", stop);
+                        // Report CS_FATAL, never signal success for unsupported work.
+                        write(m, ram, co + 132, 0x40)?;
+                        let ca = read(m, ram, co)?;
+                        write(m, ram, co, ca ^ (1 << 30))?;
+                        failed = true;
+                        let bits = read(m, ram, output + 12)?;
+                        write(m, ram, output + 12, bits ^ (1 << q))?;
+                        break;
+                    }
+                    regs = stream.regs;
+                    extract += len;
+                    m.write(ram, ro, &extract.to_le_bytes(), false)?;
+                    completed = true;
+                    queue_completed = true;
+                }
+                if queue_completed {
+                    let bits = read(m, ram, output + 12)?;
+                    write(m, ram, output + 12, bits ^ (1 << q))?;
+                }
+            }
+            if failed {
+                irq |= 1 << g;
+            }
+            let db = read(m, ram, input + 8)?;
+            write(m, ram, output + 8, db)?;
+            if completed {
+                let a = read(m, ram, output)?;
+                write(m, ram, output, a ^ (1 << 28))?;
+                irq |= 1 << g;
+            }
+        }
+        let db = read(m, ram, self.input + 8)?;
+        write(m, ram, self.output + 8, db)?;
+        Ok(irq)
     }
     /// Return (interrupt requested, halt requested). Only implemented global requests are acknowledged.
     pub fn doorbell(&mut self, m: &AddressSpace, ram: &mut [u8]) -> Result<(bool, bool), Fault> {
@@ -138,5 +251,49 @@ mod tests {
         assert!(f.boot(&m, &mut r).is_err());
         assert!(!f.running);
         assert_eq!(read(&m, &r, SHARED).unwrap(), 0);
+    }
+    #[test]
+    fn queues_advance_only_completed_work_and_interrupt_on_fault() {
+        for (opcode, done) in [(0u64, true), (4, false)] {
+            let (m, mut r) = fixture();
+            let mut f = Firmware::default();
+            f.boot(&m, &mut r).unwrap();
+            f.groups = 1;
+            let gi = SHARED + 0x3000;
+            write(&m, &mut r, gi, 1).unwrap();
+            write(&m, &mut r, gi + 80, 1).unwrap();
+            for q in 0..8u64 {
+                let ctrl = SHARED + 0x1040 + q * 12;
+                write(&m, &mut r, ctrl + 4, (SHARED + 0x4000 + q * 128) as u32).unwrap();
+                write(&m, &mut r, ctrl + 8, (SHARED + 0x8000 + q * 256) as u32).unwrap();
+            }
+            let ci = SHARED + 0x4000;
+            write(&m, &mut r, ci, 1).unwrap();
+            for (off, v) in [
+                (16, 0x18000),
+                (24, 4096),
+                (48, SHARED + 0x5000),
+                (56, SHARED + 0xa000),
+            ] {
+                m.write(&mut r, ci + off, &v.to_le_bytes(), false).unwrap();
+            }
+            m.write(&mut r, SHARED + 0x5000, &8u64.to_le_bytes(), false)
+                .unwrap();
+            r[0x18000..0x18008].copy_from_slice(&(opcode << 56).to_le_bytes());
+            let mut spaces = [m; 16];
+            spaces[1] = AddressSpace {
+                transtab: 0,
+                transcfg: 2,
+            };
+            assert_eq!(f.queues(&spaces, &mut r).unwrap() & 1, 1);
+            assert_eq!(
+                read(&m, &r, SHARED + 0xa000).unwrap(),
+                if done { 8 } else { 0 }
+            );
+            assert_eq!(
+                read(&m, &r, SHARED + 0x8000).unwrap() & (1 << 30) != 0,
+                !done
+            );
+        }
     }
 }

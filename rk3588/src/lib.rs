@@ -6,6 +6,7 @@ pub mod gpu_mmu;
 pub mod gpu_cs;
 pub mod gpu;
 pub mod gpu_fw;
+pub mod gpu_render;
 pub mod uart;
 pub mod mmc;
 pub mod phy;

@@ -85,7 +85,7 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn chunks(
+    pub(crate) fn chunks(
         &self,
         ram: &[u8],
         va: u64,

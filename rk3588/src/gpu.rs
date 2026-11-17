@@ -1,5 +1,5 @@
 //! Mali-G610 control registers and host-modeled CSF management.
-//! MCU instructions and graphics queue execution remain unsupported.
+//! MCU instructions and shader execution remain unsupported; clear passes run synchronously.
 use crate::gpu_mmu::AddressSpace;
 #[derive(Default)]
 pub struct Gpu {
@@ -54,7 +54,7 @@ impl Gpu {
             }
         } else if off == 0x700 {
             self.firmware.running = false;
-        } else if off == 0x80000 {
+        } else if (0x80000..=0x170000).contains(&off) && off%0x10000==0 {
             match self.firmware.doorbell(&self.spaces[0], ram) {
                 Ok((irq, halt)) => {
                     if irq {
@@ -70,6 +70,9 @@ impl Gpu {
                     self.raw[2] |= 1 << 19;
                 }
             }
+        }
+        if (0x80000..=0x170000).contains(&off) && off%0x10000==0 {
+            match self.firmware.queues(&self.spaces,ram){Ok(bits)=>self.raw[0]|=bits,Err(e)=>eprintln!("[mali] firmware queue error {:?}",e)}
         }
     }
     pub fn write(&mut self, off: u64, v: u32) {
