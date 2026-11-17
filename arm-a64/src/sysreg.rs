@@ -80,8 +80,9 @@ pub struct SysRegs {
 /// The AArch32 identification registers (ID_PFR0_EL1 .. MVFR2_EL1: op0 3, op1 0, CRn 0,
 /// CRm 1-3), as EL1 reads them to describe AArch32 EL0. They describe the Cortex-A72's AArch32
 /// state reduced to what `arm-a32` implements: ARMv7-A with the virtualization extensions'
-/// integer divide, VFPv4-D32 and Advanced SIMD, but none of ARMv8's AArch32 additions
-/// (LDA/STL, VSEL/VRINT/VMAXNM, CRC32, SEVL), no SWP and no ThumbEE.
+/// integer divide, VFPv4-D32 and Advanced SIMD, and of ARMv8's AArch32 additions the
+/// load-acquire/store-release family and SEVL (not VSEL/VRINT/VMAXNM or CRC32); no SWP, no
+/// ThumbEE.
 fn aarch32_id(k: u32) -> Option<u64> {
     // CRm (bits 6:3) 1..3 and op2 (bits 2:0): 0x08..0x1f
     if k & !0x7f != key(3, 0, 0, 0, 0) || !(0x08..0x20).contains(&(k & 0x7f)) {
@@ -97,9 +98,10 @@ fn aarch32_id(k: u32) -> Option<u64> {
         0x0f => 0x0210_2211,
         0x10 => 0x0210_1110, // ID_ISAR0: SDIV/UDIV in A32 and T32, no SWP
         0x11 => 0x1311_2111,
-        0x12 => 0x2123_2041, // ID_ISAR2: LoadStore 1 (no LDA/STL)
+        0x12 => 0x2123_2042, // ID_ISAR2: LoadStore 2 (LDA/STL and the acquire/release exclusives)
         0x13 => 0x0111_2131,
         0x14 => 0x0001_1142,
+        0x15 => 0x0000_0001, // ID_ISAR5: SEVL (no CRC32, no crypto)
         0x18 => 0x1011_0222, // MVFR0: VFPv4 double, D32, Advanced SIMD registers
         0x19 => 0x1111_1111, // MVFR1: Advanced SIMD integer/float/FMA, VFP FMA, FTZ, DN
         _ => 0,              // ID_AFR0, ID_ISAR5, ID_MMFR4, MVFR2, reserved

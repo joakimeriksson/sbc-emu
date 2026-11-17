@@ -33,6 +33,13 @@ fn jit32_off() -> bool {
     *OFF.get_or_init(|| std::env::var("SBC_JIT32").is_ok_and(|v| v == "0"))
 }
 
+/// `SBC_AARCH32_UNDEF=1`: print every UNDEFINED instruction of a 32-bit program (gaps in the
+/// 32-bit core show up as SIGILL in the guest otherwise).
+fn undef_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SBC_AARCH32_UNDEF").is_ok_and(|v| v == "1"))
+}
+
 /// The 64-bit core as the 32-bit core's EL1.
 struct El1<'a>(&'a mut Cpu);
 
@@ -185,7 +192,13 @@ impl Cpu {
         };
         let pc = exit.pc as u64;
         let (ec, iss, ret, far) = match exit.event {
-            El0Event::Undefined => (crate::cpu::Exc::UNKNOWN, 0, pc, None),
+            El0Event::Undefined => {
+                if undef_log() {
+                    let insn = self.a32.as_ref().and_then(|a| a.last_undef).map_or(0, |u| u.1);
+                    eprintln!("[aarch32] UNDEFINED {insn:#010x} at {pc:#x} ({})", if exit.size == 2 || self.a32.as_ref().is_some_and(|a| a.cpsr & 0x20 != 0) { "T32" } else { "A32" });
+                }
+                (crate::cpu::Exc::UNKNOWN, 0, pc, None)
+            }
             El0Event::Svc(imm) => (EC_SVC32, imm & 0xffff, pc + exit.size as u64, None),
             El0Event::Bkpt(imm) => {
                 if self.brk_to_host {

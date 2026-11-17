@@ -276,8 +276,8 @@ no CSI camera (the webcam is USB); no USB 3 devices (the USB 3 root ports stay e
 hubs, no isochronous transfers; Bluetooth has no connections (the sensor only advertises) and
 no classic devices; Wi-Fi has no radio model (emulated firmware host interface, open and
 WPA2-PSK networks); only the PCM's DREQ paces DMA (the other peripherals complete at once);
-32-bit programs get ARMv7's instruction set only (none of ARMv8's AArch32 additions such as
-LDA/STL, VRINT or CRC32; the ID registers say so) and the 32-bit core's VFP is not bit-exact
+32-bit programs get ARMv7's instruction set plus ARMv8's load-acquire/store-release and SEVL
+(not VSEL, VRINT, VMAXNM or CRC32; the ID registers say so) and the 32-bit core's VFP is not bit-exact
 (no flush-to-zero, no cumulative exception flags);
 no LSE instructions, crypto only with `--cpu-crypto` (the BCM2711's A72 has neither; the ID
 registers say so); the native JIT needs an AArch64 host and is still well below a real Pi 4

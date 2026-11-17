@@ -751,6 +751,11 @@ impl Cpu {
                     self.sent_event = true;
                     return Ok(());
                 }
+                5 => {
+                    // SEVL: this core's event register only
+                    self.event = true;
+                    return Ok(());
+                }
                 _ => return Ok(()),
             }
         }
@@ -1258,6 +1263,11 @@ impl Cpu {
             return Ok(());
         }
 
+        // ARMv8 load-acquire/store-release (A32): LDA/STL{,B,H} and LDAEX/STLEX{,B,H,D}.
+        // cccc 0001 1 sz L Rn | Rt/1111 | 11 x0 1001 | 1111/Rt (x = exclusive).
+        if insn & 0x0f80_0df0 == 0x0180_0c90 {
+            return self.acquire_release(bus, insn);
+        }
         // Load/store exclusive and the local reservation monitor.
         let load_exclusive = match insn & 0x0ff0_0fff {
             0x0190_0f9f => Some(4),
