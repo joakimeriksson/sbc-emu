@@ -4,7 +4,8 @@ use crate::dsi::{Dsi, DSI_SIZE};
 use crate::rga::{Rga, RGA_SIZE};
 use crate::vop::{Vop, VOP_SIZE};
 use allwinner_h3::{Gic, Uart, NCPU};
-use arm_a32::{Cpu, CORTEX_A12};
+use arm_a32::{CodeWatch, Cpu, CORTEX_A12};
+use std::sync::Arc;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
 
 pub const RAM_BASE: u64 = 0;
@@ -71,6 +72,9 @@ pub struct Soc {
     /// VOP-big and VOP-little.
     pub vop: [Vop; 2],
     pub dsi: Dsi,
+    /// RAM pages holding compiled code (shared by the cores' JITs): devices that write RAM
+    /// report it here.
+    pub code_watch: Arc<CodeWatch>,
     /// RGA 2D accelerator (rotates the vendor application's frames onto the panel).
     pub rga: Rga,
     /// Mali-T760 GPU (`midgard`).
@@ -106,6 +110,7 @@ impl Soc {
             periph: Peripherals::default(),
             vop: Default::default(),
             dsi: Dsi::default(),
+            code_watch: CodeWatch::new(RAM_BASE as u32, ram_size as u32),
             rga: Rga::default(),
             gpu: midgard::MaliT760::new(std::env::var("SBC_MALI_LOG").is_ok_and(|v| v != "0")),
             display_rotation: 0,
@@ -265,10 +270,16 @@ impl Soc {
         }
         if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
             self.gpu.write(offset, value, &mut self.ram.mem, self.ram.base);
+            for page in self.gpu.written_pages.drain(..) {
+                self.code_watch.dma_write(page, 0x1000);
+            }
             return Ok(());
         }
         if let Some(offset) = Self::word_offset(addr, width, RGA_BASE, RGA_SIZE)? {
             self.rga.write(offset, value, &mut self.ram.mem, self.ram.base);
+            for (pa, len) in self.rga.written.drain(..) {
+                self.code_watch.dma_write(pa, len);
+            }
             return Ok(());
         }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
@@ -297,6 +308,9 @@ impl Soc {
             return Ok(());
         }
         if let Some(result) = self.periph.write(addr, width, value, &mut self.ram, ticks_to_ns(self.now)) {
+            for (pa, len) in self.periph.dma_written.drain(..) {
+                self.code_watch.dma_write(pa, len);
+            }
             return result;
         }
         self.stub_access(addr, width, Some(value)).map(|_| ())
@@ -352,6 +366,8 @@ pub struct Machine {
     subtick: u64,
     /// The core that caused the last non-budget, non-idle stop (diagnostics).
     pub last_stop_core: usize,
+    /// Compile hot code (the A32 JIT to AArch64) on hosts that can run it.
+    jit: bool,
 }
 
 impl Machine {
@@ -380,9 +396,40 @@ impl Machine {
             exceptions: 0,
             subtick: 0,
             last_stop_core: 0,
+            jit: arm_a32::jit::available() && std::env::var("SBC_JIT").map_or(true, |v| v != "0"),
         };
+        for k in 0..NCPU {
+            machine.attach(k);
+        }
         machine.update_irqs();
         machine
+    }
+
+    /// Give core `k` direct access to RAM and, if enabled, its JIT.
+    fn attach(&mut self, k: usize) {
+        let ram = &mut self.soc.ram.mem;
+        // SAFETY: the RAM vector is allocated once with the machine and never resized; the
+        // cores are dropped with it
+        unsafe { self.cpus[k].set_ram(ram.as_mut_ptr(), RAM_BASE as u32, ram.len() as u32) };
+        if self.jit {
+            self.cpus[k].enable_jit(self.soc.code_watch.clone());
+        }
+    }
+
+    /// Turn the JIT on or off (it is on by default where the host supports it).
+    pub fn set_jit(&mut self, on: bool) {
+        self.jit = on && arm_a32::jit::available();
+        for k in 0..NCPU {
+            if self.jit {
+                self.cpus[k].enable_jit(self.soc.code_watch.clone());
+            } else {
+                self.cpus[k].disable_jit();
+            }
+        }
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.jit
     }
 
     fn new_cpu(index: usize) -> Cpu {
@@ -407,6 +454,7 @@ impl Machine {
     }
 
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Fault> {
+        self.soc.code_watch.dma_write(addr, bytes.len());
         self.soc.ram.load(addr, bytes)
     }
 
@@ -424,6 +472,7 @@ impl Machine {
         cpu.firmware_calls_to_host = true;
         cpu.cntpct = now;
         self.cpus[index] = cpu;
+        self.attach(index);
         self.state[index] = CoreState::Run;
         self.soc.gic.reset_cpu_interface(index);
     }
@@ -457,19 +506,32 @@ impl Machine {
     /// One instruction of one core: 1 ns divided among the running cores. Cores asleep in
     /// WFI/WFE (or in the boot ROM) do not count, so a lone busy core runs at 1 ns per
     /// instruction.
-    fn tick(&mut self) {
+    fn tick(&mut self, n: u64) {
         let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
-        self.advance_subtick(12 / running);
+        self.advance_subtick(n * (12 / running));
     }
 
     /// Advance virtual time by `units` of 1/12 ns.
     fn advance_subtick(&mut self, units: u64) {
         self.subtick += units;
         if self.subtick >= 125 * 12 {
-            self.subtick -= 125 * 12;
-            let ticks = self.cpus[0].cntpct + 3;
+            let periods = self.subtick / (125 * 12);
+            self.subtick -= periods * 125 * 12;
+            let ticks = self.cpus[0].cntpct + 3 * periods;
             self.set_time(ticks);
         }
+    }
+
+    /// Instructions a core may run before the next device deadline (compiled blocks chain
+    /// until then).
+    fn instructions_to_deadline(&self) -> u64 {
+        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        let now = self.cpus[0].cntpct;
+        if self.next_event <= now {
+            return 1;
+        }
+        let units = (self.next_event - now).saturating_mul(500).saturating_sub(self.subtick);
+        units.div_ceil(12 / running).max(1)
     }
 
     /// Inner-shareable TLB maintenance on core `k` reaches every core (DVM broadcast);
@@ -538,9 +600,12 @@ impl Machine {
             }
         }
         {
-            let Soc { gpu, ram, gic, rga, .. } = &mut self.soc;
+            let Soc { gpu, ram, gic, rga, code_watch, .. } = &mut self.soc;
             gic.set_level(RGA_IRQ, rga.irq());
             gpu.update(now, &mut ram.mem, ram.base);
+            for page in gpu.written_pages.drain(..) {
+                code_watch.dma_write(page, 0x1000);
+            }
             for (irq, line) in GPU_IRQS {
                 gic.set_level(line, gpu.irq(irq));
             }
@@ -628,9 +693,11 @@ impl Machine {
             self.advance_time(ticks);
             return Err(Trap::Wait);
         }
+        let i0 = self.cpus[0].instret;
+        self.cpus[0].chain_until = i0 + 1;
         let result = self.cpus[0].step(&mut self.soc);
         // step() runs core 0 alone, so each instruction is a full 1 ns.
-        self.advance_subtick(12);
+        self.advance_subtick(12 * (self.cpus[0].instret - i0).max(1));
         if self.cpus[0].sent_event {
             self.send_event(0);
         }
@@ -674,11 +741,17 @@ impl Machine {
                 });
             };
             self.switch_to(k);
-            let quantum = left.min(QUANTUM);
-            for _ in 0..quantum {
-                left -= 1;
+            let mut quantum = left.min(QUANTUM);
+            while quantum > 0 {
+                let i0 = self.cpus[k].instret;
+                self.cpus[k].chain_until = i0 + quantum.min(self.instructions_to_deadline());
                 let result = self.cpus[k].step(&mut self.soc);
-                self.tick();
+                // a compiled block runs several instructions; a trap that retired nothing
+                // still takes a tick
+                let n = (self.cpus[k].instret - i0).max(1);
+                quantum = quantum.saturating_sub(n);
+                left = left.saturating_sub(n);
+                self.tick(n);
                 if self.cpus[k].sent_event {
                     self.send_event(k);
                 }

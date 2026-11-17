@@ -43,6 +43,8 @@ pub struct Peripherals {
     pub i2c: Vec<(u64, usize, Rk3xI2c)>,
     /// GPIO0-8 (index = bank number), at `gpio::BANKS`.
     pub gpio: Vec<GpioBank>,
+    /// RAM written by DMA since the machine last looked (for the JIT's code watch).
+    pub dma_written: Vec<(u64, usize)>,
 }
 
 impl Default for Peripherals {
@@ -56,6 +58,7 @@ impl Default for Peripherals {
             ],
             i2c: I2C.iter().map(|&(base, irq)| (base, irq, Rk3xI2c::default())).collect(),
             gpio: (0..gpio::BANKS.len()).map(|_| GpioBank::default()).collect(),
+            dma_written: Vec::new(),
         }
     }
 }
@@ -108,7 +111,7 @@ impl Peripherals {
         if let Some(mmc) = self.mmc.iter_mut().find(|m| m.contains(addr)) {
             return Some(word(addr, width).map(|_| {
                 mmc.write(addr - mmc.base, value, ram);
-                mmc.dma_written.clear();
+                self.dma_written.append(&mut mmc.dma_written);
             }));
         }
         if let Some(bank) = gpio_bank(addr) {

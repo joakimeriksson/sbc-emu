@@ -40,11 +40,13 @@ pub struct Rga {
     /// Blits run, for the end-of-run report.
     pub jobs: u64,
     pub log: bool,
+    /// RAM written by blits since the machine last looked (for the CPU JIT's code watch).
+    pub written: Vec<(u64, usize)>,
 }
 
 impl Default for Rga {
     fn default() -> Self {
-        Self { regs: vec![0; RGA_SIZE as usize / 4], jobs: 0, log: std::env::var("SBC_RGA_LOG").is_ok_and(|v| v != "0") }
+        Self { regs: vec![0; RGA_SIZE as usize / 4], jobs: 0, written: Vec::new(), log: std::env::var("SBC_RGA_LOG").is_ok_and(|v| v != "0") }
     }
 }
 
@@ -257,6 +259,9 @@ impl Rga {
                 }
                 for k in 0..db as u64 {
                     let Some(pa) = dst.pa(ram, ram_base, dva + k) else { continue };
+                    if self.written.last().is_none_or(|&(p, _)| p != pa & !0xfff) {
+                        self.written.push((pa & !0xfff, 0x1000));
+                    }
                     if let Some(i) = pa.checked_sub(ram_base).and_then(|i| usize::try_from(i).ok()) {
                         if let Some(b) = ram.get_mut(i) {
                             *b = out[k as usize];
