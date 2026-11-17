@@ -381,7 +381,7 @@ impl Env for VertexEnv<'_, '_> {
                             at.buf.element(self.linear[t], self.dcd.offset_start)
                         };
                         let v = load_attr(self.vm, &at, e);
-                        convert_for(op - 0x94 & 3, at.format.class(), v)
+                        convert_for((op - 0x94) & 3, at.format.class(), v)
                     }
                     _ => [0, 0, 0, 0],
                 };
@@ -618,7 +618,7 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
             let n = run.len();
             match mode {
                 1 => run.iter().for_each(|&a| emit(POINTS, [a, a, a])),
-                2 => run.chunks_exact(2).for_each(|c| emit(LINES, [c[0], c[1], c[1]])),
+                2 => run.as_chunks::<2>().0.iter().for_each(|c| emit(LINES, [c[0], c[1], c[1]])),
                 4 | 6 => {
                     for i in 1..n {
                         emit(LINES, [run[i - 1], run[i], run[i]]);
@@ -627,7 +627,7 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
                         emit(LINES, [run[n - 1], run[0], run[0]]);
                     }
                 }
-                8 => run.chunks_exact(3).for_each(|c| emit(TRIS, [c[0], c[1], c[2]])),
+                8 => run.as_chunks::<3>().0.iter().for_each(|c| emit(TRIS, [c[0], c[1], c[2]])),
                 10 => {
                     for i in 2..n {
                         // keep the winding: odd triangles swap their first two vertices
@@ -643,7 +643,7 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
                         emit(TRIS, [run[0], run[i - 1], run[i]]);
                     }
                 }
-                14 => run.chunks_exact(4).for_each(|c| {
+                14 => run.as_chunks::<4>().0.iter().for_each(|c| {
                     emit(TRIS, [c[0], c[1], c[2]]);
                     emit(TRIS, [c[0], c[2], c[3]]);
                 }),

@@ -826,11 +826,10 @@ impl<'e, E: Env> Core<'e, E> {
                     let v = self.env.ldst(k, i, args, 0);
                     let v = if (0x04..=0x13).contains(&op) { v } else { sw(v, i.swizzle) };
                     write_dest(t, v, i.mask);
-                    if op == 0x99 || op == 0x95 || op == 0xb9 || op == 0x9d {
-                        if i.reg == 0 {
+                    if (op == 0x99 || op == 0x95 || op == 0xb9 || op == 0x9d)
+                        && i.reg == 0 {
                             t.r0_half = true;
                         }
-                    }
                 }
             }
         }
@@ -1007,7 +1006,7 @@ fn alu_one(t: &Thread, i: &AluIns, consts: u128) -> Option<(u32, u128, u128, boo
     };
     let mut res = [0u64; 16];
     match op {
-        0x3c | 0x3d | 0x3e => {
+        0x3c..=0x3e => {
             let k = if op == 0x3e { 4 } else { 3 };
             let d: f64 = (0..k).map(|c| to_f(a.lanes[c], bits) * to_f(b.lanes[c], bits)).sum();
             res = [from_f(d, bits); 16];
@@ -1060,7 +1059,7 @@ fn alu_one(t: &Thread, i: &AluIns, consts: u128) -> Option<(u32, u128, u128, boo
         _ => {
             let unary = is_lut_unary(op);
             for c in 0..n as usize {
-                let (x, y) = if matches!(op, 0x30..=0x33 | 0x7b) { (a.lanes[c], b.lanes[c]) } else { (a.lanes[c], b.lanes[c]) };
+                let (x, y) = (a.lanes[c], b.lanes[c]);
                 res[c] = lane_op(op, x, if unary { 0 } else { y }, bits);
             }
         }
@@ -1072,8 +1071,8 @@ fn alu_one(t: &Thread, i: &AluIns, consts: u128) -> Option<(u32, u128, u128, boo
     let lane_enabled = |c: u32| -> bool {
         if bits >= 16 { mask & (1 << (c * bits / 16)) != 0 } else { mask & (1 << (c / 2)) != 0 }
     };
-    let half_write;
-    if shrink == 2 || bits == 8 {
+    
+    let half_write = if shrink == 2 || bits == 8 {
         for c in 0..n {
             if !lane_enabled(c) {
                 continue;
@@ -1085,7 +1084,7 @@ fn alu_one(t: &Thread, i: &AluIns, consts: u128) -> Option<(u32, u128, u128, boo
             set_lane(&mut value, bits, c, v);
             set_lane(&mut wmask, bits, c, mask_of(bits));
         }
-        half_write = bits == 16;
+        bits == 16
     } else {
         let hb = bits / 2;
         for c in 0..n {
@@ -1112,8 +1111,8 @@ fn alu_one(t: &Thread, i: &AluIns, consts: u128) -> Option<(u32, u128, u128, boo
             set_lane(&mut value, hb, dst, h);
             set_lane(&mut wmask, hb, dst, mask_of(hb));
         }
-        half_write = hb == 16;
-    }
+        hb == 16
+    };
     Some((i.out_reg, value, wmask, half_write))
 }
 

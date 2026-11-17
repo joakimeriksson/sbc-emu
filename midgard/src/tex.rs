@@ -255,7 +255,8 @@ pub fn sample(vm: &mut Vm, dcd: &Dcd, w: &TexWord, coords: &[[f32; 4]; 4], lod: 
                 pos[d] = if s.normalized { uv[k][d] * dims[d] as f32 } else { uv[k][d] };
             }
             let border = |c: Class| -> [f32; 4] {
-                if c == Class::Float { s.border.map(f32::from_bits) } else { s.border.map(|x| f32::from_bits(x)) }
+                let _ = c;
+                s.border.map(f32::from_bits)
             };
             if nearest {
                 let mut idx = [0u32; 3];

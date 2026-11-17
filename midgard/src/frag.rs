@@ -475,16 +475,13 @@ impl FragEnv<'_, '_> {
             o[c] = (0..n).map(|i| ow[i] * f32::from_bits(vals[i][c])).sum();
         }
         // perspective division modifiers
-        match params & 7 {
-            m @ 1..=3 => {
-                let d = o[m as usize];
-                if d != 0.0 {
-                    for c in 0..3 {
-                        o[c] /= d;
-                    }
+        if let m @ 1..=3 = params & 7 {
+            let d = o[m as usize];
+            if d != 0.0 {
+                for c in 0..3 {
+                    o[c] /= d;
                 }
             }
-            _ => {}
         }
         o.map(f32::to_bits)
     }
