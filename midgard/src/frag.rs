@@ -667,6 +667,9 @@ pub fn fragment_job(vm: &mut Vm, job: u64, list: &[Prim], trace: bool) -> u64 {
     }
     if trace {
         eprintln!("[mali] fragment {}x{} at ({x0},{y0}) {} primitives, fbd {fbd:#x}", w, h, list.len());
+        for rt in &fb.rts {
+            eprintln!("[mali]   rt internal {} writeback {} block {} dither {} base {:#x} stride {}", rt.internal, rt.wb_format, rt.block, rt.dither, rt.base, rt.row_stride);
+        }
         for p in list.iter().take(3) {
             eprintln!("[mali]   prim {} v {:?} pos {:?}", p.kind, p.v, p.pos);
         }
