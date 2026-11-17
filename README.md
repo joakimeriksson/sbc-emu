@@ -73,7 +73,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 
 | Block | Model | Linux driver |
 |---|---|---|
-| CPU | 4× ARMv8.0-A, Cortex-A72 identity: A64 integer ISA with CRC32, FP (exact, all FPCR modes), Advanced SIMD, EL0–EL3, stage-1 MMU (4 KiB), generic timers, PSCI (CPU_ON/OFF, AFFINITY_INFO, reset, off) via the host | — |
+| CPU | 4× ARMv8.0-A, Cortex-A72 identity: A64 integer ISA with CRC32, FP (exact, all FPCR modes), Advanced SIMD, EL0–EL3, stage-1 MMU (4 KiB), generic timers, PSCI (CPU_ON/OFF, AFFINITY_INFO, reset, off) via the host; 32-bit programs at EL0 (AArch32: A32, Thumb-2, VFPv4, NEON on the `arm-a32` core, see [below](#32-bit-programs)) | — |
 | GIC-400 | distributor + four CPU interfaces, banked SGIs/PPIs, SPI targets | `gic-400` |
 | UART0 | PL011 | `amba-pl011` |
 | Mailbox | VideoCore property channel (board, memory, clocks, power, framebuffer) | `bcm2835-mbox`, `raspberrypi-firmware` |
@@ -276,6 +276,9 @@ no CSI camera (the webcam is USB); no USB 3 devices (the USB 3 root ports stay e
 hubs, no isochronous transfers; Bluetooth has no connections (the sensor only advertises) and
 no classic devices; Wi-Fi has no radio model (emulated firmware host interface, open and
 WPA2-PSK networks); only the PCM's DREQ paces DMA (the other peripherals complete at once);
+32-bit programs get ARMv7's instruction set only (none of ARMv8's AArch32 additions such as
+LDA/STL, VRINT or CRC32; the ID registers say so) and the 32-bit core's VFP is not bit-exact
+(no flush-to-zero, no cumulative exception flags);
 no LSE instructions, crypto only with `--cpu-crypto` (the BCM2711's A72 has neither; the ID
 registers say so); the native JIT needs an AArch64 host and is still well below a real Pi 4
 core; the browser build is about 3× slower than native and single-threaded.
@@ -285,7 +288,8 @@ core; the browser build is about 3× slower than native and single-threaded.
 QEMU's side is what its own board page lists (["Raspberry Pi boards"](https://www.qemu.org/docs/master/system/arm/raspi.html),
 documentation for QEMU 11.1.90, November 2026): "implemented devices", "missing devices", and
 nothing for what the page does not mention. QEMU also models the raspi0, 1A+, 2B, 3A+ and 3B
-(ARM1176, Cortex-A7, Cortex-A53 cores); sbc-emu models only the Pi 4 and runs AArch64 only.
+(ARM1176, Cortex-A7, Cortex-A53 cores); sbc-emu's Pi 4 boots 64-bit kernels only, but runs
+32-bit programs under them.
 
 | | sbc-emu `pi4b` | QEMU `raspi4b` (its documentation) |
 |---|---|---|
@@ -305,6 +309,28 @@ nothing for what the page does not mention. QEMU also models the raspi0, 1A+, 2B
 | I²S audio | yes: a DAC HAT, to a WAV file or the browser | not listed |
 | Cores on host threads | `--threads multi` (or in turns, repeatable to the instruction) | not on the board page (QEMU's MTTCG) |
 | In the browser | yes (WebAssembly build with its own JIT) | no |
+
+## 32-bit programs
+
+The Pi 4's Cortex-A72 runs 32-bit (AArch32) programs at EL0 under a 64-bit kernel, and so does
+the emulated one: Raspberry Pi OS's own kernel reports `CPU features: detected: 32-bit EL0
+Support` and runs armhf binaries next to arm64 ones. When the kernel returns to a 32-bit
+program, the 64-bit core (`arm-a64`) hands the user registers to an `arm-a32` core, which runs
+the program through the 64-bit core's page tables and asks it for the few system registers a
+user program may read (thread ID, generic timer, CP15 barriers). Every exception (system call,
+page fault, undefined instruction, interrupt) brings the registers back and is taken to the
+64-bit kernel with an AArch32 syndrome, as on the hardware (`arm-a64/src/aarch32.rs`,
+`arm-a32/src/el0.rs`). The 32-bit core's own JIT (A32/T32 to A64) compiles hot 32-bit code
+(`SBC_JIT32=0` interprets it): a BusyBox shell loop of 20,000 iterations takes 0.5 s instead of
+9.5 s, a gzip of 1.3 MiB 0.4 s instead of 7 s, close to the same 64-bit programs. With
+`--threads multi` the 32-bit store-exclusive is a host compare-and-swap and barriers are host
+fences, as for 64-bit code.
+
+| | Evidence |
+|---|---|
+| Syndromes, register mapping, interrupts, snapshots | `arm-a64/tests/aarch32_el0.rs`: an EL1 kernel and a 32-bit program with A32 and 16-bit Thumb SVCs, UNDEFINED, a data abort, a trapped CP15 timer read, TPIDRURO/URW, VFP registers in V0–V15, exclusives; an IRQ at the AArch32 vector; a snapshot taken inside the program resumes it; JIT-compiled 32-bit code ends exactly as interpreted (registers, memory, instruction count); two host threads add 100,000 to one counter with LDREX/STREX, interpreted and compiled |
+| Debian armhf BusyBox under the Pi kernel | Debian 13's `busybox-static` (Thumb-2, hard float) in an initramfs next to the arm64 BusyBox: shell loops, background jobs, `sha256sum` and a gzip round trip equal to the arm64 tools' results |
+| A whole armhf Debian userland | Raspberry Pi OS with Armbian's Orange Pi One image (Debian 13 armhf) as a USB stick: `chroot` into it runs its bash, perl, `dpkg` and Python 3, with `--threads single` and `multi`: SHA-256, zlib, integer and floating-point results equal to the arm64 Python's; 8 Python threads × 20,000 increments under one lock give 160,000; four shells counting under `flock` give 400; no kernel warnings |
 
 ## The JIT
 

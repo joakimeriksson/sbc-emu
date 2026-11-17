@@ -813,7 +813,7 @@ impl Cpu {
                 }
                 // IC IALLU / IC IALLUIS / IC IVAU: drop compiled code (the only instruction cache)
                 if op1 == 0 && (crm == 5 || crm == 1) && op2 == 0 {
-                    if let Some(j) = self.jit.as_mut() { j.flush(); }
+                    self.jit_invalidate(u64::MAX);
                     self.ic_bcast = Some(u64::MAX);
                 } else if op1 == 3 && crm == 5 && op2 == 1 {
                     let va = self.xr(rt);

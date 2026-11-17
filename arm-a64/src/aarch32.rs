@@ -27,6 +27,12 @@ pub(crate) const SNAP_AARCH32_CPSR: u32 = 0x1_0000;
 /// SPSR bits an AArch32 return restores into the CPSR: everything but J, SS and IL.
 const CPSR_FROM_SPSR: u32 = !((1 << 24) | (1 << 21) | (1 << 20));
 
+/// `SBC_JIT32=0`: interpret 32-bit programs even with the JIT on (A/B tests).
+fn jit32_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("SBC_JIT32").is_ok_and(|v| v == "0"))
+}
+
 /// The 64-bit core as the 32-bit core's EL1.
 struct El1<'a>(&'a mut Cpu);
 
@@ -38,6 +44,10 @@ impl El1Host for El1<'_> {
             El0Access::Exec => Access::Exec,
         };
         self.0.translate(bus, va as u64, a)
+    }
+
+    fn compiled(&mut self, pa: u32) {
+        self.0.mark_code_page(pa as u64 >> 12);
     }
 
     fn cp15(&mut self, insn: u32, value: u64) -> Cp15 {
@@ -100,9 +110,15 @@ impl Cpu {
     /// Exception return from EL1 to AArch32 EL0: `spsr` (M = User, bit 4 set) and `elr`.
     pub(crate) fn enter_aarch32(&mut self, spsr: u64, elr: u64) {
         let (ram, len, mt) = (self.ram, self.ram_len, self.mt);
+        let jit = self.jit.is_some() && !self.jit_off;
         let a = self.a32.get_or_insert_with(|| Box::new(arm_a32::Cpu::new_el0()));
         // SAFETY: the machine's guarantee for `ram` (see the field) covers this core too
         unsafe { a.el0_setup(ram, len, mt) };
+        if jit && !a.jit_enabled() && !ram.is_null() && !jit32_off() {
+            // the 32-bit core's own JIT (A32/T32 to A64); it learns of code changes through
+            // this core's instruction-cache maintenance (`code_changed`)
+            a.enable_jit(arm_a32::CodeWatch::new(0, len.min(u32::MAX as u64) as u32));
+        }
         for (r, x) in a.r.iter_mut().zip(self.x.iter()).take(15) {
             *r = *x as u32;
         }
@@ -124,6 +140,11 @@ impl Cpu {
         self.daif = cpsr & 0x1c0;
         self.chain_stop = true;
         self.interp_run = false;
+    }
+
+    /// The 32-bit core's JIT: (blocks compiled, blocks run, blocks dropped by code writes).
+    pub fn aarch32_jit_stats(&self) -> Option<(u64, u64, u64)> {
+        self.a32.as_ref().and_then(|a| a.jit_stats())
     }
 
     /// Back to AArch64 for an exception from AArch32 EL0: the registers return to their
@@ -149,6 +170,10 @@ impl Cpu {
     pub(crate) fn step_aarch32(&mut self, bus: &mut dyn Bus) -> Result<(), Trap> {
         let mut a = self.a32.take().expect("AArch32 state");
         let before = a.instret;
+        // compiled 32-bit blocks chain as far as this core's blocks may (a bounded slice when
+        // other threads may ask this core to stop: they write this core's `chain_until`)
+        let budget = self.chain_until.saturating_sub(self.instret);
+        a.chain_until = before.saturating_add(if self.mt { budget.min(20_000) } else { budget });
         let r = a.step_el0(bus, &mut El1(self));
         self.instret += a.instret.wrapping_sub(before);
         self.pc = a.r[15] as u64;

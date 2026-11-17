@@ -193,3 +193,163 @@ fn an_interrupt_leaves_the_32_bit_program_at_the_aarch32_vector() {
     assert_eq!(cpu.spsr[1] & 0x3f, 0x10);
     assert_eq!(cpu.x[0], 8);
 }
+
+/// A hot 32-bit loop (A32 and Thumb, loads and stores, exclusives, an SVC every iteration):
+/// compiled by the 32-bit core's JIT, it ends exactly as interpreted.
+const LOOP: &str = "
+    movw r1, #0
+    movt r1, #0x20
+    mov r6, #0
+    mov r8, #3000
+1:  ldr r2, [r1, #16]
+    add r2, r2, r8
+    eor r2, r2, r8, lsl #3
+    str r2, [r1, #16]
+    ldrex r3, [r1]
+    add r3, r3, #1
+    strex r12, r3, [r1]
+    cmp r12, #0
+    bne 1b
+    adr r4, thumb
+    orr r4, r4, #1
+    blx r4
+    mov r7, #2
+    svc #0
+    subs r8, r8, #1
+    bne 1b
+    mov r7, #1
+    svc #0
+    .thumb
+thumb:
+    adds r6, r6, #3
+    lsls r5, r6, #2
+    eors r5, r5, r2
+    bx lr";
+
+fn run_loop(jit: bool) -> (Cpu, u32, u32) {
+    let mut ram = FlatRam::new(0, RAM);
+    ram.load(LOAD, &assemble(KERNEL)).unwrap();
+    ram.load(USER, &assemble_a32(LOOP)).unwrap();
+    let mut cpu = Cpu::new();
+    cpu.brk_to_host = true;
+    if jit {
+        cpu.jit = arm_a64::jit::Jit::with(1 << 20, 1);
+        cpu.chain_until = u64::MAX;
+    }
+    cpu.ram = ram.mem.as_mut_ptr();
+    cpu.ram_len = ram.mem.len() as u64;
+    cpu.el = 1;
+    cpu.pc = LOAD;
+    cpu.sp = [0x40_0000, 0x50_0000, 0x60_0000, 0x70_0000];
+    cpu.sys.cpacr_el1 = 3 << 20;
+    for _ in 0..1_000_000 {
+        match cpu.step(&mut ram) {
+            Ok(()) | Err(Trap::Exception(..)) => {}
+            Err(Trap::Brk(0)) => {
+                let (a, b) = (ram.read32(DATA).unwrap(), ram.read32(DATA + 16).unwrap());
+                return (cpu, a, b);
+            }
+            Err(t) => panic!("{t:?} at pc {:#x}", cpu.pc),
+        }
+    }
+    panic!("no brk");
+}
+
+#[test]
+fn compiled_32_bit_code_ends_as_interpreted() {
+    let (want, a, b) = run_loop(false);
+    assert_eq!(a, 3000);
+    assert_eq!(want.x[0], 7 + 3000 * 100, "an SVC per iteration");
+    if !arm_a64::jit::available() {
+        return;
+    }
+    let (got, ga, gb) = run_loop(true);
+    assert_eq!((ga, gb), (a, b), "memory");
+    assert_eq!(got.x[..15], want.x[..15], "registers");
+    assert_eq!(got.instret, want.instret, "instructions");
+    let (compiled, runs, _) = got.aarch32_jit_stats().expect("the 32-bit core has a JIT");
+    assert!(compiled > 0 && runs > 1000, "{compiled} blocks compiled, {runs} runs");
+}
+
+/// Two cores on host threads (`mt`), each a 32-bit program incrementing one counter with
+/// LDREX/STREX: the store-exclusive is a compare-and-swap, so no increment is lost.
+const SHARED: &str = "
+    movw r1, #0
+    movt r1, #0x20
+    movw r8, #50000
+1:  ldrex r3, [r1]
+    add r3, r3, #1
+    strex r12, r3, [r1]
+    cmp r12, #0
+    bne 1b
+    subs r8, r8, #1
+    bne 1b
+    mov r7, #1
+    svc #0";
+
+/// A bus over the RAM the threads share.
+struct SharedRam(usize);
+macro_rules! shared_access {($r:ident, $w:ident, $t:ty) => {
+    fn $r(&mut self, a: u64) -> Result<$t, emu_core::Fault> {
+        if a as usize + std::mem::size_of::<$t>() > RAM { return Err(emu_core::Fault::Unmapped); }
+        // SAFETY: inside the shared RAM buffer, which outlives the threads
+        Ok(unsafe { ((self.0 + a as usize) as *const $t).read_unaligned() })
+    }
+    fn $w(&mut self, a: u64, v: $t) -> Result<(), emu_core::Fault> {
+        if a as usize + std::mem::size_of::<$t>() > RAM { return Err(emu_core::Fault::Unmapped); }
+        // SAFETY: as above
+        unsafe { ((self.0 + a as usize) as *mut $t).write_unaligned(v) };
+        Ok(())
+    }
+}}
+impl Bus for SharedRam {
+    shared_access!(read8, write8, u8);
+    shared_access!(read16, write16, u16);
+    shared_access!(read32, write32, u32);
+    shared_access!(read64, write64, u64);
+}
+
+#[test]
+fn two_threads_increment_one_counter_with_ldrex_strex() {
+    for jit in [false, true] {
+        if jit && !arm_a64::jit::available() {
+            continue;
+        }
+        let mut ram = FlatRam::new(0, RAM);
+        ram.load(LOAD, &assemble(KERNEL)).unwrap();
+        ram.load(USER, &assemble_a32(SHARED)).unwrap();
+        let base = ram.mem.as_mut_ptr() as usize;
+        let threads: Vec<_> = (0..2u64)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let mut bus = SharedRam(base);
+                    let mut cpu = Cpu::new();
+                    cpu.brk_to_host = true;
+                    cpu.mt = true;
+                    if jit {
+                        cpu.jit = arm_a64::jit::Jit::with(1 << 20, 1);
+                        cpu.chain_until = u64::MAX;
+                    }
+                    cpu.ram = base as *mut u8;
+                    cpu.ram_len = RAM as u64;
+                    cpu.el = 1;
+                    cpu.pc = LOAD;
+                    cpu.sp = [0x40_0000, 0x50_0000 + t * 0x8000, 0x60_0000, 0x70_0000];
+                    cpu.sys.cpacr_el1 = 3 << 20;
+                    for _ in 0..10_000_000 {
+                        match cpu.step(&mut bus) {
+                            Ok(()) | Err(Trap::Exception(..)) => {}
+                            Err(Trap::Brk(0)) => return,
+                            Err(e) => panic!("{e:?} at pc {:#x}", cpu.pc),
+                        }
+                    }
+                    panic!("no brk, pc {:#x}", cpu.pc);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(ram.read32(DATA).unwrap(), 100_000, "jit = {jit}");
+    }
+}

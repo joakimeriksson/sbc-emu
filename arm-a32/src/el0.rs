@@ -41,6 +41,9 @@ pub trait El1Host {
     /// An MRC/MCR (or MRRC/MCRR) to coprocessor 15: `insn` in its A32 encoding (condition
     /// passed); `value` is what a write stores (Rt2:Rt for MCRR).
     fn cp15(&mut self, insn: u32, value: u64) -> Cp15;
+    /// The JIT compiled code from physical `pa` (the kernel's instruction-cache maintenance
+    /// of that page must reach `Cpu::code_changed`).
+    fn compiled(&mut self, _pa: u32) {}
 }
 
 /// The reason the user program left: the AArch64 exception the 64-bit core must take.
@@ -110,7 +113,23 @@ impl Cpu {
         let host: *mut (dyn El1Host + '_) = host;
         self.el1 = Some(unsafe { std::mem::transmute::<*mut (dyn El1Host + '_), *mut (dyn El1Host + 'static)>(host) });
         self.el0_exit = None;
-        let result = self.exec_one(bus);
+        let result = if self.jit.is_some() {
+            self.jit_poll();
+            match if self.interp_run { None } else { self.jit_step(bus) } {
+                Some(r) => r,
+                None => {
+                    // a block that is not hot yet: interpreted up to its end
+                    let pc = self.r[15];
+                    let r = self.exec_one(bus);
+                    if self.r[15] != pc.wrapping_add(self.cur_size) || r.is_err() {
+                        self.interp_run = false;
+                    }
+                    r
+                }
+            }
+        } else {
+            self.exec_one(bus)
+        };
         self.el1 = None;
         match result {
             Err(Trap::Brk(imm)) => {
