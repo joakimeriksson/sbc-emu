@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["emu-core", "arm-a64", "arm-a32", "v3d", "mali400", "bcm2711", "allwinner-h3", "rockchip-rk3288","sbc-net", "cli", "wasm", "sbc-machine", "rk3588"]
+members = ["emu-core", "arm-a64", "arm-a32", "v3d", "mali400", "midgard", "bcm2711", "allwinner-h3", "rockchip-rk3288","sbc-net", "cli", "wasm", "sbc-machine", "rk3588"]
 
 [workspace.package]
 version = "0.0.1"
