@@ -1,7 +1,8 @@
 # Plan: Rockchip RK3288 and the ASUS Tinker Board
 
-Status: M3 reached on 2026-11-15 (four Cortex-A12 cores started through the boot ROM mailbox,
-Debian armmp kernel to a BusyBox shell; see "State" below). It follows the project's own-core
+Status: M4 reached on 2026-11-17 (an unmodified Armbian 26.8.1 SD image boots to the console
+login and a root shell through dw_mmc, the RK808 PMIC on I²C and emulated firmware; see
+"State" below). M3 (four cores) on 2026-11-15. It follows the project's own-core
 decision (pure Rust, no QEMU, `docs/decisions.md` D1) and the multi-board foundation in
 `docs/multi-board-foundation.md`; where they disagree, that document governs the shared crates
 and this one only the RK3288.
@@ -21,8 +22,11 @@ and this one only the RK3288.
 Board: **ASUS Tinker Board S** (adds eMMC; otherwise the Tinker Board). M2 uses Debian 13's
 `linux-image-armmp` kernel and the mainline `rk3288-tinker-s.dtb` it ships
 (`scripts/tinker-board-fixture.sh`; Alpine's armv7 `linux-lts`, the Orange Pi One kernel, is
-built without `ARCH_ROCKCHIP` and has no rk3288 device trees). The image for M4 is Armbian for
-Tinker Board on a mainline kernel (exact release and sha256 recorded when first booted).
+built without `ARCH_ROCKCHIP` and has no rk3288 device trees). The image for M4 is Armbian
+26.8.1 for the Tinker Board, Debian trixie, mainline 6.18.43 `current` kernel, minimal:
+`https://dl.armbian.com/tinkerboard/archive/Armbian_26.8.1_Tinkerboard_trixie_current_6.18.43_minimal.img.xz`,
+sha256 `cd9a7e3fe6b4b7f25612df33f807674819a736370d65ea4465fd92735024ae18` (the `.sha` Armbian
+publishes next to it; `scripts/armbian-tinkerboard-fixture.sh`).
 
 ## The hardware to model
 
@@ -34,9 +38,9 @@ Tinker Board on a mainline kernel (exact release and sha256 recorded when first 
 | Clocks, resets | CRU (rk3066-type PLLs, hiword-masked dividers and gates), GRF/SGRF, PMU syscons | `rk3288-cru`, syscon | `rockchip-rk3288::cru` (PLLs with lock in GRF_SOC_STATUS1) |
 | Console | UART2 at 0xff690000, Synopsys DesignWare APB UART (8250) | `snps,dw-apb-uart` | `allwinner_h3::Uart` (in use) |
 | Timers | arch timer (24 MHz; DT `arm,cpu-registers-not-fw-configured`, so Linux uses the secure physical timer, PPI 13) + Rockchip timers (Linux restarts timer7 itself) | `arm,armv7-timer`, `rockchip,rk3288-timer` | arch timer from the CPU |
-| SD / eMMC / SDIO | Synopsys DesignWare MMC (dw_mshc) with IDMAC | `rockchip,rk3288-dw-mshc` | new; SD card logic from `bcm2711/src/sdhci.rs` |
-| PMIC, RTC | RK808 on I²C0 (regulators, RTC, power key; the system power controller) | `rk808` | new I²C device |
-| I²C, SPI, GPIO, pinctrl | rk3x I²C, Rockchip SPI, 9 GPIO banks, pinctrl via GRF | `rk3x-i2c`, `rockchip-gpio`, `pinctrl-rockchip` | sensors from the Pi 4 (BME280, MCP3008) |
+| SD / eMMC / SDIO | Synopsys DesignWare MMC (dw_mshc) 2.70a with IDMAC; SDMMC 0xff0c0000, SDIO0/1 0xff0d0000/0xff0e0000, eMMC 0xff0f0000 | `rockchip,rk3288-dw-mshc` | `rockchip-rk3288::dwmmc` (M4) with `emu_core::sdcard::SdCard` and a new eMMC device (`emmc.rs`) |
+| PMIC, RTC | RK808 on I²C0 at 0x1b (regulators, RTC, power key; the system power controller) | `rk808` | `rockchip-rk3288::rk808` (M4) |
+| I²C, SPI, GPIO, pinctrl | rk3x I²C, Rockchip SPI, 9 GPIO banks, pinctrl via GRF | `rk3x-i2c`, `rockchip-gpio`, `pinctrl-rockchip` | `rockchip-rk3288::i2c` (six controllers, device trait) and `gpio` (input levels) in M4; sensors from the Pi 4 (BME280, MCP3008) later |
 | Ethernet | GMAC (Synopsys DWMAC) + RTL8211E PHY | `rk3288-gmac` (stmmac) | `sbc-net` NAT, DHCP, port forwarding |
 | USB | 2x DWC2 (host + OTG), EHCI/OHCI on host0; on-board hub for the 4 ports | `dwc2`, `ehci-platform` | Pi 4's DWC2, HID keyboard/tablet, mass storage; a **USB hub model** is new |
 | Display | VOP (big/little) + Synopsys DW HDMI TX, DDC on I²C | `rockchip-drm`, `dw-hdmi-rockchip` | EDID generator, VNC, browser canvas from the Pi 4 |
@@ -97,12 +101,40 @@ stated output on the serial console, and a README table row with its evidence.
     cache, VIPT aliasing instruction cache`, `VFP support v0.3: implementor 41 architecture 3
     part 30 variant d rev 0` (the line RK3288 hardware prints) and the `armv7_cortex_a12`
     PMU driver.
-- **M4: storage and a real image.**
+- **M4: storage and a real image.** Done (2026-11-17).
   - Devices: dw_mmc for SD and eMMC; RK808 on I²C (Linux will not finish probing the SD
     regulators without it; it is also the system power controller for `poweroff`).
   - Boot: firmware-style from the image's `/boot` (`armbianEnv.txt` or `extlinux.conf`, zImage,
     dtb, initrd).
   - Pass: Armbian boots to `login:` from an unmodified SD image.
+  - What it took:
+    1. `arm-a32`: STM with the PC in the register list. Armbian's kernel is built with frame
+       pointers (`UNWINDER_FRAME_POINTER`), so every function starts with `push {fp, ip, lr,
+       pc}`; the zImage decompressor died on its first call.
+    2. `dwmmc.rs`: one model per controller (base, interrupt, `CardKind::Sd` or `Emmc`):
+       commands complete when written; IDMAC 32-bit descriptors (chained and ring) for block
+       data; the FIFO at 0x200 for the transfers Linux does by PIO (< 16 bytes: the SD SCR);
+       card detect in CDETECT; VERID 2.70a, HCON for 32-bit IDMAC. Empty slots (SDIO0's
+       Wi-Fi, an absent eMMC) answer nothing and Linux gives up cleanly.
+    3. `emmc.rs`: an eMMC 5.1 device (CMD1 OCR with access mode, CID/CSD, EXT_CSD by CMD8,
+       SWITCH by CMD6, erase by CMD35/36/38), HS52 only so Linux does no tuning; byte
+       addressing up to 2 GiB with the CSD capacity, sector addressing above. `--emmc IMAGE`.
+    4. `i2c.rs`: the rk3x controller (TX, RX and REGISTER_TX modes, NAK on empty addresses)
+       with an `I2cDevice` trait; `rk808.rs`: regulators that read back what Linux writes
+       (U-Boot-like voltages at power-on), the RTC in the RK808's own calendar (November has
+       31 days; Linux converts), started from the host clock, and the DEV_OFF bit.
+    5. `gpio.rs`: input levels. With the GPIO banks as read-back stubs, the power button
+       (`gpio-keys`, GPIO0_A5, active low) read as pressed and systemd-logind powered the
+       board off right after boot; inputs now read high.
+    6. `boot::boot_from_card`: Armbian's `boot-rockchip.cmd` (armbianEnv.txt; zImage,
+       `dtb/rk3288-tinker-s.dtb` unless `fdtfile` says otherwise, uInitrd; root by UUID,
+       `ubootpart` from the MBR id) on the SD card, else the eMMC. The serial console goes
+       last on the command line so `/dev/console` is ttyS2 (no display yet); overlays from
+       armbianEnv.txt (`i2c1 i2c4 spi2 spidev2 uart1 uart2` in this image) are not applied.
+  - Pass (`scripts/tinkerboard-armbian.txt`): the Armbian banner, `multi-user.target`,
+    `tinkerboard login:`, the first-run wizard (root password; user creation skipped with
+    Ctrl-C, `serial \x03` in scripts), then from the root shell the board model,
+    `mmcblk0p1` as `/`, the `rk808-rtc` clock, four CPUs and both SD regulators.
 - **M5: networking.** GMAC + PHY on `sbc-net`: DHCP, DNS, `apt update`, `--hostfwd` for SSH.
 - **M6: USB and input.** DWC2 ports and a USB hub model; keyboard, tablet and USB stick; the
   ALC4040-style USB audio codec for the jack.
@@ -168,11 +200,31 @@ M8 and M9 are independent of each other and of M5–M7.
   no `/psci`.
 - `cli/src/serial_board.rs` (scripts, pacing, reset) and the pinned-fixture script pattern.
 
-## State (2026-11-15)
+## State (2026-11-17)
 
 `rockchip-rk3288` crate: `Machine` (four cores), `Soc` (with the 96 KiB on-chip SRAM at
-0xff700000), `cru` (CRU with core resets, GRF lock, PMU), `boot`; probe binary `rk3288-boot`;
-`sbc-emu run --board tinkerboard`. The Debian 6.12.107 armmp kernel brings up four cores and
+0xff700000), `cru` (CRU with core resets, GRF lock, PMU), `devices` (routing for `dwmmc`,
+`emmc`, `i2c`, `rk808`, `gpio`), `boot` (direct boot and `boot_from_card`); probe binary
+`rk3288-boot`; `sbc-emu run --board tinkerboard` with `--kernel`/`--dtb`/`--initrd` (direct) or
+`--sd IMAGE` / `--emmc IMAGE` (firmware-style; `--sd-persist` writes through, otherwise the
+card is copy-on-write).
+
+Armbian 26.8.1 (M4): `scripts/tinkerboard-armbian.txt` passes in 22 min 45 s on an M-series
+host (one host thread, interpreter): 51.7 G instructions summed over the cores, 24.3 s
+virtual, of which about a minute of wall time is the first-login wizard waiting for a network
+address that cannot come (no GMAC model). Linux finds the SD card (`mmc0: new high speed SDHC card`,
+`mmcblk0: p1`), the RK808 (regulators, `rk808-rtc` sets the system clock), the empty SDIO0
+(Wi-Fi) and eMMC slots time out cleanly. Gaps seen on the way, none blocking the login:
+Ethernet (`rk_gmac-dwmac`: MDIO bus registration fails on the stub; the first-login wizard
+waits about a minute for a network address), Panfrost (probe times out on the stub GPU), the
+video codec IOMMUs, USB (DWC2 stubs), HDMI/VOP (stubs). Device tree overlays from
+armbianEnv.txt are not applied. `poweroff` halts instead of switching off: 6.18 registers the
+RK808 power-off as a POWER_OFF_PREPARE handler only (`kernel_can_power_off()` is false),
+so the model's DEV_OFF path is unit-tested but not reached by this kernel. The RK3288 machine
+runs `arm-a32` as an interpreter; the A32 JIT the Orange Pi One uses is not wired in yet
+(it needs the machine's run loop, RAM attachment and DMA code invalidation; M9).
+
+M3 state, kept for reference: The Debian 6.12.107 armmp kernel brings up four cores and
 reaches the initramfs shell after about 4.3 G instructions summed over the cores (3.5 s
 virtual, about 100 s on an M-series host; one host thread). Unmodelled pages Linux touches on
 the way: timer 0xff810000, PMU SRAM 0xff720000, DMA 0xff250000/0xffb20000, GPIO banks
@@ -190,7 +242,8 @@ Advanced SIMD (MVFR1, until NEON lands).
 
 Done: the Cortex-A12 identity as an `arm_a32::CpuModel` preset (CTR, CLIDR, CCSIDR, ID
 registers, L2CTLR, PMCR IDCODE, FPSID, MVFR0/1) and the CP15 c15 diagnostic (op2 1) and internal
-feature (op2 2) registers; Thumb-2; per-core state and WFE/SEV for SMP. Still needed: NEON for
+feature (op2 2) registers; Thumb-2; per-core state and WFE/SEV for SMP; STM with the PC in
+the register list (M4, for frame-pointer kernels). Still needed: NEON for
 userland (then MVFR1's Advanced SIMD fields), LPAE for `armmp-lpae` kernels, CP14 debug and PMU
 event counters if a guest needs them (both are hidden in the ID registers today).
 
