@@ -1,6 +1,7 @@
 use crate::cru::{Cru, Grf, Pmu, CRU_SIZE, GRF_SIZE, PMU_SIZE};
 use crate::devices::Peripherals;
 use crate::dsi::{Dsi, DSI_SIZE};
+use crate::rga::{Rga, RGA_SIZE};
 use crate::vop::{Vop, VOP_SIZE};
 use allwinner_h3::{Gic, Uart, NCPU};
 use arm_a32::{Cpu, CORTEX_A12};
@@ -29,6 +30,9 @@ pub const VOP_IRQS: [usize; 2] = [32 + 15, 32 + 16];
 pub const GPU_BASE: u64 = 0xffa3_0000;
 pub const GPU_IRQS: [(midgard::Irq, usize); 3] =
     [(midgard::Irq::Job, 32 + 6), (midgard::Irq::Mmu, 32 + 7), (midgard::Irq::Gpu, 32 + 8)];
+/// RGA 2D accelerator and its interrupt (SPI 18).
+pub const RGA_BASE: u64 = 0xff92_0000;
+pub const RGA_IRQ: usize = 32 + 18;
 /// MIPI DSI host 0 (the panel board's panel).
 pub const DSI0_BASE: u64 = 0xff96_0000;
 pub const GICD_BASE: u64 = 0xffc0_1000;
@@ -67,6 +71,8 @@ pub struct Soc {
     /// VOP-big and VOP-little.
     pub vop: [Vop; 2],
     pub dsi: Dsi,
+    /// RGA 2D accelerator (rotates the vendor application's frames onto the panel).
+    pub rga: Rga,
     /// Mali-T760 GPU (`midgard`).
     pub gpu: midgard::MaliT760,
     /// How the panel is mounted, in degrees counter-clockwise (the panel node's `rotation`):
@@ -100,6 +106,7 @@ impl Soc {
             periph: Peripherals::default(),
             vop: Default::default(),
             dsi: Dsi::default(),
+            rga: Rga::default(),
             gpu: midgard::MaliT760::new(std::env::var("SBC_MALI_LOG").is_ok_and(|v| v != "0")),
             display_rotation: 0,
             display_name: "sbc-emu: RK3288",
@@ -205,6 +212,9 @@ impl Soc {
         if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
             return Ok(self.gpu.read(offset));
         }
+        if let Some(offset) = Self::word_offset(addr, width, RGA_BASE, RGA_SIZE)? {
+            return Ok(self.rga.read(offset));
+        }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
         let interface = Self::in_region(addr, width, GICC_BASE, GICC_SIZE);
         if distributor || interface {
@@ -255,6 +265,10 @@ impl Soc {
         }
         if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
             self.gpu.write(offset, value, &mut self.ram.mem, self.ram.base);
+            return Ok(());
+        }
+        if let Some(offset) = Self::word_offset(addr, width, RGA_BASE, RGA_SIZE)? {
+            self.rga.write(offset, value, &mut self.ram.mem, self.ram.base);
             return Ok(());
         }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
@@ -524,7 +538,8 @@ impl Machine {
             }
         }
         {
-            let Soc { gpu, ram, gic, .. } = &mut self.soc;
+            let Soc { gpu, ram, gic, rga, .. } = &mut self.soc;
+            gic.set_level(RGA_IRQ, rga.irq());
             gpu.update(now, &mut ram.mem, ram.base);
             for (irq, line) in GPU_IRQS {
                 gic.set_level(line, gpu.irq(irq));
