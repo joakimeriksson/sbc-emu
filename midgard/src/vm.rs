@@ -15,11 +15,13 @@ pub struct Vm<'a> {
     /// Direct-mapped translation cache: (virtual page | 1 if writable entry checked, index of the page in `ram`).
     tlb: [(u64, usize); TLB],
     pub fault: Option<Fault>,
+    /// Capture for replay: the content of every page on first touch (before any write).
+    pub capture: Option<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 impl<'a> Vm<'a> {
     pub fn new(ram: &'a mut [u8], base: u64, aspace: AddressSpace) -> Self {
-        Self { ram, base, aspace, tlb: [(u64::MAX, 0); TLB], fault: None }
+        Self { ram, base, aspace, tlb: [(u64::MAX, 0); TLB], fault: None, capture: None }
     }
 
     /// Index into `ram` of the page holding `va`, or None (fault recorded).
@@ -40,6 +42,9 @@ impl<'a> Vm<'a> {
                     return None;
                 }
                 self.tlb[slot] = (key, index);
+                if let Some(c) = &mut self.capture {
+                    c.entry(vpage).or_insert_with(|| self.ram[index..index + PAGE as usize].to_vec());
+                }
                 Some(index)
             }
             Err(f) => {

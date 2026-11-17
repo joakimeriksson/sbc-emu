@@ -15,8 +15,14 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod draw;
+pub mod format;
+pub mod frag;
+pub mod half;
+pub mod isa;
 pub mod job;
 pub mod mmu;
+pub mod tex;
 pub mod vm;
 
 use mmu::AddressSpace;
@@ -400,7 +406,14 @@ impl MaliT760 {
         let (head, config) = (s.head, s.config);
         let aspace = self.aspaces[(config & 0xf) as usize % NUM_AS];
         let mut vm = Vm::new(ram, ram_base, aspace);
+        let capture = std::env::var("SBC_MALI_CAPTURE").ok();
+        if capture.is_some() {
+            vm.capture = Some(Default::default());
+        }
         let result = self.jobs.run_chain(&mut vm, head, self.cycles(), self.trace);
+        if let (Some(dir), Some(pages)) = (capture, vm.capture.take()) {
+            capture_chain(&dir, head, &pages);
+        }
         self.chains += 1;
         let mut code = result.status;
         if let Some(f) = vm.fault {
@@ -476,6 +489,23 @@ impl MaliT760 {
             Irq::Gpu => self.gpu_rawstat & self.gpu_mask != 0,
         }
     }
+}
+
+/// Append a chain and the pages it touched to `dir/chains.bin` (for `mali-replay`):
+/// head (u64), page count (u32), then per page its GPU virtual address (u64) and 4 KiB.
+fn capture_chain(dir: &str, head: u64, pages: &std::collections::BTreeMap<u64, Vec<u8>>) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/chains.bin")) else {
+        return;
+    };
+    let mut out = Vec::with_capacity(12 + pages.len() * 4104);
+    out.extend_from_slice(&head.to_le_bytes());
+    out.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+    for (va, data) in pages {
+        out.extend_from_slice(&va.to_le_bytes());
+        out.extend_from_slice(data);
+    }
+    let _ = f.write_all(&out);
 }
 
 impl Default for MaliT760 {

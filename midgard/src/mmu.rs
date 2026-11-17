@@ -6,7 +6,7 @@
 //! at levels 0-2, 1 is a block (levels 1-2: 1 GiB, 2 MiB) or a page (level 3); 0 and 2 are
 //! invalid. The output address is bits [39:12]. `AS_TRANSTAB` holds the level-0 table's
 //! physical address with the address mode in its low two bits (3: tables; 0/1: unmapped,
-//! 2: identity).
+//! 2: identity). Permissions are stage-2 style: bit 6 allows reads, bit 7 writes.
 
 /// Physical address bits (MMU_FEATURES: 40-bit PA, 48-bit VA).
 const PA_MASK: u64 = (1 << 40) - 1;
@@ -55,7 +55,8 @@ impl AddressSpace {
             match pte & 3 {
                 3 if level < 3 => table = pte & PA_MASK & !0xfff,
                 1 if level > 0 => {
-                    if write && pte & (1 << 7) != 0 {
+                    // Stage-2-style permissions: bit 6 readable, bit 7 writable.
+                    if (write && pte & (1 << 7) == 0) || (!write && pte & (1 << 6) == 0) {
                         return Err(Fault { va, status: PERMISSION_FAULT | level | access });
                     }
                     let mask = (1u64 << shift) - 1;
@@ -88,8 +89,8 @@ mod tests {
         put(&mut ram, 0x1000, 0x2000 | 3);
         put(&mut ram, 0x2000, 0x3000 | 3);
         put(&mut ram, 0x3000 + 8, 0x4000 | 3); // VA 2 MiB..4 MiB
-        put(&mut ram, 0x4000 + 5 * 8, 0x8000 | 1 | 1 << 7); // VA 0x205000, read-only
-        put(&mut ram, 0x3000 + 2 * 8, 0x4000_0000 | 1); // 2 MiB block at VA 4 MiB
+        put(&mut ram, 0x4000 + 5 * 8, 0x8000 | 1 | 1 << 6); // VA 0x205000, read-only
+        put(&mut ram, 0x3000 + 2 * 8, 0x4000_0000 | 1 | 3 << 6); // 2 MiB block at VA 4 MiB
         let a = AddressSpace { active_transtab: 0x1000 | 4 | 3, ..Default::default() };
         assert_eq!(a.translate(&ram, 0, 0x205123, false), Ok(0x8123));
         assert_eq!(a.translate(&ram, 0, 0x412345, true), Ok(0x4001_2345));

@@ -15,8 +15,11 @@
 //! Jobs in a chain are listed in an order that satisfies their dependencies (Mesa's
 //! `pan_jc` appends them in submission order), so the model runs them in list order.
 
+use crate::draw::{self, Prim};
+use crate::frag;
 use crate::status;
 use crate::vm::Vm;
+use std::collections::HashMap;
 
 pub const JOB_NULL: u32 = 1;
 pub const JOB_WRITE_VALUE: u32 = 2;
@@ -42,6 +45,9 @@ pub struct ChainResult {
 pub struct JobState {
     /// Jobs run, by type (index = job type).
     pub counts: [u64; 16],
+    /// Polygon lists by framebuffer descriptor: tiler jobs append, the fragment job of
+    /// the same framebuffer consumes.
+    pub lists: HashMap<u64, Vec<Prim>>,
 }
 
 impl JobState {
@@ -72,8 +78,20 @@ impl JobState {
                     }
                     status::DONE
                 }
-                JOB_COMPUTE | JOB_VERTEX | JOB_TILER | JOB_FRAGMENT => {
-                    cycles += 100;
+                JOB_COMPUTE | JOB_VERTEX => {
+                    cycles += draw::vertex_job(vm, va);
+                    status::DONE
+                }
+                JOB_TILER => {
+                    let fbd = vm.r64(va + 64 + 28 * 4) & !63;
+                    let list = self.lists.entry(fbd).or_default();
+                    cycles += draw::tiler_job(vm, va, list);
+                    status::DONE
+                }
+                JOB_FRAGMENT => {
+                    let fbd = vm.r64(va + 32 + 8) & !63;
+                    let list = self.lists.remove(&fbd).unwrap_or_default();
+                    cycles += frag::fragment_job(vm, va, &list, trace);
                     status::DONE
                 }
                 _ => status::JOB_CONFIG_FAULT,
