@@ -68,10 +68,12 @@ pub(crate) struct Profile<'a> {
     /// The error for a missing `--kernel` and `--dtb`.
     pub kernel_hint: &'static str,
     pub dtb_hint: &'static str,
+    /// Kernel command line without `--append`.
+    pub cmdline: &'a str,
     /// Firmware-style boot from `--sd`/`--emmc` without `--kernel` (Armbian's /boot layout).
     pub card_boot: bool,
-    /// The RK808 PMIC/RTC on I2C0 (the Tinker Board's).
-    pub rk808: bool,
+    /// The power chips (PMIC, regulators, RTC) on I2C0; the RTC starts at the given Unix time.
+    pub power: fn(&mut devices::Peripherals, i64),
     /// Startup banner.
     pub banner: &'static str,
     /// Board-specific machine setup, before the kernel is loaded.
@@ -86,8 +88,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             default_ram_mb: rockchip_rk3288::RAM_SIZE >> 20,
             kernel_hint: "--kernel zImage is required (or --sd IMAGE to boot from the card)",
             dtb_hint: "--dtb rk3288-tinker-s.dtb is required",
+            cmdline: boot::DEFAULT_CMDLINE,
             card_boot: true,
-            rk808: true,
+            power: devices::Peripherals::attach_rk808,
             banner: "experimental Rockchip RK3288: four Cortex-A12 (interpreter), GIC-400, UART2, CRU/GRF/PMU, \
                      boot ROM SMP mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC; other devices are stubs",
             setup: &|_| {},
@@ -130,7 +133,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         )
     };
     let initrd = arg(args, "--initrd").map(read).transpose()?;
-    let cmdline = arg(args, "--append").unwrap_or(boot::DEFAULT_CMDLINE);
+    let cmdline = arg(args, "--append").unwrap_or(profile.cmdline);
     let ram = serial_board::ram_bytes(args, profile.default_ram_mb)?;
     if ram == 0 || ram > 0xfe00_0000 {
         return Err("--ram-mb must be between 1 and 4064 (DRAM ends below the RK3288 device window)".into());
@@ -144,16 +147,14 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
             .transpose()
     };
     let (sd, emmc) = (open("--sd")?, open("--emmc")?);
-    // The RK808's RTC starts at the host's time, as a board whose coin cell kept it.
+    // The RTC starts at the host's time, as on a board whose coin cell kept it.
     let unix_now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::with_ram_size(ram);
         (profile.setup)(&mut m);
-        if profile.rk808 {
-            m.soc.periph.attach_rk808(unix_now);
-        }
+        (profile.power)(&mut m.soc.periph, unix_now);
         let disk = |d: &Option<crate::disk::SharedDisk>| d.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         m.soc.periph.mmc[devices::SDMMC].insert(disk(&sd));
         m.soc.periph.mmc[devices::EMMC].insert(disk(&emmc));

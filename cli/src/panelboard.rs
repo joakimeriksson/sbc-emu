@@ -8,6 +8,7 @@
 //! panel behind VOP-little, mounted rotated (the panel node's `rotation`), which
 //! screenshots and VNC show the way the user sees it.
 use crate::{arg, tinkerboard::{self, Profile}};
+use rockchip_rk3288::{boot, devices::Peripherals};
 use emu_core::fdt::Node;
 use std::process::ExitCode;
 
@@ -38,6 +39,11 @@ fn mounting_rotation(dtb: &[u8]) -> Result<u32, String> {
     })
 }
 
+/// The command line for the vendor's userland on the eMMC image `scripts/panel-board-fixture.sh`
+/// builds (its root partition's PARTUUID; the vendor's U-Boot environment is not public).
+const EMMC_CMDLINE: &str =
+    "earlycon=uart8250,mmio32,0xff690000 console=ttyS2,115200 root=PARTUUID=4d504331-0000-4000-8000-000000000001 rootwait ro";
+
 pub(crate) fn run(args: &[String]) -> ExitCode {
     // The DTB is read again by the shared loader; it is small.
     let rotation = match arg(args, "--dtb").map(|path| std::fs::read(path).map_err(|e| format!("{path}: {e}"))) {
@@ -59,10 +65,17 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             default_ram_mb: 2048,
             kernel_hint: "--kernel zImage is required (the firmware's /boot/zImage)",
             dtb_hint: "--dtb rk3288-panel.dtb is required (the firmware's /boot)",
+            // With an eMMC and no initramfs, the vendor's own userland from the eMMC.
+            cmdline: if arg(args, "--emmc").is_some() && arg(args, "--initrd").is_none() {
+                EMMC_CMDLINE
+            } else {
+                boot::DEFAULT_CMDLINE
+            },
             card_boot: false,
-            rk808: false,
+            power: Peripherals::attach_panel_board_power,
             banner: "experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12 (interpreter), GIC-400, UART2, \
-                     CRU/GRF/PMU, VOP + MIPI DSI panel; the power chips, audio, touch, pads and the GPU are not modelled yet",
+                     CRU/GRF/PMU, VOP + MIPI DSI panel, SD/eMMC, I2C with the ACT8846 PMIC, SYR827/828 and HYM8563; \
+                     audio, touch, pads and the GPU are not modelled yet",
             setup: &|m| {
                 m.soc.display_rotation = rotation;
                 m.soc.display_name = "sbc-emu: RK3288 panel board";

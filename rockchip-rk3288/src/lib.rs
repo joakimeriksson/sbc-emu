@@ -10,6 +10,7 @@
 //! The GIC-400 and the DesignWare APB UART are the Allwinner H3 crate's models (same IP);
 //! they move to a shared crate once both boards are merged.
 
+pub mod act8846;
 pub mod boot;
 pub mod cru;
 pub mod devices;
@@ -17,9 +18,11 @@ pub mod dsi;
 pub mod dwmmc;
 pub mod emmc;
 pub mod gpio;
+pub mod hym8563;
 pub mod i2c;
 mod machine;
 pub mod rk808;
+pub mod syr82x;
 pub mod vop;
 
 pub use allwinner_h3::{Gic, Uart, NCPU, SPURIOUS};
