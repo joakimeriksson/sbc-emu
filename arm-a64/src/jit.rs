@@ -507,7 +507,7 @@ unsafe extern "C" fn h_step(cpu: *mut Cpu, expect_next: u64) -> u32 {
     }
 }
 
-struct Ctx { off_utlb_unpriv: usize, off_tpidr: usize, off_chain_until: usize, off_chain_stop: usize, off_disp: usize, off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_v: usize, off_fpsr: usize }
+struct Ctx { off_utlb_unpriv: usize, off_tpidr: usize, off_chain_until: usize, off_chain_stop: usize, off_disp: usize, off_x: usize, off_sp: usize, off_pc: usize, off_nzcv: usize, off_instret: usize, off_utlb: usize, off_ram: usize, off_excl: usize, off_excl_addr: usize, off_excl_val: usize, off_v: usize, off_fpsr: usize }
 
 /// A Cpu field offset an `ldr x, [x19, #off]` can reach (scaled 12-bit immediate).
 fn c_off_ok(off: usize) -> Option<usize> { (off % 8 == 0 && off < 32768).then_some(off) }
@@ -529,6 +529,8 @@ fn ctx() -> Ctx {
         off_utlb: std::mem::offset_of!(Cpu, utlb),
         off_ram: std::mem::offset_of!(Cpu, ram),
         off_excl: std::mem::offset_of!(Cpu, excl_armed),
+        off_excl_addr: std::mem::offset_of!(Cpu, excl_addr),
+        off_excl_val: std::mem::offset_of!(Cpu, excl_val),
         off_v: std::mem::offset_of!(Cpu, v),
         off_fpsr: std::mem::offset_of!(Cpu, fpsr),
     }
@@ -722,7 +724,7 @@ impl Cpu {
             verify = false;
             if let Some(j) = self.jit.as_mut() { j.stale_skips += 1; }
         }
-        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl, (self.el, self.spsel, self.daif), (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed)));
+        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl(), (self.el, self.spsel, self.daif), (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed)));
         if verify { self.store_log = Some(Vec::new()); }
         // SAFETY: the bus outlives the call; generated code only reaches it through h_step
         self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
@@ -744,7 +746,7 @@ impl Cpu {
             }).collect();
             for (off, old) in log.iter().rev() { unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), self.ram.add(*off), old.len()) }; }
             // re-run the same instructions in the interpreter from the same registers
-            let after = (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl, (self.el, self.spsel, self.daif));
+            let after = (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl(), (self.el, self.spsel, self.daif));
             // the timers are restored too (MSR to them may end the block); compared via the registers
             (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed) = b.8;
             let n = after.4 - b.4;
@@ -929,6 +931,8 @@ impl Cpu {
                 e.pending_native += 1;
             } else if ld1_as_ldr(i).is_some_and(|w| self.emit_ldst(&mut e, w, pc)) {
                 // LD1/ST1 of one register: the same access as LDR/STR of a Q or D register
+            } else if self.emit_excl(&mut e, i, pc) {
+                // exclusive and acquire/release accesses, CLREX
             } else if self.emit_ldst(&mut e, i, pc) {
                 // native load/store with an interpreter slow path
             } else {
@@ -1133,7 +1137,7 @@ impl Cpu {
         if !load && self.jit.as_ref().is_some_and(|j| j.verify) { return false; } // verify mode logs stores in the interpreter
         let span = if pair { 2 * size } else { size };
         let c = e.c;
-        let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
+        let (vreg, tmp) = (13u32, 14u32);
         // ---- VA in x13 (post-index: the access uses the base; x16 keeps the written-back value)
         e.count_pending();
         if rn == 31 { e.out.push(ldr_x(vreg, X_CPU, e.sp_slot)); } else { e.out.push(ldr_x(vreg, X_CPU, e.reg_off(rn))); }
@@ -1154,35 +1158,9 @@ impl Cpu {
                 e.out.push(0x8b20_0000 | (tmp << 16) | (option << 13) | (shift << 10) | (vreg << 5) | vreg); // add x13, x13, x14, <ext> #sh
             }
         }
-        // ---- micro-TLB check (no flags touched): tag = (va >> 12) + 1 | el << 60
-        let k = if load { 1 } else { 2 };
+        // ---- micro-TLB check: x14 = host address
         let mut slow: Vec<usize> = Vec::new();
-        // x17 = &utlb[k][(va >> 12) % UT] (x17 is free here: only used for large offsets above)
-        let ent = c.off_utlb + 16 * UT * k;
-        assert!(ent + 16 * UT < 32768);
-        e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
-        e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
-        e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
-        e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
-        if unpriv {
-            // the EL0 entry, poisoned (bit 59) while they belong to another ASID
-            e.out.push(ldr_x(tmp2, X_CPU, c.off_utlb_unpriv));
-            e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp);
-        } else if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
-        e.out.push(ldr_x(tmp2, 17, ent));
-        e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
-        slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow
-        e.out.push(0x9240_2c00 | (vreg << 5) | tmp2); // and x15, x13, #0xfff
-        e.out.push(0x9100_0000 | ((span - 1) << 10) | (tmp2 << 5) | tmp); // add x14, x15, #span-1
-        slow.push(e.out.len()); e.out.push(0x3760_0000 | tmp); // tbnz w14, #12, slow
-        if !load {
-            e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
-            slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow (reservation held)
-        }
-        e.out.push(ldr_x(tmp, 17, ent + 8)); // physical page
-        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // add x14, x14, x15
-        e.out.push(ldr_x(tmp2, X_CPU, c.off_ram));
-        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // x14 = host address
+        self.emit_utlb(e, if load { 1 } else { 2 }, span, unpriv, !load, &mut slow);
         // ---- the access itself, as the host instruction of the same size and extension
         let sz = size.trailing_zeros();
         let one = |rt: u32, off: u32| -> u32 {
@@ -1246,33 +1224,172 @@ impl Cpu {
 }
 
 impl Cpu {
+    /// The micro-TLB lookup of generated loads and stores (no flags touched). With the VA in
+    /// x13, leaves x14 = host address and x15 = the page offset, or branches to a slow path
+    /// (pushed to `slow`, patched by the caller) on a miss. `k`: 1 = load, 2 = store entries;
+    /// `span` > 0: bytes accessed (the slow path takes page-crossing accesses); `excl_check`:
+    /// a held reservation takes the slow path (the interpreter's store clears it). Uses x17.
+    fn emit_utlb(&self, e: &mut Emit, k: usize, span: u32, unpriv: bool, excl_check: bool, slow: &mut Vec<usize>) {
+        let c = e.c;
+        let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
+        // tag = (va >> 12) + 1 | el << 60; x17 = &utlb[k][(va >> 12) % UT]
+        let ent = c.off_utlb + 16 * UT * k;
+        assert!(ent + 16 * UT < 32768);
+        e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
+        e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
+        e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
+        e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
+        if unpriv {
+            // the EL0 entry, poisoned (bit 59) while they belong to another ASID
+            e.out.push(ldr_x(tmp2, X_CPU, c.off_utlb_unpriv));
+            e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp);
+        } else if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
+        e.out.push(ldr_x(tmp2, 17, ent));
+        e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
+        slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow
+        e.out.push(0x9240_2c00 | (vreg << 5) | tmp2); // and x15, x13, #0xfff
+        if span > 0 {
+            e.out.push(0x9100_0000 | ((span - 1) << 10) | (tmp2 << 5) | tmp); // add x14, x15, #span-1
+            slow.push(e.out.len()); e.out.push(0x3760_0000 | tmp); // tbnz w14, #12, slow
+        }
+        if excl_check {
+            e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
+            slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow (reservation held)
+        }
+        e.out.push(ldr_x(tmp, 17, ent + 8)); // physical page
+        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // add x14, x14, x15
+        e.out.push(ldr_x(tmp2, X_CPU, c.off_ram));
+        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // x14 = host address
+    }
+
+    /// LDXR/LDAXR, STXR/STLXR (8- to 64-bit), LDAR/STLR and CLREX natively: the reservation
+    /// lives in `excl_addr`/`excl_armed`/`excl_val` as the interpreter keeps it. With cores
+    /// running in parallel (`mt`) LDAR/STLR are the host's own and store-exclusive is a host
+    /// compare-and-swap loop (LDAXR/STLXR, so ARMv8.0 hosts work) against what LDXR read.
+    /// Misses, page crossings and pairs go to the interpreter.
+    fn emit_excl(&self, e: &mut Emit, i: u32, pc: u64) -> bool {
+        if self.ram.is_null() { return false; }
+        let c = e.c;
+        if [c.off_excl, c.off_excl_addr, c.off_excl_val].iter().any(|&o| c_off_ok(o).is_none()) { return false; }
+        if i & 0xffff_f0ff == 0xd503_305f {
+            // CLREX
+            e.out.push(str_x(31, X_CPU, c.off_excl));
+            e.pending_native += 1;
+            return true;
+        }
+        // load/store exclusive and ordered: size 001000 o2 L o1 Rs o0 Rt2 Rn Rt
+        if bits(i, 29, 24) != 0b001000 || bit(i, 21) || bits(i, 14, 10) != 31 { return false; }
+        let (sz, o2, load, rs, o0, rn, rt) = (bits(i, 31, 30), bit(i, 23), bit(i, 22), bits(i, 20, 16), bit(i, 15), (i >> 5) & 31, i & 31);
+        let size = 1u32 << sz;
+        let verify = self.jit.as_ref().is_some_and(|j| j.verify);
+        if o2 && (!o0 || rs != 31) { return false; } // LDLAR/STLLR (LORegions): the interpreter
+        if !o2 && load && rs != 31 { return false; }
+        if !load && verify { return false; } // verify mode logs stores in the interpreter
+        let (vreg, tmp) = (13u32, 14u32);
+        e.count_pending();
+        e.out.push(if rn == 31 { ldr_x(vreg, X_CPU, e.sp_slot) } else { ldr_x(vreg, X_CPU, e.reg_off(rn)) });
+        let mut slow: Vec<usize> = Vec::new();
+        let mut fail: Vec<usize> = Vec::new(); // store-exclusive without the reservation
+        let ldr = |rt: u32| 0x3940_0000 | (sz << 30) | (tmp << 5) | rt; // ldr{b,h,,} Rt, [x14]
+        let str_ = |rt: u32| 0x3900_0000 | (sz << 30) | (tmp << 5) | rt; // str{b,h,,} Rt, [x14]
+        let ldar = |rt: u32| 0x08df_fc00 | (sz << 30) | (tmp << 5) | rt;
+        let stlr = |rt: u32| 0x089f_fc00 | (sz << 30) | (tmp << 5) | rt;
+        if !load && !o2 {
+            // the reservation must cover this 64-byte granule
+            e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
+            fail.push(e.out.len()); e.out.push(0xb400_0000 | tmp); // cbz x14, fail
+            e.out.push(ldr_x(tmp, X_CPU, c.off_excl_addr));
+            e.out.push(0xca00_0000 | (vreg << 16) | (tmp << 5) | tmp); // eor x14, x14, x13
+            e.out.push(0xd346_fc00 | (tmp << 5) | tmp); // lsr x14, x14, #6
+            fail.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, fail
+        }
+        self.emit_utlb(e, if load { 1 } else { 2 }, size, false, !load && o2, &mut slow);
+        if self.mt && !load && !o2 && sz > 0 {
+            // the host's exclusives need natural alignment (the interpreter stores plainly)
+            e.out.push(0x9240_0000 | ((sz - 1) << 10) | (vreg << 5) | 16); // and x16, x13, #(size-1)
+            slow.push(e.out.len()); e.out.push(0xb500_0000 | 16); // cbnz x16, slow
+        }
+        let acquire = self.mt && (o2 || bit(i, 15));
+        if load {
+            e.out.push(if o2 || acquire { ldar(9) } else { ldr(9) });
+            if rt != 31 { e.out.push(str_x(9, X_CPU, e.reg_off(rt))); }
+            if !o2 {
+                e.out.push(str_x(vreg, X_CPU, c.off_excl_addr));
+                e.out.push(0xd280_0020 | tmp); // movz x14, #1
+                e.out.push(str_x(tmp, X_CPU, c.off_excl));
+                e.out.push(str_x(9, X_CPU, c.off_excl_val));
+                e.out.push(str_x(31, X_CPU, c.off_excl_val + 8));
+            }
+        } else {
+            e.out.push(if rt == 31 { 0xaa1f_03e0 | 9 } else { ldr_x(9, X_CPU, e.reg_off(rt)) });
+            if o2 {
+                e.out.push(if self.mt { stlr(9) } else { str_(9) });
+            } else if self.mt {
+                // retry: ldaxr x11, [x14]; eor x12, x11, x10; cbnz x12, lost; stlxr w12, x9, [x14]; cbnz w12, retry
+                e.out.push(ldr_x(10, X_CPU, c.off_excl_val));
+                let retry = e.out.len();
+                e.out.push(0x085f_fc00 | (sz << 30) | (tmp << 5) | 11);
+                e.out.push(0xca00_0000 | (10 << 16) | (11 << 5) | 12);
+                let lost = e.out.len(); e.out.push(0xb500_0000 | 12);
+                e.out.push(0x0800_fc00 | (sz << 30) | (12 << 16) | (tmp << 5) | 9);
+                e.out.push(0x3500_0000 | ((((retry as i64 - e.out.len() as i64) as u32) & 0x7ffff) << 5) | 12);
+                e.out.push(0x1400_0003); // b +3 (stored)
+                let at = e.out.len();
+                e.out[lost] |= (((at - lost) as u32) & 0x7ffff) << 5;
+                e.out.push(0xd503_3f5f); // clrex
+                fail.push(e.out.len()); e.out.push(0x1400_0000); // b fail (memory changed)
+            } else {
+                e.out.push(str_(9));
+            }
+            if !o2 {
+                // stored: the reservation is used up, status 0
+                e.out.push(str_x(31, X_CPU, c.off_excl));
+                if rs != 31 { e.out.push(str_x(31, X_CPU, e.reg_off(rs))); }
+            }
+        }
+        e.out.push(0x9100_0400 | (X_COUNT << 5) | X_COUNT); // add x20, x20, #1
+        let mut done_at = vec![e.out.len()];
+        e.out.push(0x1400_0000); // b done (patched)
+        if !fail.is_empty() {
+            // store-exclusive failed: drop the reservation, status 1, nothing stored
+            let at = e.out.len();
+            for b in fail.drain(..) {
+                let off = (at - b) as u32;
+                e.out[b] |= if e.out[b] & 0x7c00_0000 == 0x1400_0000 { off & 0x3ff_ffff } else { (off & 0x7ffff) << 5 };
+            }
+            e.out.push(str_x(31, X_CPU, c.off_excl));
+            if rs != 31 { e.out.push(0xd280_0020 | 9); e.out.push(str_x(9, X_CPU, e.reg_off(rs))); }
+            e.out.push(0x9100_0400 | (X_COUNT << 5) | X_COUNT); // add x20, x20, #1
+            done_at.push(e.out.len());
+            e.out.push(0x1400_0000); // b done (patched)
+        }
+        // ---- slow path: the interpreter
+        let slow_at = e.out.len();
+        for b in slow {
+            let off = (slow_at - b) as u32;
+            let w = e.out[b];
+            e.out[b] = if w & 0x7e00_0000 == 0x3600_0000 { w | ((off & 0x3fff) << 5) } else { w | ((off & 0x7ffff) << 5) };
+        }
+        let ended = emit_interp(e, i, pc);
+        debug_assert!(!ended);
+        let done = e.out.len();
+        for b in done_at { e.out[b] |= ((done - b) as u32) & 0x3ff_ffff; }
+        true
+    }
+}
+
+impl Cpu {
     /// DC ZVA, Xt: zero the 64-byte block holding Xt (DCZID_EL0 = 4), with the micro-TLB
     /// fast path of a store and the interpreter as the slow path.
     fn emit_dc_zva(&self, e: &mut Emit, i: u32, pc: u64) -> bool {
         if self.jit.as_ref().is_some_and(|j| j.verify) { return false; } // verify mode logs stores in the interpreter
         let rt = i & 31;
-        let c = e.c;
-        let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
+        let (vreg, tmp) = (13u32, 14u32);
         e.count_pending();
         if rt == 31 { e.out.push(0xaa1f_03e0 | vreg); } else { e.out.push(ldr_x(vreg, X_CPU, e.reg_off(rt))); }
         e.out.push(0x9240_0000 | (58 << 16) | (57 << 10) | (vreg << 5) | vreg); // and x13, x13, #~63
         let mut slow: Vec<usize> = Vec::new();
-        let ent = c.off_utlb + 16 * UT * 2;
-        e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
-        e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
-        e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
-        e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
-        if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
-        e.out.push(ldr_x(tmp2, 17, ent));
-        e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
-        slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow
-        e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
-        slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow (reservation held)
-        e.out.push(0x9240_2c00 | (vreg << 5) | tmp2); // and x15, x13, #0xfff
-        e.out.push(ldr_x(tmp, 17, ent + 8)); // physical page
-        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // add x14, x14, x15
-        e.out.push(ldr_x(tmp2, X_CPU, c.off_ram));
-        e.out.push(0x8b00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // x14 = host address
+        self.emit_utlb(e, 2, 0, false, true, &mut slow);
         for k in 0..4u32 { e.out.push(0xa900_0000 | ((2 * k) << 15) | (31 << 10) | (tmp << 5) | 31); } // stp xzr, xzr, [x14, #16k]
         e.out.push(0x9100_0400 | (X_COUNT << 5) | X_COUNT); // add x20, x20, #1
         let skip_at = e.out.len();

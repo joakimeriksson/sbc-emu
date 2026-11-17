@@ -281,7 +281,7 @@ impl Cpu {
                 }
                 self.utlb[2][ti] = (tag, pa & !0xfff);
             }
-            if let Some(m) = self.excl {
+            if let Some(m) = self.excl() {
                 if m & !63 == va & !63 {
                     self.set_excl(None);
                 }
@@ -324,7 +324,7 @@ impl Cpu {
             Access::Write
         };
         let crosses = (va & 0xfff) + size as u64 > 0x1000;
-        if let Some(m) = self.excl {
+        if let Some(m) = self.excl() {
             if m & !63 == va & !63 {
                 self.set_excl(None);
             }
@@ -1195,7 +1195,7 @@ impl Cpu {
                 if self.mt { std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst); }
                 self.set_x(rt, v as u64);
             } else {
-                let held = self.excl.is_some_and(|m| m & !63 == addr & !63);
+                let held = self.excl().is_some_and(|m| m & !63 == addr & !63);
                 let v = self.xr(rt) as u128;
                 let ok = if !held { false } else if self.mt { self.store_cas(bus, addr, size, self.excl_val, v)? } else { self.store(bus, addr, size, v, false)?; true };
                 self.set_excl(None);
@@ -1215,7 +1215,7 @@ impl Cpu {
                 self.set_x(rt, a as u64);
                 self.set_x(rt2, b as u64);
             } else {
-                let held = self.excl.is_some_and(|m| m & !63 == addr & !63);
+                let held = self.excl().is_some_and(|m| m & !63 == addr & !63);
                 let (a, b) = (self.xr(rt) as u128, self.xr(rt2) as u128);
                 let v = a | (b << (8 * size));
                 let ok = if !held { false } else if self.mt { self.store_cas(bus, addr, 2 * size, self.excl_val, v)? } else { self.store(bus, addr, 2 * size, v, false)?; true };
