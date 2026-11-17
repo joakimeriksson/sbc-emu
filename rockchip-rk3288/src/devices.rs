@@ -5,7 +5,10 @@
 use crate::dwmmc::{CardKind, DwMmc};
 use crate::gpio::{self, GpioBank};
 use crate::i2c::Rk3xI2c;
+use crate::act8846::{self, Act8846};
+use crate::hym8563::{self, Hym8563};
 use crate::rk808::{self, Rk808};
+use crate::syr82x::{self, Syr82x};
 use emu_core::{Fault, FlatRam};
 
 /// SD card slot (`sdmmc`, SPI 32).
@@ -63,9 +66,21 @@ impl Peripherals {
         self.i2c[0].2.attach(rk808::ADDRESS, Box::new(Rk808::new(unix_seconds)));
     }
 
+    /// The RK3288 panel board's power chips on I²C0: the ACT8846 PMIC, the SYR827 (vdd_cpu) and
+    /// SYR828 (vdd_gpu) regulators and the HYM8563 RTC, which starts at `unix_seconds`.
+    pub fn attach_panel_board_power(&mut self, unix_seconds: i64) {
+        let bus = &mut self.i2c[0].2;
+        bus.attach(act8846::ADDRESS, Box::new(Act8846::default()));
+        bus.attach(syr82x::CPU_ADDRESS, Box::new(Syr82x::default()));
+        bus.attach(syr82x::GPU_ADDRESS, Box::new(Syr82x::default()));
+        bus.attach(hym8563::ADDRESS, Box::new(Hym8563::new(unix_seconds)));
+    }
+
     /// The PMIC was told to switch the board off.
     pub fn power_off_requested(&mut self) -> bool {
-        self.i2c[0].2.device_mut::<Rk808>(rk808::ADDRESS).is_some_and(|pmic| pmic.power_off)
+        let bus = &mut self.i2c[0].2;
+        bus.device_mut::<Rk808>(rk808::ADDRESS).is_some_and(|pmic| pmic.power_off)
+            || bus.device_mut::<Act8846>(act8846::ADDRESS).is_some_and(|pmic| pmic.power_off)
     }
 
     /// Interrupt lines (GIC number, level).

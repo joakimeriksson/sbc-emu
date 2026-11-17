@@ -163,11 +163,11 @@ impl I2cDevice for Rk808 {
     }
 }
 
-fn bcd(value: u8) -> u8 {
+pub(crate) fn bcd(value: u8) -> u8 {
     value / 10 << 4 | value % 10
 }
 
-fn unbcd(value: u8) -> u8 {
+pub(crate) fn unbcd(value: u8) -> u8 {
     (value >> 4) * 10 + (value & 0xf)
 }
 
@@ -187,7 +187,7 @@ fn month_days(year: i64, month: i64, november: i64) -> i64 {
 }
 
 /// Seconds since 2000-01-01 of a date in a calendar whose November has `november` days.
-fn seconds_of(year: i64, month: i64, day: i64, hms: i64, november: i64) -> i64 {
+pub(crate) fn seconds_of(year: i64, month: i64, day: i64, hms: i64, november: i64) -> i64 {
     let mut days = 0;
     if year >= 2000 {
         for y in 2000..year {
@@ -203,7 +203,7 @@ fn seconds_of(year: i64, month: i64, day: i64, hms: i64, november: i64) -> i64 {
 }
 
 /// (year, month, day, seconds of day) of `seconds` since 2000-01-01.
-fn date_of(seconds: i64, november: i64) -> (i64, i64, i64, i64) {
+pub(crate) fn date_of(seconds: i64, november: i64) -> (i64, i64, i64, i64) {
     let mut days = seconds.div_euclid(86400);
     let hms = seconds.rem_euclid(86400);
     let mut year = 2000;

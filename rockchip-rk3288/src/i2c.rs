@@ -30,6 +30,39 @@ pub trait I2cDevice {
     }
 }
 
+/// The register protocol most I²C chips share: the first byte of a write transaction
+/// selects the register, later bytes write it and move on to the next, and reads continue
+/// from the selected register.
+#[derive(Default)]
+pub struct RegisterPointer {
+    pub pointer: u8,
+    expect_pointer: bool,
+}
+
+impl RegisterPointer {
+    pub fn start(&mut self, read: bool) {
+        self.expect_pointer = !read;
+    }
+
+    /// A byte written by the host: the register it writes, or None when it selected one.
+    pub fn written(&mut self, byte: u8) -> Option<u8> {
+        if self.expect_pointer {
+            self.pointer = byte;
+            self.expect_pointer = false;
+            None
+        } else {
+            Some(self.next())
+        }
+    }
+
+    /// The register the next byte comes from or goes to.
+    pub fn next(&mut self) -> u8 {
+        let reg = self.pointer;
+        self.pointer = reg.wrapping_add(1);
+        reg
+    }
+}
+
 pub const SIZE: u64 = 0x1000;
 
 const CON: usize = 0x00;
