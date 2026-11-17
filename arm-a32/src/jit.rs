@@ -358,6 +358,22 @@ impl Cpu {
         self.jit.is_some()
     }
 
+    /// Whether the JIT is on.
+    pub fn jit_enabled(&self) -> bool {
+        self.jit.is_some()
+    }
+
+    /// Instruction-cache maintenance by the kernel: drop the code compiled from physical page
+    /// `page` (a page number), or all code (`None`).
+    pub fn code_changed(&mut self, page: Option<u64>) {
+        let Some(j) = self.jit.as_mut() else { return };
+        match page {
+            Some(p) if p < 1 << 20 => j.watch.invalidate((p << 12) as u32),
+            Some(_) => {}
+            None => j.flush(),
+        }
+    }
+
     /// Back to the interpreter alone (compiled code is dropped).
     pub fn disable_jit(&mut self) {
         self.jit = None;
@@ -461,6 +477,11 @@ impl Cpu {
                 entry: f as usize,
             };
             jit.compiled += 1;
+            if let Some(h) = self.el1 {
+                // SAFETY: set by step_el0 for the duration of the step
+                unsafe { (*h).compiled(pa) };
+            }
+            let jit = self.jit.as_mut()?;
             if !jit.watch.is_code(pa) {
                 jit.watch.mark(pa);
                 // this core's own stores to the page must take the slow path at once (the
@@ -507,6 +528,8 @@ impl Cpu {
     ) -> Option<BlockFn> {
         let c = ctx();
         let mut e = Emit::new(&c);
+        e.el0 = self.el1.is_some();
+        e.mt = self.mt;
         e.chain = self.jit.as_ref().is_some_and(|j| j.disp != 0);
         e.prologue(privileged);
         assert_eq!(e.out.len(), PROLOGUE_WORDS + 3);
@@ -856,6 +879,11 @@ struct Emit<'a> {
     size: u32,
     /// Thumb ITSTATE of the instruction being emitted (0: not in an IT block)
     it: u32,
+    /// user code under an AArch64 kernel (`step_el0`): CP15 goes through the interpreter,
+    /// which asks the kernel's core
+    el0: bool,
+    /// other cores run in parallel: barriers are host barriers
+    mt: bool,
 }
 
 impl<'a> Emit<'a> {
@@ -871,6 +899,8 @@ impl<'a> Emit<'a> {
             thumb: false,
             size: 4,
             it: 0,
+            el0: false,
+            mt: false,
         };
         e.exit_h = e.label();
         e
@@ -1181,6 +1211,9 @@ impl<'a> Emit<'a> {
             || matches!(insn & 0x0f70_f010, 0x0750_f000 | 0x0710_f000 | 0x0650_f000)
             || insn & 0x0f70_f000 == 0x0450_f000
         {
+            if self.mt && insn & 0x0fff_ffe0 == 0x057f_f040 {
+                self.p(0xd503_3bbf); // dmb ish (DMB and DSB)
+            }
             return false;
         }
         // CPS, RFE, SRS change the mode; everything else (NEON, CLREX) continues unless
@@ -1561,7 +1594,7 @@ impl<'a> Emit<'a> {
 
     /// MRC of the thread ID registers and the (no-op) cache maintenance MCRs.
     fn coprocessor(&mut self, insn: u32) -> bool {
-        if insn & 0x0f00_0f10 != 0x0e00_0f10 {
+        if insn & 0x0f00_0f10 != 0x0e00_0f10 || self.el0 {
             return false;
         }
         let (read, opc1, crn, rd, crm, opc2) = (

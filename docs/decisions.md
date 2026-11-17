@@ -14,7 +14,7 @@ capability labels, evidence/report rules, W0–W3 and T0–T2 tiers. T1/T2 becom
 design rather than research gates, but still must be demonstrated by tests before being claimed.
 
 Consequences: the core must implement ARMv8.0-A as on Cortex-A72/A53 (EL0–EL3, AArch64 only at
-first, stage-1 MMU, generic timer, GIC-400 / BCM2836 local interrupt controller, FP/SIMD). ID
+first — 32-bit programs at EL0 came later, on the `arm-a32` core, see the README — stage-1 MMU, generic timer, GIC-400 / BCM2836 local interrupt controller, FP/SIMD). ID
 registers advertise exactly what is implemented (no LSE, no PAC, no SVE).
 
 ## D2 (2026-11-13): reduced device tree, emulated firmware boot

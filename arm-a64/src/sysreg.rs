@@ -77,6 +77,35 @@ pub struct SysRegs {
     pub unknown: Vec<u32>,
 }
 
+/// The AArch32 identification registers (ID_PFR0_EL1 .. MVFR2_EL1: op0 3, op1 0, CRn 0,
+/// CRm 1-3), as EL1 reads them to describe AArch32 EL0. They describe the Cortex-A72's AArch32
+/// state reduced to what `arm-a32` implements: ARMv7-A with the virtualization extensions'
+/// integer divide, VFPv4-D32 and Advanced SIMD, but none of ARMv8's AArch32 additions
+/// (LDA/STL, VSEL/VRINT/VMAXNM, CRC32, SEVL), no SWP and no ThumbEE.
+fn aarch32_id(k: u32) -> Option<u64> {
+    // CRm (bits 6:3) 1..3 and op2 (bits 2:0): 0x08..0x1f
+    if k & !0x7f != key(3, 0, 0, 0, 0) || !(0x08..0x20).contains(&(k & 0x7f)) {
+        return None;
+    }
+    Some(match k & 0x7f {
+        0x08 => 0x0000_0131, // ID_PFR0: A32, T32 (Thumb-2), trivial Jazelle
+        0x09 => 0x0001_1011, // ID_PFR1: Security, generic timer, ...
+        0x0a => 0x0000_0066, // ID_DFR0: ARMv8 debug (CP14), no PMU, no trace
+        0x0c => 0x1020_1105, // ID_MMFR0..3 (as the A72)
+        0x0d => 0x4000_0000,
+        0x0e => 0x0126_0000,
+        0x0f => 0x0210_2211,
+        0x10 => 0x0210_1110, // ID_ISAR0: SDIV/UDIV in A32 and T32, no SWP
+        0x11 => 0x1311_2111,
+        0x12 => 0x2123_2041, // ID_ISAR2: LoadStore 1 (no LDA/STL)
+        0x13 => 0x0111_2131,
+        0x14 => 0x0001_1142,
+        0x18 => 0x1011_0222, // MVFR0: VFPv4 double, D32, Advanced SIMD registers
+        0x19 => 0x1111_1111, // MVFR1: Advanced SIMD integer/float/FMA, VFP FMA, FTZ, DN
+        _ => 0,              // ID_AFR0, ID_ISAR5, ID_MMFR4, MVFR2, reserved
+    })
+}
+
 /// Counter ticks at `ns` nanoseconds for frequency `frq` (exact; 54 MHz avoids 128-bit math).
 pub fn count_at(ns: u64, frq: u64) -> u64 {
     if frq == 54_000_000 { ns / 500 * 27 + ns % 500 * 27 / 500 } else { (ns as u128 * frq as u128 / 1_000_000_000) as u64 }
@@ -99,8 +128,9 @@ impl Cpu {
             MIDR_EL1 => self.profile.midr,
             MPIDR_EL1 => 0x8000_0000 | s.mpidr,
             REVIDR_EL1 => 0,
-            // EL0..EL3 AArch64 only, FP and AdvSIMD implemented, no GIC system registers
-            ID_AA64PFR0_EL1 => 0x1111 | if self.profile.gic_sysregs { 1 << 24 } else { 0 },
+            // EL0 AArch64 and AArch32 (32-bit programs, see aarch32.rs), EL1..EL3 AArch64 only,
+            // FP and AdvSIMD implemented, no GIC system registers
+            ID_AA64PFR0_EL1 => 0x1112 | if self.profile.gic_sysregs { 1 << 24 } else { 0 },
             ID_AA64DFR0_EL1 => 0x0000_0006,
             // no AES/SHA/CRC32/atomics
             // CRC32 (as the Pi 4's Cortex-A72; no crypto extension on the BCM2711)
@@ -164,6 +194,7 @@ impl Cpu {
             CNTV_TVAL_EL0 => {
                 s.vtimer.cval.wrapping_sub(s.cnt.wrapping_sub(s.cntvoff)) as u32 as u64
             }
+            _ if aarch32_id(k).is_some() => aarch32_id(k).unwrap_or(0),
             _ => {
                 if !self.sys.other.contains_key(&k) && !self.sys.unknown.contains(&k) {
                     self.sys.unknown.push(k);

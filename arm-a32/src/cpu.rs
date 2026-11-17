@@ -119,6 +119,14 @@ pub struct Cpu {
     /// front cache it looks blocks up in.
     pub(crate) jit_disp: usize,
     pub(crate) jit_front: *const crate::jit::Front,
+    /// AArch32 EL0 under an AArch64 kernel (`step_el0`): the 64-bit core, while a step runs.
+    pub(crate) el1: Option<*mut dyn crate::el0::El1Host>,
+    /// The exception the last `step_el0` raised (see `take_el0_exit`).
+    pub(crate) el0_exit: Option<crate::el0::El0Exit>,
+    /// Other cores run in parallel on host threads (see `el0_setup`).
+    pub mt: bool,
+    /// The value the last load-exclusive read (compare value of a multi-threaded store).
+    pub(crate) exclusive_val: u64,
 }
 
 // SAFETY: the raw pointers (guest RAM, the bus during a step) are only dereferenced by the
@@ -168,6 +176,10 @@ impl Cpu {
             banked_fiq_r8: [0; 5],
             banked_usr_r8: [0; 5],
             exclusive_addr: None,
+            exclusive_val: 0,
+            el1: None,
+            el0_exit: None,
+            mt: false,
             exclusive_size: 0,
             sctlr: 0x00c5_0078,
             actlr: 0,
@@ -606,6 +618,10 @@ impl Cpu {
     }
 
     pub(crate) fn prefetch_abort(&mut self, va: u32, status: u32) -> Trap {
+        let fsc = Self::el0_fsc(status);
+        if self.el0_exception(crate::el0::El0Event::PrefetchAbort { va, fsc }) {
+            return Trap::Exception(0x20, 1);
+        }
         self.ifsr = status;
         self.ifar = va;
         self.enter_exception(0x0c, self.cur_pc.wrapping_add(4), MODE_ABT, true);
@@ -613,6 +629,10 @@ impl Cpu {
     }
 
     pub(crate) fn data_abort(&mut self, va: u32, status: u32, write: bool) -> Trap {
+        let fsc = Self::el0_fsc(status);
+        if self.el0_exception(crate::el0::El0Event::DataAbort { va, fsc, write }) {
+            return Trap::Exception(0x24, 1);
+        }
         self.dfsr = status | u32::from(write) << 11;
         self.dfar = va;
         self.enter_exception(0x10, self.cur_pc.wrapping_add(8), MODE_ABT, true);
@@ -681,6 +701,7 @@ impl Cpu {
                 || insn & 0x0fff_fff0 == 0x057f_f050
                 || insn == 0xf57f_f06f
             {
+                self.barrier();
                 return Ok(());
             }
             // Immediate PLD/PLDW hints need no cache model.
@@ -991,10 +1012,20 @@ impl Cpu {
 
         // SVC always enters the guest's supervisor call handler.
         if insn & 0x0f00_0000 == 0x0f00_0000 {
+            if self.el0_exception(crate::el0::El0Event::Svc(insn & 0x00ff_ffff)) {
+                return Err(Trap::Exception(0x11, 1));
+            }
             self.enter_exception(0x08, self.next_pc(), MODE_SVC, false);
             return Err(Trap::Exception(0x15, 1));
         }
 
+        // Under an AArch64 kernel, EL0 reaches only what the kernel allows.
+        if self.el1.is_some()
+            && (insn & 0x0fe0_0000 == 0x0c40_0000 || insn & 0x0f00_0010 == 0x0e00_0010)
+            && (insn >> 8) & 0xf == 15
+        {
+            return self.el0_cp15(insn);
+        }
         // CP15 64-bit architectural timer registers (MCRR/MRRC).
         if insn & 0x0fe0_0000 == 0x0c40_0000 && (insn >> 8) & 0xf == 15 {
             let read = insn & (1 << 20) != 0;
@@ -1250,15 +1281,16 @@ impl Cpu {
                 Ok(value) => value,
                 Err((va, status)) => return Err(self.data_abort(va, status, false)),
             };
-            self.r[rd as usize] = first;
+            let mut second = 0;
             if size == 8 {
                 match self.mem_read32(bus, address.wrapping_add(4), Access::Read) {
-                    Ok(value) => self.r[rd as usize + 1] = value,
+                    Ok(value) => second = value,
                     Err((va, status)) => return Err(self.data_abort(va, status, false)),
                 }
+                self.r[rd as usize + 1] = second;
             }
-            self.exclusive_addr = Some(address);
-            self.exclusive_size = size;
+            self.r[rd as usize] = first;
+            self.mark_exclusive(address, size, first as u64 | (second as u64) << 32);
             return Ok(());
         }
         let store_exclusive = match insn & 0x0ff0_0ff0 {
@@ -1282,34 +1314,12 @@ impl Cpu {
                 return Err(unimplemented());
             }
             let address = self.r[rn as usize];
-            let reserved = self.exclusive_addr == Some(address) && self.exclusive_size == size;
-            if !reserved {
-                self.r[rd as usize] = 1;
-                self.exclusive_addr = None;
-                self.exclusive_size = 0;
-                return Ok(());
+            let high = if size == 8 { self.r[rm as usize + 1] } else { 0 };
+            let value = self.r[rm as usize] as u64 | (high as u64) << 32;
+            match self.store_exclusive(bus, address, size, value) {
+                Ok(status) => self.r[rd as usize] = status,
+                Err((va, status)) => return Err(self.data_abort(va, status, true)),
             }
-            let value = self.r[rm as usize];
-            let result = match size {
-                1 => self.mem_write8(bus, address, value as u8),
-                2 => self.mem_write16(bus, address, value as u16),
-                _ => self.mem_write32(bus, address, value),
-            };
-            if let Err((va, status)) = result {
-                return Err(self.data_abort(va, status, true));
-            }
-            if size == 8 {
-                if let Err((va, status)) = self.mem_write32(
-                    bus,
-                    address.wrapping_add(4),
-                    self.r[rm as usize + 1],
-                ) {
-                    return Err(self.data_abort(va, status, true));
-                }
-            }
-            self.r[rd as usize] = 0;
-            self.exclusive_addr = None;
-            self.exclusive_size = 0;
             return Ok(());
         }
 
@@ -1725,6 +1735,10 @@ impl Cpu {
             }
             Err(Trap::Unimplemented(..)) if self.undef_to_guest => {
                 self.last_undef = Some((pc, insn));
+                if self.el0_exception(crate::el0::El0Event::Undefined) {
+                    self.r[15] = pc;
+                    return Err(Trap::Exception(0x00, 1));
+                }
                 // LR_und = instruction + 4 (ARM) or + 2 (Thumb, also for 32-bit
                 // encodings: Linux reads the halfwords at LR - 2 and LR).
                 let lr = pc.wrapping_add(if self.thumb() { 2 } else { 4 });

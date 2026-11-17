@@ -592,8 +592,7 @@ impl Cpu {
                 match self.mem_read32(bus, address, Access::Read) {
                     Ok(value) => {
                         self.r[rt as usize] = value;
-                        self.exclusive_addr = Some(address);
-                        self.exclusive_size = 4;
+                        self.mark_exclusive(address, 4, value as u64);
                         Ok(())
                     }
                     Err((va, status)) => Err(self.data_abort(va, status, false)),
@@ -601,16 +600,11 @@ impl Cpu {
             }
             0xe840 => {
                 let address = self.r[rn as usize].wrapping_add((hw2 & 0xff) << 2);
-                let reserved = self.exclusive_addr == Some(address) && self.exclusive_size == 4;
-                self.exclusive_addr = None;
-                self.exclusive_size = 0;
-                if !reserved {
-                    self.r[rd as usize] = 1;
-                    return Ok(());
+                let value = self.r[rt as usize] as u64;
+                match self.store_exclusive(bus, address, 4, value) {
+                    Ok(status) => self.r[rd as usize] = status,
+                    Err((va, status)) => return Err(self.data_abort(va, status, true)),
                 }
-                let value = self.r[rt as usize];
-                self.store(bus, address, 4, value)?;
-                self.r[rd as usize] = 0;
                 Ok(())
             }
             0xe8c0 => {
@@ -621,18 +615,11 @@ impl Cpu {
                     7 => {
                         // STREXD: T32 allows any Rt/Rt2 pair (A32 needs an even pair).
                         let address = self.r[rn as usize];
-                        let reserved =
-                            self.exclusive_addr == Some(address) && self.exclusive_size == 8;
-                        self.exclusive_addr = None;
-                        self.exclusive_size = 0;
-                        if !reserved {
-                            self.r[status as usize] = 1;
-                            return Ok(());
+                        let value = self.r[rt as usize] as u64 | (self.r[rd as usize] as u64) << 32;
+                        match self.store_exclusive(bus, address, 8, value) {
+                            Ok(s) => self.r[status as usize] = s,
+                            Err((va, s)) => return Err(self.data_abort(va, s, true)),
                         }
-                        let (a, b) = (self.r[rt as usize], self.r[rd as usize]);
-                        self.store(bus, address, 4, a)?;
-                        self.store(bus, address.wrapping_add(4), 4, b)?;
-                        self.r[status as usize] = 0;
                         Ok(())
                     }
                     _ => self.undefined(insn),
@@ -670,8 +657,7 @@ impl Cpu {
                         (Ok(a), Ok(b)) => {
                             self.r[rt as usize] = a;
                             self.r[rd as usize] = b;
-                            self.exclusive_addr = Some(address);
-                            self.exclusive_size = 8;
+                            self.mark_exclusive(address, 8, a as u64 | (b as u64) << 32);
                             Ok(())
                         }
                         (Err((va, status)), _) | (_, Err((va, status))) => {

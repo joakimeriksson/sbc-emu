@@ -39,5 +39,5 @@ fn pi_identity_and_sysreg_feature_remain_unchanged() {
     ram.write32(0,0xd5380000).unwrap(); // MRS X0,MIDR_EL1
     ram.write32(4,0xd5380401).unwrap(); // MRS X1,ID_AA64PFR0_EL1
     cpu.step(&mut ram).unwrap();cpu.step(&mut ram).unwrap();
-    assert_eq!(cpu.x[0],0x410fd083);assert_eq!(cpu.x[1],0x1111);
+    assert_eq!(cpu.x[0],0x410fd083);assert_eq!(cpu.x[1],0x1112); // EL0: AArch64 and AArch32
 }
