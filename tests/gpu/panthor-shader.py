@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit a linear RGBA8 clear pass through Linux Panthor (no Mesa/shaders)."""
+"""Submit a Mesa-assembled Valhall shader through Linux Panthor and verify its output."""
 import ctypes, fcntl, mmap, os, struct, time, zlib, base64
 fd=os.open('/dev/dri/renderD128',os.O_RDWR)
 keep=[]

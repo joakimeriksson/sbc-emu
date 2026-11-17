@@ -9,7 +9,7 @@ pub enum Error {
     Budget,
 }
 pub struct Shader {
-    pub regs: [u32; 64],
+    pub regs: [u32; 32],
     pub pc: u64,
 }
 const LUT: [u32; 32] = [
@@ -20,12 +20,12 @@ const LUT: [u32; 32] = [
 ];
 impl Shader {
     pub fn new(pc: u64) -> Self {
-        Self { regs: [0; 64], pc }
+        Self { regs: [0; 32], pc }
     }
     fn source(&self, i: u64, index: usize, uniforms: &[u32]) -> Option<u32> {
         let s = ((i >> (index * 8)) & 255) as usize;
         match s >> 6 {
-            0 | 1 => Some(self.regs[s & 63]), // discard register hint doesn't change value
+            0 | 1 => self.regs.get(s & 63).copied(), // discard register hint doesn't change value
             2 => uniforms
                 .get((((i >> 57) & 3) as usize) * 64 + (s & 63))
                 .copied(),
@@ -140,17 +140,19 @@ impl Shader {
                         || !matches!(((i >> 27) & 7, (i >> 33) & 7), (3, 1) | (7, 4))
                         || (i >> 24) & 3 != 0
                         || (i >> 36) & 15 != 0
+                        || i & (1 << 26) != 0
+                        || (i >> 30) & 7 > 2
                     {
                         return Err(bad());
                     }
                     let s = (i & 255) as usize;
-                    if s >= 64 || s & 1 != 0 || s == 63 {
+                    if s + 1 >= self.regs.len() || s & 1 != 0 {
                         return Err(bad());
                     }
                     let addr = (self.regs[s] as u64 | ((self.regs[s + 1] as u64) << 32))
                         .wrapping_add((i >> 8) as u16 as i16 as i64 as u64);
                     let count = ((i >> 33) & 7) as usize;
-                    if dst + count > 64 {
+                    if dst + count > self.regs.len() || count > 1 && dst & 1 != 0 {
                         return Err(bad());
                     }
                     if op == 0x61 {
@@ -169,6 +171,10 @@ impl Shader {
                     None
                 }
                 0x1f => {
+                    // Combining multiple words is not implemented by the scalar branch path.
+                    if (i >> 37) & 7 != 0 || (i >> 40) & 255 != 0xc0 {
+                        return Err(bad());
+                    }
                     let v = a.ok_or_else(bad)?;
                     let take = if i & (1 << 36) != 0 { v == 0 } else { v != 0 };
                     if take {
@@ -180,6 +186,9 @@ impl Shader {
                 _ => return Err(bad()),
             };
             if let Some(v) = result {
+                if dst >= self.regs.len() {
+                    return Err(bad());
+                }
                 let mask = (i >> 46) & 3;
                 self.regs[dst] = match mask {
                     3 => v,
@@ -327,5 +336,40 @@ mod tests {
             Err(Error::Unsupported { .. })
         ));
         assert_eq!(shader.regs[0], 123);
+    }
+    #[test]
+    fn unsupported_branch_memory_fields_and_registers_fault_without_side_effects() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let cases = [
+            0x001fc000000000c0 | (1 << 37),
+            ADD[3] | (1 << 26),
+            ADD[3] | (3 << 30),
+            ADD[0] | (32 << 40),
+            (ADD[0] & !255) | 32,
+        ];
+        for instruction in cases {
+            let mut ram = vec![0x55; 1024];
+            ram[..8].copy_from_slice(&instruction.to_le_bytes());
+            let before = ram.clone();
+            let mut shader = Shader::new(0);
+            shader.regs[0] = 512;
+            assert!(
+                matches!(
+                    shader.run(
+                        &m,
+                        &mut ram,
+                        &[512, 0, 1.25f32.to_bits(), 2.5f32.to_bits()],
+                        1
+                    ),
+                    Err(Error::Unsupported { .. })
+                ),
+                "{instruction:016x}"
+            );
+            assert_eq!(ram, before);
+            assert_eq!(shader.pc, 0);
+        }
     }
 }

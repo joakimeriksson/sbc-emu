@@ -18,10 +18,10 @@ lines+=['serial python3 -c \'import base64,zlib;exec(zlib.decompress(base64.b64d
 with tempfile.TemporaryDirectory(prefix='panthor-demo-') as d:
     script=pathlib.Path(d)/'script.txt';script.write_text('\n'.join(lines)+'\n')
     cmd=[str(a.emulator),'run','--board','orangepi5','--gpu','probe','--net','none','--sd',str(a.image.resolve()),'--append','init=/bin/bash','--script',str(script),'--timeout',str(a.timeout)]
-    result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=a.timeout+30)
+    result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=a.timeout+30)
     log=result.stdout.decode(errors='replace')
     a.output.parent.mkdir(parents=True,exist_ok=True)
-    logpath=a.output.with_suffix('.log');logpath.write_text(log)
+    logpath=a.output.with_suffix('.log');logpath.write_text(log+'\n[host diagnostics]\n'+result.stderr.decode(errors='replace'))
     match=re.search(r'PNG_BASE64=([A-Za-z0-9+/=]+)',log)
     if result.returncode or not match or marker not in log or 'IMAGE_END' not in log:
         raise SystemExit('Demo failed; see '+str(logpath))
