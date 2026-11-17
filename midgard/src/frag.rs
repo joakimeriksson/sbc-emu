@@ -25,6 +25,7 @@ struct RenderTarget {
     srgb: bool,
     swizzle: u32,
     clean_write: bool,
+    dither: bool,
     preload: bool,
     base: u64,
     row_stride: u32,
@@ -104,6 +105,7 @@ fn read_fb(vm: &mut Vm, tagged: u64) -> (Fb, u64) {
             srgb: w[1] & (1 << 14) != 0,
             swizzle: (w[1] >> 16) & 0xfff,
             clean_write: w[1] & (1 << 31) != 0,
+            dither: w[1] & (1 << 15) != 0,
             preload: w[2] & 1 != 0,
             base: w[8] as u64 | (w[9] as u64) << 32,
             row_stride: w[10],
@@ -156,22 +158,40 @@ fn unpack_clear(internal: u32, w: u32) -> [f32; 4] {
     out
 }
 
+/// Store a colour at the tile buffer's precision: each channel's integer bits plus the
+/// fraction bits kept for dithering (`pan_clear.c` tib layouts).
 fn quantize(internal: u32, c: [f32; 4]) -> [f32; 4] {
-    match internal_bits(internal) {
-        Some(b) => {
-            let mut o = [0f32; 4];
-            for i in 0..4 {
-                if b[i] == 0 {
-                    o[i] = 1.0;
-                } else {
-                    let m = ((1u32 << b[i]) - 1) as f32;
-                    o[i] = (c[i].clamp(0.0, 1.0) * m).round() / m;
-                }
-            }
-            o
-        }
-        None => c,
+    if internal_bits(internal).is_none() {
+        return c;
     }
+    let l = internal_layout(internal);
+    let mut o = [0f32; 4];
+    for i in 0..4 {
+        let (int, frac) = l[i];
+        if int == 0 {
+            o[i] = 1.0;
+        } else {
+            let m = (((1u32 << int) - 1) << frac) as f32;
+            o[i] = (c[i].clamp(0.0, 1.0) * m).round() / m;
+        }
+    }
+    o
+}
+
+/// Channel bits of a writeback colour format with fewer than 8 bits per channel.
+fn wb_low_bits(f: u32) -> Option<[u32; 4]> {
+    match f {
+        20 => Some([4, 4, 4, 4]),
+        21 => Some([5, 6, 5, 8]),
+        28 | 29 => Some([5, 5, 5, 1]),
+        _ => None,
+    }
+}
+
+/// 4x4 ordered dither offset in [-0.5, 0.5) of one quantisation step.
+fn bayer(x: u32, y: u32) -> f32 {
+    const M: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    (M[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 - 0.5
 }
 
 /// Bytes per pixel of a writeback colour format.
@@ -611,6 +631,15 @@ pub fn fragment_job(vm: &mut Vm, job: u64, list: &[Prim], trace: bool) -> u64 {
                     if rt.srgb {
                         for c in v.iter_mut().take(3) {
                             *c = linear_to_srgb(*c);
+                        }
+                    }
+                    if rt.dither {
+                        if let Some(bits) = wb_low_bits(rt.wb_format) {
+                            let d = bayer(x, y);
+                            for c in 0..4 {
+                                let m = ((1u32 << bits[c]) - 1) as f32;
+                                v[c] = (v[c] + d / m).clamp(0.0, 1.0);
+                            }
                         }
                     }
                     encode_wb(rt.wb_format, v, &mut b);
