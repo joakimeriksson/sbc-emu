@@ -10,7 +10,8 @@
 //! `pie`); the other cores decode those encodings as illegal. The S31 and P4 cores have
 //! Espressif's hardware loops (`decode::ISA_HWLP`, `hwlp`).
 //!
-//! Machine mode only, no MMU, no D extension. The C3 and C6 have no F, and decode its encodings
+//! Machine mode only on the C3, C6 and P4; the S31 profile (`Cpu::privileged`) adds S and U
+//! modes, delegation and Sv32 (`mmu`) for Linux. No D extension. The C3 and C6 have no F, and decode its encodings
 //! as illegal.
 //! Interrupts are *not* the standard `mie`/`mip` external-interrupt model: the C3 routes 62
 //! peripheral sources through its own interrupt matrix onto 31 CPU lines and vectors each one
@@ -26,6 +27,7 @@ pub mod exec;
 mod fpu;
 pub mod pie;
 pub mod hwlp;
+pub mod mmu;
 pub mod softfloat;
 pub mod state;
 

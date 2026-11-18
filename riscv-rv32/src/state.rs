@@ -10,6 +10,8 @@ pub mod csr {
     pub const SCOUNTEREN: u32 = 0x106; pub const SSCRATCH: u32 = 0x140; pub const SEPC: u32 = 0x141;
     pub const SCAUSE: u32 = 0x142; pub const STVAL: u32 = 0x143; pub const SIP: u32 = 0x144;
     pub const SATP: u32 = 0x180;
+    pub const MCOUNTEREN: u32 = 0x306; pub const MCOUNTINHIBIT: u32 = 0x320;
+    pub const TIME: u32 = 0xC01; pub const TIMEH: u32 = 0xC81;
     pub const MSTATUS: u32 = 0x300; pub const MISA: u32 = 0x301; pub const MIE: u32 = 0x304;
     pub const MTVEC: u32 = 0x305; pub const MEDELEG: u32 = 0x302; pub const MIDELEG: u32 = 0x303;
     pub const MSCRATCH: u32 = 0x340; pub const MEPC: u32 = 0x341;
@@ -150,6 +152,11 @@ pub struct Cpu {
     pub mip: u32,
     /// CLIC supervisor interrupt level, mirrored by scause.SPIL on an S-mode interrupt.
     pub sil: u32,
+    /// sintthresh: S-mode CLIC interrupts are taken only above it (and above `sil`)
+    pub sintthresh: u32,
+    pub mcounteren: u32,
+    /// the Sv32 TLB (`mmu`)
+    pub tlb: crate::mmu::Tlb,
     /// Host-facing scheduling work. This remains monotonic across reset and includes skipped idle
     /// cycles so existing run statistics keep their meaning.
     pub insn_count: u64,
@@ -242,7 +249,7 @@ impl Cpu {
             mtvec: 0, mepc: 0, mcause: 0, mtval: 0, mie: 0, mscratch: 0,
             priv_mode: privilege::MACHINE, privileged: false,
             stvec: 0, sepc: 0, scause: 0, stval: 0, sscratch: 0, satp: 0,
-            medeleg: 0, mideleg: 0, scounteren: 0, mip: 0, sil: 0,
+            medeleg: 0, mideleg: 0, scounteren: 0, mip: 0, sil: 0, sintthresh: 0, mcounteren: 0, tlb: crate::mmu::Tlb::default(),
             insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC, isa_ext: 0,
             has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, ext_ill_all_fp: false, user_counters: false, clic: false, clic_std: false, mintthresh: 0, mtvt: 0, hartid: 0, mil: 0, clint_levels: Vec::new(), reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
             q: [0; 8], pie_sar: 0, pie_sar_byte: 0, pie_cfg: 0, pie_state: 0,
@@ -336,6 +343,7 @@ impl Cpu {
 
     pub fn read_csr(&mut self, n: u32) -> u32 {
         use csr::*;
+        if self.privileged { if let Some(v) = self.read_priv_csr(n) { return v; } }
         match n {
             MSTATUS => self.mstatus,
             MISA => self.misa,
@@ -377,6 +385,7 @@ impl Cpu {
 
     pub fn write_csr(&mut self, n: u32, v: u32) {
         use csr::*;
+        if self.privileged && self.write_priv_csr(n, v) { return; }
         match n {
             // FS is writable and SD read-only on a core with F; without F, mstatus keeps whatever
             // was written, as it always has on the C3 and C6.
@@ -438,6 +447,12 @@ impl Cpu {
     /// while exceptions always enter at the base. In CLIC mode an exception enters at the
     /// 64-byte-aligned base and records the current level in MPIL; the level does not change.
     pub fn trap(&mut self, cause: u32, tval: u32, epc: u32) {
+        if self.privileged { self.trap_priv(cause, tval, epc, None); return; }
+        self.trap_m(cause, tval, epc);
+    }
+
+    /// The machine-mode trap entry, as every profile takes it.
+    fn trap_m(&mut self, cause: u32, tval: u32, epc: u32) {
         // An SC after the handler returns must not succeed over the handler's own stores; the
         // P4's IDF vectors issue no SC to break the reservation, so the trap does.
         if self.clic { self.reservation = None; }
@@ -464,11 +479,163 @@ impl Cpu {
     /// `mret`: restore the interrupt-enable bit and jump back; with a CLIC the level comes back
     /// from mcause.MPIL.
     pub fn mret(&mut self) {
+        let mpp = (self.mstatus & mstatus::MPP) >> 11;
         if self.clic_mode() { self.mil = (self.mcause & mcause::MPIL) >> mcause::MPIL_SHIFT; }
         // CLINT mode on a CLIC core keeps the level too (exec.rs), in hidden state pushed by `trap`.
         else if self.clic { if let Some(l) = self.clint_levels.pop() { self.mil = l; } }
         let mpie = self.mstatus & mstatus::MPIE != 0;
         self.mstatus = (self.mstatus & !mstatus::MIE) | if mpie { mstatus::MIE } else { 0 } | mstatus::MPIE;
+        if self.privileged {
+            // MPP becomes the least-privileged mode; leaving M clears MPRV
+            self.priv_mode = if mpp == 2 { privilege::USER } else { mpp };
+            self.mstatus &= !mstatus::MPP;
+            if self.priv_mode != privilege::MACHINE { self.mstatus &= !mstatus::MPRV; }
+        }
         self.pc = self.mepc;
+    }
+}
+
+/// `scause` in the S31's CLIC mode (Linux arch/riscv/include/asm/csr.h, integration/v6.18-esp32s31):
+/// the interrupt bit, SPP (28) and SPIE (27) aliasing sstatus's, SPIL (23:16), the cause (11:0).
+pub mod scause {
+    pub const SPP: u32 = 1 << 28; pub const SPIE: u32 = 1 << 27;
+    pub const SPIL_SHIFT: u32 = 16; pub const SPIL: u32 = 0xff << 16;
+}
+
+impl Cpu {
+    /// CSRs the S31 does not have: an access is an illegal instruction, which OpenSBI's
+    /// feature probing depends on (lib/sbi/sbi_hart.c `hart_detect_features`). menvcfg absent
+    /// makes it a privileged-ISA v1.11 hart; no HPM counters, Sscofpmf, AIA, Sstc, Smstateen,
+    /// Smcntrpmf, mstatush, H; 16 PMP entries.
+    fn csr_absent(n: u32) -> bool {
+        matches!(n, 0x10a | 0x10c | 0x14d | 0x15d | 0x30a | 0x31a | 0x30c..=0x30f | 0x31c..=0x31f | 0x310
+            | 0x321 | 0x322 | 0x721 | 0x722 | 0x323..=0x33f | 0x3a4..=0x3af | 0x3c0..=0x3ef
+            | 0xb03..=0xb1f | 0xb83..=0xb9f | 0xc03..=0xc1f | 0xc83..=0xc9f | 0xda0 | 0xfb0
+            | 0x200..=0x2ff | 0x600..=0x6ff | 0xa00..=0xaff | 0xe00..=0xeff)
+    }
+
+    /// Whether this CSR access is an illegal instruction at the current privilege (only with
+    /// `privileged`; the M-only profiles accept every CSR as before).
+    pub fn csr_illegal(&self, n: u32, write: bool) -> bool {
+        use csr::*;
+        if !self.privileged { return false; }
+        if (n >> 8) & 3 > self.priv_mode { return true; }
+        if write && n >> 10 == 3 { return true; }
+        let s = self.priv_mode == privilege::SUPERVISOR;
+        match n {
+            SATP => s && self.mstatus & mstatus::TVM != 0,
+            // sie/sip are inactive in CLIC mode; S-mode accesses trap and OpenSBI emulates them
+            // (lib/sbi/sbi_emulate_csr.c, CONFIG_SMCLIC)
+            SIE | SIP => s,
+            CYCLE | TIME | INSTRET | CYCLEH | TIMEH | INSTRETH => {
+                let bit = 1 << (n & 0x1f);
+                (self.priv_mode < privilege::MACHINE && self.mcounteren & bit == 0)
+                    || (self.priv_mode == privilege::USER && self.scounteren & bit == 0)
+            }
+            _ => Self::csr_absent(n),
+        }
+    }
+
+    fn read_priv_csr(&mut self, n: u32) -> Option<u32> {
+        use csr::*;
+        let cycles = self.cycle_count.wrapping_sub(self.cycle_base);
+        Some(match n {
+            SSTATUS => self.mstatus & mstatus::SSTATUS_READ,
+            SIE | SIP => 0,
+            STVEC => (self.stvec & !0x3f) | 3,
+            SCOUNTEREN => self.scounteren,
+            SSCRATCH => self.sscratch,
+            SEPC => self.sepc,
+            SCAUSE => self.scause | if self.mstatus & mstatus::SPP != 0 { scause::SPP } else { 0 } | if self.mstatus & mstatus::SPIE != 0 { scause::SPIE } else { 0 },
+            STVAL => self.stval,
+            SATP => self.satp,
+            MEDELEG => self.medeleg,
+            MIDELEG => self.mideleg,
+            MCOUNTEREN => self.mcounteren,
+            MIP => self.mip,
+            // the S31's mtime: the CPU clock (timebase-frequency 320 MHz in its device trees)
+            TIME | CYCLE => cycles as u32,
+            TIMEH | CYCLEH => (cycles >> 32) as u32,
+            _ => return None,
+        })
+    }
+
+    fn write_priv_csr(&mut self, n: u32, v: u32) -> bool {
+        use csr::*;
+        match n {
+            SSTATUS => {
+                let m = mstatus::SSTATUS_WRITE;
+                let w = (self.mstatus & !m) | (v & m);
+                self.write_mstatus_priv(w);
+            }
+            MSTATUS => self.write_mstatus_priv(v),
+            SIE | SIP => {}
+            STVEC => self.stvec = v & !0x3f,
+            SCOUNTEREN => self.scounteren = v,
+            SSCRATCH => self.sscratch = v,
+            SEPC => self.sepc = v & !1,
+            SCAUSE => {
+                self.scause = v & (mcause::INTERRUPT | scause::SPIL | mcause::CODE);
+                self.mstatus = (self.mstatus & !(mstatus::SPP | mstatus::SPIE))
+                    | if v & scause::SPP != 0 { mstatus::SPP } else { 0 } | if v & scause::SPIE != 0 { mstatus::SPIE } else { 0 };
+            }
+            STVAL => self.stval = v,
+            // no ASID bits (ASIDLEN = 0): Linux then flushes on every switch
+            SATP => { self.satp = v & 0x803f_ffff; self.tlb.flush(); }
+            MEDELEG => self.medeleg = v & 0x0004_b3ff & !(1 << 11) & !(1 << 10),
+            MIDELEG => self.mideleg = v & 0x222,
+            MCOUNTEREN => self.mcounteren = v & 7,
+            MIP => self.mip = (self.mip & !0x222) | (v & 0x222),
+            TIME | TIMEH => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// mstatus as the S31 keeps it: FS/XS/SD as before, MPP WARL (2 reads as U).
+    fn write_mstatus_priv(&mut self, v: u32) {
+        let mut v = v;
+        if v & mstatus::MPP == 2 << 11 { v &= !mstatus::MPP; }
+        let sd = if v & mstatus::FS == mstatus::FS_DIRTY { mstatus::SD } else { 0 };
+        self.mstatus = (v & !mstatus::SD) | sd;
+        if self.has_pie() || self.has_hwlp() { self.update_xs(); }
+    }
+
+    /// A trap on a core with S and U: delegated to S per medeleg/mideleg (or, for a CLIC
+    /// interrupt, per its mode, `s_irq`), otherwise taken in M as on every profile.
+    pub fn trap_priv(&mut self, cause: u32, tval: u32, epc: u32, s_irq: Option<bool>) {
+        let irq = cause & mcause::INTERRUPT != 0;
+        let code = cause & mcause::CODE;
+        let to_s = s_irq.unwrap_or_else(|| {
+            self.priv_mode <= privilege::SUPERVISOR && code < 32
+                && ((if irq { self.mideleg } else { self.medeleg }) >> code) & 1 != 0
+        });
+        if to_s {
+            self.reservation = None;
+            self.sepc = epc;
+            self.stval = tval;
+            self.scause = (cause & (mcause::INTERRUPT | mcause::CODE)) | (self.sil << scause::SPIL_SHIFT);
+            let spie = if self.mstatus & mstatus::SIE != 0 { mstatus::SPIE } else { 0 };
+            let spp = if self.priv_mode == privilege::SUPERVISOR { mstatus::SPP } else { 0 };
+            self.mstatus = (self.mstatus & !(mstatus::SIE | mstatus::SPIE | mstatus::SPP)) | spie | spp;
+            self.priv_mode = privilege::SUPERVISOR;
+            self.pc = self.stvec & !0x3f;
+            self.waiting = false;
+        } else {
+            let prev = self.priv_mode;
+            self.trap_m(cause, tval, epc);
+            self.mstatus = (self.mstatus & !mstatus::MPP) | (prev << 11);
+            self.priv_mode = privilege::MACHINE;
+        }
+    }
+
+    /// `sret` (with the S31's CLIC: an interrupt-type scause reloads the level from SPIL).
+    pub fn sret(&mut self) {
+        let spp = self.mstatus & mstatus::SPP != 0;
+        if self.scause & mcause::INTERRUPT != 0 { self.sil = (self.scause & scause::SPIL) >> scause::SPIL_SHIFT; }
+        let sie = if self.mstatus & mstatus::SPIE != 0 { mstatus::SIE } else { 0 };
+        self.mstatus = (self.mstatus & !(mstatus::SIE | mstatus::SPP | mstatus::MPRV)) | sie | mstatus::SPIE;
+        self.priv_mode = if spp { privilege::SUPERVISOR } else { privilege::USER };
+        self.pc = self.sepc;
     }
 }

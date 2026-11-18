@@ -34,7 +34,7 @@ impl emu_core::Core for Cpu {
     /// line may have moved, so the machine re-derives the core's input before the next instruction,
     /// and at a pc the machine wants to see first (a stub or a probe), so it is exact there too.
     fn run<B: Bus>(&mut self, bus: &mut B, budget: u32) -> (u32, Option<Trap>) {
-        if self.blocks.on && !bus.page_versions().is_empty() { return crate::block::run(self, bus, budget); }
+        if self.blocks.on && self.blocks_allowed() && !bus.page_versions().is_empty() { return crate::block::run(self, bus, budget); }
         for i in 0..budget {
             if let Err(t) = crate::exec::step(self, bus) { return (i + 1, Some(t)); }
             if bus.block_break() || (self.boundary_bloom != 0 && self.boundary_bloom & emu_core::core::pc_bit(self.pc) != 0) { return (i + 1, None); }

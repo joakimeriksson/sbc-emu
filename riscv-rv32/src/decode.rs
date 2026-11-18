@@ -15,6 +15,8 @@ pub enum Op {
     Add, Sub, Sll, Slt, Sltu, Xor, Srl, Sra, Or, And,
     Fence, FenceI,
     Ecall, Ebreak, Mret, Wfi,
+    // privileged S-mode instructions (S31 Linux profile)
+    Sret, SfenceVma,
     Csrrw, Csrrs, Csrrc, Csrrwi, Csrrsi, Csrrci,
     // RV32M
     Mul, Mulh, Mulhsu, Mulhu, Div, Divu, Rem, Remu,
@@ -205,6 +207,8 @@ fn decode32(pc: u32, w: u32, f: bool, zb: bool, pie: bool, hwlp: bool) -> Insn {
                 0x001 if rd == 0 && rs1 == 0 => mk(Op::Ebreak, 0),
                 0x302 if rd == 0 && rs1 == 0 => mk(Op::Mret, 0),
                 0x105 if rd == 0 && rs1 == 0 => mk(Op::Wfi, 0),
+                0x102 if rd == 0 && rs1 == 0 => mk(Op::Sret, 0),
+                _ if rd == 0 && w >> 25 == 0x09 => mk(Op::SfenceVma, 0),
                 _ => mk(Op::Illegal, 0),
             },
             1 => mk(Op::Csrrw, (w >> 20) as i32), 2 => mk(Op::Csrrs, (w >> 20) as i32), 3 => mk(Op::Csrrc, (w >> 20) as i32),

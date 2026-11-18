@@ -95,13 +95,18 @@ fn ends_block(i: &Insn) -> bool {
     use Op::*;
     match i.op {
         Csrrs | Csrrc | Csrrsi | Csrrci => i.rs1 != 0,
-        Jal | Jalr | Beq | Bne | Blt | Bge | Bltu | Bgeu | Ecall | Ebreak | Mret | Wfi | FenceI | Illegal
+        Jal | Jalr | Beq | Bne | Blt | Bge | Bltu | Bgeu | Ecall | Ebreak | Mret | Sret | SfenceVma | Wfi | FenceI | Illegal
         | Csrrw | Csrrwi | CmPopret | CmPopretz => true,
         _ => false,
     }
 }
 
 impl Cpu {
+    /// Blocks run untranslated code only: on a core with S and U, in M without MPRV.
+    #[inline(always)]
+    pub fn blocks_allowed(&self) -> bool {
+        !self.privileged || (self.priv_mode == crate::state::privilege::MACHINE && self.mstatus & crate::state::mstatus::MPRV == 0)
+    }
     /// Whether `step_outcome` would do something other than execute the instruction at pc:
     /// sleep, or take the interrupt the SoC presents.
     #[inline(always)]
@@ -197,7 +202,7 @@ pub fn run<B: Bus>(cpu: &mut Cpu, bus: &mut B, budget: u32) -> (u32, Option<Trap
     // and the interrupt test still passes: nothing in it could change either.
     let mut again: Option<Entry> = None;
     while used < budget {
-        let e = if again.is_some() { again.take() } else if cpu.waiting || cpu.irq_acts() { None } else { let pc = cpu.pc; lookup(cpu, bus, pc) };
+        let e = if again.is_some() { again.take() } else if cpu.waiting || cpu.irq_acts() || !cpu.blocks_allowed() { None } else { let pc = cpu.pc; lookup(cpu, bus, pc) };
         let Some(e) = e else {
             used += 1;
             match step_one(cpu, bus) {

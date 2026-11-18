@@ -209,6 +209,8 @@ pub fn format_for(misa: u32, i: &Insn) -> String {
         Ecall => m("ecall"),
         Ebreak => m("ebreak"),
         Mret => m("mret"),
+        Sret => m("sret"),
+        SfenceVma => m("sfence.vma"),
         Wfi => m("wfi"),
         Csrrw | Csrrs | Csrrc | Csrrwi | Csrrsi | Csrrci => {
             let n = csr_name(i.imm as u32);

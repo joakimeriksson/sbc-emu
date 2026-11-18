@@ -7,4 +7,4 @@ description = "RV32IMC(A)(F)(Zb*, Zcb, Zcmp) interpreter reused from esp32sim"
 readme = "README.md"
 
 [dependencies]
-emu-core = { package = "esp32sim-riscv-emu-core", path = "esp32sim-emu-core" }
+emu-core = { package = "esp32sim-emu-core", path = "../espressif/emu-core" }

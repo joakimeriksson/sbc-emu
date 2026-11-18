@@ -8,20 +8,38 @@ use emu_core::{CacheOperation, ControlEvent, ControlEventKind, StepKind, StepOut
 pub use emu_core::Trap;
 
 macro_rules! ld {
-    ($cpu:expr, $bus:expr, $f:ident, $addr:expr, $pc:expr) => {
-        match $bus.$f($addr) {
+    ($cpu:expr, $bus:expr, $f:ident, $addr:expr, $pc:expr) => {{
+        let va = $addr;
+        let pa = if $cpu.privileged {
+            match $cpu.translate($bus, va, crate::mmu::Access::Load) {
+                Ok(p) => p,
+                Err(c) => { $cpu.trap(c, va, $pc); return Err(Trap::Exception(c)); }
+            }
+        } else { va };
+        match $bus.$f(pa) {
             Ok(v) => v,
-            Err(_) => { $cpu.trap(exc::LOAD_ACCESS_FAULT, $addr, $pc); return Err(Trap::Exception(exc::LOAD_ACCESS_FAULT)); }
+            Err(f) => {
+                let c = if $cpu.privileged { fault_cause(f, false) } else { exc::LOAD_ACCESS_FAULT };
+                $cpu.trap(c, va, $pc); return Err(Trap::Exception(c));
+            }
         }
-    };
+    }};
 }
 macro_rules! st {
-    ($cpu:expr, $bus:expr, $f:ident, $addr:expr, $v:expr, $pc:expr) => {
-        if $bus.$f($addr, $v).is_err() {
-            $cpu.trap(exc::STORE_ACCESS_FAULT, $addr, $pc);
-            return Err(Trap::Exception(exc::STORE_ACCESS_FAULT));
+    ($cpu:expr, $bus:expr, $f:ident, $addr:expr, $v:expr, $pc:expr) => {{
+        let va = $addr;
+        let pa = if $cpu.privileged {
+            match $cpu.translate($bus, va, crate::mmu::Access::Store) {
+                Ok(p) => p,
+                Err(c) => { $cpu.trap(c, va, $pc); return Err(Trap::Exception(c)); }
+            }
+        } else { va };
+        if let Err(f) = $bus.$f(pa, $v) {
+            let c = if $cpu.privileged { fault_cause(f, true) } else { exc::STORE_ACCESS_FAULT };
+            $cpu.trap(c, va, $pc);
+            return Err(Trap::Exception(c));
         }
-    };
+    }};
 }
 
 /// Execute one instruction.
@@ -76,6 +94,9 @@ fn clic_take<B: Bus>(cpu: &mut Cpu, bus: &mut B, irq: u32, pc: u32) -> StepOutco
 /// Execute one slow-path event and retain its exact fetch window and trap timing.
 pub fn step_outcome<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> StepOutcome {
     let pc = cpu.pc;
+    if cpu.privileged {
+        if let Some(o) = priv_irq(cpu, bus, pc) { return o; }
+    } else
     // The SoC's INTC decides enable/priority and hands us the line (`Core::set_irq`); the CPU
     // only gates on mstatus.MIE, or with a CLIC on MIE and its own level too.
     if cpu.waiting || cpu.mie_enabled() {
@@ -123,12 +144,23 @@ pub fn step_outcome<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> StepOutcome {
     }
 
     bus.note_pc(pc);
-    let bytes = match bus.fetch(pc) {
-        Ok(b) => b,
-        Err(_) => {
-            cpu.insn_count += 1; cpu.cycle_count += 1;
-            cpu.trap(exc::INSN_ACCESS_FAULT, pc, pc);
-            return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(exc::INSN_ACCESS_FAULT)), control: None };
+    let bytes = if cpu.privileged && cpu.translating(crate::mmu::Access::Fetch) {
+        match fetch_translated(cpu, bus, pc) {
+            Ok(b) => b,
+            Err((cause, tval)) => {
+                cpu.insn_count += 1; cpu.cycle_count += 1;
+                cpu.trap(cause, tval, pc);
+                return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(cause)), control: None };
+            }
+        }
+    } else {
+        match bus.fetch(pc) {
+            Ok(b) => b,
+            Err(_) => {
+                cpu.insn_count += 1; cpu.cycle_count += 1;
+                cpu.trap(exc::INSN_ACCESS_FAULT, pc, pc);
+                return StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Exception(exc::INSN_ACCESS_FAULT)), control: None };
+            }
         }
     };
     let i = decode_for(cpu.isa(), pc, bytes);
@@ -142,6 +174,62 @@ pub fn step_outcome<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> StepOutcome {
         Err(trap) => StepKind::TrapDuring(trap),
     };
     StepOutcome { pc, next_pc: cpu.pc, bytes: Some(bytes), length: i.len, kind, control }
+}
+
+/// Fetch through Sv32; a 32-bit instruction in the last halfword of a page takes its upper
+/// half from the next page, which may fault on its own (tval = that address).
+fn fetch_translated<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32) -> Result<[u8; 4], (u32, u32)> {
+    use crate::mmu::Access;
+    let pa = cpu.translate(bus, pc, Access::Fetch).map_err(|c| (c, pc))?;
+    let mut b = bus.fetch(pa).map_err(|_| (exc::INSN_ACCESS_FAULT, pc))?;
+    if pc & 0xfff == 0xffe && b[0] & 3 == 3 {
+        let hi = pc.wrapping_add(2);
+        let pa2 = cpu.translate(bus, hi, Access::Fetch).map_err(|c| (c, hi))?;
+        let b2 = bus.fetch(pa2).map_err(|_| (exc::INSN_ACCESS_FAULT, hi))?;
+        b[2] = b2[0]; b[3] = b2[1];
+    }
+    Ok(b)
+}
+
+/// The candidate the SoC presents carries this bit when its CLIC mode is S (`clicintattr`
+/// mode 01): it is taken in S, gated by sstatus.SIE and the S level and threshold.
+pub const CLIC_IRQ_SMODE: u32 = 1 << 17;
+
+/// Interrupts on a core with S and U (the S31 Linux profile). An M-mode CLIC interrupt is
+/// taken whenever the hart is below M, or in M with MIE and a level above `mil`/`mintthresh`;
+/// an S-mode one below S, or in S with SIE and a level above `sil`/`sintthresh`, never in M.
+/// Any presented candidate ends a WFI.
+#[inline(always)]
+fn priv_irq<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32) -> Option<StepOutcome> {
+    use crate::state::{mstatus, privilege};
+    let line = cpu.irq?;
+    cpu.waiting = false;
+    let level = (line >> CLIC_IRQ_LEVEL_SHIFT) & 0xff;
+    if line & CLIC_IRQ_SMODE != 0 {
+        let take = cpu.priv_mode < privilege::SUPERVISOR
+            || (cpu.priv_mode == privilege::SUPERVISOR && cpu.mstatus & mstatus::SIE != 0 && level > cpu.sil.max(cpu.sintthresh));
+        if !take { return None; }
+        let (l, id) = (line & 0x1f, (line & 0x1f) + CLIC_EXT_OFFSET);
+        cpu.insn_count += 1; cpu.cycle_count += 1;
+        cpu.trap_priv(0x8000_0000 | id, 0, pc, Some(true));
+        cpu.sil = level;
+        return Some(StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(l)), control: None });
+    }
+    let take = cpu.priv_mode < privilege::MACHINE
+        || (cpu.mie_enabled() && level > cpu.mil.max(cpu.mintthresh));
+    if !take { return None; }
+    let prev = cpu.priv_mode;
+    if cpu.clic_mode() {
+        let o = clic_take(cpu, bus, line, pc);
+        cpu.mstatus = (cpu.mstatus & !mstatus::MPP) | (prev << 11);
+        cpu.priv_mode = privilege::MACHINE;
+        return Some(o);
+    }
+    let l = line & 0x1f;
+    cpu.insn_count += 1; cpu.cycle_count += 1;
+    cpu.trap_priv(0x8000_0000 | (l + CLIC_EXT_OFFSET), 0, pc, Some(false));
+    cpu.mil = level;
+    Some(StepOutcome { pc, next_pc: cpu.pc, bytes: None, length: 0, kind: StepKind::TrapBefore(Trap::Interrupt(l)), control: None })
 }
 
 #[inline]
@@ -277,10 +365,39 @@ pub(crate) fn exec_insn_inline<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn, pc:
         | EspMovxWSar | EspMovxRSar | EspMovxWCfg | EspMovxRCfg | EspMovi32A => return crate::pie::exec(cpu, bus, i, pc),
         EspLpSetup | EspLpSetupi | EspLpStarti | EspLpEndi | EspLpCount | EspLpCounti => return crate::hwlp::exec(cpu, i, pc),
 
-        Ecall => { cpu.trap(exc::ECALL_M, 0, pc); return Err(Trap::Exception(exc::ECALL_M)); }
+        Ecall => {
+            let c = if cpu.privileged { [exc::ECALL_U, exc::ECALL_S, exc::ECALL_S, exc::ECALL_M][cpu.priv_mode as usize & 3] } else { exc::ECALL_M };
+            cpu.trap(c, 0, pc); return Err(Trap::Exception(c));
+        }
         Ebreak => { cpu.trap(exc::BREAKPOINT, pc, pc); return Err(Trap::Ebreak(pc)); }
-        Mret => { cpu.mret(); return Ok(()); }
-        Wfi => { cpu.waiting = true; }
+        Mret => {
+            if cpu.privileged && cpu.priv_mode != crate::state::privilege::MACHINE { cpu.trap(exc::ILLEGAL_INSN, i.raw, pc); return Err(Trap::Exception(exc::ILLEGAL_INSN)); }
+            cpu.mret(); return Ok(());
+        }
+        Sret => {
+            use crate::state::{mstatus, privilege};
+            if !cpu.privileged || cpu.priv_mode == privilege::USER
+                || (cpu.priv_mode == privilege::SUPERVISOR && cpu.mstatus & mstatus::TSR != 0) {
+                cpu.trap(exc::ILLEGAL_INSN, i.raw, pc); return Err(Trap::Exception(exc::ILLEGAL_INSN));
+            }
+            cpu.sret(); return Ok(());
+        }
+        SfenceVma => {
+            use crate::state::{mstatus, privilege};
+            if !cpu.privileged || cpu.priv_mode == privilege::USER
+                || (cpu.priv_mode == privilege::SUPERVISOR && cpu.mstatus & mstatus::TVM != 0) {
+                cpu.trap(exc::ILLEGAL_INSN, i.raw, pc); return Err(Trap::Exception(exc::ILLEGAL_INSN));
+            }
+            cpu.tlb.flush();
+        }
+        Wfi => {
+            use crate::state::{mstatus, privilege};
+            if cpu.privileged && ((cpu.priv_mode == privilege::USER)
+                || (cpu.priv_mode == privilege::SUPERVISOR && cpu.mstatus & mstatus::TW != 0)) {
+                cpu.trap(exc::ILLEGAL_INSN, i.raw, pc); return Err(Trap::Exception(exc::ILLEGAL_INSN));
+            }
+            cpu.waiting = true;
+        }
 
         Csrrw | Csrrs | Csrrc | Csrrwi | Csrrsi | Csrrci => {
             let n = immu;
@@ -294,6 +411,10 @@ pub(crate) fn exec_insn_inline<B: Bus>(cpu: &mut Cpu, bus: &mut B, i: &Insn, pc:
             }
             // the loop CSRs are illegal with the hardware loops Off (ESP32-P4 TRM 2.7.1.3)
             if cpu.has_hwlp() && cpu.hwlp_state & 3 == 0 && crate::hwlp::is_loop_csr(n) { return Err(crate::hwlp::off(cpu, i.raw, pc)); }
+            if cpu.privileged && cpu.csr_illegal(n, matches!(i.op, Csrrw | Csrrwi) || i.rs1 != 0) {
+                if std::env::var_os("RV_TRACE_CSR").is_some() { eprintln!("[rv] illegal csr {n:#x} at {pc:#x} priv={}", cpu.priv_mode); }
+                cpu.trap(exc::ILLEGAL_INSN, i.raw, pc); return Err(Trap::Exception(exc::ILLEGAL_INSN));
+            }
             let src = if matches!(i.op, Csrrwi | Csrrsi | Csrrci) { i.rs1 as u32 } else { a };
             // A read is only skipped for csrrw with rd = x0; a write only for set/clear with a
             // zero source operand — which is how firmware reads a CSR without disturbing it.

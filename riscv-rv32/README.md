@@ -15,7 +15,11 @@ this code. It is private to this import and is not used by existing sbc-emu mach
 the main `emu-core` package is unchanged. Keeping this small compatibility layer avoids
 rewriting the imported implementation and tests during the initial import.
 
-This is **RV32 machine-mode code**, not an RV64 Linux CPU: it has no S/U privilege
-modes, Sv39 MMU, SBI, standard PLIC/CLINT or D extension. Those belong to the later RV64
-work. Local integration changes are limited to workspace/Cargo metadata and attribution;
-the instruction implementation and tests otherwise retain the upstream source.
+The nested support package now lives in `../espressif/emu-core` (package `esp32sim-emu-core`),
+shared with the vendored ESP32-S31 SoC.
+
+Changes in sbc-emu: the S31 profile (`Cpu::new_esp32s31`, `Cpu::privileged`) adds M/S/U
+privilege, trap delegation, `sret`, `sfence.vma`, Sv32 translation (`src/mmu.rs`) and the S31's
+CLIC-mode `scause`/`sret`, enough for Espressif's OpenSBI, U-Boot and Linux
+(`docs/esp32s31.md`). The C3, C6 and P4 profiles keep their machine-mode-only behaviour. It is
+still RV32 only: no RV64, Sv39, standard PLIC/CLINT or D extension.
