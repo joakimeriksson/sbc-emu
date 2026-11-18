@@ -14,3 +14,5 @@ rk3588 = { path = "../rk3588" }
 allwinner-h3 = { path = "../allwinner-h3" }
 arm-a32 = { path = "../arm-a32" }
 rockchip-rk3288 = { path = "../rockchip-rk3288" }
+starfive-jh7110 = { path = "../starfive-jh7110" }
+riscv64 = { path = "../riscv64" }

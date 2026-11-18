@@ -113,6 +113,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "riscv64"
+version = "0.0.1"
+
+[[package]]
 name = "rk3588"
 version = "0.0.1"
 dependencies = [
@@ -142,9 +146,11 @@ dependencies = [
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "riscv64",
  "rk3588",
  "rockchip-rk3288",
  "sbc-machine",
+ "starfive-jh7110",
  "v3d",
 ]
 
@@ -167,11 +173,21 @@ dependencies = [
  "emu-core",
  "rk3588",
  "rockchip-rk3288",
+ "starfive-jh7110",
 ]
 
 [[package]]
 name = "sbc-net"
 version = "0.0.1"
+
+[[package]]
+name = "starfive-jh7110"
+version = "0.0.1"
+dependencies = [
+ "emu-core",
+ "peripherals",
+ "riscv64",
+]
 
 [[package]]
 name = "v3d"

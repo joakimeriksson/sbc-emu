@@ -1,0 +1,8 @@
+# Orange Pi RV: reboot and power-off through OpenSBI's SRST and the AXP15060 PMIC on I2C5.
+wait-serial orangepi-rv#
+serial echo FIRST_BOOT; reboot -f\n
+wait-serial FIRST_BOOT
+wait-serial OpenSBI v1
+wait-serial orangepi-rv#
+serial echo SECOND_BOOT; poweroff -f\n
+wait-serial SECOND_BOOT
