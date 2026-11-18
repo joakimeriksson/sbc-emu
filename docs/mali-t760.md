@@ -46,9 +46,9 @@ sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/pa
     # or --script scripts/mali-t760-gles2.txt               # 25 scenes vs softpipe
 ```
 
-The fixture builds `gles2test` on the emulated Orange Pi One: gcc's driver finds none of
-its programs on the RK3288 yet (it runs on the `arm-a32` interpreter there, with the JIT
-on the Orange Pi One), which is an open CPU-side issue.
+The fixture builds `gles2test` on the emulated Orange Pi One. gcc runs on the RK3288 too,
+but with `init=/bin/bash` the shell's default `PATH` is not exported: gcc then cannot
+locate itself and reports that it cannot execute `cc1`. `export PATH` first.
 
 ## Debugging
 
