@@ -89,7 +89,7 @@ Compatibility labels in the plan's terms (per-feature evidence above; nothing el
 | HDMI0 | encoder, PHY, DVP clocks/resets, packet RAM, scheduler; MAI audio (IEC 958 subframes through DMA on DREQ 10); hot-plug from the always-on L2 interrupt controller; CEC registers | `vc4`, `clk-bcm2711-dvp`, `irq-brcmstb-l2` |
 | DDC | brcmstb BSC controller (polled) with an EDID EEPROM: 1920×1080 preferred, 1280×720, 1024×768…, CEA block with HDMI and LPCM audio | `i2c-brcmstb` |
 | TXP | the transposer's registers (writeback; never busy) | `vc4` |
-| V3D | hub + core registers, GPU MMU, control-list executors (binning, rendering), QPUs (interpreted, 16 lanes), TMU, TLB, TFU, CSD; jobs finish when started, their interrupt follows after the host time they took (`SBC_GPU_TIME` scales it) | `v3d`, Mesa `v3d`/`v3dv` |
+| V3D | hub + core registers, GPU MMU, control-list executors (binning, rendering), QPUs (interpreted, 16 lanes; tiles and vertices shaded on up to 16 host threads), TMU, TLB, TFU, CSD; jobs finish when started, their interrupt follows after the host time they took (`SBC_GPU_TIME` scales it) | `v3d`, Mesa `v3d`/`v3dv` |
 | Firmware framebuffer | `simple-framebuffer` in the GPU memory carve-out until `vc4` takes over (the only display with `--display fb`) | `simplefb`, fbcon |
 | Ethernet | GENET v5 (DMA rings, status blocks, INTRL2), UniMAC MDIO, BCM54213PE PHY | `bcmgenet`, `unimac-mdio`, Broadcom PHY |
 | Wi-Fi | second SD host (SDIO) + CYW43455: CCCR/FBR/CIS, backplane, EROM, SDIO core, emulated FullMAC; open `sbc-emu` and WPA2-PSK `sbc-emu-wpa2` (passphrase `raspberry-pi`) | `sdhci-iproc`, `brcmfmac`, `brcmfmac-wcc` |

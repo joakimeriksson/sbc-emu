@@ -197,7 +197,9 @@ fn convert_int(raw: u32, bits: u32, signed: bool, norm: bool, as_int: bool) -> u
 
 /// Run the coordinate (`coord`) or vertex shader of a draw over `verts`; returns the VPM
 /// output rows of each vertex.
-pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coord: bool, verts: &[(u32, u32)]) -> Vec<Vec<u32>> {
+/// `tidx`: the thread index the shader reads (Mesa's register spills go to a scratch slot per
+/// thread index, so shaders running at the same time need different ones).
+pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coord: bool, verts: &[(u32, u32)], tidx: u32) -> Vec<Vec<u32>> {
     let r = &d.rec;
     let (pc, unif, final_sec, separate, out_size) = if coord {
         (r.coordinate_shader_code_address, r.coordinate_shader_uniforms_address, r.coordinate_shader_start_in_final_thread_section,
@@ -235,6 +237,7 @@ pub fn run_vs(m: &mut Gmem, code: &mut Code, insns: &mut u64, d: &DrawState, coo
         }
         let in_rows = rows.iter().map(|r| r.len()).max().unwrap_or(0);
         let mut t = Thread::new(pc, unif, final_sec);
+        t.tidx = tidx;
         t.valid = if chunk.len() == LANES { 0xffff } else { (1u16 << chunk.len()) - 1 };
         for l in chunk.len()..LANES { t.msf[l] = 0; }
         let in_seg = if separate { in_rows.max(1) } else { 0 };
@@ -472,7 +475,7 @@ fn draw(st: &mut State, out: &mut Binned, m: &mut Gmem, code: &mut Code, insns: 
         }
     }
     // coordinate shader: clip-space positions (and point sizes)
-    let cs = run_vs(m, code, insns, &d, true, &verts);
+    let cs = crate::par::run_vs(m, code, insns, &d, true, &verts);
     let psize = d.rec.point_size_in_shaded_vertex_data;
     let pos: Vec<[f32; 4]> = cs.iter().map(|o| [0, 1, 2, 3].map(|k| f32::from_bits(*o.get(k).unwrap_or(&0)))).collect();
     let psz: Vec<f32> = cs.iter().map(|o| if psize { f32::from_bits(*o.get(6).unwrap_or(&0)) } else { d.point_size }).collect();
