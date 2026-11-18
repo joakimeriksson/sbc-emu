@@ -18,6 +18,7 @@ pub mod dwmmc;
 pub mod emmc;
 pub mod gpio;
 pub mod i2c;
+pub mod i2s;
 mod machine;
 pub mod rga;
 pub mod vop;
