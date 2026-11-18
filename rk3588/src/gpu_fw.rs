@@ -9,6 +9,7 @@ pub struct Firmware {
     output: u64,
     groups: u32,
     stride: u64,
+    failed_queues: std::collections::BTreeSet<(u32, u32)>,
 }
 fn read(m: &AddressSpace, ram: &[u8], addr: u64) -> Result<u32, Fault> {
     let mut b = [0; 4];
@@ -21,6 +22,7 @@ fn write(m: &AddressSpace, ram: &mut [u8], addr: u64, v: u32) -> Result<(), Faul
 impl Firmware {
     pub fn boot(&mut self, m: &AddressSpace, ram: &mut [u8]) -> Result<(), Fault> {
         self.running = false;
+        self.failed_queues.clear();
         let input = read(m, ram, SHARED + 8)? as u64;
         let output = read(m, ram, SHARED + 12)? as u64;
         let groups = read(m, ram, SHARED + 16)?;
@@ -79,6 +81,9 @@ impl Firmware {
             if (old ^ ack) & read(m, ram, input + 4)? != 0 {
                 irq |= 1 << g;
             }
+            if req & 7 == 0 {
+                self.failed_queues.retain(|&(group, _)| group != g);
+            }
             if req & 7 != 1 && req & 7 != 3 {
                 continue;
             }
@@ -99,8 +104,15 @@ impl Firmware {
                 let ci = read(m, ram, cs + 4)? as u64;
                 let co = read(m, ram, cs + 8)? as u64;
                 let cr = read(m, ram, ci)?;
-                write(m, ram, co, cr & 0xf17)?;
+                let previous = read(m, ram, co)?;
+                write(m, ram, co, (previous & !0xf17) | (cr & 0xf17))?;
                 if cr & 7 != 1 {
+                    if cr & 7 == 0 {
+                        self.failed_queues.remove(&(g, q));
+                    }
+                    continue;
+                }
+                if self.failed_queues.contains(&(g, q)) {
                     continue;
                 }
                 let r64 = |r: &[u8], a: u64| -> Result<u64, Fault> {
@@ -137,6 +149,7 @@ impl Firmware {
                         write(m, ram, co + 132, 0x40)?;
                         let ca = read(m, ram, co)?;
                         write(m, ram, co, ca ^ (1 << 30))?;
+                        self.failed_queues.insert((g, q));
                         failed = true;
                         let bits = read(m, ram, output + 12)?;
                         write(m, ram, output + 12, bits ^ (1 << q))?;
@@ -294,6 +307,12 @@ mod tests {
                 read(&m, &r, SHARED + 0x8000).unwrap() & (1 << 30) != 0,
                 !done
             );
+            if !done {
+                let fatal = read(&m, &r, SHARED + 0x8000).unwrap();
+                assert_eq!(f.queues(&spaces, &mut r).unwrap(), 0);
+                assert_eq!(read(&m, &r, SHARED + 0x8000).unwrap(), fatal);
+                assert_eq!(read(&m, &r, SHARED + 0xa000).unwrap(), 0);
+            }
         }
     }
 }
