@@ -65,3 +65,36 @@ to Mesa: descriptor value 0 selects 64 registers per thread, and value 2 selects
 bounded to 1,024 local invocations per group, 65,536 total invocations and an
 aggregate instruction budget. Workgroup offsets, merging, shared memory and
 barriers remain unsupported; invocations execute sequentially.
+
+### Mesa GLES clear bring-up
+
+`tools/panthor-demo.py --egl --image <mesa-equipped-armbian.img> --output out/panthor-egl.log`
+boots Linux, uploads `tests/gpu/panthor-egl.py`, and requires Mesa's Mali/Panfrost
+renderer. The guest creates a GBM/EGL GLES2 context and an RGBA8 framebuffer,
+submits consecutive clears, waits for completion, and checks every pixel through
+`glReadPixels`. Software rendering is rejected. This mode writes a serial log,
+not a PNG. The supplied image is opened with the normal copy-on-write behavior.
+
+The test image needs Python 3 and the arm64 `libegl-mesa0`, `libgles2`, and
+`libgbm1` packages plus their dependencies. The reference setup uses the pinned
+Armbian kernel/firmware with Debian Trixie's Mesa 25.0.7-2+deb13u1; a separate,
+expanded 4 GiB image was used to leave enough room for its LLVM dependencies.
+The minimal unmodified Armbian fixture does not include these libraries.
+
+The command interpreter supports scoreboard selection and registration of the
+tiler heap and OOM handler used during Mesa initialization. Queue registers and
+registrations survive doorbells and ring wraps; queue stop, group termination or
+firmware reboot discards them. A changed ring or VM requires that reset before
+reusing a queue. Geometry allocation
+and execution of the OOM handler remain unsupported. Successful
+`STORE_STATE.ERROR_STATUS` writes all eight bytes expected by Mesa's synchronous
+debug check. Faulted queues retain their fatal event and stop replaying work until
+Linux stops the queue or terminates its group.
+
+The fragment clear path accepts Mesa's single linear RGBA8 target, including the
+optional CRC-only extension and its additional framebuffer flags. Whole 16x16
+checksum tiles use the descriptor's supplied clear checksum; CRC reads do not
+elide writes in the emulator. Partial CRC tiles, depth/stencil, compression,
+multiple render targets, vertex/fragment shader draws and display scanout remain
+unsupported. `SBC_MALI_TRACE=1` logs command words and framebuffer parameters for
+bring-up. Passing this clear test does not establish general OpenGL support.
