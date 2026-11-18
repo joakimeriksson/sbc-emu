@@ -297,6 +297,55 @@ impl Cpu {
         Ok(0)
     }
 
+    /// ARMv8 load-acquire/store-release, A32 encoding (`cccc 0001 1 sz L Rn Rt 11 x0 1001 Rt`):
+    /// the exclusive forms are LDREX/STREX with ordering, the others plain loads and stores.
+    pub(crate) fn acquire_release(&mut self, bus: &mut dyn Bus, insn: u32) -> Result<(), Trap> {
+        let undefined = Err(Trap::Unimplemented(self.cur_pc as u64, insn));
+        let (load, excl, size) = (insn & (1 << 20) != 0, insn & (1 << 9) != 0, (insn >> 21) & 3);
+        if excl {
+            // the LDREX/STREX encoding (bits 9:8 = 11), between barriers
+            if !load {
+                self.barrier();
+            }
+            let r = self.execute(bus, self.cur_pc as u64, insn | 0x100);
+            if load {
+                self.barrier();
+            }
+            return r;
+        }
+        let (rn, rt) = ((insn >> 16) & 15, if load { (insn >> 12) & 15 } else { insn & 15 });
+        let bits = [4, 0, 1, 2][size as usize]; // 00 word, 01 reserved (D), 10 byte, 11 halfword
+        if bits == 0 || rn == 15 || rt == 15 || (if load { insn & 15 } else { (insn >> 12) & 15 }) != 15 {
+            return undefined;
+        }
+        let address = self.r[rn as usize];
+        use crate::mmu::Access;
+        if load {
+            let value = match bits {
+                1 => self.mem_read8(bus, address, Access::Read).map(u32::from),
+                2 => self.mem_read16(bus, address).map(u32::from),
+                _ => self.mem_read32(bus, address, Access::Read),
+            };
+            match value {
+                Ok(v) => self.r[rt as usize] = v,
+                Err((va, status)) => return Err(self.data_abort(va, status, false)),
+            }
+            self.barrier();
+        } else {
+            self.barrier();
+            let value = self.r[rt as usize];
+            let r = match bits {
+                1 => self.mem_write8(bus, address, value as u8),
+                2 => self.mem_write16(bus, address, value as u16),
+                _ => self.mem_write32(bus, address, value),
+            };
+            if let Err((va, status)) = r {
+                return Err(self.data_abort(va, status, true));
+            }
+        }
+        Ok(())
+    }
+
     /// A barrier (DMB/DSB, or a CP15 barrier): a host fence when cores run in parallel.
     pub(crate) fn barrier(&self) {
         if self.mt {

@@ -276,8 +276,8 @@ no CSI camera (the webcam is USB); no USB 3 devices (the USB 3 root ports stay e
 hubs, no isochronous transfers; Bluetooth has no connections (the sensor only advertises) and
 no classic devices; Wi-Fi has no radio model (emulated firmware host interface, open and
 WPA2-PSK networks); only the PCM's DREQ paces DMA (the other peripherals complete at once);
-32-bit programs get ARMv7's instruction set only (none of ARMv8's AArch32 additions such as
-LDA/STL, VRINT or CRC32; the ID registers say so) and the 32-bit core's VFP is not bit-exact
+32-bit programs get ARMv7's instruction set plus ARMv8's load-acquire/store-release and SEVL
+(not VSEL, VRINT, VMAXNM or CRC32; the ID registers say so) and the 32-bit core's VFP is not bit-exact
 (no flush-to-zero, no cumulative exception flags);
 no LSE instructions, crypto only with `--cpu-crypto` (the BCM2711's A72 has neither; the ID
 registers say so); the native JIT needs an AArch64 host and is still well below a real Pi 4
@@ -321,7 +321,8 @@ user program may read (thread ID, generic timer, CP15 barriers). Every exception
 page fault, undefined instruction, interrupt) brings the registers back and is taken to the
 64-bit kernel with an AArch32 syndrome, as on the hardware (`arm-a64/src/aarch32.rs`,
 `arm-a32/src/el0.rs`). The 32-bit core's own JIT (A32/T32 to A64) compiles hot 32-bit code
-(`SBC_JIT32=0` interprets it): a BusyBox shell loop of 20,000 iterations takes 0.5 s instead of
+(`SBC_JIT32=0` interprets it; `SBC_AARCH32_UNDEF=1` prints every UNDEFINED instruction of a 32-bit
+program, which the guest otherwise only sees as SIGILL): a BusyBox shell loop of 20,000 iterations takes 0.5 s instead of
 9.5 s, a gzip of 1.3 MiB 0.4 s instead of 7 s, close to the same 64-bit programs. With
 `--threads multi` the 32-bit store-exclusive is a host compare-and-swap and barriers are host
 fences, as for 64-bit code.
@@ -329,6 +330,7 @@ fences, as for 64-bit code.
 | | Evidence |
 |---|---|
 | Syndromes, register mapping, interrupts, snapshots | `arm-a64/tests/aarch32_el0.rs`: an EL1 kernel and a 32-bit program with A32 and 16-bit Thumb SVCs, UNDEFINED, a data abort, a trapped CP15 timer read, TPIDRURO/URW, VFP registers in V0–V15, exclusives; an IRQ at the AArch32 vector; a snapshot taken inside the program resumes it; JIT-compiled 32-bit code ends exactly as interpreted (registers, memory, instruction count); two host threads add 100,000 to one counter with LDREX/STREX, interpreted and compiled |
+| 32-bit Raspberry Pi OS | the unmodified Raspberry Pi OS Lite armhf image (2026-10-06, trixie; ARMv6 userland on the 64-bit `kernel8.img`, as on a Pi 4): first-boot wizard, login, `getconf LONG_BIT` = 32, Python 3 and OpenSSL 3.5 (its NEON code) give correct digests, DHCP and ping, `apt-get update` and `apt-get install` from the Raspbian archive. Its atomics go through the kernel's kuser helpers, which use ARMv8's STLEX |
 | Debian armhf BusyBox under the Pi kernel | Debian 13's `busybox-static` (Thumb-2, hard float) in an initramfs next to the arm64 BusyBox: shell loops, background jobs, `sha256sum` and a gzip round trip equal to the arm64 tools' results |
 | A whole armhf Debian userland | Raspberry Pi OS with Armbian's Orange Pi One image (Debian 13 armhf) as a USB stick: `chroot` into it runs its bash, perl, `dpkg` and Python 3, with `--threads single` and `multi`: SHA-256, zlib, integer and floating-point results equal to the arm64 Python's; 8 Python threads × 20,000 increments under one lock give 160,000; four shells counting under `flock` give 400; no kernel warnings |
 

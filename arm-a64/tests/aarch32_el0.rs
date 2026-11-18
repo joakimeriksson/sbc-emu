@@ -353,3 +353,95 @@ fn two_threads_increment_one_counter_with_ldrex_strex() {
         assert_eq!(ram.read32(DATA).unwrap(), 100_000, "jit = {jit}");
     }
 }
+
+/// ARMv8's load-acquire/store-release in A32 and T32, every size, and the kernel's
+/// `__kuser_cmpxchg` sequence (LDREX, STLEXEQ) that ARMv6 userlands use for atomics.
+const ACQ_REL: &str = "
+    .arch armv8-a
+    movw r1, #0
+    movt r1, #0x20
+    movw r2, #0x1234
+    movt r2, #0x89ab
+    stl r2, [r1]
+    lda r3, [r1]               // r3 = 0x89ab1234
+    stlb r2, [r1]
+    ldab r4, [r1]              // 0x34
+    add r5, r1, #8
+    stlh r2, [r5]
+    ldah r6, [r5]              // 0x1234
+1:  ldaex r7, [r1]
+    add r7, r7, #1
+    stlex r8, r7, [r1]
+    cmp r8, #0
+    bne 1b
+    add r9, r1, #16
+2:  ldaexd r10, r11, [r9]
+    adds r10, r10, #5
+    adc r11, r11, #0
+    stlexd r8, r10, r11, [r9]
+    cmp r8, #0
+    bne 2b
+    add r12, r1, #32           // kuser_cmpxchg(old r0 = 0, new r1' = 77, ptr r12)
+    mov r0, #0
+    mov r6, #77
+3:  ldrex r3, [r12]
+    subs r3, r3, r0
+    stlexeq r3, r6, [r12]
+    teqeq r3, #1
+    beq 3b
+    dmb ish
+    sevl
+    wfe                        // SEVL set the event: no wait
+    adr r4, thumb
+    orr r4, r4, #1
+    blx r4
+    mov r7, #1
+    svc #0
+    .thumb
+thumb:
+    add r5, r1, #40
+    stl r2, [r5]
+    lda r0, [r5]
+4:  ldaexh r6, [r5]
+    adds r6, r6, #1
+    stlexh r8, r6, [r5]
+    cmp r8, #0
+    bne 4b
+    ldaexb r9, [r5]
+    stlexb r8, r9, [r5]
+    bx lr";
+
+#[test]
+fn load_acquire_store_release_in_a32_and_t32() {
+    for jit in [false, true] {
+        if jit && !arm_a64::jit::available() {
+            continue;
+        }
+        let mut ram = FlatRam::new(0, RAM);
+        ram.load(LOAD, &assemble(KERNEL)).unwrap();
+        ram.load(USER, &assemble_a32(ACQ_REL)).unwrap();
+        ram.write64(DATA + 16, 0x1_ffff_fffe).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.brk_to_host = true;
+        if jit {
+            cpu.jit = arm_a64::jit::Jit::with(1 << 20, 1);
+            cpu.chain_until = u64::MAX;
+        }
+        cpu.ram = ram.mem.as_mut_ptr();
+        cpu.ram_len = ram.mem.len() as u64;
+        cpu.el = 1;
+        cpu.pc = LOAD;
+        cpu.sp = [0x40_0000, 0x50_0000, 0x60_0000, 0x70_0000];
+        cpu.sys.cpacr_el1 = 3 << 20;
+        run(&mut cpu, &mut ram);
+        assert_eq!(cpu.esr[1] >> 26, 0x11, "ended by the final SVC, not UNDEFINED (jit {jit})");
+        assert_eq!(cpu.x[0], 0x89ab_1234, "T32 LDA");
+        assert_eq!(cpu.x[3], 0, "cmpxchg succeeded");
+        assert_eq!(ram.read32(DATA + 32).unwrap(), 77);
+        assert_eq!(ram.read64(DATA + 16).unwrap(), 0x2_0000_0003, "LDAEXD/STLEXD with carry");
+        assert_eq!(ram.read32(DATA).unwrap(), 0x89ab_1235, "LDAEX/STLEX on the word STLB wrote into");
+        assert_eq!(ram.read16(DATA + 8).unwrap(), 0x1234, "STLH");
+        assert_eq!(ram.read16(DATA + 40).unwrap(), 0x1235, "T32 LDAEXH/STLEXH");
+        assert_eq!(cpu.x[8], 0, "T32 STLEXB");
+    }
+}
