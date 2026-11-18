@@ -47,7 +47,7 @@ Who is working where right now (update this table when you start or finish somet
 | RK3288 panel board profile on the RK3288 (`docs/panel-board.md`); next: Broadcom SDIO Wi-Fi | `rockchip-rk3288/` (display: `vop.rs`, `dsi.rs`; RGA: `rga.rs`; GPIO; the panel board's own devices), `cli/src/panelboard.rs`, `docs/panel-board*.md` | Claude Code (the Orange Pi One session) |
 | Shared device models (`peripherals/`: GIC, UART, I²C chips, timebase); used by the H3 and RK3288 machines, open to every board | `peripherals/` | Claude Code (the Orange Pi One session); changes affect the H3 and RK3288 boards |
 | Mali-T760 (Midgard) GPU of the RK3288 (`docs/mali-t760.md`) | `midgard/`, its hookup in `rockchip-rk3288/src/machine.rs`, `scripts/mali-t760-*` | Claude Code (the Orange Pi One session) |
-| RISC-V CPU import and future RV64 core | `riscv-rv32/` | OpenCode (`opencode/riscv-core`) |
+| RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); RV64 boards later | `riscv-rv32/`, `espressif/` | Claude Code (taken over from OpenCode) |
 
 ## Never
 

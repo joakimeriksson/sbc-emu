@@ -1,8 +1,8 @@
 [package]
-name = "esp32sim-riscv-emu-core"
+name = "esp32sim-emu-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Private esp32sim 32-bit core API retained for the imported RV32 interpreter"
+description = "esp32sim 32-bit bus/core API used by the imported RV32 core and the ESP32-S31 machine"
 
 [dependencies]
