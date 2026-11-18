@@ -24,7 +24,7 @@ use crate::sdio::SdioFunctions;
 use dongle::Dongle;
 use std::collections::VecDeque;
 
-pub use dongle::Station;
+pub use dongle::Network;
 
 /// SDIO IDs: Broadcom, BCM43455.
 pub const VENDOR: u16 = 0x02d0;
@@ -106,6 +106,8 @@ pub struct Bcm43455 {
     /// The emulated firmware, once the CPU runs.
     dongle: Option<Dongle>,
     mac: [u8; 6],
+    /// The access points the firmware will see.
+    networks: Vec<Network>,
     /// Frames to the host (SDPCM, complete) and the one being read.
     rx: VecDeque<Vec<u8>>,
     reading: Option<(Vec<u8>, usize)>,
@@ -145,6 +147,7 @@ impl Bcm43455 {
             ram: vec![0; RAM_SIZE as usize],
             dongle: None,
             mac,
+            networks: Network::defaults(),
             rx: VecDeque::new(),
             reading: None,
             tx: Vec::new(),
@@ -263,7 +266,7 @@ impl Bcm43455 {
             self.set_ram_word(shared + 4 * k, 0);
         }
         self.set_ram_word(RAM_SIZE - 4, RAM_BASE + shared);
-        self.dongle = Some(Dongle::new(self.mac, self.log));
+        self.dongle = Some(Dongle::new(self.mac, self.networks.clone(), self.log));
         self.sdiod[SD_TOHOSTMAILBOXDATA as usize / 4] = HMB_DATA_FWREADY | SDPCM_PROT_VERSION << 16;
         self.interrupt(I_HMB_HOST_INT);
     }
@@ -302,12 +305,12 @@ impl Bcm43455 {
         std::mem::take(&mut self.edge)
     }
 
-    /// Ethernet frames the dongle sends to the air (from the host's data channel).
+    /// Ethernet frames for the network (from the host's data channel).
     pub fn take_transmitted(&mut self) -> Vec<Vec<u8>> {
         self.dongle.as_mut().map(|d| std::mem::take(&mut d.to_air)).unwrap_or_default()
     }
 
-    /// An Ethernet frame from the air for the host.
+    /// An Ethernet frame from the network for the host.
     pub fn receive(&mut self, frame: &[u8]) {
         if let Some(d) = self.dongle.as_mut() {
             d.receive(frame);
@@ -315,12 +318,14 @@ impl Bcm43455 {
         self.flush();
     }
 
-    /// Advance the dongle's own work (scans, association) to `now_ms`.
-    pub fn tick(&mut self, now_ms: u64) {
-        if let Some(d) = self.dongle.as_mut() {
-            d.tick(now_ms);
-        }
-        self.flush();
+    /// The access points scans find (from the next firmware start).
+    pub fn set_networks(&mut self, networks: Vec<Network>) {
+        self.networks = networks;
+    }
+
+    /// The SSID of the network joined, if any.
+    pub fn joined(&self) -> Option<&str> {
+        self.dongle.as_ref()?.joined()
     }
 
     /// Move the dongle's outgoing messages into SDPCM frames for the host.

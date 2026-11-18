@@ -84,6 +84,9 @@ pub(crate) struct Profile<'a> {
     pub setup: &'a dyn Fn(&mut Machine),
     /// What the board's own boot loader changes in the device tree it passes on.
     pub fixup_dtb: fn(Vec<u8>) -> Result<Vec<u8>, String>,
+    /// The default `--net` mode (nat, local or none) when the board has a modelled network
+    /// interface; None: no network and no `--net`.
+    pub network: Option<&'static str>,
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -101,6 +104,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                      boot ROM SMP mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC; other devices are stubs",
             setup: &|_| {},
             fixup_dtb: Ok,
+            network: None,
         },
     )
 }
@@ -117,7 +121,16 @@ pub(crate) fn run_board(args: &[String], profile: &Profile) -> ExitCode {
 
 fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let tag = profile.tag;
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc"])?;
+    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc"];
+    if profile.network.is_some() {
+        options.push("--net");
+    }
+    serial_board::validate_options(args, &options)?;
+    let net = arg(args, "--net").or(profile.network).unwrap_or("none");
+    if !matches!(net, "nat" | "local" | "none") {
+        return Err("--net nat|local|none".into());
+    }
+    let trace_net = std::env::var_os("SBC_NET_LOG").is_some();
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     // Without --kernel, a card (--sd, else --emmc) is booted the way the board's firmware
     // would: armbianEnv.txt, zImage, the board DTB and uInitrd from the card's /boot.
@@ -162,6 +175,9 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         let mut m = Machine::with_ram_size(ram);
         (profile.setup)(&mut m);
         (profile.power)(&mut m.soc.periph, unix_now);
+        if net != "none" {
+            m.connect_network(net == "nat", trace_net);
+        }
         let disk = |d: &Option<crate::disk::SharedDisk>| d.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         m.soc.periph.mmc[devices::SDMMC].insert(disk(&sd));
         m.soc.periph.mmc[devices::EMMC].insert(disk(&emmc));

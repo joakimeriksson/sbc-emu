@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sbc-net = { path = "../sbc-net" }
 peripherals = { path = "../peripherals" }
 emu-core = { path = "../emu-core" }
 arm-a32 = { path = "../arm-a32" }

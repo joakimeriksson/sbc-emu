@@ -89,12 +89,15 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             power: Peripherals::attach_panel_board_power,
             banner: "experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12 (interpreter), GIC-400, UART2, \
                      CRU/GRF/PMU, VOP + MIPI DSI panel, SD/eMMC, I2C with the ACT8846 PMIC, SYR827/828 and HYM8563; \
-                     RGA, Mali-T760, ILI2116 touch and BCM43455 Wi-Fi; audio and the pads are not modelled yet",
+                     RGA, Mali-T760, ILI2116 touch and BCM43455 Wi-Fi (--net local|nat|none); audio and the pads are not modelled yet",
             setup: &|m| {
                 m.soc.display_rotation = rotation;
                 m.soc.display_name = "sbc-emu: RK3288 panel board";
             },
             fixup_dtb: enable_wifi,
+            // the virtual network only: with `--net nat` the vendor application reaches the
+            // internet (and its maker's servers) on its own
+            network: Some("local"),
         },
     )
 }

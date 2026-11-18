@@ -10,7 +10,7 @@
 //! | `syr82x` | Silergy SYR827/SYR828 regulators | panel board |
 //! | `hym8563` | Haoyu HYM8563 RTC | panel board |
 //! | `ili2116` | Ilitek ILI2116 touch controller | panel board |
-//! | `bcm43455` | Broadcom BCM43455 Wi-Fi on SDIO (brcmfmac): backplane, cores, TCM, SDPCM; an emulated dongle in place of the firmware | panel board |
+//! | `bcm43455` | Broadcom BCM43455 Wi-Fi on SDIO (brcmfmac): backplane, cores, TCM, SDPCM; an emulated FullMAC dongle in place of the firmware (scans, open and WPA2-PSK joins, Ethernet to a network) | panel board |
 //! | `sdio` | an SDIO card: CMD5/52/53, CCCR, FBR, CIS; the functions behind a trait | any SD host controller |
 //! | `timebase` | 24 MHz architectural timer ticks against nanoseconds | Allwinner H3, Rockchip RK3288 |
 //!

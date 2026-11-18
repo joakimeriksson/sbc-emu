@@ -19,6 +19,103 @@ fn writel(b: &mut Bcm43455, addr: u32, v: u32) {
     b.write_block(1, (addr & 0x7fff) | ACCESS_4B, true, &v.to_le_bytes());
 }
 
+/// A chip whose firmware runs, interrupts routed out of band.
+fn started() -> Bcm43455 {
+    let mut b = Bcm43455::new([2, 0, 0, 0, 0, 1]);
+    let arm_wrap = ARM_BASE + WRAP;
+    writel(&mut b, arm_wrap + BCMA_IOCTL, IOCTL_CPUHALT | IOCTL_CLK);
+    writel(&mut b, arm_wrap + BCMA_RESET_CTL, 0);
+    writel(&mut b, arm_wrap + BCMA_IOCTL, IOCTL_CLK);
+    assert!(b.running());
+    b
+}
+
+/// An SDPCM frame from the host on `channel`, sequence number `seq`.
+fn send(b: &mut Bcm43455, seq: u8, channel: u8, payload: &[u8]) {
+    let len = 12 + payload.len();
+    let mut f = (len as u16).to_le_bytes().to_vec();
+    f.extend_from_slice(&(!(len as u16)).to_le_bytes());
+    f.extend_from_slice(&[seq, channel, 0, 12, 0, 0, 0, 0]);
+    f.extend_from_slice(payload);
+    f.resize(len.div_ceil(64) * 64, 0);
+    b.write_block(2, 0x8000, true, &f);
+}
+
+/// A BCDC ioctl (a set when `set`), sequence number `seq`.
+fn ioctl(b: &mut Bcm43455, seq: u8, cmd: u32, set: bool, data: &[u8]) {
+    let mut p = Vec::new();
+    for w in [cmd, data.len() as u32, if set { 2 } else { 0 } | (seq as u32) << 16, 0] {
+        p.extend_from_slice(&w.to_le_bytes());
+    }
+    p.extend_from_slice(data);
+    send(b, seq, 0, &p);
+}
+
+/// Every frame waiting for the host: (channel, payload).
+fn drain(b: &mut Bcm43455) -> Vec<(u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    loop {
+        let mut head = [0u8; 4];
+        b.read_block(2, 0x8000, false, &mut head);
+        let len = u16::from_le_bytes([head[0], head[1]]) as usize;
+        if len == 0 {
+            return frames;
+        }
+        let mut rest = vec![0u8; len - 4];
+        b.read_block(2, 0x8000, false, &mut rest);
+        let doff = rest[3] as usize;
+        frames.push((rest[1] & 0x0f, rest[doff - 4..].to_vec()));
+    }
+}
+
+/// The event codes among frames from the host's point of view.
+fn events(frames: &[(u8, Vec<u8>)]) -> Vec<(u32, u32)> {
+    frames
+        .iter()
+        .filter(|(c, p)| *c == 1 && p.len() >= 4 + 14 + 10 + 16)
+        .map(|(_, p)| {
+            let m = &p[4 + 14 + 10..];
+            (u32::from_be_bytes(m[4..8].try_into().unwrap()), u32::from_be_bytes(m[8..12].try_into().unwrap()))
+        })
+        .collect()
+}
+
+/// A scan finds the access points; joining the open one carries Ethernet both ways.
+#[test]
+fn scan_join_and_data() {
+    let mut b = started();
+    let mut mask = b"event_msgs\0".to_vec();
+    mask.extend_from_slice(&[0xff; 24]);
+    ioctl(&mut b, 0, 263, true, &mask);
+    ioctl(&mut b, 1, 2, true, &[0; 4]); // up
+    let mut escan = b"escan\0".to_vec();
+    escan.extend_from_slice(&[1, 0, 0, 0, 1, 0, 0x34, 0x12]); // version, action, sync ID
+    ioctl(&mut b, 2, 263, true, &escan);
+    let frames = drain(&mut b);
+    assert_eq!(events(&frames), vec![(69, 8), (69, 8), (69, 0)], "two partial results, then done");
+    let bss = &frames.iter().find(|(c, _)| *c == 1).unwrap().1[4 + 14 + 10 + 48..];
+    assert_eq!(&bss[8..10], &0x1234u16.to_le_bytes(), "sync ID echoed");
+    assert_eq!(&bss[12 + 19..12 + 26], b"sbc-emu");
+    // join "sbc-emu": link up, then the SSID set
+    let mut ssid = 7u32.to_le_bytes().to_vec();
+    ssid.extend_from_slice(b"sbc-emu");
+    ssid.resize(36, 0);
+    ioctl(&mut b, 3, 26, true, &ssid);
+    let frames = drain(&mut b);
+    assert_eq!(events(&frames), vec![(16, 0), (0, 0)]);
+    assert_eq!(b.joined(), Some("sbc-emu"));
+    // a data frame out (BDC header, Ethernet), one in
+    let eth = [[0xff; 6].as_slice(), &[2, 0, 0, 0, 0, 1], &[0x08, 0x06], &[0; 28]].concat();
+    send(&mut b, 4, 2, &[[0x20, 0, 0, 0].as_slice(), &eth].concat());
+    assert_eq!(b.take_transmitted(), vec![eth.clone()]);
+    drain(&mut b); // the credit frame
+    b.receive(&eth);
+    assert_eq!(b.oob_level(), None, "in-band interrupts: no out-of-band level");
+    let frames = drain(&mut b);
+    assert_eq!(frames.len(), 1);
+    assert_eq!((frames[0].0, &frames[0].1[4..]), (2, eth.as_slice()));
+}
+
 /// brcmfmac's attach, download and first ioctl, in its order.
 #[test]
 fn attach_download_and_an_iovar() {

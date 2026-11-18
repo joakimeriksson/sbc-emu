@@ -117,12 +117,26 @@ impl Peripherals {
         }
     }
 
-    /// The Wi-Fi dongle's own work (scans, association, the network) up to `now_ms`.
-    pub fn tick_wifi(&mut self, now_ms: u64) {
-        if let Some(chip) = self.wifi() {
-            chip.tick(now_ms);
-            self.sync_wifi_irq();
+    /// Exchange the Wi-Fi chip's Ethernet frames with the network behind its access
+    /// points; true while it is joined (the network is then polled for replies).
+    pub fn exchange_wifi(&mut self, net: &mut sbc_net::net::VirtualNet, now_us: u64) -> bool {
+        let Some(chip) = self.wifi() else { return false };
+        let mut replies = Vec::new();
+        for frame in chip.take_transmitted() {
+            replies.extend(net.handle(&frame, now_us));
         }
+        let joined = chip.joined().is_some();
+        if joined {
+            replies.extend(net.poll(now_us));
+        }
+        if replies.is_empty() {
+            return joined;
+        }
+        for frame in replies {
+            chip.receive(&frame);
+        }
+        self.sync_wifi_irq();
+        joined
     }
 
     /// A touch (or release) at `x`, `y` on the panel board's touchscreen, if it has one.
