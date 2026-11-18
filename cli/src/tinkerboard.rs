@@ -82,6 +82,8 @@ pub(crate) struct Profile<'a> {
     pub banner: &'static str,
     /// Board-specific machine setup, before the kernel is loaded.
     pub setup: &'a dyn Fn(&mut Machine),
+    /// What the board's own boot loader changes in the device tree it passes on.
+    pub fixup_dtb: fn(Vec<u8>) -> Result<Vec<u8>, String>,
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -98,6 +100,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             banner: "experimental Rockchip RK3288: four Cortex-A12 (interpreter), GIC-400, UART2, CRU/GRF/PMU, \
                      boot ROM SMP mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC; other devices are stubs",
             setup: &|_| {},
+            fixup_dtb: Ok,
         },
     )
 }
@@ -133,7 +136,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     } else {
         (
             read(arg(args, "--kernel").ok_or(profile.kernel_hint)?)?,
-            read(arg(args, "--dtb").ok_or(profile.dtb_hint)?)?,
+            (profile.fixup_dtb)(read(arg(args, "--dtb").ok_or(profile.dtb_hint)?)?)?,
         )
     };
     let initrd = arg(args, "--initrd").map(read).transpose()?;

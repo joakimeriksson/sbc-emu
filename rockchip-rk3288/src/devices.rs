@@ -9,6 +9,8 @@ use peripherals::act8846::{self, Act8846};
 use peripherals::hym8563::{self, Hym8563};
 use peripherals::ili2116::{self, Ili2116};
 use peripherals::rk808::{self, Rk808};
+use peripherals::bcm43455::Bcm43455;
+use peripherals::sdio::SdioCard;
 use peripherals::syr82x::{self, Syr82x};
 use emu_core::{Fault, FlatRam};
 
@@ -23,6 +25,10 @@ pub const EMMC_BASE: u64 = 0xff0f_0000;
 const GPIO_IRQ_BASE: usize = 32 + 81;
 /// The panel board's touch interrupt: GPIO7_A6.
 const TOUCH_GPIO: (usize, u32) = (7, 6);
+/// The panel board's Wi-Fi host-wake interrupt: GPIO4_D6.
+const WIFI_GPIO: (usize, u32) = (4, 30);
+/// The panel board's Wi-Fi MAC address (locally administered).
+const WIFI_MAC: [u8; 6] = [0x02, 0x4d, 0x50, 0x43, 0x01, 0x01];
 /// I²C0 (PMU domain: the PMIC), SPI 60.
 pub const I2C0_BASE: u64 = 0xff65_0000;
 
@@ -84,6 +90,39 @@ impl Peripherals {
         bus.attach(hym8563::ADDRESS, Box::new(Hym8563::new(unix_seconds)));
         // the touchscreen on I²C4, its interrupt on GPIO7_A6
         self.i2c[4].2.attach(ili2116::ADDRESS, Box::new(Ili2116::default()));
+        // the BCM43455 Wi-Fi on SDIO0, host-wake on GPIO4_D6
+        self.mmc[SDIO0].insert_sdio(SdioCard::new(Box::new(Bcm43455::new(WIFI_MAC))));
+        self.sync_wifi_irq();
+    }
+
+    fn wifi(&mut self) -> Option<&mut Bcm43455> {
+        self.mmc[SDIO0].sdio_mut()?.device_mut::<Bcm43455>()
+    }
+
+    /// The Wi-Fi chip's out-of-band interrupt onto GPIO4_D6: its level, and a fresh edge
+    /// for each new cause (the line is edge-triggered and may already be asserted).
+    fn sync_wifi_irq(&mut self) {
+        let Some(chip) = self.wifi() else { return };
+        let edge = chip.take_edge();
+        let level = chip.oob_level();
+        let gpio = &mut self.gpio[WIFI_GPIO.0];
+        match level {
+            Some(level) => {
+                if edge {
+                    gpio.set_input(WIFI_GPIO.1, !level);
+                }
+                gpio.set_input(WIFI_GPIO.1, level);
+            }
+            None => gpio.set_input(WIFI_GPIO.1, true),
+        }
+    }
+
+    /// The Wi-Fi dongle's own work (scans, association, the network) up to `now_ms`.
+    pub fn tick_wifi(&mut self, now_ms: u64) {
+        if let Some(chip) = self.wifi() {
+            chip.tick(now_ms);
+            self.sync_wifi_irq();
+        }
     }
 
     /// A touch (or release) at `x`, `y` on the panel board's touchscreen, if it has one.
@@ -133,11 +172,14 @@ impl Peripherals {
 
     /// A register write, if `addr` belongs to one of these controllers. DMA goes to `ram`.
     pub fn write(&mut self, addr: u64, width: u64, value: u32, ram: &mut FlatRam, now_ns: u64) -> Option<Result<(), Fault>> {
-        if let Some(mmc) = self.mmc.iter_mut().find(|m| m.contains(addr)) {
-            return Some(word(addr, width).map(|_| {
+        if let Some(k) = self.mmc.iter().position(|m| m.contains(addr)) {
+            let result = word(addr, width).map(|_| {
+                let mmc = &mut self.mmc[k];
                 mmc.write(addr - mmc.base, value, ram);
                 self.dma_written.append(&mut mmc.dma_written);
-            }));
+            });
+            self.sync_wifi_irq();
+            return Some(result);
         }
         if let Some(bank) = gpio_bank(addr) {
             return Some(word(addr, width).map(|_| self.gpio[bank].write(addr - gpio::BANKS[bank], value)));

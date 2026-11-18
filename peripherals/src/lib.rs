@@ -10,17 +10,21 @@
 //! | `syr82x` | Silergy SYR827/SYR828 regulators | panel board |
 //! | `hym8563` | Haoyu HYM8563 RTC | panel board |
 //! | `ili2116` | Ilitek ILI2116 touch controller | panel board |
+//! | `bcm43455` | Broadcom BCM43455 Wi-Fi on SDIO (brcmfmac): backplane, cores, TCM, SDPCM; an emulated dongle in place of the firmware | panel board |
+//! | `sdio` | an SDIO card: CMD5/52/53, CCCR, FBR, CIS; the functions behind a trait | any SD host controller |
 //! | `timebase` | 24 MHz architectural timer ticks against nanoseconds | Allwinner H3, Rockchip RK3288 |
 //!
 //! A board attaches an I²C chip to its controller's bus at the chip's address; the
 //! controller model (an SoC's) drives START, bytes and STOP.
 
 pub mod act8846;
+pub mod bcm43455;
 pub mod gic;
 pub mod hym8563;
 pub mod i2c;
 pub mod ili2116;
 pub mod rk808;
+pub mod sdio;
 pub mod syr82x;
 pub mod timebase;
 pub mod uart;

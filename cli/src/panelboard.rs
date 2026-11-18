@@ -44,6 +44,20 @@ fn mounting_rotation(dtb: &[u8]) -> Result<u32, String> {
 const EMMC_CMDLINE: &str =
     "earlycon=uart8250,mmio32,0xff690000 console=ttyS2,115200 root=PARTUUID=4d504331-0000-4000-8000-000000000001 rootwait ro";
 
+/// the vendor's device tree has the Wi-Fi's SDIO host (dwmmc@ff0d0000, with the BCM43455 under
+/// it) disabled; their U-Boot, not public, presumably enables it on boards with Wi-Fi, as
+/// the vendor application expects the controller bound. Enable it.
+fn enable_wifi(dtb: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut tree = Node::parse(&dtb)?;
+    match tree.children.iter_mut().find(|n| n.name == "dwmmc@ff0d0000") {
+        Some(sdio) => {
+            sdio.set_str("status", "okay");
+            Ok(tree.to_blob())
+        }
+        None => Ok(dtb),
+    }
+}
+
 pub(crate) fn run(args: &[String]) -> ExitCode {
     // The DTB is read again by the shared loader; it is small.
     let rotation = match arg(args, "--dtb").map(|path| std::fs::read(path).map_err(|e| format!("{path}: {e}"))) {
@@ -75,11 +89,12 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             power: Peripherals::attach_panel_board_power,
             banner: "experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12 (interpreter), GIC-400, UART2, \
                      CRU/GRF/PMU, VOP + MIPI DSI panel, SD/eMMC, I2C with the ACT8846 PMIC, SYR827/828 and HYM8563; \
-                     audio, touch, pads and the GPU are not modelled yet",
+                     RGA, Mali-T760, ILI2116 touch and BCM43455 Wi-Fi; audio and the pads are not modelled yet",
             setup: &|m| {
                 m.soc.display_rotation = rotation;
                 m.soc.display_name = "sbc-emu: RK3288 panel board";
             },
+            fixup_dtb: enable_wifi,
         },
     )
 }
