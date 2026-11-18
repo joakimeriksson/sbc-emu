@@ -57,9 +57,12 @@ impl Screen for Machine {
     fn name(&self) -> &'static str {
         self.soc.display_name
     }
-    /// The pointer as a finger on the touchscreen (the panel board's; boards without one ignore it).
+    /// The pointer (absolute, 0..32767 across the picture shown) as a finger on the
+    /// touchscreen (the panel board's; boards without one ignore it).
     fn pointer(&mut self, buttons: u8, x: u16, y: u16, _wheel: i8) {
-        self.soc.touch(buttons & 1 != 0, x, y);
+        let (w, h) = self.display_size();
+        let pixel = |v: u16, n: u32| (v as u32 * n.saturating_sub(1) / 32767) as u16;
+        self.soc.touch(buttons & 1 != 0, pixel(x, w), pixel(y, h));
     }
 }
 
@@ -82,6 +85,11 @@ pub(crate) struct Profile<'a> {
     pub banner: &'static str,
     /// Board-specific machine setup, before the kernel is loaded.
     pub setup: &'a dyn Fn(&mut Machine),
+    /// What the board's own boot loader changes in the device tree it passes on.
+    pub fixup_dtb: fn(Vec<u8>) -> Result<Vec<u8>, String>,
+    /// The default `--net` mode (nat, local or none) when the board has a modelled network
+    /// interface; None: no network and no `--net`.
+    pub network: Option<&'static str>,
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -98,6 +106,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             banner: "experimental Rockchip RK3288: four Cortex-A12 (interpreter), GIC-400, UART2, CRU/GRF/PMU, \
                      boot ROM SMP mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC; other devices are stubs",
             setup: &|_| {},
+            fixup_dtb: Ok,
+            network: None,
         },
     )
 }
@@ -114,7 +124,16 @@ pub(crate) fn run_board(args: &[String], profile: &Profile) -> ExitCode {
 
 fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let tag = profile.tag;
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc"])?;
+    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc"];
+    if profile.network.is_some() {
+        options.push("--net");
+    }
+    serial_board::validate_options(args, &options)?;
+    let net = arg(args, "--net").or(profile.network).unwrap_or("none");
+    if !matches!(net, "nat" | "local" | "none") {
+        return Err("--net nat|local|none".into());
+    }
+    let trace_net = std::env::var_os("SBC_NET_LOG").is_some();
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     // Without --kernel, a card (--sd, else --emmc) is booted the way the board's firmware
     // would: armbianEnv.txt, zImage, the board DTB and uInitrd from the card's /boot.
@@ -133,7 +152,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     } else {
         (
             read(arg(args, "--kernel").ok_or(profile.kernel_hint)?)?,
-            read(arg(args, "--dtb").ok_or(profile.dtb_hint)?)?,
+            (profile.fixup_dtb)(read(arg(args, "--dtb").ok_or(profile.dtb_hint)?)?)?,
         )
     };
     let initrd = arg(args, "--initrd").map(read).transpose()?;
@@ -159,8 +178,11 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         let mut m = Machine::with_ram_size(ram);
         (profile.setup)(&mut m);
         (profile.power)(&mut m.soc.periph, unix_now);
+        if net != "none" {
+            m.connect_network(net == "nat", trace_net);
+        }
         let disk = |d: &Option<crate::disk::SharedDisk>| d.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
-        m.soc.periph.mmc[devices::SDMMC].insert(disk(&sd));
+        m.soc.periph.insert_sd(disk(&sd));
         m.soc.periph.mmc[devices::EMMC].insert(disk(&emmc));
         if card_boot {
             let boot = boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;

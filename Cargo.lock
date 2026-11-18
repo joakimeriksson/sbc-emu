@@ -72,6 +72,9 @@ dependencies = [
 [[package]]
 name = "peripherals"
 version = "0.0.1"
+dependencies = [
+ "sbc-net",
+]
 
 [[package]]
 name = "rk3588"
@@ -91,6 +94,7 @@ dependencies = [
  "mali400",
  "midgard",
  "peripherals",
+ "sbc-net",
 ]
 
 [[package]]

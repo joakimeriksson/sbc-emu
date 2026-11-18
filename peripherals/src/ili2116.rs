@@ -36,6 +36,9 @@ pub struct Ili2116 {
     /// Records the host still has to read in the current report.
     reading: Vec<[u8; 5]>,
     down: bool,
+    /// The host has read a whole report and more records wait: the line goes high and
+    /// low again (a fresh falling edge), as the controller does between reports.
+    edge: bool,
 }
 
 /// Touch records in one report: the driver rejects a count above its 10 slots.
@@ -60,6 +63,12 @@ impl Ili2116 {
             }
         }
         self.queue.push(rec);
+    }
+
+    /// A new report is ready after the host read the last one (take once): the line
+    /// should show a fresh falling edge.
+    pub fn take_edge(&mut self) -> bool {
+        std::mem::take(&mut self.edge)
     }
 
     /// The interrupt line is low (asserted) while records wait.
@@ -94,7 +103,13 @@ impl Ili2116 {
                 self.reading = all;
                 vec![n as u8]
             }
-            0x11 => self.reading.pop().map(|r| r.to_vec()).unwrap_or_else(|| vec![0; 5]),
+            0x11 => {
+                let rec = self.reading.pop().map(|r| r.to_vec()).unwrap_or_else(|| vec![0; 5]);
+                if self.reading.is_empty() && !self.queue.is_empty() {
+                    self.edge = true;
+                }
+                rec
+            }
             _ => vec![0],
         };
     }
@@ -152,6 +167,23 @@ mod tests {
         t.touch(false, 532, 770);
         assert_eq!(read_reg(&mut t, 0x10, 1), [1]);
         assert_eq!(read_reg(&mut t, 0x11, 5)[0], 0x01);
+    }
+
+    /// A release that arrives while the host reads the press is a new report: the line
+    /// stays low, so it must fall again once the press is read (it is edge-triggered).
+    #[test]
+    fn a_release_during_a_report_gets_its_own_edge() {
+        let mut t = Ili2116::default();
+        t.touch(true, 532, 770);
+        assert_eq!(read_reg(&mut t, 0x10, 1), [1]);
+        t.touch(false, 532, 770);
+        assert!(!t.take_edge());
+        assert_eq!(read_reg(&mut t, 0x11, 5)[0], 0x81);
+        assert!(t.irq_asserted());
+        assert!(t.take_edge(), "a fresh edge for the waiting release");
+        assert_eq!(read_reg(&mut t, 0x10, 1), [1]);
+        assert_eq!(read_reg(&mut t, 0x11, 5)[0], 0x01);
+        assert!(!t.irq_asserted() && !t.take_edge());
     }
 
     /// Many records are reported ten at a time, and records the host skipped are reported

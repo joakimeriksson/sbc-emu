@@ -94,6 +94,8 @@ pub struct Soc {
     pub stub_pages: Vec<u64>,
     /// Print each newly touched unmodelled device page to stderr.
     pub log_stub_pages: bool,
+    /// The network behind the Wi-Fi access points (None: no network).
+    pub wifi_net: Option<sbc_net::net::VirtualNet>,
 }
 
 impl Soc {
@@ -120,6 +122,7 @@ impl Soc {
             stub_regs: Default::default(),
             stub_pages: Vec::new(),
             log_stub_pages: false,
+            wifi_net: None,
         }
     }
 
@@ -601,11 +604,17 @@ impl Machine {
         self.soc.dirty = false;
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART2_IRQ, uart);
+        let mut next = u64::MAX;
+        if let Some(net) = self.soc.wifi_net.as_mut() {
+            if self.soc.periph.exchange_wifi(net, ticks_to_ns(now) / 1000) {
+                // poll the network every millisecond while the Wi-Fi is joined
+                next = next.min(now + 24_000);
+            }
+        }
         let Soc { periph, gic, .. } = &mut self.soc;
         for (irq, level) in periph.irq_lines() {
             gic.set_level(irq, level);
         }
-        let mut next = u64::MAX;
         for k in 0..2 {
             self.soc.vop[k].update(now);
             let irq = self.soc.vop[k].irq();
@@ -666,6 +675,19 @@ impl Machine {
         if self.soc.dirty || changed || self.cpus[0].cntpct >= self.next_event {
             self.update_irqs();
         }
+    }
+
+    /// Put the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP) behind the Wi-Fi access
+    /// points; `nat` also relays the guest's TCP/UDP to the host's network (native builds
+    /// only).
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.wifi_net = Some(net);
     }
 
     pub fn advance_time(&mut self, ticks: u64) {

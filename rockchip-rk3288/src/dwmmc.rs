@@ -2,7 +2,7 @@
 //! `dw_mmc-rockchip`), version 2.70a with a 256-word FIFO and the internal DMA controller
 //! (IDMAC, 32-bit descriptors, chained or ring). One instance per controller: the RK3288
 //! has SDMMC (0xff0c0000), SDIO0 (0xff0d0000), SDIO1 (0xff0e0000) and eMMC (0xff0f0000);
-//! each holds an SD card or an eMMC device (`CardKind`).
+//! each holds an SD card, an eMMC device or an SDIO card (`CardKind`).
 //!
 //! Commands complete when they are written (CMD with START): the response, the data phase
 //! and the interrupts (CMD_DONE, DATA_OVER, IDMAC RI/TI) are all raised at once. Linux
@@ -14,6 +14,7 @@ use crate::emmc::EmmcCard;
 use emu_core::disk::Disk;
 use emu_core::sdcard::{Data, Reply, Response, SdCard, OUT_OF_RANGE};
 use emu_core::{Bus, FlatRam};
+use peripherals::sdio::{SdioCard, Transfer};
 use std::collections::VecDeque;
 
 pub const SIZE: u64 = 0x4000;
@@ -57,6 +58,9 @@ const CMD_DAT_WR: u32 = 1 << 10;
 const CMD_DAT_EXP: u32 = 1 << 9;
 const CMD_RESP_EXP: u32 = 1 << 6;
 // RINTSTS / INTMASK
+/// SDIO interrupt of the slot: bit 16 + slot number, and Rockchip's controllers number
+/// their one slot 8 (`dw_mmc-rockchip` sets `sdio_id0` = 8): bit 24.
+const INT_SDIO: u32 = 1 << 24;
 const INT_ACD: u32 = 1 << 14;
 const INT_EBE: u32 = 1 << 15;
 const INT_DRTO: u32 = 1 << 9;
@@ -97,12 +101,15 @@ pub enum CardKind {
     Sd,
     /// Soldered eMMC device.
     Emmc,
+    /// An SDIO device (Wi-Fi), `peripherals::sdio`.
+    Sdio,
 }
 
 /// The card in a slot.
 pub enum Card {
     Sd(SdCard),
     Emmc(EmmcCard),
+    Sdio(SdioCard),
 }
 
 impl Card {
@@ -114,7 +121,7 @@ impl Card {
                 card.trace = trace;
                 Card::Sd(card)
             }
-            CardKind::Emmc => {
+            CardKind::Emmc | CardKind::Sdio => {
                 let mut card = EmmcCard::new(disk);
                 card.trace = trace;
                 Card::Emmc(card)
@@ -126,6 +133,7 @@ impl Card {
         match self {
             Card::Sd(_) => CardKind::Sd,
             Card::Emmc(_) => CardKind::Emmc,
+            Card::Sdio(_) => CardKind::Sdio,
         }
     }
 
@@ -133,6 +141,7 @@ impl Card {
         match self {
             Card::Sd(c) => c.present(),
             Card::Emmc(c) => c.present(),
+            Card::Sdio(_) => true,
         }
     }
 
@@ -140,6 +149,7 @@ impl Card {
         match self {
             Card::Sd(c) => c.command(index, arg),
             Card::Emmc(c) => c.command(index, arg),
+            Card::Sdio(_) => unreachable!("SDIO commands go through DwMmc::sdio_command"),
         }
     }
 
@@ -147,6 +157,7 @@ impl Card {
         match self {
             Card::Sd(c) => c.in_range(lba, blocks),
             Card::Emmc(c) => c.in_range(lba, blocks),
+            Card::Sdio(_) => false,
         }
     }
 
@@ -154,6 +165,7 @@ impl Card {
         match self {
             Card::Sd(c) => c.read_blocks(lba, out),
             Card::Emmc(c) => c.read_blocks(lba, out),
+            Card::Sdio(_) => {}
         }
     }
 
@@ -161,6 +173,7 @@ impl Card {
         match self {
             Card::Sd(c) => c.write_blocks(lba, data),
             Card::Emmc(c) => c.write_blocks(lba, data),
+            Card::Sdio(_) => {}
         }
     }
 
@@ -169,13 +182,16 @@ impl Card {
         match self {
             Card::Sd(c) => c.disk.as_mut(),
             Card::Emmc(c) => c.disk.as_mut(),
+            Card::Sdio(_) => None,
         }
     }
 }
 
-/// A PIO write in progress: the FIFO collects `bytes` before they go to the card.
+/// A PIO write in progress: the FIFO collects `bytes` before they go to the card (to
+/// block `lba`, or the SDIO card's CMD53 when `sdio`).
 struct PioWrite {
     lba: Option<u64>,
+    sdio: bool,
     bytes: usize,
     data: Vec<u8>,
 }
@@ -215,7 +231,14 @@ impl DwMmc {
 
     /// Insert a card backed by `disk` (or empty the slot).
     pub fn insert(&mut self, disk: Option<Box<dyn Disk>>) {
-        self.card = Card::new(self.card.kind(), disk);
+        if !matches!(self.card, Card::Sdio(_)) {
+            self.card = Card::new(self.card.kind(), disk);
+        }
+    }
+
+    /// Solder an SDIO device to the slot (in place of the SD card).
+    pub fn insert_sdio(&mut self, card: SdioCard) {
+        self.card = Card::Sdio(card);
     }
 
     pub fn contains(&self, addr: u64) -> bool {
@@ -223,7 +246,7 @@ impl DwMmc {
     }
 
     pub fn irq_level(&self) -> bool {
-        self.regs[CTRL / 4] & CTRL_INT_ENABLE != 0 && self.rintsts & self.regs[INTMASK / 4] != 0
+        self.regs[CTRL / 4] & CTRL_INT_ENABLE != 0 && self.raw_status() & self.regs[INTMASK / 4] != 0
             || self.idsts & self.regs[IDINTEN / 4] & 0x337 != 0
     }
 
@@ -245,8 +268,8 @@ impl DwMmc {
     pub fn read(&mut self, offset: u64) -> u32 {
         let offset = offset as usize;
         match offset {
-            MINTSTS => self.rintsts & self.regs[INTMASK / 4],
-            RINTSTS => self.rintsts,
+            MINTSTS => self.raw_status() & self.regs[INTMASK / 4],
+            RINTSTS => self.raw_status(),
             STATUS => self.status(),
             CDETECT => u32::from(!self.card.present()),
             WRTPRT => 0,
@@ -293,7 +316,61 @@ impl DwMmc {
         self.regs[CTRL / 4] & CTRL_USE_IDMAC != 0 && self.regs[BMOD / 4] & BMOD_ENABLE != 0
     }
 
+    /// RINTSTS with the SDIO card's interrupt as a level.
+    fn raw_status(&self) -> u32 {
+        let sdio = matches!(&self.card, Card::Sdio(c) if c.irq());
+        self.rintsts | if sdio { INT_SDIO } else { 0 }
+    }
+
+    /// The SDIO card's out-of-band device, for the board's wiring (interrupt lines).
+    pub fn sdio_mut(&mut self) -> Option<&mut SdioCard> {
+        match &mut self.card {
+            Card::Sdio(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// A command to an SDIO card: CMD52 at once, CMD53 with its data through the IDMAC or
+    /// the FIFO.
+    fn sdio_command(&mut self, cmd: u32, ram: &mut FlatRam) {
+        let index = cmd & 0x3f;
+        let arg = self.regs[CMDARG / 4];
+        let Card::Sdio(card) = &mut self.card else { return };
+        let (response, transfer) = card.command(index, arg);
+        match response {
+            None if cmd & CMD_RESP_EXP != 0 => {
+                self.rintsts |= INT_RTO | INT_CMD_DONE;
+                return;
+            }
+            None => {}
+            Some(word) => self.regs[RESP0 / 4] = word,
+        }
+        self.rintsts |= INT_CMD_DONE;
+        if cmd & CMD_DAT_EXP == 0 {
+            return;
+        }
+        let bytes = self.regs[BYTCNT / 4] as usize;
+        let ok = bytes <= MAX_TRANSFER
+            && match transfer {
+                Transfer::Read if cmd & CMD_DAT_WR == 0 => {
+                    let data = card.read_data(bytes);
+                    self.to_host(&data, ram)
+                }
+                Transfer::Write if cmd & CMD_DAT_WR != 0 => self.from_host_to(None, true, bytes, ram),
+                _ => false,
+            };
+        if !ok {
+            self.rintsts |= INT_DRTO;
+            if self.uses_idmac() {
+                self.idsts |= IDMAC_AI | IDMAC_FBE;
+            }
+        }
+    }
+
     fn command(&mut self, cmd: u32, ram: &mut FlatRam) {
+        if matches!(self.card, Card::Sdio(_)) {
+            return self.sdio_command(cmd, ram);
+        }
         let index = cmd & 0x3f;
         let arg = self.regs[CMDARG / 4];
         let reply = self.card.command(index, arg);
@@ -387,8 +464,12 @@ impl DwMmc {
 
     /// Host -> card: through the IDMAC at once, or collected from the FIFO (PIO).
     fn from_host(&mut self, lba: Option<u64>, bytes: usize, ram: &mut FlatRam) -> bool {
+        self.from_host_to(lba, false, bytes, ram)
+    }
+
+    fn from_host_to(&mut self, lba: Option<u64>, sdio: bool, bytes: usize, ram: &mut FlatRam) -> bool {
         if !self.uses_idmac() {
-            self.pio_write = Some(PioWrite { lba, bytes, data: Vec::with_capacity(bytes) });
+            self.pio_write = Some(PioWrite { lba, sdio, bytes, data: Vec::with_capacity(bytes) });
             self.rintsts |= INT_TXDR;
             return true;
         }
@@ -409,6 +490,9 @@ impl DwMmc {
         if let Some(lba) = lba {
             self.card.write_blocks(lba, &data);
         }
+        if let (true, Card::Sdio(card)) = (sdio, &mut self.card) {
+            card.write_data(&data);
+        }
         self.idsts |= IDMAC_TI | IDMAC_NI;
         self.rintsts |= INT_DATA_OVER;
         true
@@ -421,6 +505,9 @@ impl DwMmc {
             let pio = self.pio_write.take().expect("PIO write");
             if let Some(lba) = pio.lba {
                 self.card.write_blocks(lba, &pio.data[..pio.bytes]);
+            }
+            if let (true, Card::Sdio(card)) = (pio.sdio, &mut self.card) {
+                card.write_data(&pio.data[..pio.bytes]);
             }
             self.regs[TCBCNT / 4] = pio.bytes as u32;
             self.rintsts |= INT_DATA_OVER;
