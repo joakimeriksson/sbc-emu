@@ -786,8 +786,8 @@ impl Cpu {
             return Ok(());
         }
 
-        // MOVW/MOVT.
-        if insn & 0x0fb0_0000 == 0x0300_0000 || insn & 0x0fb0_0000 == 0x0340_0000 {
+        // MOVW/MOVT (bit 22 picks MOVT; the mask leaves it out).
+        if insn & 0x0fb0_0000 == 0x0300_0000 {
             let rd = (insn >> 12) & 0xf;
             if rd == 15 {
                 return Err(unimplemented());
