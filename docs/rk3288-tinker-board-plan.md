@@ -235,6 +235,10 @@ Not modelled yet, roughly in order of value:
 The panel board's own open items (the start-up "Wifi and storage systems failed" dialog, the
 pads) are listed in `docs/panel-board.md`.
 
+Times on an M-series host, one host thread (2026-11-18): `scripts/tinkerboard-shell.txt`
+8 s, `scripts/tinkerboard-armbian.txt` 5 min 52 s, `scripts/panel-board-audio.txt` 2 min 13 s,
+all on the JIT.
+
 M4 state, kept for reference: Armbian 26.8.1 passed `scripts/tinkerboard-armbian.txt` in
 22 min 45 s on the interpreter (51.7 G instructions summed over the cores, 24.3 s virtual,
 about a minute of it the first-login wizard waiting for a network address). `poweroff` halts
