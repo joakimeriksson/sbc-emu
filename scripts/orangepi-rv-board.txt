@@ -1,0 +1,35 @@
+# Orange Pi RV, the whole board with Xunlong's own kernel (orange-pi-5.15-jh7110 and its
+# jh7110-orangepi-rv.dtb): microSD card, Gigabit Ethernet and HDMI in one run.
+#   scripts/orangepi-rv-vendor-kernel.sh; F=cache/orangepi-rv; V=$F/vendor
+#   (card: mkfs.ext4 -d DIR card.img 64M with DIR/hello.txt = HELLO_FROM_HOST)
+#   sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $V/Image \
+#       --dtb $V/jh7110-orangepi-rv.dtb --initrd $F/initramfs.cpio.gz --sd card.img \
+#       --append "console=tty0 console=ttyS0,115200 earlycon rdinit=/init" \
+#       --script scripts/orangepi-rv-board.txt
+wait-serial orangepi-rv#
+serial cat /proc/device-tree/model; echo; uname -r\n
+wait-serial 5.15.0
+# microSD
+serial mount -t ext4 /dev/mmcblk1 /mnt && cat /mnt/hello.txt\n
+wait-serial HELLO_FROM_HOST
+serial dd if=/dev/urandom of=/mnt/blob bs=64k count=32 2>/dev/null; sha256sum /mnt/blob > /mnt/blob.sha; sync; echo 3 > /proc/sys/vm/drop_caches; sha256sum -c /mnt/blob.sha | sed 's/^/SD_/'\n
+wait-serial SD_/mnt/blob: OK
+# Gigabit Ethernet
+serial ip link set eth0 up; sleep 3; echo $(cat /sys/class/net/eth0/speed /sys/class/net/eth0/carrier) LINK\n
+wait-serial 1000 1 LINK
+serial udhcpc -i eth0 -n -q -t 5 2>&1 | tail -1; ping -c 2 10.0.2.2 | grep received\n
+wait-serial 2 packets received
+serial wget -q -O - http://example.com/ | grep -o '<title>.*</title>'\n
+wait-serial <title>Example Domain</title>
+# HDMI
+serial cat /sys/class/drm/card0-HDMI-A-1/status; cat /sys/class/drm/card0-HDMI-A-1/modes | head -1\n
+wait-serial 1280x720
+serial clear > /dev/tty1; echo 'Orange Pi RV: microSD, Gigabit Ethernet and HDMI' > /dev/tty1; ip -4 addr show eth0 | grep inet > /dev/tty1; df -h /mnt | tail -1 > /dev/tty1; echo SHOWN\n
+wait-serial SHOWN
+sleep 1
+screenshot out/orangepi-rv-board.png
+serial umount /mnt; cat /sys/class/hwmon/hwmon*/temp1_input | sed 's/^/TEMP=/'\n
+wait-serial TEMP=4
+serial echo BOARD_""OK\n
+wait-serial BOARD_OK
+quit

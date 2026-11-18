@@ -128,6 +128,14 @@ impl Plic {
         best
     }
 
+    /// An edge-triggered request (a pulse): pending until claimed.
+    pub fn trigger(&mut self, src: usize) {
+        let (w, b) = (src / 32, 1u32 << (src % 32));
+        if self.active[w] & b == 0 {
+            self.pending[w] |= b;
+        }
+    }
+
     /// Whether context `ctx` has an interrupt above its threshold.
     pub fn asserted(&self, ctx: usize) -> bool {
         let (src, p) = self.best(ctx);
@@ -352,5 +360,36 @@ impl Pmu {
             0x10 => self.on &= !(v & 0x7c), // SYSTOP and CPU cannot be switched off
             _ => self.regs.write(off, v),
         }
+    }
+}
+
+/// The JH7110 temperature sensor (`starfive,jh7110-temp`, 0x120e0000): one register with
+/// power-down, reset and run controls; a run converts at once and pulses the sensor's
+/// interrupt, and DOUT (bits 27:16) reads about 45 °C
+/// (`dout * 237500 / 4094 - 81100` m°C, Linux's `sfctemp` formula).
+#[derive(Default)]
+pub struct TempSensor {
+    ctrl: u32,
+    pub conversions: u64,
+}
+
+impl TempSensor {
+    const DOUT: u32 = 2173;
+
+    pub fn read(&self, off: u64) -> u32 {
+        if off == 0 { (self.ctrl & 7) | (Self::DOUT << 16) } else { 0 }
+    }
+
+    /// A register write; true when a conversion completed (an interrupt pulse).
+    pub fn write(&mut self, off: u64, v: u32) -> bool {
+        if off != 0 {
+            return false;
+        }
+        let start = v & 4 != 0 && self.ctrl & 4 == 0 && v & 1 != 0 && v & 2 == 0;
+        self.ctrl = v;
+        if start {
+            self.conversions += 1;
+        }
+        start
     }
 }

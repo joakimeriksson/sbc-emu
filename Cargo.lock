@@ -187,6 +187,7 @@ dependencies = [
  "emu-core",
  "peripherals",
  "riscv64",
+ "sbc-net",
 ]
 
 [[package]]

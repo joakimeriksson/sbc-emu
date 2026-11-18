@@ -1,9 +1,9 @@
 //! Orange Pi RV (StarFive JH7110) serial bring-up adapter: OpenSBI `fw_dynamic` and a
 //! RISC-V Linux `Image` with the distribution's device tree, loaded as the board's U-Boot
 //! would load them.
-use crate::{arg, serial_board::{self, RunConfig, SerialBoard}};
+use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use sbc_machine::Machine as HostMachine;
-use starfive_jh7110::{boot, HartState, Machine};
+use starfive_jh7110::{boot, display::{Display, Mode}, HartState, Machine};
 use std::process::ExitCode;
 
 impl SerialBoard for Machine {
@@ -15,6 +15,9 @@ impl SerialBoard for Machine {
     }
     fn instret(&self) -> u64 {
         Machine::instret(self)
+    }
+    fn screen(&mut self) -> Option<&mut dyn Screen> {
+        Some(self)
     }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);
@@ -31,10 +34,35 @@ impl SerialBoard for Machine {
                 eprintln!("[{tag}] hart {h}: last illegal instruction {insn:#010x} at {pc:#x}");
             }
         }
+        if self.soc.display.frames > 0 {
+            eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
+        }
+        if self.soc.gmac0.tx_frames + self.soc.gmac0.rx_frames > 0 {
+            eprintln!("[{tag}] Ethernet: {} frames sent, {} received", self.soc.gmac0.tx_frames, self.soc.gmac0.rx_frames);
+        }
+        if self.soc.sec.ops > 0 {
+            eprintln!("[{tag}] PKA: {} operations", self.soc.sec.ops);
+        }
         if !self.soc.stubs.is_empty() {
             let pages: Vec<String> = self.soc.stubs.keys().map(|p| format!("{p:#x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));
         }
+    }
+}
+
+impl Screen for Machine {
+    fn shown_size(&self) -> Option<(u32, u32)> {
+        self.soc.display.shown_size()
+    }
+    fn display_size(&self) -> (u32, u32) {
+        let mode = self.soc.display.mode;
+        self.soc.display.shown_size().unwrap_or((mode.width, mode.height))
+    }
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.soc.render(out)
+    }
+    fn name(&self) -> &'static str {
+        "sbc-emu: Orange Pi RV"
     }
 }
 
@@ -63,7 +91,19 @@ fn execute(args: &[String]) -> Result<(), String> {
             checked.push(a.clone());
         }
     }
-    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware"])?;
+    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode"])?;
+    let mode = match arg(args, "--hdmi-mode") {
+        Some(spec) => {
+            let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
+            let (w, h) = (w.parse().map_err(|_| "--hdmi-mode WxH")?, h.parse().map_err(|_| "--hdmi-mode WxH")?);
+            Mode::find(w, h).ok_or("--hdmi-mode: the emulated monitor offers 1280x720, 1920x1080 and 640x480")?
+        }
+        None => Mode::MODES[0],
+    };
+    let net = arg(args, "--net").unwrap_or("nat");
+    if !matches!(net, "nat" | "local" | "none") {
+        return Err("--net nat|local|none".into());
+    }
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel Image is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb jh7110-orangepi-rv.dtb is required")?)?;
@@ -75,8 +115,18 @@ fn execute(args: &[String]) -> Result<(), String> {
         return Err("--ram-mb must be between 128 and 16384".into());
     }
     let config = RunConfig::from_args("orangepi-rv", args)?;
+    // The microSD card survives guest reboots (one disk shared by the successive machines).
+    let persist = args.iter().any(|a| a == "--sd-persist");
+    let disk = arg(args, "--sd")
+        .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
+        .transpose()?;
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::new(ram);
+        m.soc.display = Display::new(mode);
+        if net != "none" {
+            m.connect_network(net == "nat", false);
+        }
+        m.soc.sdio1.insert(disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>));
         boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
         for h in smp + 1..m.harts.len() {
             m.state[h] = HartState::Off;
@@ -90,7 +140,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }

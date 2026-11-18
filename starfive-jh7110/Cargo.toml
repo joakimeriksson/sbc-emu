@@ -9,3 +9,4 @@ description = "StarFive JH7110 SoC (Orange Pi RV): four U74 harts, CLINT, PLIC, 
 riscv64 = { path = "../riscv64" }
 emu-core = { path = "../emu-core" }
 peripherals = { path = "../peripherals" }
+sbc-net = { path = "../sbc-net" }

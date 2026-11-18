@@ -81,13 +81,17 @@ cp "$work/opensbi/usr/share/opensbi/generic/firmware/fw_dynamic.bin" "$OUT/"
 
 mkdir "$work/rootfs"
 tar -xzf "$OUT/downloads/$ROOTFS" -C "$work/rootfs"
-# Kernel modules for the SD card (DesignWare MMC, mmc_block) and ext4: modules in
+# Kernel modules for the SD card (DesignWare MMC, mmc_block), ext4 and Ethernet (stmmac,
+# dwmac-starfive, the Motorcomm PHY): modules in
 # linux-stable, with modules.dep. The JH7110 clocks/resets/pinctrl/UART/PLIC are built in.
 tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
     'lib/modules/*/modules.*' 'lib/modules/*/kernel/drivers/mmc/*' \
     'lib/modules/*/kernel/fs/ext4/*' 'lib/modules/*/kernel/fs/jbd2/*' \
-    'lib/modules/*/kernel/fs/mbcache.ko.gz' 'lib/modules/*/kernel/lib/crc/*'
+    'lib/modules/*/kernel/fs/mbcache.ko.gz' 'lib/modules/*/kernel/lib/crc/*' \
+    'lib/modules/*/kernel/drivers/net/ethernet/stmicro/*' 'lib/modules/*/kernel/drivers/net/phy/*' \
+    'lib/modules/*/kernel/drivers/net/pcs/*' 'lib/modules/*/kernel/net/packet/*'
 ls "$work"/rootfs/lib/modules/*/kernel/drivers/mmc/host/dw_mmc-starfive.ko* > /dev/null
+ls "$work"/rootfs/lib/modules/*/kernel/drivers/net/ethernet/stmicro/stmmac/dwmac-starfive.ko* > /dev/null
 cat > "$work/rootfs/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev
@@ -99,6 +103,8 @@ export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin PS1='orangepi-rv# '
 # SD card: the DesignWare MMC driver, the block layer and ext4 are modules.
 modprobe dw_mmc-starfive 2>/dev/null; modprobe mmc_block 2>/dev/null
 modprobe ext4 2>/dev/null
+# Gigabit Ethernet: stmmac with the StarFive glue and the Motorcomm PHY driver are modules.
+modprobe dwmac-starfive 2>/dev/null; modprobe motorcomm 2>/dev/null; modprobe af_packet 2>/dev/null
 echo "JH7110_BOOT_OK: RV64 Linux BusyBox shell"
 # setsid -c makes the console the shell's controlling terminal (job control, ^C).
 exec /bin/busybox setsid -c /bin/sh

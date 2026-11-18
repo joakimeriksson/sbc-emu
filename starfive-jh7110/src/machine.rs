@@ -1,14 +1,21 @@
 //! The JH7110 machine: four U74 harts (hart 0, the S7 monitor core, is held in reset as
 //! the board's firmware leaves it) on one physical bus, scheduled round-robin in virtual
 //! time.
-use crate::devices::{sys_syscon, Clint, Crg, Plic, Pmu, Regs, HARTS};
-use crate::i2c::{Axp15060, DwI2c, PowerRequest};
-use emu_core::Stop;
+use crate::devices::{sys_syscon, Clint, Crg, Plic, Pmu, Regs, TempSensor, HARTS};
+use crate::i2c::{At24c04, Axp15060, DwI2c, PowerRequest};
+use crate::crypto::Sec;
+use crate::display::{Display, Mode, DC_BASE, DC_SIZE, HDMI_BASE, HDMI_SIZE, IRQ_DC, IRQ_HDMI};
+use crate::dwmmc::DwMmc;
+use crate::gmac::{Gmac, Yt8531};
+use emu_core::{FlatRam, Stop};
 use peripherals::Uart;
 use riscv64::{irq, Bus, Hart, Identity};
 use std::collections::BTreeMap;
 
 pub const RAM_BASE: u64 = 0x4000_0000;
+/// The DRAM's uncached alias (`uncached-offset = <0x4 0x0>` in StarFive's jh7110.dtsi): the
+/// same memory at +16 GiB, which the vendor kernel maps for DMA-coherent buffers.
+pub const DRAM_UNCACHED: u64 = 0x4_0000_0000;
 /// The Orange Pi RV's 4 GiB variant.
 pub const RAM_SIZE: usize = 4 << 30;
 
@@ -18,6 +25,20 @@ const NS_PER_TICK: u64 = 1_000_000_000 / MTIME_HZ;
 
 /// PLIC source numbers.
 pub const IRQ_UART0: usize = 32;
+pub const IRQ_SEC: usize = 28;
+pub const IRQ_TEMP: usize = 81;
+pub const TEMP: u64 = 0x120e_0000;
+pub const IRQ_GMAC0: usize = 7;
+pub const IRQ_GMAC1: usize = 78;
+pub const GMAC0: u64 = 0x1603_0000;
+pub const GMAC1: u64 = 0x1604_0000;
+pub const IRQ_SDIO0: usize = 74;
+pub const IRQ_SDIO1: usize = 75;
+pub const SEC: u64 = 0x1600_0000;
+pub const SDIO0: u64 = 0x1601_0000;
+pub const SDIO1: u64 = 0x1602_0000;
+/// The microSD slot's card-detect input (`cd-gpios = <&sysgpio 41 GPIO_ACTIVE_HIGH>`).
+pub const SD_CD_GPIO: u64 = 41;
 
 /// Instructions a hart runs before the next one gets its turn.
 const QUANTUM: u64 = 1000;
@@ -25,7 +46,18 @@ const QUANTUM: u64 = 1000;
 pub const CLINT: u64 = 0x0200_0000;
 pub const PLIC: u64 = 0x0c00_0000;
 pub const UART0: u64 = 0x1000_0000;
-pub const I2C5: u64 = 0x1205_0000;
+/// The seven DesignWare I²C controllers and their PLIC sources; the PMIC and the board
+/// EEPROM are on I2C5.
+pub const I2C: [(u64, usize); 7] = [
+    (0x1003_0000, 35),
+    (0x1004_0000, 36),
+    (0x1005_0000, 37),
+    (0x1203_0000, 48),
+    (0x1204_0000, 49),
+    (0x1205_0000, 50),
+    (0x1206_0000, 51),
+];
+pub const EEPROM_ADDR: u8 = 0x50;
 /// The AXP15060 PMIC's address on I2C5.
 pub const PMIC_ADDR: u8 = 0x36;
 pub const STGCRG: u64 = 0x1023_0000;
@@ -47,7 +79,7 @@ pub enum HartState {
 }
 
 pub struct Soc {
-    pub ram: Vec<u8>,
+    pub ram: FlatRam,
     pub clint: Clint,
     pub plic: Plic,
     pub uart: Uart,
@@ -58,7 +90,21 @@ pub struct Soc {
     pub voutcrg: Crg,
     pub sys_syscon: Regs,
     pub pmu: Pmu,
-    pub i2c5: DwI2c,
+    pub i2c: Vec<DwI2c>,
+    /// SDIO0 (the Wi-Fi module's slot, empty here) and SDIO1 (the microSD slot)
+    pub sec: Sec,
+    pub temp: TempSensor,
+    /// the DC8200 display controller and the Inno HDMI transmitter with its monitor
+    pub display: Display,
+    /// GMAC0 with the YT8531C PHY (MDIO address 0) and GMAC1 (no PHY on this board)
+    pub gmac0: Gmac,
+    pub gmac1: Gmac,
+    /// the network GMAC0's port is plugged into (None: no cable)
+    pub net: Option<sbc_net::net::VirtualNet>,
+    /// when the network is polled next (ns)
+    net_next: u64,
+    pub sdio0: DwMmc,
+    pub sdio1: DwMmc,
     /// GPIO35 was driven high as an output (`gpio-restart`)
     pub gpio_reset: bool,
     /// read-back stand-ins for unmodelled device pages
@@ -73,7 +119,7 @@ pub struct Soc {
 impl Soc {
     pub fn new(ram_size: usize) -> Self {
         Soc {
-            ram: vec![0; ram_size],
+            ram: FlatRam::new(RAM_BASE, ram_size),
             clint: Clint::default(),
             plic: Plic::default(),
             uart: Uart::default(),
@@ -84,13 +130,29 @@ impl Soc {
             voutcrg: Crg::new(0x10000, 0x48, 0x4c, 1),
             sys_syscon: sys_syscon(),
             pmu: Pmu::default(),
-            i2c5: {
-                let mut bus = DwI2c::default();
-                bus.attach(PMIC_ADDR, Box::new(Axp15060::default()));
-                bus
-            },
+            i2c: (0..I2C.len())
+                .map(|k| {
+                    let mut bus = DwI2c::default();
+                    if k == 5 {
+                        bus.attach(PMIC_ADDR, Box::new(Axp15060::default()));
+                        let (lo, hi) = At24c04::pair([0xff; 512]);
+                        bus.attach(EEPROM_ADDR, Box::new(lo));
+                        bus.attach(EEPROM_ADDR + 1, Box::new(hi));
+                    }
+                    bus
+                })
+                .collect(),
             stubs: BTreeMap::new(),
             gpio_reset: false,
+            sec: Sec::default(),
+            temp: TempSensor::default(),
+            display: Display::new(Mode::MODES[0]),
+            gmac0: Gmac::new(Some((0, Yt8531::default()))),
+            gmac1: Gmac::new(None),
+            net: None,
+            net_next: 0,
+            sdio0: DwMmc::new(SDIO0, IRQ_SDIO0, 32),
+            sdio1: DwMmc::new(SDIO1, IRQ_SDIO1, 32),
             now: 0,
             cur: 1,
             irq_dirty: false,
@@ -105,6 +167,59 @@ impl Soc {
     pub fn update_devices(&mut self) {
         let u = self.uart.irq();
         self.plic.set_level(IRQ_UART0, u);
+        let (m0, m1) = (self.sdio0.irq_level(), self.sdio1.irq_level());
+        self.plic.set_level(IRQ_SDIO0, m0);
+        self.plic.set_level(IRQ_SDIO1, m1);
+        let c = self.sec.irq();
+        self.plic.set_level(IRQ_SEC, c);
+        let (dc, hdmi) = (self.display.irq(), self.display.hdmi_irq());
+        self.plic.set_level(IRQ_DC, dc);
+        self.plic.set_level(IRQ_HDMI, hdmi);
+        let (g0, g1) = (self.gmac0.irq(), self.gmac1.irq());
+        self.plic.set_level(IRQ_GMAC0, g0);
+        self.plic.set_level(IRQ_GMAC1, g1);
+        for (k, &(_, irq)) in I2C.iter().enumerate() {
+            let l = self.i2c[k].irq();
+            self.plic.set_level(irq, l);
+        }
+    }
+
+    /// The HDMI picture as RGBA.
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        self.display.render(&self.ram.mem, self.ram.base, out)
+    }
+
+    /// Exchange frames between GMAC0 and the network. Returns when to poll next (ns): soon
+    /// while frames wait or the NAT relays connections, otherwise in 10 ms.
+    pub fn pump_network(&mut self) {
+        if self.now < self.net_next {
+            return;
+        }
+        let now_us = self.now / 1000;
+        match self.net.as_mut() {
+            Some(net) => {
+                for frame in std::mem::take(&mut self.gmac0.tx_out) {
+                    let replies = net.handle(&frame, now_us);
+                    self.gmac0.deliver(replies);
+                }
+                let polled = net.poll(now_us);
+                self.gmac0.deliver(polled);
+            }
+            None => self.gmac0.tx_out.clear(),
+        }
+        self.gmac0.service(&mut self.ram);
+        let busy = !self.gmac0.rx_queue.is_empty() || self.net.as_ref().is_some_and(|n| n.nat.is_some());
+        self.net_next = self.now + if busy { 1_000_000 } else { 10_000_000 };
+        self.update_devices();
+    }
+
+    /// The next network poll, while a network is connected (ns).
+    pub fn network_deadline(&self) -> u64 {
+        if self.net.is_some() && (self.gmac0.receiving() || !self.gmac0.tx_out.is_empty()) {
+            self.net_next
+        } else {
+            u64::MAX
+        }
     }
 
     /// The interrupt lines of hart `h`.
@@ -148,6 +263,34 @@ impl Soc {
                 self.irq_dirty = true;
                 r32(v)
             }
+            _ if self.sdio1.contains(a) => {
+                let v = self.sdio1.read(a - SDIO1);
+                self.update_devices();
+                self.irq_dirty = true;
+                r32(v)
+            }
+            _ if self.sdio0.contains(a) => r32(self.sdio0.read(a - SDIO0)),
+            _ if (SEC..SEC + 0x4000).contains(&a) => r32(self.sec.read(a - SEC)),
+            _ if (TEMP..TEMP + 0x10000).contains(&a) => r32(self.temp.read(a - TEMP)),
+            _ if (GMAC0..GMAC0 + 0x10000).contains(&a) => r32(self.gmac0.read(a - GMAC0)),
+            _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
+                let v = self.display.dc_read(a - DC_BASE);
+                self.update_devices();
+                self.irq_dirty = true;
+                r32(v)
+            }
+            _ if (HDMI_BASE..HDMI_BASE + HDMI_SIZE).contains(&a) => {
+                let v = self.display.hdmi_read(a - HDMI_BASE);
+                self.update_devices();
+                self.irq_dirty = true;
+                r32(v)
+            }
+            _ if (GMAC1..GMAC1 + 0x10000).contains(&a) => r32(self.gmac1.read(a - GMAC1)),
+            // GPIOIN: the inputs the board wires (the SD card-detect switch)
+            _ if a & !4 == SYSGPIO + 0x118 => {
+                let inputs = (self.sdio1.card.present() as u64) << SD_CD_GPIO;
+                r32((inputs >> (8 * (a - SYSGPIO - 0x118))) as u32)
+            }
             _ if (SYSCRG..SYSCRG + 0x10000).contains(&a) => r32(self.syscrg.read(a - SYSCRG)),
             _ if (AONCRG..AONCRG + 0x10000).contains(&a) => r32(self.aoncrg.read(a - AONCRG)),
             _ if (STGCRG..STGCRG + 0x10000).contains(&a) => r32(self.stgcrg.read(a - STGCRG)),
@@ -155,7 +298,13 @@ impl Soc {
             _ if (VOUTCRG..VOUTCRG + 0x10000).contains(&a) => r32(self.voutcrg.read(a - VOUTCRG)),
             _ if (SYS_SYSCON..SYS_SYSCON + 0x1000).contains(&a) => r32(self.sys_syscon.read(a - SYS_SYSCON)),
             _ if (PMU..PMU + 0x1000).contains(&a) => r32(self.pmu.read(a - PMU)),
-            _ if (I2C5..I2C5 + 0x10000).contains(&a) => r32(self.i2c5.read(a - I2C5)),
+            _ if I2C.iter().any(|&(b, _)| (b..b + 0x10000).contains(&a)) => {
+                let k = I2C.iter().position(|&(b, _)| (b..b + 0x10000).contains(&a)).unwrap();
+                let v = self.i2c[k].read(a - I2C[k].0);
+                self.update_devices();
+                self.irq_dirty = true;
+                r32(v)
+            }
             _ if a < RAM_BASE || (0x9_0000_0000..0xa_0000_0000).contains(&a) => {
                 let lo = *self.stub(a & !3) as u64;
                 Ok(match size {
@@ -183,6 +332,55 @@ impl Soc {
                 self.update_devices();
                 self.irq_dirty = true;
             }
+            _ if self.sdio1.contains(a) => {
+                self.sdio1.write(a - SDIO1, v32, &mut self.ram);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (TEMP..TEMP + 0x10000).contains(&a) => {
+                if self.temp.write(a - TEMP, v32) {
+                    self.plic.trigger(IRQ_TEMP);
+                    self.irq_dirty = true;
+                }
+            }
+            _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
+                self.display.dc_write(a - DC_BASE, v32);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (HDMI_BASE..HDMI_BASE + HDMI_SIZE).contains(&a) => {
+                self.display.hdmi_write(a - HDMI_BASE, v32);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (GMAC0..GMAC0 + 0x10000).contains(&a) => {
+                if self.gmac0.write(a - GMAC0, v32) {
+                    self.gmac0.service(&mut self.ram);
+                    if !self.gmac0.tx_out.is_empty() {
+                        self.net_next = self.now; // hand the frames to the network soon
+                    }
+                }
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (GMAC1..GMAC1 + 0x10000).contains(&a) => {
+                if self.gmac1.write(a - GMAC1, v32) {
+                    self.gmac1.service(&mut self.ram);
+                    self.gmac1.tx_out.clear(); // nothing is connected to GMAC1
+                }
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (SEC..SEC + 0x4000).contains(&a) => {
+                self.sec.write(a - SEC, v32);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if self.sdio0.contains(a) => {
+                self.sdio0.write(a - SDIO0, v32, &mut self.ram);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
             _ if (SYSCRG..SYSCRG + 0x10000).contains(&a) => self.syscrg.write(a - SYSCRG, v32),
             _ if (AONCRG..AONCRG + 0x10000).contains(&a) => self.aoncrg.write(a - AONCRG, v32),
             _ if (STGCRG..STGCRG + 0x10000).contains(&a) => self.stgcrg.write(a - STGCRG, v32),
@@ -190,7 +388,12 @@ impl Soc {
             _ if (VOUTCRG..VOUTCRG + 0x10000).contains(&a) => self.voutcrg.write(a - VOUTCRG, v32),
             _ if (SYS_SYSCON..SYS_SYSCON + 0x1000).contains(&a) => self.sys_syscon.write(a - SYS_SYSCON, v32),
             _ if (PMU..PMU + 0x1000).contains(&a) => self.pmu.write(a - PMU, v32),
-            _ if (I2C5..I2C5 + 0x10000).contains(&a) => self.i2c5.write(a - I2C5, v32),
+            _ if I2C.iter().any(|&(b, _)| (b..b + 0x10000).contains(&a)) => {
+                let k = I2C.iter().position(|&(b, _)| (b..b + 0x10000).contains(&a)).unwrap();
+                self.i2c[k].write(a - I2C[k].0, v32);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
             _ if a < RAM_BASE || (0x9_0000_0000..0xa_0000_0000).contains(&a) => match size {
                 8 => {
                     *self.stub(a & !3) = v as u32;
@@ -227,23 +430,29 @@ impl Bus for Soc {
     }
     #[inline(always)]
     fn ram(&mut self) -> &mut [u8] {
-        &mut self.ram
+        &mut self.ram.mem
     }
     fn read(&mut self, addr: u64, size: u8) -> Result<u64, ()> {
-        let o = addr.wrapping_sub(RAM_BASE);
-        if o + size as u64 <= self.ram.len() as u64 {
+        let mut o = addr.wrapping_sub(RAM_BASE);
+        if o >= self.ram.mem.len() as u64 {
+            o = addr.wrapping_sub(RAM_BASE + DRAM_UNCACHED);
+        }
+        if o + size as u64 <= self.ram.mem.len() as u64 {
             let o = o as usize;
             let mut b = [0u8; 8];
-            b[..size as usize].copy_from_slice(&self.ram[o..o + size as usize]);
+            b[..size as usize].copy_from_slice(&self.ram.mem[o..o + size as usize]);
             return Ok(u64::from_le_bytes(b));
         }
         self.dev_read(addr, size)
     }
     fn write(&mut self, addr: u64, size: u8, v: u64) -> Result<(), ()> {
-        let o = addr.wrapping_sub(RAM_BASE);
-        if o + size as u64 <= self.ram.len() as u64 {
+        let mut o = addr.wrapping_sub(RAM_BASE);
+        if o >= self.ram.mem.len() as u64 {
+            o = addr.wrapping_sub(RAM_BASE + DRAM_UNCACHED);
+        }
+        if o + size as u64 <= self.ram.mem.len() as u64 {
             let o = o as usize;
-            self.ram[o..o + size as usize].copy_from_slice(&v.to_le_bytes()[..size as usize]);
+            self.ram.mem[o..o + size as usize].copy_from_slice(&v.to_le_bytes()[..size as usize]);
             return Ok(());
         }
         self.dev_write(addr, size, v)
@@ -279,10 +488,10 @@ impl Machine {
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), String> {
         let o = addr.checked_sub(RAM_BASE).ok_or("below RAM")? as usize;
         let end = o + bytes.len();
-        if end > self.soc.ram.len() {
+        if end > self.soc.ram.mem.len() {
             return Err(format!("{:#x}+{:#x} is beyond RAM", addr, bytes.len()));
         }
-        self.soc.ram[o..end].copy_from_slice(bytes);
+        self.soc.ram.mem[o..end].copy_from_slice(bytes);
         Ok(())
     }
 
@@ -338,18 +547,37 @@ impl Machine {
             if std::mem::take(&mut self.soc.gpio_reset) {
                 return Stop::Reset;
             }
-            match self.soc.i2c5.device::<Axp15060>(PMIC_ADDR).map(|p| std::mem::replace(&mut p.request, PowerRequest::None)) {
+            match self.soc.i2c[5].device::<Axp15060>(PMIC_ADDR).map(|p| std::mem::replace(&mut p.request, PowerRequest::None)) {
                 Some(PowerRequest::Reset) => return Stop::Reset,
                 Some(PowerRequest::Off) => return Stop::PowerOff,
                 _ => {}
             }
+            if self.soc.net.is_some() {
+                self.soc.pump_network();
+            }
+            let vblank = self.soc.display.update(self.soc.now).unwrap_or(u64::MAX);
             if ran == 0 {
-                return Stop::Idle(self.next_deadline());
+                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank));
             }
             self.soc.now += ran;
             left = left.saturating_sub(ran);
         }
         Stop::Budget
+    }
+
+    /// Plug GMAC0's port into the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP); `nat` also
+    /// relays guest TCP/UDP to the host's network (native builds only).
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.net = Some(net);
+        if let Some((_, phy)) = self.soc.gmac0.phy.as_mut() {
+            phy.set_link(true);
+        }
     }
 
     pub fn serial_input(&mut self, byte: u8) -> bool {

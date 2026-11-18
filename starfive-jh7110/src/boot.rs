@@ -54,7 +54,7 @@ pub fn boot_linux(m: &mut Machine, opensbi: &[u8], kernel: &[u8], stock_dtb: &[u
     if opensbi.len() as u64 > KERNEL_ADDR - OPENSBI_ADDR {
         return Err("OpenSBI firmware too large for its load slot".into());
     }
-    let ram_bytes = m.soc.ram.len() as u64;
+    let ram_bytes = m.soc.ram.mem.len() as u64;
     let initrd_range = initrd.map(|d| (INITRD_ADDR, INITRD_ADDR + d.len() as u64));
     let dtb = prepare_device_tree(stock_dtb, ram_bytes, cmdline, initrd_range)?;
     if (INITRD_ADDR - DTB_ADDR) as usize <= dtb.len() {
