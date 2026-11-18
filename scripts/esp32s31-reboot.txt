@@ -1,0 +1,7 @@
+# ESP32-S31-Function-CoreBoard-1: shell, `reboot` (SBI SRST in OpenSBI -> HP core software reset -> mask ROM), shell again.
+# cargo run -p esp32s31 --release --example s31_linux -- cache/esp32s31/esp32s31_rev0_rom.elf cache/esp32s31/images/s31_full_flash.bin 6000000000 scripts/esp32s31-reboot.txt
+0 waituart0 60 ~ #
+0.2 uart0 reboot
+0.4 waituart0 60 SW_CPU_RESET
+0.5 waituart0 60 ~ #
+0.7 uart0 cat /proc/uptime; uname -r

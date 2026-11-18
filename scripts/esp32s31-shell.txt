@@ -1,0 +1,12 @@
+# ESP32-S31-Function-CoreBoard-1: boot the official Linux image to its root shell, then use it over UART0.
+# cargo run -p esp32s31 --release --example s31_linux -- cache/esp32s31/esp32s31_rev0_rom.elf cache/esp32s31/images/s31_full_flash.bin 5500000000 scripts/esp32s31-shell.txt
+# wait for the root shell, then type commands on UART0
+0 waituart0 60 ~ #
+0.2 uart0 uname -a
+0.6 uart0 cat /proc/cpuinfo
+1.0 uart0 cat /proc/device-tree/model; echo
+1.4 uart0 cat /proc/meminfo | head -3
+1.8 uart0 ls /
+2.2 uart0 echo start; sleep 1; echo slept
+3.8 uart0 cat /proc/uptime
+4.2 uart0 dmesg | tail -15
