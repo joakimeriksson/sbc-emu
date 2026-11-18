@@ -608,7 +608,7 @@ impl Cpu {
                 Ok(())
             }
             // T32 load-acquire/store-release: LDA/STL{B,H,} (op 8-10) and LDAEX/STLEX{B,H,,D}
-            // (op 12-15), as A32 encodings (Rt2 is only used by the D forms)
+            // (op 12-15), as A32 encodings
             0xe8c0 | 0xe8d0 if (hw2 >> 4) & 8 != 0 => {
                 let (op, load) = ((hw2 >> 4) & 15, hw1 & 0x10 != 0);
                 let size = [0b10, 0b11, 0b00, 0b01][(op & 3) as usize] << 21;
@@ -616,7 +616,7 @@ impl Cpu {
                 if op & 7 == 3 && !excl || (op & 3 == 3) && (rt == 15 || rd == 15) {
                     return self.undefined(insn);
                 }
-                let (status, rt2) = (hw2 & 15, (hw2 >> 8) & 15);
+                let status = hw2 & 15;
                 if op == 15 {
                     // LDAEXD/STLEXD: T32 allows any Rt/Rt2 pair, so as LDREXD/STREXD above
                     self.barrier();
@@ -626,7 +626,6 @@ impl Cpu {
                 }
                 let a32 = 0xe180_0c90 | size | u32::from(load) << 20 | rn << 16 | u32::from(excl) << 9;
                 let a32 = if load { a32 | rt << 12 | 0xf } else { a32 | (if excl { status } else { 15 }) << 12 | rt };
-                let _ = rt2;
                 self.a32(bus, a32)
             }
             0xe8c0 => {

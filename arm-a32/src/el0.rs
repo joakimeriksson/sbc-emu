@@ -302,9 +302,6 @@ impl Cpu {
     pub(crate) fn acquire_release(&mut self, bus: &mut dyn Bus, insn: u32) -> Result<(), Trap> {
         let undefined = Err(Trap::Unimplemented(self.cur_pc as u64, insn));
         let (load, excl, size) = (insn & (1 << 20) != 0, insn & (1 << 9) != 0, (insn >> 21) & 3);
-        if insn & (1 << 8) != 0 {
-            return undefined;
-        }
         if excl {
             // the LDREX/STREX encoding (bits 9:8 = 11), between barriers
             if !load {

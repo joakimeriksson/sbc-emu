@@ -2036,6 +2036,7 @@ fn writes_pc(insn: u32) -> bool {
         && rd == 15
         && !(insn & 0x0190_0000 == 0x0100_0000)
         && insn & 0x0180_0000 != 0x0100_0000
+        && insn & 0x0f80_0df0 != 0x0180_0c90 // STL{,B,H}: bits 15:12 are 1111, not Rd
     {
         return true;
     }

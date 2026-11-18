@@ -104,7 +104,7 @@ fn aarch32_id(k: u32) -> Option<u64> {
         0x15 => 0x0000_0001, // ID_ISAR5: SEVL (no CRC32, no crypto)
         0x18 => 0x1011_0222, // MVFR0: VFPv4 double, D32, Advanced SIMD registers
         0x19 => 0x1111_1111, // MVFR1: Advanced SIMD integer/float/FMA, VFP FMA, FTZ, DN
-        _ => 0,              // ID_AFR0, ID_ISAR5, ID_MMFR4, MVFR2, reserved
+        _ => 0,              // ID_AFR0, ID_MMFR4, MVFR2, reserved
     })
 }
 
