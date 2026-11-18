@@ -21,3 +21,10 @@ R48-R63 as both scalar registers and vector staging registers. `workgroup-triang
 / `.json` move the triangle shader's r16/r17 temporaries to r48/r49 so it runs
 with 32-register allocation. Both allocation modes use the same preload IDs,
 framebuffer and pixel oracle in `panthor-shader.py`.
+
+`attribute-load.asm` / `.json` use the same Mesa revision and its native
+`LD_ATTR_IMM.v2.f32` encoding. Linux test `panthor-attributes.py` binds an attribute
+table and a vertex-buffer table, loads three vertices, and writes their XY/0/1
+vectors to a separate BO region. It also checks 12 instance values with a divisor-four descriptor, verifying all
+vectors, surrounding sentinels and DRM fences. This tests attribute execution,
+not triangle rasterization.

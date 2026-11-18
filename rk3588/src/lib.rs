@@ -9,6 +9,7 @@ pub mod gpu_fw;
 pub mod gpu_render;
 pub mod gpu_shader;
 pub mod gpu_compute;
+pub mod gpu_resources;
 pub mod uart;
 pub mod mmc;
 pub mod phy;

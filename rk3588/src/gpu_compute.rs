@@ -17,7 +17,6 @@ pub fn dispatch(
     if instruction & 0x00ff_ffff_ffff_ffff != 0
         || r[33] >> 30 != 0
         || r[34..37].iter().any(|&v| v != 0)
-        || pair(r, 0) != 0
         || pair(r, 24) != 0
     {
         return Err(unsupported());
@@ -75,6 +74,7 @@ pub fn dispatch(
                     for ly in 0..local[1] {
                         for lx in 0..local[0] {
                             let mut shader = Shader::with_allocation(binary, allocation);
+                            shader.resources = crate::gpu_resources::Resources(pair(r, 0));
                             let values = [
                                 lx | (ly << 16),
                                 lz,

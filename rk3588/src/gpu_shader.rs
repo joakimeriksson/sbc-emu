@@ -15,6 +15,7 @@ pub enum RegisterAllocation {
 }
 pub struct Shader {
     pub regs: [u32; 64],
+    pub resources: crate::gpu_resources::Resources,
     register_mask: u64,
     pub pc: u64,
     pub instructions: u64,
@@ -32,6 +33,7 @@ impl Shader {
     pub fn with_allocation(pc: u64, allocation: RegisterAllocation) -> Self {
         Self {
             regs: [0; 64],
+            resources: crate::gpu_resources::Resources::default(),
             pc,
             instructions: 0,
             // Mesa bi_ra.c: full occupancy uses R0-R15 and R48-R63.
@@ -166,6 +168,36 @@ impl Shader {
                             _ => return Err(bad()),
                         }
                     })
+                }
+                0x66 => {
+                    let count = ((i >> 28) & 3) as usize + 1;
+                    if (i >> 46) & 3 != 2
+                        || (i >> 33) & 7 != count as u64
+                        || !matches!((i >> 24) & 7, 0 | 2)
+                        || i & (1 << 27) != 0
+                        || (i >> 36) & 15 != 0
+                        || (i >> 30) & 7 > 2
+                        || !self.registers_available(dst, count)
+                        || count > 1 && dst & 1 != 0
+                    {
+                        return Err(bad());
+                    }
+                    let values = self
+                        .resources
+                        .attribute(
+                            m,
+                            ram,
+                            ((i >> 16) & 15) as u32,
+                            ((i >> 20) & 15) as u32,
+                            a.ok_or_else(bad)?,
+                            c.ok_or_else(bad)?,
+                        )
+                        .map_err(|error| match error {
+                            crate::gpu_resources::Error::Memory(f) => Error::Memory(f),
+                            _ => bad(),
+                        })?;
+                    self.regs[dst..dst + count].copy_from_slice(&values[..count]);
+                    None
                 }
                 0x60 | 0x61 => {
                     // Global 32-bit scalar or 128-bit vector transfers, normal memory access.

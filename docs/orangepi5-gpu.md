@@ -85,3 +85,30 @@ Its 32-register shader uses r48/r49 for the two temporaries that the 64-register
 variant keeps in r16/r17. Both variants verify the same scene and DRM fence.
 This register-layout fix prepares real vertex/fragment shaders, but fixed-function
 triangle drawing and general Mesa applications remain incomplete.
+
+### Vertex attribute execution
+
+The interpreter decodes `LD_ATTR_IMM` through real Valhall resource tables,
+attribute descriptors and buffer descriptors. It currently supports ordinary 1D
+R32F/RG32F/RGB32F/RGBA32F attributes, RGBA/RGB1 ordering, signed byte
+offsets, per-vertex indexing and power-of-two instance divisors. Buffer
+bounds are checked before translation; an out-of-range element returns zero
+source channels with the format's implicit alpha preserved. Descriptor bounds,
+unsupported layouts and GPU memory faults stop the submission. Non-power-of-two divisors, vertex
+packet buffers, packed/normalized/integer formats and 16-bit register formats
+remain unsupported.
+
+```sh
+python3 tools/panthor-test.py --image cache/orangepi/armbian.img \
+  --guest tests/gpu/panthor-attributes.py --success-marker PANTHOR_ATTRIBUTES_OK \
+  --log out/panthor-attributes.log
+```
+
+This runs a Mesa-assembled 32-register compute shader through Linux Panthor. Each
+invocation fetches a different vertex through an RG32F attribute descriptor and
+writes an XY/0/1 vector. A second submission uses a divisor-four instance
+descriptor to fetch 12 instance vectors. The guest verifies every vector, write
+bounds and both fences.
+The same attribute instruction is present in the captured GLES vertex shader.
+The runner requires both the marker and a zero guest exit status, and preserves
+logs on failure. Full vertex/tiler/fragment drawing is still incomplete.
