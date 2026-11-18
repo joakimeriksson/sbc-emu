@@ -98,7 +98,7 @@ pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(
         destinations.push(spans);
     }
     let mut crc_destinations = Vec::new();
-    if word(&f, 12) & (1 << 31) != 0 {
+    if word(&f, 12) & (3 << 30) != 0 {
         // The descriptor supplies the checksum for a uniform clear. Only whole
         // 16x16 checksum tiles are supported until partial-tile CRC is modeled.
         if x0 != 0
@@ -120,10 +120,16 @@ pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(
             let addr = base
                 .checked_add(y as u64 * stride)
                 .ok_or(Stop::Memory(Fault::AddressSize))?;
-            crc_destinations.push(
-                m.chunks(ram, addr, columns * 8, crate::gpu_mmu::Access::Write, true)
-                    .map_err(Stop::Memory)?,
-            );
+            if word(&f, 12) & (1 << 30) != 0 {
+                m.chunks(ram, addr, columns * 8, crate::gpu_mmu::Access::Read, true)
+                    .map_err(Stop::Memory)?;
+            }
+            if word(&f, 12) & (1 << 31) != 0 {
+                crc_destinations.push(
+                    m.chunks(ram, addr, columns * 8, crate::gpu_mmu::Access::Write, true)
+                        .map_err(Stop::Memory)?,
+                );
+            }
         }
     }
     for spans in destinations {
@@ -217,6 +223,12 @@ mod tests {
         assert_eq!(&r[6144..6152], &checksum.to_le_bytes());
         assert_eq!(&r[6152..6160], &[0x55; 8]);
         r[144..152].copy_from_slice(&8192u64.to_le_bytes());
+        let before = r.clone();
+        assert!(matches!(fragment(&m, &mut r, &regs), Err(Stop::Memory(_))));
+        assert_eq!(r, before);
+        // Even though CRC reads do not elide pixels, their memory access must
+        // still fault when the checksum target is unmapped.
+        r[48..52].copy_from_slice(&0x40210000u32.to_le_bytes());
         let before = r.clone();
         assert!(matches!(fragment(&m, &mut r, &regs), Err(Stop::Memory(_))));
         assert_eq!(r, before);
