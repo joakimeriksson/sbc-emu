@@ -48,7 +48,7 @@ Who is working where right now (update this table when you start or finish somet
 | Shared device models (`peripherals/`: GIC, UART, I²C chips, timebase); used by the H3 and RK3288 machines, open to every board | `peripherals/` | Claude Code (the Orange Pi One session); changes affect the H3 and RK3288 boards |
 | Orange Pi RV (StarFive JH7110) and the RV64 core | `riscv64/`, `starfive-jh7110/`, `cli/src/orangepi_rv.rs`, `docs/orangepi-rv.md` | Claude Code |
 | Mali-T760 (Midgard) GPU of the RK3288 (`docs/mali-t760.md`) | `midgard/`, its hookup in `rockchip-rk3288/src/machine.rs`, `scripts/mali-t760-*` | Claude Code (the Orange Pi One session) |
-| RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); RV64 boards later | `riscv-rv32/`, `espressif/` | Claude Code (taken over from OpenCode) |
+| RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); the RV64 boards are in the Orange Pi RV row | `riscv-rv32/`, `espressif/` | Claude Code (taken over from OpenCode) |
 
 ## Never
 
