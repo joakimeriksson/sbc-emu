@@ -1,6 +1,7 @@
 use crate::cru::{Cru, Grf, Pmu, CRU_SIZE, GRF_SIZE, PMU_SIZE};
 use crate::devices::Peripherals;
 use crate::dsi::{Dsi, DSI_SIZE};
+use crate::i2s::I2s;
 use crate::rga::{Rga, RGA_SIZE};
 use crate::vop::{Vop, VOP_SIZE};
 use peripherals::{Gic, Uart, NCPU};
@@ -36,6 +37,15 @@ pub const RGA_BASE: u64 = 0xff92_0000;
 pub const RGA_IRQ: usize = 32 + 18;
 /// MIPI DSI host 0 (the panel board's panel).
 pub const DSI0_BASE: u64 = 0xff96_0000;
+/// I2S (8 channels out, 2 in) and the DMA controller that feeds it (`dmac_bus_s`, its
+/// peripherals 0 and 1 are the I2S's transmit and receive requests).
+pub const I2S_BASE: u64 = 0xff89_0000;
+pub const I2S_IRQ: usize = 32 + 53;
+pub const DMAC_BASE: u64 = 0xffb2_0000;
+pub const DMAC_SIZE: u64 = 0x4000;
+pub const DMAC_IRQS: [usize; 2] = [32, 32 + 1];
+const DMAC_PERI_I2S_TX: u8 = 0;
+const DMAC_PERI_I2S_RX: u8 = 1;
 pub const GICD_BASE: u64 = 0xffc0_1000;
 pub const GICC_BASE: u64 = 0xffc0_2000;
 const GICD_SIZE: u64 = 0x1000;
@@ -94,6 +104,75 @@ pub struct Soc {
     pub stub_pages: Vec<u64>,
     /// Print each newly touched unmodelled device page to stderr.
     pub log_stub_pages: bool,
+    /// The network behind the Wi-Fi access points (None: no network).
+    pub wifi_net: Option<sbc_net::net::VirtualNet>,
+    pub i2s: I2s,
+    pub dmac: peripherals::pl330::Pl330,
+}
+
+/// What the DMA controller reaches: DRAM and the I2S FIFOs.
+struct DmaBus<'a> {
+    ram: &'a mut FlatRam,
+    i2s: &'a mut I2s,
+    code_watch: &'a CodeWatch,
+}
+
+impl peripherals::pl330::Pl330Bus for DmaBus<'_> {
+    fn read(&mut self, addr: u32, buf: &mut [u8]) -> bool {
+        let addr = u64::from(addr);
+        if addr == I2S_BASE + crate::i2s::RXDR {
+            for w in buf.chunks_mut(4) {
+                let v = self.i2s.read(crate::i2s::RXDR).to_le_bytes();
+                w.copy_from_slice(&v[..w.len()]);
+            }
+            return true;
+        }
+        let start = addr.wrapping_sub(self.ram.base) as usize;
+        match self.ram.mem.get(start..start + buf.len()) {
+            Some(s) => {
+                buf.copy_from_slice(s);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn write(&mut self, addr: u32, data: &[u8]) -> bool {
+        let addr = u64::from(addr);
+        if addr == I2S_BASE + crate::i2s::TXDR {
+            for w in data.chunks(4) {
+                let mut b = [0u8; 4];
+                b[..w.len()].copy_from_slice(w);
+                self.i2s.push(u32::from_le_bytes(b));
+            }
+            return true;
+        }
+        let start = addr.wrapping_sub(self.ram.base) as usize;
+        match self.ram.mem.get_mut(start..start + data.len()) {
+            Some(s) => {
+                s.copy_from_slice(data);
+                self.code_watch.dma_write(addr, data.len());
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn request(&mut self, peri: u8) -> bool {
+        match peri {
+            DMAC_PERI_I2S_TX => self.i2s.tx_request(),
+            DMAC_PERI_I2S_RX => self.i2s.rx_request(),
+            _ => false,
+        }
+    }
+}
+
+impl Soc {
+    /// Run the DMA controller's threads against DRAM and the I2S.
+    fn run_dma(&mut self) {
+        let Soc { ram, i2s, dmac, code_watch, .. } = self;
+        dmac.run(&mut DmaBus { ram, i2s, code_watch });
+    }
 }
 
 impl Soc {
@@ -120,6 +199,9 @@ impl Soc {
             stub_regs: Default::default(),
             stub_pages: Vec::new(),
             log_stub_pages: false,
+            wifi_net: None,
+            i2s: I2s::default(),
+            dmac: peripherals::pl330::Pl330::new(),
         }
     }
 
@@ -235,6 +317,13 @@ impl Soc {
         if let Some(offset) = Self::word_offset(addr, width, RGA_BASE, RGA_SIZE)? {
             return Ok(self.rga.read(offset));
         }
+        if let Some(offset) = Self::word_offset(addr, width, I2S_BASE, crate::i2s::SIZE)? {
+            self.i2s.update(ticks_to_ns(self.now), self.cru.i2s_mclk());
+            return Ok(self.i2s.read(offset));
+        }
+        if let Some(offset) = Self::word_offset(addr, width, DMAC_BASE, DMAC_SIZE)? {
+            return Ok(self.dmac.read(offset));
+        }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
         let interface = Self::in_region(addr, width, GICC_BASE, GICC_SIZE);
         if distributor || interface {
@@ -295,6 +384,18 @@ impl Soc {
             for (pa, len) in self.rga.written.drain(..) {
                 self.code_watch.dma_write(pa, len);
             }
+            return Ok(());
+        }
+        if let Some(offset) = Self::word_offset(addr, width, I2S_BASE, crate::i2s::SIZE)? {
+            let now = ticks_to_ns(self.now);
+            self.i2s.update(now, self.cru.i2s_mclk());
+            self.i2s.write(offset, value, now);
+            self.run_dma();
+            return Ok(());
+        }
+        if let Some(offset) = Self::word_offset(addr, width, DMAC_BASE, DMAC_SIZE)? {
+            let Soc { ram, i2s, dmac, code_watch, .. } = self;
+            dmac.write(offset, value, &mut DmaBus { ram, i2s, code_watch });
             return Ok(());
         }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
@@ -601,11 +702,33 @@ impl Machine {
         self.soc.dirty = false;
         let uart = self.soc.uart.irq();
         self.soc.gic.set_level(UART2_IRQ, uart);
+        let mut next = u64::MAX;
+        if let Some(net) = self.soc.wifi_net.as_mut() {
+            if self.soc.periph.exchange_wifi(net, ticks_to_ns(now) / 1000) {
+                // poll the network every millisecond while the Wi-Fi is joined
+                next = next.min(now + 24_000);
+            }
+        }
         let Soc { periph, gic, .. } = &mut self.soc;
         for (irq, level) in periph.irq_lines() {
             gic.set_level(irq, level);
         }
-        let mut next = u64::MAX;
+        {
+            let ns = ticks_to_ns(now);
+            let mclk = self.soc.cru.i2s_mclk();
+            self.soc.i2s.update(ns, mclk);
+            if self.soc.dmac.waiting() {
+                self.soc.run_dma();
+            }
+            if let Some(due) = self.soc.i2s.next_deadline() {
+                next = next.min(ns_to_ticks(due).max(now + 1));
+            }
+            let irq = self.soc.dmac.irq();
+            for line in DMAC_IRQS {
+                self.soc.gic.set_level(line, irq);
+            }
+            self.soc.gic.set_level(I2S_IRQ, false);
+        }
         for k in 0..2 {
             self.soc.vop[k].update(now);
             let irq = self.soc.vop[k].irq();
@@ -666,6 +789,19 @@ impl Machine {
         if self.soc.dirty || changed || self.cpus[0].cntpct >= self.next_event {
             self.update_irqs();
         }
+    }
+
+    /// Put the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP) behind the Wi-Fi access
+    /// points; `nat` also relays the guest's TCP/UDP to the host's network (native builds
+    /// only).
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.wifi_net = Some(net);
     }
 
     pub fn advance_time(&mut self, ticks: u64) {

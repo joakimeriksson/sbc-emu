@@ -53,6 +53,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-periph"
+version = "0.0.1"
+dependencies = [
+ "esp32sim-emu-core",
+]
+
+[[package]]
+name = "esp-soc"
+version = "0.0.1"
+dependencies = [
+ "esp-periph",
+ "esp32sim-emu-core",
+]
+
+[[package]]
+name = "esp32s31"
+version = "0.0.1"
+dependencies = [
+ "esp-periph",
+ "esp-soc",
+ "esp32sim-emu-core",
+ "riscv-rv32",
+]
+
+[[package]]
+name = "esp32sim-emu-core"
+version = "0.0.1"
+
+[[package]]
 name = "mali400"
 version = "0.0.1"
 
@@ -72,6 +101,16 @@ dependencies = [
 [[package]]
 name = "peripherals"
 version = "0.0.1"
+dependencies = [
+ "sbc-net",
+]
+
+[[package]]
+name = "riscv-rv32"
+version = "0.0.1"
+dependencies = [
+ "esp32sim-emu-core",
+]
 
 [[package]]
 name = "rk3588"
@@ -91,6 +130,7 @@ dependencies = [
  "mali400",
  "midgard",
  "peripherals",
+ "sbc-net",
 ]
 
 [[package]]

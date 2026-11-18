@@ -10,6 +10,8 @@ pub mod gpu_render;
 pub mod gpu_shader;
 pub mod gpu_compute;
 pub mod gpu_resources;
+pub mod gpu_tiler;
+pub mod gpu_raster;
 pub mod uart;
 pub mod mmc;
 pub mod phy;

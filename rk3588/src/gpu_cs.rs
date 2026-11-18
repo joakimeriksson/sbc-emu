@@ -1,8 +1,8 @@
 //! Initial Mali Valhall command-stream interpreter.
 //!
 //! This implements a small synchronous subset used to move data and prepare
-//! commands. Only linear RGBA8 clear passes are supported; shader execution is
-//! not implemented; unknown commands stop explicitly rather than succeeding.
+//! commands, compute dispatch and linear RGBA8 clear/opaque triangle passes. Unknown commands
+//! stop explicitly rather than succeeding.
 use crate::gpu_mmu::{AddressSpace, Fault};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub struct Stream {
     pub pc: u64,
     pub end: u64,
     stack: Vec<(u64, u64, u64)>,
+    heap: Option<u64>,
+    oom_handler: Option<(u64, u64)>,
+    standalone_tiler: crate::gpu_tiler::Tiler,
 }
 impl Stream {
     pub fn new(start: u64, size: u64) -> Result<Self, Stop> {
@@ -32,10 +35,25 @@ impl Stream {
         Ok(Self {
             regs: [0; 256],
             stack: Vec::new(),
+            heap: None,
+            oom_handler: None,
+            standalone_tiler: crate::gpu_tiler::Tiler::default(),
             start,
             pc: start,
             end,
         })
+    }
+    /// Start the next ring segment while retaining architectural queue state.
+    /// A faulted or unfinished segment must be stopped/reset instead of replayed.
+    pub fn next_segment(&mut self, start: u64, size: u64) -> Result<(), Stop> {
+        if self.pc != self.end || !self.stack.is_empty() || start & 7 != 0 || size & 7 != 0 {
+            return Err(Stop::InvalidStream);
+        }
+        let end = start.checked_add(size).ok_or(Stop::InvalidStream)?;
+        self.start = start;
+        self.pc = start;
+        self.end = end;
+        Ok(())
     }
     fn pair(&self, reg: usize) -> Result<u64, Stop> {
         if reg >= 255 || reg & 1 != 0 {
@@ -63,6 +81,20 @@ impl Stream {
     }
     /// Execute at most `budget` instructions, leaving PC on an unhandled or faulting instruction.
     pub fn run(&mut self, mmu: &AddressSpace, ram: &mut [u8], budget: usize) -> Stop {
+        let mut tiler = std::mem::take(&mut self.standalone_tiler);
+        let stop = self.run_with_tiler(mmu, ram, budget, &mut tiler, (0, 0));
+        self.standalone_tiler = tiler;
+        stop
+    }
+    pub fn run_with_tiler(
+        &mut self,
+        mmu: &AddressSpace,
+        ram: &mut [u8],
+        budget: usize,
+        tiler: &mut crate::gpu_tiler::Tiler,
+        owner: (u32, u32),
+    ) -> Stop {
+        let trace = std::env::var_os("SBC_MALI_TRACE").is_some();
         for _ in 0..budget {
             self.unwind();
             if self.pc == self.end {
@@ -79,6 +111,9 @@ impl Stream {
             let opcode = (insn >> 56) as u8;
             let dst = ((insn >> 48) & 255) as usize;
             let src = ((insn >> 40) & 255) as usize;
+            if trace {
+                eprintln!("[mali cs] pc={:#x} insn={:#018x}", self.pc, insn);
+            }
             let mut next = self.pc + 8;
             let result = match opcode {
                 0 => Ok(()), // NOP
@@ -88,9 +123,42 @@ impl Stream {
                     Ok(())
                 }
                 3 if (insn >> 32) & 1 == 0 => Ok(()),
-                4 => crate::gpu_compute::dispatch(mmu,ram,&self.regs,insn),
+                4 => crate::gpu_compute::dispatch(mmu, ram, &self.regs, insn),
+                6 if self.heap.is_some() => tiler.idvs(mmu, ram, &self.regs, insn, owner),
+                11 if insn & 0x00f0_0000_0000_fffe == 0 => {
+                    let first = match self.pair(src) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let last = match self.pair(((insn >> 32) & 255) as usize) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if first != 0 || last != 0 {
+                        Err(Stop::Unsupported {
+                            pc: self.pc,
+                            opcode,
+                        })
+                    } else if insn & 1 != 0 {
+                        if let Some(heap) = self.heap {
+                            tiler.heap_operation(mmu, ram, owner, heap, 3)
+                        } else {
+                            Err(Stop::InvalidStream)
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                9 if insn & 0x00ff_ffff_ffff_ffff == 0 => Ok(()), // all position work executes synchronously
+                49 if insn & 0x00f0_fff8_0000_ffff == 0 => {
+                    if let Some(heap) = self.heap {
+                        tiler.heap_operation(mmu, ram, owner, heap, ((insn >> 32) & 7) as u32)
+                    } else {
+                        Err(Stop::InvalidStream)
+                    }
+                }
                 7 if insn & 0x00ff_ffff_ffff_ffff == 0 => {
-                    crate::gpu_render::fragment(mmu, ram, &self.regs)
+                    tiler.fragment(mmu, ram, &self.regs, owner)
                 }
                 16 => {
                     self.regs[dst] = self.regs[src].wrapping_add(insn as u32);
@@ -117,6 +185,16 @@ impl Stream {
                     next = addr;
                     Ok(())
                 }
+                23 if insn & 0x00ff_ffff_ffff_ff00 == 0 => Ok(()), // synchronous scoreboard selection
+                40 if (insn >> 32) & 255 == 3 && insn & 0x00f0_0000_0000_0000 == 0 => {
+                    let addr = match self.pair(src) {
+                        Ok(a) => a,
+                        Err(e) => return e,
+                    }
+                    .wrapping_add(insn as u16 as i16 as i64 as u64);
+                    mmu.write(ram, addr, &0u64.to_le_bytes(), true)
+                        .map_err(Stop::Memory)
+                }
                 34 | 36 | 47 => Ok(()), // synchronous resources/cache; no in-flight operations
                 51 => {
                     let a = match self.pair(src) {
@@ -138,6 +216,44 @@ impl Stream {
                         true,
                     )
                     .map_err(Stop::Memory)
+                }
+                25 if insn & 0x00ff0000ffffffff == 2 => {
+                    let addr = match self.pair(src) {
+                        Ok(a) => a,
+                        Err(e) => return e,
+                    };
+                    let len = self.regs[((insn >> 32) & 255) as usize] as u64;
+                    if addr & 7 != 0 || len & 7 != 0 || len > 1 << 20 {
+                        Err(Stop::InvalidStream)
+                    } else {
+                        match mmu.chunks(
+                            ram,
+                            addr,
+                            len as usize,
+                            crate::gpu_mmu::Access::Read,
+                            true,
+                        ) {
+                            Ok(_) => {
+                                self.oom_handler = if len == 0 { None } else { Some((addr, len)) };
+                                Ok(())
+                            }
+                            Err(f) => Err(Stop::Memory(f)),
+                        }
+                    }
+                }
+                48 if insn & 0x00ff00ffffffffff == 0 => {
+                    let addr = match self.pair(src) {
+                        Ok(a) => a,
+                        Err(e) => return e,
+                    };
+                    let mut context = [0; 32];
+                    match mmu.read(ram, addr, &mut context, true) {
+                        Ok(()) => {
+                            self.heap = Some(addr);
+                            Ok(())
+                        }
+                        Err(f) => Err(Stop::Memory(f)),
+                    }
                 }
                 20 | 21 => self.multiple(mmu, ram, insn, opcode == 21),
                 22 => {
@@ -256,6 +372,107 @@ mod tests {
     use super::*;
     fn ins(op: u64, dst: u64, src: u64, imm: u64) -> u64 {
         op << 56 | dst << 48 | src << 40 | imm
+    }
+    #[test]
+    fn standalone_heap_execution_survives_an_instruction_budget_boundary() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0; 512];
+        let code = [
+            ins(1, 0, 0, 256),
+            ins(48, 0, 0, 0),
+            ins(49, 0, 0, 0),
+            ins(49, 0, 0, 1 << 32),
+        ];
+        for (n, i) in code.into_iter().enumerate() {
+            ram[n * 8..n * 8 + 8].copy_from_slice(&i.to_le_bytes());
+        }
+        let mut stream = Stream::new(0, 32).unwrap();
+        assert_eq!(stream.run(&m, &mut ram, 3), Stop::Budget);
+        assert_eq!(stream.run(&m, &mut ram, 1), Stop::Complete);
+    }
+    #[test]
+    fn next_ring_segment_keeps_heap_and_handler_and_rejects_unfinished_work() {
+        let mmu = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0; 4096];
+        let code = [
+            ins(1, 0, 0, 1024),
+            ins(48, 0, 0, 0),
+            ins(2, 2, 0, 8),
+            ins(25, 0, 0, (2 << 32) | 2),
+        ];
+        for (i, word) in code.into_iter().enumerate() {
+            ram[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut stream = Stream::new(0, 32).unwrap();
+        assert_eq!(stream.next_segment(64, 8), Err(Stop::InvalidStream));
+        assert_eq!(stream.run(&mmu, &mut ram, 4), Stop::Complete);
+        stream.next_segment(64, 8).unwrap();
+        assert_eq!(stream.heap, Some(1024));
+        assert_eq!(stream.oom_handler, Some((1024, 8)));
+        assert_eq!(stream.regs[0], 1024);
+        assert_eq!(stream.run(&mmu, &mut ram, 1), Stop::Complete);
+        assert_eq!(
+            stream.next_segment(u64::MAX - 7, 16),
+            Err(Stop::InvalidStream)
+        );
+        assert_eq!((stream.start, stream.pc, stream.end), (64, 72, 72));
+    }
+    #[test]
+    fn successful_error_status_store_clears_all_eight_bytes_and_honors_offset() {
+        let mmu = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0xff; 4096];
+        let instruction = ins(40, 0, 0, (3 << 32) | 0xfff8);
+        ram[..8].copy_from_slice(&instruction.to_le_bytes());
+        let mut stream = Stream::new(0, 8).unwrap();
+        stream.regs[0] = 1032;
+        assert_eq!(stream.run(&mmu, &mut ram, 1), Stop::Complete);
+        assert_eq!(&ram[1024..1032], &[0; 8]);
+        assert_eq!(ram[1023], 0xff);
+        assert_eq!(ram[1032], 0xff);
+        stream.pc = 0;
+        stream.regs[0] = 4100;
+        let before = ram.clone();
+        assert!(matches!(stream.run(&mmu, &mut ram, 1), Stop::Memory(_)));
+        assert_eq!(ram, before);
+        assert_eq!(stream.pc, 0);
+    }
+    #[test]
+    fn tiler_oom_handler_registration_checks_encoding_and_memory() {
+        let mmu = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0u8; 4096];
+        let instruction = ins(25, 0, 0, (2 << 32) | 2);
+        ram[..8].copy_from_slice(&instruction.to_le_bytes());
+        let mut stream = Stream::new(0, 8).unwrap();
+        stream.regs[0] = 1024;
+        stream.regs[2] = 16;
+        assert_eq!(stream.run(&mmu, &mut ram, 1), Stop::Complete);
+        assert_eq!(stream.oom_handler, Some((1024, 16)));
+        stream.pc = 0;
+        stream.regs[2] = 0;
+        assert_eq!(stream.run(&mmu, &mut ram, 1), Stop::Complete);
+        assert_eq!(stream.oom_handler, None);
+        stream.pc = 0;
+        stream.regs[0] = 4096;
+        stream.regs[2] = 16;
+        assert!(matches!(stream.run(&mmu, &mut ram, 1), Stop::Memory(_)));
+        assert_eq!(stream.pc, 0);
+        ram[..8].copy_from_slice(&(instruction | (1 << 16)).to_le_bytes());
+        assert_eq!(
+            stream.run(&mmu, &mut ram, 1),
+            Stop::Unsupported { pc: 0, opcode: 25 }
+        );
     }
     #[test]
     fn executes_real_move_add_store_and_load_encodings() {
