@@ -25,6 +25,10 @@ pub const PMU_BASE: u64 = 0xff73_0000;
 /// VOP's IOMMU).
 pub const VOP_BASES: [u64; 2] = [0xff93_0000, 0xff94_0000];
 pub const VOP_IRQS: [usize; 2] = [32 + 15, 32 + 16];
+/// Mali-T760 MP4 GPU and its interrupts (SPI 6, 7, 8: "job", "mmu", "gpu").
+pub const GPU_BASE: u64 = 0xffa3_0000;
+pub const GPU_IRQS: [(midgard::Irq, usize); 3] =
+    [(midgard::Irq::Job, 32 + 6), (midgard::Irq::Mmu, 32 + 7), (midgard::Irq::Gpu, 32 + 8)];
 /// MIPI DSI host 0 (the panel board's panel).
 pub const DSI0_BASE: u64 = 0xff96_0000;
 pub const GICD_BASE: u64 = 0xffc0_1000;
@@ -63,6 +67,8 @@ pub struct Soc {
     /// VOP-big and VOP-little.
     pub vop: [Vop; 2],
     pub dsi: Dsi,
+    /// Mali-T760 GPU (`midgard`).
+    pub gpu: midgard::MaliT760,
     /// How the panel is mounted, in degrees counter-clockwise (the panel node's `rotation`):
     /// the picture is turned the same way for screenshots and VNC, as the user sees it.
     /// 0, 90, 180 or 270; other values show the picture unturned.
@@ -94,6 +100,7 @@ impl Soc {
             periph: Peripherals::default(),
             vop: Default::default(),
             dsi: Dsi::default(),
+            gpu: midgard::MaliT760::new(std::env::var("SBC_MALI_LOG").is_ok_and(|v| v != "0")),
             display_rotation: 0,
             display_name: "sbc-emu: RK3288",
             now: 0,
@@ -195,6 +202,9 @@ impl Soc {
         if let Some(offset) = Self::word_offset(addr, width, DSI0_BASE, DSI_SIZE)? {
             return Ok(self.dsi.read(offset));
         }
+        if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
+            return Ok(self.gpu.read(offset));
+        }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
         let interface = Self::in_region(addr, width, GICC_BASE, GICC_SIZE);
         if distributor || interface {
@@ -241,6 +251,10 @@ impl Soc {
         }
         if let Some(offset) = Self::word_offset(addr, width, DSI0_BASE, DSI_SIZE)? {
             self.dsi.write(offset, value);
+            return Ok(());
+        }
+        if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
+            self.gpu.write(offset, value, &mut self.ram.mem, self.ram.base);
             return Ok(());
         }
         let distributor = Self::in_region(addr, width, GICD_BASE, GICD_SIZE);
@@ -506,6 +520,16 @@ impl Machine {
             let irq = self.soc.vop[k].irq();
             self.soc.gic.set_level(VOP_IRQS[k], irq);
             if let Some(due) = self.soc.vop[k].next_deadline() {
+                next = next.min(due);
+            }
+        }
+        {
+            let Soc { gpu, ram, gic, .. } = &mut self.soc;
+            gpu.update(now, &mut ram.mem, ram.base);
+            for (irq, line) in GPU_IRQS {
+                gic.set_level(line, gpu.irq(irq));
+            }
+            if let Some(due) = gpu.next_deadline() {
                 next = next.min(due);
             }
         }

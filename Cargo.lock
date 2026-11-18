@@ -56,6 +56,10 @@ name = "mali400"
 version = "0.0.1"
 
 [[package]]
+name = "midgard"
+version = "0.0.1"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -81,6 +85,7 @@ dependencies = [
  "arm-a32",
  "emu-core",
  "mali400",
+ "midgard",
 ]
 
 [[package]]
