@@ -41,6 +41,18 @@ impl Stream {
             end,
         })
     }
+    /// Start the next ring segment while retaining architectural queue state.
+    /// A faulted or unfinished segment must be stopped/reset instead of replayed.
+    pub fn next_segment(&mut self, start: u64, size: u64) -> Result<(), Stop> {
+        if self.pc != self.end || !self.stack.is_empty() || start & 7 != 0 || size & 7 != 0 {
+            return Err(Stop::InvalidStream);
+        }
+        let end = start.checked_add(size).ok_or(Stop::InvalidStream)?;
+        self.start = start;
+        self.pc = start;
+        self.end = end;
+        Ok(())
+    }
     fn pair(&self, reg: usize) -> Result<u64, Stop> {
         if reg >= 255 || reg & 1 != 0 {
             return Err(Stop::InvalidRegister);
@@ -312,6 +324,36 @@ mod tests {
     use super::*;
     fn ins(op: u64, dst: u64, src: u64, imm: u64) -> u64 {
         op << 56 | dst << 48 | src << 40 | imm
+    }
+    #[test]
+    fn next_ring_segment_keeps_heap_and_handler_and_rejects_unfinished_work() {
+        let mmu = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0; 4096];
+        let code = [
+            ins(1, 0, 0, 1024),
+            ins(48, 0, 0, 0),
+            ins(2, 2, 0, 8),
+            ins(25, 0, 0, (2 << 32) | 2),
+        ];
+        for (i, word) in code.into_iter().enumerate() {
+            ram[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut stream = Stream::new(0, 32).unwrap();
+        assert_eq!(stream.next_segment(64, 8), Err(Stop::InvalidStream));
+        assert_eq!(stream.run(&mmu, &mut ram, 4), Stop::Complete);
+        stream.next_segment(64, 8).unwrap();
+        assert_eq!(stream.heap, Some(1024));
+        assert_eq!(stream.oom_handler, Some((1024, 8)));
+        assert_eq!(stream.regs[0], 1024);
+        assert_eq!(stream.run(&mmu, &mut ram, 1), Stop::Complete);
+        assert_eq!(
+            stream.next_segment(u64::MAX - 7, 16),
+            Err(Stop::InvalidStream)
+        );
+        assert_eq!((stream.start, stream.pc, stream.end), (64, 72, 72));
     }
     #[test]
     fn successful_error_status_store_clears_all_eight_bytes_and_honors_offset() {

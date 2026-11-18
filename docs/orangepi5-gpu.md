@@ -82,7 +82,10 @@ expanded 4 GiB image was used to leave enough room for its LLVM dependencies.
 The minimal unmodified Armbian fixture does not include these libraries.
 
 The command interpreter supports scoreboard selection and registration of the
-tiler heap and OOM handler used during Mesa initialization. Geometry allocation
+tiler heap and OOM handler used during Mesa initialization. Queue registers and
+registrations survive doorbells and ring wraps; queue stop, group termination or
+firmware reboot discards them. A changed ring or VM requires that reset before
+reusing a queue. Geometry allocation
 and execution of the OOM handler remain unsupported. Successful
 `STORE_STATE.ERROR_STATUS` writes all eight bytes expected by Mesa's synchronous
 debug check. Faulted queues retain their fatal event and stop replaying work until

@@ -1,6 +1,10 @@
 //! Host model of the CSF global management interface (not MCU instruction execution).
-//! Queue execution is not implemented and must not be acknowledged as completed.
+//! Queues retain their registers and setup across doorbells and ring wraps.
 use crate::gpu_mmu::{AddressSpace, Fault};
+struct Queue {
+    binding: [u64; 4], // Ring base/size and VM page-table configuration.
+    stream: crate::gpu_cs::Stream,
+}
 const SHARED: u64 = 0x04000000;
 #[derive(Default)]
 pub struct Firmware {
@@ -10,6 +14,7 @@ pub struct Firmware {
     groups: u32,
     stride: u64,
     failed_queues: std::collections::BTreeSet<(u32, u32)>,
+    queues: std::collections::BTreeMap<(u32, u32), Queue>,
 }
 fn read(m: &AddressSpace, ram: &[u8], addr: u64) -> Result<u32, Fault> {
     let mut b = [0; 4];
@@ -23,6 +28,7 @@ impl Firmware {
     pub fn boot(&mut self, m: &AddressSpace, ram: &mut [u8]) -> Result<(), Fault> {
         self.running = false;
         self.failed_queues.clear();
+        self.queues.clear();
         let input = read(m, ram, SHARED + 8)? as u64;
         let output = read(m, ram, SHARED + 12)? as u64;
         let groups = read(m, ram, SHARED + 16)?;
@@ -83,6 +89,7 @@ impl Firmware {
             }
             if req & 7 == 0 {
                 self.failed_queues.retain(|&(group, _)| group != g);
+                self.queues.retain(|&(group, _), _| group != g);
             }
             if req & 7 != 1 && req & 7 != 3 {
                 continue;
@@ -109,6 +116,7 @@ impl Firmware {
                 if cr & 7 != 1 {
                     if cr & 7 == 0 {
                         self.failed_queues.remove(&(g, q));
+                        self.queues.remove(&(g, q));
                     }
                     continue;
                 }
@@ -134,14 +142,30 @@ impl Firmware {
                 {
                     return Err(Fault::UnsupportedConfiguration);
                 }
-                let mut regs = [0; 256];
+                let binding = [base, size, spaces[asid].transtab, spaces[asid].transcfg];
                 while extract < insert {
                     let offset = extract % size;
                     let len = (insert - extract).min(size - offset);
                     let addr = base.checked_add(offset).ok_or(Fault::AddressSize)?;
-                    let mut stream = crate::gpu_cs::Stream::new(addr, len)
-                        .map_err(|_| Fault::UnsupportedConfiguration)?;
-                    stream.regs = regs;
+                    // Keep the old binding until STOP/TERMINATE, including
+                    // after a rejected rebind, so a retry cannot bypass it.
+                    if self
+                        .queues
+                        .get(&(g, q))
+                        .is_some_and(|queue| queue.binding != binding)
+                    {
+                        return Err(Fault::UnsupportedConfiguration);
+                    }
+                    let mut stream = if let Some(mut queue) = self.queues.remove(&(g, q)) {
+                        queue
+                            .stream
+                            .next_segment(addr, len)
+                            .map_err(|_| Fault::UnsupportedConfiguration)?;
+                        queue.stream
+                    } else {
+                        crate::gpu_cs::Stream::new(addr, len)
+                            .map_err(|_| Fault::UnsupportedConfiguration)?
+                    };
                     let stop = stream.run(&spaces[asid], ram, 65536);
                     if stop != crate::gpu_cs::Stop::Complete {
                         eprintln!("[mali] queue stopped: {:?}", stop);
@@ -155,7 +179,7 @@ impl Firmware {
                         write(m, ram, output + 12, bits ^ (1 << q))?;
                         break;
                     }
-                    regs = stream.regs;
+                    self.queues.insert((g, q), Queue { binding, stream });
                     extract += len;
                     m.write(ram, ro, &extract.to_le_bytes(), false)?;
                     completed = true;
@@ -265,39 +289,44 @@ mod tests {
         assert!(!f.running);
         assert_eq!(read(&m, &r, SHARED).unwrap(), 0);
     }
+    fn queue_fixture() -> (Firmware, [AddressSpace; 16], Vec<u8>) {
+        let (m, mut r) = fixture();
+        let mut f = Firmware::default();
+        f.boot(&m, &mut r).unwrap();
+        f.groups = 1;
+        let gi = SHARED + 0x3000;
+        write(&m, &mut r, gi, 1).unwrap();
+        write(&m, &mut r, gi + 80, 1).unwrap();
+        for q in 0..8u64 {
+            let ctrl = SHARED + 0x1040 + q * 12;
+            write(&m, &mut r, ctrl + 4, (SHARED + 0x4000 + q * 128) as u32).unwrap();
+            write(&m, &mut r, ctrl + 8, (SHARED + 0x8000 + q * 256) as u32).unwrap();
+        }
+        let ci = SHARED + 0x4000;
+        write(&m, &mut r, ci, 1).unwrap();
+        for (off, v) in [
+            (16, 0x18000),
+            (24, 4096),
+            (48, SHARED + 0x5000),
+            (56, SHARED + 0xa000),
+        ] {
+            m.write(&mut r, ci + off, &v.to_le_bytes(), false).unwrap();
+        }
+        m.write(&mut r, SHARED + 0x5000, &8u64.to_le_bytes(), false)
+            .unwrap();
+        let mut spaces = [m; 16];
+        spaces[1] = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        (f, spaces, r)
+    }
     #[test]
     fn queues_advance_only_completed_work_and_interrupt_on_fault() {
         for (opcode, done) in [(0u64, true), (4, false)] {
-            let (m, mut r) = fixture();
-            let mut f = Firmware::default();
-            f.boot(&m, &mut r).unwrap();
-            f.groups = 1;
-            let gi = SHARED + 0x3000;
-            write(&m, &mut r, gi, 1).unwrap();
-            write(&m, &mut r, gi + 80, 1).unwrap();
-            for q in 0..8u64 {
-                let ctrl = SHARED + 0x1040 + q * 12;
-                write(&m, &mut r, ctrl + 4, (SHARED + 0x4000 + q * 128) as u32).unwrap();
-                write(&m, &mut r, ctrl + 8, (SHARED + 0x8000 + q * 256) as u32).unwrap();
-            }
-            let ci = SHARED + 0x4000;
-            write(&m, &mut r, ci, 1).unwrap();
-            for (off, v) in [
-                (16, 0x18000),
-                (24, 4096),
-                (48, SHARED + 0x5000),
-                (56, SHARED + 0xa000),
-            ] {
-                m.write(&mut r, ci + off, &v.to_le_bytes(), false).unwrap();
-            }
-            m.write(&mut r, SHARED + 0x5000, &8u64.to_le_bytes(), false)
-                .unwrap();
+            let (mut f, spaces, mut r) = queue_fixture();
+            let m = spaces[0];
             r[0x18000..0x18008].copy_from_slice(&(opcode << 56).to_le_bytes());
-            let mut spaces = [m; 16];
-            spaces[1] = AddressSpace {
-                transtab: 0,
-                transcfg: 2,
-            };
             assert_eq!(f.queues(&spaces, &mut r).unwrap() & 1, 1);
             assert_eq!(
                 read(&m, &r, SHARED + 0xa000).unwrap(),
@@ -314,5 +343,45 @@ mod tests {
                 assert_eq!(read(&m, &r, SHARED + 0xa000).unwrap(), 0);
             }
         }
+    }
+    #[test]
+    fn queue_context_survives_doorbells_and_wrap_but_not_stop_or_terminate() {
+        let (mut f, spaces, mut r) = queue_fixture();
+        let m = spaces[0];
+        let ci = SHARED + 0x4000;
+        let put64 =
+            |r: &mut [u8], a, value: u64| m.write(r, a, &value.to_le_bytes(), false).unwrap();
+        write(&m, &mut r, ci + 24, 64).unwrap();
+        put64(&mut r, SHARED + 0xa000, 56);
+        put64(&mut r, SHARED + 0x5000, 64);
+        r[0x18038..0x18040].copy_from_slice(&((1u64 << 56) | 0x1b000).to_le_bytes());
+        f.queues(&spaces, &mut r).unwrap();
+        assert_eq!(f.queues[&(0, 0)].stream.regs[0], 0x1b000);
+        // The next doorbell wraps the ring and uses the address set above.
+        r[0x18000..0x18008].copy_from_slice(&((2u64 << 56) | (4 << 48) | 37).to_le_bytes());
+        r[0x18008..0x18010].copy_from_slice(&((21u64 << 56) | (4 << 48) | (1 << 16)).to_le_bytes());
+        put64(&mut r, SHARED + 0x5000, 80);
+        f.queues(&spaces, &mut r).unwrap();
+        assert_eq!(&r[0x1b000..0x1b004], &37u32.to_le_bytes());
+        assert_eq!(read(&m, &r, SHARED + 0xa000).unwrap(), 80);
+        // A changed ring cannot inherit the old registers, even on retries.
+        write(&m, &mut r, ci + 16, 0x19000).unwrap();
+        put64(&mut r, SHARED + 0x5000, 88);
+        for _ in 0..2 {
+            assert_eq!(
+                f.queues(&spaces, &mut r),
+                Err(Fault::UnsupportedConfiguration)
+            );
+            assert_eq!(f.queues[&(0, 0)].stream.regs[0], 0x1b000);
+        }
+        write(&m, &mut r, ci, 0).unwrap();
+        f.queues(&spaces, &mut r).unwrap();
+        assert!(f.queues.is_empty());
+        write(&m, &mut r, ci, 1).unwrap();
+        f.queues(&spaces, &mut r).unwrap();
+        assert_eq!(f.queues[&(0, 0)].stream.regs[0], 0);
+        write(&m, &mut r, SHARED + 0x3000, 0).unwrap();
+        f.queues(&spaces, &mut r).unwrap();
+        assert!(f.queues.is_empty());
     }
 }
