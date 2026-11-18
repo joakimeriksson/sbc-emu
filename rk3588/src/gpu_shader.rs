@@ -177,6 +177,7 @@ impl Shader {
                         || i & (1 << 27) != 0
                         || (i >> 36) & 15 != 0
                         || (i >> 30) & 7 > 2
+                        || (i >> 16) & 15 >= 12
                         || !self.registers_available(dst, count)
                         || count > 1 && dst & 1 != 0
                     {

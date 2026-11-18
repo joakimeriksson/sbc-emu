@@ -206,13 +206,25 @@ mod tests {
     }
     #[test]
     fn malformed_attribute_instructions_leave_registers_unchanged() {
-        let (m, resources, mut ram) = fixture();
+        let (m, mut resources, mut ram) = fixture();
+        // Even if SRT entries 12-15 are valid, the immediate encodings refer to
+        // hardware tables 60-63 and must not access those ordinary entries.
+        resources.0 = (resources.0 & !63) | 16;
+        for table in 12..16 {
+            let at = 0x1000 + table * 16;
+            ram[at..at + 8].copy_from_slice(&(0x2000u64 | (1 << 56)).to_le_bytes());
+            ram[at + 8..at + 16].copy_from_slice(&32u64.to_le_bytes());
+        }
         let captured = 0x0866800412017d7cu64;
         for instruction in [
             captured | (1 << 36),
             captured & !(7 << 33),
             captured | (1 << 24),
             (captured & !(63 << 40)) | (15 << 40),
+            (captured & !(15 << 16)) | (12 << 16),
+            (captured & !(15 << 16)) | (13 << 16),
+            (captured & !(15 << 16)) | (14 << 16),
+            (captured & !(15 << 16)) | (15 << 16),
         ] {
             ram[..8].copy_from_slice(&instruction.to_le_bytes());
             let mut shader = Shader::new(0);
