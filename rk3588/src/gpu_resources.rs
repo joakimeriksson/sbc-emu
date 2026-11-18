@@ -10,7 +10,8 @@ pub enum Error {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Resources(pub u64);
 /// GPU-mapped structured storage supplied by the vertex engine for its private
-/// position table. Contents still pass through the ordinary GPU MMU.
+/// IDVS output table (positions or generic varyings, selected by stage).
+/// Contents still pass through the ordinary GPU MMU.
 #[derive(Clone, Copy, Debug)]
 pub struct Buffer {
     pub address: u64,
@@ -73,7 +74,7 @@ impl Resources {
         Ok(descriptor)
     }
     /// Resolve LEA_BUF_IMM through a structured buffer descriptor, or through
-    /// the hardware-provided position table (13) when running a vertex shader.
+    /// the hardware-provided IDVS output table (13) when running a vertex stage.
     pub fn buffer_address(
         &self,
         m: &AddressSpace,

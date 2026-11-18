@@ -186,7 +186,8 @@ python3 tools/panthor-demo.py --gles --image <mesa-equipped-armbian.img> \
 The 512×512 image is read back from a real GLES framebuffer with
 `GL_RENDERER=Mali-G610 (Panfrost)`. Mesa compiles the shaders and submits the draw
 commands through Linux Panthor. Twenty-four opaque triangle draws, eight fragment
-programs, overlaps and multiple colors form the sun/mountain/prism scene. Interior
+programs, overlaps and multiple colors form the sun/mountain/prism scene. Its
+checker floor uses sampled texture data and interpolated coordinates. Interior
 pixel probes and `glFinish`/`glReadPixels` verify the result before PNG export.
 There is no llvmpipe fallback. Use the Mesa-equipped fixture described above.
 
@@ -237,12 +238,12 @@ registers are decoded, including native half-float uniform conversion.
 The fragment descriptor's helper-thread flag is accepted for this path. With one
 mip level and identical min/mag filters, derivatives cannot change LOD or filter
 selection. Derivative instructions, mip selection and unequal min/mag filters
-remain unsupported. This does not simulate a fragment quad or varying inputs.
+remain unsupported. This does not simulate a fragment quad; varying inputs are described below.
 
 `tests/gpu/panthor-gles-texture.py` checks all pixels in 84 Linux/Mesa frames:
 texel centers, bilinear averages and edges, out-of-range coordinates and wrapping,
 two texture units and varying source alpha. The test uses uniform coordinates;
-interpolated texture coordinates still need the varying path. Like the other
+the varying path below also exercises interpolated texture coordinates. Like the other
 GLES fixtures, it requests Mesa's linear layout with `PAN_MESA_DEBUG=sync,linear`.
 
 ```sh
@@ -251,11 +252,42 @@ python3 tools/panthor-test.py --image <mesa-image> \
   --success-marker PANTHOR_GLES_TEXTURE_OK --log out/gles-texture.log
 ```
 
+The IDVS secondary vertex stage now writes generic varyings through GPU mappings
+into a bounded hardware-output buffer, with separate SRT/FAU selectors. Position
+and varying stages share the invocation/instruction limits; combined buffer size
+is checked against Mesa's geometry allocation. Each draw retains an immutable
+snapshot of its shader-written varying data, so later draws cannot overwrite
+previous primitives' interpolation inputs.
+
+`LD_VAR_BUF_IMM` interpolates float32 or float16 source channels at the covered
+pixel center (or equivalent single-sample centroid), supports saved-position
+store/retrieve/clobber state, and writes float32 or packed float16 results. With
+W=1 this is affine barycentric interpolation; perspective correction is not yet
+supported. Byte offsets and all vertex spans are checked before destination
+registers change. Native half-source FMA, 64-bit stores and packed float conversion
+support Mesa's varying shaders without supplying vertex colors from the host.
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-varying.py \
+  --success-marker PANTHOR_GLES_VARYING_OK --log out/gles-varying.log
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-varying-texture.py \
+  --success-marker PANTHOR_GLES_VARYING_TEXTURE_OK --log out/gles-varying-texture.log
+```
+
+These Linux/Mesa fixtures check every pixel in six color-gradient frames
+(highp/mediump, both windings) and six textured frames (nearest/bilinear, both
+windings and multiple triangle sizes). Texture coordinates come from the native
+varying shader, not per-fragment CPU uniforms. Flat/integer varyings, indirect
+varying loads, sample/explicit interpolation positions and fused varying/texture
+instructions remain unsupported.
+
 This is still a subset: triangle lists with basic position FIFO, W=1, finite
-supported coordinates and depth in [0,1], one linear RGBA8 target, no separate varying shader and opaque replacement blending.
+supported coordinates and depth in [0,1], one linear RGBA8 target and opaque replacement blending.
 Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
 Nonzero global attribute/index/instance offsets, primitive restart, other
-primitive modes, perspective/clipping, varying interpolation, broader texture
+primitive modes, perspective/clipping, broader varying modes and texture
 formats/layouts, mipmaps, anisotropy, shadow/array/cube sampling,
 blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
 non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue

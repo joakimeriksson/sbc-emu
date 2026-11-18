@@ -1,5 +1,5 @@
 //! Initial scalar Valhall shader execution. Encodings follow Mesa's Valhall ISA.xml.
-//! Only the explicitly decoded 32-bit operations are supported. Unknown opcodes,
+//! Only explicitly decoded instructions are supported. Unknown opcodes,
 //! unsupported modifiers and exhausted budgets fault rather than complete work.
 use crate::gpu_mmu::{AddressSpace, Fault};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,11 +67,52 @@ fn pack_half(value: f32) -> u16 {
         sign | ((exp as u16) << 10) | ((rounded >> 13) & 1023) as u16
     }
 }
+/// Hardware interpolation buffer, populated from native varying-shader stores.
+#[derive(Clone, Debug)]
+pub struct Interpolation {
+    pub data: std::sync::Arc<[u8]>,
+    pub stride: usize,
+    pub vertices: [usize; 3],
+    pub weights: [f64; 3],
+    pub saved: bool,
+}
+impl Interpolation {
+    fn load(&self, offset: usize, components: usize, width: usize) -> Option<[f32; 4]> {
+        if offset % width != 0 || offset.checked_add(components * width)? > self.stride {
+            return None;
+        }
+        let mut out = [0.; 4];
+        for (n, out) in out.iter_mut().enumerate().take(components) {
+            let mut value = 0.;
+            for v in 0..3 {
+                let at = self.vertices[v]
+                    .checked_mul(self.stride)?
+                    .checked_add(offset + n * width)?;
+                let bytes = self.data.get(at..at.checked_add(width)?)?;
+                let source = if width == 4 {
+                    f32::from_le_bytes(bytes.try_into().ok()?)
+                } else {
+                    half(u16::from_le_bytes(bytes.try_into().ok()?))
+                };
+                if !source.is_finite() || !self.weights[v].is_finite() {
+                    return None;
+                }
+                value += source as f64 * self.weights[v];
+            }
+            *out = value as f32;
+            if !out.is_finite() {
+                return None;
+            }
+        }
+        Some(out)
+    }
+}
 pub struct Shader {
     pub regs: [u32; 64],
     pub resources: crate::gpu_resources::Resources,
     pub position_output: Option<crate::gpu_resources::Buffer>,
     pub fragment: Option<Fragment>,
+    pub interpolation: Option<Interpolation>,
     register_mask: u64,
     pub pc: u64,
     pub instructions: u64,
@@ -92,6 +133,7 @@ impl Shader {
             resources: crate::gpu_resources::Resources::default(),
             position_output: None,
             fragment: None,
+            interpolation: None,
             pc,
             instructions: 0,
             // Mesa bi_ra.c: full occupancy uses R0-R15 and R48-R63.
@@ -184,17 +226,23 @@ impl Shader {
                     Some(v.to_bits())
                 }
                 0xa4 | 0xb2 => {
-                    // Scalar f32 with identity swizzles, round-to-nearest and optional abs/neg.
+                    // Scalar f32 with half-source widening, round-to-nearest and optional abs/neg.
                     let allowed = if op == 0xa4 {
-                        0x000000fc_0000ffff
+                        0x000000fc_3c00ffff
                     } else {
-                        0x000000fc_00ffffff
+                        0x000000fc_3fffffff
                     };
                     if i & 0x000000ff_ffffffff & !allowed != 0 {
                         return Err(bad());
                     }
                     let value = |n: usize| -> Result<f32, Error> {
-                        let mut v = f32::from_bits(self.source(i, n, uniforms).ok_or_else(bad)?);
+                        let bits = self.source(i, n, uniforms).ok_or_else(bad)?;
+                        let mut v = match (i >> (28 - n * 2)) & 3 {
+                            0 => f32::from_bits(bits),
+                            1 => half(bits as u16),
+                            2 => half((bits >> 16) as u16),
+                            _ => return Err(bad()),
+                        };
                         let shift = 38 - 2 * n;
                         if i & (1 << (shift + 1)) != 0 {
                             v = v.abs();
@@ -372,6 +420,69 @@ impl Shader {
                     self.regs[dst..dst + count].copy_from_slice(&values[..count]);
                     None
                 }
+                0xa5 if (i >> 16) & 15 == 4 => {
+                    if i & 0x000000ff_ffffffff & !0x000000f0_0000ffff != 0x40000 {
+                        return Err(bad());
+                    }
+                    let value = |n: usize| -> Result<f32, Error> {
+                        let mut v = f32::from_bits(self.source(i, n, uniforms).ok_or_else(bad)?);
+                        if i & (1 << (39 - n * 2)) != 0 {
+                            v = v.abs();
+                        }
+                        if i & (1 << (38 - n * 2)) != 0 {
+                            v = -v;
+                        }
+                        Ok(v)
+                    };
+                    Some(pack_half(value(0)?) as u32 | (pack_half(value(1)?) as u32) << 16)
+                }
+                0x5c | 0x5d => {
+                    let components = ((i >> 28) & 3) as usize + 1;
+                    let count = if op == 0x5c {
+                        components
+                    } else {
+                        (components + 1) / 2
+                    };
+                    let format = (i >> 24) & 15;
+                    let update = (i >> 36) & 3;
+                    if self.fragment.is_none()
+                        || (i >> 46) & 3 != 2
+                        || i & 0xff00 != 0
+                        || (i >> 30) & 7 > 2
+                        || (i >> 33) & 7 != count as u64
+                        || (i >> 38) & 3 > 1
+                        || update == 2
+                        || (i >> 57) & 3 != 0
+                        || !matches!(format, 2 | 3)
+                        || !self.registers_available(dst, count)
+                        || count > 1 && dst & 1 != 0
+                    {
+                        return Err(bad());
+                    }
+                    let interpolation = self.interpolation.as_mut().ok_or_else(bad)?;
+                    if update == 1 && !interpolation.saved {
+                        return Err(bad());
+                    }
+                    let values = interpolation
+                        .load(
+                            ((i >> 16) & 255) as usize,
+                            components,
+                            if format == 2 { 4 } else { 2 },
+                        )
+                        .ok_or_else(bad)?;
+                    if op == 0x5c {
+                        for n in 0..count {
+                            self.regs[dst + n] = values[n].to_bits();
+                        }
+                    } else {
+                        for n in 0..count {
+                            self.regs[dst + n] = pack_half(values[n * 2]) as u32
+                                | (pack_half(values[n * 2 + 1]) as u32) << 16;
+                        }
+                    }
+                    interpolation.saved = update != 3;
+                    None
+                }
                 0x128 => {
                     // Single-level normalized 2D sampling. The compact handle's
                     // second word must contain no texel offsets or array/LOD bits.
@@ -438,7 +549,7 @@ impl Shader {
                     // MMU transfers; streaming store hints do not change data semantics
                     // in this synchronous model. Forced discarded-thread access is unsupported.
                     if ((i >> 46) & 3) != if op == 0x61 { 1 } else { 2 }
-                        || !matches!(((i >> 27) & 7, (i >> 33) & 7), (3, 1) | (7, 4))
+                        || !matches!(((i >> 27) & 7, (i >> 33) & 7), (3, 1) | (5, 2) | (7, 4))
                         || (i >> 24) & 3 > if op == 0x61 { 2 } else { 0 }
                         || (i >> 36) & 15
                             != if op == 0x60 && (i >> 27) & 7 == 7 {
@@ -885,6 +996,114 @@ mod fragment_tests {
             );
             assert_eq!(shader.regs, before);
         }
+    }
+    fn interpolation_fixture() -> Interpolation {
+        let values = [0f32, 1., 0., 0., 0.5, 0.5, 0., 0., 1., 0., 0., 0.];
+        Interpolation {
+            data: std::sync::Arc::from(
+                values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            stride: 16,
+            vertices: [0, 1, 2],
+            weights: [0.25, 0.5, 0.25],
+            saved: false,
+        }
+    }
+    #[test]
+    fn native_varying_load_checks_offsets_widths_and_cached_position() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        for (op, count) in [(0x5cu64, 2), (0x5d, 1)] {
+            let i =
+                (0x085c80041200007du64 & !((511 << 48) | (7 << 33))) | (op << 48) | (count << 33);
+            let mut ram: Vec<u8> = [i, 0x7800c00000000000]
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect();
+            let mut shader = Shader::new(0);
+            shader.fragment = Some(Fragment {
+                blend: [0; 2],
+                color: None,
+                active: true,
+            });
+            shader.interpolation = Some(interpolation_fixture());
+            shader.run(&m, &mut ram, &[], 2).unwrap();
+            assert_eq!(
+                shader.regs[0],
+                if op == 0x5c {
+                    0.5f32.to_bits()
+                } else {
+                    0x38003800
+                }
+            );
+            assert!(shader.interpolation.as_ref().unwrap().saved);
+            // Retrieve is illegal until a position has been stored.
+            ram[..8].copy_from_slice(&(i | (1 << 36)).to_le_bytes());
+            shader.pc = 0;
+            shader.interpolation.as_mut().unwrap().saved = false;
+            let before = shader.regs;
+            assert!(matches!(
+                shader.run(&m, &mut ram, &[], 2),
+                Err(Error::Unsupported { .. })
+            ));
+            assert_eq!(shader.regs, before);
+            shader.interpolation.as_mut().unwrap().saved = true;
+            shader.run(&m, &mut ram, &[], 2).unwrap();
+            ram[..8].copy_from_slice(&(i | (12 << 16)).to_le_bytes()); // v2 over stride boundary
+            shader.pc = 0;
+            assert!(matches!(
+                shader.run(&m, &mut ram, &[], 2),
+                Err(Error::Unsupported { .. })
+            ));
+        }
+    }
+    #[test]
+    fn interpolation_uses_byte_offsets_vertex_order_and_half_source_data() {
+        let mut v = interpolation_fixture();
+        assert_eq!(v.load(4, 1, 4).unwrap()[0], 0.5);
+        assert!(v.load(2, 1, 4).is_none());
+        v.weights = [1., 0., 0.];
+        v.vertices = [2, 0, 1];
+        assert_eq!(v.load(0, 2, 4).unwrap()[..2], [1., 0.]);
+        v.stride = 4;
+        v.vertices = [0, 1, 2];
+        v.weights = [0.25, 0.5, 0.25];
+        v.data = std::sync::Arc::from(
+            [0x3c000000u32, 0x38003800, 0x00003c00]
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(v.load(0, 2, 2).unwrap()[..2], [0.5, 0.5]);
+        v.vertices[2] = usize::MAX;
+        assert!(v.load(0, 2, 2).is_none());
+    }
+    #[test]
+    fn native_widening_fma_and_packed_conversion_execute() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let code = [0x00b2c0000adada40u64, 0x78a5c10000040000];
+        let mut ram: Vec<u8> = code.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let mut shader = Shader::new(0);
+        shader.regs[0] = (-0.75f32).to_bits();
+        shader.run(&m, &mut ram, &[], 2).unwrap();
+        assert_eq!(shader.regs[0], 0.125f32.to_bits());
+        assert_eq!(shader.regs[1], 0x30003000);
+        ram[..8].copy_from_slice(&(code[0] | (3 << 28)).to_le_bytes());
+        shader.pc = 0;
+        let before = shader.regs;
+        assert!(matches!(
+            shader.run(&m, &mut ram, &[], 1),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(shader.regs, before);
     }
     #[test]
     fn half_encoding_round_trips_and_rounds_ties_even() {

@@ -3,7 +3,7 @@ use crate::{
     gpu_cs::Stop,
     gpu_mmu::AddressSpace,
     gpu_resources::Resources,
-    gpu_shader::{Fragment, RegisterAllocation, Shader},
+    gpu_shader::{Fragment, Interpolation, RegisterAllocation, Shader},
     gpu_tiler::Frame,
 };
 fn word(b: &[u8], n: usize) -> u32 {
@@ -106,14 +106,16 @@ pub fn pixels(
         if r[58] & 1 == 0 {
             continue;
         }
-        for triangle in &draw.triangles {
+        for (primitive, triangle) in draw.triangles.iter().enumerate() {
             let mut v = *triangle;
+            let mut vertices = [primitive * 3, primitive * 3 + 1, primitive * 3 + 2];
             let area = edge(v[0], v[1], v[2][0], v[2][1]);
             if area == 0.0 {
                 continue;
             }
             if area < 0.0 {
                 v.swap(1, 2);
+                vertices.swap(1, 2);
             }
             let minx = v
                 .iter()
@@ -165,6 +167,31 @@ pub fn pixels(
                             0
                         },
                     ));
+                    if let Some((stride, data)) = &draw.varyings {
+                        let edge = |a: [f32; 4], b: [f32; 4], x: f64, y: f64| {
+                            (b[0] as f64 - a[0] as f64) * (y - a[1] as f64)
+                                - (b[1] as f64 - a[1] as f64) * (x - a[0] as f64)
+                        };
+                        let area = edge(v[0], v[1], v[2][0] as f64, v[2][1] as f64);
+                        if area <= 0. || !area.is_finite() {
+                            return Err(bad());
+                        }
+                        let weights = std::array::from_fn(|n| {
+                            edge(
+                                v[(n + 1) % 3],
+                                v[(n + 2) % 3],
+                                x as f64 + 0.5,
+                                y as f64 + 0.5,
+                            ) / area
+                        });
+                        shader.interpolation = Some(Interpolation {
+                            data: data.clone(),
+                            stride: *stride,
+                            vertices,
+                            weights,
+                            saved: false,
+                        });
+                    }
                     shader.fragment = Some(Fragment {
                         blend: [word(&blend, 2), word(&blend, 3)],
                         color: None,
