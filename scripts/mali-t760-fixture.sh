@@ -32,8 +32,8 @@ done
 e2fsck -fn "$FS" >/dev/null
 dd if="$FS" of="$IMG" bs=1048576 seek=4 conv=notrunc 2>/dev/null
 rm "$FS"
-# Build gles2test on the emulated Orange Pi One (same armhf userland; its gcc runs, the
-# RK3288's does not yet): the binary lands in /root/g2.
+# Build gles2test on the emulated Orange Pi One (same armhf userland): the binary lands in
+# /root/g2.
 BIN=${SBC_EMU:-target/release/sbc-emu}
 cat > "$OUT/build.txt" <<'SCRIPT'
 wait-serial root@

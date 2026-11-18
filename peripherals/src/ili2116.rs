@@ -38,6 +38,9 @@ pub struct Ili2116 {
     down: bool,
 }
 
+/// Touch records in one report: the driver rejects a count above its 10 slots.
+const MAX_REPORT: usize = 10;
+
 impl Ili2116 {
     /// A touch on the panel (from the VNC pointer): `down` and the position.
     pub fn touch(&mut self, down: bool, x: u16, y: u16) {
@@ -81,9 +84,15 @@ impl Ili2116 {
                 v
             }
             0x10 => {
-                self.reading = std::mem::take(&mut self.queue);
-                self.reading.reverse();
-                vec![self.reading.len() as u8]
+                // Records the host has not read from the last report come first; a report
+                // holds at most MAX_REPORT, the rest wait (the line stays asserted).
+                let mut all: Vec<[u8; 5]> = self.reading.drain(..).rev().collect();
+                all.append(&mut self.queue);
+                let n = all.len().min(MAX_REPORT);
+                self.queue = all.split_off(n);
+                all.reverse();
+                self.reading = all;
+                vec![n as u8]
             }
             0x11 => self.reading.pop().map(|r| r.to_vec()).unwrap_or_else(|| vec![0; 5]),
             _ => vec![0],
@@ -143,5 +152,35 @@ mod tests {
         t.touch(false, 532, 770);
         assert_eq!(read_reg(&mut t, 0x10, 1), [1]);
         assert_eq!(read_reg(&mut t, 0x11, 5)[0], 0x01);
+    }
+
+    /// Many records are reported ten at a time, and records the host skipped are reported
+    /// again first rather than lost.
+    #[test]
+    fn reports_are_bounded_and_lossless() {
+        let mut t = Ili2116::default();
+        for k in 0..15u16 {
+            t.touch(true, k, 0);
+            t.touch(false, k, 0);
+        }
+        assert_eq!(read_reg(&mut t, 0x10, 1), [10]);
+        assert_eq!(read_reg(&mut t, 0x11, 5), [0x81, 0, 0, 0, 0]);
+        // the host reads only one record, then asks again: 9 unread + 20 queued
+        assert_eq!(read_reg(&mut t, 0x10, 1), [10]);
+        assert_eq!(read_reg(&mut t, 0x11, 5), [0x01, 0, 0, 0, 0]);
+        for _ in 0..9 {
+            read_reg(&mut t, 0x11, 5);
+        }
+        assert!(t.irq_asserted());
+        assert_eq!(read_reg(&mut t, 0x10, 1), [10]);
+        for _ in 0..10 {
+            read_reg(&mut t, 0x11, 5);
+        }
+        assert_eq!(read_reg(&mut t, 0x10, 1), [9]);
+        for _ in 0..8 {
+            read_reg(&mut t, 0x11, 5);
+        }
+        assert_eq!(read_reg(&mut t, 0x11, 5), [0x01, 0, 14, 0, 0]);
+        assert!(!t.irq_asserted());
     }
 }

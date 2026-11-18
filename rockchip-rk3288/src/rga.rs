@@ -231,6 +231,10 @@ impl Rga {
         if self.log {
             eprintln!("[rga] blit {sw}x{sh} fmt {sfmt}/{sswap} -> {dw}x{dh} fmt {dfmt}/{dswap} rot {rot} mir {mir} src {sbase:#x}+{sstride} dst {dlt:#x}+{dstride} mmu {mmu:#x}");
         }
+        // Destination pages written, each once: a rotated blit walks the destination
+        // column-wise and would otherwise report a page per pixel.
+        let mut pages = std::collections::BTreeSet::new();
+        let mut last_page = u64::MAX;
         for ty in 0..th {
             let sy = (ty as u64 * sh as u64 / th as u64) as u32;
             for tx in 0..tw {
@@ -259,8 +263,9 @@ impl Rga {
                 }
                 for k in 0..db as u64 {
                     let Some(pa) = dst.pa(ram, ram_base, dva + k) else { continue };
-                    if self.written.last().is_none_or(|&(p, _)| p != pa & !0xfff) {
-                        self.written.push((pa & !0xfff, 0x1000));
+                    if pa & !0xfff != last_page {
+                        last_page = pa & !0xfff;
+                        pages.insert(last_page);
                     }
                     if let Some(i) = pa.checked_sub(ram_base).and_then(|i| usize::try_from(i).ok()) {
                         if let Some(b) = ram.get_mut(i) {
@@ -268,6 +273,13 @@ impl Rga {
                         }
                     }
                 }
+            }
+        }
+        // contiguous pages as one range each
+        for p in pages {
+            match self.written.last_mut() {
+                Some((start, len)) if *start + *len as u64 == p => *len += 0x1000,
+                _ => self.written.push((p, 0x1000)),
             }
         }
     }
@@ -304,6 +316,7 @@ mod tests {
         rga.write(CMD_CTRL as u64, 1, &mut ram, 0);
         // the source row becomes the destination column, top to bottom
         assert_eq!(&ram[0x2000..0x2008], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(rga.written, [(0x2000, 0x1000)]);
         assert!(rga.irq());
         rga.write(INT as u64, 0x600 | 0x40, &mut ram, 0);
         assert!(!rga.irq());
