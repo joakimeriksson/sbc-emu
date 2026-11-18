@@ -214,12 +214,10 @@ impl Bundle {
                     .map(|(_, u)| u)
                     .collect();
                 // Halfwords: [0,1] control word, then one register word per unit, then fields.
-                let mut regs = 2;
                 let mut p = 2 + units.len();
                 let mut ins = Vec::with_capacity(units.len());
-                for &u in &units {
+                for (regs, &u) in (2..).zip(&units) {
                     let reg = half(regs);
-                    regs += 1;
                     let n = if matches!(u, Unit::SAdd | Unit::SMul) { 2 } else { 3 };
                     let mut word = 0u64;
                     for k in 0..n {
@@ -301,6 +299,8 @@ pub trait Env {
     /// Fragment write-out of thread `t`: colour in r0 (fp16 if `half`), r1 parameters
     /// (depth in x, stencil in y, render target << 8 | sample in z).
     fn writeout(&mut self, t: usize, r0: u128, half: bool, r1: u128, r1_written: u8);
+    /// Spend `n` units of the chain's work budget; false when it has run out.
+    fn spend(&mut self, n: u64) -> bool;
 }
 
 /// Resolved address operands of a load/store instruction.
@@ -619,6 +619,14 @@ impl<'e, E: Env> Core<'e, E> {
             }
             if group == 0 {
                 continue;
+            }
+            if !self.env.spend(group.count_ones() as u64) {
+                for t in threads.iter_mut() {
+                    if t.state == State::Run {
+                        t.state = State::Done;
+                    }
+                }
+                return;
             }
             let b = self.bundle(pc);
             self.cycles += 1;
@@ -1193,7 +1201,7 @@ mod tests {
             set_lane(&mut r, 32, c, (c as f32 + 1.0).to_bits() as u64);
         }
         // swizzle wzyx (3,2,1,0), passthrough, no modifier
-        let src = (0b00_01_10_11u32 << 5) | (0 << 2);
+        let src = 0b00_01_10_11u32 << 5;
         let o = vector_source(r, src, 2, false);
         assert_eq!(f32::from_bits(o.lanes[0] as u32), 4.0);
         assert_eq!(f32::from_bits(o.lanes[3] as u32), 1.0);

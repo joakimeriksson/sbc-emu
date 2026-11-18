@@ -8,6 +8,11 @@ use crate::mmu::{AddressSpace, Fault};
 const PAGE: u64 = 0x1000;
 const TLB: usize = 64;
 
+/// Work one chain may do (about a minute of host time at worst; real chains use well under
+/// a hundredth of it): a shader stuck in a loop over a large target, or a draw with 2^32
+/// instances, fails its chain instead of hanging the emulator.
+pub const WORK_BUDGET: u64 = 1 << 30;
+
 pub struct Vm<'a> {
     ram: &'a mut [u8],
     base: u64,
@@ -15,13 +20,53 @@ pub struct Vm<'a> {
     /// Direct-mapped translation cache: (virtual page | 1 if writable entry checked, index of the page in `ram`).
     tlb: [(u64, usize); TLB],
     pub fault: Option<Fault>,
+    /// Work units (shader bundles per thread, indices, rasterised pixels) the chain may
+    /// still spend: the hardware's job timeout, where the driver would reset the GPU.
+    budget: u64,
+    /// The budget ran out; the chain fails.
+    pub exhausted: bool,
     /// Capture for replay: the content of every page on first touch (before any write).
     pub capture: Option<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 impl<'a> Vm<'a> {
     pub fn new(ram: &'a mut [u8], base: u64, aspace: AddressSpace) -> Self {
-        Self { ram, base, aspace, tlb: [(u64::MAX, 0); TLB], fault: None, capture: None }
+        Self { ram, base, aspace, tlb: [(u64::MAX, 0); TLB], fault: None, budget: WORK_BUDGET, exhausted: false, capture: None }
+    }
+
+    /// Spend `n` work units; false once the budget is gone (and from then on).
+    #[inline]
+    pub fn spend(&mut self, n: u64) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        match self.budget.checked_sub(n) {
+            Some(left) => {
+                self.budget = left;
+                true
+            }
+            None => {
+                self.exhaust();
+                false
+            }
+        }
+    }
+
+    /// Fail the chain as if it had run out of time (a structure too large to model).
+    pub fn exhaust(&mut self) {
+        self.budget = 0;
+        self.exhausted = true;
+    }
+
+    /// Give the chain `units` of work instead of `WORK_BUDGET` (tests).
+    #[cfg(test)]
+    pub fn set_budget(&mut self, units: u64) {
+        self.budget = units;
+    }
+
+    /// Work units spent so far.
+    pub fn spent(&self) -> u64 {
+        WORK_BUDGET.saturating_sub(self.budget)
     }
 
     /// Index into `ram` of the page holding `va`, or None (fault recorded).
@@ -36,11 +81,11 @@ impl<'a> Vm<'a> {
         }
         match self.aspace.translate(self.ram, self.base, vpage, write) {
             Ok(pa) => {
-                let index = usize::try_from(pa.checked_sub(self.base)?).ok()?;
-                if index.checked_add(PAGE as usize)? > self.ram.len() {
+                let index = pa.checked_sub(self.base).and_then(|i| usize::try_from(i).ok());
+                let Some(index) = index.filter(|i| i.checked_add(PAGE as usize).is_some_and(|end| end <= self.ram.len())) else {
                     self.record(Fault { va, status: crate::mmu::TRANSLATION_FAULT | 3 });
                     return None;
-                }
+                };
                 self.tlb[slot] = (key, index);
                 if let Some(c) = &mut self.capture {
                     c.entry(vpage).or_insert_with(|| self.ram[index..index + PAGE as usize].to_vec());
@@ -63,7 +108,7 @@ impl<'a> Vm<'a> {
     pub fn read_bytes(&mut self, va: u64, out: &mut [u8]) {
         let mut done = 0;
         while done < out.len() {
-            let a = va + done as u64;
+            let a = va.wrapping_add(done as u64);
             let off = (a & (PAGE - 1)) as usize;
             let n = (PAGE as usize - off).min(out.len() - done);
             match self.page(a, false) {
@@ -77,7 +122,7 @@ impl<'a> Vm<'a> {
     pub fn write_bytes(&mut self, va: u64, data: &[u8]) {
         let mut done = 0;
         while done < data.len() {
-            let a = va + done as u64;
+            let a = va.wrapping_add(done as u64);
             let off = (a & (PAGE - 1)) as usize;
             let n = (PAGE as usize - off).min(data.len() - done);
             if let Some(p) = self.page(a, true) {
@@ -114,7 +159,7 @@ impl<'a> Vm<'a> {
 
     #[inline]
     pub fn r64(&mut self, va: u64) -> u64 {
-        self.r32(va) as u64 | (self.r32(va + 4) as u64) << 32
+        self.r32(va) as u64 | (self.r32(va.wrapping_add(4)) as u64) << 32
     }
 
     pub fn rf32(&mut self, va: u64) -> f32 {
@@ -125,7 +170,7 @@ impl<'a> Vm<'a> {
     pub fn words<const N: usize>(&mut self, va: u64) -> [u32; N] {
         let mut w = [0u32; N];
         for (i, x) in w.iter_mut().enumerate() {
-            *x = self.r32(va + 4 * i as u64);
+            *x = self.r32(va.wrapping_add(4 * i as u64));
         }
         w
     }
@@ -155,6 +200,6 @@ impl<'a> Vm<'a> {
 
     pub fn w64(&mut self, va: u64, v: u64) {
         self.w32(va, v as u32);
-        self.w32(va + 4, (v >> 32) as u32);
+        self.w32(va.wrapping_add(4), (v >> 32) as u32);
     }
 }

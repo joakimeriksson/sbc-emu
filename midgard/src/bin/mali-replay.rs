@@ -87,7 +87,7 @@ fn main() {
         let aspace = AddressSpace { active_transtab: root as u64 | 3, ..Default::default() };
         let mut vm = Vm::new(&mut ram, 0, aspace);
         let t = std::time::Instant::now();
-        let r = jobs.run_chain(&mut vm, *head, 0, trace);
+        let r = jobs.run_chain(&mut vm, 0, *head, 0, trace);
         eprintln!("chain {i} head {head:#x}: status {:#x}, {} cycles, {:.1} ms, fault {:?}", r.status, r.cycles, t.elapsed().as_secs_f64() * 1e3, vm.fault);
         // keep the chain's writes
         for (k, va) in vas.iter().enumerate() {

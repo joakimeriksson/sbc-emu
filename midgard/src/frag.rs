@@ -488,6 +488,10 @@ impl FragEnv<'_, '_> {
 }
 
 impl Env for FragEnv<'_, '_> {
+    fn spend(&mut self, n: u64) -> bool {
+        self.vm.spend(n)
+    }
+
     fn code(&mut self, va: u64) -> [u8; 64] {
         let mut b = [0u8; 64];
         self.vm.read_bytes(va, &mut b);
@@ -536,6 +540,11 @@ impl Env for FragEnv<'_, '_> {
     }
 }
 
+/// Largest piece of a fragment job rendered at once (a multiple of the tile size): the
+/// tile buffers of a job are allocated per chunk, so a huge framebuffer (up to 65536 x
+/// 65536 in the descriptor) never needs host memory in proportion to its area.
+const CHUNK: u32 = 64 * TILE;
+
 /// Render a fragment job. Returns GPU cycles.
 pub fn fragment_job(vm: &mut Vm, job: u64, list: &[Prim], trace: bool) -> u64 {
     let p: [u32; 8] = vm.words(job + 32);
@@ -552,8 +561,37 @@ pub fn fragment_job(vm: &mut Vm, job: u64, list: &[Prim], trace: bool) -> u64 {
     if x1 <= x0 || y1 <= y0 {
         return 100;
     }
+    if trace {
+        eprintln!("[mali] fragment {}x{} at ({x0},{y0}) {} primitives, fbd {fbd:#x}", x1 - x0, y1 - y0, list.len());
+        for rt in &fb.rts {
+            eprintln!("[mali]   rt internal {} writeback {} block {} dither {} base {:#x} stride {}", rt.internal, rt.wb_format, rt.block, rt.dither, rt.base, rt.row_stride);
+        }
+        for p in list.iter().take(3) {
+            eprintln!("[mali]   prim {} v {:?} pos {:?}", p.kind, p.v, p.pos);
+        }
+    }
+    let mut cycles = 0;
+    let mut cy = y0;
+    while cy < y1 {
+        let mut cx = x0;
+        while cx < x1 {
+            let (cw, ch) = ((cx + CHUNK).min(x1) - cx, (cy + CHUNK).min(y1) - cy);
+            if !vm.spend(cw as u64 * ch as u64) {
+                return cycles;
+            }
+            cycles += fragment_chunk(vm, &fb, list, cx, cy, (cx + CHUNK).min(x1), (cy + CHUNK).min(y1));
+            cx += CHUNK;
+        }
+        cy += CHUNK;
+    }
+    cycles
+}
+
+/// Render the part (`x0`, `y0`)..(`x1`, `y1`) of a fragment job: load the tile buffer,
+/// rasterise every primitive into it, write it back. Returns GPU cycles.
+fn fragment_chunk(vm: &mut Vm, fb: &Fb, list: &[Prim], x0: u32, y0: u32, x1: u32, y1: u32) -> u64 {
     let (w, h) = (x1 - x0, y1 - y0);
-    let n = (w * h) as usize;
+    let n = w as usize * h as usize;
     let mut tb = TileBuf {
         x0,
         y0,
@@ -610,7 +648,11 @@ pub fn fragment_job(vm: &mut Vm, job: u64, list: &[Prim], trace: bool) -> u64 {
     }
     let mut cycles = n as u64 / 4;
     for prim in list {
-        cycles += raster(vm, &fb, &mut tb, prim);
+        let c = raster(vm, fb, &mut tb, prim);
+        cycles += c;
+        if !vm.spend(c) {
+            return cycles;
+        }
     }
     // write back
     let tiles_x = w.div_ceil(TILE);
@@ -661,21 +703,12 @@ pub fn fragment_job(vm: &mut Vm, job: u64, list: &[Prim], trace: bool) -> u64 {
                     continue;
                 }
                 let i = tb.idx(x, y);
-                write_zs(vm, &fb, x, y, tb.depth[i], tb.stencil[i]);
+                write_zs(vm, fb, x, y, tb.depth[i], tb.stencil[i]);
             }
         }
     }
-    if trace {
-        eprintln!("[mali] fragment {}x{} at ({x0},{y0}) {} primitives, fbd {fbd:#x}", w, h, list.len());
-        for rt in &fb.rts {
-            eprintln!("[mali]   rt internal {} writeback {} block {} dither {} base {:#x} stride {}", rt.internal, rt.wb_format, rt.block, rt.dither, rt.base, rt.row_stride);
-        }
-        for p in list.iter().take(3) {
-            eprintln!("[mali]   prim {} v {:?} pos {:?}", p.kind, p.v, p.pos);
-        }
-    }
     if let Ok(dir) = std::env::var("SBC_MALI_DUMP") {
-        dump(&dir, &tb, &fb);
+        dump(&dir, &tb, fb);
     }
     cycles
 }
@@ -892,6 +925,9 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
     }
     let blend: Vec<[u32; 4]> = (0..fb.rts.len()).map(|k| vm.words(ds.rsd_va + 64 + 16 * k as u64)).collect();
     let tiles_x = tb.w.div_ceil(TILE);
+    // The tile buffer is reached through `tbp` from here on (the shader environments hold
+    // it too): every access reborrows it for that access only.
+    let (bx0, by0, bx1, by1) = (tb.x0, tb.y0, tb.x0 + tb.w, tb.y0 + tb.h);
     let mut uniforms = Thread::new(rsd.pc());
     if has_shader {
         draw::preload_uniforms(vm, &dcd, &rsd, &mut uniforms);
@@ -964,7 +1000,7 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                         dx >= -r && dx < r && dy >= -r && dy < r
                     }
                 };
-                cover[k] = cov && inside_scissor && x < tb.x0 + tb.w && y < tb.y0 + tb.h;
+                cover[k] = cov && inside_scissor && x < bx1 && y < by1;
                 pix[k] = Pixel { x, y, b, front, point: pt };
             }
             if !cover.iter().any(|&c| c) {
@@ -990,7 +1026,7 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
             }
             for k in 0..4 {
                 if cover[k] {
-                    let ti = (((pix[k].y - tb.y0) / TILE) * tiles_x + (pix[k].x - tb.x0) / TILE) as usize;
+                    let ti = (((pix[k].y - by0) / TILE) * tiles_x + (pix[k].x - bx0) / TILE) as usize;
                     unsafe { (&mut *tbp).touched[ti] = true };
                 }
             }
@@ -1030,7 +1066,6 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                     continue;
                 }
                 let outs = std::mem::take(&mut core.env.out[k]);
-                let tbm = unsafe { &mut *tbp };
                 let mut zk = z[k];
                 if let Some(d) = outs.iter().rev().find_map(|o| o.depth) {
                     zk = d.clamp(0.0, 1.0);
@@ -1042,11 +1077,11 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                         continue;
                     }
                 }
-                if late && !zs_test(fb, tbm, &pix[k], zk, depth_func, depth_write, stencil_on, st, st_wmask, true) {
+                if late && !zs_test(fb, unsafe { &mut *tbp }, &pix[k], zk, depth_func, depth_write, stencil_on, st, st_wmask, true) {
                     continue;
                 }
                 occlusion += 1;
-                let i = tbm.idx(pix[k].x, pix[k].y);
+                let i = unsafe { (*tbp).idx(pix[k].x, pix[k].y) };
                 for o in &outs {
                     if o.rt as usize >= fb.rts.len() {
                         continue;
@@ -1071,6 +1106,7 @@ fn raster(vm: &mut Vm, fb: &Fb, tb: &mut TileBuf, prim: &Prim) -> u64 {
                         }
                         continue;
                     }
+                    let tbm = unsafe { &mut *tbp };
                     if raw {
                         tbm.raw[o.rt as usize][i] = o.color;
                         continue;
@@ -1128,6 +1164,10 @@ struct BlendEnv<'a, 'b> {
 }
 
 impl Env for BlendEnv<'_, '_> {
+    fn spend(&mut self, n: u64) -> bool {
+        self.vm.spend(n)
+    }
+
     fn code(&mut self, va: u64) -> [u8; 64] {
         let mut b = [0u8; 64];
         self.vm.read_bytes(va, &mut b);
@@ -1231,3 +1271,30 @@ fn pack_half(c: [f32; 4]) -> u128 {
 
 #[allow(dead_code)]
 fn _unused(_: PixelFormat) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mmu::AddressSpace;
+
+    /// A fragment job over the largest framebuffer the descriptor can name (65536 x 65536,
+    /// tiles 0..0xfff) with a preloaded render target: rendered in chunks, so it neither
+    /// overflows the tile-buffer size nor allocates the whole area, and the work budget
+    /// ends it.
+    #[test]
+    fn huge_framebuffer_is_chunked_and_bounded() {
+        let mut ram = vec![0u8; 0x4000];
+        let put = |ram: &mut [u8], a: usize, v: u32| ram[a..a + 4].copy_from_slice(&v.to_le_bytes());
+        let (job, fbd) = (0x1000, 0x2000);
+        put(&mut ram, job + 36, 0x0fff_0fff); // tile max
+        put(&mut ram, job + 40, fbd as u32);
+        put(&mut ram, fbd + 32, 0xffff_ffff); // width, height - 1
+        put(&mut ram, fbd + 128 + 4, 1); // RT0 written back (to address 0: skipped)
+        put(&mut ram, fbd + 128 + 8, 1); // and preloaded
+        let aspace = AddressSpace { active_transtab: 2, ..Default::default() };
+        let mut vm = Vm::new(&mut ram, 0, aspace);
+        vm.set_budget(3 * (CHUNK as u64 * CHUNK as u64));
+        fragment_job(&mut vm, job as u64, &[], false);
+        assert!(vm.exhausted);
+    }
+}

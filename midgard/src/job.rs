@@ -45,13 +45,24 @@ pub struct ChainResult {
 pub struct JobState {
     /// Jobs run, by type (index = job type).
     pub counts: [u64; 16],
-    /// Polygon lists by framebuffer descriptor: tiler jobs append, the fragment job of
-    /// the same framebuffer consumes.
-    pub lists: HashMap<u64, Vec<Prim>>,
+    /// Polygon lists by address space (its page-table base) and framebuffer descriptor:
+    /// tiler jobs append, the fragment job of the same framebuffer consumes. Processes
+    /// share virtual addresses, so the descriptor alone does not name a framebuffer.
+    pub lists: HashMap<(u64, u64), Vec<Prim>>,
 }
 
+/// Polygon lists kept at once; a list whose fragment job never came (a failed chain) is
+/// dropped when the address space changes, or here when too many pile up.
+const MAX_LISTS: usize = 64;
+
 impl JobState {
-    pub fn run_chain(&mut self, vm: &mut Vm, head: u64, cycle_now: u64, trace: bool) -> ChainResult {
+    /// Drop the polygon lists of the address space with page tables at `transtab`.
+    pub fn drop_lists(&mut self, transtab: u64) {
+        self.lists.retain(|&(t, _), _| t != transtab);
+    }
+
+    /// Run the chain at `head` in the address space with page tables at `transtab`.
+    pub fn run_chain(&mut self, vm: &mut Vm, transtab: u64, head: u64, cycle_now: u64, trace: bool) -> ChainResult {
         let mut va = head;
         let mut tail = head;
         let mut cycles = 0u64;
@@ -84,13 +95,17 @@ impl JobState {
                 }
                 JOB_TILER => {
                     let fbd = vm.r64(va + 64 + 28 * 4) & !63;
-                    let list = self.lists.entry(fbd).or_default();
+                    if self.lists.len() >= MAX_LISTS && !self.lists.contains_key(&(transtab, fbd)) {
+                        let stale = *self.lists.keys().next().unwrap();
+                        self.lists.remove(&stale);
+                    }
+                    let list = self.lists.entry((transtab, fbd)).or_default();
                     cycles += draw::tiler_job(vm, va, list);
                     status::DONE
                 }
                 JOB_FRAGMENT => {
                     let fbd = vm.r64(va + 32 + 8) & !63;
-                    let list = self.lists.remove(&fbd).unwrap_or_default();
+                    let list = self.lists.remove(&(transtab, fbd)).unwrap_or_default();
                     cycles += frag::fragment_job(vm, va, &list, trace);
                     status::DONE
                 }
@@ -100,6 +115,14 @@ impl JobState {
             cycles += 20;
             if vm.fault.is_some() {
                 return ChainResult { status: status::JOB_READ_FAULT, tail, cycles };
+            }
+            if vm.exhausted {
+                // the hardware would still be busy when the driver's timeout resets it
+                if trace {
+                    eprintln!("[mali] job {va:#x}: chain over its work budget, failed");
+                }
+                vm.w32(va, status::JOB_CONFIG_FAULT);
+                return ChainResult { status: status::JOB_CONFIG_FAULT, tail, cycles };
             }
             if code != status::DONE {
                 vm.w32(va, code);

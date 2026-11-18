@@ -144,14 +144,14 @@ impl Invocation {
             if hi > lo {
                 let bits = hi - lo;
                 let m = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
-                v[i] = ((packed >> lo) & m) + 1;
+                v[i] = ((packed >> lo) & m).wrapping_add(1);
             }
         }
         Self { size: [v[0], v[1], v[2]], groups: [v[3], v[4], v[5]] }
     }
 
     pub fn count(&self) -> u64 {
-        self.size.iter().chain(&self.groups).map(|&x| x as u64).product()
+        self.size.iter().chain(&self.groups).fold(1u64, |a, &x| a.saturating_mul(x as u64))
     }
 }
 
@@ -353,6 +353,10 @@ struct VertexEnv<'a, 'b> {
 }
 
 impl Env for VertexEnv<'_, '_> {
+    fn spend(&mut self, n: u64) -> bool {
+        self.vm.spend(n)
+    }
+
     fn code(&mut self, va: u64) -> [u8; 64] {
         let mut b = [0u8; 64];
         self.vm.read_bytes(va, &mut b);
@@ -371,7 +375,7 @@ impl Env for VertexEnv<'_, '_> {
                     34 => {
                         let n = self.dcd.instance_size().max(1);
                         let inst = self.instance[t];
-                        [self.linear[t] - inst * if inst > 0 { n } else { 0 } + self.dcd.offset_start, 0, 0, 1]
+                        [self.linear[t].wrapping_sub(inst.wrapping_mul(if inst > 0 { n } else { 0 })).wrapping_add(self.dcd.offset_start), 0, 0, 1]
                     }
                     36 => [self.instance[t], 0, 0, 1],
                     0 => {
@@ -457,16 +461,23 @@ pub fn vertex_job(vm: &mut Vm, job: u64) -> u64 {
         for k in 0..n {
             let i = l + k as u32;
             let (vertex, instance) = if instanced { (i % inv.groups[1], i / inv.groups[1]) } else { (i, 0) };
-            let linear = instance * isize + vertex;
+            let linear = instance.wrapping_mul(isize).wrapping_add(vertex);
             core.env.linear[k] = linear;
             core.env.vary_index[k] = linear;
             core.env.instance[k] = instance;
         }
         core.run(&mut threads[..n]);
         l += n as u32;
+        if !core.env.vm.spend(0) {
+            break;
+        }
     }
     core.cycles * 4 / 4 + total as u64
 }
+
+/// Most primitives one polygon list holds (about 160 MB); a draw that needs more fails its
+/// chain.
+pub const MAX_PRIMS: usize = 1 << 21;
 
 /// A primitive in a polygon list.
 #[derive(Clone, Debug)]
@@ -568,6 +579,11 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
     let mut prims = 0u64;
     let znear = if dcd.viewport != 0 { vm.rf32(dcd.viewport + 16) } else { 0.0 };
     for inst in 0..instances {
+        if !vm.spend(count as u64) || list.len() >= MAX_PRIMS {
+            // out of time, or more primitives than a polygon list holds: the chain fails
+            vm.exhaust();
+            break;
+        }
         let mut idx: Vec<Option<u32>> = Vec::with_capacity(count as usize);
         for k in 0..count {
             let raw = match index_type {
@@ -581,12 +597,15 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
                 continue;
             }
             let v = if index_type != 0 { (raw as i64 + base_vertex as i64) as u32 } else { raw };
-            idx.push(Some(v + inst * isize));
+            idx.push(Some(v.wrapping_add(inst.wrapping_mul(isize))));
         }
         // split at restarts
         for run in idx.split(|x| x.is_none()) {
             let run: Vec<u32> = run.iter().map(|x| x.unwrap()).collect();
             let mut emit = |kind: u8, v: [u32; 3]| {
+                if list.len() >= MAX_PRIMS {
+                    return;
+                }
                 let n = match kind {
                     POINTS => 1,
                     LINES => 2,

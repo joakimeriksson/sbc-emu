@@ -76,6 +76,7 @@ mod gpu_irq {
     pub const RESET_COMPLETED: u32 = 1 << 8;
     pub const POWER_CHANGED: u32 = 1 << 9;
     pub const POWER_CHANGED_ALL: u32 = 1 << 10;
+    pub const PRFCNT_SAMPLE_COMPLETED: u32 = 1 << 16;
     pub const CLEAN_CACHES_COMPLETED: u32 = 1 << 17;
 }
 
@@ -106,6 +107,9 @@ struct Slot {
     flush_id_next: u32,
     /// A chain is running; it completes at this tick with this status.
     running: Option<(u64, u32)>,
+    /// The last chain failed: the queued one waits until the driver has dealt with it
+    /// (panfrost writes JS_COMMAND_NEXT: NOP to drop it, START to submit again).
+    held: bool,
 }
 
 /// The register state of the GPU plus the host-side state that jobs share (polygon lists).
@@ -177,7 +181,7 @@ impl MaliT760 {
     }
 
     fn cycles(&self) -> u64 {
-        self.now * (GPU_HZ / 1_000_000) / (TICK_HZ / 1_000_000)
+        self.now.saturating_mul(GPU_HZ / 1_000_000) / (TICK_HZ / 1_000_000)
     }
 
     fn js_state(&self) -> u32 {
@@ -316,6 +320,8 @@ impl MaliT760 {
                     self.cycle_base = self.cycles();
                 }
                 6 => self.cycle_count_running = false,
+                // PRFCNT_SAMPLE: the counters (all zero) are "written" at once
+                4 => self.gpu_rawstat |= gpu_irq::PRFCNT_SAMPLE_COMPLETED,
                 7 | 8 => {
                     self.flush_id = self.flush_id.wrapping_add(1);
                     self.gpu_rawstat |= gpu_irq::CLEAN_CACHES_COMPLETED;
@@ -371,6 +377,7 @@ impl MaliT760 {
             0x5c => s.xaffinity = value,
             0x60 => {
                 s.command_next = value;
+                s.held = false;
                 self.try_start(k, ram, ram_base);
             }
             0x70 => s.flush_id_next = value,
@@ -395,7 +402,7 @@ impl MaliT760 {
 
     /// Start the queued chain if the slot is idle.
     fn try_start(&mut self, k: usize, ram: &mut [u8], ram_base: u64) {
-        if self.slots[k].command_next != 1 || self.slots[k].running.is_some() {
+        if self.slots[k].command_next != 1 || self.slots[k].running.is_some() || self.slots[k].held {
             return;
         }
         let s = &mut self.slots[k];
@@ -410,7 +417,11 @@ impl MaliT760 {
         if capture.is_some() {
             vm.capture = Some(Default::default());
         }
-        let result = self.jobs.run_chain(&mut vm, head, self.cycles(), self.trace);
+        let transtab = self.aspaces[(config & 0xf) as usize % NUM_AS].active_transtab;
+        let result = self.jobs.run_chain(&mut vm, transtab, head, self.cycles(), self.trace);
+        if self.trace {
+            eprintln!("[mali] slot {k}: chain {head:#x} spent {} of {} work units", vm.spent(), vm::WORK_BUDGET);
+        }
         if let (Some(dir), Some(pages)) = (capture, vm.capture.take()) {
             capture_chain(&dir, head, &pages);
         }
@@ -429,7 +440,7 @@ impl MaliT760 {
         }
         let s = &mut self.slots[k];
         s.tail = result.tail;
-        let ticks = (result.cycles * TICK_HZ / GPU_HZ).max(24);
+        let ticks = (result.cycles.saturating_mul(TICK_HZ) / GPU_HZ).max(24);
         s.running = Some((self.now + ticks, code));
     }
 
@@ -450,6 +461,12 @@ impl MaliT760 {
             0x14 => set_hi(&mut a.lockaddr, value),
             0x18 => {
                 if value == 1 {
+                    // the old page tables' polygon lists can no longer be drawn
+                    if a.active_transtab != a.transtab {
+                        let old = a.active_transtab;
+                        self.jobs.drop_lists(old);
+                    }
+                    let a = &mut self.aspaces[n];
                     a.active_transtab = a.transtab;
                 }
             }
@@ -468,10 +485,15 @@ impl MaliT760 {
                     self.slots[k].running = None;
                     self.slots[k].status = code;
                     self.job_rawstat |= if code == status::DONE { 1 << k } else { 1 << (k + 16) };
-                    if code != status::DONE && self.trace {
-                        eprintln!("[mali] slot {k}: chain {:#x} failed with {code:#x}", self.slots[k].head);
+                    if code != status::DONE {
+                        if self.trace {
+                            eprintln!("[mali] slot {k}: chain {:#x} failed with {code:#x}", self.slots[k].head);
+                        }
+                        // the hardware does not start the queued chain after a failure
+                        self.slots[k].held = true;
+                    } else {
+                        self.try_start(k, ram, ram_base);
                     }
-                    self.try_start(k, ram, ram_base);
                 }
             }
         }
@@ -532,5 +554,43 @@ mod tests {
         assert_eq!(g.read(0x160), 1);
         g.write(0x1c0, 0xf, &mut ram, 0);
         assert_eq!(g.read(0x140), 0);
+        g.write(0x30, 4, &mut ram, 0); // PRFCNT_SAMPLE
+        assert_ne!(g.read(0x20) & gpu_irq::PRFCNT_SAMPLE_COMPLETED, 0);
+    }
+
+    /// A job header of type `ty` at `va` with no successor.
+    fn job(ram: &mut [u8], va: usize, ty: u32) {
+        ram[va + 16..va + 20].copy_from_slice(&(ty << 1).to_le_bytes());
+    }
+
+    fn submit(g: &mut MaliT760, ram: &mut [u8], head: u32) {
+        g.write(0x1800 + 0x40, head, ram, 0); // JS0_HEAD_NEXT
+        g.write(0x1800 + 0x58, 0, ram, 0); // JS0_CONFIG_NEXT: address space 0
+        g.write(0x1800 + 0x60, 1, ram, 0); // JS0_COMMAND_NEXT: START
+    }
+
+    /// After a failed chain the queued one does not start by itself: panfrost drops it
+    /// with JS_COMMAND_NEXT = NOP and submits it again later, so it must run only then,
+    /// and only once.
+    #[test]
+    fn queued_chain_waits_after_a_failure() {
+        let mut g = MaliT760::default();
+        let mut ram = vec![0u8; 0x1000];
+        g.write(0x2400, 2, &mut ram, 0); // AS0_TRANSTAB: identity
+        g.write(0x2418, 1, &mut ram, 0); // AS0_COMMAND: UPDATE
+        job(&mut ram, 0x100, 0x7f); // invalid type: config fault
+        job(&mut ram, 0x200, job::JOB_NULL);
+        submit(&mut g, &mut ram, 0x100);
+        submit(&mut g, &mut ram, 0x200); // queued behind the running chain
+        g.update(1 << 40, &mut ram, 0);
+        assert_eq!(g.read(0x1000) & 1 << 16, 1 << 16, "slot 0 failure reported");
+        assert_eq!(ram[0x200], 0, "queued chain held");
+        g.write(0x1004, 1 << 16, &mut ram, 0); // JOB_IRQ_CLEAR
+        g.write(0x1800 + 0x60, 0, &mut ram, 0); // JS0_COMMAND_NEXT: NOP
+        g.update(1 << 40, &mut ram, 0);
+        assert_eq!(ram[0x200], 0, "dropped chain did not run");
+        submit(&mut g, &mut ram, 0x200);
+        assert_eq!(ram[0x200], status::DONE as u8, "resubmitted chain ran");
+        assert_eq!(g.jobs.counts[job::JOB_NULL as usize], 1);
     }
 }
