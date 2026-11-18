@@ -159,11 +159,15 @@ impl Peripherals {
 
     /// The touch controller's interrupt line (active low) onto GPIO7_A6.
     fn sync_touch_irq(&mut self) {
-        let asserted = match self.i2c[4].2.device_mut::<Ili2116>(ili2116::ADDRESS) {
-            Some(t) => t.irq_asserted(),
+        let (asserted, edge) = match self.i2c[4].2.device_mut::<Ili2116>(ili2116::ADDRESS) {
+            Some(t) => (t.irq_asserted(), t.take_edge()),
             None => return,
         };
-        self.gpio[TOUCH_GPIO.0].set_input(TOUCH_GPIO.1, !asserted);
+        let gpio = &mut self.gpio[TOUCH_GPIO.0];
+        if edge {
+            gpio.set_input(TOUCH_GPIO.1, true);
+        }
+        gpio.set_input(TOUCH_GPIO.1, !asserted);
     }
 
     /// The PMIC was told to switch the board off.

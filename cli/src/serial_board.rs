@@ -208,11 +208,16 @@ pub(crate) fn run<B: SerialBoard>(
                     sleep_until = Some(m.now().saturating_add((seconds * 1e9) as u64));
                     true
                 }
-                // the pointer (a touch on touchscreen boards): "pointer BUTTONS X Y"
+                // the pointer (a touch on touchscreen boards): "pointer BUTTONS X Y", X and Y
+                // in pixels of the picture shown, passed on as absolute 0..32767 like a viewer's
                 "pointer" => {
-                    let v: Vec<u16> = rest.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                    let v: Vec<u32> = rest.split_whitespace().filter_map(|w| w.parse().ok()).collect();
                     match (m.screen(), v.as_slice()) {
-                        (Some(screen), [b, x, y]) => screen.pointer(*b as u8, *x, *y, 0),
+                        (Some(screen), [b, x, y]) => {
+                            let (w, h) = screen.display_size();
+                            let scale = |v: u32, n: u32| (v.min(n.saturating_sub(1)) * 32767 / n.saturating_sub(1).max(1)) as u16;
+                            screen.pointer(*b as u8, scale(*x, w), scale(*y, h), 0)
+                        }
                         _ => return Err(format!("script: {line}")),
                     }
                     true

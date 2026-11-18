@@ -57,9 +57,12 @@ impl Screen for Machine {
     fn name(&self) -> &'static str {
         self.soc.display_name
     }
-    /// The pointer as a finger on the touchscreen (the panel board's; boards without one ignore it).
+    /// The pointer (absolute, 0..32767 across the picture shown) as a finger on the
+    /// touchscreen (the panel board's; boards without one ignore it).
     fn pointer(&mut self, buttons: u8, x: u16, y: u16, _wheel: i8) {
-        self.soc.touch(buttons & 1 != 0, x, y);
+        let (w, h) = self.display_size();
+        let pixel = |v: u16, n: u32| (v as u32 * n.saturating_sub(1) / 32767) as u16;
+        self.soc.touch(buttons & 1 != 0, pixel(x, w), pixel(y, h));
     }
 }
 
