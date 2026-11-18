@@ -20,7 +20,9 @@ pub mod emmc;
 pub mod gpio;
 pub mod hym8563;
 pub mod i2c;
+pub mod ili2116;
 mod machine;
+pub mod rga;
 pub mod rk808;
 pub mod syr82x;
 pub mod vop;
@@ -29,6 +31,6 @@ pub use allwinner_h3::{Gic, Uart, NCPU, SPURIOUS};
 pub use machine::{
     ns_to_ticks, ticks_to_ns, CoreState, Machine, Soc, BOOT_MAGIC, CRU_BASE, GICC_BASE,
     GICD_BASE, GRF_BASE, PHYSICAL_TIMER_PPI, PMU_BASE, RAM_BASE, RAM_SIZE, RK3288_MIDR,
-    RK3288_MPIDR, DSI0_BASE, GPU_BASE, GPU_IRQS, VOP_BASES, VOP_IRQS, SECURE_PHYSICAL_TIMER_PPI, SMP_MAILBOX, SRAM_BASE, SRAM_SIZE, UART2_BASE,
+    RK3288_MPIDR, DSI0_BASE, GPU_BASE, GPU_IRQS, RGA_BASE, RGA_IRQ, VOP_BASES, VOP_IRQS, SECURE_PHYSICAL_TIMER_PPI, SMP_MAILBOX, SRAM_BASE, SRAM_SIZE, UART2_BASE,
     UART2_IRQ, VIRTUAL_TIMER_PPI,
 };

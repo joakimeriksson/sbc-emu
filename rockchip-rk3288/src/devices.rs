@@ -7,6 +7,7 @@ use crate::gpio::{self, GpioBank};
 use crate::i2c::Rk3xI2c;
 use crate::act8846::{self, Act8846};
 use crate::hym8563::{self, Hym8563};
+use crate::ili2116::{self, Ili2116};
 use crate::rk808::{self, Rk808};
 use crate::syr82x::{self, Syr82x};
 use emu_core::{Fault, FlatRam};
@@ -18,6 +19,10 @@ pub const SDIO0_BASE: u64 = 0xff0d_0000;
 pub const SDIO1_BASE: u64 = 0xff0e_0000;
 /// eMMC (`emmc`, SPI 35; 8-bit, the Tinker Board S and the panel board).
 pub const EMMC_BASE: u64 = 0xff0f_0000;
+/// GPIO0-8 interrupts: SPI 81-89.
+const GPIO_IRQ_BASE: usize = 32 + 81;
+/// The panel board's touch interrupt: GPIO7_A6.
+const TOUCH_GPIO: (usize, u32) = (7, 6);
 /// I²C0 (PMU domain: the PMIC), SPI 60.
 pub const I2C0_BASE: u64 = 0xff65_0000;
 
@@ -43,6 +48,8 @@ pub struct Peripherals {
     pub i2c: Vec<(u64, usize, Rk3xI2c)>,
     /// GPIO0-8 (index = bank number), at `gpio::BANKS`.
     pub gpio: Vec<GpioBank>,
+    /// RAM written by DMA since the machine last looked (for the JIT's code watch).
+    pub dma_written: Vec<(u64, usize)>,
 }
 
 impl Default for Peripherals {
@@ -56,6 +63,7 @@ impl Default for Peripherals {
             ],
             i2c: I2C.iter().map(|&(base, irq)| (base, irq, Rk3xI2c::default())).collect(),
             gpio: (0..gpio::BANKS.len()).map(|_| GpioBank::default()).collect(),
+            dma_written: Vec::new(),
         }
     }
 }
@@ -74,6 +82,25 @@ impl Peripherals {
         bus.attach(syr82x::CPU_ADDRESS, Box::new(Syr82x::default()));
         bus.attach(syr82x::GPU_ADDRESS, Box::new(Syr82x::default()));
         bus.attach(hym8563::ADDRESS, Box::new(Hym8563::new(unix_seconds)));
+        // the touchscreen on I²C4, its interrupt on GPIO7_A6
+        self.i2c[4].2.attach(ili2116::ADDRESS, Box::new(Ili2116::default()));
+    }
+
+    /// A touch (or release) at `x`, `y` on the panel board's touchscreen, if it has one.
+    pub fn touch(&mut self, down: bool, x: u16, y: u16) {
+        if let Some(t) = self.i2c[4].2.device_mut::<Ili2116>(ili2116::ADDRESS) {
+            t.touch(down, x, y);
+        }
+        self.sync_touch_irq();
+    }
+
+    /// The touch controller's interrupt line (active low) onto GPIO7_A6.
+    fn sync_touch_irq(&mut self) {
+        let asserted = match self.i2c[4].2.device_mut::<Ili2116>(ili2116::ADDRESS) {
+            Some(t) => t.irq_asserted(),
+            None => return,
+        };
+        self.gpio[TOUCH_GPIO.0].set_input(TOUCH_GPIO.1, !asserted);
     }
 
     /// The PMIC was told to switch the board off.
@@ -87,7 +114,8 @@ impl Peripherals {
     pub fn irq_lines(&self) -> impl Iterator<Item = (usize, bool)> + '_ {
         let mmc = self.mmc.iter().map(|m| (m.irq, m.irq_level()));
         let i2c = self.i2c.iter().map(|(_, irq, c)| (*irq, c.irq()));
-        mmc.chain(i2c)
+        let gpio = self.gpio.iter().enumerate().map(|(n, g)| (GPIO_IRQ_BASE + n, g.irq()));
+        mmc.chain(i2c).chain(gpio)
     }
 
     /// A register read, if `addr` belongs to one of these controllers (word accesses only).
@@ -108,7 +136,7 @@ impl Peripherals {
         if let Some(mmc) = self.mmc.iter_mut().find(|m| m.contains(addr)) {
             return Some(word(addr, width).map(|_| {
                 mmc.write(addr - mmc.base, value, ram);
-                mmc.dma_written.clear();
+                self.dma_written.append(&mut mmc.dma_written);
             }));
         }
         if let Some(bank) = gpio_bank(addr) {
@@ -116,7 +144,10 @@ impl Peripherals {
         }
         let (base, _, i2c) = self.i2c.iter_mut().find(|(base, ..)| addr.wrapping_sub(*base) < crate::i2c::SIZE)?;
         i2c.now_ns = now_ns;
-        Some(word(addr, width).map(|_| i2c.write(addr - *base, value)))
+        let result = word(addr, width).map(|_| i2c.write(addr - *base, value));
+        // a transfer may have consumed the touch controller's records
+        self.sync_touch_irq();
+        Some(result)
     }
 }
 

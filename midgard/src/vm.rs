@@ -25,13 +25,16 @@ pub struct Vm<'a> {
     budget: u64,
     /// The budget ran out; the chain fails.
     pub exhausted: bool,
+    /// Physical pages written (recorded when a page first enters the write TLB), for the
+    /// CPU JIT's code watch.
+    pub written: Vec<u64>,
     /// Capture for replay: the content of every page on first touch (before any write).
     pub capture: Option<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 impl<'a> Vm<'a> {
     pub fn new(ram: &'a mut [u8], base: u64, aspace: AddressSpace) -> Self {
-        Self { ram, base, aspace, tlb: [(u64::MAX, 0); TLB], fault: None, budget: WORK_BUDGET, exhausted: false, capture: None }
+        Self { ram, base, aspace, tlb: [(u64::MAX, 0); TLB], fault: None, written: Vec::new(), budget: WORK_BUDGET, exhausted: false, capture: None }
     }
 
     /// Spend `n` work units; false once the budget is gone (and from then on).
@@ -87,6 +90,9 @@ impl<'a> Vm<'a> {
                     return None;
                 };
                 self.tlb[slot] = (key, index);
+                if write {
+                    self.written.push(self.base + index as u64);
+                }
                 if let Some(c) = &mut self.capture {
                     c.entry(vpage).or_insert_with(|| self.ram[index..index + PAGE as usize].to_vec());
                 }

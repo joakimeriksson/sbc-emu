@@ -139,6 +139,9 @@ pub struct MaliT760 {
     pub trace: bool,
     /// Chains run, for the end-of-run report.
     pub chains: u64,
+    /// Physical RAM pages jobs wrote since the machine last looked (the CPU JIT must drop
+    /// code compiled from them).
+    pub written_pages: Vec<u64>,
 }
 
 impl MaliT760 {
@@ -167,6 +170,7 @@ impl MaliT760 {
             now: 0,
             trace,
             chains: 0,
+            written_pages: Vec::new(),
         }
     }
 
@@ -422,6 +426,7 @@ impl MaliT760 {
         if self.trace {
             eprintln!("[mali] slot {k}: chain {head:#x} spent {} of {} work units", vm.spent(), vm::WORK_BUDGET);
         }
+        self.written_pages.append(&mut vm.written);
         if let (Some(dir), Some(pages)) = (capture, vm.capture.take()) {
             capture_chain(&dir, head, &pages);
         }
