@@ -80,7 +80,7 @@ pub fn pixels(
         let mut spd = [0; 32];
         m.read(ram, reg(r, 20), &mut spd, true)
             .map_err(Stop::Memory)?;
-        if word(&spd, 0) & !(3 << 30) != 0x128
+        if word(&spd, 0) & !((3 << 30) | (1 << 28)) != 0x128
             || word(&spd, 1) & !0xf800 != 0
             || spd[16..].iter().any(|&v| v != 0)
         {

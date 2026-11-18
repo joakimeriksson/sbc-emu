@@ -226,11 +226,37 @@ python3 tools/panthor-test.py --image <mesa-image> \
   --success-marker PANTHOR_GLES_INDEXED_OK --log out/gles-indexed.log
 ```
 
+Single-level, normalized 2D RGBA8 UNORM sampling now executes `TEX_SINGLE`
+against Mesa's resource tables and generic linear texture planes. Sampler and
+texture indices, GPU mappings, descriptor sizes, row strides and plane extents
+are checked before reading texels. Supported states are nearest or bilinear
+filtering with equal min/mag filters, clamp-to-edge/repeat/mirrored-repeat, and
+channel swizzles including zero/one. Result masks and float16/float32 output
+registers are decoded, including native half-float uniform conversion.
+
+The fragment descriptor's helper-thread flag is accepted for this path. With one
+mip level and identical min/mag filters, derivatives cannot change LOD or filter
+selection. Derivative instructions, mip selection and unequal min/mag filters
+remain unsupported. This does not simulate a fragment quad or varying inputs.
+
+`tests/gpu/panthor-gles-texture.py` checks all pixels in 84 Linux/Mesa frames:
+texel centers, bilinear averages and edges, out-of-range coordinates and wrapping,
+two texture units and varying source alpha. The test uses uniform coordinates;
+interpolated texture coordinates still need the varying path. Like the other
+GLES fixtures, it requests Mesa's linear layout with `PAN_MESA_DEBUG=sync,linear`.
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-texture.py \
+  --success-marker PANTHOR_GLES_TEXTURE_OK --log out/gles-texture.log
+```
+
 This is still a subset: triangle lists with basic position FIFO, W=1, finite
 supported coordinates and depth in [0,1], one linear RGBA8 target, no separate varying shader and opaque replacement blending.
 Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
 Nonzero global attribute/index/instance offsets, primitive restart, other
-primitive modes, perspective/clipping, varying interpolation, textures,
+primitive modes, perspective/clipping, varying interpolation, broader texture
+formats/layouts, mipmaps, anisotropy, shadow/array/cube sampling,
 blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
 non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
 synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the

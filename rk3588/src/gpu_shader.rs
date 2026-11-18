@@ -30,6 +30,43 @@ fn half(value: u16) -> f32 {
     }
     f32::from_bits(sign | (if exp == 31 { 255 } else { exp + 112 }) << 23 | mant << 13)
 }
+/// IEEE binary32 to binary16, round to nearest with ties to even.
+fn pack_half(value: f32) -> u16 {
+    let b = value.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 255) as i32;
+    let mant = b & 0x7fffff;
+    if exp == 255 {
+        return sign
+            | 0x7c00
+            | if mant == 0 {
+                0
+            } else {
+                ((mant >> 13) as u16) | 0x200
+            };
+    }
+    let exp = exp - 112;
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let mant = mant | 0x800000;
+        let shift = (14 - exp) as u32;
+        let base = mant >> shift;
+        let tail = mant & ((1 << shift) - 1);
+        return sign
+            | (base
+                + u32::from(tail > 1 << (shift - 1) || tail == 1 << (shift - 1) && base & 1 != 0))
+                as u16;
+    }
+    let rounded = mant + 0xfff + ((mant >> 13) & 1);
+    let exp = exp + (rounded >> 23) as i32;
+    if exp >= 31 {
+        sign | 0x7c00
+    } else {
+        sign | ((exp as u16) << 10) | ((rounded >> 13) & 1023) as u16
+    }
+}
 pub struct Shader {
     pub regs: [u32; 64],
     pub resources: crate::gpu_resources::Resources,
@@ -131,6 +168,20 @@ impl Shader {
                 }
                 0x90 if (i >> 16) & 31 == 0x19 && i & 0x000000ff_ffff_ff00 == 0x190000 => {
                     Some((a.ok_or_else(bad)? as f32).to_bits())
+                }
+                0x90 if (i >> 16) & 31 == 0xb => {
+                    let allowed = 255 | (1 << 28) | (3 << 30) | (3 << 38);
+                    if i & 0x000000ff_ffffffff & !allowed != 0xb0000 {
+                        return Err(bad());
+                    }
+                    let mut v = half((a.ok_or_else(bad)? >> (((i >> 28) & 1) * 16)) as u16);
+                    if i & (1 << 39) != 0 {
+                        v = v.abs();
+                    }
+                    if i & (1 << 38) != 0 {
+                        v = -v;
+                    }
+                    Some(v.to_bits())
                 }
                 0xa4 | 0xb2 => {
                     // Scalar f32 with identity swizzles, round-to-nearest and optional abs/neg.
@@ -319,6 +370,68 @@ impl Shader {
                             _ => bad(),
                         })?;
                     self.regs[dst..dst + count].copy_from_slice(&values[..count]);
+                    None
+                }
+                0x128 => {
+                    // Single-level normalized 2D sampling. The compact handle's
+                    // second word must contain no texel offsets or array/LOD bits.
+                    let src = ((i >> 16) & 63) as usize;
+                    let ptr = (i & 63) as usize;
+                    let mask = ((i >> 22) & 15) as u32;
+                    let wide = i & (1 << 46) != 0;
+                    let channels = mask.count_ones() as usize;
+                    let count = if wide { channels } else { (channels + 1) / 2 };
+                    let lod = (i >> 13) & 7;
+                    if i & 0x1f00 != 0
+                        || lod > 1
+                        || lod == 1 && self.fragment.is_none()
+                        || i & 128 != 0
+                        || ptr & 1 != 0
+                        || !self.registers_available(ptr, 2)
+                        || self.regs[ptr + 1] != 0
+                        || (i >> 26) & 3 > 1
+                        || (i >> 28) & 3 != 1
+                        || (i >> 30) & 7 > 2
+                        || (i >> 33) & 7 != 2
+                        || (i >> 36) & 7 != count.saturating_sub(1) as u64
+                        || i & (1 << 47) != 0
+                        || (i >> 57) & 3 != 0
+                        || src & 1 != 0
+                        || !self.registers_available(src, 2)
+                        || mask == 0
+                        || count > 1 && dst & 1 != 0
+                        || !self.registers_available(dst, count)
+                    {
+                        return Err(bad());
+                    }
+                    let rgba = crate::gpu_texture::sample(
+                        m,
+                        ram,
+                        self.resources,
+                        self.regs[ptr],
+                        [
+                            f32::from_bits(self.regs[src]),
+                            f32::from_bits(self.regs[src + 1]),
+                        ],
+                    )
+                    .map_err(|e| match e {
+                        crate::gpu_resources::Error::Memory(f) => Error::Memory(f),
+                        _ => bad(),
+                    })?;
+                    let values: Vec<f32> = (0..4)
+                        .filter(|n| mask & (1 << n) != 0)
+                        .map(|n| rgba[n])
+                        .collect();
+                    if wide {
+                        for (n, value) in values.iter().enumerate() {
+                            self.regs[dst + n] = value.to_bits();
+                        }
+                    } else {
+                        for (n, pair) in values.chunks(2).enumerate() {
+                            self.regs[dst + n] = pack_half(pair[0]) as u32
+                                | (pair.get(1).map_or(0, |&v| pack_half(v)) as u32) << 16;
+                        }
+                    }
                     None
                 }
                 0x60 | 0x61 => {
@@ -683,6 +796,152 @@ mod fragment_tests {
             shader.run(&m, &mut ram, &[], 1),
             Err(Error::Unsupported { .. })
         ));
+    }
+    #[test]
+    fn native_half_uniform_conversion_selects_each_lane_and_modifiers() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0; 16];
+        let code = [0x0090c000000b0080u64, 0x7890c100100b0080];
+        for (n, i) in code.iter().enumerate() {
+            ram[n * 8..n * 8 + 8].copy_from_slice(&i.to_le_bytes());
+        }
+        let mut shader = Shader::new(0);
+        shader.run(&m, &mut ram, &[0xbc003400], 2).unwrap();
+        assert_eq!(shader.regs[0], 0.25f32.to_bits());
+        assert_eq!(shader.regs[1], (-1.0f32).to_bits());
+        ram[..8].copy_from_slice(&(code[1] | (3 << 38)).to_le_bytes());
+        let mut shader = Shader::new(0);
+        shader.run(&m, &mut ram, &[0xbc003400], 1).unwrap();
+        assert_eq!(shader.regs[1], (-1.0f32).to_bits());
+    }
+    #[test]
+    fn texture_result_masks_and_widths_preserve_component_order() {
+        for mask in [1u64, 3, 5, 15] {
+            for wide in [false, true] {
+                let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+                let channels = mask.count_ones() as usize;
+                let count = if wide { channels } else { (channels + 1) / 2 };
+                let mut i = 0x4128009413c02042u64
+                    & !((15 << 22) | (7 << 36) | (1 << 46) | (63 << 16) | (7 << 13));
+                i |= (mask << 22)
+                    | (((count - 1) as u64) << 36)
+                    | (u64::from(wide) << 46)
+                    | (4 << 16);
+                ram[..8].copy_from_slice(&i.to_le_bytes());
+                ram[8..16].copy_from_slice(&0x7800c00000000000u64.to_le_bytes());
+                let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+                shader.resources = resources;
+                shader.regs.fill(0xdeadbeef);
+                shader.regs[2] = h;
+                shader.regs[3] = 0;
+                shader.regs[4] = 0.75f32.to_bits();
+                shader.regs[5] = 0.25f32.to_bits();
+                let before = shader.regs;
+                shader.run(&m, &mut ram, &[], 2).unwrap();
+                let expected = [0., 1., 0., 128. / 255.];
+                let selected: Vec<f32> = (0..4)
+                    .filter(|n| mask & (1 << n) != 0)
+                    .map(|n| expected[n])
+                    .collect();
+                for n in 0..count {
+                    let expected = if wide {
+                        selected[n].to_bits()
+                    } else {
+                        pack_half(selected[n * 2]) as u32
+                            | (selected.get(n * 2 + 1).map_or(0, |&v| pack_half(v)) as u32) << 16
+                    };
+                    assert_eq!(shader.regs[n], expected);
+                }
+                assert_eq!(&shader.regs[count..], &before[count..]);
+            }
+        }
+    }
+    #[test]
+    fn invalid_texture_encodings_do_not_modify_destinations() {
+        for bit in [8, 9, 10, 11, 12, 14, 15, 47, 57] {
+            let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+            let i = 0x4128009413c02042u64 | (1 << bit);
+            ram[..8].copy_from_slice(&i.to_le_bytes());
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+            shader.resources = resources;
+            shader.fragment = Some(Fragment {
+                blend: [0x19, 237 << 12],
+                color: None,
+                active: true,
+            });
+            shader.regs[0] = 0.25f32.to_bits();
+            shader.regs[1] = 0.25f32.to_bits();
+            shader.regs[2] = h;
+            let before = shader.regs;
+            assert!(
+                matches!(
+                    shader.run(&m, &mut ram, &[], 1),
+                    Err(Error::Unsupported { .. })
+                ),
+                "bit={bit}"
+            );
+            assert_eq!(shader.regs, before);
+        }
+    }
+    #[test]
+    fn half_encoding_round_trips_and_rounds_ties_even() {
+        for h in 0..=u16::MAX {
+            if h & 0x7c00 == 0x7c00 && h & 1023 != 0 {
+                continue;
+            }
+            assert_eq!(pack_half(half(h)), h, "{h:x}");
+        }
+        assert_eq!(pack_half(1.0 + 1.0 / 2048.), 0x3c00);
+        assert_eq!(pack_half(1.0 + 3.0 / 2048.), 0x3c02);
+        assert_eq!(pack_half(2f32.powi(-25)), 0);
+        assert_eq!(pack_half(3.0 * 2f32.powi(-25)), 2);
+    }
+    #[test]
+    fn native_texture_shader_samples_and_blends_without_host_color_injection() {
+        let (m, resources, mut ram, _) = crate::gpu_texture::test_fixture();
+        let code = [
+            0x0110c03e800000c0u64, // u=v=0.25
+            0x0091c10000000000,
+            0x0110c220001800c0, // actual compact resource handle
+            0x0091c300000000c0,
+            0x4128009413c02042,
+            0x487dbc0208ea017c,
+            0x787f4004733c00f0,
+        ];
+        for (n, i) in code.iter().enumerate() {
+            ram[n * 8..n * 8 + 8].copy_from_slice(&i.to_le_bytes());
+        }
+        let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+        shader.resources = resources;
+        shader.regs[60] = 1;
+        shader.fragment = Some(Fragment {
+            blend: [0x19, 237 << 12],
+            color: None,
+            active: true,
+        });
+        shader.run(&m, &mut ram, &[], 16).unwrap();
+        assert_eq!(shader.fragment.unwrap().color, Some([1., 0., 0., 1.]));
+        // A faulting texel read leaves the whole destination unchanged.
+        ram[0x2108..0x210c].copy_from_slice(&0xfffffff0u32.to_le_bytes());
+        let mut shader = Shader::with_allocation(32, RegisterAllocation::Registers32);
+        shader.resources = resources;
+        shader.fragment = Some(Fragment {
+            blend: [0x19, 237 << 12],
+            color: None,
+            active: true,
+        });
+        shader.regs[0] = 0.25f32.to_bits();
+        shader.regs[1] = 0.25f32.to_bits();
+        shader.regs[2] = 0x20001800;
+        let before = shader.regs;
+        assert!(matches!(
+            shader.run(&m, &mut ram, &[], 1),
+            Err(Error::Memory(_))
+        ));
+        assert_eq!(shader.regs, before);
     }
     #[test]
     fn half_conversion_preserves_special_values_and_subnormals() {

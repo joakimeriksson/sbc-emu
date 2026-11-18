@@ -39,7 +39,7 @@ fn pair(b: &[u8], n: usize) -> u64 {
     word(b, n) as u64 | ((word(b, n + 1) as u64) << 32)
 }
 impl Resources {
-    fn descriptor(
+    pub(crate) fn descriptor(
         &self,
         m: &AddressSpace,
         ram: &[u8],
