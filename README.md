@@ -251,6 +251,7 @@ GitHub Actions runs the suite on every pull request and push to `main` ([.github
 emu-core/   Bus / Core / Trap, the snapshot serializer and a device tree reader/writer
 arm-a64/    the ARMv8-A core: decode+execute, system registers, MMU, FP/NEON
 arm-a32/    the ARMv7-A core for 32-bit boards: A32, Thumb-2, VFPv4, NEON, short-descriptor MMU
+riscv-rv32/ the RV32 interpreter and tests reused from esp32sim (MIT, see its README and LICENSE)
 mali400/      the Mali-400 MP2 GPU (Utgard): GP vertex shader and PLBU, PP fragment shader, tiles, MMUs, as Linux's and Mesa's lima drivers use it
 peripherals/  device models shared between boards: GIC-400, DesignWare UART, the I²C device interface and I²C chips (RK808, ACT8846, SYR827/828 regulators, HYM8563 RTC, ILI2116 touch), the 24 MHz timebase
 midgard/      the Mali-T760 MP4 GPU (Midgard) of the RK3288: job manager, MMU, Midgard shader core, tiler, fragment pipeline, textures, as Linux's and Mesa's panfrost drivers use it; mali-replay for captured job chains

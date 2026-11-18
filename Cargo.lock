@@ -53,6 +53,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp32sim-riscv-emu-core"
+version = "0.0.1"
+
+[[package]]
 name = "mali400"
 version = "0.0.1"
 
@@ -72,6 +76,13 @@ dependencies = [
 [[package]]
 name = "peripherals"
 version = "0.0.1"
+
+[[package]]
+name = "riscv-rv32"
+version = "0.0.1"
+dependencies = [
+ "esp32sim-riscv-emu-core",
+]
 
 [[package]]
 name = "rk3588"

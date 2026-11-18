@@ -1,0 +1,8 @@
+[package]
+name = "esp32sim-riscv-emu-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Private esp32sim 32-bit core API retained for the imported RV32 interpreter"
+
+[dependencies]
