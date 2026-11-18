@@ -16,6 +16,7 @@ pub enum RegisterAllocation {
 pub struct Shader {
     pub regs: [u32; 64],
     pub resources: crate::gpu_resources::Resources,
+    pub position_output: Option<crate::gpu_resources::Buffer>,
     register_mask: u64,
     pub pc: u64,
     pub instructions: u64,
@@ -34,6 +35,7 @@ impl Shader {
         Self {
             regs: [0; 64],
             resources: crate::gpu_resources::Resources::default(),
+            position_output: None,
             pc,
             instructions: 0,
             // Mesa bi_ra.c: full occupancy uses R0-R15 and R48-R63.
@@ -169,6 +171,35 @@ impl Shader {
                         }
                     })
                 }
+                0x5e => {
+                    if (i >> 46) & 3 != 2
+                        || (i >> 33) & 7 != 2
+                        || (i >> 20) & 1023 != 0
+                        || (i >> 36) & 15 != 0
+                        || (i >> 30) & 7 > 2
+                        || dst & 1 != 0
+                        || !self.registers_available(dst, 2)
+                    {
+                        return Err(bad());
+                    }
+                    let address = self
+                        .resources
+                        .buffer_address(
+                            m,
+                            ram,
+                            ((i >> 8) & 15) as u32,
+                            ((i >> 12) & 255) as u32,
+                            a.ok_or_else(bad)?,
+                            self.position_output,
+                        )
+                        .map_err(|error| match error {
+                            crate::gpu_resources::Error::Memory(f) => Error::Memory(f),
+                            _ => bad(),
+                        })?;
+                    self.regs[dst] = address as u32;
+                    self.regs[dst + 1] = (address >> 32) as u32;
+                    None
+                }
                 0x66 => {
                     let count = ((i >> 28) & 3) as usize + 1;
                     if (i >> 46) & 3 != 2
@@ -201,10 +232,11 @@ impl Shader {
                     None
                 }
                 0x60 | 0x61 => {
-                    // Global 32-bit scalar or 128-bit vector transfers, normal memory access.
+                    // MMU transfers; streaming store hints do not change data semantics
+                    // in this synchronous model. Forced discarded-thread access is unsupported.
                     if ((i >> 46) & 3) != if op == 0x61 { 1 } else { 2 }
                         || !matches!(((i >> 27) & 7, (i >> 33) & 7), (3, 1) | (7, 4))
-                        || (i >> 24) & 3 != 0
+                        || (i >> 24) & 3 > if op == 0x61 { 2 } else { 0 }
                         || (i >> 36) & 15
                             != if op == 0x60 && (i >> 27) & 7 == 7 {
                                 7
@@ -216,7 +248,12 @@ impl Shader {
                     {
                         return Err(bad());
                     }
-                    let s = (i & 255) as usize;
+                    // Bit 6 is the source-discard hint, including for pointers.
+                    // FAU/immediate pointer operands remain unsupported.
+                    if i & 128 != 0 {
+                        return Err(bad());
+                    }
+                    let s = (i & 63) as usize;
                     if !self.registers_available(s, 2) || s & 1 != 0 {
                         return Err(bad());
                     }

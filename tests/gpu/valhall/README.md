@@ -28,3 +28,12 @@ table and a vertex-buffer table, loads three vertices, and writes their XY/0/1
 vectors to a separate BO region. It also checks 12 instance values with a divisor-four descriptor, verifying all
 vectors, surrounding sentinels and DRM fences. This tests attribute execution,
 not triangle rasterization.
+
+`position.asm` / `.json` exactly reproduce the seven instruction words captured
+from the real Mesa GLES position shader: attribute load, viewport FMA operations,
+position-buffer address and an internally streaming position store. The unit
+test supplies hardware position table 13 using GPU-mapped storage.
+`position-compute.asm` / `.json` add an internal-ID move and replace table 13 with
+ordinary structured table 3; `panthor-position.py` runs that adapted shader
+through Linux compute and checks all transformed XY/Z/W vectors and its fence.
+Neither test establishes `RUN_IDVS`, tiling or fragment/rasterizer support.

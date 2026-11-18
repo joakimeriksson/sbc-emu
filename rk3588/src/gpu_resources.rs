@@ -9,6 +9,29 @@ pub enum Error {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Resources(pub u64);
+/// GPU-mapped structured storage supplied by the vertex engine for its private
+/// position table. Contents still pass through the ordinary GPU MMU.
+#[derive(Clone, Copy, Debug)]
+pub struct Buffer {
+    pub address: u64,
+    pub size: u64,
+    pub stride: u32,
+}
+impl Buffer {
+    fn element(self, index: u32) -> Result<u64, Error> {
+        let offset = index as u64 * self.stride as u64;
+        if self.stride == 0
+            || offset
+                .checked_add(self.stride as u64)
+                .is_none_or(|end| end > self.size)
+        {
+            return Err(Error::DescriptorBounds);
+        }
+        self.address
+            .checked_add(offset)
+            .ok_or(Error::Memory(Fault::AddressSize))
+    }
+}
 fn word(b: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(b[n * 4..n * 4 + 4].try_into().unwrap())
 }
@@ -48,6 +71,42 @@ impl Resources {
         m.read(ram, address, &mut descriptor, true)
             .map_err(Error::Memory)?;
         Ok(descriptor)
+    }
+    /// Resolve LEA_BUF_IMM through a structured buffer descriptor, or through
+    /// the hardware-provided position table (13) when running a vertex shader.
+    pub fn buffer_address(
+        &self,
+        m: &AddressSpace,
+        ram: &[u8],
+        table: u32,
+        index: u32,
+        element: u32,
+        position: Option<Buffer>,
+    ) -> Result<u64, Error> {
+        if table == 13 {
+            if index != 0 {
+                return Err(Error::Unsupported);
+            }
+            return position.ok_or(Error::Unsupported)?.element(element);
+        }
+        if table >= 12 {
+            return Err(Error::Unsupported);
+        }
+        let b = self.descriptor(m, ram, table, index)?;
+        if b[20..].iter().any(|&v| v != 0) {
+            return Err(Error::Unsupported);
+        }
+        let stride = match word(&b, 0) {
+            0x39 => word(&b, 4),
+            0x19 if element == 0 && word(&b, 4) == 0 => 1,
+            _ => return Err(Error::Unsupported),
+        };
+        Buffer {
+            address: pair(&b, 2),
+            size: word(&b, 1) as u64,
+            stride,
+        }
+        .element(element)
     }
     /// Load a complete attribute, including default missing components. Buffer
     /// bounds are checked before translating data; an out-of-range fetch returns
@@ -263,5 +322,99 @@ mod tests {
         ));
         assert_eq!(shader.regs, before);
         assert_eq!(shader.pc, 0);
+    }
+    #[test]
+    fn complete_captured_mesa_position_shader_writes_gpu_mapped_output() {
+        let (m, resources, mut ram) = fixture();
+        ram.resize(0x7000, 0xa5);
+        let code: [u64; 7] = [
+            0x0866800412017d7c,
+            0x00b2c00000818040,
+            0x00b2c10000838241,
+            0x0091c20000000084,
+            0x0091c300000000d0,
+            0x105e840440000d7b,
+            0x78614008b9000044,
+        ];
+        for (n, instruction) in code.into_iter().enumerate() {
+            ram[n * 8..n * 8 + 8].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let uniforms = [
+            8f32.to_bits(),
+            8f32.to_bits(),
+            8f32.to_bits(),
+            8f32.to_bits(),
+            0.5f32.to_bits(),
+        ];
+        for (id, xy) in [(0, [2f32, 2.]), (1, [14., 2.]), (2, [8., 14.])] {
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+            shader.resources = resources;
+            shader.position_output = Some(Buffer {
+                address: 0x6000,
+                size: 48,
+                stride: 4,
+            });
+            // Mesa adds view/attribute offsets in dwords to this internal ID.
+            shader.regs[59] = id * 4;
+            shader.regs[60] = id;
+            shader.run(&m, &mut ram, &uniforms, 16).unwrap();
+            let at = 0x6000 + id as usize * 16;
+            let expected: Vec<u8> = [xy[0], xy[1], 0.5, 1.]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            assert_eq!(&ram[at..at + 16], &expected);
+        }
+        assert_eq!(&ram[0x5ff0..0x6000], &[0xa5; 16]);
+        assert_eq!(&ram[0x6030..0x6040], &[0xa5; 16]);
+        // The reserved position table cannot leak into ordinary compute use.
+        assert_eq!(
+            resources.buffer_address(&m, &ram, 13, 0, 0, None),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            resources.buffer_address(
+                &m,
+                &ram,
+                13,
+                1,
+                0,
+                Some(Buffer {
+                    address: 0x6000,
+                    size: 48,
+                    stride: 16
+                })
+            ),
+            Err(Error::Unsupported)
+        );
+    }
+    #[test]
+    fn structured_buffer_addresses_check_bounds_before_register_changes() {
+        let (m, resources, mut ram) = fixture();
+        put(&mut ram, 0x3000, 0x39);
+        put(&mut ram, 0x3010, 8);
+        assert_eq!(
+            resources.buffer_address(&m, &ram, 2, 0, 2, None).unwrap(),
+            0x4010
+        );
+        assert_eq!(
+            resources.buffer_address(&m, &ram, 2, 0, 3, None),
+            Err(Error::DescriptorBounds)
+        );
+        // LEA d4, r59, table2; reserved or malformed fields must not write d4.
+        let valid = (0x105e840440000d7bu64 & !(15 << 8)) | (2 << 8);
+        for instruction in [valid | (1 << 20), valid & !(7 << 33), valid | (1 << 40)] {
+            ram[..8].copy_from_slice(&instruction.to_le_bytes());
+            let mut shader = Shader::new(0);
+            shader.resources = resources;
+            shader.regs[4] = 0xfeed;
+            let before = shader.regs;
+            assert!(matches!(
+                shader.run(&m, &mut ram, &[], 1),
+                Err(crate::gpu_shader::Error::Unsupported { .. })
+            ));
+            assert_eq!(shader.regs, before);
+            assert_eq!(shader.pc, 0);
+        }
     }
 }

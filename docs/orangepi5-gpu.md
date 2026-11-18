@@ -112,3 +112,30 @@ bounds and both fences.
 The same attribute instruction is present in the captured GLES vertex shader.
 The runner requires both the marker and a zero guest exit status, and preserves
 logs on failure. Full vertex/tiler/fragment drawing is still incomplete.
+
+### Position shader output
+
+`LEA_BUF_IMM` now resolves structured buffer addresses and the vertex engine's
+reserved position-output table 13. Address and descriptor bounds are checked
+before updating the destination pair. Normal stores honor source-discard hints
+on their address register; internally/externally streaming store hints use the
+same GPU-MMU write path in the synchronous model. Forced discarded-thread memory
+access remains unsupported.
+
+A unit test runs all seven instruction words of the captured Mesa GLES position
+shader in 32-register mode, with hardware position storage supplied as a
+GPU-mapped buffer. It produces `(2, 2, 0.5, 1)`, `(14, 2, 0.5, 1)`, and
+`(8, 14, 0.5, 1)` from the three input vertices and viewport uniforms.
+
+```sh
+python3 tools/panthor-test.py --image cache/orangepi/armbian.img \
+  --guest tests/gpu/panthor-position.py --success-marker PANTHOR_POSITION_OK \
+  --log out/panthor-position.log
+```
+
+The Linux test adapts that shader to a compute submission: it copies global X to
+the internal-ID register and binds output to an ordinary structured buffer in
+table 3 instead of hardware position table 13. It verifies the same vectors,
+write bounds and a DRM fence. The actual GLES `RUN_IDVS` command, tiler heap
+lifecycle, primitive assembly and fragment/rasterizer integration remain
+unfinished; completing position instructions alone does not render a triangle.
