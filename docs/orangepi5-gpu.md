@@ -206,11 +206,31 @@ The native fragment path executes immediate arithmetic, alpha-to-coverage-disabl
 uses the descriptor's single-sample edge rule and scissor. Drawn tiles invalidate
 their opaque CRC rather than publishing the uniform-clear checksum.
 
-This is still a subset: non-indexed, single-instance triangle lists with basic
-position FIFO, W=1, finite supported coordinates and depth in [0,1], one linear
-RGBA8 target, no separate varying shader and opaque replacement blending.
+Indexed and instanced triangle lists also execute native shaders. Element buffers
+support unsigned 8-, 16- and 32-bit indices and signed base-vertex addition;
+non-indexed draws support a nonzero first vertex. Each instance receives its own
+position slots and instance ID, including power-of-two attribute divisors. Index
+ranges are validated through the GPU MMU before shaders execute, and position
+capacity and invocation budgets account for every instance. A later non-indexed
+draw ignores a stale element-buffer address.
+
+`tests/gpu/panthor-gles-indexed.py` runs real Mesa GLES array and element draws,
+nonzero first vertices and element-buffer byte offsets, positive and negative
+base vertices through `OES_draw_elements_base_vertex`, and instanced variants
+with divisors 1, 2 and 4. Every framebuffer pixel is checked against an independent
+triangle mask. Run it with:
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-indexed.py \
+  --success-marker PANTHOR_GLES_INDEXED_OK --log out/gles-indexed.log
+```
+
+This is still a subset: triangle lists with basic position FIFO, W=1, finite
+supported coordinates and depth in [0,1], one linear RGBA8 target, no separate varying shader and opaque replacement blending.
 Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
-Indexed/instanced draws, perspective/clipping, varying interpolation, textures,
+Nonzero global attribute/index/instance offsets, primitive restart, other
+primitive modes, perspective/clipping, varying interpolation, textures,
 blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
 non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
 synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the

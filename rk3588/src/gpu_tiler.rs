@@ -147,23 +147,28 @@ impl Tiler {
         instruction: u64,
         owner: Owner,
     ) -> Result<(), Stop> {
-        // First path: non-indexed, single-instance triangle lists, basic FIFO,
+        // Triangle lists, basic FIFO,
         // no separate varying shader, draw IDs, multiview or primitive restart.
         let flags = r[56] | instruction as u32;
+        if std::env::var_os("SBC_MALI_TRACE").is_some() {
+            eprintln!("[mali] IDVS flags={flags:08x} registers={:x?}", &r[32..60]);
+        }
         if instruction & 0x00ff_ffbd_0000_0000 != 0
-            || flags & !0x0043_800f != 0
+            || flags & !0x0043_830f != 0
             || flags & 15 != 8
             || r[32] != 0
-            || r[34] != 1
-            || r[35..40].iter().any(|&v| v != 0)
+            || r[35] != 0
+            || r[37] != 0
+            || r[38] != 0
             || r[48] != 0
-            || reg(r, 54) != 0
             || r[33] == 0
             || r[33] > 4096
             || r[33] % 3 != 0
         {
             return Err(unsupported(6));
         }
+        let vertices = draw_vertices(m, ram, r, flags)?;
+        let vertex_count = vertices.len() * r[34] as usize;
         let ctx = reg(r, 40);
         if ctx & 63 != 0 {
             return Err(Stop::InvalidStream);
@@ -177,7 +182,7 @@ impl Tiler {
                 return Err(unsupported(6));
             }
         }
-        if self.vertices + r[33] as usize > 65536 {
+        if self.vertices + vertex_count > 65536 {
             return Err(unsupported(6));
         }
         let mut tiler = [0; 128];
@@ -216,7 +221,7 @@ impl Tiler {
             .map_err(Stop::Memory)?;
         let output = pair(&tiler, 8) & !4095;
         let capacity = ((word(&tiler, 8) & 4095) as u64) << 12;
-        let bytes = r[33] as usize * 16;
+        let bytes = vertex_count * 16;
         if output == 0 || bytes as u64 > capacity {
             return Err(unsupported(6));
         }
@@ -253,7 +258,9 @@ impl Tiler {
             .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
             .collect();
         let mut budget: usize = 1 << 22;
-        for vertex in 0..r[33] {
+        for invocation in 0..vertex_count {
+            let vertex = vertices[invocation % vertices.len()];
+            let instance = (invocation / vertices.len()) as u32;
             let mut shader = Shader::with_allocation(binary, allocation);
             shader.resources = Resources(reg(r, 0));
             shader.position_output = Some(Buffer {
@@ -261,7 +268,7 @@ impl Tiler {
                 size: bytes as u64,
                 stride: 4,
             });
-            let values = [vertex * 4, vertex, 0, 0, 0];
+            let values = [invocation as u32 * 4, vertex, instance, 0, 0];
             for (n, &value) in values.iter().enumerate() {
                 if word(&spd, 1) & (1 << (11 + n)) != 0 {
                     shader.regs[59 + n] = value;
@@ -274,7 +281,7 @@ impl Tiler {
         }
         let mut data = vec![0; bytes];
         m.read(ram, output, &mut data, true).map_err(Stop::Memory)?;
-        let mut vertices = Vec::with_capacity(r[33] as usize);
+        let mut vertices = Vec::with_capacity(vertex_count);
         for v in data.chunks_exact(16) {
             let p = [
                 f32::from_bits(word(v, 0)),
@@ -311,10 +318,53 @@ impl Tiler {
             instruction,
             triangles,
         });
-        frame.vertices += r[33] as usize;
-        self.vertices += r[33] as usize;
+        frame.vertices += vertex_count;
+        self.vertices += vertex_count;
         Ok(())
     }
+}
+
+/// Decode element IDs before executing shaders. Hardware uses unsigned vertex
+/// IDs with a signed base-vertex addition; attribute bounds checks handle IDs
+/// outside a buffer. Internal position IDs remain dense and unique per instance.
+fn draw_vertices(
+    m: &AddressSpace,
+    ram: &[u8],
+    r: &[u32; 256],
+    flags: u32,
+) -> Result<Vec<u32>, Stop> {
+    if r[34] == 0 || (r[33] as u64) * (r[34] as u64) > 4096 {
+        return Err(unsupported(6));
+    }
+    let index_type = (flags >> 8) & 7;
+    let mut ids = Vec::with_capacity(r[33] as usize);
+    if index_type == 0 {
+        if r[39] != 0 {
+            return Err(unsupported(6));
+        }
+        ids.extend((0..r[33]).map(|i| i.wrapping_add(r[36])));
+    } else {
+        let width = match index_type {
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => return Err(unsupported(6)),
+        };
+        let bytes = r[33] as usize * width;
+        let address = reg(r, 54);
+        if address == 0 || address % width as u64 != 0 || bytes > r[39] as usize {
+            return Err(Stop::InvalidStream);
+        }
+        let mut indices = vec![0; bytes];
+        m.read(ram, address, &mut indices, true)
+            .map_err(Stop::Memory)?;
+        for value in indices.chunks_exact(width) {
+            let mut word = [0; 4];
+            word[..width].copy_from_slice(value);
+            ids.push(u32::from_le_bytes(word).wrapping_add(r[36]));
+        }
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -410,18 +460,119 @@ mod tests {
     fn unsupported_geometry_and_shader_faults_do_not_publish_primitives() {
         let (m, mut ram, mut r) = fixture();
         let mut t = Tiler::default();
-        r[56] |= 1 << 8;
+        r[56] |= 1 << 19;
         assert!(t
             .idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
             .is_err());
         assert!(t.frames.is_empty());
-        r[56] &= !(1 << 8);
+        r[56] &= !(1 << 19);
         ram[0x6000..0x6008].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(
             t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0)),
             Err(Stop::Shader(_))
         ));
         assert!(t.frames.is_empty());
+    }
+    #[test]
+    fn indexed_widths_signed_base_and_repeated_elements_execute_native_shader() {
+        for (kind, width) in [(1, 1), (2, 2), (3, 4)] {
+            let (m, mut ram, mut r) = fixture();
+            // Repeated indices require separate internal position slots. A
+            // signed base of -1 maps the source IDs to vertices 2, 0, 1 twice.
+            for (n, value) in [3u32, 1, 2, 3, 1, 2].iter().enumerate() {
+                ram[0xc000 + n * width..0xc000 + (n + 1) * width]
+                    .copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+            r[33] = 6;
+            r[36] = (-1i32) as u32;
+            r[39] = (6 * width) as u32;
+            r[54] = 0xc000;
+            let mut t = Tiler::default();
+            t.idvs(&m, &mut ram, &r, 0x0600004200000008 | (kind << 8), (0, 0))
+                .unwrap();
+            let frame = &t.frames[&key(&m, 0x8000)];
+            let expected = [[8., 14., 0.5, 1.], [2., 2., 0.5, 1.], [14., 2., 0.5, 1.]];
+            assert_eq!(frame.draws[0].triangles, vec![expected, expected]);
+            assert_eq!(t.vertices, 6);
+        }
+    }
+    #[test]
+    fn array_first_ignores_stale_index_buffer() {
+        let (m, mut ram, mut r) = fixture();
+        // Start at vertex one and place the original triangle after a dummy.
+        ram.copy_within(0x4000..0x4018, 0x4008);
+        ram[0x3004..0x3008].copy_from_slice(&32u32.to_le_bytes());
+        r[36] = 1;
+        r[54] = u32::MAX;
+        r[55] = u32::MAX;
+        let mut t = Tiler::default();
+        t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+            .unwrap();
+        assert_eq!(
+            t.frames[&key(&m, 0x8000)].draws[0].triangles[0],
+            [[2., 2., 0.5, 1.], [14., 2., 0.5, 1.], [8., 14., 0.5, 1.]]
+        );
+    }
+    #[test]
+    fn instance_ids_select_pot_attributes_and_unique_position_slots() {
+        let (m, mut ram, mut r) = fixture();
+        // Feed the position attribute per instance with divisor four. Every
+        // instance is a degenerate triangle, but its three outputs are distinct
+        // from other instances' slots and expose both preloaded IDs.
+        ram[0x2000..0x2004].copy_from_slice(&(0x25u32 | (((175 << 12) | 16) << 10)).to_le_bytes());
+        ram[0x2004..0x2008].copy_from_slice(&(2u32 | 64 | (2 << 24)).to_le_bytes());
+        r[34] = 9;
+        let mut t = Tiler::default();
+        t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+            .unwrap();
+        let frame = &t.frames[&key(&m, 0x8000)];
+        for (instance, triangle) in frame.draws[0].triangles.iter().enumerate() {
+            let point = [[2., 2., 0.5, 1.], [14., 2., 0.5, 1.], [8., 14., 0.5, 1.]][instance / 4];
+            assert_eq!(*triangle, [point; 3]);
+        }
+        assert_eq!(frame.vertices, 27);
+        t.clear_queue((0, 0));
+        assert_eq!(t.vertices, 0);
+    }
+    #[test]
+    fn invalid_index_ranges_and_instance_counts_publish_nothing() {
+        for (address, size, instances) in [
+            (0xc000u64, 11, 1), // one byte short
+            (0xc002, 12, 1),    // unaligned uint32
+            (0x1fffc, 12, 1),   // aligned but outside GPU RAM
+            (u64::MAX - 3, 12, 1),
+            (0xc000, 12, 0),
+            (0xc000, 12, 1366), // aggregate invocation limit
+            (0xc000, 12, u32::MAX),
+        ] {
+            let (m, mut ram, mut r) = fixture();
+            r[34] = instances;
+            r[39] = size;
+            r[54] = address as u32;
+            r[55] = (address >> 32) as u32;
+            ram[0x10000..0x10100].fill(0xa5);
+            let mut t = Tiler::default();
+            assert!(t
+                .idvs(&m, &mut ram, &r, 0x0600004200000308, (0, 0))
+                .is_err());
+            assert!(t.frames.is_empty());
+            assert_eq!(t.vertices, 0);
+            assert!(ram[0x10000..0x10100].iter().all(|&v| v == 0xa5));
+        }
+    }
+    #[test]
+    fn position_capacity_covers_all_instances() {
+        let (m, mut ram, mut r) = fixture();
+        ram[0x8020..0x8028].copy_from_slice(&0x10001u64.to_le_bytes());
+        r[34] = 86; // 258 positions need 4128 bytes, exceeding one page.
+        let mut t = Tiler::default();
+        assert!(t
+            .idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+            .is_err());
+        assert!(t.frames.is_empty());
+        // The aggregate boundary is accepted by the input decoder itself.
+        r[34] = 1365;
+        assert_eq!(draw_vertices(&m, &ram, &r, 8).unwrap().len(), 3);
     }
     #[test]
     fn opaque_heap_lifecycle_requires_order_and_valid_context() {
