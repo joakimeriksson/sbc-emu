@@ -105,9 +105,11 @@ impl Pl330 {
         Self { log: std::env::var_os("SBC_PL330_LOG").is_some(), ..Default::default() }
     }
 
-    /// The controller's interrupt (one line for all events, as Linux's handler serves all).
-    pub fn irq(&self) -> bool {
-        self.es & self.inten != 0
+    /// Interrupt line `line` (`irq[line]` on the PL330): event `line` with its interrupt
+    /// enabled. Each line carries only its own event: Linux registers a handler per line, and
+    /// a line raised for another line's event finds nothing to do, so Linux disables it.
+    pub fn irq(&self, line: usize) -> bool {
+        line < 32 && self.es & self.inten & (1 << line) != 0
     }
 
     /// A thread waits on peripheral `peri`.
@@ -487,10 +489,11 @@ mod tests {
         assert_eq!(bus.fifo.len(), 32);
         assert_eq!(bus.fifo[..3], [0, 1, 2]);
         assert_eq!(bus.fifo[31], 31);
-        assert!(d.irq(), "SEV 3 with its interrupt enabled");
+        assert!(d.irq(3), "SEV 3 with its interrupt enabled");
+        assert!(!d.irq(0), "only event 3's own line");
         assert_eq!(d.read(CS) & 0xf, ST_STOP);
         assert_eq!(d.read(SA), 0x180, "SAR advanced over the data");
         d.write(INTCLR, 1 << 3, &mut bus);
-        assert!(!d.irq());
+        assert!(!d.irq(3));
     }
 }

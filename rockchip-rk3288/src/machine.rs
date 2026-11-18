@@ -43,6 +43,8 @@ pub const I2S_BASE: u64 = 0xff89_0000;
 pub const I2S_IRQ: usize = 32 + 53;
 pub const DMAC_BASE: u64 = 0xffb2_0000;
 pub const DMAC_SIZE: u64 = 0x4000;
+/// The PL330's irq[0] and irq[1] (events 0 and 1). Linux allocates events from 0, one per
+/// running channel, so the I2S playback and capture channels land on these two.
 pub const DMAC_IRQS: [usize; 2] = [32, 32 + 1];
 const DMAC_PERI_I2S_TX: u8 = 0;
 const DMAC_PERI_I2S_RX: u8 = 1;
@@ -723,8 +725,8 @@ impl Machine {
             if let Some(due) = self.soc.i2s.next_deadline() {
                 next = next.min(ns_to_ticks(due).max(now + 1));
             }
-            let irq = self.soc.dmac.irq();
-            for line in DMAC_IRQS {
+            for (k, line) in DMAC_IRQS.into_iter().enumerate() {
+                let irq = self.soc.dmac.irq(k);
                 self.soc.gic.set_level(line, irq);
             }
             self.soc.gic.set_level(I2S_IRQ, false);

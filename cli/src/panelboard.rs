@@ -87,9 +87,10 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             },
             card_boot: false,
             power: Peripherals::attach_panel_board_power,
-            banner: "experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12 (interpreter), GIC-400, UART2, \
-                     CRU/GRF/PMU, VOP + MIPI DSI panel, SD/eMMC, I2C with the ACT8846 PMIC, SYR827/828 and HYM8563; \
-                     RGA, Mali-T760, ILI2116 touch and BCM43455 Wi-Fi (--net local|nat|none); audio and the pads are not modelled yet",
+            banner: "experimental RK3288 panel board (Rockchip RK3288): four Cortex-A12, GIC-400, UART2, CRU/GRF/PMU, \
+                     VOP + MIPI DSI panel, SD/eMMC, I2C with the ACT8846 PMIC, SYR827/828 and HYM8563; RGA, \
+                     Mali-T760, ILI2116 touch, BCM43455 Wi-Fi (--net local|nat|none), I2S audio through the PL330 \
+                     DMA (--audio-out FILE.wav|FIFO); the pads (USB) are not modelled yet",
             setup: &|m| {
                 m.soc.display_rotation = rotation;
                 m.soc.display_name = "sbc-emu: RK3288 panel board";
