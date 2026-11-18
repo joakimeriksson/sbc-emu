@@ -12,7 +12,7 @@ use peripherals::rk808::{self, Rk808};
 use peripherals::bcm43455::Bcm43455;
 use peripherals::sdio::SdioCard;
 use peripherals::syr82x::{self, Syr82x};
-use emu_core::{Fault, FlatRam};
+use emu_core::{disk::Disk, Fault, FlatRam};
 
 /// SD card slot (`sdmmc`, SPI 32).
 pub const SDMMC_BASE: u64 = 0xff0c_0000;
@@ -27,6 +27,9 @@ const GPIO_IRQ_BASE: usize = 32 + 81;
 const TOUCH_GPIO: (usize, u32) = (7, 6);
 /// The panel board's Wi-Fi host-wake interrupt: GPIO4_D6.
 const WIFI_GPIO: (usize, u32) = (4, 30);
+/// The SD slot's card-detect pin, GPIO6_C6 (active low): the RK3288's `sdmmc-cd`, which
+/// the panel board's device tree uses (`cd-gpios`); the Tinker Board's slot is `broken-cd`.
+const SD_DETECT_GPIO: (usize, u32) = (6, 22);
 /// The panel board's Wi-Fi MAC address (locally administered).
 const WIFI_MAC: [u8; 6] = [0x02, 0x4d, 0x50, 0x43, 0x01, 0x01];
 /// I²C0 (PMU domain: the PMIC), SPI 60.
@@ -78,6 +81,13 @@ impl Peripherals {
     /// The Tinker Board's RK808 PMIC on I²C0; its RTC starts at `unix_seconds`.
     pub fn attach_rk808(&mut self, unix_seconds: i64) {
         self.i2c[0].2.attach(rk808::ADDRESS, Box::new(Rk808::new(unix_seconds)));
+    }
+
+    /// A card in the SD slot (or none): the controller's CDETECT and the card-detect pin.
+    pub fn insert_sd(&mut self, disk: Option<Box<dyn Disk>>) {
+        let present = disk.is_some();
+        self.mmc[SDMMC].insert(disk);
+        self.gpio[SD_DETECT_GPIO.0].set_input(SD_DETECT_GPIO.1, !present);
     }
 
     /// The RK3288 panel board's power chips on I²C0: the ACT8846 PMIC, the SYR827 (vdd_cpu) and

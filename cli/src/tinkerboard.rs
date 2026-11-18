@@ -179,7 +179,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
             m.connect_network(net == "nat", trace_net);
         }
         let disk = |d: &Option<crate::disk::SharedDisk>| d.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
-        m.soc.periph.mmc[devices::SDMMC].insert(disk(&sd));
+        m.soc.periph.insert_sd(disk(&sd));
         m.soc.periph.mmc[devices::EMMC].insert(disk(&emmc));
         if card_boot {
             let boot = boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
