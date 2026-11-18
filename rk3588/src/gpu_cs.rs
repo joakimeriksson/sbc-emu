@@ -1,7 +1,7 @@
 //! Initial Mali Valhall command-stream interpreter.
 //!
 //! This implements a small synchronous subset used to move data and prepare
-//! commands, compute dispatch and linear RGBA8 clear passes. Unknown commands
+//! commands, compute dispatch and linear RGBA8 clear/opaque triangle passes. Unknown commands
 //! stop explicitly rather than succeeding.
 use crate::gpu_mmu::{AddressSpace, Fault};
 
@@ -24,6 +24,7 @@ pub struct Stream {
     stack: Vec<(u64, u64, u64)>,
     heap: Option<u64>,
     oom_handler: Option<(u64, u64)>,
+    standalone_tiler: crate::gpu_tiler::Tiler,
 }
 impl Stream {
     pub fn new(start: u64, size: u64) -> Result<Self, Stop> {
@@ -36,6 +37,7 @@ impl Stream {
             stack: Vec::new(),
             heap: None,
             oom_handler: None,
+            standalone_tiler: crate::gpu_tiler::Tiler::default(),
             start,
             pc: start,
             end,
@@ -79,6 +81,19 @@ impl Stream {
     }
     /// Execute at most `budget` instructions, leaving PC on an unhandled or faulting instruction.
     pub fn run(&mut self, mmu: &AddressSpace, ram: &mut [u8], budget: usize) -> Stop {
+        let mut tiler = std::mem::take(&mut self.standalone_tiler);
+        let stop = self.run_with_tiler(mmu, ram, budget, &mut tiler, (0, 0));
+        self.standalone_tiler = tiler;
+        stop
+    }
+    pub fn run_with_tiler(
+        &mut self,
+        mmu: &AddressSpace,
+        ram: &mut [u8],
+        budget: usize,
+        tiler: &mut crate::gpu_tiler::Tiler,
+        owner: (u32, u32),
+    ) -> Stop {
         let trace = std::env::var_os("SBC_MALI_TRACE").is_some();
         for _ in 0..budget {
             self.unwind();
@@ -109,8 +124,41 @@ impl Stream {
                 }
                 3 if (insn >> 32) & 1 == 0 => Ok(()),
                 4 => crate::gpu_compute::dispatch(mmu, ram, &self.regs, insn),
+                6 if self.heap.is_some() => tiler.idvs(mmu, ram, &self.regs, insn, owner),
+                11 if insn & 0x00f0_0000_0000_fffe == 0 => {
+                    let first = match self.pair(src) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let last = match self.pair(((insn >> 32) & 255) as usize) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if first != 0 || last != 0 {
+                        Err(Stop::Unsupported {
+                            pc: self.pc,
+                            opcode,
+                        })
+                    } else if insn & 1 != 0 {
+                        if let Some(heap) = self.heap {
+                            tiler.heap_operation(mmu, ram, owner, heap, 3)
+                        } else {
+                            Err(Stop::InvalidStream)
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                9 if insn & 0x00ff_ffff_ffff_ffff == 0 => Ok(()), // all position work executes synchronously
+                49 if insn & 0x00f0_fff8_0000_ffff == 0 => {
+                    if let Some(heap) = self.heap {
+                        tiler.heap_operation(mmu, ram, owner, heap, ((insn >> 32) & 7) as u32)
+                    } else {
+                        Err(Stop::InvalidStream)
+                    }
+                }
                 7 if insn & 0x00ff_ffff_ffff_ffff == 0 => {
-                    crate::gpu_render::fragment(mmu, ram, &self.regs)
+                    tiler.fragment(mmu, ram, &self.regs, owner)
                 }
                 16 => {
                     self.regs[dst] = self.regs[src].wrapping_add(insn as u32);
@@ -324,6 +372,26 @@ mod tests {
     use super::*;
     fn ins(op: u64, dst: u64, src: u64, imm: u64) -> u64 {
         op << 56 | dst << 48 | src << 40 | imm
+    }
+    #[test]
+    fn standalone_heap_execution_survives_an_instruction_budget_boundary() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0; 512];
+        let code = [
+            ins(1, 0, 0, 256),
+            ins(48, 0, 0, 0),
+            ins(49, 0, 0, 0),
+            ins(49, 0, 0, 1 << 32),
+        ];
+        for (n, i) in code.into_iter().enumerate() {
+            ram[n * 8..n * 8 + 8].copy_from_slice(&i.to_le_bytes());
+        }
+        let mut stream = Stream::new(0, 32).unwrap();
+        assert_eq!(stream.run(&m, &mut ram, 3), Stop::Budget);
+        assert_eq!(stream.run(&m, &mut ram, 1), Stop::Complete);
     }
     #[test]
     fn next_ring_segment_keeps_heap_and_handler_and_rejects_unfinished_work() {

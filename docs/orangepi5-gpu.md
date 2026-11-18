@@ -1,6 +1,6 @@
 # Orange Pi 5 GPU bring-up
 
-The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clear passes are supported. A limited Valhall compute path also runs the shader triangle demo below; fixed-function drawing remains incomplete.
+The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clears, bounded compute dispatch and an initial opaque triangle path are supported. The Mesa GLES demo below now executes real vertex and fragment shaders; broader graphics and scanout remain incomplete.
 
 The first building blocks in `rk3588` are a GPU virtual-address walker for the 4 KiB AArch64 stage-1 page tables used by Panthor and a bounded interpreter for a small subset of Valhall command-stream instructions. Tests exercise memory mapping and faults, instructions and their interaction. The control register block is connected to guest MMIO and the three GPU interrupt lines. Address-space UPDATE commands latch the programmed translation settings. A synchronous CSF queue path now connects Linux submissions to the command interpreter, including kernel CALL and completion synchronization. Unsupported work raises a queue fault.
 
@@ -83,8 +83,8 @@ python3 tools/panthor-demo.py --shader --shader-registers 32 \
 
 Its 32-register shader uses r48/r49 for the two temporaries that the 64-register
 variant keeps in r16/r17. Both variants verify the same scene and DRM fence.
-This register-layout fix prepares real vertex/fragment shaders, but fixed-function
-triangle drawing and general Mesa applications remain incomplete.
+Both register modes are used by the native GLES path below. Broader graphics
+feature coverage remains incomplete.
 
 ### Vertex attribute execution
 
@@ -111,7 +111,8 @@ descriptor to fetch 12 instance vectors. The guest verifies every vector, write
 bounds and both fences.
 The same attribute instruction is present in the captured GLES vertex shader.
 The runner requires both the marker and a zero guest exit status, and preserves
-logs on failure. Full vertex/tiler/fragment drawing is still incomplete.
+logs on failure. This test isolates fetch; the GLES demo below validates complete
+basic opaque draws.
 
 ### Position shader output
 
@@ -136,9 +137,9 @@ python3 tools/panthor-test.py --image cache/orangepi/armbian.img \
 The Linux test adapts that shader to a compute submission: it copies global X to
 the internal-ID register and binds output to an ordinary structured buffer in
 table 3 instead of hardware position table 13. It verifies the same vectors,
-write bounds and a DRM fence. The actual GLES `RUN_IDVS` command, tiler heap
-lifecycle, primitive assembly and fragment/rasterizer integration remain
-unfinished; completing position instructions alone does not render a triangle.
+write bounds and a DRM fence. Those instruction tests isolate the position path. The integrated GLES rendering
+path described below also executes `RUN_IDVS`, triangle assembly and fragment
+shading; advanced FIFO layouts and the broader graphics pipeline remain incomplete.
 
 ### Mesa GLES clear bring-up
 
@@ -159,8 +160,9 @@ The command interpreter supports scoreboard selection and registration of the
 tiler heap and OOM handler used during Mesa initialization. Queue registers and
 registrations survive doorbells and ring wraps; queue stop, group termination or
 firmware reboot discards them. A changed ring or VM requires that reset before
-reusing a queue. Geometry allocation
-and execution of the OOM handler remain unsupported. Successful
+reusing a queue. Hardware heap-chunk allocation
+and execution of the OOM handler remain unsupported; basic triangle lists are
+modeled on the host. Successful
 `STORE_STATE.ERROR_STATUS` writes all eight bytes expected by Mesa's synchronous
 debug check. Faulted queues retain their fatal event and stop replaying work until
 Linux stops the queue or terminates its group.
@@ -169,6 +171,47 @@ The fragment clear path accepts Mesa's single linear RGBA8 target, including the
 optional CRC-only extension and its additional framebuffer flags. Whole 16x16
 checksum tiles use the descriptor's supplied clear checksum; CRC reads do not
 elide writes in the emulator. Partial CRC tiles, depth/stencil, compression,
-multiple render targets, vertex/fragment shader draws and display scanout remain
-unsupported. `SBC_MALI_TRACE=1` logs command words and framebuffer parameters for
+multiple render targets, advanced shader draws and display scanout remain
+unsupported; basic opaque triangle draws are covered by the GLES demo below. `SBC_MALI_TRACE=1` logs command words and framebuffer parameters for
 bring-up. Passing this clear test does not establish general OpenGL support.
+
+
+## Real Mesa GLES rendering demo
+
+```sh
+python3 tools/panthor-demo.py --gles --image <mesa-equipped-armbian.img> \
+  --output out/panthor-gles-demo.png
+```
+
+The 512×512 image is read back from a real GLES framebuffer with
+`GL_RENDERER=Mali-G610 (Panfrost)`. Mesa compiles the shaders and submits the draw
+commands through Linux Panthor. Twenty-four opaque triangle draws, eight fragment
+programs, overlaps and multiple colors form the sun/mountain/prism scene. Interior
+pixel probes and `glFinish`/`glReadPixels` verify the result before PNG export.
+There is no llvmpipe fallback. Use the Mesa-equipped fixture described above.
+
+`tests/gpu/panthor-gles-triangle.py` checks every pixel across three submissions,
+with changed background/scale and reversed winding. Run it with
+`tools/panthor-test.py --image <image> --guest tests/gpu/panthor-gles-triangle.py
+--success-marker PANTHOR_GLES_TRIANGLE_OK --log out/gles-triangle.log`.
+
+The synchronous path implements `RUN_IDVS`, `FINISH_TILING`, heap lifecycle
+operations, `RUN_FRAGMENT` and empty-list `FINISH_FRAGMENT`. Vertex shaders write
+positions through GPU page tables into the geometry buffer supplied by Mesa.
+Opaque polygon lists and heap counters are modeled on the host; they are private
+GPU formats, as in the Midgard model. Lists are keyed by VM and tiler context,
+scoped to their owning queue, bounded, and discarded on stop/termination/reset.
+The native fragment path executes immediate arithmetic, alpha-to-coverage-disabled
+`ATEST`, discard flow control, half-float output and opaque `BLEND`. Rasterization
+uses the descriptor's single-sample edge rule and scissor. Drawn tiles invalidate
+their opaque CRC rather than publishing the uniform-clear checksum.
+
+This is still a subset: non-indexed, single-instance triangle lists with basic
+position FIFO, W=1, finite supported coordinates and depth in [0,1], one linear
+RGBA8 target, no separate varying shader and opaque replacement blending.
+Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
+Indexed/instanced draws, perspective/clipping, varying interpolation, textures,
+blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
+non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
+synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the
+demo does not establish general GLES, Vulkan or desktop support.

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the Linux Panthor clear-pass demo and extract its PNG from serial output."""
+"""Run a Linux Panthor demo and extract its PNG from serial output."""
 import argparse, base64, pathlib, subprocess, tempfile, zlib, re
 root=pathlib.Path(__file__).resolve().parent.parent
 p=argparse.ArgumentParser(description=__doc__)
 mode=p.add_mutually_exclusive_group()
 mode.add_argument('--shader',action='store_true',help='Run the compute-shader triangle demo')
+mode.add_argument('--gles',action='store_true',help='Run the real Mesa GLES rendering demo (image needs Mesa libraries)')
 mode.add_argument('--egl',action='store_true',help='Verify a real Mesa GLES clear (image needs Mesa EGL/GLES/GBM packages)')
 p.add_argument('--shader-registers',type=int,choices=(32,64),default=64,help='Shader register allocation (requires --shader)')
 p.add_argument('--image',type=pathlib.Path,required=True)
@@ -13,8 +14,8 @@ p.add_argument('--output',type=pathlib.Path,default=root/'out/panthor-clear-demo
 p.add_argument('--timeout',type=int,default=180)
 a=p.parse_args()
 if a.shader_registers!=64 and not a.shader:p.error("--shader-registers requires --shader")
-source=root/('tests/gpu/panthor-egl.py' if a.egl else 'tests/gpu/panthor-shader.py' if a.shader else 'tests/gpu/panthor-clear.py')
-marker='PANTHOR_EGL_CLEAR_OK' if a.egl else 'PANTHOR_SHADER_OK' if a.shader else 'PANTHOR_CLEAR_OK'
+source=root/('tests/gpu/panthor-gles-demo.py' if a.gles else 'tests/gpu/panthor-egl.py' if a.egl else 'tests/gpu/panthor-shader.py' if a.shader else 'tests/gpu/panthor-clear.py')
+marker='PANTHOR_GLES_DEMO_OK' if a.gles else 'PANTHOR_EGL_CLEAR_OK' if a.egl else 'PANTHOR_SHADER_OK' if a.shader else 'PANTHOR_CLEAR_OK'
 source_bytes=source.read_bytes()
 if a.shader:
     source_bytes=('import os\nos.environ["PANTHOR_SHADER_REGISTERS"]="%d"\n'%a.shader_registers).encode()+source_bytes
@@ -46,4 +47,4 @@ with tempfile.TemporaryDirectory(prefix='panthor-demo-') as d:
     png=base64.b64decode(match[1],validate=True)
     if not png.startswith(b'\x89PNG\r\n\x1a\n'):raise SystemExit('Invalid PNG output')
     a.output.write_bytes(png)
-    print('Linux Panthor submission and fence completed; image: '+str(a.output))
+    print(('Mesa GLES rendering completed; image: ' if a.gles else 'Linux Panthor submission and fence completed; image: ')+str(a.output))

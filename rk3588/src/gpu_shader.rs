@@ -13,10 +13,28 @@ pub enum RegisterAllocation {
     Registers32,
     Registers64,
 }
+/// Single-sample opaque fragment output. Created only after fixed-function
+/// blend/depth state has been validated by the rasterizer.
+#[derive(Clone, Debug)]
+pub struct Fragment {
+    pub blend: [u32; 2],
+    pub color: Option<[f32; 4]>,
+    pub active: bool,
+}
+fn half(value: u16) -> f32 {
+    let sign = ((value as u32) & 0x8000) << 16;
+    let exp = ((value >> 10) & 31) as u32;
+    let mant = (value & 1023) as u32;
+    if exp == 0 {
+        return (if sign == 0 { 1.0 } else { -1.0 }) * mant as f32 * 2f32.powi(-24);
+    }
+    f32::from_bits(sign | (if exp == 31 { 255 } else { exp + 112 }) << 23 | mant << 13)
+}
 pub struct Shader {
     pub regs: [u32; 64],
     pub resources: crate::gpu_resources::Resources,
     pub position_output: Option<crate::gpu_resources::Buffer>,
+    pub fragment: Option<Fragment>,
     register_mask: u64,
     pub pc: u64,
     pub instructions: u64,
@@ -36,6 +54,7 @@ impl Shader {
             regs: [0; 64],
             resources: crate::gpu_resources::Resources::default(),
             position_output: None,
+            fragment: None,
             pc,
             instructions: 0,
             // Mesa bi_ra.c: full occupancy uses R0-R15 and R48-R63.
@@ -62,7 +81,18 @@ impl Shader {
             2 => uniforms
                 .get((((i >> 57) & 3) as usize) * 64 + (s & 63))
                 .copied(),
-            3 => LUT.get(s & 63).copied(),
+            3 => LUT.get(s & 63).copied().or_else(|| {
+                if (i >> 57) & 3 != 0 {
+                    return None;
+                }
+                let fragment = self.fragment.as_ref()?;
+                match s & 63 {
+                    42 | 43 => Some(0),
+                    48 => Some(fragment.blend[0]),
+                    49 => Some(fragment.blend[1]),
+                    _ => None,
+                }
+            }),
             _ => None,
         }
     }
@@ -84,7 +114,7 @@ impl Shader {
                 instruction: i,
             };
             let flow = (i >> 59) & 15;
-            if i >> 63 != 0 || flow > 10 && flow != 15 {
+            if i >> 63 != 0 || flow > 10 && flow != 15 && !(flow == 13 && self.fragment.is_some()) {
                 return Err(bad());
             }
             let dst = ((i >> 40) & 63) as usize;
@@ -200,6 +230,66 @@ impl Shader {
                     self.regs[dst + 1] = (address >> 32) as u32;
                     None
                 }
+                0x110 => Some(a.ok_or_else(bad)?.wrapping_add((i >> 8) as u32)),
+                0x7d => {
+                    // Alpha-to-coverage is disabled by the validated DCD. The
+                    // native .h1 alpha operand is read but does not alter coverage.
+                    if self.fragment.is_none()
+                        || (i >> 46) & 3 != 2
+                        || (i >> 24) & 65535 != 0x208
+                        || (i >> 16) & 255 != 0xea
+                        || (i >> 57) & 3 != 0
+                        || !self.registers_available(dst, 1)
+                    {
+                        return Err(bad());
+                    }
+                    let _alpha = half((c.ok_or_else(bad)? >> 16) as u16);
+                    self.regs[dst] = a.ok_or_else(bad)?;
+                    self.fragment.as_mut().unwrap().active = self.regs[dst] & 1 != 0;
+                    None
+                }
+                0x7f => {
+                    let format = (i >> 24) & 7;
+                    let count = if format == 3 { 2 } else { 4 };
+                    if self.fragment.is_none()
+                        || !matches!(format, 2 | 3)
+                        || (i >> 46) & 3 != 1
+                        || (i >> 33) & 7 != count as u64
+                        || (i >> 28) & 3 != 3
+                        || (i >> 30) & 7 > 2
+                        || (i >> 36) & 15 != 0
+                        || (i >> 8) & 255 != 0
+                        || i & 255 != 0xf0
+                        || (i >> 57) & 3 != 0
+                        || flow != 15
+                        || dst & 1 != 0
+                        || !self.registers_available(dst, count)
+                    {
+                        return Err(bad());
+                    }
+                    a.ok_or_else(bad)?; // Validate the special blend-descriptor operand.
+                    let coverage = self.source(i, 2, uniforms).ok_or_else(bad)?;
+                    if coverage & 1 != 0 {
+                        let color = if format == 3 {
+                            let a = self.regs[dst];
+                            let b = self.regs[dst + 1];
+                            [
+                                half(a as u16),
+                                half((a >> 16) as u16),
+                                half(b as u16),
+                                half((b >> 16) as u16),
+                            ]
+                        } else {
+                            let values: [u32; 4] = self.regs[dst..dst + 4].try_into().unwrap();
+                            values.map(f32::from_bits)
+                        };
+                        if color.iter().any(|v| !v.is_finite()) {
+                            return Err(bad());
+                        }
+                        self.fragment.as_mut().unwrap().color = Some(color);
+                    }
+                    None
+                }
                 0x66 => {
                     let count = ((i >> 28) & 3) as usize + 1;
                     if (i >> 46) & 3 != 2
@@ -304,7 +394,7 @@ impl Shader {
                 };
             }
             self.pc = next;
-            if flow == 15 {
+            if flow == 15 || flow == 13 && self.fragment.as_ref().is_some_and(|f| !f.active) {
                 return Ok(());
             }
         }
@@ -549,5 +639,59 @@ mod tests {
             assert_eq!(ram, before);
             assert_eq!(shader.pc, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+    #[test]
+    fn native_panfrost_fragment_runs_coverage_discard_flow_and_half_color() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let code = [
+            0x4110c03c000000c0u64,
+            0x087dbc0208ea407c,
+            0x6891c000000000db,
+            0x4891c100000000db,
+            0x787f4004333c00f0,
+        ];
+        let mut ram: Vec<u8> = code.iter().flat_map(|i| i.to_le_bytes()).collect();
+        for coverage in [0, 1] {
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+            shader.fragment = Some(Fragment {
+                blend: [0x19, 237 << 12],
+                color: None,
+                active: true,
+            });
+            shader.regs[60] = coverage;
+            shader.run(&m, &mut ram, &[], 16).unwrap();
+            assert_eq!(
+                shader.fragment.unwrap().color,
+                if coverage == 0 {
+                    None
+                } else {
+                    Some([0., 1., 0., 1.])
+                }
+            );
+            assert_eq!(shader.instructions, if coverage == 0 { 3 } else { 5 });
+        }
+        let mut shader = Shader::new(8);
+        assert!(matches!(
+            shader.run(&m, &mut ram, &[], 1),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+    #[test]
+    fn half_conversion_preserves_special_values_and_subnormals() {
+        assert_eq!(half(0), 0.0);
+        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(half(1), 2f32.powi(-24));
+        assert_eq!(half(0x3c00), 1.0);
+        assert_eq!(half(0xbc00), -1.0);
+        assert_eq!(half(0x7c00), f32::INFINITY);
+        assert!(half(0x7e00).is_nan());
     }
 }
