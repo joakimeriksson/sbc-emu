@@ -1,6 +1,6 @@
 use crate::display::{Display, HDMI_IRQ, TCON0_IRQ};
 use crate::emac::{Emac, EMAC_BASE, EMAC_IRQ, EMAC_SIZE};
-use crate::gic::NCPU;
+use peripherals::NCPU;
 use crate::usb::{Dma, Ehci, Ohci};
 use emu_core::usb::{Keyboard, Tablet};
 use crate::{Gic, SunxiMmc, Timer, Uart};
@@ -954,16 +954,7 @@ impl Machine {
     }
 }
 
-/// 24 MHz ticks to nanoseconds (rounded up) and back (rounded down), so that
-/// `ns_to_ticks(ticks_to_ns(t)) >= t`: an idle deadline converted to nanoseconds and back
-/// always reaches the timer compare value.
-pub fn ticks_to_ns(ticks: u64) -> u64 {
-    (ticks as u128 * 125).div_ceil(3) as u64
-}
-
-pub fn ns_to_ticks(ns: u64) -> u64 {
-    (ns as u128 * 3 / 125) as u64
-}
+pub use peripherals::timebase::{ns_to_ticks, ticks_to_ns};
 
 impl Default for Machine {
     fn default() -> Self {

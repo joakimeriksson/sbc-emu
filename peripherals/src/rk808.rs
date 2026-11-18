@@ -164,7 +164,7 @@ impl I2cDevice for Rk808 {
 }
 
 pub(crate) fn bcd(value: u8) -> u8 {
-    value / 10 << 4 | value % 10
+    ((value / 10) << 4) | (value % 10)
 }
 
 pub(crate) fn unbcd(value: u8) -> u8 {

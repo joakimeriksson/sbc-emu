@@ -3,7 +3,7 @@ use crate::devices::Peripherals;
 use crate::dsi::{Dsi, DSI_SIZE};
 use crate::rga::{Rga, RGA_SIZE};
 use crate::vop::{Vop, VOP_SIZE};
-use allwinner_h3::{Gic, Uart, NCPU};
+use peripherals::{Gic, Uart, NCPU};
 use arm_a32::{CodeWatch, Cpu, CORTEX_A12};
 use std::sync::Arc;
 use emu_core::{Bus, Core, Fault, FlatRam, Stop, Trap};
@@ -863,7 +863,7 @@ impl Machine {
 }
 
 // Shared with the H3: rounds idle deadlines up so ns -> ticks reaches the compare value.
-pub use allwinner_h3::{ns_to_ticks, ticks_to_ns};
+pub use peripherals::timebase::{ns_to_ticks, ticks_to_ns};
 
 impl Default for Machine {
     fn default() -> Self {

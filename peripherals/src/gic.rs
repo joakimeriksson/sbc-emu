@@ -208,7 +208,7 @@ impl Gic {
         let offset = offset as usize;
         match offset {
             0x000 => u32::from(self.dist_enable),
-            0x004 => (NIRQ as u32 / 32) - 1 | ((NCPU as u32 - 1) << 5),
+            0x004 => ((NIRQ as u32 / 32) - 1) | ((NCPU as u32 - 1) << 5),
             0x008 => 0x0200_143b, // GIC-400 IIDR
             0x100..=0x17c | 0x180..=0x1fc => {
                 self.bits(cpu, (offset & 0x7f) * 8, |gic, c, irq| gic.enabled(c, irq))
@@ -237,7 +237,7 @@ impl Gic {
                 let base = (offset - 0xc00) * 4;
                 (0..16).fold(0, |value, index| {
                     let irq = base + index;
-                    let edge = irq < 16 || irq >= 32 && irq < NIRQ && self.edge[irq];
+                    let edge = irq < 16 || (32..NIRQ).contains(&irq) && self.edge[irq];
                     value | u32::from(edge) << (index * 2 + 1)
                 })
             }

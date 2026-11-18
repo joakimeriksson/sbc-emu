@@ -1,0 +1,8 @@
+[package]
+name = "peripherals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Device models shared between boards: the GIC-400, the DesignWare UART, the I2C device interface and I2C chips (PMICs, regulators, RTCs, touch controllers)"
+
+[dependencies]
