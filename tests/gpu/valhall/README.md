@@ -15,3 +15,9 @@ actual Valhall shader execution rather than the fixed-function triangle pipeline
 variant obtains coordinates and output addresses from preloaded global IDs and
 runs all pixels in one compute dispatch. `panthor-shader.py` embeds these words.
 The original triangle fixture remains a scalar instruction regression test.
+
+`split-registers.asm` / `.json` use the same assembler revision to exercise
+R48-R63 as both scalar registers and vector staging registers. `workgroup-triangle-32.asm`
+/ `.json` move the triangle shader's r16/r17 temporaries to r48/r49 so it runs
+with 32-register allocation. Both allocation modes use the same preload IDs,
+framebuffer and pixel oracle in `panthor-shader.py`.

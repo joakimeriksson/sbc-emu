@@ -15,7 +15,7 @@ pub enum RegisterAllocation {
 }
 pub struct Shader {
     pub regs: [u32; 64],
-    register_count: usize,
+    register_mask: u64,
     pub pc: u64,
     pub instructions: u64,
 }
@@ -34,11 +34,18 @@ impl Shader {
             regs: [0; 64],
             pc,
             instructions: 0,
-            register_count: match allocation {
-                RegisterAllocation::Registers32 => 32,
-                RegisterAllocation::Registers64 => 64,
+            // Mesa bi_ra.c: full occupancy uses R0-R15 and R48-R63.
+            register_mask: match allocation {
+                RegisterAllocation::Registers32 => 0xffff_0000_0000_ffff,
+                RegisterAllocation::Registers64 => u64::MAX,
             },
         }
+    }
+    fn registers_available(&self, first: usize, count: usize) -> bool {
+        count != 0
+            && first < 64
+            && count <= 64 - first
+            && (first..first + count).all(|r| self.register_mask & (1 << r) != 0)
     }
     fn source(&self, i: u64, index: usize, uniforms: &[u32]) -> Option<u32> {
         let s = ((i >> (index * 8)) & 255) as usize;
@@ -46,7 +53,7 @@ impl Shader {
             0 | 1 => self
                 .regs
                 .get(s & 63)
-                .filter(|_| s & 63 < self.register_count)
+                .filter(|_| self.registers_available(s & 63, 1))
                 .copied(), // discard register hint doesn't change value
             2 => uniforms
                 .get((((i >> 57) & 3) as usize) * 64 + (s & 63))
@@ -161,24 +168,29 @@ impl Shader {
                     })
                 }
                 0x60 | 0x61 => {
-                    // One 32-bit global staging register, normal memory access.
+                    // Global 32-bit scalar or 128-bit vector transfers, normal memory access.
                     if ((i >> 46) & 3) != if op == 0x61 { 1 } else { 2 }
                         || !matches!(((i >> 27) & 7, (i >> 33) & 7), (3, 1) | (7, 4))
                         || (i >> 24) & 3 != 0
-                        || (i >> 36) & 15 != 0
+                        || (i >> 36) & 15
+                            != if op == 0x60 && (i >> 27) & 7 == 7 {
+                                7
+                            } else {
+                                0
+                            }
                         || i & (1 << 26) != 0
                         || (i >> 30) & 7 > 2
                     {
                         return Err(bad());
                     }
                     let s = (i & 255) as usize;
-                    if s + 1 >= self.register_count || s & 1 != 0 {
+                    if !self.registers_available(s, 2) || s & 1 != 0 {
                         return Err(bad());
                     }
                     let addr = (self.regs[s] as u64 | ((self.regs[s + 1] as u64) << 32))
                         .wrapping_add((i >> 8) as u16 as i16 as i64 as u64);
                     let count = ((i >> 33) & 7) as usize;
-                    if dst + count > self.register_count || count > 1 && dst & 1 != 0 {
+                    if !self.registers_available(dst, count) || count > 1 && dst & 1 != 0 {
                         return Err(bad());
                     }
                     if op == 0x61 {
@@ -212,7 +224,7 @@ impl Shader {
                 _ => return Err(bad()),
             };
             if let Some(v) = result {
-                if dst >= self.register_count {
+                if !self.registers_available(dst, 1) {
                     return Err(bad());
                 }
                 let mask = (i >> 46) & 3;
@@ -394,6 +406,76 @@ mod tests {
                 ),
                 "{instruction:016x}"
             );
+            assert_eq!(ram, before);
+            assert_eq!(shader.pc, 0);
+        }
+    }
+    #[test]
+    fn mesa_split_register_shader_reads_preloads_and_transfers_high_vectors() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let code = [
+            0x91c00000000080u64,
+            0x91c10000000081u64,
+            0x91f0000000003cu64,
+            0x91f1000000003du64,
+            0x91f2000000003bu64,
+            0x91f3000000003eu64,
+            0x61700838000000u64,
+            0x60bc7838000000u64,
+            0x617c0838001000u64,
+            0x7800c00000000000u64,
+        ];
+        for allocation in [
+            RegisterAllocation::Registers32,
+            RegisterAllocation::Registers64,
+        ] {
+            let mut ram = vec![0; 4096];
+            for (n, instruction) in code.into_iter().enumerate() {
+                ram[n * 8..n * 8 + 8].copy_from_slice(&instruction.to_le_bytes());
+            }
+            let mut shader = Shader::with_allocation(0, allocation);
+            shader.regs[59..63].copy_from_slice(&[9, 11, 13, 15]);
+            shader.run(&m, &mut ram, &[1024, 0], 16).unwrap();
+            let expected: Vec<u8> = [11u32, 13, 9, 15]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            assert_eq!(&ram[1024..1040], &expected);
+            assert_eq!(&ram[1040..1056], &expected);
+            assert_eq!(&shader.regs[60..64], &[11, 13, 9, 15]);
+        }
+    }
+    #[test]
+    fn split_register_hole_rejects_scalar_address_and_crossing_vectors() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let instructions = [
+            0x0091d000000000c0u64, // MOV r16, zero
+            0x0091c00000000010,    // MOV r0, r16
+            0x0061700838000010,    // STORE.i128 r48..r51, address r16:r17
+            0x00614e0838000000,    // STORE.i128 r14..r17 crosses the hole
+            0x00608e7838000000,    // LOAD.i128 r14..r17 crosses the hole
+        ];
+        for instruction in instructions {
+            let mut ram = vec![0x55; 4096];
+            ram[..8].copy_from_slice(&instruction.to_le_bytes());
+            let before = ram.clone();
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+            shader.regs[0] = 1024;
+            let registers = shader.regs;
+            assert!(
+                matches!(
+                    shader.run(&m, &mut ram, &[], 1),
+                    Err(Error::Unsupported { .. })
+                ),
+                "{instruction:x}"
+            );
+            assert_eq!(shader.regs, registers);
             assert_eq!(ram, before);
             assert_eq!(shader.pc, 0);
         }

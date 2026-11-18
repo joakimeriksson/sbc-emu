@@ -65,3 +65,23 @@ to Mesa: descriptor value 0 selects 64 registers per thread, and value 2 selects
 bounded to 1,024 local invocations per group, 65,536 total invocations and an
 aggregate instruction budget. Workgroup offsets, merging, shared memory and
 barriers remain unsupported; invocations execute sequentially.
+
+Valhall's 32-register allocation is split: R0-R15 and R48-R63 are accessible;
+R16-R47 are unavailable. This follows Mesa's `bi_allocate_registers` affinity in
+[`bi_ra.c`](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/06efd8542f442e701685e26abe4d73c4ddf7b249/src/panfrost/compiler/bifrost/bi_ra.c).
+The upper bank supports both reads and writes, including system-value preloads
+and vector transfers. The interpreter checks every register in address pairs and
+staging vectors before accessing guest memory. The 128-bit load's identity lane
+encoding is accepted; reserved lane encodings are rejected.
+
+Run the Linux shader demo in this allocation mode with:
+
+```sh
+python3 tools/panthor-demo.py --shader --shader-registers 32 \
+  --image cache/orangepi/armbian.img --output out/panthor-shader-32.png
+```
+
+Its 32-register shader uses r48/r49 for the two temporaries that the 64-register
+variant keeps in r16/r17. Both variants verify the same scene and DRM fence.
+This register-layout fix prepares real vertex/fragment shaders, but fixed-function
+triangle drawing and general Mesa applications remain incomplete.

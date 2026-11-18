@@ -4,14 +4,19 @@ import argparse, base64, pathlib, subprocess, tempfile, zlib, re
 root=pathlib.Path(__file__).resolve().parent.parent
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--shader',action='store_true',help='Run the compute-shader triangle demo')
+p.add_argument('--shader-registers',type=int,choices=(32,64),default=64,help='Shader register allocation (requires --shader)')
 p.add_argument('--image',type=pathlib.Path,required=True)
 p.add_argument('--emulator',type=pathlib.Path,default=root/'target/release/sbc-emu')
 p.add_argument('--output',type=pathlib.Path,default=root/'out/panthor-clear-demo.png')
 p.add_argument('--timeout',type=int,default=180)
 a=p.parse_args()
+if a.shader_registers!=64 and not a.shader:p.error("--shader-registers requires --shader")
 source=root/('tests/gpu/panthor-shader.py' if a.shader else 'tests/gpu/panthor-clear.py')
 marker='PANTHOR_SHADER_OK' if a.shader else 'PANTHOR_CLEAR_OK'
-payload=base64.b64encode(zlib.compress(source.read_bytes())).decode()
+source_bytes=source.read_bytes()
+if a.shader:
+    source_bytes=('import os\nos.environ["PANTHOR_SHADER_REGISTERS"]="%d"\n'%a.shader_registers).encode()+source_bytes
+payload=base64.b64encode(zlib.compress(source_bytes)).decode()
 lines=['wait-serial root@','serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs none /tmp; modprobe fixed; modprobe panthor; stty -echo\\n','serial : > /tmp/demo.b64\\n']
 for i in range(0,len(payload),500):lines.append('serial printf %s '+payload[i:i+500]+' >> /tmp/demo.b64\\n')
 lines+=['serial python3 -c \'import base64,zlib;exec(zlib.decompress(base64.b64decode(open("/tmp/demo.b64").read())))\'\\n','wait-serial '+marker,'wait-serial IMAGE_END','quit']
