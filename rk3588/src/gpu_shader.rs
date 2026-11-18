@@ -8,9 +8,16 @@ pub enum Error {
     Unsupported { pc: u64, instruction: u64 },
     Budget,
 }
+#[derive(Clone, Copy, Debug)]
+pub enum RegisterAllocation {
+    Registers32,
+    Registers64,
+}
 pub struct Shader {
-    pub regs: [u32; 32],
+    pub regs: [u32; 64],
+    register_count: usize,
     pub pc: u64,
+    pub instructions: u64,
 }
 const LUT: [u32; 32] = [
     0, 0xffffffff, 0x7fffffff, 0xfafcfdfe, 0x01000000, 0x80002000, 0x70605030, 0xc0b0a090,
@@ -20,12 +27,27 @@ const LUT: [u32; 32] = [
 ];
 impl Shader {
     pub fn new(pc: u64) -> Self {
-        Self { regs: [0; 32], pc }
+        Self::with_allocation(pc, RegisterAllocation::Registers64)
+    }
+    pub fn with_allocation(pc: u64, allocation: RegisterAllocation) -> Self {
+        Self {
+            regs: [0; 64],
+            pc,
+            instructions: 0,
+            register_count: match allocation {
+                RegisterAllocation::Registers32 => 32,
+                RegisterAllocation::Registers64 => 64,
+            },
+        }
     }
     fn source(&self, i: u64, index: usize, uniforms: &[u32]) -> Option<u32> {
         let s = ((i >> (index * 8)) & 255) as usize;
         match s >> 6 {
-            0 | 1 => self.regs.get(s & 63).copied(), // discard register hint doesn't change value
+            0 | 1 => self
+                .regs
+                .get(s & 63)
+                .filter(|_| s & 63 < self.register_count)
+                .copied(), // discard register hint doesn't change value
             2 => uniforms
                 .get((((i >> 57) & 3) as usize) * 64 + (s & 63))
                 .copied(),
@@ -41,6 +63,7 @@ impl Shader {
         budget: usize,
     ) -> Result<(), Error> {
         for _ in 0..budget {
+            self.instructions += 1;
             let mut b = [0; 8];
             m.read(ram, self.pc, &mut b, true).map_err(Error::Memory)?;
             let i = u64::from_le_bytes(b);
@@ -64,6 +87,9 @@ impl Shader {
                 }
                 0xa0 if (i >> 16) & 15 == 0 && i & 0x000000ff_ffff_0000 == 0 => {
                     Some(a.ok_or_else(bad)?.wrapping_add(c.ok_or_else(bad)?))
+                }
+                0x90 if (i >> 16) & 31 == 0x19 && i & 0x000000ff_ffff_ff00 == 0x190000 => {
+                    Some((a.ok_or_else(bad)? as f32).to_bits())
                 }
                 0xa4 | 0xb2 => {
                     // Scalar f32 with identity swizzles, round-to-nearest and optional abs/neg.
@@ -146,13 +172,13 @@ impl Shader {
                         return Err(bad());
                     }
                     let s = (i & 255) as usize;
-                    if s + 1 >= self.regs.len() || s & 1 != 0 {
+                    if s + 1 >= self.register_count || s & 1 != 0 {
                         return Err(bad());
                     }
                     let addr = (self.regs[s] as u64 | ((self.regs[s + 1] as u64) << 32))
                         .wrapping_add((i >> 8) as u16 as i16 as i64 as u64);
                     let count = ((i >> 33) & 7) as usize;
-                    if dst + count > self.regs.len() || count > 1 && dst & 1 != 0 {
+                    if dst + count > self.register_count || count > 1 && dst & 1 != 0 {
                         return Err(bad());
                     }
                     if op == 0x61 {
@@ -186,7 +212,7 @@ impl Shader {
                 _ => return Err(bad()),
             };
             if let Some(v) = result {
-                if dst >= self.regs.len() {
+                if dst >= self.register_count {
                     return Err(bad());
                 }
                 let mask = (i >> 46) & 3;
@@ -354,7 +380,7 @@ mod tests {
             let mut ram = vec![0x55; 1024];
             ram[..8].copy_from_slice(&instruction.to_le_bytes());
             let before = ram.clone();
-            let mut shader = Shader::new(0);
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
             shader.regs[0] = 512;
             assert!(
                 matches!(

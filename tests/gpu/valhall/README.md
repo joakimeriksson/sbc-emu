@@ -10,3 +10,8 @@ The shader receives output address, coordinates, edge coefficients and backgroun
 color through FAU uniforms. It calculates barycentric coverage and color itself.
 The guest submits one single-invocation compute dispatch per pixel; this exercises
 actual Valhall shader execution rather than the fixed-function triangle pipeline.
+
+`workgroup-triangle.asm` / `.json` use the same Mesa assembler revision. This
+variant obtains coordinates and output addresses from preloaded global IDs and
+runs all pixels in one compute dispatch. `panthor-shader.py` embeds these words.
+The original triangle fixture remains a scalar instruction regression test.
