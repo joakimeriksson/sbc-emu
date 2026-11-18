@@ -52,6 +52,10 @@ fn general(m: &mut Gmem, cfg: u32, req: &TmuReq, lanes: u16) -> Vec<V> {
         }
         return Vec::new();
     }
+    // Read-modify-write operations: render workers on other host threads may run the same
+    // shader on other tiles, so each request's updates are applied under one lock.
+    static RMW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _rmw = RMW.lock().unwrap_or_else(|e| e.into_inner());
     if data.is_empty() {
         // read-type operations: increment / decrement / not, or cache maintenance (no data)
         if !matches!(op, 8..=10) { return Vec::new(); }

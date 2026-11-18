@@ -22,6 +22,7 @@ pub mod tfu;
 pub mod csd;
 pub mod bin;
 pub mod render;
+pub mod par;
 pub mod raster;
 
 use std::collections::HashMap;
@@ -94,6 +95,7 @@ impl Clock {
 /// Decoded-instruction cache for QPU code (direct-mapped), valid for one job: BOs get remapped
 /// between jobs.
 /// Decoded QPU instructions, and whether a shader in the current job ran away.
+#[derive(Clone)]
 pub struct Code {
     tags: Vec<u32>,
     insts: Vec<qpu::Inst>,

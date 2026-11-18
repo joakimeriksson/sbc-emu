@@ -118,7 +118,8 @@ is not part of the evaluation.
 
 glmark2 score **12**. The frame rates are guest-time rates: each GPU job's done interrupt is held back
 by the host time the job took, so they show how fast the interpreted GPU is on the host
-(here an Apple-silicon Mac), not how fast a real Pi 4 is.
+(here an Apple-silicon Mac), not how fast a real Pi 4 is. This table was measured with the GPU
+on one host thread, before [parallel rendering](#parallel-rendering).
 
 ![glmark2 scenes on the emulated V3D](img/glmark2-1080p.png)
 
@@ -157,6 +158,49 @@ by the host time the job took, so they show how fast the interpreted GPU is on t
 | loop | `fragment-loop=false:fragment-steps=5:vertex-steps=5` | 15 | 66.686 ms |
 | loop | `fragment-steps=5:fragment-uniform=false:vertex-steps=5` | 16 | 66.449 ms |
 | loop | `fragment-steps=5:fragment-uniform=true:vertex-steps=5` | 11 | 96.275 ms |
+
+### Parallel rendering
+
+The V3D's QPUs shade several tiles at once, and the tiles of a render job are independent, so
+the model renders them on several host threads (`SBC_V3D_THREADS`; default: the host's cores
+minus two, at most 16; the browser build stays on one thread):
+
+- **Tiles:** consecutive supertiles of the render control list are queued, then each worker
+  takes the next tile with its own tile buffer, shader thread and instruction cache. A tile
+  starts from the tile buffer as it was before the tiles were queued. Serially it would start
+  from what the previous tile left, but Mesa either loads each tile or clears it with the
+  previous tile's store, so the result is the same.
+- **Vertices:** the vertex shader (render job) and the coordinate shader (bin job) of a
+  draw run in 128-vertex chunks on all workers. The shader runs 16 vertices at a time, each
+  batch on its own, so the outputs are those of one serial run.
+- **Thread indices:** shaders that run at the same time get distinct thread indices (TIDX:
+  2 × worker for fragment shaders, 2 × worker + 1 for vertex and coordinate shaders). Mesa
+  places register spills in a scratch slot per thread index, sized for 4 threads × 8 QPUs.
+- **Atomics:** TMU atomics and other read-modify-write operations take a lock, so atomic
+  counters stay atomic across workers.
+
+**Check:** the GL scenes above render to byte-identical images with 1 and 16 threads, and in
+`--threads multi`. `atlas_pbo` fails in all three for its known reason.
+
+glmark2-es2-drm at 1024×768 (5 s per scene, from the browser demo snapshot, Apple M5 Max with
+18 cores):
+
+| Scene | 1 thread | 16 threads |
+|---|---|---|
+| build | 71 fps | 286 fps |
+| texture (linear) | 27 fps | 223 fps |
+| shading (phong) | 19 fps | 125 fps |
+| bump (high-poly) | 14 fps | 60 fps |
+| effect2d (3×3 kernel) | 6 fps | 48 fps |
+| desktop (shadow) | 5 fps | 39 fps |
+| jellyfish | 5 fps | 41 fps |
+| shadow | 11 fps | 76 fps |
+| refract | 487 ms/frame | 135 ms/frame |
+| terrain | 1140 ms/frame | 433 ms/frame |
+
+**What limits it now:** QPU instructions (interpreted) and texture fetch and filtering, on
+every worker. Terrain and refract also bin a lot of geometry, and the binning after the
+coordinate shader is still serial.
 
 ## In the browser
 
@@ -209,3 +253,5 @@ filtering instead.
   equations, depth and stencil, early Z, fragment shader address) and per distinct tile store
   format: what an application asks of the GPU, without tracing every draw.
 - `SBC_GPU_TIME=X`: scale the guest time GPU jobs take (default 1: their host time; 0: instant).
+- `SBC_V3D_THREADS=N`: host threads for rendering (1: everything on one thread, as before
+  [parallel rendering](#parallel-rendering); useful to tell a threading problem from another).

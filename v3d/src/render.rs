@@ -5,7 +5,7 @@
 //! tests, fragment shading on 16-lane QPU threads, and tile buffer writes with blending.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::bin::{self, Binned, ClipVert, DrawState, Prim};
 use crate::formats::{self, it};
@@ -18,6 +18,7 @@ use crate::{BinResults, Code, Gmem};
 #[derive(Clone, Copy, Default)]
 struct RtCfg { bpp: u32, ty: u32, clamp: u32, clear: [u32; 4] }
 
+#[derive(Clone)]
 struct TileBuf {
     w: u32,
     h: u32,
@@ -53,13 +54,24 @@ struct Render<'r> {
     tile: (u32, u32),
     generic: (u32, u32),
     supertile: MulticoreRenderingSupertileCfg,
-    /// vertex shader outputs per draw of the current bin result
+    /// vertex shader outputs per draw of the current bin result (this worker's copy)
     vs_cache: HashMap<u32, Arc<VsOut>>,
+    /// the same, shared by the render workers: each draw's vertex shader runs once
+    vs_shared: VsShared,
     occlusion: HashMap<u32, u32>,
     insns: u64,
     /// fragment shader thread storage, reused between invocations
     thread: Option<Box<Thread>>,
+    /// tiles of consecutive supertile packets, rendered together (in parallel where possible)
+    queue: Vec<(u32, u32)>,
+    /// this worker's number: its shaders' thread indices (TIDX) are 2w (fragment) and 2w+1
+    /// (vertex), distinct between workers, inside the 4 x 8 QPU threads Mesa sizes register
+    /// spill memory for
+    worker: u32,
 }
+
+type VsShared = Arc<Mutex<HashMap<u32, Arc<OnceLock<Arc<VsOut>>>>>>;
+
 
 /// The tile-list base addresses a render control list points at (the binning results it reads).
 pub fn tile_list_bases(start: u32, end: u32, m: &mut Gmem) -> Vec<u32> {
@@ -76,18 +88,23 @@ pub fn run(start: u32, end: u32, binned: &BinResults, m: &mut Gmem, code: &mut C
     let mut r = Render {
         binned, cur: None, width: 0, height: 0, msaa: false, nrt: 1, rt: [RtCfg::default(); 4], depth_type: 0, early_ds_clear: false,
         z_clear: 1.0, s_clear: 0, tile_w: 64, tile_h: 64, tb: TileBuf::new(64, 64, 1), tile: (0, 0), generic: (0, 0),
-        supertile: MulticoreRenderingSupertileCfg::default(), vs_cache: HashMap::new(), occlusion: HashMap::new(), insns: 0, thread: None,
+        supertile: MulticoreRenderingSupertileCfg::default(), vs_cache: HashMap::new(), vs_shared: Default::default(), occlusion: HashMap::new(),
+        insns: 0, thread: None, queue: Vec::new(), worker: 0,
     };
     let mut cl = bin::Cl::new(start, end);
     while let Some((op, b)) = cl.next(m) {
         if op == 13 { break; }
+        // supertiles are independent: queue them, render them together before anything else
+        if op == 23 { r.queue_supertile(&b); continue; }
+        r.flush(m, code);
         r.packet(op, &b, m, code);
     }
+    r.flush(m, code);
     for (addr, n) in r.occlusion.drain() { let v = m.r32(addr); m.w32(addr, v.wrapping_add(n)); }
     *insns += r.insns;
 }
 
-impl Render<'_> {
+impl<'r> Render<'r> {
     fn packet(&mut self, op: u8, b: &[u8; 32], m: &mut Gmem, code: &mut Code) {
         match op {
             121 => match b[1] & 0xf {
@@ -145,6 +162,7 @@ impl Render<'_> {
                 let mark = m.r32(c.address);
                 self.cur = self.binned.get(&c.address).filter(|b| b.marker == mark).cloned();
                 self.vs_cache.clear();
+                self.vs_shared = Default::default();
                 if self.cur.is_none() { crate::log(&format!("v3d: render job: no binned primitives for tile lists at {:#x}", c.address)); }
             }
             122 => self.supertile = MulticoreRenderingSupertileCfg::parse(b),
@@ -152,20 +170,8 @@ impl Render<'_> {
             125 => {}
             20 => { let c = StartAddressOfGenericTileList::parse(b); self.generic = (c.start, c.end); }
             23 => {
-                let c = SupertileCoordinates::parse(b);
-                let (sw, sh) = (self.supertile.supertile_width_in_tiles.max(1), self.supertile.supertile_height_in_tiles.max(1));
-                let (tx_n, ty_n) = ((self.width + self.tile_w - 1) / self.tile_w, (self.height + self.tile_h - 1) / self.tile_h);
-                for ty in c.row_number_in_supertiles * sh..(c.row_number_in_supertiles + 1) * sh {
-                    for tx in c.column_number_in_supertiles * sw..(c.column_number_in_supertiles + 1) * sw {
-                        if tx >= tx_n || ty >= ty_n { continue; }
-                        self.start_tile(tx, ty);
-                        let mut sub = bin::Cl::new(self.generic.0, self.generic.1);
-                        while let Some((op, b)) = sub.next(m) {
-                            if op == 27 { break; }
-                            self.packet(op, &b, m, code);
-                        }
-                    }
-                }
+                self.queue_supertile(b);
+                self.flush(m, code);
             }
             30 => self.load(&LoadTileBufferGeneral::parse(b), m),
             29 => self.store(&StoreTileBufferGeneral::parse(b), m),
@@ -173,6 +179,137 @@ impl Render<'_> {
             21 => self.render_tile(m, code),
             26 | 27 | 56 | 54 | 19 | 126 => {}
             _ => {}
+        }
+    }
+
+    /// The tiles of a supertile, in order, onto the queue.
+    fn queue_supertile(&mut self, b: &[u8; 32]) {
+        let c = SupertileCoordinates::parse(b);
+        let (sw, sh) = (self.supertile.supertile_width_in_tiles.max(1), self.supertile.supertile_height_in_tiles.max(1));
+        let (tx_n, ty_n) = (self.width.div_ceil(self.tile_w), self.height.div_ceil(self.tile_h));
+        for ty in c.row_number_in_supertiles * sh..(c.row_number_in_supertiles + 1) * sh {
+            for tx in c.column_number_in_supertiles * sw..(c.column_number_in_supertiles + 1) * sw {
+                if tx < tx_n && ty < ty_n { self.queue.push((tx, ty)); }
+            }
+        }
+    }
+
+    /// One tile: its generic tile list (loads, the binned primitives, stores).
+    fn run_tile(&mut self, tx: u32, ty: u32, m: &mut Gmem, code: &mut Code) {
+        self.start_tile(tx, ty);
+        let mut sub = bin::Cl::new(self.generic.0, self.generic.1);
+        while let Some((op, b)) = sub.next(m) {
+            if op == 27 { break; }
+            self.packet(op, &b, m, code);
+        }
+    }
+
+    /// Render the queued tiles. Tiles are independent on the hardware too (its QPUs shade
+    /// several at once), so with more than one render thread each worker takes the next tile
+    /// from the queue, with its own tile buffer, shader thread and instruction cache. A tile
+    /// starts from the tile buffer the previous tile left (Mesa clears it with the previous
+    /// tile's stores): every worker starts from the buffer as it is now, which is what each
+    /// tile sees serially when the stores clear or the next tile loads.
+    fn flush(&mut self, m: &mut Gmem, code: &mut Code) {
+        if self.queue.is_empty() { return; }
+        let tiles = std::mem::take(&mut self.queue);
+        let workers = crate::par::threads().min(tiles.len());
+        if workers <= 1 {
+            for (tx, ty) in tiles { self.run_tile(tx, ty, m, code); }
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.run_parallel(&tiles, workers, m, code);
+    }
+
+    /// Shade the vertices of the draws these tiles use before rendering them, all workers
+    /// taking 128-vertex chunks (the shader runs 16 vertices at a time, each batch on its own,
+    /// so chunks give the same outputs as one run). Otherwise the first worker to reach a big
+    /// draw would shade all of it while the others wait.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn shade_vertices(&mut self, tiles: &[(u32, u32)], workers: usize, m: &mut Gmem, code: &mut Code) {
+        const CHUNK: usize = 8 * LANES;
+        let Some(binned) = self.cur.clone() else { return };
+        let mut want = vec![false; binned.draws.len()];
+        for &(tx, ty) in tiles {
+            if tx >= binned.tiles_x || ty >= binned.tiles_y { continue; }
+            for &pi in &binned.lists[(ty * binned.tiles_x + tx) as usize] { want[binned.prims[pi as usize].draw as usize] = true; }
+        }
+        {
+            let shared = self.vs_shared.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, w) in want.iter_mut().enumerate() { if shared.get(&(k as u32)).is_some_and(|c| c.get().is_some()) { *w = false; } }
+        }
+        let items: Vec<(usize, usize)> = want.iter().enumerate().filter(|(_, &w)| w)
+            .flat_map(|(k, _)| (0..binned.draws[k].verts.len().div_ceil(CHUNK)).map(move |c| (k, c))).collect();
+        if items.len() < 2 { return; }
+        let draws = &binned.draws;
+        let outs = crate::par::items(workers.min(items.len()), items.len(), m, code, &|k, i, wm, wc| {
+            let (draw, c) = items[i];
+            let d = &draws[draw];
+            let verts = &d.verts[c * CHUNK..((c + 1) * CHUNK).min(d.verts.len())];
+            let mut ins = 0;
+            let o = bin::run_vs(wm, wc, &mut ins, d, false, verts, 2 * k as u32 + 1);
+            (o, ins)
+        });
+        // items are in draw then chunk order: sorting by item puts each draw's chunks together
+        let mut outs = outs;
+        outs.sort_by_key(|o| o.0);
+        let mut shared = self.vs_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut k = 0;
+        while k < outs.len() {
+            let draw = items[outs[k].0].0;
+            let mut o = Vec::with_capacity(draws[draw].verts.len());
+            while k < outs.len() && items[outs[k].0].0 == draw {
+                self.insns += outs[k].1 .1;
+                o.append(&mut outs[k].1 .0);
+                k += 1;
+            }
+            let _ = shared.entry(draw as u32).or_default().set(Arc::new(VsOut::new(&draws[draw], o)));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_parallel(&mut self, tiles: &[(u32, u32)], workers: usize, m: &mut Gmem, code: &mut Code) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        self.shade_vertices(tiles, workers, m, code);
+        let next = AtomicUsize::new(0);
+        let n = tiles.len();
+        let outs: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers).map(|k| {
+                let (mut w, mut wm, mut wc) = (self.fork(), m.share(), code.clone());
+                w.worker = k as u32;
+                let next = &next;
+                s.spawn(move || {
+                    let mut last = None;
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n { break; }
+                        w.run_tile(tiles[i].0, tiles[i].1, &mut wm, &mut wc);
+                        if i == n - 1 { last = Some((w.tb.clone(), w.tile)); }
+                    }
+                    (w.occlusion, w.insns, wc.runaway, wm.faults, last)
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+        });
+        for (occlusion, insns, runaway, faults, last) in outs {
+            for (a, k) in occlusion { *self.occlusion.entry(a).or_default() += k; }
+            self.insns += insns;
+            code.runaway |= runaway;
+            m.faults += faults;
+            if let Some((tb, tile)) = last { self.tb = tb; self.tile = tile; }
+        }
+    }
+
+    /// A render worker: this job's state, its own tile buffer (a copy of the current one) and
+    /// shader thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fork(&self) -> Render<'r> {
+        Render {
+            binned: self.binned, cur: self.cur.clone(), width: self.width, height: self.height, msaa: self.msaa, nrt: self.nrt, rt: self.rt,
+            depth_type: self.depth_type, early_ds_clear: self.early_ds_clear, z_clear: self.z_clear, s_clear: self.s_clear,
+            tile_w: self.tile_w, tile_h: self.tile_h, tb: self.tb.clone(), tile: self.tile, generic: self.generic, supertile: self.supertile,
+            vs_cache: HashMap::new(), vs_shared: self.vs_shared.clone(), occlusion: HashMap::new(), insns: 0, thread: None, queue: Vec::new(), worker: 0,
         }
     }
 
@@ -356,23 +493,27 @@ impl Render<'_> {
         let list = &binned.lists[(ty * binned.tiles_x + tx) as usize];
         for &pi in list {
             let p = &binned.prims[pi as usize];
-            let d = binned.draws[p.draw as usize].clone();
+            let d = &binned.draws[p.draw as usize];
             let outs = match self.vs_cache.get(&p.draw) {
                 Some(o) => o.clone(),
                 None => {
+                    // the first worker to need a draw's vertices shades them; others wait for it
+                    let cell = self.vs_shared.lock().unwrap_or_else(|e| e.into_inner()).entry(p.draw).or_default().clone();
                     let mut ins = 0;
-                    let o = bin::run_vs(m, code, &mut ins, &d, false, &d.verts);
+                    let o = cell.get_or_init(|| {
+                        let o = bin::run_vs(m, code, &mut ins, d, false, &d.verts, 2 * self.worker + 1);
+                        if crate::log_enabled() {
+                            let row = |k: usize| o[k].iter().map(|v| format!("{:#x}/{}", v, f32::from_bits(*v))).collect::<Vec<_>>().join(" ");
+                            crate::log(&format!("v3d: draw {} VS out v0: {}", p.draw, row(0)));
+                        }
+                        Arc::new(VsOut::new(d, o))
+                    }).clone();
                     self.insns += ins;
-                    if crate::log_enabled() {
-                        let row = |k: usize| o[k].iter().map(|v| format!("{:#x}/{}", v, f32::from_bits(*v))).collect::<Vec<_>>().join(" ");
-                        crate::log(&format!("v3d: draw {} VS out v0: {}", p.draw, row(0)));
-                    }
-                    let o = Arc::new(VsOut::new(&d, o));
                     self.vs_cache.insert(p.draw, o.clone());
                     o
                 }
             };
-            self.draw_prim(&d, p, &outs, m, code);
+            self.draw_prim(d, p, &outs, m, code);
         }
     }
 
@@ -546,6 +687,7 @@ impl Render<'_> {
             let mut t = self.thread.take().unwrap_or_else(|| Box::new(Thread::new(0, 0, false)));
             t.reset(rec.fragment_shader_code_address, rec.fragment_shader_uniforms_address, rec.fragment_shader_start_in_final_thread_section);
             t.revf = p.reverse;
+            t.tidx = 2 * self.worker;
             let mut fe = FsEnv { r: self, d, geo, m, bary: [[0.0; 3]; LANES], z: [0.0; LANES], vary_n: 0, tlb_cfg: !0, rd: 0, pending: Vec::new(), spec: 0, need: 0,
                                  tile0: (tx0, ty0), passed: 0, prim: p };
             t.valid = 0;
