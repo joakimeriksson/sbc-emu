@@ -30,6 +30,9 @@ impl SerialBoard for Machine {
             self.exceptions,
             self.state
         );
+        if self.soc.i2s.frames > 0 || self.soc.i2s.underruns > 0 {
+            eprintln!("[{tag}] audio: {} frames played at {} Hz, {} underruns", self.soc.i2s.frames, self.soc.i2s.rate, self.soc.i2s.underruns);
+        }
         let frames: u64 = self.soc.vop.iter().map(|v| v.frames).sum();
         if frames > 0 {
             eprintln!("[{tag}] display: {frames} frames scanned out, {} DSI packets to the panel", self.soc.dsi.packets);
@@ -41,6 +44,13 @@ impl SerialBoard for Machine {
     }
     fn screen(&mut self) -> Option<&mut dyn Screen> {
         Some(self)
+    }
+    fn capture_audio(&mut self) -> bool {
+        self.soc.i2s.capture = true;
+        true
+    }
+    fn take_audio(&mut self) -> (u32, Vec<i16>) {
+        (self.soc.i2s.rate, std::mem::take(&mut self.soc.i2s.out))
     }
 }
 
@@ -124,7 +134,7 @@ pub(crate) fn run_board(args: &[String], profile: &Profile) -> ExitCode {
 
 fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let tag = profile.tag;
-    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc"];
+    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc", "--audio-out"];
     if profile.network.is_some() {
         options.push("--net");
     }

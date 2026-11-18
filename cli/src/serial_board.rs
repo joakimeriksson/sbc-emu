@@ -23,6 +23,41 @@ pub(crate) trait SerialBoard {
     fn screen(&mut self) -> Option<&mut dyn Screen> {
         None
     }
+    /// Start keeping what the board plays (for `--audio-out`); false: it has no audio.
+    fn capture_audio(&mut self) -> bool {
+        false
+    }
+    /// The samples played since the last call: the rate (Hz) and 16-bit stereo.
+    fn take_audio(&mut self) -> (u32, Vec<i16>) {
+        (0, Vec::new())
+    }
+}
+
+/// Where `--audio-out` goes: a WAV file, or raw 16-bit little-endian stereo for any other
+/// path (a named pipe for a live player such as `ffplay -f s16le -ar RATE -ch_layout stereo`).
+enum AudioOut {
+    Wav(crate::wav::Wav),
+    Raw(std::fs::File),
+}
+
+impl AudioOut {
+    fn open(path: &str) -> std::io::Result<Self> {
+        Ok(if path.ends_with(".wav") {
+            AudioOut::Wav(crate::wav::Wav::create(path)?)
+        } else {
+            AudioOut::Raw(std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?)
+        })
+    }
+
+    fn push(&mut self, rate: u32, samples: &[i16]) {
+        match self {
+            AudioOut::Wav(w) => w.push(rate, samples),
+            AudioOut::Raw(f) => {
+                let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                let _ = f.write_all(&bytes);
+            }
+        }
+    }
 }
 
 /// Save what the display shows as a PNG.
@@ -75,6 +110,8 @@ pub(crate) struct RunConfig {
     pub screenshot: Option<String>,
     /// VNC server for the display (`--vnc :N`).
     pub vnc: Option<String>,
+    /// What the board plays (`--audio-out FILE.wav`, or raw PCM to any other path).
+    pub audio_out: Option<String>,
 }
 
 impl RunConfig {
@@ -105,7 +142,8 @@ impl RunConfig {
             }
         }
         let (screenshot, vnc) = (arg(args, "--screenshot").map(str::to_owned), arg(args, "--vnc").map(str::to_owned));
-        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc })
+        let audio_out = arg(args, "--audio-out").map(str::to_owned);
+        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out })
     }
 }
 
@@ -129,6 +167,11 @@ pub(crate) fn run<B: SerialBoard>(
     let mut m = make_machine()?;
     let mut vnc = match config.vnc.as_deref() {
         Some(spec) => Some(Vnc::listen(spec).map_err(|e| format!("--vnc {spec}: {e}"))?),
+        None => None,
+    };
+    let mut audio = match config.audio_out.as_deref() {
+        Some(path) if m.capture_audio() => Some(AudioOut::open(path).map_err(|e| format!("--audio-out {path}: {e}"))?),
+        Some(_) => return Err("--audio-out: this board has no modelled audio output".into()),
         None => None,
     };
     let _terminal = crate::terminal::RawTty::enable();
@@ -266,6 +309,10 @@ pub(crate) fn run<B: SerialBoard>(
         }
         let budget = (config.max_insns - m.instret()).min(1_000_000);
         let stop = m.host().run(budget);
+        if let Some(a) = audio.as_mut() {
+            let (rate, samples) = m.take_audio();
+            a.push(rate, &samples);
+        }
         let bytes = m.host().take_serial_output();
         if !bytes.is_empty() {
             output.write_all(&bytes).map_err(|e| e.to_string())?;
@@ -295,6 +342,9 @@ pub(crate) fn run<B: SerialBoard>(
             }
             Stop::Reset => {
                 m = make_machine()?;
+                if audio.is_some() {
+                    m.capture_audio();
+                }
                 anchor = Instant::now();
                 serial.clear();
                 pending.clear();

@@ -113,6 +113,26 @@ impl Cru {
         OSC_HZ * nf / (nr * no)
     }
 
+    /// I2S0's MCLK as Linux computes it (`clk-rk3288.c`): `i2s_src` is CPLL or GPLL
+    /// (CLKSEL_CON4[15]) over CLKSEL_CON4[6:0] + 1; `i2s_frac` scales it by CLKSEL_CON8
+    /// (numerator << 16 | denominator); `i2s_pre` picks one (CLKSEL_CON4[9:8]: src, frac,
+    /// the external clock, 12 MHz). 0 for the external clock (not modelled).
+    pub fn i2s_mclk(&self) -> u64 {
+        let sel4 = self.regs[(clksel_con(4) / 4) as usize];
+        let pll = if sel4 >> 15 & 1 == 0 { 2 } else { 3 };
+        let src = self.pll_rate(pll) / (u64::from(sel4 & 0x7f) + 1);
+        match sel4 >> 8 & 3 {
+            0 => src,
+            1 => {
+                let frac = self.regs[(clksel_con(8) / 4) as usize];
+                let (num, den) = (u64::from(frac >> 16), u64::from(frac & 0xffff));
+                (src * num).checked_div(den).unwrap_or(0)
+            }
+            2 => 0,
+            _ => OSC_HZ / 2,
+        }
+    }
+
     /// PLLs that are powered (not in power-down) report lock.
     pub fn pll_locked(&self, pll: usize) -> bool {
         self.regs[pll * 4 + 3] & (1 << 1 | 1 << 5) == 0
