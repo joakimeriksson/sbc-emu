@@ -59,6 +59,26 @@ const SEA_ON_WALK: u32 = 0b010100;
 use crate::cpu::UT;
 
 impl Cpu {
+    /// Micro-TLB `k` (0 fetch, 1 load, 2 store) entry holding `tag` for `va`, moved to way 0
+    /// on a way-1 hit: its index, or None.
+    #[inline(always)]
+    pub(crate) fn utlb_hit(&mut self, k: usize, va: u64, tag: u64) -> Option<usize> {
+        let s = crate::cpu::uti(va);
+        let t = &mut self.utlb[k];
+        if t[s].0 == tag { return Some(s); }
+        if t[s + 1].0 == tag { t.swap(s, s + 1); return Some(s); }
+        None
+    }
+    /// Install `page` for `tag` in way 0 of `va`'s set (way 0's entry moves to way 1).
+    #[inline(always)]
+    pub(crate) fn utlb_fill(&mut self, k: usize, va: u64, tag: u64, page: u64) -> usize {
+        let s = crate::cpu::uti(va);
+        let t = &mut self.utlb[k];
+        t[s + 1] = t[s];
+        t[s] = (tag, page);
+        s
+    }
+
     pub fn tlb_flush(&mut self) {
         self.utlb = [[(0, 0); UT]; 3];
         self.tlb_blocks = [(u64::MAX, 0); 2];
@@ -76,8 +96,8 @@ impl Cpu {
         // inside a block that was cached page by page: the TLBI covers all of its pages
         let (lo, hi) = self.tlb_blocks[(va >> 55 & 1) as usize];
         if va >= lo && va < hi { return self.tlb_flush(); }
-        let u = (va >> 12) as usize & (UT - 1);
-        for t in self.utlb.iter_mut() { t[u] = (0, 0); }
+        let u = crate::cpu::uti(va);
+        for t in self.utlb.iter_mut() { t[u] = (0, 0); t[u + 1] = (0, 0); }
         if let Some(a) = self.a32.as_mut() { a.utlb_invalidate(va & ((1 << 56) - 1)); }
         if let Some(t) = self.tlb.as_mut() { t[(va >> 12) as usize & (TLB_SIZE - 1)].tag = 0; }
     }

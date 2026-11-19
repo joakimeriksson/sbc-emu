@@ -1,6 +1,6 @@
 //! A64 decode + execute, one instruction per call. Encodings follow the Arm ARM (DDI 0487)
 //! "A64 instruction set encoding" tables; group comments name the table.
-use crate::cpu::UT;
+
 use crate::cpu::{Cpu, Exc};
 use crate::mmu::Access;
 use emu_core::{Bus, Trap};
@@ -196,14 +196,16 @@ impl Cpu {
         if fast && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let el = if unpriv { 0 } else { self.el as u64 };
             let tag = ((va >> 12) + 1) | (el << 60);
-            let ti = (va >> 12) as usize & (UT - 1);
-            if self.utlb[1][ti].0 != tag {
-                let pa = self.pa(bus, va, if unpriv { Access::ReadUnpriv } else { Access::Read })?;
-                if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
-                    return self.load_slow(bus, va, size, unpriv);
+            let ti = match self.utlb_hit(1, va, tag) {
+                Some(t) => t,
+                None => {
+                    let pa = self.pa(bus, va, if unpriv { Access::ReadUnpriv } else { Access::Read })?;
+                    if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
+                        return self.load_slow(bus, va, size, unpriv);
+                    }
+                    self.utlb_fill(1, va, tag, pa & !0xfff)
                 }
-                self.utlb[1][ti] = (tag, pa & !0xfff);
-            }
+            };
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
             let p = unsafe { self.ram.add((self.utlb[1][ti].1 | (va & 0xfff)) as usize) };
             let v = unsafe {
@@ -273,14 +275,16 @@ impl Cpu {
         if fast && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let el = if unpriv { 0 } else { self.el as u64 };
             let tag = ((va >> 12) + 1) | (el << 60);
-            let ti = (va >> 12) as usize & (UT - 1);
-            if self.utlb[2][ti].0 != tag {
-                let pa = self.pa(bus, va, if unpriv { Access::WriteUnpriv } else { Access::Write })?;
-                if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
-                    return self.store_slow(bus, va, size, v, unpriv);
+            let ti = match self.utlb_hit(2, va, tag) {
+                Some(t) => t,
+                None => {
+                    let pa = self.pa(bus, va, if unpriv { Access::WriteUnpriv } else { Access::Write })?;
+                    if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
+                        return self.store_slow(bus, va, size, v, unpriv);
+                    }
+                    self.utlb_fill(2, va, tag, pa & !0xfff)
                 }
-                self.utlb[2][ti] = (tag, pa & !0xfff);
-            }
+            };
             if let Some(m) = self.excl() {
                 if m & !63 == va & !63 {
                     self.set_excl(None);
@@ -373,14 +377,13 @@ impl Cpu {
             return Err(self.sync_exception(Exc::PC_ALIGN, 0, pc, Some(pc)));
         }
         let tag = ((pc >> 12) + 1) | ((self.el as u64) << 60);
-        let ti = (pc >> 12) as usize & (UT - 1);
-        let insn = if self.utlb[0][ti].0 == tag {
+        let insn = if let Some(ti) = self.utlb_hit(0, pc, tag) {
             // SAFETY: the page was checked to lie inside guest RAM when the entry was filled
             unsafe { (self.ram.add((self.utlb[0][ti].1 | (pc & 0xfff)) as usize) as *const u32).read_unaligned() }
         } else {
             let pa = self.pa(bus, pc, Access::Exec)?;
             if !self.ram.is_null() && (pa | 0xfff) < self.ram_len {
-                self.utlb[0][ti] = (tag, pa & !0xfff);
+                self.utlb_fill(0, pc, tag, pa & !0xfff);
             }
             bus.fetch(pa).map_err(|_| self.abort(pc, false, 0x10, true))?
         };
