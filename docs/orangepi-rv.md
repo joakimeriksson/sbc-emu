@@ -7,19 +7,20 @@ an S7 monitor core, 4 GiB of LPDDR4, a microSD slot, SPI NOR, Gigabit Ethernet, 
 3.0 ports (a VL805 on PCIe), HDMI 2.0 and an M.2 slot. sbc-emu runs it on its own RV64
 interpreter (`riscv64/`, no QEMU) and SoC model (`starfive-jh7110/`). The CPU, the microSD
 card, Gigabit Ethernet, the four USB 3.0 ports (PCIe → VL805) with a keyboard, tablet and USB
-stick, an NVMe SSD in the M.2 slot, Wi-Fi (the AP6256 on SDIO), audio from the headphone jack's
-PWM DAC, and the HDMI output work. The GPU does not.
+stick, an NVMe SSD in the M.2 slot, Wi-Fi and Bluetooth (the AP6256), audio from the
+headphone jack's PWM DAC, and the HDMI output with HDMI audio work. The GPU does not.
 
 Two unmodified kernels boot on it:
 
 | Kernel | Device tree | Works |
 |---|---|---|
 | Alpine `linux-stable` 7.1.5 (mainline) | mainline `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, Wi-Fi (`brcmfmac`), audio, **HDMI** (the firmware's framebuffer under `simpledrm`), reboot/poweroff |
-| Xunlong's own kernel (`orangepi-xunlong/linux-orangepi`, branch `orange-pi-5.15-jh7110`, StarFive's 5.15 BSP), built with `orangepi-build`'s `linux-starfive2-current` config | its `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, audio, **HDMI** (DC8200 + Inno HDMI, fbcon) with the USB keyboard, RSA on the crypto engine |
+| Xunlong's own kernel (`orangepi-xunlong/linux-orangepi`, branch `orange-pi-5.15-jh7110`, StarFive's 5.15 BSP), built with `orangepi-build`'s `linux-starfive2-current` config | its `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, Wi-Fi (`bcmdhd`), Bluetooth, audio, **HDMI** (DC8200 + Inno HDMI, fbcon) with the USB keyboard, HDMI audio, RSA on the crypto engine |
 
 ```sh
 scripts/orangepi-rv-fixture.sh             # pinned Alpine downloads -> cache/orangepi-rv/
-scripts/orangepi-rv-vendor-kernel.sh       # Xunlong's kernel, built in Docker -> cache/orangepi-rv/vendor/
+scripts/orangepi-rv-vendor-kernel.sh       # Xunlong's kernel, built in Docker, and an initramfs with
+                                           # its Wi-Fi/Bluetooth modules -> cache/orangepi-rv/vendor/
 F=cache/orangepi-rv; V=$F/vendor
 # mainline
 sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $F/Image \
@@ -27,12 +28,13 @@ sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $F/Image \
 # the board's own kernel, with an SD card, a USB stick, Ethernet and the HDMI output on VNC :1
 # (the VNC keyboard and pointer are the USB keyboard and tablet)
 sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $V/Image \
-    --dtb $V/jh7110-orangepi-rv.dtb --initrd $F/initramfs.cpio.gz --sd card.img --usb-drive stick.img \
+    --dtb $V/jh7110-orangepi-rv.dtb --initrd $V/initramfs.cpio.gz --sd card.img --usb-drive stick.img \
     --append "console=tty0 console=ttyS0,115200 earlycon rdinit=/init" --vnc :1
 # --smp 1..4 (default 4), --ram-mb N (default 4096), --net nat|local|none (default nat),
 # --hdmi-mode 1280x720|1920x1080|640x480, --screenshot OUT.png, --sd-persist, --script FILE,
 # --usb-drive IMAGE (a USB stick), --nvme IMAGE (an NVMe SSD in the M.2 slot),
-# --audio-out FILE.wav (what the headphone jack plays; raw 16-bit stereo to any other path)
+# --audio-out FILE.wav (what the headphone jack or HDMI plays; raw 16-bit stereo to any other path)
+# SBC_NET_LOG=1 in the environment logs the NAT's DHCP, ARP, TCP and UDP relaying
 ```
 
 The boot is the board's own chain from the second stage on. On the board, the mask ROM
@@ -69,8 +71,10 @@ them with its own DRM driver.
 | Ethernet | GMAC0 (DWMAC 5.10a, stmmac + `dwmac-starfive`) and the Motorcomm YT8531C PHY on MDIO: `Link is Up - 1Gbps/Full`. On sbc-net's virtual network: a DHCP lease of 10.0.2.15, pings to the gateway, and an HTTP fetch from the host's network through the NAT. Works on both kernels | `scripts/orangepi-rv-net.txt`, `scripts/orangepi-rv-board.txt` |
 | USB 3.0 | PCIe0 (PLDA, `pcie-starfive`/`pcie_plda`) with the VL805 xHCI (`1106:3483`) signalling by MSI, as on the board. Both root hubs come up; a USB keyboard, tablet and `--usb-drive` stick enumerate. A key typed on the keyboard arrives as an input event. The stick's ext4 filesystem mounts, and a 2 MiB file written to it verifies after dropping the page cache. Works on both kernels | `scripts/orangepi-rv-usb.txt` |
 | M.2 NVMe | `--nvme IMAGE` puts an NVMe 1.4 SSD on PCIe1 (class 010802, MSI). The `nvme` driver brings up its admin and I/O queues; the 64 MiB ext4 drive mounts; a 4 MiB file written to it verifies after dropping the page cache. Works on both kernels | `scripts/orangepi-rv-nvme.txt` |
-| Wi-Fi | **mainline:** the AP6256's BCM43456 on SDIO0 (DW MMC with SDIO). `brcmfmac` loads the real `brcmfmac43456-sdio` firmware for `BCM4345/9`, and the emulated FullMAC host interface answers it (the radio and the proprietary firmware are not emulated). The scan finds the virtual access points `sbc-emu` and `sbc-emu-wpa2`; `iw connect` joins `sbc-emu`; DHCP 10.0.2.15 and ping over `wlan0` work. Xunlong's kernel uses Broadcom's out-of-tree `bcmdhd` module instead, which is not set up | `scripts/orangepi-rv-wifi.txt` |
+| Wi-Fi | **mainline:** the AP6256's BCM43456 on SDIO0 (DW MMC with SDIO). `brcmfmac` loads the real `brcmfmac43456-sdio` firmware for `BCM4345/9`, and the emulated FullMAC host interface answers it (the radio and the proprietary firmware are not emulated). The scan finds the virtual access points `sbc-emu` and `sbc-emu-wpa2`; `iw connect` joins `sbc-emu`; DHCP 10.0.2.15 and ping over `wlan0` work. **Xunlong's kernel:** Broadcom's `bcmdhd` (`CONFIG_BCMDHD_OOB`) downloads Xunlong's `fw_bcm43456c5_ag.bin` and `nvram_ap6256.txt` and takes its interrupts on the out-of-band WL_HOST_WAKE line (GPIO21 through the GPIO interrupt controller); the same scan, join, DHCP and ping work | `scripts/orangepi-rv-wifi.txt` |
+| Bluetooth | **Xunlong's kernel:** the AP6256's BCM4345C5 as an HCI controller on UART1 (H4). Xunlong's DT has no serdev node for it, so `hciattach /dev/ttyS1 any` attaches it as on the board's images; `hciconfig hci0 up` brings it to `UP RUNNING` with its name and address, and an LE scan (`hcitool lescan`) finds the virtual peripheral `sbc-emu sensor`. Mainline's DT leaves UART1 disabled | `scripts/orangepi-rv-bluetooth.txt` |
 | Audio | The PWM DAC fed by the AXI DMA controller: Linux's `jh7110_pwmdac` with `dw-axi-dmac` cyclic DMA and simple-audio-card (`StarFive-PWMDAC-Sound-Card`). `speaker-test -t sine -f 440` at 48 kHz reaches `--audio-out` as a 440.0 Hz sine of the right length, on the left channel (`-s 1`). Works on both kernels | `scripts/orangepi-rv-audio.txt` |
+| HDMI audio | **Xunlong's kernel:** I2STX_4CH0 (DesignWare I2S) fed by the AXI DMA controller into the Inno HDMI: `Starfive-HDMI-Sound-Card`. `speaker-test -D hw:1,0 -t sine -f 440` at 48 kHz reaches `--audio-out` as a 440 Hz sine; the I2S paces the DMA at the rate its clock dividers give | `scripts/orangepi-rv-hdmi-audio.txt` |
 | HDMI (mainline) | The firmware framebuffer under `simpledrm`: `fb0` at 1280x720 with fbcon. The whole board on mainline in one run, about 45 s wall: microSD read/write; Ethernet with DHCP, ping and HTTP; the USB stick; the HDMI console, where a shell on `tty1` runs a command typed on the USB keyboard | `scripts/orangepi-rv-board-mainline.txt` |
 | HDMI | **Xunlong's kernel:** StarFive's DRM driver binds the DC8200 and the Inno HDMI. The connector is `connected`, with the monitor's EDID offering 1280x720, 1920x1080 and 640x480. The HDMI PHY is programmed for 74.25 MHz; `fb0` carries the kernel console (160x45) at 1280x720 with vblank interrupts. Output goes to VNC (`--vnc :N`), `--screenshot` and the script's `screenshot FILE` | `scripts/orangepi-rv-hdmi.txt`, `scripts/orangepi-rv-board.txt` |
 | Board devices | Xunlong's kernel: the AXP15060 regulators (`hdmi_1p8`, `hdmi_0p9`, `vcc_3v3`, `cpu_vdd`, …) on I2C5; the 24C04 board EEPROM; the temperature sensor; the crypto engine's PKA, which verifies the kernel's X.509 certificates with RSA | `scripts/orangepi-rv-board.txt` |
@@ -95,7 +99,8 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - The clock/reset generators, with Linux's reset-status semantics.
   - The PLL syscon.
   - The power-management unit's domains.
-  - The board's GPIO35 restart line and GPIO41 card detect.
+  - The system GPIO block's interrupt controller (level and edge, per-pin enables), with the board's GPIO35 restart line, GPIO41 card detect and GPIO21 Wi-Fi host wake as inputs.
+  - UART1 with the AP6256's Bluetooth controller (`bluetooth.rs`, adapted from the Raspberry Pi 4's CYW43455 model): HCI over H4, Broadcom vendor commands, one virtual LE peripheral that advertises every 100 ms. No connections.
 - **`dwmmc.rs`:** the two DesignWare MMC hosts, adapted from the RK3288 model.
 - **`gmac.rs`:** GMAC0/GMAC1 (DWMAC4 descriptors, one DMA channel, no offloads advertised) and the YT8531C PHY (RGMII LDO strapped to 1.8 V, as the board's DT drive strengths need). GMAC1 has no PHY, as on the board.
 - **`i2c.rs`:** the seven DesignWare I²C controllers, used polled by OpenSBI and with interrupts by Linux. I2C5 carries the AXP15060 PMIC and the 24C04 EEPROM.
@@ -108,10 +113,11 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - PCIe1 is the M.2 slot: empty, or `nvme.rs`. That is an NVMe controller with admin and I/O queues, PRP lists, Identify/queue/feature/log commands, Read/Write/Flush/Write Zeroes/DSM, and one namespace of 512-byte blocks on a copy-on-write image.
 - **`sdio.rs`, `wifi.rs`:**
   - SDIO in the DW MMC model: CMD5/3/7, CMD52, CMD53 through the IDMAC or the FIFO, and the card interrupt as RINTSTS bit 16.
-  - The BCM43456, adapted from the Raspberry Pi 4's CYW43455 model: chip revision 9, SDIO ID `02d0:4345`. The access point's network is isolated (DHCP, DNS, local services), as on the Pi.
+  - The BCM43456, adapted from the Raspberry Pi 4's CYW43455 model: chip revision 9, SDIO ID `02d0:4345`. It answers both `brcmfmac` and `bcmdhd` (their extra iovars, the two-byte event pad, scan results that arrive after the request's reply), and raises its interrupt on DAT[1] or on the WL_HOST_WAKE pin. The access point's network is isolated (DHCP, DNS, local services), as on the Pi.
 - **`audio.rs`:**
   - The DesignWare AXI DMA controller: four channels with linked-list blocks. A block marked LLI_LAST stops the channel with DMA_TRF; the next block comes from CH_LLP. Memory-to-memory transfers complete at once.
   - The PWM DAC: transfers to it are paced by its sample rate, computed from the SYSCRG dividers and CNT_N.
+  - I2STX_4CH0, the DesignWare I2S that feeds the Inno HDMI: paced by MCLK over its dividers and the word length.
 - **`crypto.rs`:** the security engine's PKA, a Montgomery engine running the vendor driver's RSA sequence. The AES and SHA engines are not modelled.
 - **Other devices:**
   - The temperature sensor.
@@ -123,10 +129,10 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 ## Not working yet
 
 - **USB 2.0:** the SoC's own USB 2.0/OTG controller (Cadence, the board's USB-C data role) is not modelled. The devices are emulated: a keyboard, a tablet and a USB stick (`--usb-drive`; a guest reboot starts again from the image).
-- **Wi-Fi with Xunlong's kernel:** its `bcmdhd` module and firmware are not in the initramfs. Bluetooth (the AP6256's UART half) is not modelled.
+- **Bluetooth on mainline:** mainline's DT leaves UART1 disabled and has no Bluetooth node. Bluetooth connections (ACL) are not modelled.
 - **Not modelled:**
   - the PowerVR GPU (Xunlong's kernel loads no firmware, and the driver gives up);
-  - HDMI audio (I2S into the Inno HDMI), MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
+  - MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
 - **Mainline HDMI:** only the firmware's fixed-mode framebuffer is available (no mode setting, no hot-plug). Mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
 - **Firmware:** no mask ROM, U-Boot SPL or U-Boot. Mainline U-Boot recognises the board (EEPROM product ID `XOPIRV`, since 2026.07) and would need the DDR controller, QSPI/SD boot and the EEPROM contents.
 - **Distribution images:** Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried. The kernel they use is the one built here.

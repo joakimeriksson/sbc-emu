@@ -3,7 +3,7 @@
 //! would load them.
 use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use sbc_machine::Machine as HostMachine;
-use starfive_jh7110::{boot, display::{Display, Mode}, HartState, Machine};
+use starfive_jh7110::{boot, display::{Display, Mode}, AudioSource, HartState, Machine};
 use std::process::ExitCode;
 
 impl SerialBoard for Machine {
@@ -20,11 +20,28 @@ impl SerialBoard for Machine {
         Some(self)
     }
     fn capture_audio(&mut self) -> bool {
-        self.soc.pwmdac.capture = true;
+        self.soc.pwmdac.capture.on = true;
+        self.soc.i2s.capture.on = true;
         true
     }
+    /// What one output plays: the first of the headphone jack (PWM DAC) and HDMI (I2S) to
+    /// produce samples is recorded for the rest of the run; the other's samples are dropped
+    /// (one WAV file holds one stream at one rate).
     fn take_audio(&mut self) -> (u32, Vec<i16>) {
-        (self.soc.pwmdac.rate, std::mem::take(&mut self.soc.pwmdac.samples))
+        let soc = &mut self.soc;
+        if soc.audio_source.is_none() {
+            if !soc.pwmdac.capture.samples.is_empty() {
+                soc.audio_source = Some(AudioSource::Dac);
+            } else if !soc.i2s.capture.samples.is_empty() {
+                soc.audio_source = Some(AudioSource::Hdmi);
+            }
+        }
+        let (keep, drop) = match soc.audio_source {
+            Some(AudioSource::Hdmi) => (&mut soc.i2s.capture, &mut soc.pwmdac.capture),
+            _ => (&mut soc.pwmdac.capture, &mut soc.i2s.capture),
+        };
+        drop.samples.clear();
+        (keep.rate, std::mem::take(&mut keep.samples))
     }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);
@@ -48,8 +65,11 @@ impl SerialBoard for Machine {
         if let Some(n) = self.soc.pcie[1].nvme.as_ref() {
             eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes; PCIe1: {} MSIs", n.reads, n.writes, self.soc.pcie[1].msis);
         }
-        if self.soc.pwmdac.frames > 0 {
-            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
+        if self.soc.pwmdac.capture.frames > 0 {
+            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.capture.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
+        }
+        if self.soc.i2s.capture.frames > 0 {
+            eprintln!("[{tag}] audio (HDMI, I2S): {} frames at {} Hz", self.soc.i2s.capture.frames, self.soc.i2s_rate());
         }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
@@ -162,7 +182,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             m.soc.attach_nvme(Box::new(d));
         }
         if net != "none" {
-            m.connect_network(net == "nat", false);
+            m.connect_network(net == "nat", std::env::var_os("SBC_NET_LOG").is_some());
         }
         m.soc.sdio1.insert(disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>));
         m.soc.display = Display::new(mode);
@@ -180,7 +200,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi (AP6256), audio (PWM DAC, --audio-out), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }

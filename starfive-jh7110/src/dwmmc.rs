@@ -387,6 +387,11 @@ impl DwMmc {
         }
     }
 
+    /// When the SDIO card next acts on its own (ns; `u64::MAX` for never).
+    pub fn next_event(&self) -> u64 {
+        self.sdio.as_ref().and_then(|c| c.next_event()).unwrap_or(u64::MAX)
+    }
+
     /// CMD12 sent by the controller after the data (SEND_STOP).
     fn auto_stop(&mut self) {
         if let Some(Response::Short(word)) = self.card.command(12, 0).response {
