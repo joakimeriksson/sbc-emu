@@ -7,15 +7,15 @@ an S7 monitor core, 4 GiB of LPDDR4, a microSD slot, SPI NOR, Gigabit Ethernet, 
 3.0 ports (a VL805 on PCIe), HDMI 2.0 and an M.2 slot. sbc-emu runs it on its own RV64
 interpreter (`riscv64/`, no QEMU) and SoC model (`starfive-jh7110/`). The CPU, the microSD
 card, Gigabit Ethernet, the four USB 3.0 ports (PCIe → VL805) with a keyboard, tablet and USB
-stick, an NVMe SSD in the M.2 slot, Wi-Fi (the AP6256 on SDIO) and the HDMI output work. The
-GPU and audio do not.
+stick, an NVMe SSD in the M.2 slot, Wi-Fi (the AP6256 on SDIO), audio from the headphone jack's
+PWM DAC, and the HDMI output work. The GPU does not.
 
 Two unmodified kernels boot on it:
 
 | Kernel | Device tree | Works |
 |---|---|---|
-| Alpine `linux-stable` 7.1.5 (mainline) | mainline `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, Wi-Fi (`brcmfmac`), reboot/poweroff. No HDMI: mainline has no JH7110 display driver or DT nodes yet |
-| Xunlong's own kernel (`orangepi-xunlong/linux-orangepi`, branch `orange-pi-5.15-jh7110`, StarFive's 5.15 BSP), built with `orangepi-build`'s `linux-starfive2-current` config | its `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, **HDMI** (DC8200 + Inno HDMI, fbcon) with the USB keyboard, RSA on the crypto engine |
+| Alpine `linux-stable` 7.1.5 (mainline) | mainline `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, Wi-Fi (`brcmfmac`), audio, reboot/poweroff. No HDMI: mainline has no JH7110 display driver or DT nodes yet |
+| Xunlong's own kernel (`orangepi-xunlong/linux-orangepi`, branch `orange-pi-5.15-jh7110`, StarFive's 5.15 BSP), built with `orangepi-build`'s `linux-starfive2-current` config | its `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, audio, **HDMI** (DC8200 + Inno HDMI, fbcon) with the USB keyboard, RSA on the crypto engine |
 
 ```sh
 scripts/orangepi-rv-fixture.sh             # pinned Alpine downloads -> cache/orangepi-rv/
@@ -31,7 +31,8 @@ sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $V/Image \
     --append "console=tty0 console=ttyS0,115200 earlycon rdinit=/init" --vnc :1
 # --smp 1..4 (default 4), --ram-mb N (default 4096), --net nat|local|none (default nat),
 # --hdmi-mode 1280x720|1920x1080|640x480, --screenshot OUT.png, --sd-persist, --script FILE,
-# --usb-drive IMAGE (a USB stick), --nvme IMAGE (an NVMe SSD in the M.2 slot)
+# --usb-drive IMAGE (a USB stick), --nvme IMAGE (an NVMe SSD in the M.2 slot),
+# --audio-out FILE.wav (what the headphone jack plays; raw 16-bit stereo to any other path)
 ```
 
 The boot is the board's own chain from the second stage on. On the board, the mask ROM
@@ -59,6 +60,7 @@ console and system reset.
 | USB 3.0 | PCIe0 (PLDA, `pcie-starfive`/`pcie_plda`) with the VL805 xHCI (`1106:3483`) signalling by MSI, as on the board. Both root hubs come up; a USB keyboard, tablet and `--usb-drive` stick enumerate. A key typed on the keyboard arrives as an input event. The stick's ext4 filesystem mounts, and a 2 MiB file written to it verifies after dropping the page cache. Works on both kernels | `scripts/orangepi-rv-usb.txt` |
 | M.2 NVMe | `--nvme IMAGE` puts an NVMe 1.4 SSD on PCIe1 (class 010802, MSI). The `nvme` driver brings up its admin and I/O queues; the 64 MiB ext4 drive mounts; a 4 MiB file written to it verifies after dropping the page cache. Works on both kernels | `scripts/orangepi-rv-nvme.txt` |
 | Wi-Fi | **mainline:** the AP6256's BCM43456 on SDIO0 (DW MMC with SDIO). `brcmfmac` loads the real `brcmfmac43456-sdio` firmware for `BCM4345/9`, and the emulated FullMAC host interface answers it (the radio and the proprietary firmware are not emulated). The scan finds the virtual access points `sbc-emu` and `sbc-emu-wpa2`; `iw connect` joins `sbc-emu`; DHCP 10.0.2.15 and ping over `wlan0` work. Xunlong's kernel uses Broadcom's out-of-tree `bcmdhd` module instead, which is not set up | `scripts/orangepi-rv-wifi.txt` |
+| Audio | The PWM DAC fed by the AXI DMA controller: Linux's `jh7110_pwmdac` with `dw-axi-dmac` cyclic DMA and simple-audio-card (`StarFive-PWMDAC-Sound-Card`). `speaker-test -t sine -f 440` at 48 kHz reaches `--audio-out` as a 440.0 Hz sine of the right length, on the left channel (`-s 1`). Works on both kernels | `scripts/orangepi-rv-audio.txt` |
 | HDMI | **Xunlong's kernel:** StarFive's DRM driver binds the DC8200 and the Inno HDMI. The connector is `connected`, with the monitor's EDID offering 1280x720, 1920x1080 and 640x480. The HDMI PHY is programmed for 74.25 MHz; `fb0` carries the kernel console (160x45) at 1280x720 with vblank interrupts. Output goes to VNC (`--vnc :N`), `--screenshot` and the script's `screenshot FILE` | `scripts/orangepi-rv-hdmi.txt`, `scripts/orangepi-rv-board.txt` |
 | Board devices | Xunlong's kernel: the AXP15060 regulators (`hdmi_1p8`, `hdmi_0p9`, `vcc_3v3`, `cpu_vdd`, …) on I2C5; the 24C04 board EEPROM; the temperature sensor; the crypto engine's PKA, which verifies the kernel's X.509 certificates with RSA | `scripts/orangepi-rv-board.txt` |
 
@@ -96,6 +98,9 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 - **`sdio.rs`, `wifi.rs`:**
   - SDIO in the DW MMC model: CMD5/3/7, CMD52, CMD53 through the IDMAC or the FIFO, and the card interrupt as RINTSTS bit 16.
   - The BCM43456, adapted from the Raspberry Pi 4's CYW43455 model: chip revision 9, SDIO ID `02d0:4345`. The access point's network is isolated (DHCP, DNS, local services), as on the Pi.
+- **`audio.rs`:**
+  - The DesignWare AXI DMA controller: four channels with linked-list blocks. A block marked LLI_LAST stops the channel with DMA_TRF; the next block comes from CH_LLP. Memory-to-memory transfers complete at once.
+  - The PWM DAC: transfers to it are paced by its sample rate, computed from the SYSCRG dividers and CNT_N.
 - **`crypto.rs`:** the security engine's PKA, a Montgomery engine running the vendor driver's RSA sequence. The AES and SHA engines are not modelled.
 - **Other devices:**
   - The temperature sensor.
@@ -110,7 +115,7 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 - **Wi-Fi with Xunlong's kernel:** its `bcmdhd` module and firmware are not in the initramfs. Bluetooth (the AP6256's UART half) is not modelled.
 - **Not modelled:**
   - the PowerVR GPU (Xunlong's kernel loads no firmware, and the driver gives up);
-  - audio, MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
+  - HDMI audio (I2S into the Inno HDMI), MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
 - **Mainline HDMI:** the mainline kernel has no HDMI output, because mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
 - **Firmware:** no mask ROM, U-Boot SPL or U-Boot. Mainline U-Boot recognises the board (EEPROM product ID `XOPIRV`, since 2026.07) and would need the DDR controller, QSPI/SD boot and the EEPROM contents.
 - **Distribution images:** Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried. The kernel they use is the one built here.

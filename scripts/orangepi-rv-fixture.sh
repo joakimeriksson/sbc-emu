@@ -5,7 +5,8 @@
 #   OUT/jh7110-orangepi-rv.dtb      the matching mainline device tree, unmodified
 #   OUT/fw_dynamic.bin              Alpine opensbi, generic platform, FW_DYNAMIC firmware
 #   OUT/initramfs.cpio.gz           Alpine riscv64 minirootfs + a serial-shell /init, with the
-#                                   SD/Ethernet/USB HID/Wi-Fi modules, the BCM43456 firmware and iw
+#                                   SD/Ethernet/USB HID/Wi-Fi/audio modules, the BCM43456 firmware,
+#                                   iw, aplay and speaker-test
 # Usage: scripts/orangepi-rv-fixture.sh [OUT]   (default cache/orangepi-rv)
 # Downloads are verified against SHA-256; Alpine eventually removes superseded
 # package versions, so update the pins together.
@@ -30,6 +31,10 @@ IW_APK=iw-6.17-r0.apk
 IW_SHA=14b204e41395781f49edfd26982ed18aa58ecf23e3c78cfe1b38b9372d6ad6a6
 LIBNL_APK=libnl3-3.11.0-r0.apk
 LIBNL_SHA=9f768fa96f6b282e62322c4769fadb587afc71d37ab3df65af2e90e492237268
+ALSALIB_APK=alsa-lib-1.2.15.3-r0.apk
+ALSALIB_SHA=095540647f4bd4c5c70abeb68e242f3c285857e84ecfc3788d8b0b41bd1580e3
+ALSAUTILS_APK=alsa-utils-1.2.15.2-r1.apk
+ALSAUTILS_SHA=88f905da0d555f26231c52b3a17b9fe5d4db1f95f7683000bb0b3ad0429d08a8
 OPENSBI_APK=opensbi-1.8.1-r0.apk
 OPENSBI_URL=$MIRROR/v3.24/main/riscv64/$OPENSBI_APK
 OPENSBI_SHA=b1086a0b5d1b18249db6df7df31e97cbdab90886ee465e1c429f8ad8cac47664
@@ -56,6 +61,8 @@ fetch "$OPENSBI_APK" "$OPENSBI_URL" "$OPENSBI_SHA"
 fetch "$FIRMWARE_APK" "$FIRMWARE_URL" "$FIRMWARE_SHA"
 fetch "$IW_APK" "$MIRROR/v3.24/main/riscv64/$IW_APK" "$IW_SHA"
 fetch "$LIBNL_APK" "$MIRROR/v3.24/main/riscv64/$LIBNL_APK" "$LIBNL_SHA"
+fetch "$ALSALIB_APK" "$MIRROR/v3.24/main/riscv64/$ALSALIB_APK" "$ALSALIB_SHA"
+fetch "$ALSAUTILS_APK" "$MIRROR/v3.24/main/riscv64/$ALSAUTILS_APK" "$ALSAUTILS_SHA"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -106,7 +113,11 @@ tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
     'lib/modules/*/kernel/drivers/net/wireless/broadcom/brcm80211/*' 'lib/modules/*/kernel/net/wireless/*' \
     'lib/modules/*/kernel/drivers/i2c/busses/i2c-designware-*' 'lib/modules/*/kernel/drivers/mfd/axp20x*' \
     'lib/modules/*/kernel/drivers/regulator/axp20x-regulator.ko.gz' 'lib/modules/*/kernel/drivers/mmc/core/*' \
-    'lib/modules/*/kernel/drivers/regulator/fixed.ko.gz' 'lib/modules/*/kernel/net/rfkill/*'
+    'lib/modules/*/kernel/drivers/regulator/fixed.ko.gz' 'lib/modules/*/kernel/net/rfkill/*' \
+    'lib/modules/*/kernel/sound/*'
+# ALSA: aplay and speaker-test for the PWM DAC (headphone jack)
+tar -xzf "$OUT/downloads/$ALSALIB_APK" -C "$work/rootfs" $wildcards 'usr/lib/*' 'usr/share/alsa/*'
+tar -xzf "$OUT/downloads/$ALSAUTILS_APK" -C "$work/rootfs" usr/bin/aplay usr/bin/speaker-test
 # iw (and libnl) to scan for and join the virtual access point
 tar -xzf "$OUT/downloads/$IW_APK" -C "$work/rootfs" usr/sbin/iw
 tar -xzf "$OUT/downloads/$LIBNL_APK" -C "$work/rootfs" $wildcards 'usr/lib/*'
@@ -134,6 +145,8 @@ modprobe usbhid 2>/dev/null; modprobe hid-generic 2>/dev/null; modprobe evdev 2>
 modprobe fixed 2>/dev/null; modprobe i2c-designware-platform 2>/dev/null; modprobe axp20x-i2c 2>/dev/null
 modprobe axp20x-regulator 2>/dev/null
 modprobe pwrseq_simple 2>/dev/null; modprobe brcmfmac 2>/dev/null
+# audio: the PWM DAC, its dummy S/PDIF codec and the simple sound card
+modprobe jh7110_pwmdac 2>/dev/null; modprobe snd-soc-spdif-tx 2>/dev/null; modprobe snd-soc-simple-card 2>/dev/null
 echo "JH7110_BOOT_OK: RV64 Linux BusyBox shell"
 # setsid -c makes the console the shell's controlling terminal (job control, ^C).
 exec /bin/busybox setsid -c /bin/sh

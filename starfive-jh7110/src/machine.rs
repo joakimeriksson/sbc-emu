@@ -3,6 +3,7 @@
 //! time.
 use crate::devices::{sys_syscon, Clint, Crg, Plic, Pmu, Regs, TempSensor, HARTS};
 use crate::i2c::{At24c04, Axp15060, DwI2c, PowerRequest};
+use crate::audio::{AxiDmac, Pwmdac, DMA_BASE, DMA_SIZE, IRQ_DMA, PWMDAC_BASE, PWMDAC_SIZE};
 use crate::crypto::Sec;
 use crate::display::{Display, Mode, DC_BASE, DC_SIZE, HDMI_BASE, HDMI_SIZE, IRQ_DC, IRQ_HDMI};
 use crate::dwmmc::DwMmc;
@@ -98,6 +99,9 @@ pub struct Soc {
     pub i2c: Vec<DwI2c>,
     /// SDIO0 (the Wi-Fi module's slot, empty here) and SDIO1 (the microSD slot)
     pub sec: Sec,
+    /// the AXI DMA controller and the PWM DAC (the board's audio output)
+    pub dmac: AxiDmac,
+    pub pwmdac: Pwmdac,
     /// PCIe0 (the VL805 USB 3.0 controller) and PCIe1 (the empty M.2 slot)
     pub pcie: [Port; 2],
     /// the USB devices: keyboard and tablet on the VL805's ports, an optional USB drive
@@ -156,6 +160,8 @@ impl Soc {
             stubs: BTreeMap::new(),
             gpio_reset: false,
             sec: Sec::default(),
+            dmac: AxiDmac::default(),
+            pwmdac: Pwmdac::default(),
             pcie: [
                 {
                     let mut p = Port::new(0x2b00_0000, 0x9_4000_0000, 56, true);
@@ -202,6 +208,8 @@ impl Soc {
         self.plic.set_level(IRQ_SDIO1, m1);
         let c = self.sec.irq();
         self.plic.set_level(IRQ_SEC, c);
+        let d = self.dmac.irq();
+        self.plic.set_level(IRQ_DMA, d);
         let (dc, hdmi) = (self.display.irq(), self.display.hdmi_irq());
         self.plic.set_level(IRQ_DC, dc);
         self.plic.set_level(IRQ_HDMI, hdmi);
@@ -241,6 +249,23 @@ impl Soc {
         if let Some(x) = self.pcie[0].xhci.as_mut() {
             x.attach(&[DevId::Keyboard, DevId::Tablet, DevId::Storage]);
         }
+    }
+
+    /// The PWM DAC's sample rate, from the SYSCRG's audio_root and pwmdac_core dividers
+    /// (PLL2 at 1188 MHz) and the DAC's CNT_N.
+    pub fn sample_rate(&self) -> u32 {
+        let div = |index: u64| self.syscrg.read(4 * index) & 0xff_ffff;
+        crate::audio::sample_rate(1_188_000_000, div(16), div(158), (self.pwmdac.read(4) >> 4) & 0x1ff)
+    }
+
+    /// Move audio samples due by now into the DAC; returns the next audio deadline.
+    pub fn audio_tick(&mut self) -> u64 {
+        let rate = self.sample_rate();
+        let next = self.dmac.update(self.now, &mut self.ram.mem, RAM_BASE, &mut self.pwmdac, rate);
+        if self.dmac.irq() {
+            self.update_devices();
+        }
+        next.unwrap_or(u64::MAX)
     }
 
     /// The HDMI picture as RGBA.
@@ -361,6 +386,8 @@ impl Soc {
             }
             _ if self.sdio0.contains(a) => r32(self.sdio0.read(a - SDIO0)),
             _ if (SEC..SEC + 0x4000).contains(&a) => r32(self.sec.read(a - SEC)),
+            _ if (DMA_BASE..DMA_BASE + DMA_SIZE).contains(&a) => r32(self.dmac.read(a - DMA_BASE)),
+            _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => r32(self.pwmdac.read(a - PWMDAC_BASE)),
             _ if (TEMP..TEMP + 0x10000).contains(&a) => r32(self.temp.read(a - TEMP)),
             _ if (GMAC0..GMAC0 + 0x10000).contains(&a) => r32(self.gmac0.read(a - GMAC0)),
             _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
@@ -453,6 +480,16 @@ impl Soc {
                 self.sdio1.write(a - SDIO1, v32, &mut self.ram);
                 self.update_devices();
                 self.irq_dirty = true;
+            }
+            _ if (DMA_BASE..DMA_BASE + DMA_SIZE).contains(&a) => {
+                let rate = self.sample_rate();
+                self.dmac.write(a - DMA_BASE, v32, &mut self.ram.mem, RAM_BASE, &mut self.pwmdac, rate);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => {
+                let rate = self.sample_rate();
+                self.pwmdac.write(a - PWMDAC_BASE, v32, rate);
             }
             _ if (TEMP..TEMP + 0x10000).contains(&a) => {
                 if self.temp.write(a - TEMP, v32) {
@@ -674,8 +711,9 @@ impl Machine {
             }
             let vblank = self.soc.display.update(self.soc.now).unwrap_or(u64::MAX);
             let usb = self.soc.usb_tick();
+            let audio = self.soc.audio_tick();
             if ran == 0 {
-                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb));
+                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb).min(audio));
             }
             self.soc.now += ran;
             left = left.saturating_sub(ran);

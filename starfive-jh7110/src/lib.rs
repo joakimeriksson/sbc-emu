@@ -2,6 +2,7 @@
 //! the CLINT and PLIC, UART0 (DesignWare 8250), the clock/reset generators and PLL syscon
 //! Linux's clock drivers need, read-back stand-ins for other device pages, and a direct
 //! boot through OpenSBI (`fw_dynamic`) as the board's U-Boot SPL starts it.
+pub mod audio;
 pub mod boot;
 pub mod crypto;
 pub mod devices;

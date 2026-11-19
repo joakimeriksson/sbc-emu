@@ -19,6 +19,13 @@ impl SerialBoard for Machine {
     fn screen(&mut self) -> Option<&mut dyn Screen> {
         Some(self)
     }
+    fn capture_audio(&mut self) -> bool {
+        self.soc.pwmdac.capture = true;
+        true
+    }
+    fn take_audio(&mut self) -> (u32, Vec<i16>) {
+        (self.soc.pwmdac.rate, std::mem::take(&mut self.soc.pwmdac.samples))
+    }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);
         for (h, hart) in self.harts.iter().enumerate() {
@@ -40,6 +47,9 @@ impl SerialBoard for Machine {
         }
         if let Some(n) = self.soc.pcie[1].nvme.as_ref() {
             eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes; PCIe1: {} MSIs", n.reads, n.writes, self.soc.pcie[1].msis);
+        }
+        if self.soc.pwmdac.frames > 0 {
+            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
         }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
@@ -107,7 +117,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             checked.push(a.clone());
         }
     }
-    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme"])?;
+    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme", "--audio-out"])?;
     let mode = match arg(args, "--hdmi-mode") {
         Some(spec) => {
             let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
@@ -169,7 +179,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi (AP6256), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi (AP6256), audio (PWM DAC, --audio-out), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }

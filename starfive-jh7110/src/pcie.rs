@@ -110,13 +110,12 @@ impl Port {
             return;
         }
         let level = self.xhci.as_ref().is_some_and(|x| x.irq());
-        if level && self.msi_enabled() {
-            if self.send_msi() {
+        if level && self.msi_enabled()
+            && self.send_msi() {
                 if let Some(x) = self.xhci.as_mut() {
                     x.msi_sent();
                 }
             }
-        }
         self.last_level = self.xhci.as_ref().is_some_and(|x| x.irq());
     }
 

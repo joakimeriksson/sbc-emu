@@ -254,6 +254,7 @@ impl Nvme {
         true
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_guest(&self, cmd: &[u8], len: usize, ram: &[u8], base: u64) -> Option<Vec<u8>> {
         let mut data = Vec::with_capacity(len);
         for (a, n) in self.prps(cmd, len, ram, base)? {
