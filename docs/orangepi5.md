@@ -1,6 +1,12 @@
 # Orange Pi 5 experimental direct boot
 
-The `orangepi5` board models one reduced Cortex-A55, the RK3588S GICv3 distributor and redistributor, UART2 and the 24 MHz timer. Firmware services are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. USB, graphics, wireless, snapshots and the remaining seven CPU cores are not implemented. The advertised CPU features are limited to what the emulator implements.
+The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. USB, display output, wireless and snapshots are not implemented.
+
+## Cores
+
+`--smp N` (1..8, default 8) starts the first N cores: cores 0..3 are the Cortex-A55s (MPIDR 0x000..0x300, MIDR `0x412fd050`), cores 4..7 the Cortex-A76s (MPIDR 0x400..0x700, MIDR `0x414fd0b0`). Linux starts the secondary cores with PSCI CPU_ON. The device tree describes them as the mainline `rk3588s.dtsi` does: `capacity-dmips-mhz` 530/1024, fixed 1.8/2.4 GHz clocks and a `cpu-map` with the A55 cluster and two A76 pairs, so the scheduler sees the A76s as the big cores (capacity 1024 against 397). The GIC routes SPIs by affinity (or to any core with IRM) and delivers SGIs from `ICC_SGI1R_EL1` to their target cores.
+
+The cores take turns on one host thread in rounds of 20 µs of virtual time, as on the Raspberry Pi 4 board, so runs are repeatable. The Armbian image reaches its login prompt in about 7.8 s of guest time on eight cores (37 s wall on an M-series Mac), against 15.2 s guest and 25 s wall on one core. `scripts/orangepi5-smp.txt` (Armbian, `--append init=/bin/bash`) checks the core count, the part numbers, work pinned to each core, per-core timer and IPI counts and the capacities.
 
 
 ## SD root filesystem fixture

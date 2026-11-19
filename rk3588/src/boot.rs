@@ -4,16 +4,19 @@ use crate::Machine;
 
 pub const DEFAULT_CMDLINE:&str="console=ttyS2,1500000n8 earlycon=uart8250,mmio32,0xfeb50000 8250.nr_uarts=3 rdinit=/init loglevel=7";
 pub const DTB:u64=0x03f0_0000;
+/// Phandles of the cpu nodes (core k: CPU_PHANDLE + k).
+const CPU_PHANDLE:u32=0x10;
 pub const INITRD:u64=0x0400_0000;
 
 pub fn device_tree(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>, sd:bool)->Vec<u8> {
-    device_tree_gpu(ram,cmdline,initrd,sd,false)
+    device_tree_gpu(ram,cmdline,initrd,sd,false,1)
 }
-pub fn device_tree_gpu(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,sd:bool,gpu:bool)->Vec<u8> {
+/// The reduced DT for `cpus` cores: cores 0..3 are Cortex-A55, 4..7 Cortex-A76.
+pub fn device_tree_gpu(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,sd:bool,gpu:bool,cpus:usize)->Vec<u8> {
     let mut f=Fdt::default();
     f.begin("");
     f.strs("compatible", &["xunlong,orangepi-5","rockchip,rk3588s"]);
-    f.str("model","Orange Pi 5 (sbc-emu reduced RK3588S DT, one A55)");
+    f.str("model","Orange Pi 5 (sbc-emu reduced RK3588S DT)");
     f.cells("#address-cells",&[2]); f.cells("#size-cells",&[2]); f.cells("interrupt-parent",&[1]);
     f.begin("aliases");f.str("serial2","/serial@feb50000");f.end();
     f.begin("chosen");f.str("bootargs",cmdline);f.str("stdout-path","serial2:1500000n8");
@@ -21,12 +24,34 @@ pub fn device_tree_gpu(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,sd:bool,gpu
     f.end();
     f.begin("memory@0");f.str("device_type","memory");f.cells("reg",&[0,0,(ram>>32) as u32,ram as u32]);f.end();
     f.begin("cpus");f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);
-    f.begin("cpu@0");f.str("device_type","cpu");f.str("compatible","arm,cortex-a55");f.cells("reg",&[0]);f.str("enable-method","psci");f.end();f.end();
+    for k in 0..cpus {
+        let reg=crate::gic::affinity(k) as u32;
+        f.begin(&format!("cpu@{reg:x}"));f.str("device_type","cpu");
+        f.str("compatible",if k<4 {"arm,cortex-a55"} else {"arm,cortex-a76"});f.cells("reg",&[reg]);f.str("enable-method","psci");
+        // relative capacities as in the mainline rk3588s.dtsi (energy-aware scheduling)
+        f.cells("capacity-dmips-mhz",&[if k<4 {530} else {1024}]);
+        f.cells("clocks",&[if k<4 {6} else {7}]);f.cells("phandle",&[CPU_PHANDLE+k as u32]);f.end();
+    }
+    // Clusters as in the mainline rk3588s.dtsi: the A55s share one, the A76s are in pairs.
+    // Linux reads the capacities above only through a cpu-map.
+    f.begin("cpu-map");
+    for (c,cores) in [(0..4),(4..6),(6..8)].into_iter().enumerate() {
+        if cores.start>=cpus {break;}
+        f.begin(&format!("cluster{c}"));
+        for (n,k) in cores.filter(|&k|k<cpus).enumerate() { f.begin(&format!("core{n}"));f.cells("cpu",&[CPU_PHANDLE+k as u32]);f.end(); }
+        f.end();
+    }
+    f.end();
+    f.end();
+    // The cores' fixed rates (the board's top OPPs), which the scheduler's capacities scale by.
+    for (name,hz,ph) in [("cpu-little-clock",1_800_000_000u32,6),("cpu-big-clock",2_400_000_000,7)] {
+        f.begin(name);f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[hz]);f.cells("phandle",&[ph]);f.end();
+    }
     f.begin("psci");f.strs("compatible",&["arm,psci-1.0","arm,psci-0.2"]);f.str("method","smc");f.end();
     f.begin("timer");f.str("compatible","arm,armv8-timer");f.empty("always-on");
     f.cells("interrupts",&[1,13,4,1,14,4,1,11,4,1,10,4]);f.end();
     f.begin("interrupt-controller@fe600000");f.str("compatible","arm,gic-v3");
-    f.cells("reg",&[0,0xfe600000,0,0x10000,0,0xfe680000,0,0x20000]);
+    f.cells("reg",&[0,0xfe600000,0,0x10000,0,0xfe680000,0,0x100000]);
     f.empty("interrupt-controller");f.cells("#interrupt-cells",&[3]);f.cells("#address-cells",&[2]);f.cells("#size-cells",&[2]);f.empty("ranges");f.cells("phandle",&[1]);f.end();
     // Firmware-initialized clocks: CRU/PMU/pinctrl are intentionally absent in this DT.
     f.begin("uart-clock");f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[24_000_000]);f.cells("phandle",&[2]);f.end();
@@ -72,11 +97,12 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
         if end>m.soc.ram.len() as u64 {return Err("initrd exceeds RAM".into());}
         m.soc.ram[INITRD as usize..end as usize].copy_from_slice(data);Some((INITRD,end))
     }else{None};
-    let dt=device_tree_gpu(m.soc.ram.len() as u64,cmdline,range,m.soc.mmc.card.present(),m.gpu_probe);
+    let dt=device_tree_gpu(m.soc.ram.len() as u64,cmdline,range,m.soc.mmc.card.present(),m.gpu_probe,m.cpus.len());
     if DTB+dt.len() as u64>INITRD {return Err("device tree exceeds boot layout".into());}
     m.soc.ram[DTB as usize..DTB as usize+dt.len()].copy_from_slice(&dt);
-    m.cpu.el=1; m.cpu.spsel=true; m.cpu.daif=0x3c0;m.cpu.pc=entry;
-    m.cpu.x=[0;31];m.cpu.x[0]=DTB;m.cpu.sys.cpacr_el1=3<<20;
+    let c=m.cpu_mut();
+    c.el=1; c.spsel=true; c.daif=0x3c0;c.pc=entry;
+    c.x=[0;31];c.x[0]=DTB;c.sys.cpacr_el1=3<<20;
     Ok(())
 }
 

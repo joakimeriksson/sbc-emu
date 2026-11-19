@@ -9,12 +9,15 @@ use crate::disk::SharedDisk;
 impl SerialBoard for rk3588::Machine {
     fn host(&mut self) -> HostMachine<'_> { HostMachine::OrangePi5(self) }
     fn now(&self) -> u64 { rk3588::Machine::now(self) }
-    fn instret(&self) -> u64 { self.cpu.instret }
+    fn instret(&self) -> u64 { rk3588::Machine::instret(self) }
     fn report(&self, tag: &str) {
         let m = self;
-        eprintln!("[{tag}] pc={:#x} insns={} virtual={:.3}s irqs={} acknowledgements={} exceptions={}",m.cpu.pc,m.cpu.instret,m.now() as f64/1e9,m.irqs,m.soc.gic.acknowledges,m.exceptions);
+        let pcs: Vec<String> = m.cpus.iter().zip(&m.state).map(|(c, s)| format!("{:#x}{}", c.pc, if *s == rk3588::CoreState::Off { "(off)" } else { "" })).collect();
+        eprintln!("[{tag}] pc={} insns={} virtual={:.3}s irqs={} acknowledgements={} exceptions={}",pcs.join(","),m.instret(),m.now() as f64/1e9,m.irqs,m.soc.gic.acknowledges,m.exceptions);
         if !m.soc.unknown.is_empty(){eprintln!("[{tag}] unmapped MMIO: {:x?}",m.soc.unknown);}
-        if !m.cpu.sys.unknown.is_empty(){eprintln!("[{tag}] unmodelled system registers: {:x?}",m.cpu.sys.unknown);}
+        let mut sys: Vec<u32> = m.cpus.iter().flat_map(|c| c.sys.unknown.iter().copied()).collect();
+        sys.sort_unstable(); sys.dedup();
+        if !sys.is_empty(){eprintln!("[{tag}] unmodelled system registers: {:x?}",sys);}
     }
 }
 
@@ -22,8 +25,9 @@ pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net"])?;
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp"])?;
     if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
+    let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
     let gpu=arg(args,"--gpu").unwrap_or("none");
     if !["none","probe"].contains(&gpu) {return Err("--gpu accepts none or probe (experimental, no rendering)".into());}
     let net=arg(args,"--net").unwrap_or("nat");
@@ -38,7 +42,7 @@ fn execute(args:&[String])->Result<(),String> {
     let persist=args.iter().any(|a|a=="--sd-persist");
     let disk=arg(args,"--sd").map(|p|SharedDisk::open(p,persist).map_err(|e|format!("{p}: {e}"))).transpose()?;
     let make_machine=||->Result<rk3588::Machine,String>{
-        let mut m=rk3588::Machine::new(ram)?;
+        let mut m=rk3588::Machine::with_cpus(ram,smp)?;
         m.gpu_probe=gpu=="probe";
         if net != "none" { m.connect_network(net == "nat", false); }
         m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
@@ -50,14 +54,14 @@ fn execute(args:&[String])->Result<(),String> {
             let bootargs=image_cmdline(&card.cmdline,arg(args,"--append"));
             rk3588::boot::boot_linux(&mut m,&card.kernel,card.initrd.as_deref(),&bootargs)?;
         }
-        if !args.iter().any(|a|a=="--no-jit") {m.cpu.enable_jit();}
+        if !args.iter().any(|a|a=="--no-jit") {m.enable_jit();}
         Ok(m)
     };
     if kernel.is_none() && arg(args,"--dump-dtb").is_some() {return Err("--dump-dtb is not yet supported for SD image boot".into());}
     if let Some(path)=arg(args,"--dump-dtb") {
-        std::fs::write(path,rk3588::boot::device_tree_gpu(ram as u64,cmdline,initrd.as_ref().map(|d|(rk3588::boot::INITRD,rk3588::boot::INITRD+d.len() as u64)),disk.is_some(),gpu=="probe")).map_err(|e|e.to_string())?;
+        std::fs::write(path,rk3588::boot::device_tree_gpu(ram as u64,cmdline,initrd.as_ref().map(|d|(rk3588::boot::INITRD,rk3588::boot::INITRD+d.len() as u64)),disk.is_some(),gpu=="probe",smp)).map_err(|e|e.to_string())?;
     }
-    eprintln!("[orangepi5] experimental RK3588S: one reduced Cortex-A55, GICv3, UART2; emulated firmware, reduced DT");
+    eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2; emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4));
     serial_board::run(config, make_machine)
 }
 
