@@ -242,3 +242,21 @@ fn usb_host_is_a_platform_xhci_with_keyboard_and_tablet() {
     let dt=rk3588::boot::device_tree(128<<20,"",None,false);
     assert!(dt.windows(12).any(|w|w==b"generic-xhci"));
 }
+
+#[test]
+fn m2_slot_is_an_ecam_host_with_an_intx_nvme() {
+    let mut m=Machine::new(128<<20).unwrap();
+    assert_eq!(m.soc.read32(rk3588::pcie::ECAM).unwrap(),u32::MAX,"empty slot");
+    m.attach_nvme(Box::new(emu_core::disk::MemDisk(vec![0u8;1<<20])));
+    assert_eq!(m.soc.read32(rk3588::pcie::ECAM).unwrap(),0x0001_fffd);
+    let dt=rk3588::boot::device_tree(128<<20,"",None,false);
+    assert!(dt.windows(21).any(|w|w==b"pci-host-ecam-generic"));
+    // a 16-bit write to the status register (clearing error bits) keeps the command register
+    let ecam=rk3588::pcie::ECAM;
+    m.soc.write32(ecam+4,6).unwrap();
+    m.soc.write16(ecam+6,0xf900).unwrap();
+    assert_eq!(m.soc.read32(ecam+4).unwrap()&0xffff,6,"memory decode and bus mastering stay on");
+    m.soc.write8(ecam+0x3c,42).unwrap();
+    m.soc.write8(ecam+0x3d,0).unwrap();
+    assert_eq!(m.soc.read32(ecam+0x3c).unwrap()&0xff,42,"interrupt line kept");
+}

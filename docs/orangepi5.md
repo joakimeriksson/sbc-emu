@@ -1,6 +1,6 @@
 # Orange Pi 5 experimental direct boot
 
-The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer, and the USB 3.0 host carries a keyboard, a tablet and an optional USB stick (see below). Wireless and snapshots are not implemented.
+The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer, the USB 3.0 host carries a keyboard, a tablet and an optional USB stick, and the M.2 slot can hold an NVMe SSD (see below). Wireless and snapshots are not implemented.
 
 ## Cores
 
@@ -87,4 +87,12 @@ The RK3588S's USB 3.0 host (`usb_host2_xhci` at 0xfcd00000, the board's USB-A po
 `scripts/orangepi5-usb.txt` (Armbian, `--usb-drive stick.img --append init=/bin/bash`) checks that the three devices enumerate, that a key typed on the USB keyboard arrives as an input event, and that the stick's ext4 filesystem mounts and a 2 MiB file written to it verifies after dropping the page cache.
 
 Limits: the root hub reports four USB 2.0 and four USB 3.0 ports (the VL805's layout, not the DWC3's one of each), and the devices are full/high speed on the USB 2.0 ports. The USB 2.0 hosts (EHCI/OHCI), the USB-C OTG port and the DWC3 global registers are not modelled.
+
+## M.2 NVMe
+
+`--nvme IMAGE` puts an NVMe 1.4 SSD (copy-on-write, each boot starts from the image) in the M.2 slot. The slot's PCIe 2.0 x1 controller (pcie2x1l2) is described as a generic ECAM host (`pci-host-ecam-generic`) in its own windows: configuration space at 0xf4000000 (bus 0 only) and 32-bit memory at 0xf4200000. Linux's PCI core assigns the SSD's 16 KiB BAR; the `nvme` driver brings up its admin and I/O queues on INTA, which is the controller's legacy interrupt (SPI 250). The NVMe model is the Orange Pi RV's, with INTx added.
+
+`scripts/orangepi5-nvme.txt` (Armbian, `--nvme nvme.img --append init=/bin/bash`) checks enumeration, then mounts the SSD's ext4 filesystem and verifies a 4 MiB file written to it after dropping the page cache.
+
+Limits: the DesignWare PCIe controller, its PHY and MSI (through the GIC ITS) are not modelled, so the driver uses one I/O queue on INTx. Only an NVMe SSD can go in the slot.
 
