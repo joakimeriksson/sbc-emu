@@ -19,6 +19,8 @@ pub mod display;
 pub mod xhci;
 pub mod nvme;
 pub mod pcie;
+#[cfg(not(target_arch = "wasm32"))]
+mod mt;
 pub mod mmc;
 pub mod phy;
 pub mod gmac;
@@ -53,6 +55,8 @@ pub struct Soc {
     pub pcie: pcie::Pcie,
     /// the emulated USB devices: a keyboard and a tablet, and a stick with `--usb-drive`
     pub usb: emu_core::usb::Devices,
+    /// virtual time of the network's next poll (ns)
+    pub next_net_poll: u64,
     pub dirty: bool,
     pub unknown: Vec<u64>,
 }
@@ -106,6 +110,35 @@ impl Soc {
         else if (GICR..GICR+GICR_SIZE).contains(&addr) {self.gic.redist_write((addr-GICR)&!3,v);}
         else { if !self.unknown.contains(&addr) {self.unknown.push(addr);} return Err(Fault::Unmapped); }
         Ok(())
+    }
+}
+impl Soc {
+    /// Device work up to time `now` (ns): Ethernet frames and the network's timers, USB polls.
+    pub fn service(&mut self, now: u64) {
+        self.gmac.service(&mut self.ram);
+        if let Some(net) = &mut self.net {
+            let now_us = now / 1000;
+            for frame in std::mem::take(&mut self.gmac.tx_out) {
+                let replies=net.handle(&frame, now_us);
+                if self.gmac.receiving() {sbc_net::net::enqueue_bounded(&mut self.gmac.rx_queue,replies); }
+            }
+            if now >= self.next_net_poll {
+                let replies=net.poll(now_us);
+                if self.gmac.receiving() {sbc_net::net::enqueue_bounded(&mut self.gmac.rx_queue,replies); }
+                self.next_net_poll = now.saturating_add(1_000_000);
+            }
+            self.gmac.service(&mut self.ram);
+        } else { self.gmac.tx_out.clear(); }
+        self.xhci.tick(now,&mut self.ram,&mut self.usb);
+    }
+    /// The devices' interrupt lines into the GIC.
+    pub fn device_lines(&mut self) {
+        self.gic.set_line(XHCI_IRQ,self.xhci.irq());
+        self.gic.set_line(pcie::IRQ,self.pcie.irq());
+        self.gic.set_line(32+234,self.gmac.irq());
+        self.gic.set_line(UART_IRQ,self.uart.irq());
+        self.gic.set_line(32+203,self.mmc.irq());
+        for (i,spi) in [92,93,94].into_iter().enumerate() { self.gic.set_line(32+spi,self.gpu.irq(i)); }
     }
 }
 macro_rules! bus_access {
@@ -163,7 +196,10 @@ pub struct Machine {
     next_check: u64,
     /// virtual time at which the current round ends (u64::MAX: one core runs alone)
     round_end: u64,
-    next_net_poll: u64,
+    /// run the cores on their own host threads (`--threads multi`: faster, not repeatable)
+    pub multi: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    mt: Option<mt::Mt>,
     pub irqs: u64,
     pub exceptions: u64,
 }
@@ -173,8 +209,8 @@ impl Machine {
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
-        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),dirty:true,unknown:Vec::new()};
-        let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,next_net_poll:0,irqs:0,exceptions:0};
+        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),next_net_poll:0,dirty:true,unknown:Vec::new()};
+        let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,multi:false,#[cfg(not(target_arch = "wasm32"))] mt:None,irqs:0,exceptions:0};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
         Ok(m)
@@ -249,7 +285,7 @@ impl Machine {
     /// The earliest deadline after `t` that core `c` must notice: its own timers, those of
     /// sleeping cores and the network poll (cores waiting for their turn check their own).
     fn deadline_after(&self, t: u64, c: usize) -> Option<u64> {
-        let mut d=[self.soc.net.as_ref().map(|_|self.next_net_poll),self.soc.xhci.next_event(&self.soc.usb)].into_iter().flatten().filter(|&x|x>t).min();
+        let mut d=[self.soc.net.as_ref().map(|_|self.soc.next_net_poll),self.soc.xhci.next_event(&self.soc.usb)].into_iter().flatten().filter(|&x|x>t).min();
         for (k,cpu) in self.cpus.iter().enumerate() {
             if self.state[k]==CoreState::Off || (k!=c && self.state[k]==CoreState::Run) {continue;}
             for ns in Self::timer_deadlines(cpu) { if ns>t { d=Some(d.map_or(ns,|x|x.min(ns))); } }
@@ -261,29 +297,7 @@ impl Machine {
         let usb=self.soc.xhci.next_event(&self.soc.usb);
         self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(usb).min()
     }
-    fn devices(&mut self) {
-        self.soc.gmac.service(&mut self.soc.ram);
-        if let Some(net) = &mut self.soc.net {
-            let now_us = self.now / 1000;
-            for frame in std::mem::take(&mut self.soc.gmac.tx_out) {
-                let replies=net.handle(&frame, now_us);
-                if self.soc.gmac.receiving() {sbc_net::net::enqueue_bounded(&mut self.soc.gmac.rx_queue,replies); }
-            }
-            if self.now >= self.next_net_poll {
-                let replies=net.poll(now_us);
-                if self.soc.gmac.receiving() {sbc_net::net::enqueue_bounded(&mut self.soc.gmac.rx_queue,replies); }
-                self.next_net_poll = self.now.saturating_add(1_000_000);
-            }
-            self.soc.gmac.service(&mut self.soc.ram);
-        } else { self.soc.gmac.tx_out.clear(); }
-        self.soc.xhci.tick(self.now,&mut self.soc.ram,&mut self.soc.usb);
-        self.soc.gic.set_line(XHCI_IRQ,self.soc.xhci.irq());
-        self.soc.gic.set_line(pcie::IRQ,self.soc.pcie.irq());
-        self.soc.gic.set_line(32+234,self.soc.gmac.irq());
-        self.soc.gic.set_line(UART_IRQ,self.soc.uart.irq());
-        self.soc.gic.set_line(32+203,self.soc.mmc.irq());
-        for (i,spi) in [92,93,94].into_iter().enumerate() { self.soc.gic.set_line(32+spi,self.soc.gpu.irq(i)); }
-    }
+    fn devices(&mut self) { self.soc.service(self.now); self.soc.device_lines(); }
     fn update(&mut self) {
         let c=self.cur;
         let t=self.cpus[c].now_ns();
@@ -326,6 +340,9 @@ impl Machine {
     /// turns in rounds of 20 µs of virtual time (`SBC_QUANTUM` ns), all starting the round at
     /// the same time; a core that is alone runs without rounds until something wakes another.
     pub fn run(&mut self,budget:u64)->Stop {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.multi { return self.run_threaded(std::time::Duration::from_millis(10)); }
+        if self.cpus[0].mt { for c in self.cpus.iter_mut() { c.mt=false; } }
         let end=self.instret().saturating_add(budget);
         let mut total=self.instret();
         let mut steps=budget;
@@ -338,7 +355,7 @@ impl Machine {
             if runnable==0 {
                 let poll=self.soc.net.as_ref().is_some_and(|n|n.nat.is_some()) || !self.soc.gmac.rx_queue.is_empty();
                 let mut until=self.next_deadline().unwrap_or(self.now+10_000_000);
-                if poll {until=until.min(self.next_net_poll);}
+                if poll {until=until.min(self.soc.next_net_poll);}
                 break Stop::Idle(until.max(self.now));
             }
             let round_start=self.now;
@@ -437,17 +454,28 @@ impl Machine {
     /// EL. RAM, the retired count and the JIT are kept.
     fn cpu_on(&mut self, caller: usize, t: usize, entry: u64, context: u64) {
         let (el,now)=(self.cpus[caller].el,self.cpus[caller].now_ns());
-        let mut f=self.fresh_cpu(t);
-        let c=&mut self.cpus[t];
+        Self::reset_core(&mut self.cpus[t],t,el,entry,context,now);
+        self.state[t]=CoreState::Run;
+        self.round_end=self.round_end.min(now+quantum());
+        self.soc.dirty=true;
+    }
+    /// Core `k` out of reset at `entry` (PSCI CPU_ON: MMU off, interrupts masked, x0 =
+    /// `context`, in the caller's EL `el`): RAM, the retired count, the JIT and the shared
+    /// compiled-pages map are kept.
+    pub(crate) fn reset_core(c: &mut Cpu, k: usize, el: u8, entry: u64, context: u64, now: u64) {
+        let mut f=Cpu::new();
+        f.profile=core_profile(k);
+        f.sys.cntfrq=CNTFRQ;
+        f.sys.mpidr=core_mpidr(k);
+        f.firmware_calls_to_host=true;
+        f.ram=c.ram; f.ram_len=c.ram_len;
+        f.code_pages=c.code_pages.clone();
         f.instret=c.instret;
         f.sys.time_base_ns=now; f.sys.time_base_instret=c.instret;
         f.el=el; f.spsel=true; f.daif=0xf<<6; f.pc=entry; f.x[0]=context;
         f.sys.cpacr_el1=3<<20;
-        f.jit_off=c.jit_off; f.wall_clock=c.wall_clock;
+        f.jit_off=c.jit_off; f.crypto=c.crypto; f.mt=c.mt; f.wall_clock=c.wall_clock;
         let mut old=std::mem::replace(c,f);
         old.hand_jit_to(c);
-        self.state[t]=CoreState::Run;
-        self.round_end=self.round_end.min(now+quantum());
-        self.soc.dirty=true;
     }
 }
