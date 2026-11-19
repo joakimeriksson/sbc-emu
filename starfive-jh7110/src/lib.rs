@@ -10,5 +10,9 @@ pub mod dwmmc;
 pub mod gmac;
 pub mod i2c;
 pub mod machine;
+pub mod pcie;
+pub mod sdio;
+pub mod wifi;
+pub mod xhci;
 
 pub use machine::{HartState, Machine, Soc, RAM_BASE, RAM_SIZE};

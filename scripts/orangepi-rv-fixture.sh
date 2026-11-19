@@ -4,7 +4,8 @@
 #                                   (the package ships it gzip'd as vmlinuz; only gunzipped)
 #   OUT/jh7110-orangepi-rv.dtb      the matching mainline device tree, unmodified
 #   OUT/fw_dynamic.bin              Alpine opensbi, generic platform, FW_DYNAMIC firmware
-#   OUT/initramfs.cpio.gz           Alpine riscv64 minirootfs + a serial-shell /init
+#   OUT/initramfs.cpio.gz           Alpine riscv64 minirootfs + a serial-shell /init, with the
+#                                   SD/Ethernet/USB HID/Wi-Fi modules, the BCM43456 firmware and iw
 # Usage: scripts/orangepi-rv-fixture.sh [OUT]   (default cache/orangepi-rv)
 # Downloads are verified against SHA-256; Alpine eventually removes superseded
 # package versions, so update the pins together.
@@ -22,6 +23,13 @@ ROOTFS_SHA=010683db6c73b3ad1c334fc8f93f64ae748ef67ae6d69e964929aeaf8517bff3
 KERNEL_APK=linux-stable-7.1.5-r0.apk
 KERNEL_URL=$MIRROR/v3.24/community/riscv64/$KERNEL_APK
 KERNEL_SHA=48712755bb52ace44a01f89ccd0677a528ba39e2a271664475380759cb9eb401
+FIRMWARE_APK=linux-firmware-brcm-20260519-r0.apk
+FIRMWARE_URL=$MIRROR/v3.24/main/riscv64/$FIRMWARE_APK
+FIRMWARE_SHA=8ccddc77b11c411a05cc5639f91049bf91c6e191dc3569be48a537925c3d838c
+IW_APK=iw-6.17-r0.apk
+IW_SHA=14b204e41395781f49edfd26982ed18aa58ecf23e3c78cfe1b38b9372d6ad6a6
+LIBNL_APK=libnl3-3.11.0-r0.apk
+LIBNL_SHA=9f768fa96f6b282e62322c4769fadb587afc71d37ab3df65af2e90e492237268
 OPENSBI_APK=opensbi-1.8.1-r0.apk
 OPENSBI_URL=$MIRROR/v3.24/main/riscv64/$OPENSBI_APK
 OPENSBI_SHA=b1086a0b5d1b18249db6df7df31e97cbdab90886ee465e1c429f8ad8cac47664
@@ -45,6 +53,9 @@ fetch() { # file url sha256
 fetch "$ROOTFS" "$ROOTFS_URL" "$ROOTFS_SHA"
 fetch "$KERNEL_APK" "$KERNEL_URL" "$KERNEL_SHA"
 fetch "$OPENSBI_APK" "$OPENSBI_URL" "$OPENSBI_SHA"
+fetch "$FIRMWARE_APK" "$FIRMWARE_URL" "$FIRMWARE_SHA"
+fetch "$IW_APK" "$MIRROR/v3.24/main/riscv64/$IW_APK" "$IW_SHA"
+fetch "$LIBNL_APK" "$MIRROR/v3.24/main/riscv64/$LIBNL_APK" "$LIBNL_SHA"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -82,14 +93,26 @@ cp "$work/opensbi/usr/share/opensbi/generic/firmware/fw_dynamic.bin" "$OUT/"
 mkdir "$work/rootfs"
 tar -xzf "$OUT/downloads/$ROOTFS" -C "$work/rootfs"
 # Kernel modules for the SD card (DesignWare MMC, mmc_block), ext4 and Ethernet (stmmac,
-# dwmac-starfive, the Motorcomm PHY): modules in
+# dwmac-starfive, the Motorcomm PHY) and USB HID: modules in
 # linux-stable, with modules.dep. The JH7110 clocks/resets/pinctrl/UART/PLIC are built in.
 tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
     'lib/modules/*/modules.*' 'lib/modules/*/kernel/drivers/mmc/*' \
     'lib/modules/*/kernel/fs/ext4/*' 'lib/modules/*/kernel/fs/jbd2/*' \
     'lib/modules/*/kernel/fs/mbcache.ko.gz' 'lib/modules/*/kernel/lib/crc/*' \
     'lib/modules/*/kernel/drivers/net/ethernet/stmicro/*' 'lib/modules/*/kernel/drivers/net/phy/*' \
-    'lib/modules/*/kernel/drivers/net/pcs/*' 'lib/modules/*/kernel/net/packet/*'
+    'lib/modules/*/kernel/drivers/net/pcs/*' 'lib/modules/*/kernel/net/packet/*' \
+    'lib/modules/*/kernel/drivers/hid/hid.ko.gz' 'lib/modules/*/kernel/drivers/hid/hid-generic.ko.gz' \
+    'lib/modules/*/kernel/drivers/hid/usbhid/*' 'lib/modules/*/kernel/drivers/input/evdev.ko.gz' \
+    'lib/modules/*/kernel/drivers/net/wireless/broadcom/brcm80211/*' 'lib/modules/*/kernel/net/wireless/*' \
+    'lib/modules/*/kernel/drivers/i2c/busses/i2c-designware-*' 'lib/modules/*/kernel/drivers/mfd/axp20x*' \
+    'lib/modules/*/kernel/drivers/regulator/axp20x-regulator.ko.gz' 'lib/modules/*/kernel/drivers/mmc/core/*' \
+    'lib/modules/*/kernel/drivers/regulator/fixed.ko.gz' 'lib/modules/*/kernel/net/rfkill/*'
+# iw (and libnl) to scan for and join the virtual access point
+tar -xzf "$OUT/downloads/$IW_APK" -C "$work/rootfs" usr/sbin/iw
+tar -xzf "$OUT/downloads/$LIBNL_APK" -C "$work/rootfs" $wildcards 'usr/lib/*'
+# The AP6256's BCM43456 firmware (brcmfmac43456-sdio: firmware, CLM, generic NVRAM)
+tar -xzf "$OUT/downloads/$FIRMWARE_APK" -C "$work/rootfs" $wildcards 'lib/firmware/brcm/brcmfmac43456-sdio.bin.zst' \
+    'lib/firmware/brcm/brcmfmac43456-sdio.clm_blob.zst' 'lib/firmware/brcm/brcmfmac43456-sdio.txt.zst'
 ls "$work"/rootfs/lib/modules/*/kernel/drivers/mmc/host/dw_mmc-starfive.ko* > /dev/null
 ls "$work"/rootfs/lib/modules/*/kernel/drivers/net/ethernet/stmicro/stmmac/dwmac-starfive.ko* > /dev/null
 cat > "$work/rootfs/init" <<'INIT'
@@ -105,6 +128,12 @@ modprobe dw_mmc-starfive 2>/dev/null; modprobe mmc_block 2>/dev/null
 modprobe ext4 2>/dev/null
 # Gigabit Ethernet: stmmac with the StarFive glue and the Motorcomm PHY driver are modules.
 modprobe dwmac-starfive 2>/dev/null; modprobe motorcomm 2>/dev/null; modprobe af_packet 2>/dev/null
+# USB keyboard and tablet on the VL805 (USB HID and evdev are modules)
+modprobe usbhid 2>/dev/null; modprobe hid-generic 2>/dev/null; modprobe evdev 2>/dev/null
+# Wi-Fi: the PMIC's regulators (I2C5) power the SDIO slot; then brcmfmac on SDIO0
+modprobe fixed 2>/dev/null; modprobe i2c-designware-platform 2>/dev/null; modprobe axp20x-i2c 2>/dev/null
+modprobe axp20x-regulator 2>/dev/null
+modprobe pwrseq_simple 2>/dev/null; modprobe brcmfmac 2>/dev/null
 echo "JH7110_BOOT_OK: RV64 Linux BusyBox shell"
 # setsid -c makes the console the shell's controlling terminal (job control, ^C).
 exec /bin/busybox setsid -c /bin/sh

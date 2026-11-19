@@ -6,6 +6,8 @@ use crate::i2c::{At24c04, Axp15060, DwI2c, PowerRequest};
 use crate::crypto::Sec;
 use crate::display::{Display, Mode, DC_BASE, DC_SIZE, HDMI_BASE, HDMI_SIZE, IRQ_DC, IRQ_HDMI};
 use crate::dwmmc::DwMmc;
+use crate::pcie::Port;
+use emu_core::usb::{DevId, Devices};
 use crate::gmac::{Gmac, Yt8531};
 use emu_core::{FlatRam, Stop};
 use peripherals::Uart;
@@ -26,6 +28,9 @@ const NS_PER_TICK: u64 = 1_000_000_000 / MTIME_HZ;
 /// PLIC source numbers.
 pub const IRQ_UART0: usize = 32;
 pub const IRQ_SEC: usize = 28;
+/// The STG syscon: the PCIe ports' link status (DATA_LINK_ACTIVE, bit 5) lives here.
+pub const STG_SYSCON: u64 = 0x1024_0000;
+const STG_PCIE_LNKSTA: [u64; 2] = [0x48 + 0x170, 0x1f8 + 0x170];
 pub const IRQ_TEMP: usize = 81;
 pub const TEMP: u64 = 0x120e_0000;
 pub const IRQ_GMAC0: usize = 7;
@@ -93,6 +98,10 @@ pub struct Soc {
     pub i2c: Vec<DwI2c>,
     /// SDIO0 (the Wi-Fi module's slot, empty here) and SDIO1 (the microSD slot)
     pub sec: Sec,
+    /// PCIe0 (the VL805 USB 3.0 controller) and PCIe1 (the empty M.2 slot)
+    pub pcie: [Port; 2],
+    /// the USB devices: keyboard and tablet on the VL805's ports, an optional USB drive
+    pub usb: Devices,
     pub temp: TempSensor,
     /// the DC8200 display controller and the Inno HDMI transmitter with its monitor
     pub display: Display,
@@ -101,6 +110,8 @@ pub struct Soc {
     pub gmac1: Gmac,
     /// the network GMAC0's port is plugged into (None: no cable)
     pub net: Option<sbc_net::net::VirtualNet>,
+    /// the network behind the virtual Wi-Fi access point
+    pub wifi_net: Option<sbc_net::net::VirtualNet>,
     /// when the network is polled next (ns)
     net_next: u64,
     pub sdio0: DwMmc,
@@ -145,13 +156,32 @@ impl Soc {
             stubs: BTreeMap::new(),
             gpio_reset: false,
             sec: Sec::default(),
+            pcie: [
+                {
+                    let mut p = Port::new(0x2b00_0000, 0x9_4000_0000, 56, true);
+                    if let Some(x) = p.xhci.as_mut() {
+                        x.attach(&[DevId::Keyboard, DevId::Tablet]);
+                    }
+                    p
+                },
+                Port::new(0x2c00_0000, 0x9_c000_0000, 57, false),
+            ],
+            usb: Devices::default(),
             temp: TempSensor::default(),
             display: Display::new(Mode::MODES[0]),
             gmac0: Gmac::new(Some((0, Yt8531::default()))),
             gmac1: Gmac::new(None),
             net: None,
+            wifi_net: None,
             net_next: 0,
-            sdio0: DwMmc::new(SDIO0, IRQ_SDIO0, 32),
+            sdio0: {
+                // the AP6256 Wi-Fi module (BCM43456)
+                let mut host = DwMmc::new(SDIO0, IRQ_SDIO0, 32);
+                let mut chip = crate::wifi::Bcm43456::new();
+                crate::sdio::SdioCard::set_trace(&mut chip, std::env::var_os("SBC_WIFI_TRACE").is_some());
+                host.sdio = Some(Box::new(chip));
+                host
+            },
             sdio1: DwMmc::new(SDIO1, IRQ_SDIO1, 32),
             now: 0,
             cur: 1,
@@ -175,12 +205,36 @@ impl Soc {
         let (dc, hdmi) = (self.display.irq(), self.display.hdmi_irq());
         self.plic.set_level(IRQ_DC, dc);
         self.plic.set_level(IRQ_HDMI, hdmi);
+        for k in 0..2 {
+            self.pcie[k].update();
+            let l = self.pcie[k].irq_level();
+            self.plic.set_level(self.pcie[k].irq, l);
+        }
         let (g0, g1) = (self.gmac0.irq(), self.gmac1.irq());
         self.plic.set_level(IRQ_GMAC0, g0);
         self.plic.set_level(IRQ_GMAC1, g1);
         for (k, &(_, irq)) in I2C.iter().enumerate() {
             let l = self.i2c[k].irq();
             self.plic.set_level(irq, l);
+        }
+    }
+
+    /// Run the VL805's periodic work (retrying IN transfers of devices with input); returns
+    /// its next deadline (ns).
+    pub fn usb_tick(&mut self) -> u64 {
+        let now = self.now;
+        let Some(x) = self.pcie[0].xhci.as_mut() else { return u64::MAX };
+        x.tick(now, &mut self.ram.mem, &mut self.usb);
+        let next = x.next_event(&self.usb).unwrap_or(u64::MAX);
+        self.update_devices();
+        next
+    }
+
+    /// Plug a USB drive into the next free port of the VL805.
+    pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
+        self.usb.storage = Some(emu_core::usb::Storage::new(disk));
+        if let Some(x) = self.pcie[0].xhci.as_mut() {
+            x.attach(&[DevId::Keyboard, DevId::Tablet, DevId::Storage]);
         }
     }
 
@@ -208,7 +262,18 @@ impl Soc {
             None => self.gmac0.tx_out.clear(),
         }
         self.gmac0.service(&mut self.ram);
-        let busy = !self.gmac0.rx_queue.is_empty() || self.net.as_ref().is_some_and(|n| n.nat.is_some());
+        // Wi-Fi: the associated interface's frames go to the network behind the access point
+        if let (Some(card), Some(wnet)) = (self.sdio0.sdio.as_mut(), self.wifi_net.as_mut()) {
+            let mut replies = Vec::new();
+            for f in card.take_tx() {
+                replies.extend(wnet.handle(&f, now_us));
+            }
+            replies.extend(wnet.poll(now_us));
+            for r in replies {
+                card.deliver(&r);
+            }
+        }
+        let busy = !self.gmac0.rx_queue.is_empty() || self.net.as_ref().is_some_and(|n| n.nat.is_some()) || self.wifi_net.is_some();
         self.net_next = self.now + if busy { 1_000_000 } else { 10_000_000 };
         self.update_devices();
     }
@@ -247,6 +312,26 @@ impl Soc {
 
     fn dev_read(&mut self, a: u64, size: u8) -> Result<u64, ()> {
         let r32 = |v: u32| Ok(v as u64);
+        for k in 0..2 {
+            let p = &mut self.pcie[k];
+            if p.in_bar(a) {
+                let v = p.mem_read(a & !3);
+                self.update_devices();
+                self.irq_dirty = true;
+                return r32(v);
+            }
+            if (p.apb..p.apb + 0x100_0000).contains(&a) {
+                return r32(p.bridge_read(a - p.apb));
+            }
+            if (p.cfg..p.cfg + 0x1000_0000).contains(&a) {
+                let v = p.cfg_read((a - p.cfg) & !3);
+                return Ok(((v as u64) >> (8 * (a & 3))) & (u64::MAX >> (64 - 8 * size.min(4) as u64)));
+            }
+        }
+        if let Some(k) = STG_PCIE_LNKSTA.iter().position(|&o| a == STG_SYSCON + o) {
+            let link = (self.pcie[k].link_up() as u32) << 5;
+            return r32(*self.stub(a) | link);
+        }
         match a {
             _ if (CLINT..CLINT + 0x10000).contains(&a) => {
                 let t = self.mtime();
@@ -318,6 +403,33 @@ impl Soc {
 
     fn dev_write(&mut self, a: u64, size: u8, v: u64) -> Result<(), ()> {
         let v32 = v as u32;
+        for k in 0..2 {
+            if self.pcie[k].in_bar(a) {
+                self.pcie[k].mem_write(a & !3, v32, &mut self.ram.mem, &mut self.usb);
+                self.update_devices();
+                self.irq_dirty = true;
+                return Ok(());
+            }
+            let (apb, cfg) = (self.pcie[k].apb, self.pcie[k].cfg);
+            if (apb..apb + 0x100_0000).contains(&a) {
+                self.pcie[k].bridge_write(a - apb, v32);
+                self.update_devices();
+                self.irq_dirty = true;
+                return Ok(());
+            }
+            if (cfg..cfg + 0x1000_0000).contains(&a) {
+                let o = (a - cfg) & !3;
+                let v = if size >= 4 {
+                    v32
+                } else {
+                    let sh = 8 * (a & 3);
+                    let mask = ((1u64 << (8 * size as u64)) - 1) as u32;
+                    (self.pcie[k].cfg_read(o) & !(mask << sh)) | ((v32 & mask) << sh)
+                };
+                self.pcie[k].cfg_write(o, v);
+                return Ok(());
+            }
+        }
         match a {
             _ if (CLINT..CLINT + 0x10000).contains(&a) => {
                 self.clint.write(a - CLINT, size, v);
@@ -556,8 +668,9 @@ impl Machine {
                 self.soc.pump_network();
             }
             let vblank = self.soc.display.update(self.soc.now).unwrap_or(u64::MAX);
+            let usb = self.soc.usb_tick();
             if ran == 0 {
-                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank));
+                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb));
             }
             self.soc.now += ran;
             left = left.saturating_sub(ran);
@@ -575,6 +688,8 @@ impl Machine {
         }
         let _ = nat;
         self.soc.net = Some(net);
+        // the Wi-Fi access point's network (isolated: DHCP, DNS and local services)
+        self.soc.wifi_net = Some(sbc_net::net::VirtualNet::new(log));
         if let Some((_, phy)) = self.soc.gmac0.phy.as_mut() {
             phy.set_link(true);
         }

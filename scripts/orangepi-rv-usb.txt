@@ -1,0 +1,22 @@
+# Orange Pi RV USB 3.0: the VL805 xHCI behind PCIe0, its root hub, the USB keyboard and
+# tablet, and a USB drive (--usb-drive IMAGE, an ext4 image with hello.txt = HELLO_FROM_HOST).
+# Works with the mainline kernel (Alpine 7.1, pcie-starfive + xhci-pci built in) and Xunlong's.
+wait-serial orangepi-rv#
+serial cat /sys/bus/pci/devices/*/vendor /sys/bus/pci/devices/*/device | sort -u | tr -d '\n' | sed 's/$/ PCI_IDS/'; echo\n
+wait-serial 0x1106
+serial cat /sys/bus/usb/devices/*/product | sort | sed 's/^/USBDEV_/'\n
+wait-serial USBDEV_
+serial cat /sys/class/input/input*/name\n
+wait-serial sbc-emu Virtual USB Tablet
+# a key pressed on the USB keyboard arrives as an input event
+serial (head -c 24 /dev/input/event0 | od -An -tx1 | head -1 | sed 's/^/K''EYEV/') & sleep 1\n
+sleep 1
+type a
+wait-serial KEYEV
+serial modprobe usb-storage 2>/dev/null; modprobe sd_mod 2>/dev/null; sleep 3; mount -t ext4 /dev/sda /mnt && cat /mnt/hello.txt\n
+wait-serial HELLO_FROM_HOST
+serial dd if=/dev/urandom of=/mnt/usbblob bs=64k count=32 2>/dev/null; sha256sum /mnt/usbblob > /mnt/usbblob.sha; sync; echo 3 > /proc/sys/vm/drop_caches; sha256sum -c /mnt/usbblob.sha | sed 's/^/USB_/'\n
+wait-serial USB_/mnt/usbblob: OK
+serial umount /mnt; echo USB_""DONE\n
+wait-serial USB_DONE
+quit

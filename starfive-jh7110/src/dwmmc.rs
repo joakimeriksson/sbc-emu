@@ -2,10 +2,13 @@
 //! `dw_mmc` + `dw_mmc-starfive`): SDIO0 (0x16010000, the Wi-Fi slot) and SDIO1
 //! (0x16020000, the microSD slot), 32-word FIFOs, 32-bit IDMAC descriptors.
 //!
-//! Adapted from sbc-emu's RK3288 model (`rockchip-rk3288/src/dwmmc.rs`), SD cards only.
+//! Adapted from sbc-emu's RK3288 model (`rockchip-rk3288/src/dwmmc.rs`) for SD cards, with
+//! SDIO cards added (the Wi-Fi module on SDIO0): CMD5/CMD3/CMD7, CMD52 and CMD53 data through
+//! the IDMAC or the FIFO, and the card interrupt (DAT[1]) as RINTSTS bit 16 while it is asserted.
 //! Commands complete when they are written (CMD with START): the response, the data phase
 //! and the interrupts (CMD_DONE, DATA_OVER, IDMAC RI/TI) are all raised at once. Linux
 //! moves block data with the IDMAC; short transfers (the SD SCR) go through the FIFO.
+use crate::sdio::SdioCard;
 use emu_core::disk::Disk;
 use emu_core::sdcard::{Data, Reply, Response, SdCard, OUT_OF_RANGE};
 use emu_core::{Bus, FlatRam};
@@ -53,6 +56,8 @@ const CMD_DAT_EXP: u32 = 1 << 9;
 const CMD_RESP_EXP: u32 = 1 << 6;
 // RINTSTS / INTMASK
 const INT_ACD: u32 = 1 << 14;
+const INT_SDIO: u32 = 1 << 16;
+const BLKSIZ: usize = 0x01c;
 const INT_EBE: u32 = 1 << 15;
 const INT_DRTO: u32 = 1 << 9;
 const INT_RTO: u32 = 1 << 8;
@@ -128,6 +133,14 @@ pub struct DwMmc {
     /// FIFO depth in 32-bit words (`fifo-depth`)
     fifo_depth: usize,
     pub card: Card,
+    /// an SDIO card in the slot (instead of `card`)
+    pub sdio: Option<Box<dyn SdioCard>>,
+    sdio_rca: u16,
+    sdio_selected: bool,
+    /// the function, address and increment of a CMD53 write waiting for its data
+    sdio_target: Option<(u8, u32, bool)>,
+    /// `SBC_MMC_TRACE`: print SDIO commands
+    trace: bool,
     regs: [u32; 0x40],
     rintsts: u32,
     idsts: u32,
@@ -148,6 +161,11 @@ impl DwMmc {
             irq,
             fifo_depth,
             card: Card::new(None),
+            sdio: None,
+            sdio_rca: 0,
+            sdio_selected: false,
+            sdio_target: None,
+            trace: std::env::var_os("SBC_MMC_TRACE").is_some(),
             regs,
             rintsts: 0,
             idsts: 0,
@@ -166,8 +184,13 @@ impl DwMmc {
         addr.wrapping_sub(self.base) < SIZE
     }
 
+    /// RINTSTS with the SDIO card's interrupt (bit 16) while it asserts DAT[1].
+    fn rint(&self) -> u32 {
+        self.rintsts | if self.sdio.as_ref().is_some_and(|c| c.irq()) { INT_SDIO } else { 0 }
+    }
+
     pub fn irq_level(&self) -> bool {
-        self.regs[CTRL / 4] & CTRL_INT_ENABLE != 0 && self.rintsts & self.regs[INTMASK / 4] != 0
+        self.regs[CTRL / 4] & CTRL_INT_ENABLE != 0 && self.rint() & self.regs[INTMASK / 4] != 0
             || self.idsts & self.regs[IDINTEN / 4] & 0x337 != 0
     }
 
@@ -180,7 +203,7 @@ impl DwMmc {
         if count as usize >= self.fifo_depth {
             status |= 1 << 3; // FIFO full
         }
-        if self.card.present() {
+        if self.card.present() || self.sdio.is_some() {
             status |= 1 << 8; // DAT3: card present
         }
         status
@@ -189,10 +212,10 @@ impl DwMmc {
     pub fn read(&mut self, offset: u64) -> u32 {
         let offset = offset as usize;
         match offset {
-            MINTSTS => self.rintsts & self.regs[INTMASK / 4],
-            RINTSTS => self.rintsts,
+            MINTSTS => self.rint() & self.regs[INTMASK / 4],
+            RINTSTS => self.rint(),
             STATUS => self.status(),
-            CDETECT => u32::from(!self.card.present()),
+            CDETECT => u32::from(!self.card.present() && self.sdio.is_none()),
             WRTPRT => 0,
             VERID => VERSION,
             HCON => HCONFIG,
@@ -238,6 +261,9 @@ impl DwMmc {
     }
 
     fn command(&mut self, cmd: u32, ram: &mut FlatRam) {
+        if self.sdio.is_some() {
+            return self.sdio_command(cmd, ram);
+        }
         let index = cmd & 0x3f;
         let arg = self.regs[CMDARG / 4];
         let reply = self.card.command(index, arg);
@@ -289,6 +315,78 @@ impl DwMmc {
         }
     }
 
+    /// The SDIO card's commands (SDIO Simplified Specification 3.0): identification,
+    /// CMD52 register access and CMD53 block/byte transfers of BYTCNT bytes.
+    fn sdio_command(&mut self, cmd: u32, ram: &mut FlatRam) {
+        let index = cmd & 0x3f;
+        let arg = self.regs[CMDARG / 4];
+        let selected = self.sdio_selected;
+        let r5 = |d: u8| -> u32 { ((if selected { 0x20 } else { 0x10 }) << 8) | d as u32 };
+        let trace = self.trace;
+        let Some(card) = self.sdio.as_mut() else { return };
+        if trace {
+            eprintln!("[sdio] CMD{index} arg {arg:#010x} cmd {cmd:#010x} bytcnt {}", self.regs[BYTCNT / 4]);
+        }
+        let resp = match index {
+            0 => {
+                self.sdio_selected = false;
+                self.rintsts |= INT_CMD_DONE;
+                return;
+            }
+            // R4: ready, the I/O functions, no memory, 2.7-3.6 V
+            5 => (1 << 31) | ((card.num_functions() as u32 & 7) << 28) | 0x00ff_8000,
+            3 => {
+                self.sdio_rca = 1;
+                1 << 16
+            }
+            7 => {
+                self.sdio_selected = (arg >> 16) as u16 == self.sdio_rca;
+                0x0000_0700
+            }
+            52 => {
+                let (write, func, raw, addr) = (arg >> 31 != 0, ((arg >> 28) & 7) as u8, arg & (1 << 27) != 0, (arg >> 9) & 0x1_ffff);
+                let d = card.rw_direct(write, func, addr, arg as u8, raw);
+                r5(d)
+            }
+            53 => r5(0),
+            _ => {
+                self.rintsts |= INT_RTO | INT_CMD_DONE;
+                return;
+            }
+        };
+        self.regs[RESP0 / 4] = resp;
+        self.rintsts |= INT_CMD_DONE;
+        if index != 53 || cmd & CMD_DAT_EXP == 0 {
+            return;
+        }
+        let (write, func, incr, addr) = (arg >> 31 != 0, ((arg >> 28) & 7) as u8, arg & (1 << 26) != 0, (arg >> 9) & 0x1_ffff);
+        let bytes = (self.regs[BYTCNT / 4] as usize).max(self.regs[BLKSIZ / 4] as usize & 0xffff).min(MAX_TRANSFER);
+        let ok = if write {
+            self.sdio_target = Some((func, addr, incr));
+            self.from_host(None, bytes, ram)
+        } else {
+            let mut data = vec![0u8; bytes];
+            if let Some(c) = self.sdio.as_mut() {
+                c.read_ext(func, addr, incr, &mut data);
+            }
+            self.to_host(&data, ram)
+        };
+        if !ok {
+            self.sdio_target = None;
+            self.rintsts |= INT_DRTO;
+            if self.uses_idmac() {
+                self.idsts |= IDMAC_AI | IDMAC_FBE;
+            }
+        }
+    }
+
+    /// Time passes for the SDIO card (firmware timers, delayed events).
+    pub fn tick(&mut self, now: u64) {
+        if let Some(c) = self.sdio.as_mut() {
+            c.tick(now);
+        }
+    }
+
     /// CMD12 sent by the controller after the data (SEND_STOP).
     fn auto_stop(&mut self) {
         if let Some(Response::Short(word)) = self.card.command(12, 0).response {
@@ -316,8 +414,8 @@ impl DwMmc {
             }
             return ok;
         }
-        if data.len() > self.fifo_depth * 4 {
-            return false; // Linux uses PIO for transfers under 16 bytes only
+        if data.len() > MAX_TRANSFER {
+            return false;
         }
         self.fifo.clear();
         for chunk in data.chunks(4) {
@@ -352,7 +450,11 @@ impl DwMmc {
         if !ok {
             return false;
         }
-        if let Some(lba) = lba {
+        if let Some((func, addr, incr)) = self.sdio_target.take() {
+            if let Some(c) = self.sdio.as_mut() {
+                c.write_ext(func, addr, incr, &data);
+            }
+        } else if let Some(lba) = lba {
             self.card.write_blocks(lba, &data);
         }
         self.idsts |= IDMAC_TI | IDMAC_NI;
@@ -365,7 +467,11 @@ impl DwMmc {
         pio.data.extend_from_slice(&value.to_le_bytes());
         if pio.data.len() >= pio.bytes {
             let pio = self.pio_write.take().expect("PIO write");
-            if let Some(lba) = pio.lba {
+            if let Some((func, addr, incr)) = self.sdio_target.take() {
+                if let Some(c) = self.sdio.as_mut() {
+                    c.write_ext(func, addr, incr, &pio.data[..pio.bytes]);
+                }
+            } else if let Some(lba) = pio.lba {
                 self.card.write_blocks(lba, &pio.data[..pio.bytes]);
             }
             self.regs[TCBCNT / 4] = pio.bytes as u32;

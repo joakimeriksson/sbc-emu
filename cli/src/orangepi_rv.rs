@@ -34,6 +34,10 @@ impl SerialBoard for Machine {
                 eprintln!("[{tag}] hart {h}: last illegal instruction {insn:#010x} at {pc:#x}");
             }
         }
+        if let Some(x) = self.soc.pcie[0].xhci.as_ref() {
+            let devs: Vec<String> = x.attached().iter().map(|d| format!("{d:?}")).collect();
+            eprintln!("[{tag}] USB (VL805): {}; PCIe0: {}", devs.join(", "), self.soc.pcie[0].summary());
+        }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
         }
@@ -64,6 +68,15 @@ impl Screen for Machine {
     fn name(&self) -> &'static str {
         "sbc-emu: Orange Pi RV"
     }
+    fn key(&mut self, usage: u8, down: bool) {
+        self.soc.usb.kbd.key(usage, down);
+    }
+    fn type_byte(&mut self, b: u8) {
+        self.soc.usb.kbd.type_byte(b);
+    }
+    fn pointer(&mut self, buttons: u8, x: u16, y: u16, wheel: i8) {
+        self.soc.usb.tablet.pointer(buttons, x, y, wheel);
+    }
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -91,7 +104,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             checked.push(a.clone());
         }
     }
-    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode"])?;
+    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive"])?;
     let mode = match arg(args, "--hdmi-mode") {
         Some(spec) => {
             let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
@@ -120,9 +133,16 @@ fn execute(args: &[String]) -> Result<(), String> {
     let disk = arg(args, "--sd")
         .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
         .transpose()?;
+    // --usb-drive IMAGE: a USB stick in one of the VL805's USB-A ports (copy-on-write; each
+    // boot starts from the image)
+    let usb_drive = arg(args, "--usb-drive");
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::new(ram);
         m.soc.display = Display::new(mode);
+        if let Some(path) = usb_drive {
+            let d = crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?;
+            m.soc.attach_usb_drive(Box::new(d));
+        }
         if net != "none" {
             m.connect_network(net == "nat", false);
         }
@@ -140,7 +160,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }
