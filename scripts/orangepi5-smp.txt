@@ -1,0 +1,16 @@
+# All eight cores of the RK3588S on the Armbian image:
+#   --board orangepi5 --sd Armbian.img --append init=/bin/bash
+# four Cortex-A55 (part 0xd05) and four Cortex-A76 (part 0xd0b); work pinned to each core
+# finishes there; IPIs and per-core timers count on every core; the scheduler sees the
+# A76s as the big cores (capacity 1024 against 397, from 1024 vs 530 DMIPS/MHz at 2.4/1.8 GHz).
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; echo CPUS_$(nproc); grep -c 'CPU part.*0xd05' /proc/cpuinfo | sed 's/^/A55_/'; grep -c 'CPU part.*0xd0b' /proc/cpuinfo | sed 's/^/A76_/'\n
+wait-serial CPUS_8
+wait-serial A55_4
+wait-serial A76_4
+serial for i in 0 1 2 3 4 5 6 7; do taskset -c $i sh -c 'n=0; while [ $n -lt 3000 ]; do n=$((n+1)); done; echo CORE_$(cut -d" " -f39 /proc/self/stat)_DONE' & done; wait; echo ALL_DONE\n
+wait-serial ALL_DONE
+serial grep -E 'IPI0|arch_timer' /proc/interrupts; echo CAPACITY $(cat /sys/devices/system/cpu/cpu*/cpu_capacity); echo SMP_$((6*7))\n
+wait-serial CAPACITY 397 397 397 397 1024 1024 1024 1024
+wait-serial SMP_42
+quit

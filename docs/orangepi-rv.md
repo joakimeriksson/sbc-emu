@@ -37,9 +37,31 @@ sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $V/Image \
 # SBC_NET_LOG=1 in the environment logs the NAT's DHCP, ARP, TCP and UDP relaying
 ```
 
-The boot is the board's own chain from the second stage on. On the board, the mask ROM
-loads U-Boot SPL, which trains DRAM and starts OpenSBI's `fw_dynamic` at 0x4000_0000 on
-every U74, followed by U-Boot. Here the emulator plays the SPL and U-Boot parts:
+There are two ways to boot.
+
+**From the microSD card, through the board's own boot chain** (no `--kernel`):
+
+```sh
+scripts/orangepi-rv-uboot.sh   # mainline U-Boot v2026.10 in Docker, and a bootable card -> cache/orangepi-rv/uboot/
+sbc-emu run --board orangepi-rv --sd cache/orangepi-rv/uboot/sdcard.img
+```
+
+1. **The mask ROM** (modelled, not run): the boot-mode straps select SD. The ROM reads the
+   SPL header at the start of the card, or at its backup offset (2 MiB, the `spl`
+   partition), checks its CRC-32, copies U-Boot SPL into the 2 MiB L2 LIM at 0x0800_0000,
+   and starts the four U74s there.
+2. **U-Boot SPL** (real) brings up the DDR controller. It reads the board EEPROM, whose
+   product ID `XOPIRV` makes it pick the Orange Pi RV device tree, then loads `u-boot.itb`
+   (OpenSBI and U-Boot) from GPT partition 2.
+3. **OpenSBI and U-Boot** (real): U-Boot shows `Model: Xunlong Orange Pi RV`, probes the SD
+   card, Ethernet (with the EEPROM's MAC address) and USB. Its distro boot finds
+   `/boot/extlinux/extlinux.conf` on partition 3 and starts Linux with the DTB and initramfs
+   named there.
+
+The card from `scripts/orangepi-rv-uboot.sh` carries the mainline fixture's kernel. Any
+card in StarFive's layout should boot the same way.
+
+**Directly** (`--kernel`, `--dtb`, `--firmware`): the emulator plays the SPL and U-Boot parts:
 - It loads OpenSBI at 0x4000_0000 and starts harts 1–4 there. A `fw_dynamic_info` names
   the kernel at 0x4020_0000 (S mode) as the next stage.
 - It loads the device tree at 0x4600_0000 and the initrd at 0x4610_0000, U-Boot's
@@ -65,6 +87,7 @@ them with its own DRM driver.
 |---|---|---|
 | CPU | RV64IMAFDC + Zicsr, Zifencei, Zicntr, Zba, Zbb (the U74's `rv64imafdc_zba_zbb`), M/S/U at privileged 1.11, Sv39 with superpages and hardware A/D, no ASIDs; all 166 riscv-tests in the U74's ISA pass (`rv64ui/um/ua/uc/uf/ud/si/mi/uzba/uzbb -p`) | `scripts/riscv-tests.sh`, `cargo test -p riscv64` |
 | Firmware | OpenSBI 1.8.1 reports `Platform Name: Xunlong Orange Pi RV`, 4 harts, aclint-mswi/mtimer, uart8250, `pm-reset` | `scripts/orangepi-rv-shell.txt` |
+| Boot chain | From the SD card: the boot ROM loads U-Boot SPL 2026.10. SPL brings up DDR and loads OpenSBI and U-Boot from the card. U-Boot reports `Model: Xunlong Orange Pi RV` and `eth0: ethernet@16030000`, then boots Linux from the card's `extlinux.conf`. Linux mounts the card, has the EEPROM's MAC address on `eth0`, and gets a DHCP lease. About 72 s wall, 20 s guest time | `scripts/orangepi-rv-uboot.txt` |
 | Shell | **mainline:** reaches the `orangepi-rv#` BusyBox prompt at about 3.3 s guest time (about 3.8 G instructions, 30 s wall on an M-series Mac). Checked in the script: `uname -a`; the DT model `Xunlong Orange Pi RV`; 4 CPUs with `rv64imafdc_…_zba_zbb` and `mmu: sv39`; `free -m` 3934 MB; double-precision `awk` math; `sleep 1`; timer and IPI interrupts on all four CPUs; four parallel shell loops | `scripts/orangepi-rv-shell.txt` |
 | Reset | `reboot -f` resets through Linux's `gpio-restart` (GPIO35), and OpenSBI and Linux boot again. `poweroff -f` goes through OpenSBI SRST, then the AXP15060 PMIC's power register over I2C5, and the run ends | `scripts/orangepi-rv-reboot.txt` |
 | microSD | DesignWare MMC (SDIO1, IDMAC) with card detect on GPIO41: `mmc1: new high speed SDHC card`. A host-made ext4 card mounts; a 4 MiB file written by the guest verifies after dropping the page cache; `fstrim` works; the data survives a guest reboot. The same works on Xunlong's kernel | `scripts/orangepi-rv-sd.txt`, `scripts/orangepi-rv-board.txt` |
@@ -77,6 +100,7 @@ them with its own DRM driver.
 | HDMI audio | **Xunlong's kernel:** I2STX_4CH0 (DesignWare I2S) fed by the AXI DMA controller into the Inno HDMI: `Starfive-HDMI-Sound-Card`. `speaker-test -D hw:1,0 -t sine -f 440` at 48 kHz reaches `--audio-out` as a 440 Hz sine; the I2S paces the DMA at the rate its clock dividers give | `scripts/orangepi-rv-hdmi-audio.txt` |
 | HDMI (mainline) | The firmware framebuffer under `simpledrm`: `fb0` at 1280x720 with fbcon. The whole board on mainline in one run, about 45 s wall: microSD read/write; Ethernet with DHCP, ping and HTTP; the USB stick; the HDMI console, where a shell on `tty1` runs a command typed on the USB keyboard | `scripts/orangepi-rv-board-mainline.txt` |
 | HDMI | **Xunlong's kernel:** StarFive's DRM driver binds the DC8200 and the Inno HDMI. The connector is `connected`, with the monitor's EDID offering 1280x720, 1920x1080 and 640x480. The HDMI PHY is programmed for 74.25 MHz; `fb0` carries the kernel console (160x45) at 1280x720 with vblank interrupts. Output goes to VNC (`--vnc :N`), `--screenshot` and the script's `screenshot FILE` | `scripts/orangepi-rv-hdmi.txt`, `scripts/orangepi-rv-board.txt` |
+| GPU | The PowerVR BXE-4-32 with the open stack: mainline Linux's `powervr` driver in a kernel built with it (`scripts/orangepi-rv-gpu.sh`), and Mesa's PowerVR Vulkan driver. The driver probes the GPU node the firmware adds, loads the firmware file and boots the firmware, which the emulator plays. Runtime PM suspends and resumes the GPU. Mesa finds `PowerVR B-Series BXE-4-32 MC1`. A Vulkan compute dispatch (4096 invocations) gives correct results. Offscreen rendering clears and draws a colour-interpolated triangle, read back exactly. Debian's `vkcube --wsi display` shows the textured, lit cube on HDMI through KMS. Every pixel comes from Mesa's own shader programs, run on the emulated PDS and USC | `scripts/orangepi-rv-gpu.txt`, `scripts/orangepi-rv-gpu-vkcube.txt` |
 | Board devices | Xunlong's kernel: the AXP15060 regulators (`hdmi_1p8`, `hdmi_0p9`, `vcc_3v3`, `cpu_vdd`, …) on I2C5; the 24C04 board EEPROM; the temperature sensor; the crypto engine's PKA, which verifies the kernel's X.509 certificates with RSA | `scripts/orangepi-rv-board.txt` |
 
 The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`, about 25 s wall):
@@ -86,6 +110,10 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 - the HDMI console, where a shell on `tty1` runs a command typed on the USB keyboard.
 
 ![HDMI output](img/orangepi-rv-hdmi.png)
+
+`vkcube` on the PowerVR BXE-4-32 (mainline `powervr`, Mesa's PowerVR Vulkan driver, 640x480):
+
+![vkcube](img/orangepi-rv-vkcube.png)
 
 ## What is modelled
 
@@ -119,8 +147,26 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - The PWM DAC: transfers to it are paced by its sample rate, computed from the SYSCRG dividers and CNT_N.
   - I2STX_4CH0, the DesignWare I2S that feeds the Inno HDMI: paced by MCLK over its dividers and the word length.
 - **`crypto.rs`:** the security engine's PKA, a Montgomery engine running the vendor driver's RSA sequence. The AES and SHA engines are not modelled.
+- **`powervr/`: the GPU**, a PowerVR BXE-4-32 (BVNC 36.50.54.182).
+  - Linux's `powervr` driver does not program the GPU's pipelines. It hands work to firmware on a MIPS microcontroller inside the GPU, through command rings in memory.
+  - The model has the registers the driver uses: BVNC, reset, idle and MMU status, the MIPS wrapper and its interrupt, and the MTS doorbell.
+  - It plays the firmware at that interface. It boots when the driver releases the MIPS core from reset, and finds the driver's init structures through the driver's MIPS page table. It reports the firmware started and idle, and serves the kernel command ring: power requests, MMU cache flushes, health checks and cleanups.
+  - Imagination publishes no open-driver firmware for this core, so `powervr::firmware` makes the file the driver loads. It has the header, the MIPS layout and the core's device info (errata, enhancements and features from Imagination's DDK table and Mesa's `bxe-4-32.h`), and no firmware code.
+  - It runs the jobs. Compute (CDM) dispatches kernels as PDS tasks.
+  - Geometry (VDM) runs the vertex programs, clips (Sutherland-Hodgman, against w and z), culls and applies the viewport.
+  - Fragment (16x16 tiles) runs the background object, edge-function rasterisation with depth, the coefficient and fragment programs in 2x2 quads (for derivatives), and the end-of-tile program through the PBE.
+  - Transfer (TQ_3D) copies run the same tile loop.
+  - `pds.rs` and `usc.rs` interpret the PDS and Rogue USC instruction sets, as far as Mesa's programs use them. `tpu.rs` samples textures: twiddled or strided, point or bilinear, with mip levels, LOD, wrap modes and sRGB.
+  - Anything unmodelled faults loudly rather than rendering something wrong.
+  - The firmware adds a GPU node to mainline's device tree (`img,img-bxe-4-32`, `img,img-rogue`), which has none yet. The core is not on the driver's supported list, so it needs `powervr.exp_hw_support=1`.
+- **Boot devices** (`boot.rs`, `machine.rs`):
+  - The boot ROM's SD path and the 2 MiB L2 LIM at 0x0800_0000. The MMC's IDMAC reaches the LIM, where SPL keeps its buffers.
+  - The boot-mode straps (SD), the DDR controller's training handshake, and an idle QSPI controller.
+  - The 24C04 EEPROM in StarFive's format (`SFVF`, product `XOPIRVA1-2450-D004E000-…` with the DRAM size, MAC addresses, CRC-16s).
+  - The bus clock dividers at the board's rates (APB 49.5 MHz from PLL2).
 - **Other devices:**
   - The temperature sensor.
+  - The TRNG, whose numbers come from a deterministic generator (not entropy).
   - All other device pages are read-back stand-ins; every run lists them at the end.
 - **Virtual time:**
   - Each hart runs at 1 ns per instruction, round-robin in 1000-instruction slices.
@@ -130,10 +176,20 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 
 - **USB 2.0:** the SoC's own USB 2.0/OTG controller (Cadence, the board's USB-C data role) is not modelled. The devices are emulated: a keyboard, a tablet and a USB stick (`--usb-drive`; a guest reboot starts again from the image).
 - **Bluetooth on mainline:** mainline's DT leaves UART1 disabled and has no Bluetooth node. Bluetooth connections (ACL) are not modelled.
+- **GPU:**
+  - **Speed.** GPU work runs synchronously in the interpreter, so a 640x480 frame takes real time while guest time stands still.
+  - **Not modelled** (these fault): stencil, depth/stencil load/store, MSAA, points and lines, tessellation and geometry shaders, occlusion queries, depth bias, odd-stride transfers (FAST_2D) and anisotropic filtering.
+  - **No OpenGL:** OpenGL through Zink is not set up.
+  - Xunlong's kernel and its closed driver (`pvrsrvkm`) are not supported: their firmware is closed, and that driver gives up without it.
 - **Not modelled:**
-  - the PowerVR GPU (Xunlong's kernel loads no firmware, and the driver gives up);
   - MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
 - **Mainline HDMI:** only the firmware's fixed-mode framebuffer is available (no mode setting, no hot-plug). Mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
-- **Firmware:** no mask ROM, U-Boot SPL or U-Boot. Mainline U-Boot recognises the board (EEPROM product ID `XOPIRV`, since 2026.07) and would need the DDR controller, QSPI/SD boot and the EEPROM contents.
+- **Boot chain:**
+  - The mask ROM is modelled, not executed (StarFive's ROM image is not public), and only its SD path is.
+  - The DDR controller completes training at once, and its PHY reports no frequency changes.
+  - The SPI NOR flash is absent: the QSPI controller answers, but no flash returns a JEDEC ID, so U-Boot keeps its default environment and cannot boot from SPI.
+  - The SDIO slot holds the Wi-Fi chip, so U-Boot's probe of it as an SD card fails with "Card did not respond to voltage select". That is harmless.
+  - **No HDMI console for mainline after an SD boot.** Mainline U-Boot has no JH7110 display driver, so no framebuffer is handed over and `simpledrm` has nothing to drive. The same is true on the board. Xunlong's kernel on a card drives HDMI itself, and direct boot hands mainline the firmware framebuffer.
+  - SD boot needs `--ram-mb` 2048, 4096, 8192 or 16384: U-Boot takes the DRAM size from the EEPROM and knows only those.
 - **Distribution images:** Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried. The kernel they use is the one built here.
 - **Speed:** interpreter only, about 125 M instructions per second, all harts on one host thread.

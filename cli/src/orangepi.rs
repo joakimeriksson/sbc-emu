@@ -1,5 +1,5 @@
 //! Native serial-only RK3588S bring-up adapter. Unsupported Pi options fail explicitly.
-use crate::{arg, serial_board::{self, RunConfig, SerialBoard}};
+use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
 
@@ -9,21 +9,51 @@ use crate::disk::SharedDisk;
 impl SerialBoard for rk3588::Machine {
     fn host(&mut self) -> HostMachine<'_> { HostMachine::OrangePi5(self) }
     fn now(&self) -> u64 { rk3588::Machine::now(self) }
-    fn instret(&self) -> u64 { self.cpu.instret }
+    fn screen(&mut self) -> Option<&mut dyn Screen> { Some(self) }
+    fn instret(&self) -> u64 { rk3588::Machine::instret(self) }
     fn report(&self, tag: &str) {
         let m = self;
-        eprintln!("[{tag}] pc={:#x} insns={} virtual={:.3}s irqs={} acknowledgements={} exceptions={}",m.cpu.pc,m.cpu.instret,m.now() as f64/1e9,m.irqs,m.soc.gic.acknowledges,m.exceptions);
+        let pcs: Vec<String> = m.cpus.iter().zip(&m.state).map(|(c, s)| format!("{:#x}{}", c.pc, if *s == rk3588::CoreState::Off { "(off)" } else { "" })).collect();
+        eprintln!("[{tag}] pc={} insns={} virtual={:.3}s irqs={} acknowledgements={} exceptions={}",pcs.join(","),m.instret(),m.now() as f64/1e9,m.irqs,m.soc.gic.acknowledges,m.exceptions);
         if !m.soc.unknown.is_empty(){eprintln!("[{tag}] unmapped MMIO: {:x?}",m.soc.unknown);}
-        if !m.cpu.sys.unknown.is_empty(){eprintln!("[{tag}] unmodelled system registers: {:x?}",m.cpu.sys.unknown);}
+        let mut sys: Vec<u32> = m.cpus.iter().flat_map(|c| c.sys.unknown.iter().copied()).collect();
+        sys.sort_unstable(); sys.dedup();
+        if !sys.is_empty(){eprintln!("[{tag}] unmodelled system registers: {:x?}",sys);}
+        let usb: Vec<String> = m.soc.xhci.attached().iter().map(|d| format!("{d:?}")).collect();
+        eprintln!("[{tag}] USB: {}", usb.join(", "));
+        if let Some(n) = m.soc.pcie.nvme.as_ref() { eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes", n.reads, n.writes); }
+        if m.soc.display.frames.get() > 0 { eprintln!("[{tag}] HDMI: {} frames shown", m.soc.display.frames.get()); }
     }
+}
+
+impl Screen for rk3588::Machine {
+    fn shown_size(&self) -> Option<(u32, u32)> { self.soc.display.shown_size() }
+    fn display_size(&self) -> (u32, u32) { self.soc.display.shown_size().unwrap_or((1280, 720)) }
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.display.render(&self.soc.ram, out) }
+    fn name(&self) -> &'static str { "sbc-emu: Orange Pi 5" }
+    fn key(&mut self, usage: u8, down: bool) { self.soc.usb.kbd.key(usage, down); self.soc.dirty = true; }
+    fn type_byte(&mut self, b: u8) { self.soc.usb.kbd.type_byte(b); self.soc.dirty = true; }
+    fn pointer(&mut self, buttons: u8, x: u16, y: u16, wheel: i8) { self.soc.usb.tablet.pointer(buttons, x, y, wheel); self.soc.dirty = true; }
 }
 
 pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net"])?;
-    if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme"])?;
+    // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
+    let multi=match arg(args,"--threads") { None|Some("single")=>false, Some("multi")=>true, Some(_)=>return Err("--threads single|multi".into()) };
+    let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
+    // HDMI: the firmware's framebuffer at the monitor's preferred mode, unless --no-display
+    if arg(args,"--hdmi-mode").is_some() && args.iter().any(|a|a=="--no-display") {return Err("--hdmi-mode and --no-display contradict each other".into());}
+    let hdmi=match arg(args,"--hdmi-mode") {
+        Some(spec)=>{
+            let (w,h)=spec.split_once('x').ok_or("--hdmi-mode WxH")?;
+            let (w,h)=(w.parse().map_err(|_|"--hdmi-mode WxH")?,h.parse().map_err(|_|"--hdmi-mode WxH")?);
+            Some(rk3588::display::Mode::find(w,h).ok_or("--hdmi-mode: the emulated monitor offers 1280x720, 1920x1080 and 640x480")?)
+        }
+        None=>(!args.iter().any(|a|a=="--no-display")).then_some(rk3588::display::Mode::MODES[0]),
+    };
     let gpu=arg(args,"--gpu").unwrap_or("none");
     if !["none","probe"].contains(&gpu) {return Err("--gpu accepts none or probe (experimental, no rendering)".into());}
     let net=arg(args,"--net").unwrap_or("nat");
@@ -38,8 +68,18 @@ fn execute(args:&[String])->Result<(),String> {
     let persist=args.iter().any(|a|a=="--sd-persist");
     let disk=arg(args,"--sd").map(|p|SharedDisk::open(p,persist).map_err(|e|format!("{p}: {e}"))).transpose()?;
     let make_machine=||->Result<rk3588::Machine,String>{
-        let mut m=rk3588::Machine::new(ram)?;
+        let mut m=rk3588::Machine::with_cpus(ram,smp)?;
         m.gpu_probe=gpu=="probe";
+        m.multi=multi;
+        if let Some(mode)=hdmi { m.enable_hdmi(mode); }
+        // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
+        // --nvme IMAGE: an NVMe SSD in the M.2 slot (copy-on-write; each boot starts from the image)
+        if let Some(path)=arg(args,"--nvme") {
+            m.attach_nvme(Box::new(crate::disk::CowFile::open(path).map_err(|e|format!("{path}: {e}"))?));
+        }
+        if let Some(path)=arg(args,"--usb-drive") {
+            m.attach_usb_drive(Box::new(crate::disk::CowFile::open(path).map_err(|e|format!("{path}: {e}"))?));
+        }
         if net != "none" { m.connect_network(net == "nat", false); }
         m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
         if let Some(kernel)=kernel.as_ref() {
@@ -50,14 +90,13 @@ fn execute(args:&[String])->Result<(),String> {
             let bootargs=image_cmdline(&card.cmdline,arg(args,"--append"));
             rk3588::boot::boot_linux(&mut m,&card.kernel,card.initrd.as_deref(),&bootargs)?;
         }
-        if !args.iter().any(|a|a=="--no-jit") {m.cpu.enable_jit();}
+        if !args.iter().any(|a|a=="--no-jit") {m.enable_jit();}
         Ok(m)
     };
-    if kernel.is_none() && arg(args,"--dump-dtb").is_some() {return Err("--dump-dtb is not yet supported for SD image boot".into());}
     if let Some(path)=arg(args,"--dump-dtb") {
-        std::fs::write(path,rk3588::boot::device_tree_gpu(ram as u64,cmdline,initrd.as_ref().map(|d|(rk3588::boot::INITRD,rk3588::boot::INITRD+d.len() as u64)),disk.is_some(),gpu=="probe")).map_err(|e|e.to_string())?;
+        std::fs::write(path,&make_machine()?.dtb).map_err(|e|format!("{path}: {e}"))?;
     }
-    eprintln!("[orangepi5] experimental RK3588S: one reduced Cortex-A55, GICv3, UART2; emulated firmware, reduced DT");
+    eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2, microSD, Ethernet, USB (keyboard, tablet{}), HDMI ({}); emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4),if arg(args,"--usb-drive").is_some() {", stick"} else {""},hdmi.map_or("off".to_string(),|m|format!("{}x{} framebuffer",m.width,m.height)));
     serial_board::run(config, make_machine)
 }
 

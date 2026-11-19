@@ -72,7 +72,8 @@ fn screenshot<B: SerialBoard>(m: &mut B, tag: &str, path: &str) {
     }
 }
 
-/// Options every serial board accepts; `extra` lists board-specific valued options.
+/// Options every serial board accepts; `extra` lists board-specific valued options. A board
+/// that lists `--smp` there checks its core count itself; the others run one core.
 pub(crate) fn validate_options(args: &[String], extra: &[&str]) -> Result<(), String> {
     const COMMON: [&str; 9] = [
         "--board", "--kernel", "--initrd", "--append", "--script", "--timeout", "--max-insns",
@@ -95,7 +96,7 @@ pub(crate) fn validate_options(args: &[String], extra: &[&str]) -> Result<(), St
         }
         index += 2;
     }
-    if arg(args, "--smp").is_some_and(|s| s != "1") {
+    if !extra.contains(&"--smp") && arg(args, "--smp").is_some_and(|s| s != "1") {
         return Err("only --smp 1 is implemented for this board".into());
     }
     Ok(())
