@@ -20,9 +20,20 @@ impl Exc {
     pub const BRK: u32 = 0x3c;
 }
 
+/// A `chain_until` that never runs out (the largest the generated code's signed test allows).
+pub const UNBOUNDED: u64 = i64::MAX as u64;
+
 /// Entries per micro-TLB (a power of two). At most 256: compiled code reaches the `Cpu`
 /// fields laid out after the tables with short immediate offsets (512 breaks that).
 pub(crate) const UT: usize = 256;
+/// The micro-TLBs are 2-way set associative: set `s` is entries `2s` (way 0, most recently
+/// used) and `2s + 1`. Set of virtual address `va`, as its way-0 entry index: the page number
+/// XOR-folded with itself shifted by 8 (pages that differ only in high bits, like a program's
+/// data and its mmap heap at the same low page bits, would otherwise share a set). Generated
+/// code computes the same: `eor x, va, va, lsr #8; ubfx x, x, #12, #log2(UT / 2)`, entries
+/// 32 bytes apart.
+#[inline(always)]
+pub(crate) fn uti(va: u64) -> usize { (((va ^ (va >> 8)) >> 12) as usize & (UT / 2 - 1)) * 2 }
 
 /// Board-selected CPU identity. ISA feature registers still advertise implemented features only.
 #[derive(Clone, Copy, Debug)]
@@ -104,13 +115,15 @@ pub struct Cpu {
     pub(crate) store_log: Option<Vec<(usize, Vec<u8>)>>,
     /// Block chaining (native JIT): compiled blocks jump straight into their successors while
     /// `instret < chain_until` (0, the default, never chains); the caller sets it to the next
-    /// instant it must look at the machine (budget end, device deadline).
+    /// instant it must look at the machine (budget end, device deadline). Generated code tests
+    /// `instret - chain_until` for its sign, so a budget is at most `UNBOUNDED`.
     pub chain_until: u64,
     /// set when an instruction run inside a block may need the machine's attention (device
     /// access, system register, exception level change, ...): the chain stops after the block
     pub(crate) chain_stop: bool,
-    /// the native JIT's block dispatcher (code address)
+    /// the native JIT's block dispatcher and exit stub (code addresses)
     pub(crate) jit_disp: u64,
+    pub(crate) jit_exit: u64,
     /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
     pub last_wfe: bool,
     /// multi-threaded run: cores execute in parallel on shared memory, so barriers and
@@ -186,7 +199,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
         }
     }
 
@@ -437,7 +450,7 @@ impl Cpu {
 
     /// Tests: a small code buffer and compile-on-first-use, when `SBC_JIT=1` is set.
     pub fn enable_test_jit_from_env(&mut self) {
-        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); self.chain_until = u64::MAX; }
+        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); self.chain_until = UNBOUNDED; }
     }
 }
 
@@ -453,7 +466,7 @@ impl Cpu {
     /// all cores.
     pub fn hand_jit_to(&mut self, other: &mut Cpu) {
         if other.jit.is_some() { return; } // it has its own (multi-threaded runs)
-        if let Some(j) = self.jit.take() { other.jit = Some(j); other.jit_disp = self.jit_disp; }
+        if let Some(j) = self.jit.take() { other.jit = Some(j); other.jit_disp = self.jit_disp; other.jit_exit = self.jit_exit; }
     }
 
     /// Address of `chain_until`: another thread may store 0 there (atomically) to make this core
