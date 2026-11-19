@@ -47,7 +47,7 @@ the browser (WebAssembly). The [sbc-emu page](web/index.html) runs its 3D demos 
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
-| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 37 s on four cores in turns, 29 s with a host thread per core (`--threads multi`); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 26 s on four cores in turns, 17.5 s with a host thread per core (`--threads multi`); faster than QEMU's TCG on the workloads [below](#compared-with-qemus-raspi4b) except SHA-256; all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
 | Floating point | exact Arm semantics: FPCR rounding modes, flush-to-zero, default NaN, all FPSR exception flags, Arm's estimate tables | `diff_fp.rs`: 18,800 random cases bit-exact against the host CPU (interpreter and JIT) |
 | More peripherals | DMA controller, hardware RNG, thermal sensor, PM watchdog and power domains, system timer, mini UART | stock drivers bind: `/dev/hwrng`, `/sys/class/thermal`, `/dev/watchdog` (expiry reboots), `ttyS0`, `dma0chan*` |
 | Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core, breakpoints and watchpoints), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
@@ -318,6 +318,25 @@ nothing for what the page does not mention. QEMU also models the raspi0, 1A+, 2B
 | Cores on host threads | `--threads multi` (or in turns, repeatable to the instruction) | not on the board page (QEMU's MTTCG) |
 | In the browser | yes (WebAssembly build with its own JIT) | no |
 
+Speed, measured (not from QEMU's documentation): the same Raspberry Pi OS image and kernel, four
+cores, 2 GiB, on an Apple silicon Mac; QEMU 11.1.3 `raspi4b` with multi-threaded TCG, sbc-emu
+`--threads multi`. Host wall-clock times (sbc-emu's guest clock is virtual, so its times are taken
+from the host between serial markers); single runs, on a host with other jobs, so ±10%.
+
+| | sbc-emu | QEMU `raspi4b` |
+|---|---|---|
+| Boot to `login:` | 17.5 s | 42–51 s |
+| 1500 × `/bin/true` (process creation) | 6.2 s | 7.3 s |
+| `find /usr -type f` three times (file system, system calls) | 1.7 s | 6.9 s |
+| `python3`: sum of 10 M squares | 3.4 s | 4.0 s |
+| the same, four at once | 3.9 s | 4.9 s |
+| `sha256sum` of 1 GB of zeros | 5.4 s | 4.5 s |
+| glmark2 at 1920×1080 | score 73 | no 3D GPU |
+
+QEMU needed three changes to boot the image at all: the kernel uncompressed, the Bluetooth node
+removed from the device tree (its PL011 is the console), and `systemd.watchdog_sec=off` (its
+watchdog model reset the board every few seconds); sbc-emu boots the stock SD image.
+
 ## 32-bit programs
 
 The Pi 4's Cortex-A72 runs 32-bit (AArch32) programs at EL0 under a 64-bit kernel, and so does
@@ -345,10 +364,13 @@ fences, as for 64-bit code.
 ## The JIT
 
 `arm-a64/src/jit.rs`. Guest and host share the A64 instruction set, so integer and FP/SIMD
-data-processing instructions are emitted as themselves with guest registers renamed to host
-temporaries — the host computes exactly the architected result, flags included. Loads and stores
-probe the core's micro-TLB inline and fall back to the interpreter; system instructions, exception
-generation and ERET call the interpreter and end the block. FP/SIMD instructions run natively only
+data-processing instructions are emitted as themselves with guest registers renamed to the host
+registers that cache them — the host computes exactly the architected result, flags included.
+Inside a block guest X registers and SP live in host x0–x8/x22–x28 and V registers in v16–v31
+(loaded on first use, written back before exits and interpreter calls); the guest NZCV stays in the
+host flags, also across linked branches and the dispatcher. Loads and stores probe the core's
+micro-TLB inline, with an interpreter slow path placed after the block; system instructions,
+exception generation and ERET call the interpreter and end the block. FP/SIMD instructions run natively only
 after the interpreter has proven it implements them (so extensions the emulated Cortex-A72 lacks
 stay undefined). Blocks are keyed by virtual and physical PC, EL, SPSel and FP enable, and are
 discarded on `IC IVAU`/`IC IALLU` (CTR_EL0.DIC = 0 obliges software to issue them). Every CPU test
@@ -369,6 +391,8 @@ with `--no-display`; single runs, some next to other jobs, so ±10%):
 | 256-entry micro-TLBs (fetch misses 110 M → 33 M; more would push `Cpu` fields that compiled code reaches by immediate offsets out of range) | 46.5 s |
 | native FMOV between X/W and D/S registers, LDNP/STNP, DC ZVA (64-byte zeroing), DUP from a general register, one-register LD1/ST1 (the most frequent instructions compiled blocks still handed to the interpreter) | 42.4 s |
 | ADMA2 on the SD card (the driver moved every sector through the data port, 4 bytes per load) | 36.9 s |
+| main in November 2026 (V3D, display and device work since; the next row's baseline) | 29.6 s |
+| guest registers cached in host registers (16 X, 16 V) instead of loaded and stored around every instruction; load/store slow paths out of line; the micro-TLBs 2-way set associative with a hashed index (python3's data and its mmap heap shared a direct-mapped slot: ~10 M interpreter fallbacks per second); an enter stub instead of a prologue per block, with instret and the RAM base in host registers and NZCV live across linked blocks | 26.4 s (17.5 s with `--threads multi`) |
 
 Blocks average about 5 guest instructions; a chain now runs about 100 before it returns to the
 machine loop. A chain stops at the budget/deadline and whenever an interpreted instruction may need
@@ -378,6 +402,9 @@ Debugging switches: `SBC_JIT_VERIFY=1` re-runs every block in the interpreter fr
 (stores rolled back; blocks whose code changed before an `IC`, or that touched a device, are
 skipped) and reports the first mismatch; `SBC_JIT_PROFILE=1` prints the instruction words compiled
 blocks still hand to the interpreter; `SBC_JIT_CHAIN=0` turns chaining and linking off;
+`SBC_JIT_MAP=FILE` writes the host address, size and guest PC of every compiled block (to attribute
+host profiler samples, e.g. from `samply`); `SBC_JIT_DUMP=<pc>` writes a block's guest and host
+instruction words to `jit-<pc>.guest`/`.host`;
 `SBC_JIT_WATCH=<page>` traces compiles and invalidations on one physical page.
 
 ### In the browser

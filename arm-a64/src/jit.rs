@@ -1,12 +1,18 @@
 //! A64 → A64 block JIT (AArch64 macOS/Linux hosts).
 //!
-//! Guest and host share the instruction set, so integer data-processing instructions are
-//! emitted *as themselves* with the guest registers renamed to host temporaries: the host CPU
-//! computes exactly the architected result, flags included. Guest NZCV stays in the host flags
-//! for the whole block. Branches end a block and compute the next PC natively. Every other
-//! instruction (loads/stores, FP/SIMD, system) calls back into the interpreter for that single
-//! instruction, so memory, MMU faults, exceptions and devices keep the interpreter's exact
-//! semantics; system instructions, exception generation and ERET end the block.
+//! Guest and host share the instruction set, so integer and FP/SIMD data-processing
+//! instructions are emitted *as themselves* with the guest registers renamed to the host
+//! registers that cache them: the host computes exactly the architected result, flags included.
+//! Inside a block guest X registers and SP live in x0-x8/x22-x28 and V registers in v16-v31
+//! (loaded on first use, written back before exits and interpreter calls); guest NZCV stays in
+//! the host flags, also across linked branches and the dispatcher. Loads and stores probe the
+//! core's micro-TLB inline (a slow path after the block calls the interpreter); system
+//! instructions, exception generation and ERET call the interpreter and end the block, so
+//! memory, MMU faults, exceptions and devices keep the interpreter's exact semantics.
+//!
+//! Rust enters compiled code through an enter stub (x19 = Cpu, x20 = instret, x21 = guest RAM);
+//! block exits branch straight into the next block (same page, patched in) or through the
+//! shared dispatcher while `instret < chain_until`, and return through the exit stub.
 //!
 //! Blocks are keyed by physical address, exception level and SPSel and never cross a 4 KiB
 //! page. They are discarded by `IC IALLU[IS]` / `IC IVAU` — the cache maintenance software must
