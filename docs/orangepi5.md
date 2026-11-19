@@ -1,6 +1,6 @@
 # Orange Pi 5 experimental direct boot
 
-The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer (see below). USB, wireless and snapshots are not implemented.
+The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer, and the USB 3.0 host carries a keyboard, a tablet and an optional USB stick (see below). Wireless and snapshots are not implemented.
 
 ## Cores
 
@@ -76,7 +76,15 @@ The emulated firmware sets up HDMI0 as U-Boot does on boards whose display the k
 
 `--vnc :N` shows the output to a VNC viewer, `--screenshot OUT.png` and the script's `screenshot FILE` save it, `--hdmi-mode 1280x720|1920x1080|640x480` picks the mode, and `--no-display` turns HDMI off. `scripts/orangepi5-hdmi.txt` boots the image to Armbian's first-run prompt and takes a screenshot. `--dump-dtb FILE` writes the device tree the run booted with, also for SD image boots.
 
-The VOP2 and the HDMI/eDP transmitters are not modelled, so mode setting and hot-plug do not work, and the kernel's own Rockchip DRM driver has no node to bind. There is no keyboard or pointer yet (USB is not modelled).
+The VOP2 and the HDMI/eDP transmitters are not modelled, so mode setting and hot-plug do not work, and the kernel's own Rockchip DRM driver has no node to bind. The VNC keyboard and pointer are the USB keyboard and tablet.
 
 ![HDMI output](img/orangepi5-hdmi.png)
+
+## USB
+
+The RK3588S's USB 3.0 host (`usb_host2_xhci` at 0xfcd00000, the board's USB-A port, SPI 222) is described as a platform `generic-xhci`, as the firmware leaves its DWC3 glue in host mode, and Linux drives it with `xhci-plat-hcd`. The xHCI register model is the one the Raspberry Pi 4 and Orange Pi RV boards use (the VL805's). A keyboard and a tablet are always plugged in; `--usb-drive IMAGE` adds a USB stick (copy-on-write, each boot starts from the image).
+
+`scripts/orangepi5-usb.txt` (Armbian, `--usb-drive stick.img --append init=/bin/bash`) checks that the three devices enumerate, that a key typed on the USB keyboard arrives as an input event, and that the stick's ext4 filesystem mounts and a 2 MiB file written to it verifies after dropping the page cache.
+
+Limits: the root hub reports four USB 2.0 and four USB 3.0 ports (the VL805's layout, not the DWC3's one of each), and the devices are full/high speed on the USB 2.0 ports. The USB 2.0 hosts (EHCI/OHCI), the USB-C OTG port and the DWC3 global registers are not modelled.
 

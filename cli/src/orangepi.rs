@@ -19,6 +19,8 @@ impl SerialBoard for rk3588::Machine {
         let mut sys: Vec<u32> = m.cpus.iter().flat_map(|c| c.sys.unknown.iter().copied()).collect();
         sys.sort_unstable(); sys.dedup();
         if !sys.is_empty(){eprintln!("[{tag}] unmodelled system registers: {:x?}",sys);}
+        let usb: Vec<String> = m.soc.xhci.attached().iter().map(|d| format!("{d:?}")).collect();
+        eprintln!("[{tag}] USB: {}", usb.join(", "));
         if m.soc.display.frames.get() > 0 { eprintln!("[{tag}] HDMI: {} frames shown", m.soc.display.frames.get()); }
     }
 }
@@ -28,13 +30,16 @@ impl Screen for rk3588::Machine {
     fn display_size(&self) -> (u32, u32) { self.soc.display.shown_size().unwrap_or((1280, 720)) }
     fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.display.render(&self.soc.ram, out) }
     fn name(&self) -> &'static str { "sbc-emu: Orange Pi 5" }
+    fn key(&mut self, usage: u8, down: bool) { self.soc.usb.kbd.key(usage, down); self.soc.dirty = true; }
+    fn type_byte(&mut self, b: u8) { self.soc.usb.kbd.type_byte(b); self.soc.dirty = true; }
+    fn pointer(&mut self, buttons: u8, x: u16, y: u16, wheel: i8) { self.soc.usb.tablet.pointer(buttons, x, y, wheel); self.soc.dirty = true; }
 }
 
 pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot"])?;
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive"])?;
     if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
     let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
     // HDMI: the firmware's framebuffer at the monitor's preferred mode, unless --no-display
@@ -63,6 +68,10 @@ fn execute(args:&[String])->Result<(),String> {
         let mut m=rk3588::Machine::with_cpus(ram,smp)?;
         m.gpu_probe=gpu=="probe";
         if let Some(mode)=hdmi { m.enable_hdmi(mode); }
+        // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
+        if let Some(path)=arg(args,"--usb-drive") {
+            m.attach_usb_drive(Box::new(crate::disk::CowFile::open(path).map_err(|e|format!("{path}: {e}"))?));
+        }
         if net != "none" { m.connect_network(net == "nat", false); }
         m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
         if let Some(kernel)=kernel.as_ref() {
@@ -79,7 +88,7 @@ fn execute(args:&[String])->Result<(),String> {
     if let Some(path)=arg(args,"--dump-dtb") {
         std::fs::write(path,&make_machine()?.dtb).map_err(|e|format!("{path}: {e}"))?;
     }
-    eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2, microSD, Ethernet, HDMI ({}); emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4),hdmi.map_or("off".to_string(),|m|format!("{}x{} framebuffer",m.width,m.height)));
+    eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2, microSD, Ethernet, USB (keyboard, tablet{}), HDMI ({}); emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4),if arg(args,"--usb-drive").is_some() {", stick"} else {""},hdmi.map_or("off".to_string(),|m|format!("{}x{} framebuffer",m.width,m.height)));
     serial_board::run(config, make_machine)
 }
 
