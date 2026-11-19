@@ -256,6 +256,14 @@ fn watch_page() -> Option<u64> {
     *W.get_or_init(|| std::env::var("SBC_JIT_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
 }
 
+/// debugging: `SBC_JIT_MAP=FILE` appends "host-address bytes guest-pc words" for every block
+/// (and "dispatcher") written to the code buffer, to attribute host profiler samples
+fn code_map(start: usize, bytes: usize, what: &str) {
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| std::env::var("SBC_JIT_MAP").ok().and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok()).map(std::sync::Mutex::new));
+    if let Some(f) = f { use std::io::Write; let _ = writeln!(f.lock().unwrap(), "{start:x} {bytes} {what}"); }
+}
+
 /// Hash of the instruction words a block at `pa` may span (to the end of its page).
 fn code_hash(cpu: &Cpu, pa: u64) -> u64 {
     let end = ((pa | 0xfff) + 1).min(pa + 4 * MAX_INSNS as u64).min(cpu.ram_len);
@@ -278,6 +286,16 @@ const T: [u32; 4] = [9, 10, 11, 12]; // temporaries for guest registers
 const X_SCRATCH: u32 = 13;
 /// callee-saved: natives executed since the last flush to instret
 const X_COUNT: u32 = 20;
+/// Host registers that cache guest general registers inside a block. They are caller-saved:
+/// before any call out of generated code (the interpreter) and before every exit, changed
+/// values are written back to `Cpu`; after a call they are forgotten or reloaded.
+const CACHE: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+/// cache key of the guest stack pointer (0..=30 are X0..X30)
+const SP_G: u32 = 31;
+
+/// One host register of the guest register cache.
+#[derive(Clone, Copy, Default)]
+struct Slot { guest: Option<u32>, dirty: bool, used: u32, pinned: bool }
 
 fn ldr_x(rt: u32, rn: u32, off: usize) -> u32 { debug_assert!(off % 8 == 0 && off < 32768); 0xf940_0000 | (((off / 8) as u32) << 10) | (rn << 5) | rt }
 fn str_x(rt: u32, rn: u32, off: usize) -> u32 { debug_assert!(off % 8 == 0 && off < 32768); 0xf900_0000 | (((off / 8) as u32) << 10) | (rn << 5) | rt }
@@ -539,10 +557,63 @@ fn ctx() -> Ctx {
 struct Emit<'a> { out: Vec<u32>, c: &'a Ctx, sp_slot: usize, pending_native: u64, /** block runs native FP/SIMD: carry FPSR */ fpsr: bool,
                   /** chain to the next block: its key's mode bits (bits 48.. of `key`), None = plain return */ chain: Option<u32>,
                   /** virtual page of the block (targets there can be linked directly) */ page: u64,
-                  /** patchable direct branches: (word index, target pc) */ links: Vec<(usize, u64)> }
+                  /** patchable direct branches: (word index, target pc) */ links: Vec<(usize, u64)>,
+                  /** guest registers held in `CACHE` */ ra: [Slot; CACHE.len()], tick: u32,
+                  /** load/store slow paths, emitted after the block */ slow_paths: Vec<SlowPath> }
 
 impl Emit<'_> {
     fn reg_off(&self, r: u32) -> usize { self.c.off_x + 8 * r as usize }
+    /// `Cpu` offset of cache key `g` (a general register, or the SP of the current EL)
+    fn g_off(&self, g: u32) -> usize { if g == SP_G { self.sp_slot } else { self.reg_off(g) } }
+    /// Cache key of register field value `r` read as `how`; None = the zero register.
+    fn key_of(r: u32, how: R) -> Option<u32> { if r != 31 { Some(r) } else if how == R::Sp { Some(SP_G) } else { None } }
+    /// A host register holding guest register `g` for the current instruction (pinned until
+    /// `unpin`), loaded from `Cpu` when `load` and not cached yet. Evicts the least recently
+    /// used unpinned register, writing it back if changed.
+    fn alloc(&mut self, g: u32, load: bool) -> u32 {
+        self.tick += 1;
+        if let Some(k) = self.ra.iter().position(|s| s.guest == Some(g)) {
+            self.ra[k].used = self.tick;
+            self.ra[k].pinned = true;
+            return CACHE[k];
+        }
+        let k = self.ra.iter().position(|s| s.guest.is_none()).unwrap_or_else(|| {
+            (0..CACHE.len()).filter(|&k| !self.ra[k].pinned).min_by_key(|&k| self.ra[k].used).expect("an unpinned cache register")
+        });
+        if let (Some(old), true) = (self.ra[k].guest, self.ra[k].dirty) { self.out.push(str_x(CACHE[k], X_CPU, self.g_off(old))); }
+        if load { self.out.push(ldr_x(CACHE[k], X_CPU, self.g_off(g))); }
+        self.ra[k] = Slot { guest: Some(g), dirty: false, used: self.tick, pinned: true };
+        CACHE[k]
+    }
+    /// Host register to read register field `r` from (31 = the zero register when `how` is Zr).
+    fn get(&mut self, r: u32, how: R) -> u32 { match Self::key_of(r, how) { Some(g) => self.alloc(g, true), None => 31 } }
+    /// Host register to write register field `r` into (not loaded: the caller writes all of it
+    /// and then calls `dirty`). Reading sources first keeps a source that is also the
+    /// destination loaded.
+    fn def(&mut self, r: u32, how: R) -> u32 { match Self::key_of(r, how) { Some(g) => self.alloc(g, false), None => 31 } }
+    /// The cached register for field `r` now holds a new guest value.
+    fn dirty(&mut self, r: u32, how: R) {
+        if let Some(g) = Self::key_of(r, how) {
+            if let Some(s) = self.ra.iter_mut().find(|s| s.guest == Some(g)) { s.dirty = true; }
+        }
+    }
+    fn unpin(&mut self) { for s in &mut self.ra { s.pinned = false; } }
+    /// Stores of the changed cached registers (the state is left as it is: for slow paths).
+    fn spill_code(&self) -> Vec<u32> {
+        (0..CACHE.len()).filter_map(|k| match self.ra[k] { Slot { guest: Some(g), dirty: true, .. } => Some(str_x(CACHE[k], X_CPU, self.g_off(g))), _ => None }).collect()
+    }
+    /// Loads of every cached register (after a slow path's interpreter call).
+    fn reload_code(&self) -> Vec<u32> {
+        (0..CACHE.len()).filter_map(|k| self.ra[k].guest.map(|g| ldr_x(CACHE[k], X_CPU, self.g_off(g)))).collect()
+    }
+    /// Write the changed registers back (they stay cached, now clean).
+    fn ra_flush(&mut self) {
+        let st = self.spill_code();
+        self.out.extend(st);
+        for s in &mut self.ra { s.dirty = false; }
+    }
+    /// Drop the cache (the interpreter may have changed any register in `Cpu`).
+    fn ra_forget(&mut self) { self.ra = [Slot::default(); CACHE.len()]; }
     /// Fold the compile-time count of natives into x20 (the run-time native counter).
     fn count_pending(&mut self) {
         if self.pending_native == 0 { return; }
@@ -605,12 +676,6 @@ impl Emit<'_> {
         self.ret(0);
     }
     fn set_pc_const(&mut self, pc: u64) { mov64(&mut self.out, X_SCRATCH, pc); self.out.push(str_x(X_SCRATCH, X_CPU, self.c.off_pc)); }
-    fn load_guest(&mut self, host: u32, r: u32, how: R) {
-        if r == 31 { if how == R::Sp { self.out.push(ldr_x(host, X_CPU, self.sp_slot)); } } else { self.out.push(ldr_x(host, X_CPU, self.reg_off(r))); }
-    }
-    fn store_guest(&mut self, host: u32, r: u32, how: R) {
-        if r == 31 { if how == R::Sp { self.out.push(str_x(host, X_CPU, self.sp_slot)); } } else { self.out.push(str_x(host, X_CPU, self.reg_off(r))); }
-    }
 }
 
 impl Cpu {
@@ -807,7 +872,7 @@ impl Cpu {
             }
         }
         let chain = self.jit.as_ref().is_some_and(|j| !j.verify).then(|| (key(0, self.el, self.spsel, (self.sys.cpacr_el1 >> 20) & 3) >> 48) as u32);
-        let mut e = Emit { out: Vec::with_capacity(512), c: &c, sp_slot, pending_native: 0, fpsr, chain, page: self.pc >> 12, links: Vec::new() };
+        let mut e = Emit { out: Vec::with_capacity(512), c: &c, sp_slot, pending_native: 0, fpsr, chain, page: self.pc >> 12, links: Vec::new(), ra: [Slot::default(); CACHE.len()], tick: 0, slow_paths: Vec::new() };
         // prologue: save x19/x20 and the frame, x19 = cpu, guest flags into host NZCV
         e.out.push(0xa9be_7bfd); // stp x29, x30, [sp, #-32]!
         e.out.push(0xa901_53f3); // stp x19, x20, [sp, #16]
@@ -825,26 +890,25 @@ impl Cpu {
             // SAFETY: `a` is inside guest RAM (checked) and blocks stop at the page end
             let i = unsafe { (self.ram.add(a as usize) as *const u32).read_unaligned() };
             if let Some(ops) = native_operands(i).filter(|_| mask & 1 != 0) {
-                // rename guest registers to host temporaries; 31 stays ZR or becomes the SP slot
-                let mut map: Vec<(u32, R, u32)> = Vec::new(); // (guest reg, kind, host temp)
-                let mut enc = i;
-                for &(shift, how) in &ops {
-                    let r = (i >> shift) & 31;
-                    if r == 31 && how == R::Zr { continue; }
-                    let host = match map.iter().find(|m| m.0 == r && m.1 == how) { Some(m) => m.2, None => { let h = T[map.len()]; map.push((r, how, h)); h } };
-                    enc = (enc & !(31 << shift)) | (host << shift);
-                }
-                for &(r, how, h) in &map { e.load_guest(h, r, how); }
-                e.out.push(enc);
-                // write back the destination (field 0) unless the instruction has none (CCMP)
+                // rename guest registers to the host registers caching them; 31 stays ZR or is
+                // the cached SP. Sources first, then the destination (field 0, unless the
+                // instruction has none: CCMP), which is loaded only when also read (MOVK, BFM).
                 let has_rd = !(bits(i, 28, 21) == 0b11010010);
+                let rd_read = matches!((bits(i, 28, 23), bits(i, 30, 29)), (0b100101, 3) | (0b100110, 1));
+                let mut enc = i;
+                for (n, &(shift, how)) in ops.iter().enumerate().skip(has_rd as usize) {
+                    let _ = n;
+                    let h = e.get((i >> shift) & 31, how);
+                    enc = (enc & !(31 << shift)) | (h << shift);
+                }
                 if has_rd {
-                    let rd = i & 31;
-                    let how = ops[0].1;
-                    if !(rd == 31 && how == R::Zr) {
-                        let h = map.iter().find(|m| m.0 == rd && m.1 == how).map(|m| m.2).unwrap();
-                        e.store_guest(h, rd, how);
-                    }
+                    let (rd, how) = (i & 31, ops[0].1);
+                    let h = if rd_read { e.get(rd, how) } else { e.def(rd, how) };
+                    enc = (enc & !31) | h;
+                    e.out.push(enc);
+                    e.dirty(rd, how);
+                } else {
+                    e.out.push(enc);
                 }
                 natives += 1;
                 e.pending_native += 1;
@@ -853,7 +917,7 @@ impl Cpu {
                 let imm = (((((bits(i, 23, 5) << 2) | bits(i, 30, 29)) as u64) << 43) as i64 >> 43) as u64;
                 let sx = if bit(i, 31) { (pc & !0xfff).wrapping_add(imm << 12) } else { pc.wrapping_add(imm) };
                 let rd = i & 31;
-                if rd != 31 { mov64(&mut e.out, T[0], sx); e.out.push(str_x(T[0], X_CPU, e.reg_off(rd))); }
+                if rd != 31 { let h = e.def(rd, R::Zr); mov64(&mut e.out, h, sx); e.dirty(rd, R::Zr); }
                 natives += 1;
                 e.pending_native += 1;
             } else if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
@@ -872,8 +936,9 @@ impl Cpu {
                 // MRS Xt, TPIDR_EL0 / TPIDRRO_EL0 / TPIDR_EL1 (thread pointers)
                 let rt = i & 31;
                 if rt != 31 {
-                    e.out.push(ldr_x(T[0], X_CPU, c.off_tpidr + 8 * n));
-                    e.out.push(str_x(T[0], X_CPU, e.reg_off(rt)));
+                    let h = e.def(rt, R::Zr);
+                    e.out.push(ldr_x(h, X_CPU, c.off_tpidr + 8 * n));
+                    e.dirty(rt, R::Zr);
                 }
                 natives += 1;
                 e.pending_native += 1;
@@ -881,8 +946,16 @@ impl Cpu {
                 // MRS Xt, SP_EL0 (Linux keeps `current` there)
                 let rt = i & 31;
                 if rt != 31 {
-                    e.out.push(ldr_x(T[0], X_CPU, c.off_sp));
-                    e.out.push(str_x(T[0], X_CPU, e.reg_off(rt)));
+                    if e.sp_slot == c.off_sp {
+                        // SP_EL0 is the SP in use (SPSel = 0): it may be cached
+                        let s = e.get(31, R::Sp);
+                        let h = e.def(rt, R::Zr);
+                        e.out.push(0xaa00_03e0 | (s << 16) | h); // mov xh, xs
+                    } else {
+                        let h = e.def(rt, R::Zr);
+                        e.out.push(ldr_x(h, X_CPU, c.off_sp));
+                    }
+                    e.dirty(rt, R::Zr);
                 }
                 natives += 1;
                 e.pending_native += 1;
@@ -893,12 +966,14 @@ impl Cpu {
                 if i & 0x0001_0000 == 0 {
                     // to a general register (zero-extended for W)
                     if rd != 31 {
-                        e.out.push(if x { ldr_x(T[0], X_CPU, v_off(&c, rn) as usize) } else { ldr_w(T[0], X_CPU, v_off(&c, rn) as usize) });
-                        e.out.push(str_x(T[0], X_CPU, e.reg_off(rd)));
+                        let h = e.def(rd, R::Zr);
+                        e.out.push(if x { ldr_x(h, X_CPU, v_off(&c, rn) as usize) } else { ldr_w(h, X_CPU, v_off(&c, rn) as usize) });
+                        e.dirty(rd, R::Zr);
                     }
                 } else {
                     // to a SIMD&FP register: the rest of the vector is zeroed
-                    if rn == 31 { e.out.push(0xaa1f_03e0 | T[0]); } else if x { e.out.push(ldr_x(T[0], X_CPU, e.reg_off(rn))); } else { e.out.push(ldr_w(T[0], X_CPU, e.reg_off(rn))); }
+                    let h = e.get(rn, R::Zr);
+                    if x { e.out.push(0xaa00_03e0 | (h << 16) | T[0]); } else { e.out.push(0x2a00_03e0 | (h << 16) | T[0]); } // mov x9, xh / mov w9, wh
                     e.out.push(str_x(T[0], X_CPU, v_off(&c, rd) as usize));
                     e.out.push(str_x(31, X_CPU, v_off(&c, rd) as usize + 8));
                 }
@@ -924,7 +999,8 @@ impl Cpu {
                 && (self.sys.cpacr_el1 >> 20) & 3 == 3 && v_off(&c, 31) < 65536 {
                 // DUP Vd.<T>, Wn/Xn: the host's own DUP from a scratch register into v0
                 let (rd, rn) = (i & 31, (i >> 5) & 31);
-                if rn == 31 { e.out.push(0xaa1f_03e0 | T[0]); } else { e.out.push(ldr_x(T[0], X_CPU, e.reg_off(rn))); }
+                let h = e.get(rn, R::Zr);
+                e.out.push(0xaa00_03e0 | (h << 16) | T[0]); // mov x9, xh (or xzr)
                 e.out.push((i & !0x3ff) | (T[0] << 5)); // dup v0.<T>, w9/x9
                 e.out.push(0x3d80_0000 | ((v_off(&c, rd) / 16) << 10) | (X_CPU << 5)); // str q0, [cpu.v[rd]]
                 natives += 1;
@@ -936,8 +1012,13 @@ impl Cpu {
             } else if self.emit_ldst(&mut e, i, pc) {
                 // native load/store with an interpreter slow path
             } else {
-                if emit_interp(&mut e, i, pc) { ended = true; break; }
+                // the interpreter reads and may write any register in `Cpu`
+                e.ra_flush();
+                let end = emit_interp(&mut e, i, pc);
+                e.ra_forget();
+                if end { ended = true; break; }
             }
+            e.unpin();
             pc += 4;
             a += 4;
             if a & 0xfff == 0 { break; } // never cross a page
@@ -945,19 +1026,31 @@ impl Cpu {
         let _ = natives;
         if !ended {
             // fell off the end of the block: continue at pc
+            e.ra_flush();
             e.flush_instret();
             e.save_flags();
             e.exit_const(pc);
         }
+        e.emit_slow_paths();
         if e.chain.is_some() && self.jit.as_ref()?.disp.is_none() {
             let words = dispatcher(&c, self.jit.as_ref()?.front.as_ptr() as u64);
             match self.jit.as_mut()?.code.write(&words) {
-                Some(d) => self.jit.as_mut()?.disp = Some(d as u64),
+                Some(d) => { code_map(d as usize, 4 * words.len(), "dispatcher"); self.jit.as_mut()?.disp = Some(d as u64) }
                 None => { let j = self.jit.as_mut()?; j.full_flushes += 1; j.flush(); return None; }
             }
         }
         if let Some(d) = self.jit.as_ref()?.disp { self.jit_disp = d; }
         let f = self.jit.as_mut()?.code.write(&e.out);
+        if let Some(p) = f {
+            code_map(p as usize, 4 * e.out.len(), &format!("{:x} {}", self.pc, (pc - self.pc) / 4 + 1));
+            // debugging: `SBC_JIT_DUMP=PC` writes the guest and host words of blocks at PC
+            if std::env::var("SBC_JIT_DUMP").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) == Some(self.pc) {
+                let guest: Vec<u8> = (0..(pc - self.pc + 4)).map(|k| unsafe { *self.ram.add((pa + k) as usize) }).collect();
+                let host: Vec<u8> = e.out.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("jit-{:x}.guest", self.pc), guest);
+                let _ = std::fs::write(format!("jit-{:x}.host", self.pc), host);
+            }
+        }
         let f = match f {
             Some(p) => p,
             None => { let j = self.jit.as_mut()?; j.full_flushes += 1; j.flush(); return None; }
@@ -975,6 +1068,9 @@ impl Cpu {
         // B / BL
         if bits(i, 30, 26) == 0b00101 {
             let target = pc.wrapping_add(sx((bits(i, 25, 0) as u64) << 2, 28));
+            // the block ends: cached registers go back first (X30 then written in `Cpu`)
+            e.ra_flush();
+            e.ra_forget();
             if bit(i, 31) { mov64(&mut e.out, T[0], pc + 4); e.out.push(str_x(T[0], X_CPU, e.reg_off(30))); }
             e.pending_native += 1;
             e.flush_instret();
@@ -985,6 +1081,7 @@ impl Cpu {
         // B.cond: select with the guest flags still in the host NZCV
         if bits(i, 31, 24) == 0b0101_0100 && !bit(i, 4) {
             let target = pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21));
+            e.ra_flush();
             e.pending_native += 1;
             e.flush_instret();
             e.save_flags(); // keeps the host NZCV
@@ -1002,13 +1099,14 @@ impl Cpu {
         if cb || tb {
             let rt = i & 31;
             let target = if cb { pc.wrapping_add(sx((bits(i, 23, 5) as u64) << 2, 21)) } else { pc.wrapping_add(sx((bits(i, 18, 5) as u64) << 2, 16)) };
-            if rt == 31 { e.out.push(0xaa1f_03e0 | T[2]); } else { e.out.push(ldr_x(T[2], X_CPU, e.reg_off(rt))); }
+            let h = e.get(rt, R::Zr); // a cache register (or xzr): survives the code below
+            e.ra_flush();
             e.pending_native += 1;
-            e.flush_instret(); // x13, x20: x11 survives
+            e.flush_instret(); // x13, x20
             e.save_flags(); // x9
-            // the host branch (same test on x11) jumps to the taken exit
+            // the host branch (same test on the same value) jumps to the taken exit
             let at = e.out.len();
-            e.out.push(if cb { i & !(31 | (0x7ffff << 5)) } else { i & !(31 | (0x3fff << 5)) } | T[2]);
+            e.out.push(if cb { i & !(31 | (0x7ffff << 5)) } else { i & !(31 | (0x3fff << 5)) } | h);
             e.exit_const(pc + 4);
             let off = (e.out.len() - at) as u32;
             e.out[at] |= if cb { (off & 0x7ffff) << 5 } else { (off & 0x3fff) << 5 };
@@ -1020,9 +1118,11 @@ impl Cpu {
             let opc = bits(i, 24, 21);
             if opc > 2 { return None; }
             let rn = bits(i, 9, 5);
-            if rn == 31 { e.out.push(0xaa1f_03e0 | T[0]); } else { e.out.push(ldr_x(T[0], X_CPU, e.reg_off(rn))); }
+            let h = e.get(rn, R::Zr);
+            e.out.push(str_x(h, X_CPU, e.c.off_pc)); // before BLR changes X30 (BLR X30)
+            e.ra_flush();
+            e.ra_forget();
             if opc == 1 { mov64(&mut e.out, T[1], pc + 4); e.out.push(str_x(T[1], X_CPU, e.reg_off(30))); }
-            e.out.push(str_x(T[0], X_CPU, e.c.off_pc));
             e.pending_native += 1;
             e.flush_instret();
             e.save_flags();
@@ -1138,9 +1238,18 @@ impl Cpu {
         let span = if pair { 2 * size } else { size };
         let c = e.c;
         let (vreg, tmp) = (13u32, 14u32);
-        // ---- VA in x13 (post-index: the access uses the base; x16 keeps the written-back value)
-        e.count_pending();
-        if rn == 31 { e.out.push(ldr_x(vreg, X_CPU, e.sp_slot)); } else { e.out.push(ldr_x(vreg, X_CPU, e.reg_off(rn))); }
+        let pending = e.pending_native;
+        // ---- the cache registers this access uses, all allocated before the first branch to
+        // the slow path, so both paths see the same cache: base, index, data (a load's data
+        // registers are written only by the fast path; the slow path reloads every cached one)
+        let base = e.get(rn, R::Sp);
+        let idx = if let Addr::Reg(rm, _, _) = addr { e.get(rm, R::Zr) } else { 31 };
+        let (h1, h2) = if vec { (0, 0) }
+            else if load { (e.def(rt, R::Zr), if pair { e.def(rt2, R::Zr) } else { 31 }) }
+            else { (e.get(rt, R::Zr), if pair { e.get(rt2, R::Zr) } else { 31 }) };
+        let spill = e.spill_code();
+        let reload = e.reload_code();
+        // ---- VA in x13
         let add_imm = |out: &mut Vec<u32>, rd: u32, rn: u32, imm: i64| {
             if imm == 0 { if rd != rn { out.push(0x9100_0000 | (rn << 5) | rd); } return; }
             let (op, v) = if imm < 0 { (0xd100_0000u32, (-imm) as u64) } else { (0x9100_0000u32, imm as u64) };
@@ -1148,14 +1257,10 @@ impl Cpu {
             else { mov64(out, 17, v); out.push(if imm < 0 { 0xcb00_0000 } else { 0x8b00_0000 } | (17 << 16) | (rn << 5) | rd); }
         };
         match addr {
-            Addr::Imm(imm) => match mode {
-                0 => add_imm(&mut e.out, vreg, vreg, imm),
-                1 => add_imm(&mut e.out, 16, vreg, imm),
-                _ => { add_imm(&mut e.out, vreg, vreg, imm); e.out.push(0xaa00_03e0 | (vreg << 16) | 16); } // x16 = x13
-            },
-            Addr::Reg(rm, option, shift) => {
-                if rm == 31 { e.out.push(0xaa1f_03e0 | tmp); } else { e.out.push(ldr_x(tmp, X_CPU, e.reg_off(rm))); }
-                e.out.push(0x8b20_0000 | (tmp << 16) | (option << 13) | (shift << 10) | (vreg << 5) | vreg); // add x13, x13, x14, <ext> #sh
+            // post-index: the access uses the base as it is
+            Addr::Imm(imm) => add_imm(&mut e.out, vreg, base, if mode == 1 { 0 } else { imm }),
+            Addr::Reg(_, option, shift) => {
+                e.out.push(0x8b20_0000 | (idx << 16) | (option << 13) | (shift << 10) | (base << 5) | vreg); // add x13, base, idx, <ext> #sh
             }
         }
         // ---- micro-TLB check: x14 = host address
@@ -1168,7 +1273,6 @@ impl Cpu {
             let opc = if !load { 0 } else { match signed_to { 0 => 1, 64 => 2, _ => 3 } };
             0x3900_0000 | (sz << 30) | (opc << 22) | ((off >> sz) << 10) | (tmp << 5) | rt
         };
-        let regs = if pair { vec![(rt, 0u32, 9u32), (rt2, size, 10u32)] } else { vec![(rt, 0, 9)] };
         let ldq = |v: u32, r: u32| 0x3dc0_0000 | ((v_off(c, r) / 16) << 10) | (X_CPU << 5) | v; // ldr qV, [cpu.v[r]]
         let stq = |v: u32, r: u32| 0x3d80_0000 | ((v_off(c, r) / 16) << 10) | (X_CPU << 5) | v; // str qV, [cpu.v[r]]
         if vec {
@@ -1187,71 +1291,100 @@ impl Cpu {
                 else { e.out.push(0x3d00_0000 | (s_bits << 30) | (opc_q << 22) | (tmp << 5)); } // str b/h/s/d/q0, [x14]
             }
         } else if load {
+            // straight into the cache registers (xzr for register 31: loaded and dropped)
             if pair && signed_to == 64 {
-                e.out.push(0x6940_0000 | (10 << 10) | (tmp << 5) | 9); // ldpsw x9, x10, [x14]
+                e.out.push(0x6940_0000 | (h2 << 10) | (tmp << 5) | h1); // ldpsw
             } else if pair {
-                e.out.push(if sz == 3 { 0xa940_0000 } else { 0x2940_0000 } | (10 << 10) | (tmp << 5) | 9); // ldp
+                e.out.push(if sz == 3 { 0xa940_0000 } else { 0x2940_0000 } | (h2 << 10) | (tmp << 5) | h1); // ldp
             } else {
-                e.out.push(one(9, 0));
+                e.out.push(one(h1, 0));
             }
-            for &(r, _, h) in &regs { if r != 31 { e.out.push(str_x(h, X_CPU, e.reg_off(r))); } }
+            e.dirty(rt, R::Zr);
+            if pair { e.dirty(rt2, R::Zr); }
+        } else if pair {
+            e.out.push(if sz == 3 { 0xa900_0000 } else { 0x2900_0000 } | (h2 << 10) | (tmp << 5) | h1); // stp
         } else {
-            for &(r, _, h) in &regs { if r == 31 { e.out.push(0xaa1f_03e0 | h); } else { e.out.push(ldr_x(h, X_CPU, e.reg_off(r))); } }
-            if pair { e.out.push(if sz == 3 { 0xa900_0000 } else { 0x2900_0000 } | (10 << 10) | (tmp << 5) | 9); } // stp
-            else { e.out.push(one(9, 0)); }
+            e.out.push(one(h1, 0));
         }
-        // ---- base writeback
-        match mode {
-            1 | 2 => { if rn == 31 { e.out.push(str_x(16, X_CPU, e.sp_slot)); } else { e.out.push(str_x(16, X_CPU, e.reg_off(rn))); } }
-            _ => {}
+        // ---- base writeback (never onto a data register: refused above)
+        if let (1 | 2, Addr::Imm(imm)) = (mode, &addr) {
+            if mode == 1 { add_imm(&mut e.out, base, base, *imm); } else { e.out.push(0x9100_0000 | (vreg << 5) | base); } // mov base, x13
+            e.dirty(rn, R::Sp);
         }
-        e.out.push(0x9100_0400 | (X_COUNT << 5) | X_COUNT); // add x20, x20, #1
-        let skip_at = e.out.len();
-        e.out.push(0x1400_0000); // b done (patched)
-        // ---- slow path: the interpreter
-        let slow_at = e.out.len();
-        for b in slow {
-            let off = (slow_at - b) as u32;
-            let w = e.out[b];
-            e.out[b] = if w & 0x7e00_0000 == 0x3600_0000 { w | ((off & 0x3fff) << 5) } else { w | ((off & 0x7ffff) << 5) };
-        }
-        let ended = emit_interp(e, i, pc);
-        debug_assert!(!ended);
-        let done = e.out.len();
-        e.out[skip_at] |= ((done - skip_at) as u32) & 0x3ff_ffff;
+        // ---- the slow path (the interpreter) goes after the block's last exit; the fast path
+        // falls through, and counts this instruction at compile time like any native one
+        e.slow_paths.push(SlowPath { sites: slow, spill, reload, i, pc, pending, done: e.out.len() });
+        e.pending_native += 1;
+        e.unpin();
         true
+    }
+}
+
+/// An out-of-line slow path of a native load/store: entered from `sites` with the cache as it
+/// was before the access, `pending` natives not yet in x20; rejoins the fast path at `done`.
+struct SlowPath { sites: Vec<usize>, spill: Vec<u32>, reload: Vec<u32>, i: u32, pc: u64, pending: u64, done: usize }
+
+impl Emit<'_> {
+    /// Emit the slow paths after the block's code.
+    fn emit_slow_paths(&mut self) {
+        for sp in std::mem::take(&mut self.slow_paths) {
+            let at = self.out.len();
+            for b in sp.sites {
+                let off = (at - b) as u32;
+                let w = self.out[b];
+                self.out[b] = if w & 0x7e00_0000 == 0x3600_0000 { w | ((off & 0x3fff) << 5) } else { w | ((off & 0x7ffff) << 5) };
+            }
+            self.out.extend(sp.spill);
+            self.pending_native = sp.pending;
+            let ended = emit_interp(self, sp.i, sp.pc);
+            debug_assert!(!ended);
+            // instret now includes this instruction, and the fast path counts it and the
+            // `pending` before it again at compile time: x20 = -(pending + 1) cancels that
+            self.out.push(0x9280_0000 | ((sp.pending as u32) << 5) | X_COUNT); // movn x20, #pending
+            self.out.extend(sp.reload);
+            let b = self.out.len();
+            self.out.push(0x1400_0000 | (((sp.done as i64 - b as i64) as u32) & 0x3ff_ffff)); // b done
+        }
+        self.pending_native = 0;
     }
 }
 
 impl Cpu {
     /// The micro-TLB lookup of generated loads and stores (no flags touched). With the VA in
-    /// x13, leaves x14 = host address and x15 = the page offset, or branches to a slow path
-    /// (pushed to `slow`, patched by the caller) on a miss. `k`: 1 = load, 2 = store entries;
-    /// `span` > 0: bytes accessed (the slow path takes page-crossing accesses); `excl_check`:
-    /// a held reservation takes the slow path (the interpreter's store clears it). Uses x17.
+    /// x13, leaves x14 = host address, or branches to a slow path (pushed to `slow`, patched by
+    /// the caller) on a miss. `k`: 1 = load, 2 = store entries; `span` > 0: bytes accessed;
+    /// `excl_check`: a held reservation takes the slow path (the interpreter's store clears
+    /// it). Uses x15 and x17.
     fn emit_utlb(&self, e: &mut Emit, k: usize, span: u32, unpriv: bool, excl_check: bool, slow: &mut Vec<usize>) {
         let c = e.c;
         let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
-        // tag = (va >> 12) + 1 | el << 60; x17 = &utlb[k][(va >> 12) % UT]
+        // x17 = &utlb[k][(va >> 12) % UT]; the tag compared is that of the access's LAST byte,
+        // (last >> 12) + 1 | el << 60: a page-crossing access cannot match the first page's
+        // entry, so it takes the slow path without a separate check
         let ent = c.off_utlb + 16 * UT * k;
         assert!(ent + 16 * UT < 32768);
-        e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
-        e.out.push(0x9240_0000 | ((UT.trailing_zeros() - 1) << 10) | (tmp << 5) | 17); // and x17, x14, #(UT-1)
+        if span > 1 {
+            e.out.push(0x9100_0000 | ((span - 1) << 10) | (vreg << 5) | tmp2); // add x15, x13, #span-1
+            e.out.push(0xd34c_fc00 | (tmp2 << 5) | tmp); // lsr x14, x15, #12
+        } else {
+            e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12
+        }
+        e.out.push(0xd340_0000 | (12 << 16) | ((11 + UT.trailing_zeros()) << 10) | (vreg << 5) | 17); // ubfx x17, x13, #12, #log2(UT)
         e.out.push(0x8b00_0000 | (17 << 16) | (4 << 10) | (X_CPU << 5) | 17); // add x17, x19, x17, lsl #4
         e.out.push(0x9100_0400 | (tmp << 5) | tmp); // add x14, x14, #1
         if unpriv {
             // the EL0 entry, poisoned (bit 59) while they belong to another ASID
             e.out.push(ldr_x(tmp2, X_CPU, c.off_utlb_unpriv));
             e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp);
-        } else if self.el != 0 { mov64(&mut e.out, tmp2, (self.el as u64) << 60); e.out.push(0xaa00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); }
+        } else if self.el != 0 {
+            // orr x14, x14, #(el << 60): a logical immediate (bit 60, bit 61, or both)
+            let (immr, imms) = match self.el { 1 => (4, 0), 2 => (3, 0), _ => (4, 1) };
+            e.out.push(0xb240_0000 | (immr << 16) | (imms << 10) | (tmp << 5) | tmp);
+        }
         e.out.push(ldr_x(tmp2, 17, ent));
         e.out.push(0xcb00_0000 | (tmp2 << 16) | (tmp << 5) | tmp); // sub x14, x14, x15
         slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow
         e.out.push(0x9240_2c00 | (vreg << 5) | tmp2); // and x15, x13, #0xfff
-        if span > 0 {
-            e.out.push(0x9100_0000 | ((span - 1) << 10) | (tmp2 << 5) | tmp); // add x14, x15, #span-1
-            slow.push(e.out.len()); e.out.push(0x3760_0000 | tmp); // tbnz w14, #12, slow
-        }
         if excl_check {
             e.out.push(ldr_x(tmp, X_CPU, c.off_excl));
             slow.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, slow (reservation held)
@@ -1287,6 +1420,9 @@ impl Cpu {
         if !load && verify { return false; } // verify mode logs stores in the interpreter
         let (vreg, tmp) = (13u32, 14u32);
         e.count_pending();
+        // works on the registers in `Cpu` (rare enough not to use the cache)
+        e.ra_flush();
+        e.ra_forget();
         e.out.push(if rn == 31 { ldr_x(vreg, X_CPU, e.sp_slot) } else { ldr_x(vreg, X_CPU, e.reg_off(rn)) });
         let mut slow: Vec<usize> = Vec::new();
         let mut fail: Vec<usize> = Vec::new(); // store-exclusive without the reservation
@@ -1386,6 +1522,8 @@ impl Cpu {
         let rt = i & 31;
         let (vreg, tmp) = (13u32, 14u32);
         e.count_pending();
+        e.ra_flush();
+        e.ra_forget();
         if rt == 31 { e.out.push(0xaa1f_03e0 | vreg); } else { e.out.push(ldr_x(vreg, X_CPU, e.reg_off(rt))); }
         e.out.push(0x9240_0000 | (58 << 16) | (57 << 10) | (vreg << 5) | vreg); // and x13, x13, #~63
         let mut slow: Vec<usize> = Vec::new();
