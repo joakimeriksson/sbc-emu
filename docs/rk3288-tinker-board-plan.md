@@ -1,7 +1,7 @@
 # Plan: Rockchip RK3288 and the ASUS Tinker Board
 
-Status (2026-11-18): M0–M4 and M8 (Mali-T760) done, M7 for the DSI panel only, M9 for the
-JIT only; the panel board profile runs the vendor's application with touch, Wi-Fi and audio. See "State"
+Status (2026-11-20): M0–M4, M7 (HDMI on the Tinker Board, DSI on the panel board) and M8
+(Mali-T760) done, M9 for the JIT only; the panel board profile runs the vendor's application with touch, Wi-Fi and audio. See "State"
 below. M4 (Armbian from an unmodified SD image to a root shell) was reached on 2026-11-17, M3
 (four cores) on 2026-11-15. It follows the project's own-core
 decision (pure Rust, no QEMU, `docs/decisions.md` D1) and the multi-board foundation in
@@ -139,9 +139,26 @@ stated output on the serial console, and a README table row with its evidence.
 - **M5: networking.** GMAC + PHY on `sbc-net`: DHCP, DNS, `apt update`, `--hostfwd` for SSH.
 - **M6: USB and input.** DWC2 ports and a USB hub model; keyboard, tablet and USB stick; the
   ALC4040-style USB audio codec for the jack.
-- **M7: display.**
+- **M7: display.** Done (2026-11-20).
   - Devices: VOP + DW HDMI + EDID.
   - Pass: fbcon and DRM/KMS on HDMI; VNC and `--screenshot` work.
+  - What it took:
+    1. `peripherals/src/dw_hdmi.rs`: the DesignWare HDMI TX the H3 already had, moved out of
+       `allwinner-h3` so both SoCs share it. The RK3288 identifies as v2.00a with the
+       Synopsys HDMI 2.0 TX PHY (CONFIG2 0xf3), which Linux programs over the controller's
+       PHY I2C master: those accesses complete at once, and the PHY's PLL reports lock
+       (PHY_STAT0 bit 0) while PHY_CONF0 has the transmitter powered and PDDQ clear, so both
+       power-on and power-off checks pass. Byte registers on a 4-byte stride
+       (`reg-io-width = <4>`) at 0xff980000, interrupt SPI 103.
+    2. The EDID: the Tinker Board's device tree reads it over I2C5 (`ddc-i2c-bus`), not the
+       controller's DDC master, so the monitor is an EDID EEPROM at 0x50 on the rk3x I2C5
+       model (`EdidEeprom`). `--hdmi-mode 1024x768|1280x720|1920x1080` picks its preferred
+       mode (default 1280x720).
+    3. `vop.rs`: INTR_CTRL0 latches only enabled sources. With raw status, Linux's
+       `vop_wait_for_irq_handler` polled a frame-start bit that no handler would clear and
+       logged "VOP vblank IRQ stuck for 10 ms" on every disabled-vblank flush.
+  - Pass (`scripts/tinkerboard-armbian.txt`): `HDMI-A-1` connected at 1280x720, fb0 at
+    1280,720; Armbian's kernel log, console and login prompt on the HDMI screen.
 - **M8: Mali-T760 (Midgard).**
   - Model: job manager, MMU, tiler and shader cores for the Midgard ISA (VLIW, unlike V3D's QPU).
   - Validation: Panfrost + Mesa, compared pixel by pixel against llvmpipe with the existing
@@ -201,9 +218,9 @@ M8 and M9 are independent of each other and of M5–M7.
   no `/psci`.
 - `cli/src/serial_board.rs` (scripts, pacing, reset) and the pinned-fixture script pattern.
 
-## State (2026-11-18)
+## State (2026-11-20)
 
-Milestones: M0–M4 and M8 done; M7 done for the panel board's DSI panel but not HDMI; M9 half
+Milestones: M0–M4, M7 and M8 done; M9 half
 done (the JIT, not threads); M5, M6 and M10 not started. The panel board profile runs the vendor's
 firmware to its application with display, touch, Wi-Fi and audio (`docs/panel-board.md`).
 
@@ -213,7 +230,7 @@ firmware to its application with display, touch, Wi-Fi and audio (`docs/panel-bo
 | Interrupts, timers, SMP | GIC-400, the generic timer, the boot ROM SMP mailbox, TLB broadcast | `machine.rs` |
 | Clocks, power | CRU (PLLs, the I2S fractional divider), GRF/SGRF, PMU; RK808 (Tinker Board) or ACT8846, SYR827/828 and HYM8563 (panel board) on I2C | `cru.rs`, `i2c.rs`, `peripherals/` |
 | Storage | dw_mmc for SD (card detect on GPIO6_C6 for the panel board), eMMC and SDIO; boot from the card's `/boot` like the firmware | `dwmmc.rs`, `emmc.rs`, `boot.rs` |
-| Display | VOP (both, two windows), IOMMU, DW MIPI DSI to the panel board's panel; VNC and `--screenshot` | `vop.rs`, `dsi.rs` |
+| Display | VOP (both, two windows), IOMMU; DW HDMI with a monitor (EDID on I2C5, `--hdmi-mode`) on the Tinker Board, DW MIPI DSI to the panel board's panel; VNC and `--screenshot` | `vop.rs`, `dsi.rs`, `peripherals/src/dw_hdmi.rs` |
 | 2D and GPU | RGA; Mali-T760 MP4 for Panfrost + Mesa (kmscube, 25 of 25 GLES 2 scenes match softpipe) | `rga.rs`, `midgard/` |
 | Touch | ILI2116 on I2C4 (panel board) | `peripherals/src/ili2116.rs` |
 | Wi-Fi | BCM43455 on SDIO for brcmfmac: scan, open and WPA2 joins, DHCP and NAT on `sbc-net` (panel board) | `peripherals/src/bcm43455/` |
@@ -227,9 +244,9 @@ Not modelled yet, roughly in order of value:
    time idle and 5 % while it plays a sample, too slow for live audio; recording with
    `--audio-out` works. This touches `arm-a32` and needs its owner.
 3. **GMAC Ethernet** (M5). Armbian's first-login wizard waits about a minute for an address.
-4. **HDMI** (M7). The Tinker Board has no screen output; the VOP is there, the DW HDMI is not.
-5. The browser build and demo (M10).
-6. Smaller: the second PL330 (0xff250000), backlight PWM, the SAR ADC, Bluetooth, the
+4. The browser build and demo (M10).
+5. Smaller: HDMI audio (the Tinker Board's I2S goes to the HDMI transmitter; its audio
+   registers are storage only), the second PL330 (0xff250000), backlight PWM, the SAR ADC, Bluetooth, the
    video codec IOMMUs, device tree overlays from `armbianEnv.txt`, LPAE kernels.
 
 The panel board's own open items (the start-up "Wifi and storage systems failed" dialog, the

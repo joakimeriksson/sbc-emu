@@ -4,6 +4,7 @@ use crate::dsi::{Dsi, DSI_SIZE};
 use crate::i2s::I2s;
 use crate::rga::{Rga, RGA_SIZE};
 use crate::vop::{Vop, VOP_SIZE};
+use peripherals::dw_hdmi::{DwHdmi, Identity, Mode};
 use peripherals::{Gic, Uart, NCPU};
 use arm_a32::{CodeWatch, Cpu, CORTEX_A12};
 use std::sync::Arc;
@@ -37,6 +38,12 @@ pub const RGA_BASE: u64 = 0xff92_0000;
 pub const RGA_IRQ: usize = 32 + 18;
 /// MIPI DSI host 0 (the panel board's panel).
 pub const DSI0_BASE: u64 = 0xff96_0000;
+/// DesignWare HDMI TX (`reg-io-width = <4>`: byte registers on a 4-byte stride) and its
+/// interrupt (SPI 103). The EDID is read over I2C5 (`ddc-i2c-bus`), where the board puts
+/// the monitor (`Peripherals::attach_hdmi_monitor`).
+pub const HDMI_BASE: u64 = 0xff98_0000;
+pub const HDMI_SIZE: u64 = 0x2_0000;
+pub const HDMI_IRQ: usize = 32 + 103;
 /// I2S (8 channels out, 2 in) and the DMA controller that feeds it (`dmac_bus_s`, its
 /// peripherals 0 and 1 are the I2S's transmit and receive requests).
 pub const I2S_BASE: u64 = 0xff89_0000;
@@ -84,6 +91,8 @@ pub struct Soc {
     /// VOP-big and VOP-little.
     pub vop: [Vop; 2],
     pub dsi: Dsi,
+    /// HDMI transmitter (the Tinker Board's display output).
+    pub hdmi: DwHdmi,
     /// RAM pages holding compiled code (shared by the cores' JITs): devices that write RAM
     /// report it here.
     pub code_watch: Arc<CodeWatch>,
@@ -191,6 +200,7 @@ impl Soc {
             periph: Peripherals::default(),
             vop: Default::default(),
             dsi: Dsi::default(),
+            hdmi: DwHdmi::new(Identity::RK3288, &Mode::MODES[1]),
             code_watch: CodeWatch::new(RAM_BASE as u32, ram_size as u32),
             rga: Rga::default(),
             gpu: midgard::MaliT760::new(std::env::var("SBC_MALI_LOG").is_ok_and(|v| v != "0")),
@@ -313,6 +323,9 @@ impl Soc {
         if let Some(offset) = Self::word_offset(addr, width, DSI0_BASE, DSI_SIZE)? {
             return Ok(self.dsi.read(offset));
         }
+        if let Some(offset) = Self::word_offset(addr, width, HDMI_BASE, HDMI_SIZE)? {
+            return Ok(self.hdmi.read(offset as usize / 4) as u32);
+        }
         if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
             return Ok(self.gpu.read(offset));
         }
@@ -372,6 +385,10 @@ impl Soc {
         }
         if let Some(offset) = Self::word_offset(addr, width, DSI0_BASE, DSI_SIZE)? {
             self.dsi.write(offset, value);
+            return Ok(());
+        }
+        if let Some(offset) = Self::word_offset(addr, width, HDMI_BASE, HDMI_SIZE)? {
+            self.hdmi.write(offset as usize / 4, value as u8);
             return Ok(());
         }
         if let Some(offset) = Self::word_offset(addr, width, GPU_BASE, midgard::SIZE)? {
@@ -730,6 +747,7 @@ impl Machine {
                 self.soc.gic.set_level(line, irq);
             }
             self.soc.gic.set_level(I2S_IRQ, false);
+            self.soc.gic.set_level(HDMI_IRQ, self.soc.hdmi.irq());
         }
         for k in 0..2 {
             self.soc.vop[k].update(now);
@@ -791,6 +809,13 @@ impl Machine {
         if self.soc.dirty || changed || self.cpus[0].cntpct >= self.next_event {
             self.update_irqs();
         }
+    }
+
+    /// Plug a monitor whose preferred mode is `mode` into the HDMI port: the transmitter
+    /// reports it connected and its EDID answers on the DDC bus (I2C5).
+    pub fn connect_hdmi(&mut self, mode: &Mode) {
+        self.soc.hdmi = DwHdmi::new(Identity::RK3288, mode);
+        self.soc.periph.attach_hdmi_monitor(mode);
     }
 
     /// Put the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP) behind the Wi-Fi access

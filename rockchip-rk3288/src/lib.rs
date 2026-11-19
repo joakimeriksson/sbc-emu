@@ -10,6 +10,8 @@
 //! The GIC-400, the DesignWare APB UART and the I²C chips (RK808, ACT8846, SYR827/828,
 //! HYM8563, ILI2116) are the shared `peripherals` crate's models.
 
+/// The monitor modes the HDMI port's emulated monitor offers (`--hdmi-mode`).
+pub use peripherals::dw_hdmi::Mode as HdmiMode;
 pub mod boot;
 pub mod cru;
 pub mod devices;

@@ -115,7 +115,7 @@ impl Vop {
                     // The VOP finishes the frame and holds; it reports that on every standby
                     // request, including one made while the bit was already set (Linux's
                     // CRTC disable sets it again and waits for the hold).
-                    self.status |= DSP_HOLD_VALID;
+                    self.raise(DSP_HOLD_VALID);
                 }
                 if self.next_frame.is_none() && self.timing_programmed() {
                     self.next_frame = Some(now + FRAME_TICKS);
@@ -137,13 +137,19 @@ impl Vop {
         if let Some(due) = self.next_frame {
             if now >= due {
                 self.frames += 1;
-                self.status |= FRAME_START;
                 // A line-flag interrupt fires every frame at the programmed line.
-                self.status |= LINE_FLAG;
+                self.raise(FRAME_START | LINE_FLAG);
                 let missed = (now - due) / FRAME_TICKS;
                 self.next_frame = Some(due + (missed + 1) * FRAME_TICKS);
             }
         }
+    }
+
+    /// Latch interrupt sources. The RK3288's INTR_CTRL0 reports enabled sources only: Linux
+    /// polls the frame-start status in `vop_wait_for_irq_handler` while that interrupt may be
+    /// disabled, and a status bit no handler will clear stalls it ("VOP vblank IRQ stuck").
+    fn raise(&mut self, sources: u32) {
+        self.status |= sources & self.regs[INTR_CTRL0] >> 4 & 0xf;
     }
 
     pub fn next_deadline(&self) -> Option<u64> {
@@ -275,6 +281,19 @@ mod tests {
         vop.write(0x48, 1 << 16 | 3, 0);
         vop.write(0x50, 3 << 16 | 10, 0);
         vop.write(0x08, 0, 0);
+    }
+
+    #[test]
+    fn disabled_sources_do_not_latch() {
+        let mut vop = Vop::default();
+        programmed(&mut vop);
+        let due = vop.next_deadline().unwrap();
+        vop.update(due);
+        assert_eq!(vop.read(0x20) & 0xf, 0, "frame start passed with its interrupt off");
+        vop.write(0x20, FRAME_START << 4, due);
+        assert!(!vop.irq(), "enabling does not report an old frame");
+        vop.update(due + FRAME_TICKS);
+        assert!(vop.irq());
     }
 
     #[test]
