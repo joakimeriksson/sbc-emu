@@ -342,7 +342,7 @@ impl Cdm {
     /// Run a USC program for `insts`; false if it faulted.
     fn usc(&mut self, mem: &mut GpuMem, u: pds::DoutU, coeffs: &mut [u32], insts: &mut [usc::Instance]) -> bool {
         let entry = USC_HEAP + u.exe_offset as u64;
-        let mut m = usc::Machine { mem, coeffs, shareds: &mut self.shareds, cache: &mut self.cache, trace: self.trace, emits: Vec::new() };
+        let mut m = usc::Machine { mem, coeffs, shareds: &mut self.shareds, cache: &mut self.cache, trace: self.trace, emits: Vec::new(), quad: Vec::new() };
         match m.run(entry, insts) {
             Ok(_) => true,
             Err(f) => {

@@ -67,8 +67,10 @@ struct Ppp {
 struct Prim {
     v: [Vertex; 3],
     ppp: Ppp,
-    /// the primitive faces away (clockwise in window coordinates)
+    /// the primitive faces away (clockwise in Vulkan's framebuffer orientation)
     back: bool,
+    /// the vertex outputs of the original (unclipped) triangle, for flat shading
+    flat: [Vec<u32>; 3],
 }
 
 /// The primitives of one scene (render).
@@ -92,6 +94,20 @@ struct Job<'a, 'b> {
     pds: Pds,
     cache: HashMap<u64, Result<usc::Group, usc::DecodeError>>,
     trace: bool,
+    stats: JobStats,
+}
+
+/// What happened to primitives and pixels in a job (for the trace summary).
+#[derive(Debug, Default)]
+struct JobStats {
+    vertices: u64,
+    triangles: u64,
+    culled: u64,
+    behind: u64,
+    degenerate: u64,
+    covered: u64,
+    depth_failed: u64,
+    shaded: u64,
 }
 
 fn u64_at(w: &[u32], byte: usize) -> u64 {
@@ -133,7 +149,7 @@ impl Job<'_, '_> {
     /// Run a USC program on `insts`; returns its emitpix requests.
     fn usc(&mut self, u: pds::DoutU, coeffs: &mut [u32], shareds: &mut [u32], insts: &mut [Instance]) -> Result<Vec<(u32, u32)>, String> {
         let entry = USC_HEAP + u.exe_offset as u64;
-        let mut m = usc::Machine { mem: self.mem, coeffs, shareds, cache: &mut self.cache, trace: self.trace, emits: Vec::new() };
+        let mut m = usc::Machine { mem: self.mem, coeffs, shareds, cache: &mut self.cache, trace: self.trace, emits: Vec::new(), quad: Vec::new() };
         m.run(entry, insts).map_err(|f| format!("USC program {entry:#x}: fault at {:#x}: {}", f.pc, f.msg))?;
         Ok(m.emits)
     }
@@ -241,7 +257,7 @@ impl Gfx {
         if flags & 1 != 0 || !self.scenes.contains_key(&hwrt) {
             self.scenes.insert(hwrt, Scene::default());
         }
-        let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace };
+        let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace, stats: JobStats::default() };
         let mut ppp = Ppp::default();
         let mut vdm = VdmState::default();
         let mut shareds = vec![0u32; 1024];
@@ -344,7 +360,8 @@ impl Gfx {
                     }
                     for n in 0..instances {
                         let verts = shade_vertices(&mut job, &vdm, &mut shareds, &idx, n)?;
-                        assemble(&verts, topology, &ppp, &mut prims)?;
+                        job.stats.vertices += verts.len() as u64;
+                        assemble(&verts, topology, &ppp, &mut prims, &mut job.stats, trace)?;
                     }
                     self.draws += 1;
                 }
@@ -363,7 +380,7 @@ impl Gfx {
         }
         self.prims += prims.len() as u64;
         if trace {
-            eprintln!("[gpu geom] hwrt {hwrt:#x}: {} primitives", prims.len());
+            eprintln!("[gpu geom] hwrt {hwrt:#x}: {} primitives, {:?}", prims.len(), job.stats);
         }
         self.scenes.entry(hwrt).or_default().prims.extend(prims);
         Ok(())
@@ -394,45 +411,106 @@ fn shade_vertices(job: &mut Job, vdm: &VdmState, shareds: &mut [u32], idx: &[u32
     Ok(insts.into_iter().map(|i| Vertex { win: [0.0; 4], out: i.vout }).collect())
 }
 
-/// Primitive assembly, clip-space rejection, the viewport transform and culling.
-fn assemble(verts: &[Vertex], topology: u32, ppp: &Ppp, out: &mut Vec<Prim>) -> Result<(), String> {
+/// Clip a polygon of vertex outputs (clip-space position in outputs 0..3) against the
+/// half-space `d(v) >= 0`, interpolating every output linearly in clip space.
+fn clip_poly(poly: Vec<Vec<u32>>, d: impl Fn(&[f32]) -> f32) -> Vec<Vec<u32>> {
+    let pos = |o: &Vec<u32>| -> Vec<f32> { (0..4).map(|i| f(o.get(i).copied().unwrap_or(0))).collect() };
+    let mut out = Vec::new();
+    for i in 0..poly.len() {
+        let (a, b) = (&poly[i], &poly[(i + 1) % poly.len()]);
+        let (da, db) = (d(&pos(a)), d(&pos(b)));
+        if da >= 0.0 {
+            out.push(a.clone());
+        }
+        if (da >= 0.0) != (db >= 0.0) {
+            let t = da / (da - db);
+            let n = a.len().max(b.len());
+            let lerp = (0..n)
+                .map(|k| {
+                    let (x, y) = (f(a.get(k).copied().unwrap_or(0)), f(b.get(k).copied().unwrap_or(0)));
+                    (x + (y - x) * t).to_bits()
+                })
+                .collect();
+            out.push(lerp);
+        }
+    }
+    out
+}
+
+/// Primitive assembly, clipping, the viewport transform and culling.
+///
+/// Clipping is in clip space against w > 0 (w >= TA_WCLAMP with the W clamp enabled)
+/// and, with PPP_CTRL.clip_mode front/rear, against Vulkan's 0 <= z <= w; with clip_mode 0
+/// (depth clamp) z is clamped to the viewport's depth range instead. x and y need no
+/// clipping: pixels outside the render are never covered. A clipped triangle becomes a
+/// fan; flat-shaded varyings still come from the original provoking vertex.
+fn assemble(verts: &[Vertex], topology: u32, ppp: &Ppp, out: &mut Vec<Prim>, stats: &mut JobStats, trace: bool) -> Result<(), String> {
     let tris: Vec<[usize; 3]> = match topology {
         6 => (0..verts.len() / 3).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect(),
         9 => (0..verts.len().saturating_sub(2)).map(|i| if i % 2 == 0 { [i, i + 1, i + 2] } else { [i + 1, i, i + 2] }).collect(),
         11 => (1..verts.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(),
         t => return Err(format!("primitive topology {t} (points / lines / patches) not implemented")),
     };
+    // TA_OUTPUT_SEL: clip / cull planes (0..15), viewport (19) and render target (20) index
+    if ppp.outsel & 0xffff != 0 || ppp.outsel & (3 << 19) != 0 {
+        return Err(format!("clip / cull distances or viewport / layer outputs (OUTPUT_SEL {:#x}) not implemented", ppp.outsel));
+    }
     let vp = *ppp.viewports.first().ok_or("draw without a viewport")?;
+    let wmin = if ppp.ppp_ctrl & (1 << 5) != 0 { ppp.wclamp.max(f32::MIN_POSITIVE) } else { f32::MIN_POSITIVE };
+    let clip_mode = (ppp.ppp_ctrl >> 10) & 3;
     for t in tris {
-        let mut v = [verts[t[0]].clone(), verts[t[1]].clone(), verts[t[2]].clone()];
-        // no clipper: a primitive crossing w <= 0 is dropped (Vulkan's guard band covers the
-        // rest; x/y outside the render are clipped per pixel)
-        let mut ok = true;
-        for vx in &mut v {
-            let c: Vec<f32> = (0..4).map(|i| f(vx.out.get(i).copied().unwrap_or(0))).collect();
-            let w = c[3].max(if ppp.ppp_ctrl & (1 << 5) != 0 { ppp.wclamp } else { f32::MIN });
-            if w <= 0.0 {
-                ok = false;
-                break;
+        stats.triangles += 1;
+        let orig = [verts[t[0]].out.clone(), verts[t[1]].out.clone(), verts[t[2]].out.clone()];
+        let mut poly = orig.to_vec();
+        poly = clip_poly(poly, |c| c[3] - wmin);
+        if clip_mode != 0 {
+            poly = clip_poly(poly, |c| c[2]);
+            poly = clip_poly(poly, |c| c[3] - c[2]);
+        }
+        if poly.len() < 3 {
+            stats.behind += 1;
+            continue;
+        }
+        let win: Vec<[f32; 4]> = poly
+            .iter()
+            .map(|o| {
+                let c: Vec<f32> = (0..4).map(|i| f(o.get(i).copied().unwrap_or(0))).collect();
+                let mut z = vp[4] + vp[5] * c[2] / c[3];
+                if clip_mode == 0 {
+                    z = z.clamp(vp[4].min(vp[4] + vp[5]), vp[4].max(vp[4] + vp[5]));
+                }
+                [vp[0] + vp[1] * c[0] / c[3], vp[2] + vp[3] * c[1] / c[3], z, 1.0 / c[3]]
+            })
+            .collect();
+        for i in 1..poly.len() - 1 {
+            let v = [0, i, i + 1].map(|k| Vertex { win: win[k], out: poly[k].clone() });
+            let area = (v[1].win[0] - v[0].win[0]) * (v[2].win[1] - v[0].win[1]) - (v[2].win[0] - v[0].win[0]) * (v[1].win[1] - v[0].win[1]);
+            // Vulkan's orientation: a = -1/2 * sum(x_i * y_i+1 - x_i+1 * y_i) in framebuffer
+            // coordinates (y down), counter-clockwise when positive; `area` is twice the
+            // sum without the minus sign, so counter-clockwise is a negative `area`
+            let ccw = area < 0.0;
+            if trace {
+                let w: Vec<String> = v.iter().map(|v| format!("({:.1},{:.1},{:.3})", v.win[0], v.win[1], v.win[2])).collect();
+                eprintln!("[gpu geom]   triangle {} area {area:.1} ppp_ctrl {:#x}", w.join(" "), ppp.ppp_ctrl);
             }
-            vx.win = [vp[0] + vp[1] * c[0] / w, vp[2] + vp[3] * c[1] / w, vp[4] + vp[5] * c[2] / w, 1.0 / w];
+            // cull mode: 1 removes clockwise, 2 counter-clockwise triangles
+            match ppp.ppp_ctrl & 3 {
+                1 if !ccw => {
+                    stats.culled += 1;
+                    continue;
+                }
+                2 if ccw => {
+                    stats.culled += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if area == 0.0 {
+                stats.degenerate += 1;
+                continue;
+            }
+            out.push(Prim { v, ppp: ppp.clone(), back: !ccw, flat: orig.clone() });
         }
-        if !ok {
-            continue;
-        }
-        let area = (v[1].win[0] - v[0].win[0]) * (v[2].win[1] - v[0].win[1]) - (v[2].win[0] - v[0].win[0]) * (v[1].win[1] - v[0].win[1]);
-        // y points down: a positive area is clockwise on screen, counter-clockwise in
-        // Vulkan's framebuffer coordinates
-        let ccw = area > 0.0;
-        match ppp.ppp_ctrl & 3 {
-            1 if !ccw => continue,
-            2 if ccw => continue,
-            _ => {}
-        }
-        if area == 0.0 {
-            continue;
-        }
-        out.push(Prim { v, ppp: ppp.clone(), back: !ccw });
     }
     Ok(())
 }
@@ -550,6 +628,8 @@ struct Render {
     /// PBE register words per render target
     pbe: Vec<[u64; 3]>,
     depth_clear: f32,
+    /// depth precision: the ZLS format's integer range (0 for float depth)
+    depth_scale: f32,
     scissor_base: u64,
 }
 
@@ -629,6 +709,10 @@ impl Render {
         let v = &prim.v;
         let ppp = &prim.ppp;
         let (ispa, _ispb) = if prim.back && ppp.ispctl & (1 << 19) != 0 { (ppp.ispa_back, ppp.ispb_back) } else { (ppp.ispa, ppp.ispb) };
+        // ISPCTL: depth bias (17), visibility test / occlusion query (15)
+        if ppp.ispctl & ((1 << 17) | (1 << 15)) != 0 {
+            return Err(format!("depth bias / occlusion query (ISPCTL {:#x}) not implemented", ppp.ispctl));
+        }
         if (ispa >> 28) & 0xf != 0 {
             return Err(format!("ISP object type {} (lines / points) not implemented", (ispa >> 28) & 0xf));
         }
@@ -662,7 +746,12 @@ impl Render {
             if e0 < 0.0 || e1 < 0.0 || e2 < 0.0 {
                 continue;
             }
-            let z = zplane[0] * x + zplane[1] * y + zplane[2];
+            job.stats.covered += 1;
+            let mut z = zplane[0] * x + zplane[1] * y + zplane[2];
+            if self.depth_scale != 0.0 {
+                // a unorm depth buffer holds z at its precision
+                z = (z.clamp(0.0, 1.0) * self.depth_scale).round() / self.depth_scale;
+            }
             let pass = match dcmp {
                 0 => false,
                 1 => z < depth[i],
@@ -674,6 +763,7 @@ impl Render {
                 _ => true,
             };
             if !pass {
+                job.stats.depth_failed += 1;
                 continue;
             }
             if dwrite {
@@ -715,7 +805,18 @@ impl Render {
         let mut none2 = [];
         let (u, _) = job.pds(kick + 32, kick, 8, vec![], false, &mut none, &mut none2)?;
         let u = u.ok_or("fragment kick program without a DOUTU")?;
-        let mut insts: Vec<Instance> = covered
+        // shade whole 2x2 quads: the uncovered pixels of a quad run as helpers (for
+        // derivatives) and keep their results to themselves
+        let mut lanes: Vec<usize> = covered
+            .iter()
+            .flat_map(|&i| {
+                let (qx, qy) = ((i as u32 % TILE) & !1, (i as u32 / TILE) & !1);
+                [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| ((qy + dy) * TILE + qx + dx) as usize)
+            })
+            .collect();
+        lanes.sort_unstable();
+        lanes.dedup();
+        let mut insts: Vec<Instance> = lanes
             .iter()
             .map(|&i| {
                 let mut inst = pixels[i].clone();
@@ -725,10 +826,11 @@ impl Render {
             })
             .collect();
         job.usc(u, &mut coeffs, &mut shareds, &mut insts)?;
+        job.stats.shaded += covered.len() as u64;
         // punch-through and depth-feedback objects keep only the pixels the shader passed
         let feedback = matches!((ispa >> 24) & 7, 2 | 4 | 5);
-        for (inst, &i) in insts.iter().zip(&covered) {
-            if !feedback || inst.feedback {
+        for (inst, &i) in insts.iter().zip(&lanes) {
+            if covered.binary_search(&i).is_ok() && (!feedback || inst.feedback) {
                 pixels[i].out = inst.out;
             }
         }
@@ -789,7 +891,19 @@ fn tsp(douti: u64, prim: &Prim, origin: (u32, u32), coeffs: &mut [u32]) -> Resul
                 });
                 plane(pts)
             }
-            k => [0.0, 0.0, val(k as usize)],
+            k => {
+                let o = &prim.flat[k as usize];
+                // the flat value of the provoking vertex, from the unclipped triangle
+                let mut t: Vec<f32> = Vec::new();
+                if outsel & (1 << 16) != 0 {
+                    t.push(1.0 / f(o.get(3).copied().unwrap_or(0)));
+                }
+                if outsel & (1 << 21) != 0 {
+                    t.push(prim.v[0].win[2]);
+                }
+                t.extend(o.iter().skip(4).map(|&w| f(w)));
+                [0.0, 0.0, t.get(a).copied().unwrap_or(0.0)]
+            }
         };
         // relative to the tile: A*(x - x0) + B*(y - y0) + C'
         let c0 = p[2] + p[0] * origin.0 as f32 + p[1] * origin.1 as f32;
@@ -828,6 +942,13 @@ impl Gfx {
             return Err(format!("depth / stencil load and store (ZLSCTL {:#x}) not implemented", r64(120)));
         }
         let pbe: Vec<[u64; 3]> = (0..8).map(|i| [r64(152 + 24 * i), r64(160 + 24 * i), r64(168 + 24 * i)]).collect();
+        // the background depth is in the ZLS format (ZLSCTL.zloadformat): 0 F32, 1 24-bit
+        // and 2 16-bit unorm, 3 F32 with stencil
+        let (depth_clear, depth_scale) = match (r64(120) >> 23) & 3 {
+            1 => ((r(36) & 0xff_ffff) as f32 / 16_777_215.0, 16_777_215.0),
+            2 => ((r(36) & 0xffff) as f32 / 65535.0, 65535.0),
+            _ => (f(r(36)), 0.0),
+        };
         let bg = [r64(352), r64(360), r64(368)];
         let bgnd = (bgobjvals & (1 << 9) != 0).then(|| {
             let kick = bg[0] & 0xffff_fff0;
@@ -847,14 +968,15 @@ impl Gfx {
             // the end-of-tile PDS code sits in the EOT static data area at PDS offset 0x80
             eot: (0x80, pixel_data, 4 * (pixel_info & 0x1f) as usize, 16 * ((pixel_info >> 9) & 0x3f) as usize),
             pbe,
-            depth_clear: f(r(36)),
+            depth_clear,
+            depth_scale,
             scissor_base: r64(96) & 0xff_ffff_fffc,
         };
-        let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace };
+        let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace, stats: JobStats::default() };
         let tiles = render.run(&mut job, &scene.prims)?;
         self.tiles += tiles;
         if trace {
-            eprintln!("[gpu frag] hwrt {hwrt:#x}: {w}x{h}, {} primitives, {tiles} tiles", scene.prims.len());
+            eprintln!("[gpu frag] hwrt {hwrt:#x}: {w}x{h}, {} primitives, {tiles} tiles, {:?}", scene.prims.len(), job.stats);
         }
         Ok(())
     }
@@ -900,9 +1022,10 @@ impl Gfx {
             eot: ((r(48) & !0xf) as u64, (r(52) & !0xf) as u64, 4 * (pixel_info & 0x1f) as usize, 16 * ((pixel_info >> 9) & 0x3f) as usize),
             pbe,
             depth_clear: 1.0,
+            depth_scale: 0.0,
             scissor_base: 0,
         };
-        let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace };
+        let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace, stats: JobStats::default() };
         let tiles = render.run(&mut job, &[])?;
         self.tiles += tiles;
         if trace {
@@ -962,6 +1085,47 @@ mod tests {
         pbe(&mut mem, (s0, s1), [r0, r1, 0], (0, 0), &tile_regs()).unwrap();
         assert_eq!(mem.0.len(), 8);
         assert_eq!(mem.0[&(0x1000 + 4 * (8 + 3))], 3 | 1 << 8 | 0xff << 24);
+    }
+
+    fn vertex(x: f32, y: f32, z: f32, w: f32) -> Vertex {
+        Vertex { win: [0.0; 4], out: [x, y, z, w].map(f32::to_bits).to_vec() }
+    }
+
+    /// A PPP state with an identity viewport (window = NDC), FRONT_REAR clipping and the
+    /// given cull mode.
+    fn ppp(cull: u32) -> Ppp {
+        Ppp { viewports: vec![[0.0, 1.0, 0.0, 1.0, 0.0, 1.0]], ppp_ctrl: (1 << 10) | cull, ..Default::default() }
+    }
+
+    #[test]
+    fn culling_follows_vulkan_orientation() {
+        // (0,0) -> (0,1) -> (1,0) with y down: counter-clockwise on screen, front-facing
+        // for VK_FRONT_FACE_COUNTER_CLOCKWISE
+        let v = [vertex(0.0, 0.0, 0.5, 1.0), vertex(0.0, 1.0, 0.5, 1.0), vertex(1.0, 0.0, 0.5, 1.0)];
+        let mut stats = JobStats::default();
+        for (cull, kept) in [(0, 1), (1, 1), (2, 0)] {
+            let mut out = Vec::new();
+            assemble(&v, 6, &ppp(cull), &mut out, &mut stats, false).unwrap();
+            assert_eq!(out.len(), kept, "cull mode {cull}");
+            if kept == 1 {
+                assert!(!out[0].back);
+            }
+        }
+    }
+
+    #[test]
+    fn clipping_against_w_and_z() {
+        // one vertex behind the eye: the visible part is a quad (two triangles)
+        let v = [vertex(0.0, 0.0, 0.5, 1.0), vertex(0.0, 1.0, 0.5, 1.0), vertex(1.0, 0.0, 0.5, -1.0)];
+        let mut out = Vec::new();
+        assemble(&v, 6, &ppp(0), &mut out, &mut JobStats::default(), false).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|p| p.v.iter().all(|v| v.win[3] > 0.0)));
+        // beyond the far plane (z > w): nothing
+        let v = [vertex(0.0, 0.0, 2.0, 1.0), vertex(0.0, 1.0, 2.0, 1.0), vertex(1.0, 0.0, 2.0, 1.0)];
+        let mut out = Vec::new();
+        assemble(&v, 6, &ppp(0), &mut out, &mut JobStats::default(), false).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

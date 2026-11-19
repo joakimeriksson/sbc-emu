@@ -90,6 +90,8 @@ pub struct Firmware {
     /// the 3D pipeline: scenes between their geometry and fragment jobs
     pub gfx: crate::gfx::Gfx,
     pub trace: bool,
+    /// trace only the first this many GPU jobs (SBC_GPU_TRACE_JOBS; 0 = all)
+    pub trace_jobs: u64,
 }
 
 impl Firmware {
@@ -252,7 +254,10 @@ impl Firmware {
                 }
                 CCB_CMD_CDM => {
                     let mut vm = crate::vm::Vm::new(pc);
+                    let trace = self.trace;
+                    self.trace = self.job_trace();
                     crate::cdm::run(self, ram, &mut vm, body);
+                    self.trace = trace;
                     self.jobs += 1;
                 }
                 // a partial render: only needed when the parameter buffer runs out, which it
@@ -272,7 +277,7 @@ impl Firmware {
                     };
                     let mut vm = crate::vm::Vm::new(pc);
                     let mut mem = crate::cdm::GpuMem { ram, vm: &mut vm };
-                    let trace = self.trace;
+                    let trace = self.job_trace();
                     let r = match ty {
                         CCB_CMD_GEOM => self.gfx.geom(&mut mem, &words, trace),
                         CCB_CMD_FRAG => self.gfx.frag(&mut mem, &words, screen, trace),
@@ -292,6 +297,11 @@ impl Firmware {
         }
         self.wr(ram, ctl + CCCB_READ_OFFSET, roff);
         self.irq = true;
+    }
+
+    /// Whether to trace the next GPU job.
+    fn job_trace(&self) -> bool {
+        self.trace && (self.trace_jobs == 0 || self.jobs < self.trace_jobs)
     }
 
     /// Read a 32-bit word at a firmware address.

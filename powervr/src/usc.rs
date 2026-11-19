@@ -1148,6 +1148,17 @@ pub struct Machine<'a> {
     pub trace: bool,
     /// `emitpix` requests of this run (PBE state words 0 and 1), for the data master
     pub emits: Vec<(u32, u32)>,
+    /// per lane, the quad partner lanes in x and y (pixel instances): built on first use
+    pub quad: Vec<[Option<usize>; 2]>,
+}
+
+/// Values a group needs from the other lanes of each 2x2 pixel quad, computed before the
+/// lanes execute: derivatives for phase 0 / phase 1 (`fdsx`, `fdsy`), and texture
+/// coordinate gradients (du/dx, dv/dx, du/dy, dv/dy) for an implicit-LOD sample.
+#[derive(Default)]
+struct QuadValues {
+    deriv: Vec<[f32; 2]>,
+    grads: Vec<Option<[f32; 4]>>,
 }
 
 /// The constant registers (special bank 0..31 hold their index; others from Mesa's
@@ -1364,19 +1375,83 @@ impl Machine<'_> {
             Alu::Control => return self.exec_ctrl(g, insts),
             Alu::Main | Alu::Bitwise => {}
         }
+        let quad = self.quad_values(g, insts)?;
         for (lane, inst) in insts.iter_mut().enumerate() {
             if !g.hdr.cc.passes(inst.pe, inst.p0) {
                 continue;
             }
             for k in 0..g.hdr.rpt as u16 {
                 if g.hdr.alu == Alu::Main {
-                    self.exec_main(g, inst, lane, k, stats)?;
+                    self.exec_main(g, inst, lane, k, stats, &quad)?;
                 } else {
                     self.exec_bitwise(g, inst, lane, k)?;
                 }
             }
         }
         Ok(None)
+    }
+
+    /// The quad partners of every lane, from the pixel positions.
+    fn quad_map(&mut self, insts: &[Instance]) {
+        if self.quad.len() == insts.len() {
+            return;
+        }
+        let at: HashMap<(i64, i64), usize> = insts.iter().enumerate().map(|(i, p)| ((p.pos[0].floor() as i64, p.pos[1].floor() as i64), i)).collect();
+        self.quad = insts
+            .iter()
+            .map(|p| {
+                let (x, y) = (p.pos[0].floor() as i64, p.pos[1].floor() as i64);
+                [at.get(&(x ^ 1, y)).copied(), at.get(&(x, y ^ 1)).copied()]
+            })
+            .collect();
+    }
+
+    /// Cross-lane values of a group (see `QuadValues`), if it needs any.
+    fn quad_values(&mut self, g: &Group, insts: &[Instance]) -> Result<QuadValues, String> {
+        let deriv_op = |op: Option<MainOp>| match op {
+            Some(MainOp::Sngl { op: o @ (Sngl::Dsx | Sngl::Dsy | Sngl::Dsxf | Sngl::Dsyf), s0 }) => Some((o, s0)),
+            _ => None,
+        };
+        let derivs = [deriv_op(g.p0), deriv_op(g.p1)];
+        let smp = matches!(g.backend, Some(Backend::Smp { nncoords: false, .. }));
+        let mut q = QuadValues::default();
+        if derivs.iter().all(|d| d.is_none()) && !smp {
+            return Ok(q);
+        }
+        if g.hdr.rpt > 1 {
+            return Err("repeated derivative / implicit-LOD sample not implemented".into());
+        }
+        self.quad_map(insts);
+        // dx: v(right) - v(left) in the lane's row pair; dy likewise down a column
+        let diff = |m: &Self, lane: usize, axis: usize, v: &dyn Fn(usize) -> Result<f32, String>| -> Result<f32, String> {
+            let p = m.quad[lane][axis].ok_or("derivative of a pixel without its full 2x2 quad")?;
+            let first = insts[lane].pos[axis].floor() as i64 & 1 == 0;
+            Ok(if first { v(p)? - v(lane)? } else { v(lane)? - v(p)? })
+        };
+        q.deriv = vec![[0.0; 2]; insts.len()];
+        for (phase, d) in derivs.iter().enumerate() {
+            let Some((op, mods)) = *d else { continue };
+            let src = g.src[if phase == 0 { 0 } else { 3 }].ok_or("derivative without a source")?;
+            let axis = if matches!(op, Sngl::Dsx | Sngl::Dsxf) { 0 } else { 1 };
+            let val = |l: usize| -> Result<f32, String> { Ok(fmod(self.reg(&insts[l], l, src)?, mods)) };
+            for lane in 0..insts.len() {
+                q.deriv[lane][phase] = diff(self, lane, axis, &val)?;
+            }
+        }
+        if smp {
+            let c = g.src[1].ok_or("sample without coordinates")?;
+            let u = |l: usize| -> Result<f32, String> { Ok(f(self.reg(&insts[l], l, c)?)) };
+            let v = |l: usize| -> Result<f32, String> { Ok(f(self.reg(&insts[l], l, c.offset(1))?)) };
+            q.grads = (0..insts.len())
+                .map(|l| -> Result<Option<[f32; 4]>, String> {
+                    if self.quad[l][0].is_none() || self.quad[l][1].is_none() {
+                        return Ok(None);
+                    }
+                    Ok(Some([diff(self, l, 0, &u)?, diff(self, l, 0, &v)?, diff(self, l, 1, &u)?, diff(self, l, 1, &v)?]))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(q)
     }
 
     fn srcs(&self, g: &Group, inst: &Instance, lane: usize, k: u16) -> Result<[u32; 6], String> {
@@ -1389,7 +1464,7 @@ impl Machine<'_> {
         Ok(s)
     }
 
-    fn exec_main(&mut self, g: &Group, inst: &mut Instance, lane: usize, k: u16, stats: &mut Stats) -> Result<(), String> {
+    fn exec_main(&mut self, g: &Group, inst: &mut Instance, lane: usize, k: u16, stats: &mut Stats, quad: &QuadValues) -> Result<(), String> {
         let mut s = self.srcs(g, inst, lane, k)?;
         // a repeated unpack of a packed format reads element k of one source register
         let mut upck_elem = None;
@@ -1410,6 +1485,12 @@ impl Machine<'_> {
         }
         if let Some(op) = g.p1 {
             self.unit(op, &mut l, s[3], 0, 0, is0, inst.p0, 1)?;
+        }
+        // derivatives come from the quad
+        for (phase, op) in [g.p0, g.p1].into_iter().enumerate() {
+            if let Some(MainOp::Sngl { op: Sngl::Dsx | Sngl::Dsy | Sngl::Dsxf | Sngl::Dsyf, .. }) = op {
+                l.ft[phase] = quad.deriv[lane][phase].to_bits();
+            }
         }
         // a repeated pack into a packed format fills field k of one destination register
         let mut pck_field = None;
@@ -1446,7 +1527,8 @@ impl Machine<'_> {
         }
         if let Some(b) = g.backend {
             // the backend sees the value on w0, and some backend ops drive w0/w1 themselves
-            for (i, v) in self.backend(g, b, inst, lane, k, w[0], stats)?.into_iter().enumerate() {
+            let grads = quad.grads.get(lane).copied().flatten();
+            for (i, v) in self.backend(g, b, inst, lane, k, w[0], grads, stats)?.into_iter().enumerate() {
                 if let Some(v) = v {
                     w[i] = v;
                 }
@@ -1490,6 +1572,8 @@ impl Machine<'_> {
                     Sngl::Log => x.log2().to_bits(),
                     Sngl::Exp => x.exp2().to_bits(),
                     Sngl::Logcn => x.max(f32::MIN_POSITIVE).log2().to_bits(),
+                    // computed across the quad by the caller
+                    Sngl::Dsx | Sngl::Dsy | Sngl::Dsxf | Sngl::Dsyf => 0,
                     op => return Err(format!("sngl op {op:?} not implemented")),
                 }
             }
@@ -1616,7 +1700,7 @@ impl Machine<'_> {
 
     /// A backend op for one instance; returns values it drives onto w0 / w1.
     #[allow(clippy::too_many_arguments)]
-    fn backend(&mut self, g: &Group, b: Backend, inst: &mut Instance, lane: usize, k: u16, w0: u32, stats: &mut Stats) -> Result<[Option<u32>; 2], String> {
+    fn backend(&mut self, g: &Group, b: Backend, inst: &mut Instance, lane: usize, k: u16, w0: u32, grads: Option<[f32; 4]>, stats: &mut Stats) -> Result<[Option<u32>; 2], String> {
         let slot = |n: u8| g.src.get(n as usize).copied().flatten().map(|r| r.offset(k)).ok_or(format!("backend source s{n} missing"));
         let addr = |m: &Self, inst: &Instance, n: u8| -> Result<u64, String> {
             let r = slot(n)?;
@@ -1719,7 +1803,10 @@ impl Machine<'_> {
                 }
                 let cr = slot(1)?;
                 let coords: Vec<f32> = (0..dmn.max(1) as u16).map(|i| self.reg(inst, lane, cr.offset(i)).map(f)).collect::<Result<_, _>>()?;
-                let texel = crate::tpu::sample(self.mem, img, smp, &coords, nncoords, integer)?;
+                if !nncoords && grads.is_none() {
+                    return Err("implicit-LOD sample outside a pixel quad".into());
+                }
+                let texel = crate::tpu::sample(self.mem, img, smp, &coords, nncoords, integer, grads)?;
                 let dst = slot(4)?;
                 for i in 0..chan as u16 {
                     self.set_reg(inst, dst.offset(i), texel[i as usize])?;
@@ -2089,7 +2176,7 @@ mod tests {
                     inst
                 })
                 .collect();
-            let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false, emits: Vec::new() };
+            let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false, emits: Vec::new(), quad: Vec::new() };
             let st = m.run(CODE, &mut insts).unwrap();
             assert_eq!(st.stores, 64);
         }
@@ -2117,7 +2204,7 @@ mod tests {
                 inst
             })
             .collect();
-        let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false, emits: Vec::new() };
+        let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false, emits: Vec::new(), quad: Vec::new() };
         let st = m.run(CODE, &mut insts).unwrap();
         assert_eq!(st.stores, 0);
         // and the branch skipped the body
@@ -2183,7 +2270,7 @@ mod tests {
             mem.0.insert(0x1000 + 4 * i as u64, u32::from_le_bytes(b));
         }
         let mut cache = HashMap::new();
-        let mut m = Machine { mem: &mut mem, coeffs, shareds, cache: &mut cache, trace: false, emits: Vec::new() };
+        let mut m = Machine { mem: &mut mem, coeffs, shareds, cache: &mut cache, trace: false, emits: Vec::new(), quad: Vec::new() };
         m.run(0x1000, insts).unwrap();
         m.emits
     }

@@ -40,6 +40,7 @@ impl Default for Gpu {
         let trace = std::env::var_os("SBC_GPU_TRACE").is_some_and(|v| !v.is_empty());
         let mut fw = fw::Firmware::default();
         fw.trace = trace;
+        fw.trace_jobs = std::env::var("SBC_GPU_TRACE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         Gpu { regs: BTreeMap::new(), fw, irq_status: 0, trace }
     }
 }
