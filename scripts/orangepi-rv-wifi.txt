@@ -1,5 +1,6 @@
-# Orange Pi RV Wi-Fi: the AP6256 (BCM43456) on SDIO0 with mainline brcmfmac and the real
-# brcmfmac43456-sdio firmware (the firmware is downloaded to the chip; its host interface is
+# Orange Pi RV Wi-Fi: the AP6256 (BCM43456) on SDIO0. Mainline: brcmfmac with the real
+# brcmfmac43456-sdio firmware; Xunlong's kernel: bcmdhd with Xunlong's AP6256 firmware (the
+# firmware is downloaded to the chip; its host interface is
 # emulated): scan, join the virtual access point "sbc-emu", DHCP and ping on wlan0.
 wait-serial orangepi-rv#
 serial sleep 2; ip link set wlan0 up && echo WLAN_""UP\n

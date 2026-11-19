@@ -11,8 +11,16 @@ pub trait SdioCard {
     fn write_ext(&mut self, func: u8, addr: u32, incr: bool, data: &[u8]);
     /// the card's interrupt line (DAT[1])
     fn irq(&self) -> bool;
+    /// the card's out-of-band interrupt (a host-wake GPIO), for hosts that use one
+    fn oob_irq(&self) -> bool {
+        self.irq()
+    }
     /// time passes (ns): firmware timers, delayed events
     fn tick(&mut self, _now_ns: u64) {}
+    /// when the card next has something to do on its own (ns), for the machine's idle deadline
+    fn next_event(&self) -> Option<u64> {
+        None
+    }
     /// network frames the card transmitted (Ethernet II)
     fn take_tx(&mut self) -> Vec<Vec<u8>> { Vec::new() }
     /// a network frame for the card

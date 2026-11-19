@@ -1,0 +1,9 @@
+# Orange Pi RV HDMI audio with Xunlong's kernel: I2STX_4CH0 (DesignWare I2S) fed by the AXI
+# DMA controller into the Inno HDMI ("Starfive-HDMI-Sound-Card", ALSA card 1). A 440 Hz
+# sine plays on it; the host writes what the I2S transmits to --audio-out FILE.wav.
+wait-serial orangepi-rv#
+serial cat /proc/asound/cards | grep HDMI | sed 's/^/CARD/'\n
+wait-serial Starfive-HDMI-Sound-Card
+serial speaker-test -D hw:1,0 -t sine -f 440 -c 2 -r 48000 -F S16_LE -l 1 -s 1 2>&1 | grep -E 'Rate|Front|error' | sed 's/^/ST /'; echo HDMI_AUDIO_""DONE\n
+wait-serial HDMI_AUDIO_DONE
+quit

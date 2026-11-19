@@ -175,6 +175,8 @@ struct Udp {
     reply_src: [u8; 4], // DNS's guest-visible address, before host resolver redirection
     sock: UdpSocket,
     last_activity_us: u64,
+    /// replies already on the socket when the guest sent a new query, delivered first
+    queued: Vec<Vec<u8>>,
 }
 
 /// A host port relayed to a guest TCP port (QEMU's hostfwd).
@@ -191,6 +193,8 @@ pub struct Nat {
     udp: Vec<Udp>,
     isn: u32,
     pub resolver: [u8; 4],
+    /// the host resolver left a query unanswered: no waiting for replies until then
+    dns_quiet_until: Option<std::time::Instant>,
     pub log: bool,
     pub tcp_opened: u64, pub tcp_refused: u64, pub udp_flows: u64,
     pub udp_evicted: u64, pub udp_send_errors: u64,
@@ -199,7 +203,7 @@ pub struct Nat {
 
 impl Nat {
     pub fn new(log: bool) -> Self {
-        Self { tcp: Vec::new(), forwards: Vec::new(), next_fwd_port: 49152, udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log,
+        Self { tcp: Vec::new(), forwards: Vec::new(), next_fwd_port: 49152, udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), dns_quiet_until: None, log,
             tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
     }
 
@@ -220,7 +224,7 @@ impl Nat {
                     if self.log { eprintln!("[nat] UDP evicted least recently active flow (table full)"); }
                 }
                 self.udp.push(Udp { guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
-                    reply_src: *reply_src, sock, last_activity_us: now_us });
+                    reply_src: *reply_src, sock, last_activity_us: now_us, queued: Vec::new() });
                 self.udp_flows += 1;
                 if self.log { eprintln!("[nat] UDP {}:{} -> {}:{} ({} bytes)", ip(gip), sport, ip(dip), dport, payload.len()); }
                 self.udp.len() - 1
@@ -228,8 +232,23 @@ impl Nat {
         };
         let flow = &mut self.udp[idx];
         flow.last_activity_us = now_us;
+        if dport == 53 {
+            // set earlier replies aside, so the wait below is for this query's reply
+            let mut buf = [0; 2048];
+            while let Ok(n) = flow.sock.recv(&mut buf) {
+                flow.queued.push(buf[..n].to_vec());
+            }
+        }
         match flow.sock.send(payload) {
-            Ok(n) => self.bytes_to_host += n as u64,
+            Ok(n) => {
+                self.bytes_to_host += n as u64;
+                if dport == 53 && self.dns_quiet_until.is_none_or(|t| std::time::Instant::now() >= t) {
+                    self.dns_quiet_until = (!wait_for_reply(&flow.sock)).then(|| std::time::Instant::now() + DNS_QUIET);
+                    if self.dns_quiet_until.is_some() && self.log {
+                        eprintln!("[nat] DNS: the host resolver did not answer; not waiting for it for {}s", DNS_QUIET.as_secs());
+                    }
+                }
+            }
             Err(e) => {
                 self.udp_send_errors += 1;
                 if self.log { eprintln!("[nat] UDP {}:{} send failed: {}", ip(dip), dport, e); }
@@ -405,6 +424,13 @@ impl Nat {
         }
         for flow in &mut self.udp {
             let mut buf = [0; 2048];
+            let queued = std::mem::take(&mut flow.queued);
+            for q in &queued {
+                self.bytes_to_guest += q.len() as u64;
+                flow.last_activity_us = now_us;
+                let udp = udp_packet(&flow.reply_src, &flow.guest_ip, flow.dst_port, flow.guest_port, q);
+                out.push(ethernet(&flow.guest_mac, &GATEWAY_MAC, 0x0800, &ip_packet(17, &flow.reply_src, &flow.guest_ip, &udp)));
+            }
             for _ in 0..UDP_BATCH {
                 let Ok(n) = flow.sock.recv(&mut buf) else { break };
                 if self.log { eprintln!("[nat] UDP reply {} bytes -> guest port {}", n, flow.guest_port); }
@@ -421,6 +447,24 @@ impl Nat {
         self.udp.retain(|f| now_us.wrapping_sub(f.last_activity_us) < IDLE_CLOSE_US);
         out
     }
+}
+
+/// How long to wait for a DNS reply, and how long to stop waiting after one never came.
+const DNS_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+const DNS_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hold the emulator until a DNS reply is in (up to `DNS_WAIT`), so the guest sees the host
+/// resolver answer at once. Idle guest time catches up with the wall clock in big steps (the
+/// interpreter runs behind it), and a resolver that takes half a second (Tailscale's
+/// 100.100.100.100, for one) would otherwise time out the guest's lookup before it answers.
+/// The reply stays queued for `poll`. Returns whether a reply came; one that did not stops
+/// the waiting for `DNS_QUIET`, so a dead resolver stalls the emulator once, not per query.
+fn wait_for_reply(sock: &UdpSocket) -> bool {
+    let got = sock.set_nonblocking(false).is_ok()
+        && sock.set_read_timeout(Some(DNS_WAIT)).is_ok()
+        && sock.peek(&mut [0u8; 2048]).is_ok();
+    let _ = sock.set_nonblocking(true);
+    got
 }
 
 fn host_resolver() -> [u8; 4] {
