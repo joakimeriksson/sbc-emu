@@ -82,13 +82,13 @@ fn byte_priorities_and_64bit_affinity_registers() {
 #[test]
 fn timer_wakes_waiting_core_at_24mhz() {
     let mut m=Machine::new(128<<20).unwrap();m.soc.gic=enabled_gic();
-    m.cpu.pc=0x80000;
+    m.cpus[0].pc=0x80000;
     m.soc.ram[0x80000..0x80004].copy_from_slice(&0xd503207fu32.to_le_bytes()); // WFI
-    m.cpu.sys.vtimer.ctl=1;m.cpu.sys.vtimer.cval=24_000;
+    m.cpus[0].sys.vtimer.ctl=1;m.cpus[0].sys.vtimer.cval=24_000;
     let Stop::Idle(deadline)=m.run(100) else {panic!("expected WFI idle")};
     assert_eq!(deadline,1_000_000);
-    m.idle_until(deadline-1);assert!(!m.cpu.irq);
-    m.idle_until(deadline);assert!(m.cpu.irq);
+    m.idle_until(deadline-1);assert!(!m.cpus[0].irq);
+    m.idle_until(deadline);assert!(m.cpus[0].irq);
     assert_eq!(m.soc.gic.sys_read(IAR),Some(27));
 }
 
@@ -128,7 +128,78 @@ fn gmac_partial_writes_preserve_neighbors_and_idle_does_not_poll_local_network()
     assert_eq!(m.soc.read32(rk3588::GMAC+0x1134).unwrap(),0x1234ab78);
     m.connect_network(false,false);
     m.soc.ram[..4].copy_from_slice(&0xd503207fu32.to_le_bytes());
-    m.cpu.pc=0;
+    m.cpus[0].pc=0;
     let Stop::Idle(deadline)=m.run(10) else {panic!("expected WFI")};
     assert!(deadline-m.now()>1_000_000);
+}
+
+/// Enable PE `pe`'s CPU interface and redistributor and all SGIs/PPIs on it.
+fn enable_pe(g: &mut Gic, pe: usize) {
+    let f = pe as u64 * rk3588::gic::FRAME;
+    g.redist_write(f+0x14,0);
+    g.redist_write(f+0x10080,u32::MAX);
+    g.redist_write(f+0x10100,u32::MAX);
+    g.cur=pe; g.sys_write(PMR,0xf0); g.sys_write(GROUP1,1);
+}
+
+#[test]
+fn eight_redistributors_report_core_affinities() {
+    let g=Gic::with_cpus(8);
+    for pe in 0..8u64 {
+        let f=pe*rk3588::gic::FRAME;
+        let typer=g.redist_read(f+8) as u64 | (g.redist_read(f+12) as u64) << 32;
+        assert_eq!(typer>>32,pe<<8,"Aff1 = core");
+        assert_eq!((typer>>8)&0xffff,pe,"processor number");
+        assert_eq!(typer&0x10!=0,pe==7,"Last only on the final frame");
+    }
+    assert_eq!((g.dist_read(4)>>5)&7,7,"GICD_TYPER.CPUNumber");
+}
+
+#[test]
+fn sgis_reach_only_their_targets() {
+    let mut g=Gic::with_cpus(8);
+    g.dist_write(0,0x12);
+    for pe in 0..8 { enable_pe(&mut g,pe); }
+    g.cur=0;
+    g.sys_write(rk3588::gic::SGI1R,(1<<24)|(5<<16)|1); // SGI1 to Aff1=5 (core 5)
+    assert_eq!((0..8).filter(|&k|g.irq_out(k)).collect::<Vec<_>>(),[5]);
+    g.cur=5; assert_eq!(g.sys_read(IAR),Some(1)); g.sys_write(EOIR,1);
+    g.cur=2;
+    g.sys_write(rk3588::gic::SGI1R,(2<<24)|(1<<40)); // IRM: everyone but core 2
+    assert_eq!((0..8).filter(|&k|g.irq_out(k)).collect::<Vec<_>>(),[0,1,3,4,5,6,7]);
+}
+
+#[test]
+fn spis_follow_their_affinity_route() {
+    let mut g=Gic::with_cpus(8);
+    g.dist_write(0,0x12);
+    for pe in 0..8 { enable_pe(&mut g,pe); }
+    g.dist_write(0x80+((UART_IRQ/32)*4) as u64,u32::MAX);
+    g.dist_write(0x100+((UART_IRQ/32)*4) as u64,1<<(UART_IRQ%32));
+    g.dist_write(0x6000+UART_IRQ as u64*8,6<<8); // to core 6
+    g.set_line(UART_IRQ,true);
+    assert_eq!((0..8).filter(|&k|g.irq_out(k)).collect::<Vec<_>>(),[6]);
+    g.dist_write(0x6000+UART_IRQ as u64*8,1<<31); // IRM: any core; the first to acknowledge takes it
+    assert!((0..8).all(|k|g.irq_out(k)));
+    g.cur=3; assert_eq!(g.sys_read(IAR),Some(UART_IRQ as u64));
+    assert!((0..8).all(|k|!g.irq_out(k)),"active on core 3");
+}
+
+#[test]
+fn psci_cpu_on_starts_a_big_core_with_its_identity() {
+    let mut m=Machine::with_cpus(128<<20,8).unwrap();
+    // core 0: CPU_ON(0x400, entry 0x90000, context 0x1234) by SMC, then WFI
+    let code=[0xd2800060u32 /* movz x0,#3 */, 0xf2b08000 /* movk x0,#0x8400,lsl16 */, 0xd2808001 /* movz x1,#0x400 */,
+        0xd2920002 /* movz x2,#0x9000 */, 0xd37cec42 /* lsl x2,x2,#4 */, 0xd2824683 /* movz x3,#0x1234 */, 0xd4000003 /* smc */, 0xd503207f /* wfi */];
+    for (i,w) in code.iter().enumerate() { m.soc.ram[0x80000+i*4..0x80004+i*4].copy_from_slice(&w.to_le_bytes()); }
+    // core 4: read MPIDR_EL1 and MIDR_EL1 into x1/x2, then WFI
+    for (i,w) in [0xd53800a1u32 /* mrs x1,mpidr_el1 */, 0xd5380002 /* mrs x2,midr_el1 */, 0xd503207f].iter().enumerate() { m.soc.ram[0x90000+i*4..0x90004+i*4].copy_from_slice(&w.to_le_bytes()); }
+    m.cpus[0].pc=0x80000; m.cpus[0].el=1;
+    let _=m.run(1000);
+    assert_eq!(m.cpus[0].x[0],0,"CPU_ON succeeded");
+    assert_eq!(m.state[4],rk3588::CoreState::Wfi);
+    assert_eq!(m.cpus[4].x[0],0x1234);
+    assert_eq!(m.cpus[4].x[1],0x8100_0400);
+    assert_eq!(m.cpus[4].x[2],0x414f_d0b0,"Cortex-A76");
+    assert!(m.state.iter().enumerate().all(|(k,s)|k==0||k==4||*s==rk3588::CoreState::Off));
 }

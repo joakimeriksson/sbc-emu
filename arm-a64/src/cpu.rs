@@ -34,6 +34,8 @@ impl CpuProfile {
     pub const CORTEX_A72: Self = Self { midr: 0x410f_d083, gic_sysregs: false };
     /// Reduced A55 profile: no LSE/FP16/RAS advertised until those features exist.
     pub const CORTEX_A55: Self = Self { midr: 0x412f_d050, gic_sysregs: true };
+    /// Cortex-A76 r4p0 (the RK3588's big cores), with the same reduced feature set as the A55.
+    pub const CORTEX_A76: Self = Self { midr: 0x414f_d0b0, gic_sysregs: true };
 }
 
 pub struct Cpu {
