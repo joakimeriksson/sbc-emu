@@ -125,7 +125,9 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
     m.soc.ram[entry as usize..entry as usize+kernel.len()].copy_from_slice(kernel);
     let range=if let Some(data)=initrd {
         let end=INITRD.checked_add(data.len() as u64).ok_or("initrd size overflow")?;
-        if end>m.soc.ram.len() as u64 {return Err("initrd exceeds RAM".into());}
+        // below the HDMI framebuffer (no-map) when there is one
+        let top=m.soc.display.scanout.map_or(m.soc.ram.len() as u64,|(fb,_)|fb);
+        if end>top {return Err(format!("initrd ({} MiB) does not fit below {:#x}; give more --ram-mb",data.len()>>20,top));}
         m.soc.ram[INITRD as usize..end as usize].copy_from_slice(data);Some((INITRD,end))
     }else{None};
     let dt=device_tree_for(m.soc.ram.len() as u64,cmdline,range,&Hardware::of(m));
