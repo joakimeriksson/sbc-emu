@@ -238,4 +238,12 @@ fn m2_slot_is_an_ecam_host_with_an_intx_nvme() {
     assert_eq!(m.soc.read32(rk3588::pcie::ECAM).unwrap(),0x0001_fffd);
     let dt=rk3588::boot::device_tree(128<<20,"",None,false);
     assert!(dt.windows(21).any(|w|w==b"pci-host-ecam-generic"));
+    // a 16-bit write to the status register (clearing error bits) keeps the command register
+    let ecam=rk3588::pcie::ECAM;
+    m.soc.write32(ecam+4,6).unwrap();
+    m.soc.write16(ecam+6,0xf900).unwrap();
+    assert_eq!(m.soc.read32(ecam+4).unwrap()&0xffff,6,"memory decode and bus mastering stay on");
+    m.soc.write8(ecam+0x3c,42).unwrap();
+    m.soc.write8(ecam+0x3d,0).unwrap();
+    assert_eq!(m.soc.read32(ecam+0x3c).unwrap()&0xff,42,"interrupt line kept");
 }
