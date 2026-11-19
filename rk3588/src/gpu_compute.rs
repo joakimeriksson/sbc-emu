@@ -17,7 +17,6 @@ pub fn dispatch(
     if instruction & 0x00ff_ffff_ffff_ffff != 0
         || r[33] >> 30 != 0
         || r[34..37].iter().any(|&v| v != 0)
-        || pair(r, 0) != 0
         || pair(r, 24) != 0
     {
         return Err(unsupported());
@@ -49,9 +48,6 @@ pub fn dispatch(
         _ => return Err(unsupported()),
     };
     let preload = word(1);
-    if matches!(allocation, RegisterAllocation::Registers32) && preload != 0 {
-        return Err(unsupported());
-    }
     let binary = word(2) as u64 | ((word(3) as u64) << 32);
     if binary & 7 != 0 {
         return Err(Stop::InvalidStream);
@@ -78,6 +74,7 @@ pub fn dispatch(
                     for ly in 0..local[1] {
                         for lx in 0..local[0] {
                             let mut shader = Shader::with_allocation(binary, allocation);
+                            shader.resources = crate::gpu_resources::Resources(pair(r, 0));
                             let values = [
                                 lx | (ly << 16),
                                 lz,
@@ -199,12 +196,16 @@ mod tests {
         regs[9] = 1 << 24;
         regs[33] = 2 | (1 << 10) | (1 << 20);
         regs[37..40].fill(2);
-        dispatch(&m, &mut ram, &regs, 4 << 56).unwrap();
-        let values: Vec<u32> = ram[1024..1056]
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-            .collect();
-        assert_eq!(values, [0x10002, 1, 5, 3, 1, 1, 1, 3]);
+        for allocation in [0u32, 2] {
+            ram[..4].copy_from_slice(&(0x18 | (allocation << 30)).to_le_bytes());
+            ram[1024..1056].fill(0);
+            dispatch(&m, &mut ram, &regs, 4 << 56).unwrap();
+            let values: Vec<u32> = ram[1024..1056]
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            assert_eq!(values, [0x10002, 1, 5, 3, 1, 1, 1, 3]);
+        }
         // Shader preloads that this model does not implement must not be ignored.
         ram[4..8].copy_from_slice(&1u32.to_le_bytes());
         assert!(matches!(

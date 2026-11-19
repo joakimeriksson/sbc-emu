@@ -1,6 +1,6 @@
 # Orange Pi 5 GPU bring-up
 
-The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clear passes are supported. A limited Valhall compute path also runs the shader triangle demo below; fixed-function drawing remains incomplete.
+The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clears, bounded compute dispatch and an initial opaque triangle path are supported. The Mesa GLES demo below now executes real vertex and fragment shaders; broader graphics and scanout remain incomplete.
 
 The first building blocks in `rk3588` are a GPU virtual-address walker for the 4 KiB AArch64 stage-1 page tables used by Panthor and a bounded interpreter for a small subset of Valhall command-stream instructions. Tests exercise memory mapping and faults, instructions and their interaction. The control register block is connected to guest MMIO and the three GPU interrupt lines. Address-space UPDATE commands latch the programmed translation settings. A synchronous CSF queue path now connects Linux submissions to the command interpreter, including kernel CALL and completion synchronization. Unsupported work raises a queue fault.
 
@@ -66,6 +66,81 @@ bounded to 1,024 local invocations per group, 65,536 total invocations and an
 aggregate instruction budget. Workgroup offsets, merging, shared memory and
 barriers remain unsupported; invocations execute sequentially.
 
+Valhall's 32-register allocation is split: R0-R15 and R48-R63 are accessible;
+R16-R47 are unavailable. This follows Mesa's `bi_allocate_registers` affinity in
+[`bi_ra.c`](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/06efd8542f442e701685e26abe4d73c4ddf7b249/src/panfrost/compiler/bifrost/bi_ra.c).
+The upper bank supports both reads and writes, including system-value preloads
+and vector transfers. The interpreter checks every register in address pairs and
+staging vectors before accessing guest memory. The 128-bit load's identity lane
+encoding is accepted; reserved lane encodings are rejected.
+
+Run the Linux shader demo in this allocation mode with:
+
+```sh
+python3 tools/panthor-demo.py --shader --shader-registers 32 \
+  --image cache/orangepi/armbian.img --output out/panthor-shader-32.png
+```
+
+Its 32-register shader uses r48/r49 for the two temporaries that the 64-register
+variant keeps in r16/r17. Both variants verify the same scene and DRM fence.
+Both register modes are used by the native GLES path below. Broader graphics
+feature coverage remains incomplete.
+
+### Vertex attribute execution
+
+The interpreter decodes `LD_ATTR_IMM` through real Valhall resource tables,
+attribute descriptors and buffer descriptors. It currently supports ordinary 1D
+R32F/RG32F/RGB32F/RGBA32F attributes, RGBA/RGB1 ordering, signed byte
+offsets, per-vertex indexing and power-of-two instance divisors. Buffer
+bounds are checked before translation; an out-of-range element returns zero
+source channels with the format's implicit alpha preserved. Descriptor bounds,
+unsupported layouts and GPU memory faults stop the submission. Non-power-of-two divisors, vertex
+packet buffers, packed/normalized/integer formats and 16-bit register formats
+remain unsupported.
+
+```sh
+python3 tools/panthor-test.py --image cache/orangepi/armbian.img \
+  --guest tests/gpu/panthor-attributes.py --success-marker PANTHOR_ATTRIBUTES_OK \
+  --log out/panthor-attributes.log
+```
+
+This runs a Mesa-assembled 32-register compute shader through Linux Panthor. Each
+invocation fetches a different vertex through an RG32F attribute descriptor and
+writes an XY/0/1 vector. A second submission uses a divisor-four instance
+descriptor to fetch 12 instance vectors. The guest verifies every vector, write
+bounds and both fences.
+The same attribute instruction is present in the captured GLES vertex shader.
+The runner requires both the marker and a zero guest exit status, and preserves
+logs on failure. This test isolates fetch; the GLES demo below validates complete
+basic opaque draws.
+
+### Position shader output
+
+`LEA_BUF_IMM` now resolves structured buffer addresses and the vertex engine's
+reserved position-output table 13. Address and descriptor bounds are checked
+before updating the destination pair. Normal stores honor source-discard hints
+on their address register; internally/externally streaming store hints use the
+same GPU-MMU write path in the synchronous model. Forced discarded-thread memory
+access remains unsupported.
+
+A unit test runs all seven instruction words of the captured Mesa GLES position
+shader in 32-register mode, with hardware position storage supplied as a
+GPU-mapped buffer. It produces `(2, 2, 0.5, 1)`, `(14, 2, 0.5, 1)`, and
+`(8, 14, 0.5, 1)` from the three input vertices and viewport uniforms.
+
+```sh
+python3 tools/panthor-test.py --image cache/orangepi/armbian.img \
+  --guest tests/gpu/panthor-position.py --success-marker PANTHOR_POSITION_OK \
+  --log out/panthor-position.log
+```
+
+The Linux test adapts that shader to a compute submission: it copies global X to
+the internal-ID register and binds output to an ordinary structured buffer in
+table 3 instead of hardware position table 13. It verifies the same vectors,
+write bounds and a DRM fence. Those instruction tests isolate the position path. The integrated GLES rendering
+path described below also executes `RUN_IDVS`, triangle assembly and fragment
+shading; advanced FIFO layouts and the broader graphics pipeline remain incomplete.
+
 ### Mesa GLES clear bring-up
 
 `tools/panthor-demo.py --egl --image <mesa-equipped-armbian.img> --output out/panthor-egl.log`
@@ -85,8 +160,9 @@ The command interpreter supports scoreboard selection and registration of the
 tiler heap and OOM handler used during Mesa initialization. Queue registers and
 registrations survive doorbells and ring wraps; queue stop, group termination or
 firmware reboot discards them. A changed ring or VM requires that reset before
-reusing a queue. Geometry allocation
-and execution of the OOM handler remain unsupported. Successful
+reusing a queue. Hardware heap-chunk allocation
+and execution of the OOM handler remain unsupported; basic triangle lists are
+modeled on the host. Successful
 `STORE_STATE.ERROR_STATUS` writes all eight bytes expected by Mesa's synchronous
 debug check. Faulted queues retain their fatal event and stop replaying work until
 Linux stops the queue or terminates its group.
@@ -95,6 +171,67 @@ The fragment clear path accepts Mesa's single linear RGBA8 target, including the
 optional CRC-only extension and its additional framebuffer flags. Whole 16x16
 checksum tiles use the descriptor's supplied clear checksum; CRC reads do not
 elide writes in the emulator. Partial CRC tiles, depth/stencil, compression,
-multiple render targets, vertex/fragment shader draws and display scanout remain
-unsupported. `SBC_MALI_TRACE=1` logs command words and framebuffer parameters for
+multiple render targets, advanced shader draws and display scanout remain
+unsupported; basic opaque triangle draws are covered by the GLES demo below. `SBC_MALI_TRACE=1` logs command words and framebuffer parameters for
 bring-up. Passing this clear test does not establish general OpenGL support.
+
+
+## Real Mesa GLES rendering demo
+
+```sh
+python3 tools/panthor-demo.py --gles --image <mesa-equipped-armbian.img> \
+  --output out/panthor-gles-demo.png
+```
+
+The 512×512 image is read back from a real GLES framebuffer with
+`GL_RENDERER=Mali-G610 (Panfrost)`. Mesa compiles the shaders and submits the draw
+commands through Linux Panthor. Twenty-four opaque triangle draws, eight fragment
+programs, overlaps and multiple colors form the sun/mountain/prism scene. Interior
+pixel probes and `glFinish`/`glReadPixels` verify the result before PNG export.
+There is no llvmpipe fallback. Use the Mesa-equipped fixture described above.
+
+`tests/gpu/panthor-gles-triangle.py` checks every pixel across three submissions,
+with changed background/scale and reversed winding. Run it with
+`tools/panthor-test.py --image <image> --guest tests/gpu/panthor-gles-triangle.py
+--success-marker PANTHOR_GLES_TRIANGLE_OK --log out/gles-triangle.log`.
+
+The synchronous path implements `RUN_IDVS`, `FINISH_TILING`, heap lifecycle
+operations, `RUN_FRAGMENT` and empty-list `FINISH_FRAGMENT`. Vertex shaders write
+positions through GPU page tables into the geometry buffer supplied by Mesa.
+Opaque polygon lists and heap counters are modeled on the host; they are private
+GPU formats, as in the Midgard model. Lists are keyed by VM and tiler context,
+scoped to their owning queue, bounded, and discarded on stop/termination/reset.
+The native fragment path executes immediate arithmetic, alpha-to-coverage-disabled
+`ATEST`, discard flow control, half-float output and opaque `BLEND`. Rasterization
+uses the descriptor's single-sample edge rule and scissor. Drawn tiles invalidate
+their opaque CRC rather than publishing the uniform-clear checksum.
+
+Indexed and instanced triangle lists also execute native shaders. Element buffers
+support unsigned 8-, 16- and 32-bit indices and signed base-vertex addition;
+non-indexed draws support a nonzero first vertex. Each instance receives its own
+position slots and instance ID, including power-of-two attribute divisors. Index
+ranges are validated through the GPU MMU before shaders execute, and position
+capacity and invocation budgets account for every instance. A later non-indexed
+draw ignores a stale element-buffer address.
+
+`tests/gpu/panthor-gles-indexed.py` runs real Mesa GLES array and element draws,
+nonzero first vertices and element-buffer byte offsets, positive and negative
+base vertices through `OES_draw_elements_base_vertex`, and instanced variants
+with divisors 1, 2 and 4. Every framebuffer pixel is checked against an independent
+triangle mask. Run it with:
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-indexed.py \
+  --success-marker PANTHOR_GLES_INDEXED_OK --log out/gles-indexed.log
+```
+
+This is still a subset: triangle lists with basic position FIFO, W=1, finite
+supported coordinates and depth in [0,1], one linear RGBA8 target, no separate varying shader and opaque replacement blending.
+Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
+Nonzero global attribute/index/instance offsets, primitive restart, other
+primitive modes, perspective/clipping, varying interpolation, textures,
+blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
+non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
+synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the
+demo does not establish general GLES, Vulkan or desktop support.
