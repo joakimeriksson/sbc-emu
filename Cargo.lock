@@ -106,6 +106,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "powervr"
+version = "0.0.1"
+dependencies = [
+ "emu-core",
+]
+
+[[package]]
 name = "riscv-rv32"
 version = "0.0.1"
 dependencies = [
@@ -186,6 +193,7 @@ version = "0.0.1"
 dependencies = [
  "emu-core",
  "peripherals",
+ "powervr",
  "riscv64",
  "sbc-net",
 ]
