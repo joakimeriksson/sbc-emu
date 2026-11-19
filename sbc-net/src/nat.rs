@@ -229,7 +229,10 @@ impl Nat {
         let flow = &mut self.udp[idx];
         flow.last_activity_us = now_us;
         match flow.sock.send(payload) {
-            Ok(n) => self.bytes_to_host += n as u64,
+            Ok(n) => {
+                self.bytes_to_host += n as u64;
+                if dport == 53 { wait_for_reply(&flow.sock); }
+            }
             Err(e) => {
                 self.udp_send_errors += 1;
                 if self.log { eprintln!("[nat] UDP {}:{} send failed: {}", ip(dip), dport, e); }
@@ -421,6 +424,18 @@ impl Nat {
         self.udp.retain(|f| now_us.wrapping_sub(f.last_activity_us) < IDLE_CLOSE_US);
         out
     }
+}
+
+/// Hold the emulator until a DNS reply is in (up to two seconds), so the guest sees the host
+/// resolver answer at once. Idle guest time catches up with the wall clock in big steps (the
+/// interpreter runs behind it), and a resolver that takes half a second (Tailscale's
+/// 100.100.100.100, for one) would otherwise time out the guest's lookup before it answers.
+/// The reply stays queued for `poll`.
+fn wait_for_reply(sock: &UdpSocket) {
+    if sock.set_nonblocking(false).is_ok() && sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).is_ok() {
+        let _ = sock.peek(&mut [0u8; 1]);
+    }
+    let _ = sock.set_nonblocking(true);
 }
 
 fn host_resolver() -> [u8; 4] {

@@ -3,7 +3,7 @@
 //! time.
 use crate::devices::{sys_syscon, Clint, Crg, Plic, Pmu, Regs, TempSensor, HARTS};
 use crate::i2c::{At24c04, Axp15060, DwI2c, PowerRequest};
-use crate::audio::{AxiDmac, Pwmdac, DMA_BASE, DMA_SIZE, IRQ_DMA, PWMDAC_BASE, PWMDAC_SIZE};
+use crate::audio::{AxiDmac, I2s, Pwmdac, Sinks, DMA_BASE, DMA_SIZE, I2S0_BASE, I2S_SIZE, IRQ_DMA, PWMDAC_BASE, PWMDAC_SIZE};
 use crate::crypto::Sec;
 use crate::display::{Display, Mode, DC_BASE, DC_SIZE, HDMI_BASE, HDMI_SIZE, IRQ_DC, IRQ_HDMI};
 use crate::dwmmc::DwMmc;
@@ -28,6 +28,8 @@ const NS_PER_TICK: u64 = 1_000_000_000 / MTIME_HZ;
 
 /// PLIC source numbers.
 pub const IRQ_UART0: usize = 32;
+pub const IRQ_UART1: usize = 33;
+pub const UART1: u64 = 0x1001_0000;
 pub const IRQ_SEC: usize = 28;
 /// The STG syscon: the PCIe ports' link status (DATA_LINK_ACTIVE, bit 5) lives here.
 pub const STG_SYSCON: u64 = 0x1024_0000;
@@ -45,6 +47,10 @@ pub const SDIO0: u64 = 0x1601_0000;
 pub const SDIO1: u64 = 0x1602_0000;
 /// The microSD slot's card-detect input (`cd-gpios = <&sysgpio 41 GPIO_ACTIVE_HIGH>`).
 pub const SD_CD_GPIO: u64 = 41;
+/// The AP6256's WL_HOST_WAKE (out-of-band Wi-Fi interrupt) input.
+pub const WIFI_WAKE_GPIO: u64 = 21;
+/// The system GPIO block's interrupt.
+pub const IRQ_SYSGPIO: usize = 86;
 
 /// Instructions a hart runs before the next one gets its turn.
 const QUANTUM: u64 = 1000;
@@ -89,6 +95,9 @@ pub struct Soc {
     pub clint: Clint,
     pub plic: Plic,
     pub uart: Uart,
+    /// UART1 with the AP6256's Bluetooth controller on it
+    pub uart1: Uart,
+    pub bt: crate::bluetooth::Bluetooth,
     pub syscrg: Crg,
     pub aoncrg: Crg,
     pub stgcrg: Crg,
@@ -102,6 +111,8 @@ pub struct Soc {
     /// the AXI DMA controller and the PWM DAC (the board's audio output)
     pub dmac: AxiDmac,
     pub pwmdac: Pwmdac,
+    /// I2STX_4CH0: the HDMI audio path
+    pub i2s: I2s,
     /// PCIe0 (the VL805 USB 3.0 controller) and PCIe1 (the empty M.2 slot)
     pub pcie: [Port; 2],
     /// the USB devices: keyboard and tablet on the VL805's ports, an optional USB drive
@@ -122,6 +133,9 @@ pub struct Soc {
     pub sdio1: DwMmc,
     /// GPIO35 was driven high as an output (`gpio-restart`)
     pub gpio_reset: bool,
+    /// GPIO interrupts: the inputs at the last update and the latched edges
+    gpio_prev: u64,
+    gpio_edges: u64,
     /// read-back stand-ins for unmodelled device pages
     pub stubs: BTreeMap<u64, Box<[u32; 1024]>>,
     /// virtual time (ns), kept here for `mtime`
@@ -138,6 +152,8 @@ impl Soc {
             clint: Clint::default(),
             plic: Plic::default(),
             uart: Uart::default(),
+            uart1: Uart::default(),
+            bt: crate::bluetooth::Bluetooth::new(),
             syscrg: Crg::new(0x10000, 0x2f8, 0x308, 4),
             aoncrg: Crg::new(0x10000, 0x38, 0x3c, 1),
             stgcrg: Crg::new(0x10000, 0x74, 0x78, 1),
@@ -159,9 +175,12 @@ impl Soc {
                 .collect(),
             stubs: BTreeMap::new(),
             gpio_reset: false,
+            gpio_prev: 0,
+            gpio_edges: 0,
             sec: Sec::default(),
             dmac: AxiDmac::default(),
             pwmdac: Pwmdac::default(),
+            i2s: I2s::default(),
             pcie: [
                 {
                     let mut p = Port::new(0x2b00_0000, 0x9_4000_0000, 56, true);
@@ -203,6 +222,8 @@ impl Soc {
     pub fn update_devices(&mut self) {
         let u = self.uart.irq();
         self.plic.set_level(IRQ_UART0, u);
+        let u1 = self.uart1.irq();
+        self.plic.set_level(IRQ_UART1, u1);
         let (m0, m1) = (self.sdio0.irq_level(), self.sdio1.irq_level());
         self.plic.set_level(IRQ_SDIO0, m0);
         self.plic.set_level(IRQ_SDIO1, m1);
@@ -210,6 +231,9 @@ impl Soc {
         self.plic.set_level(IRQ_SEC, c);
         let d = self.dmac.irq();
         self.plic.set_level(IRQ_DMA, d);
+        self.gpio_update();
+        let g = self.gpio_mis() != 0;
+        self.plic.set_level(IRQ_SYSGPIO, g);
         let (dc, hdmi) = (self.display.irq(), self.display.hdmi_irq());
         self.plic.set_level(IRQ_DC, dc);
         self.plic.set_level(IRQ_HDMI, hdmi);
@@ -251,6 +275,31 @@ impl Soc {
         }
     }
 
+    /// Bluetooth on UART1: what the host sent goes to the controller; what it answers
+    /// fills the receive FIFO.
+    fn bt_pump(&mut self) {
+        if !self.uart1.out.is_empty() {
+            let b = std::mem::take(&mut self.uart1.out);
+            self.bt.receive(&b);
+        }
+        while let Some(&b) = self.bt.tx.front() {
+            if !self.uart1.push_rx(b) {
+                break;
+            }
+            self.bt.tx.pop_front();
+        }
+    }
+
+    /// Bluetooth time (LE advertising reports); returns the next deadline.
+    pub fn bt_tick(&mut self) -> u64 {
+        self.bt.tick(self.now);
+        if !self.bt.tx.is_empty() {
+            self.bt_pump();
+            self.update_devices();
+        }
+        self.bt.next_event().unwrap_or(u64::MAX)
+    }
+
     /// The PWM DAC's sample rate, from the SYSCRG's audio_root and pwmdac_core dividers
     /// (PLL2 at 1188 MHz) and the DAC's CNT_N.
     pub fn sample_rate(&self) -> u32 {
@@ -258,10 +307,22 @@ impl Soc {
         crate::audio::sample_rate(1_188_000_000, div(16), div(158), (self.pwmdac.read(4) >> 4) & 0x1ff)
     }
 
-    /// Move audio samples due by now into the DAC; returns the next audio deadline.
+    /// I2STX_4CH0's sample rate: its bit clock (MCLK / i2stx0_bclk_mst divider; MCLK is
+    /// mclk_inner = PLL2 / audio_root / mclk_inner dividers, or the board's 12.288 MHz
+    /// mclk_ext) / (2 * the word length), snapped to the standard rate.
+    pub fn i2s_rate(&self) -> u32 {
+        let reg = |index: u64| self.syscrg.read(4 * index);
+        let div = |index: u64| (reg(index) & 0xff_ffff).max(1) as u64;
+        let mclk = if (reg(18) >> 24) & 0x3f == 1 { 12_288_000 } else { 1_188_000_000 / div(16) / div(17) };
+        crate::audio::snap_rate(mclk / div(162) / (2 * self.i2s.word_bits() as u64))
+    }
+
+    /// Move audio samples due by now into the DAC and the I2S; returns the next audio
+    /// deadline.
     pub fn audio_tick(&mut self) -> u64 {
-        let rate = self.sample_rate();
-        let next = self.dmac.update(self.now, &mut self.ram.mem, RAM_BASE, &mut self.pwmdac, rate);
+        let (dac_rate, i2s_rate) = (self.sample_rate(), self.i2s_rate());
+        let mut sinks = Sinks { dac: &mut self.pwmdac, dac_rate, i2s: &mut self.i2s, i2s_rate };
+        let next = self.dmac.update(self.now, &mut self.ram.mem, RAM_BASE, &mut sinks);
         if self.dmac.irq() {
             self.update_devices();
         }
@@ -315,6 +376,40 @@ impl Soc {
         } else {
             u64::MAX
         }
+    }
+
+    /// The GPIO inputs the board wires: the SD card-detect switch and the Wi-Fi host wake.
+    fn gpio_inputs(&self) -> u64 {
+        let wake = self.sdio0.sdio.as_ref().is_some_and(|c| c.oob_irq());
+        (self.sdio1.card.present() as u64) << SD_CD_GPIO | (wake as u64) << WIFI_WAKE_GPIO
+    }
+
+    /// A 64-bit GPIO interrupt register pair (low word at `off`, high word at `off + 4`).
+    fn gpio_reg(&mut self, off: u64) -> u64 {
+        *self.stub(SYSGPIO + off) as u64 | (*self.stub(SYSGPIO + off + 4) as u64) << 32
+    }
+
+    /// Latch the edges the inputs made since the last update (IS = 1: edge; IBE: both;
+    /// IEV = 1: rising, 0: falling).
+    fn gpio_update(&mut self) {
+        let now = self.gpio_inputs();
+        let (is, ibe, iev) = (self.gpio_reg(0xe0), self.gpio_reg(0xf0), self.gpio_reg(0xf8));
+        let (rise, fall) = (now & !self.gpio_prev, !now & self.gpio_prev);
+        self.gpio_edges |= is & ((ibe & (rise | fall)) | (!ibe & ((iev & rise) | (!iev & fall))));
+        self.gpio_prev = now;
+    }
+
+    /// Raw interrupt status: level-triggered pins (IS = 0) are active at the level IEV
+    /// selects (0 high, 1 low); edge-triggered pins report their latched edges.
+    fn gpio_ris(&mut self) -> u64 {
+        let now = self.gpio_inputs();
+        let (is, iev) = (self.gpio_reg(0xe0), self.gpio_reg(0xf8));
+        (!is & (now ^ iev)) | (is & self.gpio_edges)
+    }
+
+    fn gpio_mis(&mut self) -> u64 {
+        let ie = self.gpio_reg(0x100);
+        self.gpio_ris() & ie
     }
 
     /// The interrupt lines of hart `h`.
@@ -388,6 +483,7 @@ impl Soc {
             _ if (SEC..SEC + 0x4000).contains(&a) => r32(self.sec.read(a - SEC)),
             _ if (DMA_BASE..DMA_BASE + DMA_SIZE).contains(&a) => r32(self.dmac.read(a - DMA_BASE)),
             _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => r32(self.pwmdac.read(a - PWMDAC_BASE)),
+            _ if (I2S0_BASE..I2S0_BASE + I2S_SIZE).contains(&a) => r32(self.i2s.read(a - I2S0_BASE)),
             _ if (TEMP..TEMP + 0x10000).contains(&a) => r32(self.temp.read(a - TEMP)),
             _ if (GMAC0..GMAC0 + 0x10000).contains(&a) => r32(self.gmac0.read(a - GMAC0)),
             _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
@@ -403,10 +499,25 @@ impl Soc {
                 r32(v)
             }
             _ if (GMAC1..GMAC1 + 0x10000).contains(&a) => r32(self.gmac1.read(a - GMAC1)),
-            // GPIOIN: the inputs the board wires (the SD card-detect switch)
+            // GPIOIN: the inputs the board wires (the SD card-detect switch, Wi-Fi host wake)
             _ if a & !4 == SYSGPIO + 0x118 => {
-                let inputs = (self.sdio1.card.present() as u64) << SD_CD_GPIO;
+                let inputs = self.gpio_inputs();
                 r32((inputs >> (8 * (a - SYSGPIO - 0x118))) as u32)
+            }
+            _ if a & !4 == SYSGPIO + 0x108 => {
+                let v = self.gpio_ris();
+                r32((v >> (8 * (a - SYSGPIO - 0x108))) as u32)
+            }
+            _ if a & !4 == SYSGPIO + 0x110 => {
+                let v = self.gpio_mis();
+                r32((v >> (8 * (a - SYSGPIO - 0x110))) as u32)
+            }
+            _ if (UART1..UART1 + 0x10000).contains(&a) => {
+                let v = self.uart1.read(a - UART1);
+                self.bt_pump();
+                self.update_devices();
+                self.irq_dirty = true;
+                r32(v)
             }
             _ if (SYSCRG..SYSCRG + 0x10000).contains(&a) => r32(self.syscrg.read(a - SYSCRG)),
             _ if (AONCRG..AONCRG + 0x10000).contains(&a) => r32(self.aoncrg.read(a - AONCRG)),
@@ -482,10 +593,15 @@ impl Soc {
                 self.irq_dirty = true;
             }
             _ if (DMA_BASE..DMA_BASE + DMA_SIZE).contains(&a) => {
-                let rate = self.sample_rate();
-                self.dmac.write(a - DMA_BASE, v32, &mut self.ram.mem, RAM_BASE, &mut self.pwmdac, rate);
+                let (dac_rate, i2s_rate) = (self.sample_rate(), self.i2s_rate());
+                let mut sinks = Sinks { dac: &mut self.pwmdac, dac_rate, i2s: &mut self.i2s, i2s_rate };
+                self.dmac.write(a - DMA_BASE, v32, &mut self.ram.mem, RAM_BASE, &mut sinks);
                 self.update_devices();
                 self.irq_dirty = true;
+            }
+            _ if (I2S0_BASE..I2S0_BASE + I2S_SIZE).contains(&a) => {
+                let rate = self.i2s_rate();
+                self.i2s.write(a - I2S0_BASE, v32, rate);
             }
             _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => {
                 let rate = self.sample_rate();
@@ -496,6 +612,20 @@ impl Soc {
                     self.plic.trigger(IRQ_TEMP);
                     self.irq_dirty = true;
                 }
+            }
+            // GPIOIC: a 0 -> 1 pulse on a bit clears that pin's latched edge
+            _ if a & !4 == SYSGPIO + 0xe8 => {
+                let old = *self.stub(a);
+                let shift = 8 * (a - SYSGPIO - 0xe8);
+                self.gpio_edges &= !(((v32 & !old) as u64) << shift);
+                *self.stub(a) = v32;
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (SYSGPIO + 0xe0..SYSGPIO + 0x108).contains(&a) => {
+                *self.stub(a & !3) = v32;
+                self.update_devices();
+                self.irq_dirty = true;
             }
             _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
                 self.display.dc_write(a - DC_BASE, v32);
@@ -532,6 +662,12 @@ impl Soc {
             }
             _ if self.sdio0.contains(a) => {
                 self.sdio0.write(a - SDIO0, v32, &mut self.ram);
+                self.update_devices();
+                self.irq_dirty = true;
+            }
+            _ if (UART1..UART1 + 0x10000).contains(&a) => {
+                self.uart1.write(a - UART1, v32);
+                self.bt_pump();
                 self.update_devices();
                 self.irq_dirty = true;
             }
@@ -712,8 +848,10 @@ impl Machine {
             let vblank = self.soc.display.update(self.soc.now).unwrap_or(u64::MAX);
             let usb = self.soc.usb_tick();
             let audio = self.soc.audio_tick();
+            self.soc.sdio0.tick(self.soc.now);
+            let bt = self.soc.bt_tick();
             if ran == 0 {
-                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb).min(audio));
+                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb).min(audio).min(bt));
             }
             self.soc.now += ran;
             left = left.saturating_sub(ran);

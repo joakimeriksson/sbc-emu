@@ -20,11 +20,18 @@ impl SerialBoard for Machine {
         Some(self)
     }
     fn capture_audio(&mut self) -> bool {
-        self.soc.pwmdac.capture = true;
+        self.soc.pwmdac.capture.on = true;
+        self.soc.i2s.capture.on = true;
         true
     }
+    /// What the headphone jack (PWM DAC) plays, or else what goes to HDMI (I2S).
     fn take_audio(&mut self) -> (u32, Vec<i16>) {
-        (self.soc.pwmdac.rate, std::mem::take(&mut self.soc.pwmdac.samples))
+        let dac = &mut self.soc.pwmdac.capture;
+        if !dac.samples.is_empty() {
+            return (dac.rate, std::mem::take(&mut dac.samples));
+        }
+        let i2s = &mut self.soc.i2s.capture;
+        (i2s.rate, std::mem::take(&mut i2s.samples))
     }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);
@@ -48,8 +55,11 @@ impl SerialBoard for Machine {
         if let Some(n) = self.soc.pcie[1].nvme.as_ref() {
             eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes; PCIe1: {} MSIs", n.reads, n.writes, self.soc.pcie[1].msis);
         }
-        if self.soc.pwmdac.frames > 0 {
-            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
+        if self.soc.pwmdac.capture.frames > 0 {
+            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.capture.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
+        }
+        if self.soc.i2s.capture.frames > 0 {
+            eprintln!("[{tag}] audio (HDMI, I2S): {} frames at {} Hz", self.soc.i2s.capture.frames, self.soc.i2s_rate());
         }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
@@ -162,7 +172,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             m.soc.attach_nvme(Box::new(d));
         }
         if net != "none" {
-            m.connect_network(net == "nat", false);
+            m.connect_network(net == "nat", std::env::var_os("SBC_NET_LOG").is_some());
         }
         m.soc.sdio1.insert(disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>));
         m.soc.display = Display::new(mode);
@@ -180,7 +190,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi (AP6256), audio (PWM DAC, --audio-out), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }
