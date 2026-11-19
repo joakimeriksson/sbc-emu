@@ -41,7 +41,8 @@ pub(crate) fn run(args:&[String])->ExitCode {
 }
 fn execute(args:&[String])->Result<(),String> {
     serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme"])?;
-    if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
+    // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
+    let multi=match arg(args,"--threads") { None|Some("single")=>false, Some("multi")=>true, Some(_)=>return Err("--threads single|multi".into()) };
     let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
     // HDMI: the firmware's framebuffer at the monitor's preferred mode, unless --no-display
     let hdmi=match arg(args,"--hdmi-mode") {
@@ -68,6 +69,7 @@ fn execute(args:&[String])->Result<(),String> {
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::with_cpus(ram,smp)?;
         m.gpu_probe=gpu=="probe";
+        m.multi=multi;
         if let Some(mode)=hdmi { m.enable_hdmi(mode); }
         // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
         // --nvme IMAGE: an NVMe SSD in the M.2 slot (copy-on-write; each boot starts from the image)
