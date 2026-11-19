@@ -45,6 +45,27 @@ pub const KCCB_CMD_HEALTH_CHECK: u32 = 0x2abc_0073;
 pub const KCCB_CMD_COMBINED_GEOM_FRAG_KICK: u32 = 0x2abc_0075;
 const RTN_EXECUTED: u32 = 1;
 
+// struct rogue_fwif_fwcommoncontext
+const CTX_CCBCTL: u32 = 0;
+const CTX_CCB: u32 = 4;
+const CTX_MEM_CONTEXT: u32 = 136;
+// struct rogue_fwif_cccb_ctl
+const CCCB_WRITE_OFFSET: u32 = 0;
+const CCCB_READ_OFFSET: u32 = 4;
+const CCCB_WRAP_MASK: u32 = 12;
+/// struct rogue_fwif_ccb_cmd_header
+const CMD_HEADER_SIZE: u32 = 40;
+
+// job commands: 201.. with the magic and ROGUE_CCB_TYPE_TASK (bit 15)
+pub const CCB_CMD_GEOM: u32 = 0x2abc_80c9;
+pub const CCB_CMD_FRAG: u32 = 0x2abc_80cb;
+pub const CCB_CMD_FRAG_PR: u32 = 0x2abc_80cc;
+pub const CCB_CMD_CDM: u32 = 0x2abc_80cd;
+pub const CCB_CMD_FENCE: u32 = 0x2abc_00d4;
+pub const CCB_CMD_UPDATE: u32 = 0x2abc_00d5;
+pub const CCB_CMD_FENCE_PR: u32 = 0x2abc_00d7;
+pub const CCB_CMD_UNFENCED_UPDATE: u32 = 0x2abc_00dc;
+
 #[derive(Default)]
 pub struct Firmware {
     /// running (between the driver releasing the MIPS core and a power-off or reset)
@@ -61,6 +82,7 @@ pub struct Firmware {
     /// statistics
     pub boots: u64,
     pub commands: u64,
+    pub jobs: u64,
     pub trace: bool,
 }
 
@@ -173,6 +195,11 @@ impl Firmware {
                     self.running = false;
                 }
             }
+            KCCB_CMD_KICK => self.kick(ram, cmd + 8),
+            KCCB_CMD_COMBINED_GEOM_FRAG_KICK => {
+                self.kick(ram, cmd + 8);
+                self.kick(ram, cmd + 40);
+            }
             KCCB_CMD_MMUCACHE => {
                 // nothing is cached: translations are read from memory each time
                 let (sync, value) = (self.rd(ram, cmd + 12), self.rd(ram, cmd + 16));
@@ -184,6 +211,58 @@ impl Firmware {
             _ => {}
         }
         RTN_EXECUTED
+    }
+
+    /// A context's client command ring has new commands (`struct rogue_fwif_kccb_cmd_kick_data`
+    /// at `kick`): run them in order.
+    fn kick(&mut self, ram: &mut FlatRam, kick: u32) {
+        let ctx = self.rd(ram, kick);
+        let (ctl, ccb, mem_ctx) = (self.rd(ram, ctx + CTX_CCBCTL), self.rd(ram, ctx + CTX_CCB), self.rd(ram, ctx + CTX_MEM_CONTEXT));
+        // the page catalogue of the context's GPU virtual address space
+        let pc = self.translate(ram, mem_ctx).and_then(|pa| read64(ram, pa)).unwrap_or(0);
+        // the kick carries the new write offset and wrap mask; the firmware keeps them in the
+        // control block
+        let (woff, wrap) = (self.rd(ram, kick + 4), self.rd(ram, kick + 8));
+        self.wr(ram, ctl + CCCB_WRITE_OFFSET, woff);
+        self.wr(ram, ctl + CCCB_WRAP_MASK, wrap);
+        let mut roff = self.rd(ram, ctl + CCCB_READ_OFFSET);
+        let mut guard = 0;
+        while roff != woff && guard < 4096 {
+            guard += 1;
+            let hdr = ccb + roff;
+            let (ty, size) = (self.rd(ram, hdr), self.rd(ram, hdr + 4));
+            let body = hdr + CMD_HEADER_SIZE;
+            if self.trace {
+                eprintln!("[gpu fw] ctx {ctx:#x} ccb cmd {ty:#x} size {size}");
+            }
+            match ty {
+                // all earlier work is complete when a command is reached: fences are met
+                CCB_CMD_FENCE | CCB_CMD_FENCE_PR => {}
+                CCB_CMD_UPDATE | CCB_CMD_UNFENCED_UPDATE => {
+                    for i in 0..size / 8 {
+                        let (addr, value) = (self.rd(ram, body + 8 * i), self.rd(ram, body + 8 * i + 4));
+                        self.wr(ram, addr, value);
+                    }
+                }
+                CCB_CMD_CDM => {
+                    let mut vm = crate::vm::Vm::new(pc);
+                    crate::cdm::run(self, ram, &mut vm, body);
+                    self.jobs += 1;
+                }
+                CCB_CMD_GEOM | CCB_CMD_FRAG | CCB_CMD_FRAG_PR => {
+                    self.jobs += 1;
+                }
+                _ => {}
+            }
+            roff = (roff + CMD_HEADER_SIZE + size) & wrap;
+        }
+        self.wr(ram, ctl + CCCB_READ_OFFSET, roff);
+        self.irq = true;
+    }
+
+    /// Read a 32-bit word at a firmware address.
+    pub fn fw_read(&self, ram: &FlatRam, fw_addr: u32) -> u32 {
+        self.rd(ram, fw_addr)
     }
 
     /// Whether an interrupt to the host is due (and clear the request).

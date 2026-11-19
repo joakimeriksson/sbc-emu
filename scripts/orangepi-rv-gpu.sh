@@ -128,6 +128,12 @@ LIST
 for d in lib bin sbin; do [ -e "$work/root/debian/$d" ] || ln -s "usr/$d" "$work/root/debian/$d"; done
 mkdir -p "$work/root/debian/dev" "$work/root/debian/proc" "$work/root/debian/sys" "$work/root/debian/tmp"
 
+# sbc-emu's GPU tests (tests/gpu/pvr/build.sh), when built
+if [ -d tests/gpu/pvr/out ]; then
+  mkdir -p "$work/root/debian/usr/local/bin"
+  for t in tests/gpu/pvr/out/vk*; do case "$t" in *.spv|*.h) ;; *) cp "$t" "$work/root/debian/usr/local/bin/" ;; esac; done
+fi
+
 # the GPU firmware file: sbc-emu's stand-in (header, layout and the BXE-4-32's device info,
 # no firmware code; the emulator plays the firmware), as Imagination publishes none for
 # this core

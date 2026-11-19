@@ -9,9 +9,11 @@
 //!
 //! `firmware` makes the firmware file the driver loads (header, layout and device info; no
 //! Imagination code).
+pub mod cdm;
 pub mod firmware;
 pub mod fw;
 pub mod regs;
+pub mod vm;
 
 use emu_core::FlatRam;
 use std::collections::BTreeMap;
@@ -27,7 +29,10 @@ pub struct Gpu {
 
 impl Default for Gpu {
     fn default() -> Self {
-        Gpu { regs: BTreeMap::new(), fw: fw::Firmware::default(), irq_status: 0, trace: std::env::var_os("SBC_GPU_TRACE").is_some_and(|v| !v.is_empty()) }
+        let trace = std::env::var_os("SBC_GPU_TRACE").is_some_and(|v| !v.is_empty());
+        let mut fw = fw::Firmware::default();
+        fw.trace = trace;
+        Gpu { regs: BTreeMap::new(), fw, irq_status: 0, trace }
     }
 }
 
