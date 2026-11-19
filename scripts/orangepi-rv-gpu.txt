@@ -1,6 +1,7 @@
 # Orange Pi RV GPU (PowerVR BXE-4-32) with the open stack: mainline Linux's powervr driver
 # loads the firmware file, boots the firmware (played by the emulator) and runtime-suspends
-# the GPU; Mesa's PowerVR Vulkan driver finds the device. Needs scripts/orangepi-rv-gpu.sh:
+# the GPU; Mesa's PowerVR Vulkan driver finds the device and runs a compute shader on it.
+# Needs scripts/orangepi-rv-gpu.sh:
 #   sbc-emu run --board orangepi-rv --firmware fw_dynamic.bin --kernel cache/orangepi-rv/gpu/Image \
 #     --dtb jh7110-orangepi-rv.dtb --initrd cache/orangepi-rv/gpu/initramfs.cpio.gz --script ...
 wait-serial orangepi-rv#
@@ -12,6 +13,9 @@ serial mount -t devtmpfs dev /debian/dev; mount -t proc proc /debian/proc; mount
 wait-serial MNT_OK
 serial PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 chroot /debian vulkaninfo --summary 2>&1 | grep -E 'deviceName|driverName|deviceID'\n
 wait-serial deviceName         = PowerVR B-Series BXE-4-32 MC1
+# a Vulkan compute dispatch (tests/gpu/pvr/vkcompute.c): 4096 invocations, checked on the host
+serial PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 chroot /debian /usr/local/bin/vkcompute 2>&1 | grep VKCOMPUTE\n
+wait-serial VKCOMPUTE_OK 4096 invocations
 serial echo GPU_""DONE\n
 wait-serial GPU_DONE
 quit

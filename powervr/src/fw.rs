@@ -83,6 +83,9 @@ pub struct Firmware {
     pub boots: u64,
     pub commands: u64,
     pub jobs: u64,
+    /// compute invocations run, and GPU programs abandoned on an unimplemented instruction
+    pub invocations: u64,
+    pub gpu_faults: u64,
     pub trace: bool,
 }
 

@@ -9,10 +9,16 @@
 //!
 //! `firmware` makes the firmware file the driver loads (header, layout and device info; no
 //! Imagination code).
+//!
+//! Compute jobs run: `cdm` walks the compute data master's control stream and runs each
+//! kernel's tasks, `pds` interprets the data-sequencer programs that load the shader's
+//! inputs, and `usc` decodes and executes the shader programs themselves.
 pub mod cdm;
 pub mod firmware;
 pub mod fw;
+pub mod pds;
 pub mod regs;
+pub mod usc;
 pub mod vm;
 
 use emu_core::FlatRam;

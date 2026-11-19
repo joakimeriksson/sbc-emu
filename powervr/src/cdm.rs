@@ -2,9 +2,22 @@
 //! control stream at `cdm_ctrl_stream_base` (Mesa's `csbgen/rogue/cdm.xml`): compute kernel
 //! blocks, links and a terminate. A kernel names a PDS program (data and code segments in
 //! the PDS heap) that sets up and starts the USC tasks for its workgroups.
+//!
+//! How a compute shader gets its inputs (Mesa's `pvr_pds_compute_shader`,
+//! `pvr_compute_update_shared`, `pco_nir_compute.c`):
+//! - push constants and descriptor addresses: a first kernel with `usc_common_shared` runs
+//!   the pipeline's "descriptor" PDS program, which DMAs them (DOUTD) into the shared
+//!   registers `sh*`;
+//! - workgroup ID: the compute PDS program's coefficient-update branch (IF1) adds the base
+//!   workgroup and DOUTWs the IDs the CDM put in its temps 0, 1, 3 into coefficients `cf*`;
+//! - local invocation index (Mesa flattens the workgroup): the instance branch DOUTWs temp 0
+//!   into the unified store, `vi*`, then DOUTU starts the shader with that many temps.
 use crate::fw::Firmware;
+use crate::pds::{self, Pds};
+use crate::usc;
 use crate::vm::Vm;
 use emu_core::FlatRam;
+use std::collections::HashMap;
 
 /// Where the PDS and USC code heaps sit in every GPU virtual address space
 /// (`sysinit.pds_exec_base`, `usc_exec_base`).
@@ -99,14 +112,248 @@ pub fn run(fw: &mut Firmware, ram: &mut FlatRam, vm: &mut Vm, cmd: u32) {
     let rd64 = |fw: &Firmware, off: u32| fw.fw_read(ram, cmd + off) as u64 | (fw.fw_read(ram, cmd + off + 4) as u64) << 32;
     let stream = rd64(fw, 8 + 32);
     let kernels = parse(ram, vm, stream);
+    let trace = fw.trace;
+    let mut mem = GpuMem { ram, vm };
+    let mut cdm = Cdm {
+        shareds: vec![0; SHARED_WORDS],
+        pds: Pds { trace, ..Default::default() },
+        cache: HashMap::new(),
+        trace,
+        faults: 0,
+        invocations: 0,
+    };
     for k in &kernels {
-        if fw.trace {
+        if trace {
             eprintln!("[gpu cdm] {k:x?}");
-            let dump = |vm: &mut Vm, base: u64, n: u64| -> String {
-                (0..n).map(|i| vm.read32(ram, PDS_HEAP + base + 4 * i).map_or("--------".into(), |w| format!("{w:08x}"))).collect::<Vec<_>>().join(" ")
-            };
-            eprintln!("[gpu cdm]   pds data: {}", dump(vm, k.data_addr, 4 * k.pds_data_size as u64));
-            eprintln!("[gpu cdm]   pds code: {}", dump(vm, k.code_addr, 32));
+            let data: Vec<String> = (0..4 * k.pds_data_size as u64)
+                .map(|i| mem.read32(PDS_HEAP + k.data_addr + 4 * i).map_or("--------".into(), |w| format!("{w:08x}")))
+                .collect();
+            eprintln!("[gpu cdm]   pds data: {}", data.join(" "));
         }
+        cdm.kernel(&mut mem, k);
+    }
+    fw.invocations += cdm.invocations;
+    fw.gpu_faults += cdm.faults;
+    if trace {
+        eprintln!("[gpu cdm] job done: {} kernels, {} invocations, {} faults", kernels.len(), cdm.invocations, cdm.faults);
+    }
+}
+
+/// Words of the shared part of the common store (shared registers come first in the
+/// cluster's common store; Mesa allocates at most 1024 dwords of them).
+const SHARED_WORDS: usize = 4096;
+
+/// GPU memory through the job's address space.
+struct GpuMem<'a> {
+    ram: &'a mut FlatRam,
+    vm: &'a mut Vm,
+}
+
+impl usc::Memory for GpuMem<'_> {
+    fn read32(&mut self, va: u64) -> Option<u32> {
+        self.vm.read32(self.ram, va)
+    }
+
+    fn write32(&mut self, va: u64, v: u32) -> bool {
+        self.vm.write32(self.ram, va, v)
+    }
+}
+
+impl GpuMem<'_> {
+    fn read32(&mut self, va: u64) -> Option<u32> {
+        self.vm.read32(self.ram, va)
+    }
+}
+
+/// The CDM's state across the kernels of one job.
+struct Cdm {
+    /// shared registers (`sh*` in the USC): loaded by a kernel with `usc_common_shared`,
+    /// read by the kernels after it
+    shareds: Vec<u32>,
+    pds: Pds,
+    /// decoded USC groups
+    cache: HashMap<u64, Result<usc::Group, usc::DecodeError>>,
+    trace: bool,
+    faults: u64,
+    invocations: u64,
+}
+
+/// Where a PDS task's output goes: the common store (shared registers or a workgroup's
+/// coefficients) and the unified store of the instance it runs for.
+struct TaskHost<'a, 'b> {
+    mem: &'a mut GpuMem<'b>,
+    common: &'a mut [u32],
+    unified: &'a mut [u32],
+    doutu: Option<pds::DoutU>,
+    trace: bool,
+}
+
+impl TaskHost<'_, '_> {
+    fn store(&mut self, common: bool, at: u32, v: u32) {
+        let (store, name) = if common { (&mut *self.common, "common") } else { (&mut *self.unified, "unified") };
+        match store.get_mut(at as usize) {
+            Some(s) => *s = v,
+            None if self.trace => eprintln!("[gpu pds] write beyond the {name} store: {at}"),
+            None => {}
+        }
+    }
+}
+
+impl pds::Host for TaskHost<'_, '_> {
+    fn read32(&mut self, va: u64) -> Option<u32> {
+        self.mem.read32(va)
+    }
+
+    fn write32(&mut self, va: u64, v: u32) -> bool {
+        usc::Memory::write32(self.mem, va, v)
+    }
+
+    fn doutd(&mut self, d: pds::DoutD) {
+        for i in 0..d.size {
+            let v = self.mem.read32(d.addr + 4 * i as u64);
+            if v.is_none() && self.trace {
+                eprintln!("[gpu pds] doutd from unmapped {:#x}", d.addr + 4 * i as u64);
+            }
+            self.store(d.common, d.ao + i, v.unwrap_or(0));
+        }
+    }
+
+    fn doutw(&mut self, w: pds::DoutW) {
+        for (i, v) in w.words.iter().enumerate() {
+            if let Some(v) = v {
+                self.store(w.common, w.ao + i as u32, *v);
+            }
+        }
+    }
+
+    fn doutu(&mut self, u: pds::DoutU) {
+        self.doutu = Some(u);
+    }
+
+    fn dout_other(&mut self, kind: pds::DoutKind, src0: u64, src1: u32) {
+        if self.trace {
+            eprintln!("[gpu pds] dout {kind:?} {src0:#x} {src1:#x} not modelled for compute");
+        }
+    }
+}
+
+impl Cdm {
+    /// Run one kernel the way the CDM does:
+    ///
+    /// - A kernel with `usc_common_shared` set fills (or frees) the shared registers: its PDS
+    ///   program runs once per task, and its writes to the common store land in the shared
+    ///   area that the following kernels read as `sh*`.
+    /// - Otherwise each workgroup first gets a *coefficient update task* (the PDS program
+    ///   with IF1 set and the workgroup ID in temps 0, 1 and 3), whose common-store writes
+    ///   fill that workgroup's coefficient registers (`cf*`); then its *instance tasks* (IF1
+    ///   clear, the flat local invocation index in temp 0), whose unified-store writes land
+    ///   in each instance's `vi*` registers and whose DOUTU starts the USC program.
+    ///
+    /// IF0 is set for every task (cc-gated instructions such as the DOUTU run). The
+    /// hardware runs the instance program once per task of up to 32 instances; running it
+    /// per instance gives each its own unified store, which is what the DOUTW of the local
+    /// index means. The USC then runs a whole workgroup in lockstep, so barriers need no
+    /// extra care.
+    fn kernel(&mut self, mem: &mut GpuMem, k: &Kernel) {
+        let data: Vec<u32> = (0..4 * k.pds_data_size as u64).map(|i| mem.read32(PDS_HEAP + k.data_addr + 4 * i).unwrap_or(0)).collect();
+        let code = PDS_HEAP + k.code_addr;
+        if self.trace {
+            let words: Vec<u32> = (0..256).map_while(|i| mem.read32(code + 4 * i)).collect();
+            for l in pds::disassemble(&words[..pds::program_len(&words)]).lines() {
+                eprintln!("[gpu pds]   {l}");
+            }
+        }
+        let groups = match k.indirect {
+            Some(addr) => {
+                let g: Vec<u32> = (0..3).map(|i| mem.read32(addr + 4 * i).unwrap_or(0)).collect();
+                [g[0], g[1], g[2]]
+            }
+            None => k.groups,
+        };
+        let local = (k.size[0] * k.size[1] * k.size[2]) as usize;
+        // KERNEL0 sizes: common store in 64-byte units, unified store in 16-byte units
+        let coeff_words = (16 * k.usc_common_size as usize).max(16);
+        let unified_words = (4 * k.usc_unified_size as usize).max(4);
+        let coeff_task = !k.usc_common_shared && k.usc_common_size > 0;
+        if k.offsets != [0; 3] && self.trace {
+            eprintln!("[gpu cdm] global offsets {:?} ignored", k.offsets);
+        }
+        for z in 0..groups[2] {
+            for y in 0..groups[1] {
+                for x in 0..groups[0] {
+                    // the PDS runs of the first workgroup are traced
+                    self.pds.trace = self.trace && x == 0 && y == 0 && z == 0;
+                    let mut coeffs = vec![0u32; coeff_words];
+                    if coeff_task {
+                        let task = pds::Task { if0: true, if1: true, temps: vec![x, y, 0, z] };
+                        let mut none = [];
+                        let mut host = TaskHost { mem, common: &mut coeffs, unified: &mut none, doutu: None, trace: false };
+                        let r = self.pds.run(&mut host, code, &data, &task);
+                        let kick = host.doutu;
+                        if let Err(e) = r {
+                            self.fault(format!("PDS coefficient task: {e:?}"));
+                            return;
+                        }
+                        if let Some(u) = kick {
+                            // the coefficient update program runs once for the workgroup
+                            let mut insts = vec![usc::Instance::new((u.temps as usize).max(8), unified_words)];
+                            if !self.usc(mem, u, &mut coeffs, &mut insts) {
+                                return;
+                            }
+                        }
+                    }
+                    let mut insts = Vec::with_capacity(local);
+                    let mut kick = None;
+                    for i in 0..local {
+                        let task = pds::Task { if0: true, if1: false, temps: vec![i as u32, 0] };
+                        let mut unified = vec![0u32; unified_words];
+                        let common = if k.usc_common_shared { &mut self.shareds[..] } else { &mut coeffs[..] };
+                        let mut host = TaskHost { mem, common, unified: &mut unified, doutu: None, trace: self.trace };
+                        let r = self.pds.run(&mut host, code, &data, &task);
+                        kick = kick.or(host.doutu);
+                        // ... and of those, the first instance task
+                        self.pds.trace = false;
+                        if let Err(e) = r {
+                            self.fault(format!("PDS instance task: {e:?}"));
+                            return;
+                        }
+                        let mut inst = usc::Instance::new(8, 0);
+                        inst.vtxin = unified;
+                        insts.push(inst);
+                    }
+                    if let Some(u) = kick {
+                        for inst in &mut insts {
+                            inst.temps = vec![0; (u.temps as usize).max(8)];
+                        }
+                        if !self.usc(mem, u, &mut coeffs, &mut insts) {
+                            return;
+                        }
+                        self.invocations += insts.len() as u64;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run a USC program for `insts`; false if it faulted.
+    fn usc(&mut self, mem: &mut GpuMem, u: pds::DoutU, coeffs: &mut [u32], insts: &mut [usc::Instance]) -> bool {
+        let entry = USC_HEAP + u.exe_offset as u64;
+        let mut m = usc::Machine { mem, coeffs, shareds: &mut self.shareds, cache: &mut self.cache, trace: self.trace };
+        match m.run(entry, insts) {
+            Ok(_) => true,
+            Err(f) => {
+                self.fault(format!("USC program {entry:#x}: fault at {:#x}: {}", f.pc, f.msg));
+                false
+            }
+        }
+    }
+
+    /// An unimplemented instruction or a bad access: the kernel is abandoned. Reported
+    /// under trace, and once per job otherwise.
+    fn fault(&mut self, msg: String) {
+        if self.trace || self.faults == 0 {
+            eprintln!("[gpu cdm] {msg}");
+        }
+        self.faults += 1;
     }
 }
