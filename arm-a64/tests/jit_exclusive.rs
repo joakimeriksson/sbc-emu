@@ -81,7 +81,7 @@ fn core(ram: *mut u8, jit: bool, mt: bool) -> Cpu {
     cpu.mt = mt;
     if jit {
         cpu.jit = jit::Jit::with(1 << 20, 1);
-        cpu.chain_until = u64::MAX;
+        cpu.chain_until = arm_a64::UNBOUNDED;
     }
     cpu
 }

@@ -1139,7 +1139,9 @@ impl Cpu {
         if let Some(p) = f {
             code_map(p as usize, 4 * e.out.len(), &format!("{:x} {}", self.pc, (pc - self.pc) / 4 + 1));
             // debugging: `SBC_JIT_DUMP=PC` writes the guest and host words of blocks at PC
-            if std::env::var("SBC_JIT_DUMP").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) == Some(self.pc) {
+            static DUMP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+            let dump = *DUMP.get_or_init(|| std::env::var("SBC_JIT_DUMP").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()));
+            if dump == Some(self.pc) {
                 let guest: Vec<u8> = (0..(pc - self.pc + 4)).map(|k| unsafe { *self.ram.add((pa + k) as usize) }).collect();
                 let host: Vec<u8> = e.out.iter().flat_map(|w| w.to_le_bytes()).collect();
                 let _ = std::fs::write(format!("jit-{:x}.guest", self.pc), guest);
@@ -1464,13 +1466,16 @@ impl Cpu {
     fn emit_utlb(&self, e: &mut Emit, k: usize, span: u32, unpriv: bool, excl_check: bool, slow: &mut Vec<usize>, way1: bool) -> Option<(usize, usize, usize)> {
         let c = e.c;
         let (vreg, tmp, tmp2) = (13u32, 14u32, 15u32);
-        // x17 = &utlb[k][uti(va)]; the tag compared is that of the access's LAST byte,
-        // (last >> 12) + 1 | el << 60: a page-crossing access cannot match the first page's
-        // entry, so it takes the slow path without a separate check
+        // x17 = &utlb[k][uti(va)]; tag = (va >> 12) + 1 | el << 60. A page-crossing access
+        // takes the slow path first: the hashed set of page P can hold page P + 1 (`uti`
+        // maps both to one set when P ends in 14 one bits, the last page before each 64 MiB),
+        // so comparing the last byte's tag alone would hit P + 1's frame
         let ent = c.off_utlb + 16 * UT * k;
         assert!(ent + 16 * UT < 32768);
         if span > 1 {
             e.out.push(0x9100_0000 | ((span - 1) << 10) | (vreg << 5) | tmp2); // add x15, x13, #span-1
+            e.out.push(0xca00_0000 | (vreg << 16) | (tmp2 << 5) | 16); // eor x16, x15, x13
+            slow.push(e.out.len()); e.out.push(0x3760_0000 | 16); // tbnz w16, #12, slow (crosses a page)
             e.out.push(0xd34c_fc00 | (tmp2 << 5) | tmp); // lsr x14, x15, #12
         } else {
             e.out.push(0xd34c_fc00 | (vreg << 5) | tmp); // lsr x14, x13, #12

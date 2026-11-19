@@ -20,6 +20,9 @@ impl Exc {
     pub const BRK: u32 = 0x3c;
 }
 
+/// A `chain_until` that never runs out (the largest the generated code's signed test allows).
+pub const UNBOUNDED: u64 = i64::MAX as u64;
+
 /// Entries per micro-TLB (a power of two). At most 256: compiled code reaches the `Cpu`
 /// fields laid out after the tables with short immediate offsets (512 breaks that).
 pub(crate) const UT: usize = 256;
@@ -110,7 +113,8 @@ pub struct Cpu {
     pub(crate) store_log: Option<Vec<(usize, Vec<u8>)>>,
     /// Block chaining (native JIT): compiled blocks jump straight into their successors while
     /// `instret < chain_until` (0, the default, never chains); the caller sets it to the next
-    /// instant it must look at the machine (budget end, device deadline).
+    /// instant it must look at the machine (budget end, device deadline). Generated code tests
+    /// `instret - chain_until` for its sign, so a budget is at most `UNBOUNDED`.
     pub chain_until: u64,
     /// set when an instruction run inside a block may need the machine's attention (device
     /// access, system register, exception level change, ...): the chain stops after the block
@@ -444,7 +448,7 @@ impl Cpu {
 
     /// Tests: a small code buffer and compile-on-first-use, when `SBC_JIT=1` is set.
     pub fn enable_test_jit_from_env(&mut self) {
-        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); self.chain_until = u64::MAX; }
+        if std::env::var("SBC_JIT").is_ok_and(|v| v == "1") { self.jit = crate::jit::Jit::with(1 << 20, 1); self.chain_until = UNBOUNDED; }
     }
 }
 

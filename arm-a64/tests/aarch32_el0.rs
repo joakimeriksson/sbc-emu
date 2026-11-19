@@ -234,7 +234,7 @@ fn run_loop(jit: bool) -> (Cpu, u32, u32) {
     cpu.brk_to_host = true;
     if jit {
         cpu.jit = arm_a64::jit::Jit::with(1 << 20, 1);
-        cpu.chain_until = u64::MAX;
+        cpu.chain_until = arm_a64::UNBOUNDED;
     }
     cpu.ram = ram.mem.as_mut_ptr();
     cpu.ram_len = ram.mem.len() as u64;
@@ -328,7 +328,7 @@ fn two_threads_increment_one_counter_with_ldrex_strex() {
                     cpu.mt = true;
                     if jit {
                         cpu.jit = arm_a64::jit::Jit::with(1 << 20, 1);
-                        cpu.chain_until = u64::MAX;
+                        cpu.chain_until = arm_a64::UNBOUNDED;
                     }
                     cpu.ram = base as *mut u8;
                     cpu.ram_len = RAM as u64;
@@ -425,7 +425,7 @@ fn load_acquire_store_release_in_a32_and_t32() {
         cpu.brk_to_host = true;
         if jit {
             cpu.jit = arm_a64::jit::Jit::with(1 << 20, 1);
-            cpu.chain_until = u64::MAX;
+            cpu.chain_until = arm_a64::UNBOUNDED;
         }
         cpu.ram = ram.mem.as_mut_ptr();
         cpu.ram_len = ram.mem.len() as u64;
