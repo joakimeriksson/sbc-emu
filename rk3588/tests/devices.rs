@@ -222,6 +222,19 @@ fn hdmi_framebuffer_is_handed_over_and_reserved() {
 }
 
 #[test]
+fn initrd_stays_below_the_hdmi_framebuffer() {
+    use rk3588::display::Mode;
+    let mut image=vec![0;4096];image[56..60].copy_from_slice(b"ARMd");
+    // 128 MiB: the framebuffer starts at 112 MiB, the initrd at 64 MiB, so 48 MiB fit
+    let initrd=vec![0;49<<20];
+    let mut m=Machine::new(128<<20).unwrap();
+    m.enable_hdmi(Mode{width:1280,height:720});
+    assert!(rk3588::boot::boot_linux(&mut m,&image,Some(&initrd),"").is_err());
+    let mut plain=Machine::new(128<<20).unwrap();
+    rk3588::boot::boot_linux(&mut plain,&image,Some(&initrd),"").unwrap();
+}
+
+#[test]
 fn usb_host_is_a_platform_xhci_with_keyboard_and_tablet() {
     let mut m=Machine::new(128<<20).unwrap();
     assert_eq!(m.soc.read32(rk3588::XHCI).unwrap()>>16,0x0100,"HCIVERSION 1.0");

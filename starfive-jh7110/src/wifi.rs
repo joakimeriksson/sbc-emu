@@ -75,6 +75,10 @@ const E_ESCAN_RESULT: u32 = 69;
 const BCME_UNSUPPORTED: i32 = -23;
 
 pub struct Bcm43456 {
+    /// virtual time (ns) from the host's ticks
+    now: u64,
+    /// scans the host requested: (sync id, when the results are due), oldest first
+    pending_scans: VecDeque<(u16, u64)>,
     // function 0
     ioe: u8,
     ien: u8,
@@ -128,6 +132,7 @@ impl Default for Bcm43456 {
 impl Bcm43456 {
     pub fn new() -> Self {
         Bcm43456 {
+            now: 0, pending_scans: VecDeque::new(),
             ioe: 0, ien: 0, bus_if: 0, bus_speed: 0x01, brcm_cardctrl: 0, fn_blksize: [0; 3],
             window: 0, watermark: 0, devctl: 0, clkcsr: 0, pullup: 0, mesbusy: 0, sleepcsr: 0x03,
             ram: vec![0; RAM_SIZE as usize], regs: Default::default(), ram_written: false, running: false,
@@ -423,6 +428,9 @@ impl Bcm43456 {
         match (cmd, set) {
             (C_GET_VERSION, false) => Ok(u32v(2)),
             (C_GET_BANDLIST, false) => Ok([u32v(1), u32v(2)].concat()), // one band: 2.4 GHz
+            (115, false) => Ok(u32v(0)), // WLC_GET_SCANSUPPRESS: off
+            (141, false) => Ok(u32v(2)), // WLC_GET_BAND: 2.4 GHz
+            (242, false) => Ok(u32v(0)), // WLC_GET_RADAR: off
             (C_GET_REVINFO, false) => {
                 let mut v = vec![0u8; 68];
                 for (k, x) in [0x14e4u32, 0x43ab, 0x0 /*radio*/, 9, 0x2a, 0, 0, 0x4345, 0, 9, 0, 0, 0, 0, 0, 0, 0].iter().enumerate() { v[4 * k..4 * k + 4].copy_from_slice(&x.to_le_bytes()); }
@@ -463,6 +471,16 @@ impl Bcm43456 {
             "cur_etheraddr" => self.mac.to_vec(),
             "ver" => b"wl0: Nov 13 2026 00:00:00 version 7.45.265 (sbc-emu emulated FullMAC) FWID 01-5bc0e000\n\0".to_vec(),
             "event_msgs" => { let mut m = self.event_mask.clone(); m.resize(len.max(1), 0); m }
+            "event_msgs_ext" => {
+                let want = data.get(name_end + 4).copied().unwrap_or(0) as usize;
+                let mut m = self.event_mask.clone();
+                m.resize(want.max(m.len()), 0);
+                let mut v = vec![1, 0, m.len() as u8, m.len() as u8];
+                v.extend_from_slice(&m);
+                v
+            }
+            // probes Broadcom's bcmdhd makes: features this firmware has off
+            "roamscan_mode" | "tdls_enable" | "p2p" | "mapsta_mode" | "event_log_max_sets" => u32v(0),
             "cap" => b"sta wme 802.11d 802.11h ampdu ampdu_tx ampdu_rx\0".to_vec(),
             "chanspecs" => {
                 // the query carries a chanspec naming the bandwidth asked for: 20 MHz channels
@@ -501,8 +519,32 @@ impl Bcm43456 {
                 self.join_ssid(&ssid);
             }
             "escan" => {
+                // results come after the request's reply, as a real scan's do (Broadcom's
+                // bcmdhd ignores results that arrive before it has seen the reply)
+                // struct brcmf_escan_params_le { u32 version; u16 action; u16 sync_id; ... }:
+                // action 1 starts a scan, 3 aborts the ones in progress
+                let action = val.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(1);
                 let sync = val.get(6..8).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
-                self.scan_results(sync);
+                if action == 3 {
+                    self.pending_scans.clear();
+                } else {
+                    self.pending_scans.push_back((sync, self.now + 50_000_000));
+                }
+            }
+            "event_msgs_ext" => {
+                // struct eventmsgs_ext { u8 ver, command, len, maxgetsize; u8 mask[] }:
+                // command 1 sets the bits, 2 clears them, 3 replaces the mask
+                if let (Some(&cmd), Some(&n)) = (val.get(1), val.get(2)) {
+                    let bits = val.get(4..4 + n as usize).unwrap_or(&[]);
+                    if self.event_mask.len() < bits.len() { self.event_mask.resize(bits.len(), 0); }
+                    for (k, &b) in bits.iter().enumerate() {
+                        match cmd {
+                            1 => self.event_mask[k] |= b,
+                            2 => self.event_mask[k] &= !b,
+                            _ => self.event_mask[k] = b,
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -520,7 +562,9 @@ impl Bcm43456 {
         p.extend_from_slice(&self.mac); // ethernet: dst
         p.extend_from_slice(&self.mac); // src
         p.extend_from_slice(&0x886cu16.to_be_bytes());
-        let body_len = 10 + 48 + data.len();
+        // the firmware pads event data with two bytes (BCMILCP_BCM_SUBTYPE_EVENT_DATA_PAD);
+        // Broadcom's bcmdhd requires the frame length to include them
+        let body_len = 10 + 48 + data.len() + 2;
         p.extend_from_slice(&0x8001u16.to_be_bytes()); // brcm_ethhdr subtype
         p.extend_from_slice(&(body_len as u16).to_be_bytes());
         p.push(0); // version
@@ -540,6 +584,7 @@ impl Bcm43456 {
         p.push(0); // ifidx
         p.push(0); // bsscfgidx
         p.extend_from_slice(data);
+        p.extend_from_slice(&[0, 0]);
         self.queue_rx(1, &p);
     }
 
@@ -736,12 +781,29 @@ impl SdioCard for Bcm43456 {
     }
 
     fn irq(&self) -> bool { self.ien & 0x03 == 0x03 && self.irq_pending() }
+    /// WL_HOST_WAKE: the chip's interrupt status on its out-of-band pin (Broadcom's bcmdhd
+    /// with `CONFIG_BCMDHD_OOB` takes interrupts there instead of on DAT[1])
+    fn oob_irq(&self) -> bool { self.irq_pending() }
     fn take_tx(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.tx_out) }
     fn deliver(&mut self, eth: &[u8]) { Bcm43456::deliver(self, eth) }
     fn set_trace(&mut self, on: bool) { self.trace = on; }
+    fn tick(&mut self, now_ns: u64) {
+        self.now = now_ns;
+        while let Some(&(sync, due)) = self.pending_scans.front() {
+            if now_ns < due {
+                break;
+            }
+            self.pending_scans.pop_front();
+            self.scan_results(sync);
+        }
+    }
+
+    fn next_event(&self) -> Option<u64> {
+        self.pending_scans.front().map(|&(_, due)| due)
+    }
 
     fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("bcm43456-v2");
+        w.tag("bcm43456-v3");
         for v in [self.ioe, self.ien, self.bus_if, self.bus_speed, self.brcm_cardctrl, self.watermark, self.devctl, self.clkcsr, self.pullup, self.mesbusy, self.sleepcsr, self.rx_seq, self.host_seq] { w.u8(v); }
         for v in self.fn_blksize { w.u16(v); }
         w.u32(self.window);
@@ -757,12 +819,16 @@ impl SdioCard for Bcm43456 {
         w.u64(self.net as u64);
         w.u8(match self.wpa { Wpa::Open => 0, Wpa::AwaitM2 => 1, Wpa::AwaitM4 => 2, Wpa::Installed => 3 });
         w.bytes(&self.pmk); w.bytes(&self.anonce); w.u64(self.replay);
+        w.u64(self.now);
+        w.u64(self.pending_scans.len() as u64);
+        for &(sync, due) in &self.pending_scans { w.u16(sync); w.u64(due); }
         // the firmware image in RAM is not needed once running (the emulated firmware replaces it)
     }
 
     fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
         let tag = r.bytes()?;
-        let v2 = tag == b"bcm43456-v2";
+        let v3 = tag == b"bcm43456-v3";
+        let v2 = v3 || tag == b"bcm43456-v2";
         if !v2 && tag != b"bcm43456-v1" { return Err(emu_core::snap::SnapError("snapshot layout mismatch: Wi-Fi chip".into())); }
         for v in [&mut self.ioe, &mut self.ien, &mut self.bus_if, &mut self.bus_speed, &mut self.brcm_cardctrl, &mut self.watermark, &mut self.devctl,
                   &mut self.clkcsr, &mut self.pullup, &mut self.mesbusy, &mut self.sleepcsr, &mut self.rx_seq, &mut self.host_seq] { *v = r.u8()?; }
@@ -782,6 +848,11 @@ impl SdioCard for Bcm43456 {
             self.pmk.copy_from_slice(&r.bytes()?[..32]);
             self.anonce.copy_from_slice(&r.bytes()?[..32]);
             self.replay = r.u64()?;
+        }
+        self.pending_scans.clear();
+        if v3 {
+            self.now = r.u64()?;
+            for _ in 0..r.u64()? { let sync = r.u16()?; let due = r.u64()?; self.pending_scans.push_back((sync, due)); }
         }
         self.rx_cur = None;
         self.tx_buf.clear();
