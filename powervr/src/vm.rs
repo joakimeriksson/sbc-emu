@@ -61,10 +61,10 @@ impl Vm {
 
 fn rd32(ram: &FlatRam, pa: u64) -> Option<u32> {
     let o = pa.checked_sub(ram.base)? as usize;
-    ram.mem.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    ram.mem.get(o..o.checked_add(4)?).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
 fn rd64(ram: &FlatRam, pa: u64) -> Option<u64> {
     let o = pa.checked_sub(ram.base)? as usize;
-    ram.mem.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    ram.mem.get(o..o.checked_add(8)?).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }

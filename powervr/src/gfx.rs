@@ -71,6 +71,8 @@ struct Prim {
     back: bool,
     /// the vertex outputs of the original (unclipped) triangle, for flat shading
     flat: [Vec<u32>; 3],
+    /// the original vertices' window z
+    flat_z: [f32; 3],
 }
 
 /// The primitives of one scene (render).
@@ -110,9 +112,31 @@ struct JobStats {
     shaded: u64,
 }
 
-fn u64_at(w: &[u32], byte: usize) -> u64 {
-    w[byte / 4] as u64 | (w[byte / 4 + 1] as u64) << 32
+/// Word `i` of a command (0 beyond its end: the callers check the length first).
+fn word(w: &[u32], i: usize) -> u32 {
+    w.get(i).copied().unwrap_or(0)
 }
+
+fn u64_at(w: &[u32], byte: usize) -> u64 {
+    word(w, byte / 4) as u64 | (word(w, byte / 4 + 1) as u64) << 32
+}
+
+/// A command must be at least as long as its firmware structure.
+fn check_len(cmd: &[u32], bytes: usize, what: &str) -> Result<(), String> {
+    if cmd.len() * 4 < bytes {
+        return Err(format!("{what} command of {} bytes, expected {bytes}", cmd.len() * 4));
+    }
+    Ok(())
+}
+
+/// `struct rogue_fwif_cmd_geom`, `_frag` and `_transfer` sizes.
+const GEOM_CMD_BYTES: usize = 112;
+const FRAG_CMD_BYTES: usize = 480;
+const TRANSFER_CMD_BYTES: usize = 192;
+/// The most vertices one INDEX_LIST may shade (index count x instances), and the largest
+/// render: guest-controlled sizes must not exhaust host memory or time.
+const MAX_DRAW_VERTICES: u64 = 1 << 22;
+const MAX_RENDER_SIZE: u32 = 8192;
 
 fn f(v: u32) -> f32 {
     f32::from_bits(v)
@@ -141,7 +165,7 @@ impl Job<'_, '_> {
         }
         let task = pds::Task { if0: true, if1, temps };
         let mut host = TaskHost { mem: self.mem, common, unified, doutu: None, douti: Vec::new(), trace: self.trace };
-        self.pds.trace = false;
+        self.pds.trace = self.trace;
         self.pds.run(&mut host, PDS_HEAP + code, &data, &task).map_err(|e| format!("PDS program {code:#x}: {e:?}"))?;
         Ok((host.doutu, host.douti))
     }
@@ -251,9 +275,10 @@ impl Gfx {
     /// A geometry job: walk the VDM control stream, shade the vertices, and add the
     /// primitives to the scene of the job's HWRT data.
     pub(crate) fn geom(&mut self, mem: &mut GpuMem, cmd: &[u32], trace: bool) -> Result<(), String> {
-        let hwrt = cmd[1];
+        check_len(cmd, GEOM_CMD_BYTES, "geometry")?;
+        let hwrt = word(cmd, 1);
         let stream = u64_at(cmd, 16) & 0xff_ffff_fffc;
-        let flags = cmd[80 / 4];
+        let flags = word(cmd, 80 / 4);
         if flags & 1 != 0 || !self.scenes.contains_key(&hwrt) {
             self.scenes.insert(hwrt, Scene::default());
         }
@@ -326,7 +351,7 @@ impl Gfx {
                     let bit = |n: u32| w0 & (1 << n) != 0;
                     let index_addr = if bit(28) { Some(((w0 & 0xff) as u64) << 32 | next(&mut job)? as u64) } else { None };
                     let count = if bit(27) { next(&mut job)? } else { 0 };
-                    let instances = if bit(26) { next(&mut job)? + 1 } else { 1 };
+                    let instances = if bit(26) { next(&mut job)?.saturating_add(1) } else { 1 };
                     let offset = if bit(25) { next(&mut job)? } else { 0 };
                     if bit(24) {
                         next(&mut job)?;
@@ -338,6 +363,9 @@ impl Gfx {
                     if bit(22) {
                         next(&mut job)?;
                     }
+                    if count as u64 * instances as u64 > MAX_DRAW_VERTICES {
+                        return Err(format!("draw of {count} indices x {instances} instances exceeds {MAX_DRAW_VERTICES} vertices"));
+                    }
                     let index_size = (w0 >> 17) & 3;
                     let topology = (w0 >> 8) & 0xf;
                     pc = p;
@@ -347,7 +375,7 @@ impl Gfx {
                             None => i,
                             Some(a) => {
                                 let bytes = 1u64 << index_size;
-                                let at = a + i as u64 * bytes;
+                                let at = a.wrapping_add(i as u64 * bytes);
                                 let word = job.read(at & !3)?;
                                 match index_size {
                                     0 => (word >> (8 * (at & 3))) & 0xff,
@@ -393,15 +421,19 @@ fn shade_vertices(job: &mut Job, vdm: &VdmState, shareds: &mut [u32], idx: &[u32
     let unified_words = (4 * vdm.unified as usize).max(4);
     let mut insts = Vec::with_capacity(idx.len());
     let mut kick = None;
-    for &i in idx {
+    // trace the vertex PDS program for the first vertex only
+    let trace = job.trace;
+    for (n_vtx, &i) in idx.iter().enumerate() {
+        job.trace = trace && n_vtx == 0;
         let mut unified = vec![0u32; unified_words];
-        let (u, _) = job.pds(vdm.vs_code, vdm.vs_data, 4 * vdm.pds_data as usize, vec![i, n], false, shareds, &mut unified)?;
+        let r = job.pds(vdm.vs_code, vdm.vs_data, 4 * vdm.pds_data as usize, vec![i, n], false, shareds, &mut unified);
+        job.trace = trace;
+        let (u, _) = r?;
         kick = kick.or(u);
         let mut inst = Instance::new(8, 0);
         inst.vtxin = unified;
         inst.vout = vec![0; vdm.out_size as usize];
         insts.push(inst);
-        job.trace = false;
     }
     let u = kick.ok_or("vertex PDS program without a DOUTU")?;
     for inst in &mut insts {
@@ -409,6 +441,25 @@ fn shade_vertices(job: &mut Job, vdm: &VdmState, shareds: &mut [u32], idx: &[u32
     }
     job.usc(u, &mut [], shareds, &mut insts)?;
     Ok(insts.into_iter().map(|i| Vertex { win: [0.0; 4], out: i.vout }).collect())
+}
+
+/// The triangles of a primitive topology, as vertex indices in the order the hardware
+/// keeps them, and whether a triangle faces the opposite way to that order.
+///
+/// The provoking vertex is a position in this order: Mesa patches the coefficient
+/// program's flat iterators to FLAT_VERTEX0 for lists and strips, FLAT_VERTEX1 for fans
+/// and FLAT_VERTEX2 for last-vertex provoking (`pvr_setup_fragment_coeff_program` /
+/// TA_STATE_PPP_CTRL.flatshade_vtx). Vulkan's first-vertex convention makes vertex i
+/// provoking for strip triangle i and i+1 for fan triangle i, last-vertex i+2 for both,
+/// so strip triangles stay (i, i+1, i+2), odd ones facing the other way, and fan
+/// triangles are (0, i+1, i+2).
+fn triangles(n: usize, topology: u32) -> Result<Vec<([usize; 3], bool)>, String> {
+    Ok(match topology {
+        6 => (0..n / 3).map(|t| ([3 * t, 3 * t + 1, 3 * t + 2], false)).collect(),
+        9 => (0..n.saturating_sub(2)).map(|i| ([i, i + 1, i + 2], i % 2 == 1)).collect(),
+        11 => (1..n.saturating_sub(1)).map(|i| ([0, i, i + 1], false)).collect(),
+        t => return Err(format!("primitive topology {t} (points / lines / patches) not implemented")),
+    })
 }
 
 /// Clip a polygon of vertex outputs (clip-space position in outputs 0..3) against the
@@ -445,12 +496,7 @@ fn clip_poly(poly: Vec<Vec<u32>>, d: impl Fn(&[f32]) -> f32) -> Vec<Vec<u32>> {
 /// clipping: pixels outside the render are never covered. A clipped triangle becomes a
 /// fan; flat-shaded varyings still come from the original provoking vertex.
 fn assemble(verts: &[Vertex], topology: u32, ppp: &Ppp, out: &mut Vec<Prim>, stats: &mut JobStats, trace: bool) -> Result<(), String> {
-    let tris: Vec<[usize; 3]> = match topology {
-        6 => (0..verts.len() / 3).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect(),
-        9 => (0..verts.len().saturating_sub(2)).map(|i| if i % 2 == 0 { [i, i + 1, i + 2] } else { [i + 1, i, i + 2] }).collect(),
-        11 => (1..verts.len().saturating_sub(1)).map(|i| [0, i, i + 1]).collect(),
-        t => return Err(format!("primitive topology {t} (points / lines / patches) not implemented")),
-    };
+    let tris = triangles(verts.len(), topology)?;
     // TA_OUTPUT_SEL: clip / cull planes (0..15), viewport (19) and render target (20) index
     if ppp.outsel & 0xffff != 0 || ppp.outsel & (3 << 19) != 0 {
         return Err(format!("clip / cull distances or viewport / layer outputs (OUTPUT_SEL {:#x}) not implemented", ppp.outsel));
@@ -458,9 +504,14 @@ fn assemble(verts: &[Vertex], topology: u32, ppp: &Ppp, out: &mut Vec<Prim>, sta
     let vp = *ppp.viewports.first().ok_or("draw without a viewport")?;
     let wmin = if ppp.ppp_ctrl & (1 << 5) != 0 { ppp.wclamp.max(f32::MIN_POSITIVE) } else { f32::MIN_POSITIVE };
     let clip_mode = (ppp.ppp_ctrl >> 10) & 3;
-    for t in tris {
+    for (t, flip) in tris {
         stats.triangles += 1;
         let orig = [verts[t[0]].out.clone(), verts[t[1]].out.clone(), verts[t[2]].out.clone()];
+        // window z of the original vertices, for flat-shaded z
+        let flat_z = std::array::from_fn(|k| {
+            let (z, w) = (f(orig[k].get(2).copied().unwrap_or(0)), f(orig[k].get(3).copied().unwrap_or(0)));
+            if w > 0.0 { vp[4] + vp[5] * z / w } else { 0.0 }
+        });
         let mut poly = orig.to_vec();
         poly = clip_poly(poly, |c| c[3] - wmin);
         if clip_mode != 0 {
@@ -485,10 +536,16 @@ fn assemble(verts: &[Vertex], topology: u32, ppp: &Ppp, out: &mut Vec<Prim>, sta
         for i in 1..poly.len() - 1 {
             let v = [0, i, i + 1].map(|k| Vertex { win: win[k], out: poly[k].clone() });
             let area = (v[1].win[0] - v[0].win[0]) * (v[2].win[1] - v[0].win[1]) - (v[2].win[0] - v[0].win[0]) * (v[1].win[1] - v[0].win[1]);
+            // a NaN / infinite position (w overflow, garbage outputs) would cover everything
+            if !area.is_finite() || v.iter().any(|v| v.win.iter().any(|c| !c.is_finite())) {
+                stats.degenerate += 1;
+                continue;
+            }
             // Vulkan's orientation: a = -1/2 * sum(x_i * y_i+1 - x_i+1 * y_i) in framebuffer
             // coordinates (y down), counter-clockwise when positive; `area` is twice the
-            // sum without the minus sign, so counter-clockwise is a negative `area`
-            let ccw = area < 0.0;
+            // sum without the minus sign, so counter-clockwise is a negative `area`. Odd
+            // strip triangles are kept in strip order and face the other way.
+            let ccw = (area < 0.0) != flip;
             if trace {
                 let w: Vec<String> = v.iter().map(|v| format!("({:.1},{:.1},{:.3})", v.win[0], v.win[1], v.win[2])).collect();
                 eprintln!("[gpu geom]   triangle {} area {area:.1} ppp_ctrl {:#x}", w.join(" "), ppp.ppp_ctrl);
@@ -509,7 +566,7 @@ fn assemble(verts: &[Vertex], topology: u32, ppp: &Ppp, out: &mut Vec<Prim>, sta
                 stats.degenerate += 1;
                 continue;
             }
-            out.push(Prim { v, ppp: ppp.clone(), back: !ccw, flat: orig.clone() });
+            out.push(Prim { v, ppp: ppp.clone(), back: !ccw, flat: orig.clone(), flat_z });
         }
     }
     Ok(())
@@ -635,6 +692,13 @@ struct Render {
 
 impl Render {
     fn run(&self, job: &mut Job, prims: &[Prim]) -> Result<u64, String> {
+        let trace = job.trace;
+        let r = self.run_tiles(job, prims);
+        job.trace = trace;
+        r
+    }
+
+    fn run_tiles(&self, job: &mut Job, prims: &[Prim]) -> Result<u64, String> {
         let mut tiles = 0;
         for ty in self.origin.1..self.origin.1 + self.tiles.1 {
             for tx in self.origin.0..self.origin.0 + self.tiles.0 {
@@ -724,13 +788,14 @@ impl Render {
             None
         };
         let zplane = plane([[v[0].win[0], v[0].win[1], v[0].win[2]], [v[1].win[0], v[1].win[1], v[1].win[2]], [v[2].win[0], v[2].win[1], v[2].win[2]]]);
-        // edge functions, oriented so that inside is positive
-        let area = (v[1].win[0] - v[0].win[0]) * (v[2].win[1] - v[0].win[1]) - (v[2].win[0] - v[0].win[0]) * (v[1].win[1] - v[0].win[1]);
-        let s = area.signum();
-        let edge = |a: &Vertex, b: &Vertex, x: f32, y: f32| s * ((b.win[0] - a.win[0]) * (y - a.win[1]) - (b.win[1] - a.win[1]) * (x - a.win[0]));
+        let tri = [0, 1, 2].map(|k| [v[k].win[0], v[k].win[1]]);
         let dcmp = (ispa >> 17) & 7;
         let dwrite = ispa & (1 << 21) == 0;
+        // punch-through and depth-feedback objects keep only the pixels the shader passes:
+        // their depth is written after shading
+        let feedback = matches!((ispa >> 24) & 7, 2 | 4 | 5);
         let mut covered = Vec::new();
+        let mut zs = Vec::new();
         for (i, px) in pixels.iter().enumerate() {
             let (x, y) = (px.pos[0], px.pos[1]);
             let (ix, iy) = (x as u32, y as u32);
@@ -742,8 +807,7 @@ impl Render {
                     continue;
                 }
             }
-            let (e0, e1, e2) = (edge(&v[1], &v[2], x, y), edge(&v[2], &v[0], x, y), edge(&v[0], &v[1], x, y));
-            if e0 < 0.0 || e1 < 0.0 || e2 < 0.0 {
+            if !inside(tri, x, y) {
                 continue;
             }
             job.stats.covered += 1;
@@ -766,10 +830,11 @@ impl Render {
                 job.stats.depth_failed += 1;
                 continue;
             }
-            if dwrite {
+            if dwrite && !feedback {
                 depth[i] = z;
             }
             covered.push(i);
+            zs.push(z);
         }
         // tag write disabled: depth / stencil only
         if covered.is_empty() || ppp.ispctl & (1 << 21) != 0 {
@@ -827,15 +892,50 @@ impl Render {
             .collect();
         job.usc(u, &mut coeffs, &mut shareds, &mut insts)?;
         job.stats.shaded += covered.len() as u64;
-        // punch-through and depth-feedback objects keep only the pixels the shader passed
-        let feedback = matches!((ispa >> 24) & 7, 2 | 4 | 5);
-        for (inst, &i) in insts.iter().zip(&lanes) {
-            if covered.binary_search(&i).is_ok() && (!feedback || inst.feedback) {
-                pixels[i].out = inst.out;
-            }
-        }
+        commit(&insts, &lanes, &covered, &zs, feedback && dwrite, feedback, pixels, depth);
         Ok(true)
     }
+}
+
+/// After the fragment shader: covered pixels (not the quad helpers) take the shader's
+/// output registers, unless the object needs feedback and the shader did not pass the
+/// pixel; for feedback objects the depth test's result (`zs`, per covered pixel) is
+/// written only for passed pixels, and only now.
+#[allow(clippy::too_many_arguments)]
+fn commit(insts: &[Instance], lanes: &[usize], covered: &[usize], zs: &[f32], write_depth: bool, feedback: bool, pixels: &mut [Instance], depth: &mut [f32]) {
+    for (inst, &i) in insts.iter().zip(lanes) {
+        let Ok(c) = covered.binary_search(&i) else { continue };
+        if !feedback || inst.feedback {
+            pixels[i].out = inst.out;
+            if write_depth {
+                depth[i] = zs[c];
+            }
+        }
+    }
+}
+
+/// Whether the sample at (x, y) is inside the triangle `t` (window x, y), with Vulkan's
+/// top-left rule for samples exactly on an edge: an edge owns them if the triangle lies
+/// to its right (a left edge) or below it (a top edge, horizontal), so a sample on an
+/// edge shared by two triangles belongs to exactly one of them.
+fn inside(t: [[f32; 2]; 3], x: f32, y: f32) -> bool {
+    let p = t.map(|v| [v[0] as f64, v[1] as f64]);
+    let (x, y) = (x as f64, y as f64);
+    let area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+    if area == 0.0 || !area.is_finite() {
+        return false;
+    }
+    let s = area.signum();
+    for (a, b) in [(p[1], p[2]), (p[2], p[0]), (p[0], p[1])] {
+        // e = A (x - ax) + B (y - ay), oriented so the inside is positive
+        let (ea, eb) = (-s * (b[1] - a[1]), s * (b[0] - a[0]));
+        let e = ea * (x - a[0]) + eb * (y - a[1]);
+        let owns = ea > 0.0 || (ea == 0.0 && eb > 0.0);
+        if e < 0.0 || (e == 0.0 && !owns) {
+            return false;
+        }
+    }
+    true
 }
 
 fn overlaps(p: &Prim, x0: u32, y0: u32) -> bool {
@@ -899,7 +999,7 @@ fn tsp(douti: u64, prim: &Prim, origin: (u32, u32), coeffs: &mut [u32]) -> Resul
                     t.push(1.0 / f(o.get(3).copied().unwrap_or(0)));
                 }
                 if outsel & (1 << 21) != 0 {
-                    t.push(prim.v[0].win[2]);
+                    t.push(prim.flat_z[k as usize]);
                 }
                 t.extend(o.iter().skip(4).map(|&w| f(w)));
                 [0.0, 0.0, t.get(a).copied().unwrap_or(0.0)]
@@ -917,10 +1017,14 @@ fn tsp(douti: u64, prim: &Prim, origin: (u32, u32), coeffs: &mut [u32]) -> Resul
 impl Gfx {
     /// A fragment job: render the scene of its HWRT data.
     pub(crate) fn frag(&mut self, mem: &mut GpuMem, cmd: &[u32], screen: u32, trace: bool) -> Result<(), String> {
-        let hwrt = cmd[1];
+        check_len(cmd, FRAG_CMD_BYTES, "fragment")?;
+        let hwrt = word(cmd, 1);
         let scene = self.scenes.remove(&hwrt).unwrap_or_default();
         let (w, h) = ((screen & 0x7fff) + 1, ((screen >> 16) & 0x7fff) + 1);
-        let r = |off: usize| cmd[(16 + off) / 4];
+        if w > MAX_RENDER_SIZE || h > MAX_RENDER_SIZE {
+            return Err(format!("render of {w}x{h} exceeds {MAX_RENDER_SIZE}x{MAX_RENDER_SIZE}"));
+        }
+        let r = |off: usize| word(cmd, (16 + off) / 4);
         let r64 = |off: usize| u64_at(cmd, 16 + off);
         let out_ctrl = r(0);
         if out_ctrl & 3 == 2 {
@@ -984,7 +1088,8 @@ impl Gfx {
     /// A transfer (TQ_3D) job: a render of background objects only, with the region and
     /// PBE state in the command.
     pub(crate) fn transfer(&mut self, mem: &mut GpuMem, cmd: &[u32], trace: bool) -> Result<(), String> {
-        let r = |off: usize| cmd[(8 + off) / 4];
+        check_len(cmd, TRANSFER_CMD_BYTES, "transfer")?;
+        let r = |off: usize| word(cmd, (8 + off) / 4);
         let r64 = |off: usize| u64_at(cmd, 8 + off);
         let bgobjvals = r(0);
         let isp_render = r(56);
@@ -1126,6 +1231,90 @@ mod tests {
         let mut out = Vec::new();
         assemble(&v, 6, &ppp(0), &mut out, &mut JobStats::default(), false).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn shared_edges_are_covered_once() {
+        // a 4x4 square split along its diagonal, corners on pixel centres: every sample
+        // on the shared diagonal and on the outer edges is decided by the top-left rule
+        let (a, b, c, d) = ([0.5, 0.5], [4.5, 0.5], [4.5, 4.5], [0.5, 4.5]);
+        for (t0, t1) in [([a, b, c], [a, c, d]), ([a, c, b], [a, d, c])] {
+            let mut count = [[0; 6]; 6];
+            for (y, row) in count.iter_mut().enumerate() {
+                for (x, n) in row.iter_mut().enumerate() {
+                    let (sx, sy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    *n = inside(t0, sx, sy) as u32 + inside(t1, sx, sy) as u32;
+                }
+            }
+            // no sample twice; inside the square once (left and top edges in, right and
+            // bottom out)
+            assert!(count.iter().flatten().all(|&n| n <= 1));
+            for y in 0..6 {
+                for x in 0..6 {
+                    assert_eq!(count[y][x], (x < 4 && y < 4) as u32, "pixel ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strip_and_fan_order_keeps_the_provoking_vertex_first() {
+        // strips: (i, i+1, i+2), odd ones flagged as facing the other way; fans:
+        // (0, i+1, i+2), provoking vertex i+1 at position 1 (Mesa's FLAT_VERTEX1)
+        assert_eq!(triangles(5, 9).unwrap(), [([0, 1, 2], false), ([1, 2, 3], true), ([2, 3, 4], false)]);
+        assert_eq!(triangles(4, 11).unwrap(), [([0, 1, 2], false), ([0, 2, 3], false)]);
+        // a counter-clockwise strip: every triangle front-facing, none culled with CULL_CW
+        let v = [vertex(0.0, 0.0, 0.5, 1.0), vertex(0.0, 0.5, 0.5, 1.0), vertex(0.5, 0.0, 0.5, 1.0), vertex(0.5, 0.5, 0.5, 1.0)];
+        let mut out = Vec::new();
+        assemble(&v, 9, &ppp(1), &mut out, &mut JobStats::default(), false).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|p| !p.back));
+        // the odd triangle keeps strip order: vertex 1 first
+        assert_eq!(out[1].flat[0], v[1].out);
+    }
+
+    #[test]
+    fn non_finite_positions_are_rejected() {
+        let v = [vertex(0.0, 0.0, 0.5, 1.0), vertex(f32::NAN, 1.0, 0.5, 1.0), vertex(1.0, 0.0, 0.5, 1.0)];
+        let mut out = Vec::new();
+        let mut stats = JobStats::default();
+        assemble(&v, 6, &ppp(0), &mut out, &mut stats, false).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(stats.degenerate, 1);
+        assert!(!inside([[0.0, 0.0], [f32::INFINITY, 1.0], [1.0, 0.0]], 0.5, 0.25));
+    }
+
+    #[test]
+    fn feedback_objects_write_depth_only_for_passed_pixels() {
+        let mut pixels: Vec<Instance> = (0..4).map(|_| Instance::new(8, 0)).collect();
+        let mut depth = vec![1.0f32; 4];
+        // pixels 0 and 1 covered (with quad helpers 2 and 3); the shader passes pixel 1
+        let mut insts: Vec<Instance> = (0..4).map(|_| Instance::new(8, 0)).collect();
+        for (i, inst) in insts.iter_mut().enumerate() {
+            inst.out[0] = 10 + i as u32;
+            inst.feedback = i == 1 || i == 3;
+        }
+        commit(&insts, &[0, 1, 2, 3], &[0, 1], &[0.25, 0.5], true, true, &mut pixels, &mut depth);
+        assert_eq!(depth, [1.0, 0.5, 1.0, 1.0]);
+        assert_eq!(pixels.iter().map(|p| p.out[0]).collect::<Vec<_>>(), [0, 11, 0, 0]);
+        // opaque objects: every covered pixel, depth already written by the test
+        let mut depth = vec![1.0f32; 4];
+        commit(&insts, &[0, 1, 2, 3], &[0, 1], &[0.25, 0.5], false, false, &mut pixels, &mut depth);
+        assert_eq!(depth, [1.0; 4]);
+        assert_eq!(pixels.iter().map(|p| p.out[0]).collect::<Vec<_>>(), [10, 11, 0, 0]);
+    }
+
+    #[test]
+    fn short_commands_fault_instead_of_panicking() {
+        let mut ram = emu_core::FlatRam::new(0, 4096);
+        let mut vm = crate::vm::Vm::new(0);
+        let mut mem = GpuMem { ram: &mut ram, vm: &mut vm };
+        let mut g = Gfx::default();
+        assert!(g.geom(&mut mem, &[0; 3], false).is_err());
+        assert!(g.frag(&mut mem, &[0; 2], 0, false).is_err());
+        assert!(g.transfer(&mut mem, &[], false).is_err());
+        // an oversized render
+        assert!(g.frag(&mut mem, &[0; 120], 0x7fff_7fff, false).is_err());
     }
 
     #[test]

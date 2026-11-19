@@ -64,7 +64,8 @@ fn is_integer_format(fmt: u32) -> bool {
     matches!(fmt, 24 | 25 | 35 | 36 | 62 | 63 | 65 | 66)
 }
 
-fn f16_to_f32(h: u16) -> f32 {
+/// IEEE half to f32.
+pub fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = ((h >> 10) & 0x1f) as i32;
     let m = (h & 0x3ff) as f32;
@@ -293,8 +294,8 @@ pub fn sample(mem: &mut dyn Memory, img: [u32; 4], smp: [u32; 4], coords: &[f32]
             let (x0, y0) = (x.floor(), y.floor());
             let (fx, fy) = (x - x0, y - y0);
             for (dx, dy, wt) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
-                let tx = address(x0 as i64 + dx, w, modes.0)?;
-                let ty = if image.textype == 0 { 0 } else { address(y0 as i64 + dy, h, modes.1)? };
+                let tx = address((x0 as i64).saturating_add(dx), w, modes.0)?;
+                let ty = if image.textype == 0 { 0 } else { address((y0 as i64).saturating_add(dy), h, modes.1)? };
                 let t = image.to_float(image.texel(mem, l, tx, ty)?)?;
                 for i in 0..4 {
                     acc[i] += t[i] * wt * weight;

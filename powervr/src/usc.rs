@@ -666,7 +666,7 @@ fn fetch(mem: &mut dyn Memory, va: u64) -> Option<Vec<u8>> {
         0 => 32,
         n => 2 * n,
     };
-    (0..len).map(|i| byte(mem, va + i)).collect()
+    (0..len).map(|i| byte(mem, va.wrapping_add(i))).collect()
 }
 
 impl Group {
@@ -1236,6 +1236,11 @@ fn const_reg(idx: u16) -> Option<u32> {
     TABLE.iter().find(|(i, _)| *i == idx).map(|(_, v)| *v)
 }
 
+/// The longest load / store burst accepted (the immediate field holds up to 16).
+const MAX_BURST: u32 = 64;
+/// Vertex outputs per vertex (`vs_output_size` is an 8-bit dword count).
+const MAX_VERTEX_OUTPUTS: usize = 256;
+
 /// Special register numbers (`pco_isa.py` SR).
 const SR_INST_NUM: u16 = 51;
 const SR_SAMP_NUM: u16 = 53;
@@ -1363,7 +1368,7 @@ impl Machine<'_> {
             }
             pc = match next {
                 Some(target) => target.wrapping_add(pc),
-                None => pc + g.hdr.len as u64,
+                None => pc.wrapping_add(g.hdr.len as u64),
             };
         }
         Err(Fault { pc, msg: "runaway program".into() })
@@ -1707,10 +1712,15 @@ impl Machine<'_> {
             Ok(m.reg(inst, lane, r)? as u64 | (m.reg(inst, lane, r.offset(1))? as u64) << 32)
         };
         let burst = |m: &Self, inst: &Instance, bl: Burst| -> Result<u32, String> {
-            match bl {
-                Burst::Imm(n) => Ok(n as u32),
-                Burst::Src(n) => m.reg(inst, lane, slot(n)?),
+            let n = match bl {
+                Burst::Imm(n) => n as u32,
+                Burst::Src(n) => m.reg(inst, lane, slot(n)?)?,
+            };
+            // a register-held burst length is guest data: hardware bursts are at most 16
+            if n > MAX_BURST {
+                return Err(format!("load/store burst of {n} words"));
             }
+            Ok(n)
         };
         match b {
             Backend::Ld { addr: a, burst: bl, .. } => {
@@ -1718,7 +1728,7 @@ impl Machine<'_> {
                 let n = burst(self, inst, bl)?;
                 let dst = slot(3)?;
                 for i in 0..n {
-                    let v = self.mem.read32(va + 4 * i as u64).ok_or(format!("load from unmapped {:#x}", va + 4 * i as u64))?;
+                    let v = self.mem.read32(va.wrapping_add(4 * i as u64)).ok_or(format!("load from unmapped {:#x}", va.wrapping_add(4 * i as u64)))?;
                     self.set_reg(inst, dst.offset(i as u16), v)?;
                 }
                 stats.loads += 1;
@@ -1731,13 +1741,13 @@ impl Machine<'_> {
                     let v = self.reg(inst, lane, src.offset(i as u16))?;
                     match dsize {
                         2 => {
-                            if !self.mem.write32(va + 4 * i as u64, v) {
-                                return Err(format!("store to unmapped {:#x}", va + 4 * i as u64));
+                            if !self.mem.write32(va.wrapping_add(4 * i as u64), v) {
+                                return Err(format!("store to unmapped {:#x}", va.wrapping_add(4 * i as u64)));
                             }
                         }
                         0 | 1 => {
                             let bytes = if dsize == 0 { 1 } else { 2 };
-                            let a = va + (bytes * i) as u64;
+                            let a = va.wrapping_add((bytes * i) as u64);
                             let word = self.mem.read32(a & !3).ok_or(format!("store to unmapped {a:#x}"))?;
                             let sh = 8 * (a & 3) as u32;
                             let m = if bytes == 1 { 0xffu32 } else { 0xffff } << sh;
@@ -1756,6 +1766,9 @@ impl Machine<'_> {
                         Some(a) => a as usize + k as usize,
                         None => self.reg(inst, lane, slot(src)?)? as usize,
                     };
+                    if at >= MAX_VERTEX_OUTPUTS {
+                        return Err(format!("vertex output {at} beyond the {MAX_VERTEX_OUTPUTS} the TA takes"));
+                    }
                     if inst.vout.len() <= at {
                         inst.vout.resize(at + 1, 0);
                     }
@@ -2016,14 +2029,34 @@ pub fn f32_to_f16(x: f32) -> u16 {
     sign | r as u16
 }
 
-fn unpack(fmt: u8, v: u32, elem: u8, _scale_rtz: bool) -> Result<u32, String> {
-    Ok(match fmt {
-        6 => (v as f32).to_bits(),
-        7 => (v as i32 as f32).to_bits(),
-        15 => v,
-        0 => (((v >> (8 * elem)) & 0xff) as f32).to_bits(),
-        fmt => return Err(format!("upck.{} not implemented", pck_name(fmt))),
-    })
+/// UPCK: element `elem` of `fmt` in `v` as a float; `scale` maps the integer range to
+/// [0, 1] (unsigned) or [-1, 1] (signed), as unpack_unorm / unpack_snorm do.
+fn unpack(fmt: u8, v: u32, elem: u8, scale: bool) -> Result<u32, String> {
+    let field = |bits: u32| (v >> (bits * elem as u32)) & ((1u64 << bits) - 1) as u32;
+    let x = match fmt {
+        0 => {
+            let b = field(8) as f32;
+            if scale { b / 255.0 } else { b }
+        }
+        1 => {
+            let b = field(8) as u8 as i8 as f32;
+            if scale { (b / 127.0).max(-1.0) } else { b }
+        }
+        3 => {
+            let h = field(16) as f32;
+            if scale { h / 65535.0 } else { h }
+        }
+        4 => {
+            let h = field(16) as u16 as i16 as f32;
+            if scale { (h / 32767.0).max(-1.0) } else { h }
+        }
+        14 if !scale => crate::tpu::f16_to_f32(field(16) as u16),
+        6 if !scale => v as f32,
+        7 if !scale => v as i32 as f32,
+        15 if !scale => return Ok(v),
+        fmt => return Err(format!("upck.{}{} not implemented", pck_name(fmt), if scale { ".scale" } else { "" })),
+    };
+    Ok(x.to_bits())
 }
 
 /// The TST unit: compare is1 with is2 (or with zero for the one-operand tests).
@@ -2315,5 +2348,22 @@ mod tests {
         // (0.5, 0.25, 0.5, 1.0) as RGBA8
         assert_eq!(insts[0].out[0], 0x80 | 0x40 << 8 | 0x80 << 16 | 0xff << 24);
         assert!(insts[0].feedback);
+    }
+
+    #[test]
+    fn unpack_scale_normalises() {
+        let f = |b: u32| f32::from_bits(b);
+        // upck.u8888.scale: element 2 of 0x80ff4000 is 0xff -> 1.0; without scale 255.0
+        assert_eq!(f(unpack(0, 0x80ff_4000, 2, true).unwrap()), 1.0);
+        assert_eq!(f(unpack(0, 0x80ff_4000, 1, true).unwrap()), 64.0 / 255.0);
+        assert_eq!(f(unpack(0, 0x80ff_4000, 2, false).unwrap()), 255.0);
+        // signed: 0x81 = -127 -> -1.0, 0x80 = -128 clamps to -1.0
+        assert_eq!(f(unpack(1, 0x8081, 0, true).unwrap()), -1.0);
+        assert_eq!(f(unpack(1, 0x8081, 1, true).unwrap()), -1.0);
+        assert_eq!(f(unpack(3, 0xffff_0000, 1, true).unwrap()), 1.0);
+        assert_eq!(f(unpack(14, 0x3c00, 0, false).unwrap()), 1.0);
+        // scale on a format that has no normalised form is not silently ignored
+        assert!(unpack(6, 1, 0, true).is_err());
+        assert!(unpack(15, 1, 0, true).is_err());
     }
 }

@@ -109,7 +109,7 @@ pub fn parse(ram: &FlatRam, vm: &mut Vm, mut va: u64) -> Vec<Kernel> {
 
 /// `struct rogue_fwif_cmd_compute` at `cmd`: regs at +8.
 pub fn run(fw: &mut Firmware, ram: &mut FlatRam, vm: &mut Vm, cmd: u32) {
-    let rd64 = |fw: &Firmware, off: u32| fw.fw_read(ram, cmd + off) as u64 | (fw.fw_read(ram, cmd + off + 4) as u64) << 32;
+    let rd64 = |fw: &Firmware, off: u32| fw.fw_read(ram, cmd.wrapping_add(off)) as u64 | (fw.fw_read(ram, cmd.wrapping_add(off + 4)) as u64) << 32;
     let stream = rd64(fw, 8 + 32);
     let kernels = parse(ram, vm, stream);
     let trace = fw.trace;
@@ -138,6 +138,10 @@ pub fn run(fw: &mut Firmware, ram: &mut FlatRam, vm: &mut Vm, cmd: u32) {
         eprintln!("[gpu cdm] job done: {} kernels, {} invocations, {} faults", kernels.len(), cdm.invocations, cdm.faults);
     }
 }
+
+/// The largest workgroup (instances) and dispatch (workgroups) a kernel may ask for.
+const MAX_WORKGROUP_INSTANCES: usize = 4096;
+const MAX_WORKGROUPS: u64 = 1 << 24;
 
 /// Words of the shared part of the common store (shared registers come first in the
 /// cluster's common store; Mesa allocates at most 1024 dwords of them).
@@ -269,12 +273,19 @@ impl Cdm {
         }
         let groups = match k.indirect {
             Some(addr) => {
-                let g: Vec<u32> = (0..3).map(|i| mem.read32(addr + 4 * i).unwrap_or(0)).collect();
+                let g: Vec<u32> = (0..3).map(|i| mem.read32(addr.wrapping_add(4 * i)).unwrap_or(0)).collect();
                 [g[0], g[1], g[2]]
             }
             None => k.groups,
         };
         let local = (k.size[0] * k.size[1] * k.size[2]) as usize;
+        // guest-controlled sizes: refuse what no Vulkan dispatch produces rather than
+        // exhausting host memory or time
+        let total = groups.iter().map(|&g| g as u64).product::<u64>();
+        if local > MAX_WORKGROUP_INSTANCES || total > MAX_WORKGROUPS {
+            self.fault(format!("dispatch of {groups:?} workgroups of {local} instances is beyond the emulator's limits"));
+            return;
+        }
         // KERNEL0 sizes: common store in 64-byte units, unified store in 16-byte units
         let coeff_words = (16 * k.usc_common_size as usize).max(16);
         let unified_words = (4 * k.usc_unified_size as usize).max(4);
