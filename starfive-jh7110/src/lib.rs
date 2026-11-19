@@ -10,6 +10,7 @@ pub mod dwmmc;
 pub mod gmac;
 pub mod i2c;
 pub mod machine;
+pub mod nvme;
 pub mod pcie;
 pub mod sdio;
 pub mod wifi;

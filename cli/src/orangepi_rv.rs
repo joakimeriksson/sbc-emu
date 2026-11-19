@@ -38,6 +38,9 @@ impl SerialBoard for Machine {
             let devs: Vec<String> = x.attached().iter().map(|d| format!("{d:?}")).collect();
             eprintln!("[{tag}] USB (VL805): {}; PCIe0: {}", devs.join(", "), self.soc.pcie[0].summary());
         }
+        if let Some(n) = self.soc.pcie[1].nvme.as_ref() {
+            eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes; PCIe1: {} MSIs", n.reads, n.writes, self.soc.pcie[1].msis);
+        }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
         }
@@ -104,7 +107,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             checked.push(a.clone());
         }
     }
-    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive"])?;
+    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme"])?;
     let mode = match arg(args, "--hdmi-mode") {
         Some(spec) => {
             let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
@@ -136,12 +139,18 @@ fn execute(args: &[String]) -> Result<(), String> {
     // --usb-drive IMAGE: a USB stick in one of the VL805's USB-A ports (copy-on-write; each
     // boot starts from the image)
     let usb_drive = arg(args, "--usb-drive");
+    // --nvme IMAGE: an NVMe SSD in the M.2 slot (copy-on-write; each boot starts from the image)
+    let nvme = arg(args, "--nvme");
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::new(ram);
         m.soc.display = Display::new(mode);
         if let Some(path) = usb_drive {
             let d = crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?;
             m.soc.attach_usb_drive(Box::new(d));
+        }
+        if let Some(path) = nvme {
+            let d = crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?;
+            m.soc.attach_nvme(Box::new(d));
         }
         if net != "none" {
             m.connect_network(net == "nat", false);
@@ -160,7 +169,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi (AP6256), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }

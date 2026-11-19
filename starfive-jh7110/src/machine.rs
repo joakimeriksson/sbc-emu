@@ -230,6 +230,11 @@ impl Soc {
         next
     }
 
+    /// Fit an NVMe SSD backed by `disk` in the M.2 slot (PCIe1).
+    pub fn attach_nvme(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
+        self.pcie[1].attach_nvme(crate::nvme::Nvme::new(Some(disk)));
+    }
+
     /// Plug a USB drive into the next free port of the VL805.
     pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
         self.usb.storage = Some(emu_core::usb::Storage::new(disk));
