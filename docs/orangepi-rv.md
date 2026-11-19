@@ -14,7 +14,7 @@ Two unmodified kernels boot on it:
 
 | Kernel | Device tree | Works |
 |---|---|---|
-| Alpine `linux-stable` 7.1.5 (mainline) | mainline `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, Wi-Fi (`brcmfmac`), audio, reboot/poweroff. No HDMI: mainline has no JH7110 display driver or DT nodes yet |
+| Alpine `linux-stable` 7.1.5 (mainline) | mainline `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, Wi-Fi (`brcmfmac`), audio, **HDMI** (the firmware's framebuffer under `simpledrm`), reboot/poweroff |
 | Xunlong's own kernel (`orangepi-xunlong/linux-orangepi`, branch `orange-pi-5.15-jh7110`, StarFive's 5.15 BSP), built with `orangepi-build`'s `linux-starfive2-current` config | its `jh7110-orangepi-rv.dtb` | shell, SMP, microSD, Ethernet, USB 3.0, M.2 NVMe, audio, **HDMI** (DC8200 + Inno HDMI, fbcon) with the USB keyboard, RSA on the crypto engine |
 
 ```sh
@@ -47,6 +47,16 @@ every U74, followed by U-Boot. Here the emulator plays the SPL and U-Boot parts:
 Real OpenSBI (Alpine's 1.8.1, generic platform) then runs the platform, HSM, IPIs, timer,
 console and system reset.
 
+For a kernel whose device tree has no display controller node (mainline), the firmware also
+hands over the HDMI output, as U-Boot does on boards whose display mainline cannot drive yet:
+- it sets up the DC8200 to scan out a framebuffer at the monitor's preferred mode;
+- the framebuffer sits in the top 16 MiB of RAM below 4 GiB;
+- it describes the framebuffer as a no-map `/reserved-memory` region and a
+  `/chosen/framebuffer` `simple-framebuffer` node, which Linux's `simpledrm` drives.
+
+Xunlong's kernel describes the DC8200 and Inno HDMI itself, so it gets no handoff and drives
+them with its own DRM driver.
+
 ## Status
 
 | | Status | Evidence |
@@ -61,6 +71,7 @@ console and system reset.
 | M.2 NVMe | `--nvme IMAGE` puts an NVMe 1.4 SSD on PCIe1 (class 010802, MSI). The `nvme` driver brings up its admin and I/O queues; the 64 MiB ext4 drive mounts; a 4 MiB file written to it verifies after dropping the page cache. Works on both kernels | `scripts/orangepi-rv-nvme.txt` |
 | Wi-Fi | **mainline:** the AP6256's BCM43456 on SDIO0 (DW MMC with SDIO). `brcmfmac` loads the real `brcmfmac43456-sdio` firmware for `BCM4345/9`, and the emulated FullMAC host interface answers it (the radio and the proprietary firmware are not emulated). The scan finds the virtual access points `sbc-emu` and `sbc-emu-wpa2`; `iw connect` joins `sbc-emu`; DHCP 10.0.2.15 and ping over `wlan0` work. Xunlong's kernel uses Broadcom's out-of-tree `bcmdhd` module instead, which is not set up | `scripts/orangepi-rv-wifi.txt` |
 | Audio | The PWM DAC fed by the AXI DMA controller: Linux's `jh7110_pwmdac` with `dw-axi-dmac` cyclic DMA and simple-audio-card (`StarFive-PWMDAC-Sound-Card`). `speaker-test -t sine -f 440` at 48 kHz reaches `--audio-out` as a 440.0 Hz sine of the right length, on the left channel (`-s 1`). Works on both kernels | `scripts/orangepi-rv-audio.txt` |
+| HDMI (mainline) | The firmware framebuffer under `simpledrm`: `fb0` at 1280x720 with fbcon. The whole board on mainline in one run, about 45 s wall: microSD read/write; Ethernet with DHCP, ping and HTTP; the USB stick; the HDMI console, where a shell on `tty1` runs a command typed on the USB keyboard | `scripts/orangepi-rv-board-mainline.txt` |
 | HDMI | **Xunlong's kernel:** StarFive's DRM driver binds the DC8200 and the Inno HDMI. The connector is `connected`, with the monitor's EDID offering 1280x720, 1920x1080 and 640x480. The HDMI PHY is programmed for 74.25 MHz; `fb0` carries the kernel console (160x45) at 1280x720 with vblank interrupts. Output goes to VNC (`--vnc :N`), `--screenshot` and the script's `screenshot FILE` | `scripts/orangepi-rv-hdmi.txt`, `scripts/orangepi-rv-board.txt` |
 | Board devices | Xunlong's kernel: the AXP15060 regulators (`hdmi_1p8`, `hdmi_0p9`, `vcc_3v3`, `cpu_vdd`, …) on I2C5; the 24C04 board EEPROM; the temperature sensor; the crypto engine's PKA, which verifies the kernel's X.509 certificates with RSA | `scripts/orangepi-rv-board.txt` |
 
@@ -116,7 +127,7 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 - **Not modelled:**
   - the PowerVR GPU (Xunlong's kernel loads no firmware, and the driver gives up);
   - HDMI audio (I2S into the Inno HDMI), MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
-- **Mainline HDMI:** the mainline kernel has no HDMI output, because mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
+- **Mainline HDMI:** only the firmware's fixed-mode framebuffer is available (no mode setting, no hot-plug). Mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
 - **Firmware:** no mask ROM, U-Boot SPL or U-Boot. Mainline U-Boot recognises the board (EEPROM product ID `XOPIRV`, since 2026.07) and would need the DDR controller, QSPI/SD boot and the EEPROM contents.
 - **Distribution images:** Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried. The kernel they use is the one built here.
 - **Speed:** interpreter only, about 125 M instructions per second, all harts on one host thread.

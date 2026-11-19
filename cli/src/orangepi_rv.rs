@@ -153,7 +153,6 @@ fn execute(args: &[String]) -> Result<(), String> {
     let nvme = arg(args, "--nvme");
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::new(ram);
-        m.soc.display = Display::new(mode);
         if let Some(path) = usb_drive {
             let d = crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?;
             m.soc.attach_usb_drive(Box::new(d));
@@ -166,6 +165,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             m.connect_network(net == "nat", false);
         }
         m.soc.sdio1.insert(disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>));
+        m.soc.display = Display::new(mode);
         boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
         for h in smp + 1..m.harts.len() {
             m.state[h] = HartState::Off;
@@ -174,7 +174,8 @@ fn execute(args: &[String]) -> Result<(), String> {
     };
     if let Some(path) = arg(args, "--dump-dtb") {
         let range = initrd.as_ref().map(|d| (boot::INITRD_ADDR, boot::INITRD_ADDR + d.len() as u64));
-        let blob = boot::prepare_device_tree(&dtb, ram as u64, cmdline, range)?;
+        let fb = (!boot::has_display_node(&dtb)).then(|| (boot::framebuffer_addr(ram as u64), mode.width, mode.height));
+        let blob = boot::prepare_device_tree(&dtb, ram as u64, cmdline, range, fb)?;
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(

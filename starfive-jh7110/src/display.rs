@@ -174,6 +174,22 @@ impl Display {
         }
     }
 
+    /// What the boot firmware leaves running for a kernel without a display driver (the
+    /// simple-framebuffer handoff): panel 0 at the monitor's preferred mode, scanning out
+    /// primary plane 0 from `addr` (XRGB8888, stride = width * 4). Interrupts stay off.
+    pub fn firmware_scanout(&mut self, addr: u32) {
+        let m = self.mode;
+        let (htotal, vtotal) = (m.width + m.hfp + m.hsync + m.hbp, m.height + m.vfp + m.vsync + m.vbp);
+        self.dc_write(DISPLAY_H, m.width | htotal << 16);
+        self.dc_write(DISPLAY_V, m.height | vtotal << 16);
+        self.dc_write(FB_ADDRESS, addr);
+        self.dc_write(FB_STRIDE, m.width * 4);
+        self.dc_write(FB_SIZE, m.width | m.height << 15);
+        self.dc_write(FB_CONFIG, 5 << 26);
+        self.dc_write(FB_CONFIG_EX, 1 << 13);
+        self.dc_write(DISPLAY_PANEL_CONFIG, 1 << 12);
+    }
+
     /// Panel `id` is running (DISPLAY_PANEL_CONFIG output enable).
     fn panel_on(&self, id: u64) -> bool {
         self.reg(DISPLAY_PANEL_CONFIG + 4 * id) & (1 << 12) != 0
