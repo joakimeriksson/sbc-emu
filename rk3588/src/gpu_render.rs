@@ -1,4 +1,4 @@
-//! Valhall single-target linear RGBA8 clears and opaque triangle writeback.
+//! Valhall single-target linear RGBA8 clears and ordered blended writeback.
 //! Compression, depth/stencil and MSAA remain unsupported.
 use crate::{
     gpu_cs::Stop,
@@ -146,7 +146,7 @@ pub fn fragment_frame(
         }
     }
     let pixels = if let Some(frame) = frame {
-        crate::gpu_raster::pixels(m, ram, frame, [x0, y0, x1, y1], pair(&f, 2))?
+        crate::gpu_raster::pixels(m, ram, frame, [x0, y0, x1, y1], pair(&f, 2), color)?
     } else {
         Vec::new()
     };

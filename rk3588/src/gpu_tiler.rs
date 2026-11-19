@@ -796,6 +796,92 @@ mod tests {
         }
     }
     #[test]
+    fn blended_writeback_is_ordered_and_a_late_fault_does_not_clear_the_target() {
+        let (m, mut ram, mut r) = fixture();
+        fn put(ram: &mut [u8], address: usize, words: &[u32]) {
+            for (n, v) in words.iter().enumerate() {
+                ram[address + n * 4..address + n * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        ram[0x5200..0x5500].fill(0);
+        put(
+            &mut ram,
+            0x5200,
+            &[0x80000128, 0x3000, 0x6200, 0, 0, 0, 0, 0],
+        );
+        put(&mut ram, 0x5300, &[0x201, 0xf0503503, 0x1a, 0xed000]);
+        put(&mut ram, 0x5400, &[7, 0, 0, 0, 7 << 29]);
+        let code = [
+            0x4110c038000000c0u64,
+            0x087dbc0208ea407c,
+            0x6891c000000000db,
+            0x4891c100000000da,
+            0x787f4004333c00f0,
+        ];
+        for (n, i) in code.iter().enumerate() {
+            ram[0x6200 + n * 8..0x6208 + n * 8].copy_from_slice(&i.to_le_bytes());
+        }
+        r[20] = 0x5200;
+        // Only four low bits encode RT count; address bits 4/5 are real.
+        ram.copy_within(0x5300..0x5310, 0x5330);
+        r[50] = 0x5331;
+        r[52] = 0x5400;
+        r[57] = 0x21aa;
+        r[58] = 0x1ffff;
+        r[43] = 0xf000f;
+        let mut t = Tiler::default();
+        for _ in 0..2 {
+            t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+                .unwrap();
+        }
+        ram[0xd000..0xd0c0].fill(0);
+        put(&mut ram, 0xd020, &[0xf000f, 0, 0xf000f, 2 << 6]);
+        put(&mut ram, 0xd038, &[0x8000, 0]);
+        put(
+            &mut ram,
+            0xd080,
+            &[1 << 26, 1 | (19 << 3) | (2 << 8) | (0x688 << 16)],
+        );
+        put(
+            &mut ram,
+            0xd0a0,
+            &[
+                0xe000, 0, 64, 0, 0xffdf8020, 0xffdf8020, 0xffdf8020, 0xffdf8020,
+            ],
+        );
+        let mut f = [0; 256];
+        f[40] = 0xd003;
+        f[43] = 0xf000f;
+        ram[0xe000..0xe400].fill(0x55);
+        let k = key(&m, 0x8000);
+        t.frames.get_mut(&k).unwrap().draws[1].regs[50] = 0x5501;
+        ram[0x5500..0x5510].fill(0); // unsupported blend shader mode
+        assert!(t.fragment(&m, &mut ram, &f, (0, 0)).is_err());
+        assert!(ram[0xe000..0xe400].iter().all(|&v| v == 0x55));
+        t.frames.get_mut(&k).unwrap().draws[1].regs[50] = 0x5301;
+        t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        assert_eq!(
+            &ram[0xe000 + (8 * 16 + 8) * 4..0xe004 + (8 * 16 + 8) * 4],
+            &[8, 224, 56, 159]
+        );
+        assert_eq!(&ram[0xe000..0xe004], &[32, 128, 223, 255]);
+        assert!(t.frames.is_empty());
+        assert_eq!(t.vertices, 0);
+        // All color channels disabled: Mesa supplies an Off descriptor and no
+        // fragment shader. Depth/stencil state still has to be side-effect-free.
+        put(&mut ram, 0x5500, &[0, 0, 3, 0]);
+        r[58] = 0xffff;
+        r[20] = 0;
+        r[50] = 0x5501;
+        t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+            .unwrap();
+        t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        assert_eq!(
+            &ram[0xe000 + (8 * 16 + 8) * 4..0xe004 + (8 * 16 + 8) * 4],
+            &[32, 128, 223, 255]
+        );
+    }
+    #[test]
     fn opaque_heap_lifecycle_requires_order_and_valid_context() {
         let (m, ram, _) = fixture();
         let mut t = Tiler::default();

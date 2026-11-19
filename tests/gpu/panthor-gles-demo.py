@@ -65,7 +65,7 @@ function(gl,'glEnableVertexAttribArray',None,[U])(0)
 function(gl,'glViewport',None,[I,I,I,I])(0,0,512,512)
 def draw(points,color):
     if color not in programs:
-        fragment_shader=shader(0x8b30,('precision mediump float;void main(){gl_FragColor=vec4(%s,1.0);}'%','.join(str(v) for v in color)).encode())
+        fragment_shader=shader(0x8b30,('precision mediump float;void main(){gl_FragColor=vec4(%s);}'%','.join(str(v) for v in (color+(1.0,) if len(color)==3 else color))).encode())
         program=function(gl,'glCreateProgram',U,[])()
         for ident in [vertex_shader,fragment_shader]:function(gl,'glAttachShader',None,[U,U])(program,ident)
         function(gl,'glBindAttribLocation',None,[U,U,C.c_char_p])(program,0,b'position')
@@ -102,6 +102,14 @@ function(gl,'glClearColor',None,[F,F,F,F])(*background,1)
 function(gl,'glClear',None,[U])(0x4000)
 # Sun, mountain faces and a geometric prism; all are native GLES triangle draws.
 sun=(0.96,0.48,0.18)
+# Three translucent disks blend into a halo before the opaque scene is drawn.
+function(gl,'glEnable',None,[U])(0xbe2)
+function(gl,'glBlendFuncSeparate',None,[U,U,U,U])(0x302,0x303,1,0x303)
+for radius,alpha in [(0.46,0.025),(0.40,0.05),(0.34,0.15)]:
+    for n in range(16):
+        a=n*math.tau/16;b=(n+1)*math.tau/16
+        draw([(0.48,0.43),(0.48+radius*math.cos(a),0.43+radius*math.sin(a)),(0.48+radius*math.cos(b),0.43+radius*math.sin(b))],sun+(alpha,))
+function(gl,'glDisable',None,[U])(0xbe2)
 for n in range(16):
     a=n*math.tau/16;b=(n+1)*math.tau/16
     draw([(0.48,0.43),(0.48+0.28*math.cos(a),0.43+0.28*math.sin(a)),(0.48+0.28*math.cos(b),0.43+0.28*math.sin(b))],sun)
@@ -118,7 +126,7 @@ pixels=(C.c_ubyte*(512*512*4))()
 function(gl,'glReadPixels',None,[I,I,I,I,U,U,P])(0,0,512,512,0x1908,0x1401,pixels)
 assert function(gl,'glGetError',U,[])()==0
 # Interior probes span different programs, overlaps and untouched background.
-for x,y,color in [(18,482,background),(382,378,sun),(214,250,(0.10,0.82,0.96)),(302,250,(0.48,0.23,0.86)),(18,18,(0.04,0.06,0.14)),(34,18,(19/255,40/255,66/255))]:
+for x,y,color in [(18,482,background),(382,378,sun),(214,250,(0.10,0.82,0.96)),(302,250,(0.48,0.23,0.86)),(18,18,(0.04,0.06,0.14)),(34,18,(19/255,40/255,66/255)),(465,385,(24/255,18/255,22/255))]:
     actual=list(pixels[(y*512+x)*4:(y*512+x+1)*4])
     expected=[round(c*255) for c in color]+[255]
     assert all(abs(a-b)<=1 for a,b in zip(actual,expected)),(x,y,actual,expected)

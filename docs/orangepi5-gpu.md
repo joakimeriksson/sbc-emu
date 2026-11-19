@@ -185,9 +185,10 @@ python3 tools/panthor-demo.py --gles --image <mesa-equipped-armbian.img> \
 
 The 512×512 image is read back from a real GLES framebuffer with
 `GL_RENDERER=Mali-G610 (Panfrost)`. Mesa compiles the shaders and submits the draw
-commands through Linux Panthor. Twenty-four opaque triangle draws, eight fragment
+commands through Linux Panthor. Seventy-two triangle draws, eleven fragment
 programs, overlaps and multiple colors form the sun/mountain/prism scene. Its
-checker floor uses sampled texture data and interpolated coordinates. Interior
+checker floor uses sampled texture data and interpolated coordinates; the sun
+has three translucent halo layers blended over the background. Interior
 pixel probes and `glFinish`/`glReadPixels` verify the result before PNG export.
 There is no llvmpipe fallback. Use the Mesa-equipped fixture described above.
 
@@ -283,13 +284,44 @@ varying shader, not per-fragment CPU uniforms. Flat/integer varyings, indirect
 varying loads, sample/explicit interpolation positions and fused varying/texture
 instructions remain unsupported.
 
+Fixed-function blending now decodes Mali's `A + B × C` equations independently
+for RGB and alpha. Supported operands include source/destination color and alpha,
+source-times-two, inverse factors, and the descriptor's scalar blend constant.
+The constant follows Mesa's target-format scaling (RGBA8 uses `255 << 8`).
+Blend descriptor pointers reserve only their four low bits for RT count;
+addresses aligned to 16 bytes retain their remaining address bits. Channel masks
+and alpha-to-one are honored; a disabled Off descriptor can omit
+its fragment program when the render-target mask is zero and depth/stencil and
+occlusion have no side effects.
+
+Fragments composite in submission order against the clear color and earlier
+fragments, with RGBA8 conversion after each write. A bounded sparse color cache
+preserves overlapping draws; framebuffer clear/writeback remains deferred until
+all supported draws validate and finish. Shader memory side effects are not
+rolled back on faults. The native ATEST datum may be copied through a register;
+only the disabled, zero datum is supported.
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-blend.py \
+  --success-marker PANTHOR_GLES_BLEND_OK --log out/gles-blend.log
+```
+
+The test checks all pixels in 16 frames, including three overlapping layers,
+straight/premultiplied alpha, separate RGB/alpha factors, addition, multiplication,
+constants, subtraction, channel masks, disabled color writes, and translucent
+rectangles with a shared edge and scissoring. Its oracle uses GL factors, not the
+Mali descriptor equation. Blend shaders, logic operations, sRGB conversion and
+framebuffer preload/incremental rendering remain unsupported; these draws share
+a clear-backed render pass.
+
 This is still a subset: triangle lists with basic position FIFO, W=1, finite
-supported coordinates and depth in [0,1], one linear RGBA8 target and opaque replacement blending.
+supported coordinates and depth in [0,1], one linear RGBA8 target and supported fixed-function blending.
 Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
 Nonzero global attribute/index/instance offsets, primitive restart, other
 primitive modes, perspective/clipping, broader varying modes and texture
 formats/layouts, mipmaps, anisotropy, shadow/array/cube sampling,
-blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
+blend shaders, logic operations, depth/stencil, MSAA, framebuffer preload shaders,
 non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
 synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the
 demo does not establish general GLES, Vulkan or desktop support.

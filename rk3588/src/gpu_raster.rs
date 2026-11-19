@@ -1,4 +1,4 @@
-//! Single-sample triangle rasterization and native opaque fragment shaders.
+//! Single-sample triangle rasterization, native fragment shaders and blending.
 use crate::{
     gpu_cs::Stop,
     gpu_mmu::AddressSpace,
@@ -30,25 +30,28 @@ pub fn pixels(
     frame: &Frame,
     bounds: [u32; 4],
     frame_arg: u64,
+    clear_color: [u8; 4],
 ) -> Result<Vec<(u32, u32, [u8; 4])>, Stop> {
     let [x0, y0, x1, y1] = bounds;
     let mut output = Vec::new();
+    let mut colors = std::collections::BTreeMap::new();
     let mut remaining: usize = 1 << 22;
     for draw in &frame.draws {
         let r = &draw.regs;
         // No depth/stencil, culling, multisampling, occlusion or alpha-to-coverage yet.
         if r[57] & ((1 << 11) | (3 << 14) | (3 << 17) | (15 << 19)) != 0
             || r[58] & !0x0001_ffff != 0
-            || r[58] >> 16 != 1
+            || r[58] >> 16 > 1
             || reg(r, 46) != 0
         {
             return Err(bad());
         }
         let mut blend = [0; 16];
-        if reg(r, 50) & 63 != 1 {
+        // RUN_IDVS packs the RT count in bits [3:0], not an address-alignment mask.
+        if reg(r, 50) & 15 != 1 {
             return Err(bad());
         }
-        m.read(ram, reg(r, 50) & !63, &mut blend, true)
+        m.read(ram, reg(r, 50) & !15, &mut blend, true)
             .map_err(Stop::Memory)?;
         if std::env::var_os("SBC_MALI_TRACE").is_some() {
             eprintln!(
@@ -60,13 +63,8 @@ pub fn pixels(
                 &r[57..59]
             );
         }
-        if word(&blend, 0) != 0x200
-            || word(&blend, 1) != 0xf012_2122
-            || word(&blend, 2) != 0x19
-            || word(&blend, 3) != 237 << 12
-        {
-            return Err(bad());
-        }
+        let compositor = crate::gpu_blend::Blend::decode(std::array::from_fn(|n| word(&blend, n)))
+            .map_err(|_| bad())?;
         let mut zs = [0; 32];
         m.read(ram, reg(r, 52), &mut zs, true)
             .map_err(Stop::Memory)?;
@@ -77,6 +75,17 @@ pub fn pixels(
         {
             return Err(bad());
         }
+        if r[58] & (1 << 16) == 0 {
+            // Mesa omits the fragment program when color writes are disabled.
+            // Depth/stencil and occlusion side effects were rejected above.
+            if reg(r, 20) != 0 {
+                return Err(bad());
+            }
+            continue;
+        }
+        if r[58] & 1 == 0 {
+            continue;
+        } // the only supported sample is masked off
         let mut spd = [0; 32];
         m.read(ram, reg(r, 20), &mut spd, true)
             .map_err(Stop::Memory)?;
@@ -103,9 +112,6 @@ pub fn pixels(
             .chunks_exact(4)
             .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
             .collect();
-        if r[58] & 1 == 0 {
-            continue;
-        }
         for (primitive, triangle) in draw.triangles.iter().enumerate() {
             let mut v = *triangle;
             let mut vertices = [primitive * 3, primitive * 3 + 1, primitive * 3 + 2];
@@ -217,7 +223,10 @@ pub fn pixels(
                         if output.len() >= 1 << 20 {
                             return Err(bad());
                         }
-                        output.push((x, y, color.map(|v| (v.clamp(0., 1.) * 255.).round() as u8)));
+                        let destination = *colors.get(&(x, y)).unwrap_or(&clear_color);
+                        let color = compositor.apply(color, destination);
+                        colors.insert((x, y), color);
+                        output.push((x, y, color));
                     }
                 }
             }

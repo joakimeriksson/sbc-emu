@@ -13,7 +13,7 @@ pub enum RegisterAllocation {
     Registers32,
     Registers64,
 }
-/// Single-sample opaque fragment output. Created only after fixed-function
+/// Single-sample fragment output. Created only after fixed-function
 /// blend/depth state has been validated by the rasterizer.
 #[derive(Clone, Debug)]
 pub struct Fragment {
@@ -336,7 +336,7 @@ impl Shader {
                     if self.fragment.is_none()
                         || (i >> 46) & 3 != 2
                         || (i >> 24) & 65535 != 0x208
-                        || (i >> 16) & 255 != 0xea
+                        || self.source(i, 2, uniforms) != Some(0)
                         || (i >> 57) & 3 != 0
                         || !self.registers_available(dst, 1)
                     {
@@ -907,6 +907,36 @@ mod fragment_tests {
             shader.run(&m, &mut ram, &[], 1),
             Err(Error::Unsupported { .. })
         ));
+    }
+    #[test]
+    fn atest_accepts_a_register_copy_of_the_disabled_datum() {
+        let m = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let code = [
+            0x4091c000000000eau64,
+            0x087dbc020840817c,
+            0x7800c00000000000,
+        ];
+        let mut ram: Vec<u8> = code.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let mut shader = Shader::new(0);
+        shader.fragment = Some(Fragment {
+            blend: [0; 2],
+            color: None,
+            active: true,
+        });
+        shader.regs[60] = 1;
+        shader.run(&m, &mut ram, &[0, 0x38000000], 3).unwrap();
+        assert_eq!(shader.regs[60], 1);
+        shader.pc = 8;
+        shader.regs[0] = 1;
+        let before = shader.regs;
+        assert!(matches!(
+            shader.run(&m, &mut ram, &[0, 0x38000000], 1),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(shader.regs, before);
     }
     #[test]
     fn native_half_uniform_conversion_selects_each_lane_and_modifiers() {
