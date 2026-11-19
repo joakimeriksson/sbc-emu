@@ -58,6 +58,9 @@ pub const TEMP: u64 = 0x120e_0000;
 /// The true random number generator and its interrupt.
 pub const TRNG: u64 = 0x1600_c000;
 pub const IRQ_TRNG: usize = 30;
+/// The GPU (`crate::boot::GPU_BASE`) and its interrupt.
+use crate::boot::GPU_BASE;
+pub const IRQ_GPU: usize = crate::boot::IRQ_GPU as usize;
 pub const IRQ_GMAC0: usize = 7;
 pub const IRQ_GMAC1: usize = 78;
 pub const GMAC0: u64 = 0x1603_0000;
@@ -147,6 +150,8 @@ pub struct Soc {
     pub temp: TempSensor,
     /// the output `--audio-out` records (the first to play)
     pub audio_source: Option<AudioSource>,
+    /// the PowerVR BXE-4-32 GPU
+    pub gpu: powervr::Gpu,
     pub trng: Trng,
     /// the DC8200 display controller and the Inno HDMI transmitter with its monitor
     pub display: Display,
@@ -238,6 +243,7 @@ impl Soc {
             usb: Devices::default(),
             temp: TempSensor::default(),
             audio_source: None,
+            gpu: powervr::Gpu::default(),
             trng: Trng::default(),
             display: Display::new(Mode::MODES[0]),
             gmac0: Gmac::new(Some((0, Yt8531::default()))),
@@ -559,6 +565,7 @@ impl Soc {
             _ if (I2S0_BASE..I2S0_BASE + I2S_SIZE).contains(&a) => r32(self.i2s.read(a - I2S0_BASE)),
             _ if (TEMP..TEMP + 0x10000).contains(&a) => r32(self.temp.read(a - TEMP)),
             _ if (TRNG..TRNG + 0x4000).contains(&a) => r32(self.trng.read(a - TRNG)),
+            _ if (GPU_BASE..GPU_BASE + 0x10_0000).contains(&a) => Ok(self.gpu.read(a - GPU_BASE, size)),
             _ if (GMAC0..GMAC0 + 0x10000).contains(&a) => r32(self.gmac0.read(a - GMAC0)),
             _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
                 let v = self.display.dc_read(a - DC_BASE);
@@ -689,6 +696,12 @@ impl Soc {
             _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => {
                 let rate = self.sample_rate();
                 self.pwmdac.write(a - PWMDAC_BASE, v32, rate);
+            }
+            _ if (GPU_BASE..GPU_BASE + 0x10_0000).contains(&a) => {
+                self.gpu.write(a - GPU_BASE, size, v, &mut self.ram);
+                let g = self.gpu.irq();
+                self.plic.set_level(IRQ_GPU, g);
+                self.irq_dirty = true;
             }
             _ if (TRNG..TRNG + 0x4000).contains(&a) => {
                 self.trng.write(a - TRNG, v32);
