@@ -15,6 +15,7 @@ pub struct Firmware {
     stride: u64,
     failed_queues: std::collections::BTreeSet<(u32, u32)>,
     queues: std::collections::BTreeMap<(u32, u32), Queue>,
+    tiler: crate::gpu_tiler::Tiler,
 }
 fn read(m: &AddressSpace, ram: &[u8], addr: u64) -> Result<u32, Fault> {
     let mut b = [0; 4];
@@ -29,6 +30,7 @@ impl Firmware {
         self.running = false;
         self.failed_queues.clear();
         self.queues.clear();
+        self.tiler = crate::gpu_tiler::Tiler::default();
         let input = read(m, ram, SHARED + 8)? as u64;
         let output = read(m, ram, SHARED + 12)? as u64;
         let groups = read(m, ram, SHARED + 16)?;
@@ -90,6 +92,7 @@ impl Firmware {
             if req & 7 == 0 {
                 self.failed_queues.retain(|&(group, _)| group != g);
                 self.queues.retain(|&(group, _), _| group != g);
+                self.tiler.clear_group(g);
             }
             if req & 7 != 1 && req & 7 != 3 {
                 continue;
@@ -117,6 +120,7 @@ impl Firmware {
                     if cr & 7 == 0 {
                         self.failed_queues.remove(&(g, q));
                         self.queues.remove(&(g, q));
+                        self.tiler.clear_queue((g, q));
                     }
                     continue;
                 }
@@ -166,7 +170,8 @@ impl Firmware {
                         crate::gpu_cs::Stream::new(addr, len)
                             .map_err(|_| Fault::UnsupportedConfiguration)?
                     };
-                    let stop = stream.run(&spaces[asid], ram, 65536);
+                    let stop =
+                        stream.run_with_tiler(&spaces[asid], ram, 65536, &mut self.tiler, (g, q));
                     if stop != crate::gpu_cs::Stop::Complete {
                         eprintln!("[mali] queue stopped: {:?}", stop);
                         // Report CS_FATAL, never signal success for unsupported work.

@@ -1,0 +1,12 @@
+# Orange Pi RV M.2 slot: an NVMe SSD on PCIe1 (--nvme IMAGE, an ext4 image with
+# hello.txt = HELLO_FROM_HOST): enumeration, the nvme driver, mount, write and verify.
+wait-serial orangepi-rv#
+serial cat /sys/class/nvme/nvme0/model; cat /sys/block/nvme0n1/size | sed 's/^/NVME_SECTORS_/'\n
+wait-serial NVME_SECTORS_131072
+serial mkdir -p /ssd; mount -t ext4 /dev/nvme0n1 /ssd && cat /ssd/hello.txt | sed 's/^/NVME_/'\n
+wait-serial NVME_HELLO_FROM_HOST
+serial dd if=/dev/urandom of=/ssd/blob bs=64k count=64 2>/dev/null; sha256sum /ssd/blob > /ssd/blob.sha; sync; echo 3 > /proc/sys/vm/drop_caches; sha256sum -c /ssd/blob.sha | sed 's/^/NVME_/'\n
+wait-serial NVME_/ssd/blob: OK
+serial umount /ssd; echo NVME_""DONE\n
+wait-serial NVME_DONE
+quit

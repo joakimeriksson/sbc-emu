@@ -1,5 +1,5 @@
-//! Initial Valhall fragment pass: single linear RGBA8 color-target clears.
-//! Geometry, shaders, compression, depth/stencil and MSAA are rejected.
+//! Valhall single-target linear RGBA8 clears and opaque triangle writeback.
+//! Compression, depth/stencil and MSAA remain unsupported.
 use crate::{
     gpu_cs::Stop,
     gpu_mmu::{AddressSpace, Fault},
@@ -11,6 +11,14 @@ fn pair(b: &[u8], n: usize) -> u64 {
     word(b, n) as u64 | (word(b, n + 1) as u64) << 32
 }
 pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(), Stop> {
+    fragment_frame(m, ram, regs, None)
+}
+pub fn fragment_frame(
+    m: &AddressSpace,
+    ram: &mut [u8],
+    regs: &[u32; 256],
+    frame: Option<&crate::gpu_tiler::Frame>,
+) -> Result<(), Stop> {
     let fbd = (regs[40] as u64 | ((regs[41] as u64) << 32)) & !63;
     let mut f = [0; 128];
     m.read(ram, fbd, &mut f, true).map_err(Stop::Memory)?;
@@ -29,11 +37,16 @@ pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(
     if width > 4096
         || height > 4096
         || word(&f, 0) != 0
-        || pair(&f, 14) != 0
+        || (pair(&f, 14) != 0) != frame.is_some()
         || word(&f, 11) & ((7 << 0) | (7 << 3) | (15 << 19)) != 0
         || word(&f, 12) & !((3 << 16) | (1 << 21) | (15 << 28)) != 0
     {
         return Err(unsupported());
+    }
+    if let Some(frame) = frame {
+        if frame.width != width || frame.height != height || (word(&f, 11) >> 6) & 7 != 2 {
+            return Err(unsupported());
+        }
     }
     // CRC reads may elide identical tiles on hardware. This synchronous clear
     // path always writes the pixels instead, preserving the same result.
@@ -132,6 +145,11 @@ pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(
             }
         }
     }
+    let pixels = if let Some(frame) = frame {
+        crate::gpu_raster::pixels(m, ram, frame, [x0, y0, x1, y1], pair(&f, 2))?
+    } else {
+        Vec::new()
+    };
     for spans in destinations {
         let mut offset = 0;
         for (p, len) in spans {
@@ -139,7 +157,19 @@ pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(
             offset += len;
         }
     }
-    let checksum = pair(&extension, 2).to_le_bytes();
+    for (x, y, color) in pixels {
+        let address = base
+            .checked_add(y as u64 * stride + x as u64 * 4)
+            .ok_or(Stop::Memory(Fault::AddressSize))?;
+        m.write(ram, address, &color, true).map_err(Stop::Memory)?;
+    }
+    // A drawn tile is not a uniform clear. Invalidate its opaque checksum rather
+    // than publishing the clear's checksum for non-uniform pixels.
+    let checksum = if frame.is_some() {
+        0u64.to_le_bytes()
+    } else {
+        pair(&extension, 2).to_le_bytes()
+    };
     for spans in crc_destinations {
         let mut offset = 0;
         for (p, len) in spans {

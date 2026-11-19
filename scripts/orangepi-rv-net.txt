@@ -1,0 +1,15 @@
+# Orange Pi RV Gigabit Ethernet (GMAC0, DWMAC 5.10a + Motorcomm YT8531C) on the virtual
+# network (--net nat, the default): link, DHCP lease 10.0.2.15, ping the gateway, and an
+# HTTP fetch from the host's network through the NAT.
+wait-serial orangepi-rv#
+serial ip link set eth0 up; sleep 3; echo $(cat /sys/class/net/eth0/speed /sys/class/net/eth0/carrier) LINK\n
+wait-serial 1000 1 LINK
+serial udhcpc -i eth0 -n -q -t 5 2>&1 | tail -2; ip -4 addr show eth0 | grep inet\n
+wait-serial inet 10.0.2.15
+serial ping -c 3 10.0.2.2 | tail -2\n
+wait-serial 3 packets received
+serial wget -q -O - http://example.com/ | grep -o '<title>.*</title>'\n
+wait-serial <title>Example Domain</title>
+serial echo NET_OK\n
+wait-serial NET_OK
+quit

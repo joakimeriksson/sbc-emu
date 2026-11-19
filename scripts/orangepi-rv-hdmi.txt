@@ -1,0 +1,16 @@
+# Orange Pi RV HDMI with Xunlong's own kernel (DC8200 + Inno HDMI, StarFive DRM driver):
+# the monitor's EDID, the DRM connector, fbcon on the HDMI output, a screenshot.
+#   scripts/orangepi-rv-vendor-kernel.sh; V=cache/orangepi-rv/vendor
+#   sbc-emu run --board orangepi-rv --firmware ... --kernel $V/Image --dtb $V/jh7110-orangepi-rv.dtb \
+#       --initrd ... --append "console=tty0 console=ttyS0,115200 earlycon rdinit=/init" \
+#       --script scripts/orangepi-rv-hdmi.txt --screenshot out/orangepi-rv-hdmi.png
+wait-serial orangepi-rv#
+serial cat /sys/class/drm/card*-HDMI-A-1/status /sys/class/drm/card*-HDMI-A-1/modes | head -3; cat /proc/fb\n
+wait-serial 1280x720
+serial echo HELLO_FROM_THE_ORANGE_PI_RV > /dev/tty1; uname -a > /dev/tty1; echo FB_WRITTEN\n
+wait-serial FB_WRITTEN
+sleep 1
+screenshot out/orangepi-rv-hdmi.png
+serial echo HDMI_OK\n
+wait-serial HDMI_OK
+quit

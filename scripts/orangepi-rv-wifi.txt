@@ -1,0 +1,16 @@
+# Orange Pi RV Wi-Fi: the AP6256 (BCM43456) on SDIO0 with mainline brcmfmac and the real
+# brcmfmac43456-sdio firmware (the firmware is downloaded to the chip; its host interface is
+# emulated): scan, join the virtual access point "sbc-emu", DHCP and ping on wlan0.
+wait-serial orangepi-rv#
+serial sleep 2; ip link set wlan0 up && echo WLAN_""UP\n
+wait-serial WLAN_UP
+# the emulated firmware scans at once: trigger, then read cfg80211's results
+serial iw dev wlan0 scan trigger; sleep 2; iw dev wlan0 scan dump | grep -E 'SSID|freq'\n
+wait-serial SSID: sbc-emu
+serial iw dev wlan0 connect sbc-emu; sleep 2; iw dev wlan0 link | head -2\n
+wait-serial Connected to
+serial udhcpc -i wlan0 -n -q -t 5 2>&1 | tail -1; ping -c 2 10.0.2.2 | grep received | sed 's/^/WIFI_/'\n
+wait-serial WIFI_2 packets transmitted, 2 packets received
+serial echo WIFI_""DONE\n
+wait-serial WIFI_DONE
+quit
