@@ -1,0 +1,8 @@
+# HDMI on the Armbian image (--sd Armbian.img): the firmware's framebuffer under simpledrm,
+# udev loads the module from the DT node, fbcon and the tty1 getty draw on it.
+# sbc-emu run --board orangepi5 --sd Armbian.img --script scripts/orangepi5-hdmi.txt --screenshot out.png
+wait-serial orangepi5 login:
+wait-serial Create root password:
+sleep 2
+screenshot out/orangepi5-hdmi.png
+quit

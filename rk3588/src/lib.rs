@@ -15,6 +15,7 @@ pub mod gpu_raster;
 pub mod gpu_blend;
 pub mod gpu_texture;
 pub mod uart;
+pub mod display;
 pub mod mmc;
 pub mod phy;
 pub mod gmac;
@@ -40,6 +41,7 @@ pub struct Soc {
     pub gmac: gmac::Gmac,
     pub net: Option<sbc_net::net::VirtualNet>,
     pub gic: gic::Gic,
+    pub display: display::Display,
     pub dirty: bool,
     pub unknown: Vec<u64>,
 }
@@ -129,6 +131,8 @@ pub struct Machine {
     pub cpus: Vec<Cpu>,
     pub state: Vec<CoreState>,
     pub gpu_probe: bool,
+    /// the device tree handed to Linux
+    pub dtb: Vec<u8>,
     pub soc: Soc,
     /// virtual time in ns: the latest time any core or device has seen
     pub now: u64,
@@ -148,8 +152,8 @@ impl Machine {
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
-        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),dirty:true,unknown:Vec::new()};
-        let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,now:0,cur:0,next_check:0,round_end:u64::MAX,next_net_poll:0,irqs:0,exceptions:0};
+        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),dirty:true,unknown:Vec::new()};
+        let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,next_net_poll:0,irqs:0,exceptions:0};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
         Ok(m)
@@ -181,6 +185,12 @@ impl Machine {
         self.soc.net = Some(net);
     }
     pub fn now(&self)->u64 {self.now.max(self.cpus[self.cur].now_ns())}
+    /// Hand the HDMI output over as the firmware's framebuffer at the top of RAM.
+    pub fn enable_hdmi(&mut self, mode: display::Mode) {
+        let addr=display::framebuffer_addr(self.soc.ram.len() as u64);
+        self.soc.ram[addr as usize..].fill(0);
+        self.soc.display=display::Display::new(addr,mode);
+    }
     pub fn serial_input(&mut self,b:u8)->bool {self.soc.dirty=true;self.soc.uart.input(b)}
 
     fn ns_of_count(c: u64) -> u64 { ((c as u128*1_000_000_000).div_ceil(CNTFRQ as u128)).min(u64::MAX as u128) as u64 }
