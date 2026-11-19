@@ -229,3 +229,13 @@ fn usb_host_is_a_platform_xhci_with_keyboard_and_tablet() {
     let dt=rk3588::boot::device_tree(128<<20,"",None,false);
     assert!(dt.windows(12).any(|w|w==b"generic-xhci"));
 }
+
+#[test]
+fn m2_slot_is_an_ecam_host_with_an_intx_nvme() {
+    let mut m=Machine::new(128<<20).unwrap();
+    assert_eq!(m.soc.read32(rk3588::pcie::ECAM).unwrap(),u32::MAX,"empty slot");
+    m.attach_nvme(Box::new(emu_core::disk::MemDisk(vec![0u8;1<<20])));
+    assert_eq!(m.soc.read32(rk3588::pcie::ECAM).unwrap(),0x0001_fffd);
+    let dt=rk3588::boot::device_tree(128<<20,"",None,false);
+    assert!(dt.windows(21).any(|w|w==b"pci-host-ecam-generic"));
+}

@@ -1,0 +1,11 @@
+# M.2 NVMe on the Armbian image: --sd Armbian.img --nvme nvme.img --append init=/bin/bash
+# (nvme.img: an ext4 filesystem with hello.txt). The SSD enumerates on the PCIe host, the
+# nvme driver brings up its queues on INTx, the filesystem mounts, and a 4 MiB file written to
+# it verifies after dropping the page cache.
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; stty -echo; dmesg | grep -iE 'pci|nvme' | tail -12; cat /sys/class/nvme/nvme0/model; echo NVME_$(ls /sys/block | grep -c nvme0n1)\n
+wait-serial NVME_1
+serial mkdir -p /mnt && mount /dev/nvme0n1 /mnt && cat /mnt/hello.txt && dd if=/dev/urandom of=/mnt/blob bs=64k count=64 2>/dev/null && a=$(md5sum < /mnt/blob) && sync && echo 3 > /proc/sys/vm/drop_caches && b=$(md5sum < /mnt/blob) && [ "$a" = "$b" ] && grep -E 'nvme' /proc/interrupts | head -3; echo NVME_RW_$((40+2))\n
+wait-serial USB_STICK_HELLO
+wait-serial NVME_RW_42
+quit

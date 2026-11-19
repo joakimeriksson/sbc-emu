@@ -21,6 +21,7 @@ impl SerialBoard for rk3588::Machine {
         if !sys.is_empty(){eprintln!("[{tag}] unmodelled system registers: {:x?}",sys);}
         let usb: Vec<String> = m.soc.xhci.attached().iter().map(|d| format!("{d:?}")).collect();
         eprintln!("[{tag}] USB: {}", usb.join(", "));
+        if let Some(n) = m.soc.pcie.nvme.as_ref() { eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes", n.reads, n.writes); }
         if m.soc.display.frames.get() > 0 { eprintln!("[{tag}] HDMI: {} frames shown", m.soc.display.frames.get()); }
     }
 }
@@ -39,7 +40,7 @@ pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive"])?;
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme"])?;
     if arg(args,"--threads").is_some_and(|s|s!="single") {return Err("Orange Pi currently uses deterministic single-thread execution".into());}
     let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
     // HDMI: the firmware's framebuffer at the monitor's preferred mode, unless --no-display
@@ -69,6 +70,10 @@ fn execute(args:&[String])->Result<(),String> {
         m.gpu_probe=gpu=="probe";
         if let Some(mode)=hdmi { m.enable_hdmi(mode); }
         // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
+        // --nvme IMAGE: an NVMe SSD in the M.2 slot (copy-on-write; each boot starts from the image)
+        if let Some(path)=arg(args,"--nvme") {
+            m.attach_nvme(Box::new(crate::disk::CowFile::open(path).map_err(|e|format!("{path}: {e}"))?));
+        }
         if let Some(path)=arg(args,"--usb-drive") {
             m.attach_usb_drive(Box::new(crate::disk::CowFile::open(path).map_err(|e|format!("{path}: {e}"))?));
         }

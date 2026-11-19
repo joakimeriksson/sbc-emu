@@ -111,6 +111,18 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
     // host mode by the firmware, so Linux sees a platform xHCI.
     f.begin("usb@fcd00000");f.str("compatible","generic-xhci");
     f.cells("reg",&[0,crate::XHCI as u32,0,0x10000]);f.cells("interrupts",&[0,(crate::XHCI_IRQ-32) as u32,4]);f.end();
+    // The M.2 slot's PCIe 2.0 x1 controller as a generic ECAM host with one bus; INTA of
+    // device 0 is the controller's legacy interrupt.
+    {
+        use crate::pcie::{ECAM,ECAM_SIZE,MEM,MEM_SIZE,IRQ};
+        f.begin(&format!("pcie@{ECAM:x}"));f.str("compatible","pci-host-ecam-generic");f.str("device_type","pci");
+        f.cells("reg",&[0,ECAM as u32,0,ECAM_SIZE as u32]);f.cells("bus-range",&[0,0]);
+        f.cells("#address-cells",&[3]);f.cells("#size-cells",&[2]);f.cells("#interrupt-cells",&[1]);
+        f.cells("ranges",&[0x0200_0000,0,MEM as u32,0,MEM as u32,0,MEM_SIZE as u32]);
+        f.cells("interrupt-map-mask",&[0,0,0,7]);
+        f.cells("interrupt-map",&[0,0,0,1, 1,0,0, 0,(IRQ-32) as u32,4]);
+        f.empty("dma-coherent");f.end();
+    }
     if sd {
         f.begin("mmc@fe2c0000");f.strs("compatible",&["rockchip,rk3588-dw-mshc","rockchip,rk3288-dw-mshc"]);
         f.cells("reg",&[0,0xfe2c0000,0,0x4000]);f.cells("interrupts",&[0,203,4]);

@@ -17,6 +17,8 @@ pub mod gpu_texture;
 pub mod uart;
 pub mod display;
 pub mod xhci;
+pub mod nvme;
+pub mod pcie;
 pub mod mmc;
 pub mod phy;
 pub mod gmac;
@@ -47,6 +49,8 @@ pub struct Soc {
     pub gic: gic::Gic,
     pub display: display::Display,
     pub xhci: xhci::Xhci,
+    /// the M.2 slot (PCIe 2.0 x1): empty or an NVMe SSD
+    pub pcie: pcie::Pcie,
     /// the emulated USB devices: a keyboard and a tablet, and a stick with `--usb-drive`
     pub usb: emu_core::usb::Devices,
     pub dirty: bool,
@@ -63,6 +67,8 @@ impl Soc {
         let word = if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.read((addr-0xfb000000)&!3)}
         else if (GMAC..GMAC+0x10000).contains(&addr) { self.gmac.read((addr-GMAC)&!3) }
         else if (XHCI..XHCI+0x10000).contains(&addr) { self.xhci.read((addr-XHCI)&!3) }
+        else if (pcie::ECAM..pcie::ECAM+pcie::ECAM_SIZE).contains(&addr) { self.pcie.cfg_read((addr-pcie::ECAM)&!3) }
+        else if (pcie::MEM..pcie::MEM+pcie::MEM_SIZE).contains(&addr) { self.pcie.mem_read(addr&!3).unwrap_or(u32::MAX) }
         else if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
         else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
@@ -88,6 +94,8 @@ impl Soc {
         if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.write_memory((addr-0xfb000000)&!3,v,&mut self.ram);}
         else if (GMAC..GMAC+0x10000).contains(&addr) {self.gmac.write((addr-GMAC)&!3,v);}
         else if (XHCI..XHCI+0x10000).contains(&addr) {self.xhci.write((addr-XHCI)&!3,v,&mut self.ram,&mut self.usb);}
+        else if (pcie::ECAM..pcie::ECAM+pcie::ECAM_SIZE).contains(&addr) {self.pcie.cfg_write((addr-pcie::ECAM)&!3,v);}
+        else if (pcie::MEM..pcie::MEM+pcie::MEM_SIZE).contains(&addr) {self.pcie.mem_write(addr&!3,v,&mut self.ram);}
         else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
@@ -161,7 +169,7 @@ impl Machine {
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
-        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),dirty:true,unknown:Vec::new()};
+        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),dirty:true,unknown:Vec::new()};
         let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,next_net_poll:0,irqs:0,exceptions:0};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
@@ -206,6 +214,8 @@ impl Machine {
         use emu_core::usb::DevId;
         self.soc.xhci.attach(&[DevId::Keyboard,DevId::Tablet,DevId::Storage]);
     }
+    /// Fit an NVMe SSD backed by `disk` in the M.2 slot.
+    pub fn attach_nvme(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) { self.soc.pcie.attach_nvme(nvme::Nvme::new(Some(disk))); }
     pub fn serial_input(&mut self,b:u8)->bool {self.soc.dirty=true;self.soc.uart.input(b)}
 
     fn ns_of_count(c: u64) -> u64 { ((c as u128*1_000_000_000).div_ceil(CNTFRQ as u128)).min(u64::MAX as u128) as u64 }
@@ -264,6 +274,7 @@ impl Machine {
         } else { self.soc.gmac.tx_out.clear(); }
         self.soc.xhci.tick(self.now,&mut self.soc.ram,&mut self.soc.usb);
         self.soc.gic.set_line(XHCI_IRQ,self.soc.xhci.irq());
+        self.soc.gic.set_line(pcie::IRQ,self.soc.pcie.irq());
         self.soc.gic.set_line(32+234,self.soc.gmac.irq());
         self.soc.gic.set_line(UART_IRQ,self.soc.uart.irq());
         self.soc.gic.set_line(32+203,self.soc.mmc.irq());
