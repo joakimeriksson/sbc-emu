@@ -107,6 +107,10 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
     f.str("phy-mode","rgmii-rxid"); f.cells("phy-handle",&[3]);
     f.begin("mdio"); f.str("compatible","snps,dwmac-mdio"); f.cells("#address-cells",&[1]); f.cells("#size-cells",&[0]);
     f.begin("ethernet-phy@1"); f.cells("reg",&[1]); f.cells("phandle",&[3]); f.end(); f.end(); f.end();
+    // The USB 3.0 host (usb_host2_xhci): the board's USB-A port. Its DWC3 glue is left in
+    // host mode by the firmware, so Linux sees a platform xHCI.
+    f.begin("usb@fcd00000");f.str("compatible","generic-xhci");
+    f.cells("reg",&[0,crate::XHCI as u32,0,0x10000]);f.cells("interrupts",&[0,(crate::XHCI_IRQ-32) as u32,4]);f.end();
     if sd {
         f.begin("mmc@fe2c0000");f.strs("compatible",&["rockchip,rk3588-dw-mshc","rockchip,rk3288-dw-mshc"]);
         f.cells("reg",&[0,0xfe2c0000,0,0x4000]);f.cells("interrupts",&[0,203,4]);

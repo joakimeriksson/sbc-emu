@@ -16,6 +16,7 @@ pub mod gpu_blend;
 pub mod gpu_texture;
 pub mod uart;
 pub mod display;
+pub mod xhci;
 pub mod mmc;
 pub mod phy;
 pub mod gmac;
@@ -24,6 +25,9 @@ use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
 
 pub const GMAC: u64 = 0xfe1c_0000;
+/// The USB 3.0 host (usb_host2_xhci) and its interrupt.
+pub const XHCI: u64 = 0xfcd0_0000;
+pub const XHCI_IRQ: usize = 32 + 222;
 pub const MMC: u64 = 0xfe2c_0000;
 pub const UART2: u64 = 0xfeb5_0000;
 pub const GICD: u64 = 0xfe60_0000;
@@ -42,6 +46,9 @@ pub struct Soc {
     pub net: Option<sbc_net::net::VirtualNet>,
     pub gic: gic::Gic,
     pub display: display::Display,
+    pub xhci: xhci::Xhci,
+    /// the emulated USB devices: a keyboard and a tablet, and a stick with `--usb-drive`
+    pub usb: emu_core::usb::Devices,
     pub dirty: bool,
     pub unknown: Vec<u64>,
 }
@@ -55,6 +62,7 @@ impl Soc {
         self.dirty = true;
         let word = if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.read((addr-0xfb000000)&!3)}
         else if (GMAC..GMAC+0x10000).contains(&addr) { self.gmac.read((addr-GMAC)&!3) }
+        else if (XHCI..XHCI+0x10000).contains(&addr) { self.xhci.read((addr-XHCI)&!3) }
         else if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
         else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
@@ -79,6 +87,7 @@ impl Soc {
         } else {value as u32};
         if (0xfb000000..0xfb200000).contains(&addr) {self.gpu.write_memory((addr-0xfb000000)&!3,v,&mut self.ram);}
         else if (GMAC..GMAC+0x10000).contains(&addr) {self.gmac.write((addr-GMAC)&!3,v);}
+        else if (XHCI..XHCI+0x10000).contains(&addr) {self.xhci.write((addr-XHCI)&!3,v,&mut self.ram,&mut self.usb);}
         else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
@@ -152,7 +161,7 @@ impl Machine {
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
-        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),dirty:true,unknown:Vec::new()};
+        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),dirty:true,unknown:Vec::new()};
         let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,next_net_poll:0,irqs:0,exceptions:0};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
@@ -191,6 +200,12 @@ impl Machine {
         self.soc.ram[addr as usize..].fill(0);
         self.soc.display=display::Display::new(addr,mode);
     }
+    /// Plug a USB stick backed by `disk` in next to the keyboard and the tablet.
+    pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
+        self.soc.usb.storage=Some(emu_core::usb::Storage::new(disk));
+        use emu_core::usb::DevId;
+        self.soc.xhci.attach(&[DevId::Keyboard,DevId::Tablet,DevId::Storage]);
+    }
     pub fn serial_input(&mut self,b:u8)->bool {self.soc.dirty=true;self.soc.uart.input(b)}
 
     fn ns_of_count(c: u64) -> u64 { ((c as u128*1_000_000_000).div_ceil(CNTFRQ as u128)).min(u64::MAX as u128) as u64 }
@@ -220,7 +235,7 @@ impl Machine {
     /// The earliest deadline after `t` that core `c` must notice: its own timers, those of
     /// sleeping cores and the network poll (cores waiting for their turn check their own).
     fn deadline_after(&self, t: u64, c: usize) -> Option<u64> {
-        let mut d=self.soc.net.as_ref().map(|_|self.next_net_poll).filter(|&x|x>t);
+        let mut d=[self.soc.net.as_ref().map(|_|self.next_net_poll),self.soc.xhci.next_event(&self.soc.usb)].into_iter().flatten().filter(|&x|x>t).min();
         for (k,cpu) in self.cpus.iter().enumerate() {
             if self.state[k]==CoreState::Off || (k!=c && self.state[k]==CoreState::Run) {continue;}
             for ns in Self::timer_deadlines(cpu) { if ns>t { d=Some(d.map_or(ns,|x|x.min(ns))); } }
@@ -229,7 +244,8 @@ impl Machine {
     }
     /// The next timer deadline of any core that is on.
     fn next_deadline(&self) -> Option<u64> {
-        self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).min()
+        let usb=self.soc.xhci.next_event(&self.soc.usb);
+        self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(usb).min()
     }
     fn devices(&mut self) {
         self.soc.gmac.service(&mut self.soc.ram);
@@ -246,6 +262,8 @@ impl Machine {
             }
             self.soc.gmac.service(&mut self.soc.ram);
         } else { self.soc.gmac.tx_out.clear(); }
+        self.soc.xhci.tick(self.now,&mut self.soc.ram,&mut self.soc.usb);
+        self.soc.gic.set_line(XHCI_IRQ,self.soc.xhci.irq());
         self.soc.gic.set_line(32+234,self.soc.gmac.irq());
         self.soc.gic.set_line(UART_IRQ,self.soc.uart.irq());
         self.soc.gic.set_line(32+203,self.soc.mmc.irq());

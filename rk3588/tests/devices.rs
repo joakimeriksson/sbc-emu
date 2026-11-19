@@ -233,3 +233,12 @@ fn initrd_stays_below_the_hdmi_framebuffer() {
     let mut plain=Machine::new(128<<20).unwrap();
     rk3588::boot::boot_linux(&mut plain,&image,Some(&initrd),"").unwrap();
 }
+
+#[test]
+fn usb_host_is_a_platform_xhci_with_keyboard_and_tablet() {
+    let mut m=Machine::new(128<<20).unwrap();
+    assert_eq!(m.soc.read32(rk3588::XHCI).unwrap()>>16,0x0100,"HCIVERSION 1.0");
+    assert_eq!(m.soc.xhci.attached(),[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);
+    let dt=rk3588::boot::device_tree(128<<20,"",None,false);
+    assert!(dt.windows(12).any(|w|w==b"generic-xhci"));
+}

@@ -1,0 +1,17 @@
+# USB on the Armbian image: --sd Armbian.img --usb-drive stick.img --append init=/bin/bash
+# (stick.img: an ext4 filesystem with hello.txt containing USB_STICK_HELLO)
+# The platform xHCI enumerates the keyboard, the tablet and the stick; a key typed on the USB
+# keyboard arrives as an input event; the stick mounts, and a file written to it verifies
+# after dropping the page cache.
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; stty -echo; dmesg | grep -iE 'xhci|usb [0-9]|input:|sd[a-z]' | tail -20; echo USB_DEVS_$(ls /sys/bus/usb/devices | grep -c '^[0-9]-[0-9]$')\n
+wait-serial USB_DEVS_3
+serial ev=$(grep -A6 -i 'keyboard' /proc/bus/input/devices | grep -o 'event[0-9]*' | head -1); echo KBD_$ev; (echo KEY_EVENT_$(dd if=/dev/input/$ev bs=24 count=1 2>/dev/null | wc -c)) &\n
+wait-serial KBD_event
+sleep 1
+type a
+wait-serial KEY_EVENT_24
+serial mkdir -p /mnt && mount /dev/sda /mnt && cat /mnt/hello.txt && dd if=/dev/urandom of=/mnt/blob bs=64k count=32 2>/dev/null && a=$(md5sum < /mnt/blob) && sync && echo 3 > /proc/sys/vm/drop_caches && b=$(md5sum < /mnt/blob) && [ "$a" = "$b" ] && echo STICK_RW_$((40+2))\n
+wait-serial USB_STICK_HELLO
+wait-serial STICK_RW_42
+quit
