@@ -16,8 +16,10 @@
 pub mod cdm;
 pub mod firmware;
 pub mod fw;
+pub mod gfx;
 pub mod pds;
 pub mod regs;
+pub mod tpu;
 pub mod usc;
 pub mod vm;
 

@@ -60,6 +60,7 @@ const CMD_HEADER_SIZE: u32 = 40;
 pub const CCB_CMD_GEOM: u32 = 0x2abc_80c9;
 pub const CCB_CMD_FRAG: u32 = 0x2abc_80cb;
 pub const CCB_CMD_FRAG_PR: u32 = 0x2abc_80cc;
+pub const CCB_CMD_TQ_3D: u32 = 0x2abc_80ca;
 pub const CCB_CMD_CDM: u32 = 0x2abc_80cd;
 pub const CCB_CMD_FENCE: u32 = 0x2abc_00d4;
 pub const CCB_CMD_UPDATE: u32 = 0x2abc_00d5;
@@ -86,6 +87,8 @@ pub struct Firmware {
     /// compute invocations run, and GPU programs abandoned on an unimplemented instruction
     pub invocations: u64,
     pub gpu_faults: u64,
+    /// the 3D pipeline: scenes between their geometry and fragment jobs
+    pub gfx: crate::gfx::Gfx,
     pub trace: bool,
 }
 
@@ -252,7 +255,35 @@ impl Firmware {
                     crate::cdm::run(self, ram, &mut vm, body);
                     self.jobs += 1;
                 }
-                CCB_CMD_GEOM | CCB_CMD_FRAG | CCB_CMD_FRAG_PR => {
+                // a partial render: only needed when the parameter buffer runs out, which it
+                // never does here; its fences and updates are the commands around it
+                CCB_CMD_FRAG_PR => {
+                    self.jobs += 1;
+                }
+                CCB_CMD_GEOM | CCB_CMD_FRAG | CCB_CMD_TQ_3D => {
+                    let words: Vec<u32> = (0..size / 4).map(|i| self.rd(ram, body + 4 * i)).collect();
+                    // the render size: the HWRT data's common part, screen_pixel_max
+                    let screen = match ty {
+                        CCB_CMD_FRAG => {
+                            let common = self.rd(ram, words[1] + 164);
+                            self.rd(ram, common + 4)
+                        }
+                        _ => 0,
+                    };
+                    let mut vm = crate::vm::Vm::new(pc);
+                    let mut mem = crate::cdm::GpuMem { ram, vm: &mut vm };
+                    let trace = self.trace;
+                    let r = match ty {
+                        CCB_CMD_GEOM => self.gfx.geom(&mut mem, &words, trace),
+                        CCB_CMD_FRAG => self.gfx.frag(&mut mem, &words, screen, trace),
+                        _ => self.gfx.transfer(&mut mem, &words, trace),
+                    };
+                    if let Err(e) = r {
+                        if trace || self.gpu_faults == 0 {
+                            eprintln!("[gpu gfx] job {ty:#x}: {e}");
+                        }
+                        self.gpu_faults += 1;
+                    }
                     self.jobs += 1;
                 }
                 _ => {}

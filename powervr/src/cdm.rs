@@ -144,9 +144,9 @@ pub fn run(fw: &mut Firmware, ram: &mut FlatRam, vm: &mut Vm, cmd: u32) {
 const SHARED_WORDS: usize = 4096;
 
 /// GPU memory through the job's address space.
-struct GpuMem<'a> {
-    ram: &'a mut FlatRam,
-    vm: &'a mut Vm,
+pub(crate) struct GpuMem<'a> {
+    pub(crate) ram: &'a mut FlatRam,
+    pub(crate) vm: &'a mut Vm,
 }
 
 impl usc::Memory for GpuMem<'_> {
@@ -160,7 +160,7 @@ impl usc::Memory for GpuMem<'_> {
 }
 
 impl GpuMem<'_> {
-    fn read32(&mut self, va: u64) -> Option<u32> {
+    pub(crate) fn read32(&mut self, va: u64) -> Option<u32> {
         self.vm.read32(self.ram, va)
     }
 }
@@ -180,12 +180,14 @@ struct Cdm {
 
 /// Where a PDS task's output goes: the common store (shared registers or a workgroup's
 /// coefficients) and the unified store of the instance it runs for.
-struct TaskHost<'a, 'b> {
-    mem: &'a mut GpuMem<'b>,
-    common: &'a mut [u32],
-    unified: &'a mut [u32],
-    doutu: Option<pds::DoutU>,
-    trace: bool,
+pub(crate) struct TaskHost<'a, 'b> {
+    pub(crate) mem: &'a mut GpuMem<'b>,
+    pub(crate) common: &'a mut [u32],
+    pub(crate) unified: &'a mut [u32],
+    pub(crate) doutu: Option<pds::DoutU>,
+    /// DOUTI issues (iterator / coefficient set-ups) in program order
+    pub(crate) douti: Vec<u64>,
+    pub(crate) trace: bool,
 }
 
 impl TaskHost<'_, '_> {
@@ -231,8 +233,10 @@ impl pds::Host for TaskHost<'_, '_> {
     }
 
     fn dout_other(&mut self, kind: pds::DoutKind, src0: u64, src1: u32) {
-        if self.trace {
-            eprintln!("[gpu pds] dout {kind:?} {src0:#x} {src1:#x} not modelled for compute");
+        if kind == pds::DoutKind::I {
+            self.douti.push(src0);
+        } else if self.trace {
+            eprintln!("[gpu pds] dout {kind:?} {src0:#x} {src1:#x} not modelled");
         }
     }
 }
@@ -287,7 +291,7 @@ impl Cdm {
                     if coeff_task {
                         let task = pds::Task { if0: true, if1: true, temps: vec![x, y, 0, z] };
                         let mut none = [];
-                        let mut host = TaskHost { mem, common: &mut coeffs, unified: &mut none, doutu: None, trace: false };
+                        let mut host = TaskHost { mem, common: &mut coeffs, unified: &mut none, doutu: None, douti: Vec::new(), trace: false };
                         let r = self.pds.run(&mut host, code, &data, &task);
                         let kick = host.doutu;
                         if let Err(e) = r {
@@ -308,7 +312,7 @@ impl Cdm {
                         let task = pds::Task { if0: true, if1: false, temps: vec![i as u32, 0] };
                         let mut unified = vec![0u32; unified_words];
                         let common = if k.usc_common_shared { &mut self.shareds[..] } else { &mut coeffs[..] };
-                        let mut host = TaskHost { mem, common, unified: &mut unified, doutu: None, trace: self.trace };
+                        let mut host = TaskHost { mem, common, unified: &mut unified, doutu: None, douti: Vec::new(), trace: self.trace };
                         let r = self.pds.run(&mut host, code, &data, &task);
                         kick = kick.or(host.doutu);
                         // ... and of those, the first instance task
@@ -338,7 +342,7 @@ impl Cdm {
     /// Run a USC program for `insts`; false if it faulted.
     fn usc(&mut self, mem: &mut GpuMem, u: pds::DoutU, coeffs: &mut [u32], insts: &mut [usc::Instance]) -> bool {
         let entry = USC_HEAP + u.exe_offset as u64;
-        let mut m = usc::Machine { mem, coeffs, shareds: &mut self.shareds, cache: &mut self.cache, trace: self.trace };
+        let mut m = usc::Machine { mem, coeffs, shareds: &mut self.shareds, cache: &mut self.cache, trace: self.trace, emits: Vec::new() };
         match m.run(entry, insts) {
             Ok(_) => true,
             Err(f) => {

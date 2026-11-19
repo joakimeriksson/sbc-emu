@@ -237,6 +237,22 @@ pub enum Backend {
     /// data fence on `drc` for the address in slot `addr`
     Idf { drc: u8, addr: u8 },
     Atomic { drc: u8, op: u8, src: u8, dst: u8 },
+    /// vertex output (the unified vertex store): write the value on w0 to output `imm`
+    /// (or the address in slot `src`); op: 0 write, 1 emit, 2 cut, 3 emit+cut, 4 end task,
+    /// 5 emit+end task, 6 write+emit+end task
+    Uvsw { op: u8, imm: Option<u8>, src: u8 },
+    /// save (op 0) or restore (op 1) the instance masks; mode 0 vm, 1 icm, 2 icmoc, 3 icmi,
+    /// 4 caxy
+    Msk { mov: bool, sm: bool, mode: u8 },
+    /// visibility feedback to the ISP: alpha test (`atst`; alphaf when !ifb) or depth (depthf)
+    Vistest { atst: bool, pwen: bool, ifb: bool },
+    /// iterate `count` varyings from the coefficients named by s0 into the registers from s3
+    Fitr { persp: bool, drc: u8, mode: u8, sat: bool, count: u8 },
+    /// the end-of-tile emit: the PBE writes the tile's output registers (state in s0, s2)
+    Emitpix { freep: bool },
+    /// texture sample: image state from s0, coordinates from s1, sampler state from s2,
+    /// `chan` channels into the registers from s4
+    Smp { drc: u8, dmn: u8, chan: u8, lodm: u8, fcnorm: bool, nncoords: bool, proj: bool, integer: bool, array: bool, f16: bool },
 }
 
 /// Bitwise phase 0.
@@ -284,6 +300,9 @@ pub enum Ctrl {
     Wop,
     Nop,
     Mutex { lr: u8, id: u8 },
+    /// iterate `count` varyings from coefficients `coff` (A, B, C per component, 4 words
+    /// apart) into temps from `dest`; with `persp` divided by the plane at `woff`
+    Ditr { dest: u8, coff: u16, persp: u8, woff: u16, mode: u8, count: u8, f16: bool, sat: bool },
 }
 
 /// One decoded instruction group.
@@ -514,8 +533,34 @@ fn decode_main(r: &Rd, phase: Phase) -> Result<(MainOp, usize), DecodeError> {
 /// Decode a backend op; returns it and its length.
 fn decode_backend(r: &Rd) -> Result<(Backend, usize), DecodeError> {
     let (b0, b1, b2, b3) = (r.at(0), r.at(1), r.at(2), r.at(3));
-    if b0 >> 5 != 7 {
-        return err(format!("backend op {} (uvsw/msk/phas/setl/vistest/fitr/emit) not implemented", b0 >> 5));
+    let bit = |b: u8, n: u8| b & (1 << n) != 0;
+    match b0 >> 5 {
+        0 => {
+            let (op, imm) = (b0 & 7, bit(b0, 3));
+            let writes = op == 0 || op == 6;
+            let (imm, src, n) = match (writes, imm) {
+                (true, true) => (Some(b1), 0, 2),
+                (true, false) => (None, b1 & 7, 2),
+                (false, true) => (None, 0, 2),
+                (false, false) => (None, 0, 1),
+            };
+            return Ok((Backend::Uvsw { op, imm, src }, n));
+        }
+        1 => {
+            let sm = bit(b0, 3);
+            return Ok((Backend::Msk { mov: bit(b0, 4), sm, mode: b0 & 7 }, if sm { 2 } else { 1 }));
+        }
+        4 => return Ok((Backend::Vistest { atst: bit(b0, 1), pwen: bit(b0, 2), ifb: bit(b0, 0) }, 1)),
+        5 => {
+            let count = match b1 & 0xf {
+                0 => 16,
+                n => n,
+            };
+            return Ok((Backend::Fitr { persp: bit(b0, 4), drc: (b0 >> 3) & 1, mode: b0 & 3, sat: bit(b1, 4), count }, 2));
+        }
+        6 => return Ok((Backend::Emitpix { freep: bit(b0, 1) }, 1)),
+        7 => {}
+        op => return err(format!("backend op {op} (phas/setl) not implemented")),
     }
     let drc = (b0 >> 3) & 1;
     let immbl = b0 & 0x10 != 0;
@@ -544,7 +589,24 @@ fn decode_backend(r: &Rd) -> Result<(Backend, usize), DecodeError> {
             (st, if tiled { 4 } else { 3 })
         }
         5 => (Backend::Atomic { drc, op: b1 >> 4, src: b1 & 7, dst: b2 & 7 }, 3),
-        4 => return err("smp (texture sample) not implemented"),
+        4 => {
+            let (exta, extb) = (bit(b1, 4), bit(b1, 7));
+            let extc = extb && bit(b3, 7);
+            let b4 = r.at(4);
+            let smp = Backend::Smp {
+                drc,
+                dmn: (b1 >> 5) & 3,
+                chan: ((b1 >> 2) & 3) + 1,
+                lodm: b1 & 3,
+                fcnorm: bit(b0, 4),
+                nncoords: exta && bit(b2, 3),
+                proj: exta && bit(b2, 6),
+                integer: extc && bit(b4, 1),
+                array: extc && bit(b4, 0),
+                f16: extb && bit(b3, 4),
+            };
+            (smp, if extc { 5 } else if extb { 4 } else if exta { 3 } else { 2 })
+        }
         op => return err(format!("dma op {op} not implemented")),
     })
 }
@@ -562,6 +624,26 @@ fn decode_ctrl(r: &Rd, ctrlop: u8) -> Result<(Ctrl, usize), DecodeError> {
         5 => (Ctrl::Wdf, 0),
         6 => (Ctrl::Mutex { lr: b0 >> 6, id: b0 & 0xf }, 1),
         7 => (Ctrl::Nop, 1),
+        12 => {
+            let count = match b3 >> 4 {
+                0 => 16,
+                n => n,
+            };
+            if b3 & 0xf != 0 {
+                return err("ditr with indexed coefficients not implemented");
+            }
+            let d = Ctrl::Ditr {
+                dest: b0,
+                coff: (b1 >> 2) as u16 * 4,
+                persp: b1 & 3,
+                woff: (b2 >> 2) as u16 * 4,
+                mode: b2 & 3,
+                count,
+                f16: b4 & 0x40 != 0,
+                sat: b4 & 1 != 0,
+            };
+            (d, 5)
+        }
         op => {
             let name = match op {
                 1 => "lapc",
@@ -912,6 +994,30 @@ impl fmt::Display for Group {
                 ),
                 Backend::Idf { drc, addr } => format!("idf drc{drc}, {}", slot_name(addr)),
                 Backend::Atomic { drc, op, src, dst } => format!("atomic op{op} {} <- [{}], drc{drc}", slot_name(dst), slot_name(src)),
+                Backend::Uvsw { op, imm, src } => {
+                    let ops = ["write", "emit", "cut", "emit.cut", "endtask", "emit.endtask", "write.emit.endtask", "?"];
+                    let a = imm.map_or(format!("[{}]", slot_name(src)), |a| format!("{a:#x}"));
+                    if op == 0 || op == 6 { format!("uvsw.{} w0, {a}", ops[op as usize & 7]) } else { format!("uvsw.{}", ops[op as usize & 7]) }
+                }
+                Backend::Msk { mov, sm, mode } => {
+                    let m = ["vm", "icm", "icmoc", "icmi", "caxy", "?", "?", "?"][mode as usize & 7];
+                    format!("{}msk.{m}{}", if mov { "mov" } else { "sav" }, if sm { ".sm" } else { "" })
+                }
+                Backend::Vistest { atst, pwen, ifb } => format!(
+                    "{}{}",
+                    if !atst { "depthf" } else if ifb { "alphatst" } else { "alphaf" },
+                    if pwen { " p0" } else { "" }
+                ),
+                Backend::Fitr { persp, mode, sat, count, .. } => {
+                    format!("fitr{}.m{mode}{} s3, s0, {count}", if persp { "p" } else { "" }, if sat { ".sat" } else { "" })
+                }
+                Backend::Emitpix { freep } => format!("emitpix{} s0, s2", if freep { ".freep" } else { "" }),
+                Backend::Smp { dmn, chan, nncoords, integer, .. } => format!(
+                    "smp.{}d{}{} s4, s0, s1, s2, {chan}",
+                    dmn,
+                    if nncoords { ".nncoords" } else { "" },
+                    if integer { ".integer" } else { "" }
+                ),
             });
         }
         if let Some(p) = self.bw0 {
@@ -949,6 +1055,9 @@ impl fmt::Display for Group {
                 Ctrl::Wop => "wop".into(),
                 Ctrl::Nop => "nop".into(),
                 Ctrl::Mutex { lr, id } => format!("mutex lr{lr} id{id}"),
+                Ctrl::Ditr { dest, coff, persp, woff, count, .. } => {
+                    if persp != 0 { format!("ditrp r{dest}, cf{coff}, cf{woff}, {count}") } else { format!("ditr r{dest}, cf{coff}, {count}") }
+                }
             });
         }
         let srcs: Vec<String> =
@@ -988,11 +1097,29 @@ pub struct Instance {
     /// execution enabled
     pub pe: bool,
     pub p0: bool,
+    /// pixel output registers (`po0..7`, special registers 32..35 and 164..167): a pixel's
+    /// place in the on-chip tile buffer
+    pub out: [u32; 8],
+    /// vertex outputs written with `uvsw.write`
+    pub vout: Vec<u32>,
+    /// a pixel's position: pixel centre (x, y) on the render target and in its tile
+    pub pos: [f32; 4],
+    /// the instance sent visibility feedback (`alphaf`): the pixel passes
+    pub feedback: bool,
 }
 
 impl Instance {
     pub fn new(temps: usize, vtxins: usize) -> Instance {
-        Instance { temps: vec![0; temps], vtxin: vec![0; vtxins], pe: true, p0: false }
+        Instance {
+            temps: vec![0; temps],
+            vtxin: vec![0; vtxins],
+            pe: true,
+            p0: false,
+            out: [0; 8],
+            vout: Vec::new(),
+            pos: [0.0; 4],
+            feedback: false,
+        }
     }
 }
 
@@ -1019,6 +1146,8 @@ pub struct Machine<'a> {
     /// decoded groups by address (code does not change during a job)
     pub cache: &'a mut HashMap<u64, Result<Group, DecodeError>>,
     pub trace: bool,
+    /// `emitpix` requests of this run (PBE state words 0 and 1), for the data master
+    pub emits: Vec<(u32, u32)>,
 }
 
 /// The constant registers (special bank 0..31 hold their index; others from Mesa's
@@ -1098,6 +1227,22 @@ fn const_reg(idx: u16) -> Option<u32> {
 
 /// Special register numbers (`pco_isa.py` SR).
 const SR_INST_NUM: u16 = 51;
+const SR_SAMP_NUM: u16 = 53;
+const SR_X_P: u16 = 97;
+const SR_X_S: u16 = 98;
+const SR_Y_P: u16 = 100;
+const SR_Y_S: u16 = 101;
+const SR_TILE_X_P: u16 = 114;
+const SR_TILE_Y_P: u16 = 116;
+
+/// The pixel output register a special register number names, if any.
+fn pixout(idx: u16) -> Option<usize> {
+    match idx {
+        32..=35 => Some(idx as usize - 32),
+        164..=167 => Some(idx as usize - 160),
+        _ => None,
+    }
+}
 
 fn f(v: u32) -> f32 {
     f32::from_bits(v)
@@ -1134,10 +1279,19 @@ impl Machine<'_> {
             Bank::Special => {
                 if let Some(c) = const_reg(r.idx) {
                     Some(c)
-                } else if r.idx == SR_INST_NUM {
-                    Some(lane as u32)
+                } else if let Some(o) = pixout(r.idx) {
+                    Some(inst.out[o])
                 } else {
-                    return Err(format!("special register sr{} not implemented", r.idx));
+                    // pixel positions are pixel centres: one sample per pixel
+                    Some(match r.idx {
+                        SR_INST_NUM => lane as u32,
+                        SR_SAMP_NUM => 0,
+                        SR_X_P | SR_X_S => inst.pos[0].to_bits(),
+                        SR_Y_P | SR_Y_S => inst.pos[1].to_bits(),
+                        SR_TILE_X_P => inst.pos[2].to_bits(),
+                        SR_TILE_Y_P => inst.pos[3].to_bits(),
+                        _ => return Err(format!("special register sr{} not implemented", r.idx)),
+                    })
                 }
             }
             Bank::Temp => inst.temps.get(i).copied(),
@@ -1152,6 +1306,10 @@ impl Machine<'_> {
     fn set_reg(&mut self, inst: &mut Instance, r: RegRef, v: u32) -> Result<(), String> {
         let i = r.idx as usize;
         let slot = match r.bank {
+            Bank::Special => match pixout(r.idx) {
+                Some(o) => Some(&mut inst.out[o]),
+                None => return Err(format!("write to special register sr{}", r.idx)),
+            },
             Bank::Temp => inst.temps.get_mut(i),
             Bank::Vtxin => inst.vtxin.get_mut(i),
             Bank::Coeff => self.coeffs.get_mut(i),
@@ -1232,21 +1390,40 @@ impl Machine<'_> {
     }
 
     fn exec_main(&mut self, g: &Group, inst: &mut Instance, lane: usize, k: u16, stats: &mut Stats) -> Result<(), String> {
-        let s = self.srcs(g, inst, lane, k)?;
+        let mut s = self.srcs(g, inst, lane, k)?;
+        // a repeated unpack of a packed format reads element k of one source register
+        let mut upck_elem = None;
+        if let (Some(MainOp::Upck { fmt, .. }), Some(r)) = (g.p0, g.src[0]) {
+            if g.hdr.rpt > 1 && pck_fields(fmt) > 1 {
+                s[0] = self.reg(inst, lane, r)?;
+                upck_elem = Some(k as u8);
+            }
+        }
         let is0 = s[[0, 3, 4, 5, 1, 2, 0, 0][g.is0 as usize & 7]];
         let mut l = Lanes { ft: [0, 0, 0, is0], ftt: false };
         if let Some(op) = g.p0 {
+            let op = match (op, upck_elem) {
+                (MainOp::Upck { scale_rtz, fmt, .. }, Some(e)) => MainOp::Upck { elem: e, scale_rtz, fmt },
+                (op, _) => op,
+            };
             self.unit(op, &mut l, s[0], s[1], s[2], is0, inst.p0, 0)?;
         }
         if let Some(op) = g.p1 {
             self.unit(op, &mut l, s[3], 0, 0, is0, inst.p0, 1)?;
         }
+        // a repeated pack into a packed format fills field k of one destination register
+        let mut pck_field = None;
         if let Some(MainOp::Pck { prog, rtz, scale, fmt }) = g.pck {
             let is3 = l.ft[[0, 1, 3, 3][g.iss[3] as usize & 3]];
-            if prog || scale {
-                return Err(format!("pck.{}{} not implemented", pck_name(fmt), if prog { ".prog" } else { ".scale" }));
+            if prog {
+                return Err(format!("pck.{}.prog not implemented", pck_name(fmt)));
             }
-            l.ft[2] = pack(fmt, is3, rtz)?;
+            let field = if pck_fields(fmt) > 1 { k as u32 } else { 0 };
+            let (v, m) = pack(fmt, is3, rtz, scale, field)?;
+            l.ft[2] = v;
+            if pck_fields(fmt) > 1 {
+                pck_field = Some(m);
+            }
         }
         if let Some(MainOp::Tst { op, ty, elem, pwen, .. }) = g.tst {
             let is1 = l.ft[[0, 3][g.iss[1] as usize & 1]];
@@ -1268,13 +1445,23 @@ impl Machine<'_> {
             mask = maskw0;
         }
         if let Some(b) = g.backend {
-            self.backend(g, b, inst, lane, k, stats)?;
+            // the backend sees the value on w0, and some backend ops drive w0/w1 themselves
+            for (i, v) in self.backend(g, b, inst, lane, k, w[0], stats)?.into_iter().enumerate() {
+                if let Some(v) = v {
+                    w[i] = v;
+                }
+            }
         }
         for (i, d) in g.dst.iter().enumerate() {
             if let Some(d) = d {
-                let d = d.offset(k);
+                let packed = i == 0 && pck_field.is_some() && g.iss[4] == 2;
+                let d = if packed { *d } else { d.offset(k) };
                 let mut v = w[i];
-                if i == 0 && mask != 0xf {
+                if packed {
+                    let m = pck_field.unwrap();
+                    let old = if k == 0 { 0 } else { self.reg(inst, lane, d)? };
+                    v = (old & !m) | (v & m);
+                } else if i == 0 && mask != 0xf {
                     // byte-masked write into the existing value
                     let old = self.reg(inst, lane, d)?;
                     let m = (0..4).filter(|b| mask & (1 << b) != 0).fold(0u32, |m, b| m | 0xff << (8 * b));
@@ -1427,7 +1614,9 @@ impl Machine<'_> {
         Ok(())
     }
 
-    fn backend(&mut self, g: &Group, b: Backend, inst: &mut Instance, lane: usize, k: u16, stats: &mut Stats) -> Result<(), String> {
+    /// A backend op for one instance; returns values it drives onto w0 / w1.
+    #[allow(clippy::too_many_arguments)]
+    fn backend(&mut self, g: &Group, b: Backend, inst: &mut Instance, lane: usize, k: u16, w0: u32, stats: &mut Stats) -> Result<[Option<u32>; 2], String> {
         let slot = |n: u8| g.src.get(n as usize).copied().flatten().map(|r| r.offset(k)).ok_or(format!("backend source s{n} missing"));
         let addr = |m: &Self, inst: &Instance, n: u8| -> Result<u64, String> {
             let r = slot(n)?;
@@ -1477,9 +1666,88 @@ impl Machine<'_> {
             }
             // the memory model is synchronous: fences have nothing to wait for
             Backend::Idf { .. } => {}
+            Backend::Uvsw { op, imm, src } => {
+                if op == 0 || op == 6 {
+                    let at = match imm {
+                        Some(a) => a as usize + k as usize,
+                        None => self.reg(inst, lane, slot(src)?)? as usize,
+                    };
+                    if inst.vout.len() <= at {
+                        inst.vout.resize(at + 1, 0);
+                    }
+                    inst.vout[at] = w0;
+                }
+                // emit / cut / end task: the vertex is complete when the program ends
+            }
+            Backend::Msk { mov: false, sm: false, mode } => {
+                // one sample per pixel: an executing instance covers sample 0
+                return match mode {
+                    0 | 1 => Ok([Some(1), Some(1)]),
+                    m => Err(format!("savmsk mode {m} not implemented")),
+                };
+            }
+            Backend::Vistest { atst: true, pwen, ifb: false } => {
+                // alpha feedback with an always-pass compare (Mesa's alphaf sc0, sc0, sc7)
+                let cmp = self.reg(inst, lane, slot(2)?)?;
+                if cmp != 7 {
+                    return Err(format!("alphaf with compare {cmp} not implemented"));
+                }
+                inst.feedback = true;
+                if pwen {
+                    inst.p0 = true;
+                }
+            }
+            Backend::Emitpix { .. } => {
+                let s0 = self.reg(inst, lane, slot(0)?)?;
+                let s2 = self.reg(inst, lane, slot(2)?)?;
+                self.emits.push((s0, s2));
+            }
+            Backend::Fitr { persp: false, mode: 0, sat, count, .. } => {
+                let c = slot(0)?;
+                let dst = slot(3)?;
+                for i in 0..count as u16 {
+                    let v = self.iterate(inst, lane, c.offset(4 * i), None, sat)?;
+                    self.set_reg(inst, dst.offset(i), v)?;
+                }
+            }
+            Backend::Smp { dmn, chan, nncoords, integer, proj: false, array: false, f16: false, lodm: 0, .. } => {
+                let (st, sm) = (slot(0)?, slot(2)?);
+                let (mut img, mut smp) = ([0u32; 4], [0u32; 4]);
+                for i in 0..4 {
+                    img[i] = self.reg(inst, lane, st.offset(i as u16))?;
+                    smp[i] = self.reg(inst, lane, sm.offset(i as u16))?;
+                }
+                let cr = slot(1)?;
+                let coords: Vec<f32> = (0..dmn.max(1) as u16).map(|i| self.reg(inst, lane, cr.offset(i)).map(f)).collect::<Result<_, _>>()?;
+                let texel = crate::tpu::sample(self.mem, img, smp, &coords, nncoords, integer)?;
+                let dst = slot(4)?;
+                for i in 0..chan as u16 {
+                    self.set_reg(inst, dst.offset(i), texel[i as usize])?;
+                }
+            }
             b => return Err(format!("backend op {b:?} not implemented")),
         }
-        Ok(())
+        Ok([None, None])
+    }
+
+    /// A varying at the instance's pixel: A*x + B*y + C from the coefficients at `c`
+    /// (x, y the pixel centre relative to its tile), divided by the plane at `w` if given.
+    fn iterate(&self, inst: &Instance, lane: usize, c: RegRef, w: Option<RegRef>, sat: bool) -> Result<u32, String> {
+        let (x, y) = (inst.pos[2], inst.pos[3]);
+        let plane = |m: &Self, r: RegRef| -> Result<f32, String> {
+            let a = f(m.reg(inst, lane, r)?);
+            let b = f(m.reg(inst, lane, r.offset(1))?);
+            let c = f(m.reg(inst, lane, r.offset(2))?);
+            Ok(a * x + b * y + c)
+        };
+        let mut v = plane(self, c)?;
+        if let Some(w) = w {
+            v /= plane(self, w)?;
+        }
+        if sat {
+            v = v.clamp(0.0, 1.0);
+        }
+        Ok(v.to_bits())
     }
 
     fn exec_ctrl(&mut self, g: &Group, insts: &mut [Instance]) -> Result<Option<u64>, String> {
@@ -1565,6 +1833,21 @@ impl Machine<'_> {
                 }
                 Ok(None)
             }
+            Some(Ctrl::Ditr { dest, coff, persp, woff, mode: 0, count, f16: false, sat }) => {
+                for (lane, i) in insts.iter_mut().enumerate() {
+                    if !cc.passes(i.pe, i.p0) {
+                        continue;
+                    }
+                    let w = (persp != 0).then_some(RegRef { bank: Bank::Coeff, idx: woff });
+                    for n in 0..count as u16 {
+                        let c = RegRef { bank: Bank::Coeff, idx: coff + 4 * n };
+                        let v = self.iterate(i, lane, c, w, sat)?;
+                        self.set_reg(i, RegRef { bank: Bank::Temp, idx: dest as u16 + n }, v)?;
+                    }
+                }
+                Ok(None)
+            }
+            Some(Ctrl::Ditr { .. }) => Err("ditr in sample/centroid mode or f16 not implemented".into()),
             // memory accesses complete synchronously; there are no other tasks to wait for
             Some(Ctrl::Wdf) | Some(Ctrl::Wop) | Some(Ctrl::Nop) | Some(Ctrl::Mutex { .. }) => Ok(None),
             None => Err("control group without an op".into()),
@@ -1577,16 +1860,73 @@ fn f2i(x: f32, rtz: bool) -> f32 {
     if rtz { x.trunc() } else { x.round_ties_even() }
 }
 
-fn pack(fmt: u8, v: u32, rtz: bool) -> Result<u32, String> {
-    Ok(match fmt {
-        30 => 0,
-        31 => 1.0f32.to_bits(),
-        15 => v,
+/// Fields of a packed format (1 for the 32-bit ones).
+fn pck_fields(fmt: u8) -> u32 {
+    match fmt {
+        0..=2 => 4,
+        3..=5 | 14 => 2,
+        _ => 1,
+    }
+}
+
+/// PCK: convert float `v` into field `field` of `fmt`; returns the bits (in place) and
+/// the field's mask. `scale` maps [0, 1] (or [-1, 1]) to the integer range.
+fn pack(fmt: u8, v: u32, rtz: bool, scale: bool, field: u32) -> Result<(u32, u32), String> {
+    let x = f(v);
+    let int = |x: f32, lo: f32, hi: f32| f2i(x, rtz).clamp(lo, hi);
+    let (bits, width) = match fmt {
+        30 => (0, 32),
+        31 => (1.0f32.to_bits(), 32),
+        15 => (v, 32),
         // float to integer conversions saturate; NaN becomes 0
-        6 => f2i(f(v), rtz) as u32,
-        7 => f2i(f(v), rtz) as i32 as u32,
-        fmt => return Err(format!("pck.{} not implemented", pck_name(fmt))),
-    })
+        6 => (f2i(x, rtz) as u32, 32),
+        7 => (f2i(x, rtz) as i32 as u32, 32),
+        // coverage: the mask of samples per pixel for a coverage value (one sample)
+        16 => ((x > 0.0) as u32, 32),
+        0 => ((if scale { int(x.clamp(0.0, 1.0) * 255.0, 0.0, 255.0) } else { int(x, 0.0, 255.0) }) as u32, 8),
+        1 => ((if scale { int(x.clamp(-1.0, 1.0) * 127.0, -127.0, 127.0) } else { int(x, -128.0, 127.0) }) as i32 as u32 & 0xff, 8),
+        3 => ((if scale { int(x.clamp(0.0, 1.0) * 65535.0, 0.0, 65535.0) } else { int(x, 0.0, 65535.0) }) as u32, 16),
+        4 => ((if scale { int(x.clamp(-1.0, 1.0) * 32767.0, -32767.0, 32767.0) } else { int(x, -32768.0, 32767.0) }) as i32 as u32 & 0xffff, 16),
+        14 => (f32_to_f16(x) as u32, 16),
+        fmt => return Err(format!("pck.{}{} not implemented", pck_name(fmt), if scale { ".scale" } else { "" })),
+    };
+    if width == 32 {
+        return Ok((bits, u32::MAX));
+    }
+    let sh = width * field;
+    let m = ((1u32 << width) - 1) << sh;
+    Ok(((bits << sh) & m, m))
+}
+
+/// f32 to IEEE half (round to nearest even).
+pub fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let r = if rem > mid || (rem == mid && half & 1 != 0) { half + 1 } else { half };
+        return sign | r as u16;
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    let r = if rem > 0x1000 || (rem == 0x1000 && half & 1 != 0) { half + 1 } else { half };
+    sign | r as u16
 }
 
 fn unpack(fmt: u8, v: u32, elem: u8, _scale_rtz: bool) -> Result<u32, String> {
@@ -1749,7 +2089,7 @@ mod tests {
                     inst
                 })
                 .collect();
-            let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false };
+            let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false, emits: Vec::new() };
             let st = m.run(CODE, &mut insts).unwrap();
             assert_eq!(st.stores, 64);
         }
@@ -1777,10 +2117,116 @@ mod tests {
                 inst
             })
             .collect();
-        let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false };
+        let mut m = Machine { mem: &mut mem, coeffs: &mut coeffs, shareds: &mut shareds, cache: &mut cache, trace: false, emits: Vec::new() };
         let st = m.run(CODE, &mut insts).unwrap();
         assert_eq!(st.stores, 0);
         // and the branch skipped the body
         assert!(st.groups < 10);
+    }
+
+    /// Graphics programs Mesa 26.2.6 compiled for vktriangle (PCO_DEBUG_PRINT=binary):
+    /// the load-op (clear) background shader, end-of-tile programs, the vertex and fragment
+    /// shaders of tests/gpu/pvr/tri.{vert,frag} and the transfer-queue copy shader.
+    const EOT_SH: [u8; 16] = [0x48, 0xa0, 0x80, 0xc2, 0x80, 0x40, 0x80, 0x01, 0x88, 0x00, 0x00, 0xff, 0xf2, 0xff, 0xff, 0xff];
+    const LOADOP: [u8; 16] = [0x38, 0x8a, 0x80, 0x87, 0x80, 0x08, 0x00, 0x00, 0x00, 0x20, 0xf3, 0xff, 0xff, 0xff, 0xff, 0xff];
+    const EOT_IMM: [u8; 40] = [0x86, 0x92, 0x40, 0x13, 0x20, 0x1a, 0x08, 0x00, 0x00, 0x00, 0x40, 0xff, 0x86, 0x92, 0x40, 0x13, 0x00, 0xb4, 0x02, 0x00, 0x00, 0x00, 0x41, 0xff, 0x48, 0xa0, 0x80, 0xc2, 0xc1, 0x40, 0x00, 0x40, 0x00, 0x00, 0xf3, 0xff, 0xff, 0xff, 0xff, 0xff];
+    const VS: [u8; 80] = [0x55, 0xa0, 0x04, 0x08, 0x04, 0x82, 0x04, 0x00, 0x00, 0x30, 0x35, 0x82, 0x00, 0x87, 0x80, 0x04, 0x00, 0x00, 0x00, 0x40, 0x35, 0x82, 0x00, 0x87, 0x81, 0x04, 0x00, 0x00, 0x00, 0x41, 0x34, 0x82, 0x00, 0x87, 0x00, 0x00, 0x00, 0x42, 0x35, 0x82, 0x00, 0x87, 0x80, 0x01, 0x00, 0x00, 0x00, 0x43, 0x58, 0xa0, 0x06, 0x08, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x30, 0xf3, 0xff, 0xff, 0xff, 0xff, 0xff, 0x58, 0xa0, 0x80, 0x0e, 0x07, 0x80, 0x01, 0x00, 0x00, 0x30, 0xf3, 0xff, 0xff, 0xff, 0xff, 0xff];
+    const FS: [u8; 360] = [0x34, 0x82, 0x00, 0x87, 0x00, 0x00, 0x00, 0x48, 0x57, 0xc0, 0x00, 0xf3, 0xb0, 0xf2, 0x40, 0x80, 0x40, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x81, 0x60, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x81, 0x61, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x80, 0x78, 0x00, 0x05, 0x00, 0x30, 0x00, 0x57, 0xc0, 0x00, 0xf3, 0xb0, 0xf2, 0x40, 0x80, 0x40, 0x00, 0x00, 0x00, 0x00, 0xff, 0x04, 0x81, 0x60, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x81, 0x61, 0x00, 0x08, 0x00, 0x00, 0x00, 0x02, 0x80, 0x6a, 0xff, 0x57, 0x92, 0x00, 0x9c, 0x10, 0x80, 0x40, 0xa0, 0x00, 0x30, 0x00, 0x2c, 0x44, 0xff, 0x44, 0xa2, 0x00, 0x20, 0x00, 0x00, 0x00, 0x45, 0x56, 0xd2, 0x40, 0x00, 0x02, 0x80, 0x81, 0x80, 0xd5, 0x01, 0x46, 0xff, 0x56, 0xb2, 0x40, 0x41, 0x02, 0x80, 0x40, 0x00, 0x45, 0x46, 0x47, 0xff, 0x56, 0xb2, 0x40, 0x41, 0x02, 0x80, 0x40, 0x00, 0x44, 0x47, 0x44, 0xff, 0x34, 0x82, 0x00, 0x87, 0x48, 0x00, 0x00, 0x47, 0x99, 0xd2, 0x00, 0xd3, 0x3c, 0xf8, 0xc0, 0x9c, 0x1e, 0x87, 0x87, 0xc4, 0xcf, 0x80, 0x11, 0x00, 0x20, 0x44, 0x56, 0xb2, 0x40, 0x40, 0x02, 0x80, 0x40, 0x00, 0x47, 0x44, 0x44, 0xff, 0x34, 0x82, 0x00, 0x87, 0x44, 0x00, 0x00, 0x48, 0x67, 0xf2, 0x40, 0x01, 0x68, 0x03, 0x90, 0x49, 0x80, 0x00, 0x80, 0x80, 0x89, 0x44, 0x78, 0xd2, 0x00, 0xd1, 0x3c, 0xf0, 0xb0, 0x87, 0x87, 0xc4, 0xd0, 0x80, 0x10, 0x00, 0x01, 0x44, 0x56, 0xb2, 0x40, 0x41, 0x02, 0x80, 0x40, 0x00, 0x44, 0x45, 0x44, 0xff, 0x56, 0xb2, 0x40, 0x41, 0x02, 0x80, 0x40, 0x00, 0x46, 0x44, 0x44, 0xff, 0x34, 0x82, 0x00, 0x87, 0x48, 0x00, 0x00, 0x45, 0x99, 0xd2, 0x00, 0xd3, 0x3c, 0xf8, 0xc0, 0x9c, 0x1e, 0x87, 0x87, 0xc4, 0xcf, 0x80, 0x11, 0x00, 0x20, 0x44, 0x56, 0xb2, 0x40, 0x40, 0x02, 0x80, 0x40, 0x00, 0x45, 0x44, 0x44, 0xff, 0x34, 0x82, 0x00, 0x87, 0x44, 0x00, 0x00, 0x48, 0x35, 0x82, 0x00, 0x87, 0x80, 0x01, 0x00, 0x00, 0x00, 0x43, 0x57, 0x92, 0x06, 0x9c, 0x20, 0x80, 0x40, 0xa0, 0x40, 0x10, 0x00, 0x2c, 0x44, 0xff, 0x34, 0x82, 0x00, 0x87, 0x48, 0x00, 0x00, 0x40, 0x98, 0xc0, 0x00, 0xd3, 0x3c, 0xf1, 0xa0, 0x9c, 0x1e, 0x87, 0xc0, 0xcf, 0x80, 0x11, 0x00, 0x20, 0x45, 0xa9, 0x00, 0x82, 0x80, 0x40, 0x00, 0x07, 0x00, 0x00, 0x05, 0x80, 0x6a, 0xff, 0xf3, 0xff, 0xff, 0xff, 0xff, 0xff, 0x34, 0x8a, 0x80, 0x87, 0x44, 0x00, 0x00, 0x20];
+    const TQ: [u8; 200] = [0x57, 0x92, 0x00, 0x9c, 0x10, 0x80, 0x40, 0xa0, 0x00, 0x30, 0x00, 0x2c, 0x40, 0xff, 0x55, 0xd2, 0x40, 0x01, 0x02, 0x80, 0xa0, 0x80, 0x81, 0x40, 0x99, 0xc2, 0x00, 0xd3, 0x3c, 0xf0, 0xa0, 0x9c, 0x1e, 0x87, 0xc0, 0xcf, 0x80, 0x11, 0x00, 0x20, 0x40, 0xff, 0x56, 0x92, 0x00, 0xd3, 0x3f, 0x80, 0xc1, 0x83, 0x10, 0x00, 0x30, 0x41, 0x56, 0x92, 0x00, 0xd3, 0x3f, 0x80, 0xc2, 0x83, 0x10, 0x00, 0x30, 0x42, 0x78, 0xd2, 0x00, 0xd0, 0x3c, 0xf2, 0xb0, 0x87, 0x87, 0xc1, 0xe0, 0x80, 0x10, 0x42, 0x11, 0x43, 0x57, 0x92, 0x00, 0x9c, 0x10, 0x80, 0x40, 0xa0, 0x00, 0x30, 0x00, 0x2c, 0x40, 0xff, 0x55, 0xd2, 0x40, 0x01, 0x02, 0x80, 0xa0, 0x80, 0x81, 0x40, 0x99, 0xc2, 0x00, 0xd3, 0x3c, 0xf0, 0xa0, 0x9c, 0x1e, 0x87, 0xc0, 0xcf, 0x80, 0x11, 0x00, 0x20, 0x40, 0xff, 0x56, 0x92, 0x00, 0xd3, 0x3f, 0x80, 0xc4, 0x83, 0x10, 0x00, 0x30, 0x41, 0x56, 0x92, 0x00, 0xd3, 0x3f, 0x80, 0xc5, 0x83, 0x10, 0x00, 0x30, 0x42, 0x78, 0xd2, 0x00, 0xd0, 0x3c, 0xf2, 0xb0, 0x87, 0x87, 0xc1, 0xe0, 0x80, 0x10, 0x42, 0x11, 0x44, 0x67, 0xa0, 0x00, 0xe4, 0x54, 0x08, 0x80, 0x63, 0x80, 0x08, 0x88, 0x80, 0xa0, 0x00, 0x02, 0x80, 0x6a, 0xff, 0x35, 0x8a, 0x00, 0x87, 0x40, 0x00, 0x00, 0x20, 0xf1, 0xff, 0x34, 0x8a, 0x80, 0x87, 0x41, 0x00, 0x00, 0x21];
+
+    fn disasm(code: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        loop {
+            let g = Group::decode(&code[pos..]).unwrap_or_else(|e| panic!("group at {pos:#x}: {}", e.0));
+            out.push(format!("{pos:#05x}: {g}"));
+            let end = g.hdr.end || (g.hdr.alu == Alu::Control && g.hdr.miscctl && g.ctrl == Some(Ctrl::Nop));
+            pos += g.hdr.len as usize;
+            if end || pos >= code.len() {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_the_graphics_programs() {
+        for (name, code, groups) in [("loadop", &LOADOP[..], 1), ("eot1.sh", &EOT_SH[..], 1), ("eot1.imm", &EOT_IMM[..], 3), ("vs", &VS[..], 7), ("fs", &FS[..], 33), ("tq", &TQ[..], 16)] {
+            let d = disasm(code);
+            for l in &d {
+                println!("{name} {l}");
+            }
+            assert_eq!(d.len(), groups, "{name}");
+        }
+        // the clear: o0 = sh0
+        let g = Group::decode(&LOADOP).unwrap();
+        assert_eq!(g.src[0], Some(RegRef { bank: Bank::Shared, idx: 0 }));
+        assert_eq!(g.dst[0], Some(RegRef { bank: Bank::Special, idx: 32 }));
+        // eot: emitpix with the PBE state in s0, s2
+        let g = Group::decode(&EOT_SH).unwrap();
+        assert_eq!(g.backend, Some(Backend::Emitpix { freep: true }));
+        assert_eq!(g.src[2], Some(RegRef { bank: Bank::Shared, idx: 1 }));
+        // vs: uvsw.write of vi2..4 to outputs 4..6
+        let g = Group::decode(&VS).unwrap();
+        assert_eq!(g.hdr.rpt, 3);
+        assert_eq!(g.backend, Some(Backend::Uvsw { op: 0, imm: Some(4), src: 0 }));
+    }
+
+    fn run_code(code: &[u8], insts: &mut [Instance], shareds: &mut [u32]) -> Vec<(u32, u32)> {
+        run_with_coeffs(code, insts, shareds, &mut [0; 16])
+    }
+
+    fn run_with_coeffs(code: &[u8], insts: &mut [Instance], shareds: &mut [u32], coeffs: &mut [u32]) -> Vec<(u32, u32)> {
+        let mut mem = Mem(HashMap::new());
+        for (i, w) in code.chunks(4).enumerate() {
+            let mut b = [0xffu8; 4];
+            b[..w.len()].copy_from_slice(w);
+            mem.0.insert(0x1000 + 4 * i as u64, u32::from_le_bytes(b));
+        }
+        let mut cache = HashMap::new();
+        let mut m = Machine { mem: &mut mem, coeffs, shareds, cache: &mut cache, trace: false, emits: Vec::new() };
+        m.run(0x1000, insts).unwrap();
+        m.emits
+    }
+
+    #[test]
+    fn vertex_shader_writes_position_and_colour() {
+        let mut inst = Instance::new(8, 8);
+        // vi0..1 position, vi2..4 colour
+        inst.vtxin[..5].copy_from_slice(&[0.5f32, -0.75, 1.0, 0.25, 0.0].map(f32::to_bits));
+        let mut insts = [inst];
+        run_code(&VS, &mut insts, &mut [0; 16]);
+        let out: Vec<f32> = insts[0].vout.iter().map(|&w| f32::from_bits(w)).collect();
+        assert_eq!(out, [0.5, -0.75, 0.0, 1.0, 1.0, 0.25, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn load_op_and_end_of_tile_programs() {
+        // the clear: o0 = sh0 for every pixel
+        let mut px: Vec<Instance> = (0..4).map(|_| Instance::new(8, 0)).collect();
+        run_code(&LOADOP, &mut px, &mut [0xff00_00ff]);
+        assert!(px.iter().all(|p| p.out[0] == 0xff00_00ff));
+        // end of tile: one emitpix with the PBE state words from the shared registers
+        let emits = run_code(&EOT_SH, &mut [Instance::new(8, 0)], &mut [0x2b400, 0x82020]);
+        assert_eq!(emits, [(0x2b400, 0x82020)]);
+        // ... or from immediates
+        let emits = run_code(&EOT_IMM, &mut [Instance::new(8, 0)], &mut [0; 4]);
+        assert_eq!(emits, [(0x2b400, 0x81a20)]);
+    }
+
+    #[test]
+    fn fragment_shader_interpolates_and_packs() {
+        // coefficient sets (A, B, C, -): W = 2 everywhere; colour/w planes r = x/2,
+        // g = 0.5, b = y/4 (perspective-divided by W: r = x/4, g = 0.25, b = y/8)
+        let p = |a: f32, b: f32, c: f32| [a.to_bits(), b.to_bits(), c.to_bits(), 0];
+        let mut coeffs: Vec<u32> = [p(0.0, 0.0, 2.0), p(0.5, 0.0, 0.0), p(0.0, 0.0, 0.5), p(0.0, 0.25, 0.0)].concat();
+        let mut inst = Instance::new(9, 0);
+        // tile-relative pixel centre (2.0, 4.0)
+        inst.pos = [2.0, 4.0, 2.0, 4.0];
+        let mut insts = [inst];
+        // sh0: the fragment meta word with the sample mask (bits 9..) for sample 0
+        run_with_coeffs(&FS, &mut insts, &mut [1 << 9], &mut coeffs);
+        // (0.5, 0.25, 0.5, 1.0) as RGBA8
+        assert_eq!(insts[0].out[0], 0x80 | 0x40 << 8 | 0x80 << 16 | 0xff << 24);
+        assert!(insts[0].feedback);
     }
 }
