@@ -126,16 +126,7 @@ impl RunConfig {
             .map(Duration::try_from_secs_f64)
             .transpose()
             .map_err(|_| "invalid --timeout")?;
-        let script: VecDeque<String> = match arg(args, "--script") {
-            Some(p) => std::fs::read_to_string(p)
-                .map_err(|e| e.to_string())?
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.starts_with('#'))
-                .map(str::to_owned)
-                .collect(),
-            None => VecDeque::new(),
-        };
+        let script = crate::script::load(arg(args, "--script")).map_err(|e| e.to_string())?;
         for line in &script {
             if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep" | "pointer")) {
                 return Err(format!("unsupported script command: {line}"));
@@ -231,7 +222,7 @@ pub(crate) fn run<B: SerialBoard>(
                 "serial" => {
                     // \x03 is Ctrl-C (SIGINT through the guest's tty)
                     pending.extend(
-                        rest.replace("\\n", "\r").replace("\\r", "\r").replace("\\t", "\t").replace("\\x03", "\x03").bytes(),
+                        crate::script::unescape(rest).replace("\\x03", "\x03").bytes(),
                     );
                     true
                 }
@@ -317,14 +308,7 @@ pub(crate) fn run<B: SerialBoard>(
         if !bytes.is_empty() {
             output.write_all(&bytes).map_err(|e| e.to_string())?;
             output.flush().map_err(|e| e.to_string())?;
-            serial.push_str(&String::from_utf8_lossy(&bytes));
-            if serial.len() > 1 << 20 {
-                let mut cut = serial.len() - (1 << 19);
-                while !serial.is_char_boundary(cut) {
-                    cut += 1;
-                }
-                serial.drain(..cut);
-            }
+            crate::script::append_serial(&mut serial, &bytes);
         }
         match stop {
             Stop::Budget => {}

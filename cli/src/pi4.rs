@@ -47,9 +47,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         Some(p) => match std::fs::File::create(p) { Ok(f) => Some(f), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
         None => None,
     };
-    let mut script: std::collections::VecDeque<String> = match arg(args, "--script") {
-        Some(p) => match std::fs::read_to_string(p) { Ok(t) => t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string).collect(), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
-        None => Default::default(),
+    let mut script = match crate::script::load(arg(args, "--script")) {
+        Ok(script) => script,
+        Err(e) => { eprintln!("{}: {e}", arg(args, "--script").unwrap_or("")); return ExitCode::FAILURE; }
     };
     let mut serial_log = String::new();
     let mut script_wait_until: Option<Instant> = None;
@@ -256,7 +256,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             script_wait_until = None;
             if let Some(line) = script.front().cloned() {
                 let (cmd, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
-                let unescape = |t: &str| t.replace("\\n", "\r").replace("\\r", "\r").replace("\\t", "\t").replace("\\e", "\x1b");
+                let unescape = |t: &str| crate::script::unescape(t).replace("\\e", "\x1b");
                 let mut done = true;
                 match cmd {
                     "wait-serial" => done = serial_log.contains(rest),
@@ -370,8 +370,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             }
         } else { m.soc.gpio.events.clear(); }
         if !script.is_empty() {
-            serial_log.push_str(&String::from_utf8_lossy(HostMachine::Pi4(&mut m).serial_output()));
-            if serial_log.len() > 1 << 20 { serial_log.drain(..serial_log.len() - (1 << 19)); }
+            crate::script::append_serial(&mut serial_log, HostMachine::Pi4(&mut m).serial_output());
         }
         if monitor_line.is_none() { flush(&mut m, &mut out, tty.0); }
         if let Some(w) = audio_out.as_mut() {
