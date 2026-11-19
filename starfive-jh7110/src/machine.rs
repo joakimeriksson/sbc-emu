@@ -116,7 +116,8 @@ pub struct Soc {
     pub ram: FlatRam,
     /// the L2 LIM (U-Boot SPL's code, data and stack)
     pub sram: FlatRam,
-    /// reads of the DDR controller's training status (0x518)
+    /// reads of the DDR controller's training status (0x518) since SPL started training
+    /// (its write to 0x514)
     dmc_status_reads: u32,
     pub clint: Clint,
     pub plic: Plic,
@@ -514,20 +515,22 @@ impl Soc {
                 b[..n].copy_from_slice(&self.sram.mem[o..o + n]);
                 Ok(u64::from_le_bytes(b))
             }
-            // DDR controller: the PHY's init is done (0x504 bit 31). Training (0x518 bit 1)
-            // shows as running once, for SPL's start check, then complete; the PHY then asks
-            // for no frequency changes.
             // AON syscon: the boot-mode straps (bits 1:0) read 1, SD card (SDIO1), as the
             // Orange Pi RV boots from its microSD slot
             _ if a == BOOT_MODE_REG => r32((*self.stub(a) & !3) | 1),
             // Cadence QSPI controller: always idle (CONFIG bit 31); no flash answers its
             // JEDEC ID read, so U-Boot keeps its default environment
             _ if a == QSPI_CTRL => r32(*self.stub(a) | 1 << 31),
+            // DDR controller: the PHY's init is done (0x504 bit 31). Training (0x518 bit 1),
+            // started by SPL's write to 0x514, shows as running for the first read after the
+            // start (SPL's start check), then complete. The PHY's frequency-change request
+            // word (PHY register 1) reads 0: no requests, so no clock switches.
             _ if a == DMC_CTRL + 0x504 => r32(*self.stub(a) | 1 << 31),
             _ if a == DMC_CTRL + 0x518 => {
                 self.dmc_status_reads += 1;
                 r32(if self.dmc_status_reads == 1 { 2 } else { 0 })
             }
+            _ if a == DMC_PHY + 4 => r32(0),
             _ if (CLINT..CLINT + 0x10000).contains(&a) => {
                 let t = self.mtime();
                 Ok(self.clint.read(a - CLINT, size, t))
@@ -645,6 +648,10 @@ impl Soc {
             }
         }
         match a {
+            _ if a == DMC_CTRL + 0x514 => {
+                self.dmc_status_reads = 0;
+                *self.stub(a) = v32;
+            }
             _ if (SRAM_BASE..SRAM_BASE + SRAM_SIZE as u64).contains(&a) => {
                 let o = (a - SRAM_BASE) as usize;
                 let n = (size as usize).min(SRAM_SIZE - o);

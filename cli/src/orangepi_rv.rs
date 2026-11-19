@@ -164,6 +164,12 @@ fn execute(args: &[String]) -> Result<(), String> {
         if arg(args, "--sd").is_none() {
             return Err("--kernel Image (direct boot), or --sd CARD.img to boot from the card's U-Boot".into());
         }
+        // the card's U-Boot loads the kernel, device tree and initrd itself
+        for opt in ["--dtb", "--firmware", "--initrd", "--append", "--dump-dtb"] {
+            if arg(args, opt).is_some() {
+                return Err(format!("{opt} applies to direct boot (--kernel); booting from the SD card, U-Boot takes these from the card"));
+            }
+        }
         (Vec::new(), Vec::new(), Vec::new())
     };
     let initrd = arg(args, "--initrd").map(read).transpose()?;
@@ -171,6 +177,9 @@ fn execute(args: &[String]) -> Result<(), String> {
     let ram = serial_board::ram_bytes(args, starfive_jh7110::RAM_SIZE >> 20)?;
     if ram < (128 << 20) || ram > (16 << 30) {
         return Err("--ram-mb must be between 128 and 16384".into());
+    }
+    if !direct && !boot::uboot_ram_ok(ram as u64) {
+        return Err("booting from the SD card needs --ram-mb 2048, 4096, 8192 or 16384: U-Boot knows only the board's DRAM sizes".into());
     }
     let config = RunConfig::from_args("orangepi-rv", args)?;
     // The microSD card survives guest reboots (one disk shared by the successive machines).

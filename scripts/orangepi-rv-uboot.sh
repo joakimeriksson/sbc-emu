@@ -19,16 +19,17 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git make gcc gcc-riscv64-l
     libssl-dev libgnutls28-dev python3 python3-setuptools python3-pyelftools python3-dev swig \
     device-tree-compiler uuid-dev ca-certificates >/dev/null
 cd /work
-if [ ! -d u-boot ]; then
-  git init -q u-boot && cd u-boot
-  git remote add origin https://github.com/u-boot/u-boot.git
-  git fetch -q --depth 1 origin $UBOOT_REV && git checkout -q FETCH_HEAD
-  cd ..
-fi
+# the pinned commit, also after an interrupted first fetch or a change of UBOOT_REV
+[ -d u-boot/.git ] || { rm -rf u-boot; git init -q u-boot; git -C u-boot remote add origin https://github.com/u-boot/u-boot.git; }
 cd u-boot
+if [ "\$(git rev-parse -q --verify HEAD 2>/dev/null)" != "$UBOOT_REV" ]; then
+  git fetch -q --depth 1 origin $UBOOT_REV
+  git checkout -q --force FETCH_HEAD
+fi
 export ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-
 make starfive_visionfive2_defconfig >/dev/null
-make -j\$(nproc) OPENSBI=/out/fw_dynamic.bin 2>&1 | grep -E "error|Error" | head -20 || true
+rm -f spl/u-boot-spl.bin.normal.out u-boot.itb
+make -j\$(nproc) OPENSBI=/out/fw_dynamic.bin > /out/build.log 2>&1 || { grep -E "error|Error" /out/build.log | head -20; exit 1; }
 cp spl/u-boot-spl.bin.normal.out u-boot.itb /out/
 cp .config /out/uboot.config
 SCRIPT

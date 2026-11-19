@@ -142,7 +142,8 @@ pub fn boot_linux(m: &mut Machine, opensbi: &[u8], kernel: &[u8], stock_dtb: &[u
 /// CRC-16. The rest reads as erased.
 pub fn board_eeprom(ram_bytes: u64) -> [u8; 512] {
     let mut e = [0xffu8; 512];
-    let gib = (ram_bytes >> 30).clamp(1, 16);
+    // U-Boot knows the board's DRAM sizes only (2, 4, 8 or 16 GiB): the largest that fits
+    let gib = eeprom_ram_gib(ram_bytes);
     let pstr = format!("XOPIRVA1-2450-D{gib:03X}E000-00000001");
     let mut out = Vec::new();
     // header: signature, format version (2, as U-Boot writes it), reserved, number of
@@ -182,6 +183,16 @@ pub fn board_eeprom(ram_bytes: u64) -> [u8; 512] {
     }
     e[..out.len()].copy_from_slice(&out);
     e
+}
+
+/// The DRAM size the EEPROM names: U-Boot accepts 2, 4, 8 and 16 GiB.
+pub fn eeprom_ram_gib(ram_bytes: u64) -> u64 {
+    [16, 8, 4, 2].into_iter().find(|&g| ram_bytes >= g << 30).unwrap_or(2)
+}
+
+/// Whether U-Boot can run with this much RAM (it takes the size from the EEPROM).
+pub fn uboot_ram_ok(ram_bytes: u64) -> bool {
+    [2u64, 4, 8, 16].iter().any(|&g| ram_bytes == g << 30)
 }
 
 /// U-Boot's `crc16`: polynomial 0x8005, reflected, initial value 0.
@@ -280,7 +291,15 @@ mod tests {
     fn boot_rom_loads_spl_from_the_backup_copy() {
         let body: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         // sector 0 holds a protective MBR, as on a GPT card: the ROM falls back to 2 MiB
-        let mut m = machine_with_card(&spl_image(&body), 0x20_0000);
+        let mut img = vec![0u8; 512];
+        img[446 + 4] = 0xee; // one partition of type 0xEE (GPT protective) covering the disk
+        img[446 + 8] = 1;
+        img[446 + 12..446 + 16].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        img[510] = 0x55;
+        img[511] = 0xaa;
+        img.resize(0x20_0000, 0);
+        img.extend_from_slice(&spl_image(&body));
+        let mut m = machine_with_card(&img, 0);
         boot_rom(&mut m).unwrap();
         assert_eq!(&m.soc.sram.mem[..body.len()], &body[..]);
         for h in 1..m.harts.len() {
@@ -297,6 +316,14 @@ mod tests {
         img[0x400] ^= 0xff;
         let mut m = machine_with_card(&img, 0);
         assert!(boot_rom(&mut m).is_err());
+    }
+
+    #[test]
+    fn eeprom_names_a_size_uboot_knows() {
+        assert_eq!(eeprom_ram_gib(4 << 30), 4);
+        assert_eq!(eeprom_ram_gib(3 << 30), 2);
+        assert_eq!(eeprom_ram_gib(1 << 30), 2);
+        assert!(uboot_ram_ok(8 << 30) && !uboot_ram_ok(3 << 30));
     }
 
     #[test]

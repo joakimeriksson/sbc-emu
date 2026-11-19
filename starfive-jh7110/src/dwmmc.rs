@@ -177,9 +177,6 @@ pub struct DwMmc {
     idsts: u32,
     fifo: VecDeque<u32>,
     pio_write: Option<PioWrite>,
-    /// RAM ranges written by DMA since the machine last looked (compiled code there is
-    /// stale for a JIT).
-    pub dma_written: Vec<(u64, usize)>,
 }
 
 impl DwMmc {
@@ -202,7 +199,6 @@ impl DwMmc {
             idsts: 0,
             fifo: VecDeque::new(),
             pio_write: None,
-            dma_written: Vec::new(),
         }
     }
 
@@ -441,14 +437,11 @@ impl DwMmc {
     fn to_host(&mut self, data: &[u8], ram: &mut DmaMem) -> bool {
         if self.uses_idmac() {
             let mut pos = 0;
-            let mut written = std::mem::take(&mut self.dma_written);
             let ok = self.walk(data.len(), ram, |ram, address, n| {
                 let ok = ram.load(address, &data[pos..pos + n]);
-                written.push((address, n));
                 pos += n;
                 ok
             });
-            self.dma_written = written;
             if ok {
                 self.idsts |= IDMAC_RI | IDMAC_NI;
                 self.rintsts |= INT_DATA_OVER;
