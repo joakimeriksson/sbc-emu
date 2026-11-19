@@ -1,8 +1,9 @@
 # Plan: Rockchip RK3288 and the ASUS Tinker Board
 
-Status: M4 reached on 2026-11-17 (an unmodified Armbian 26.8.1 SD image boots to the console
-login and a root shell through dw_mmc, the RK808 PMIC on I²C and emulated firmware; see
-"State" below). M3 (four cores) on 2026-11-15. It follows the project's own-core
+Status (2026-11-18): M0–M4 and M8 (Mali-T760) done, M7 for the DSI panel only, M9 for the
+JIT only; the panel board profile runs the vendor's application with touch, Wi-Fi and audio. See "State"
+below. M4 (Armbian from an unmodified SD image to a root shell) was reached on 2026-11-17, M3
+(four cores) on 2026-11-15. It follows the project's own-core
 decision (pure Rust, no QEMU, `docs/decisions.md` D1) and the multi-board foundation in
 `docs/multi-board-foundation.md`; where they disagree, that document governs the shared crates
 and this one only the RK3288.
@@ -65,8 +66,8 @@ stated output on the serial console, and a README table row with its evidence.
   (`Board::TinkerBoard`, `cli/src/tinkerboard.rs` on the shared `serial_board` runner). Done.
 - **M1: the 32-bit core, complete enough for Linux.** `arm-a32` boots the Debian armmp kernel
   in ARM mode, has Thumb-2, SMP support (per-core state, WFE/SEV) and, since M3, the
-  Cortex-A12 identity (`arm_a32::CORTEX_A12`) with the CP15 c15 errata registers. Still
-  missing (list in "Core changes needed" below): NEON, LPAE.
+  Cortex-A12 identity (`arm_a32::CORTEX_A12`) with the CP15 c15 errata registers, and NEON
+  (#18). Still missing (list in "Core changes needed" below): LPAE.
 - **M2: kernel to a serial shell.** Done (2026-11-15).
   - Boot: Debian `zImage` + stock `rk3288-tinker-s.dtb` + a BusyBox initramfs, loaded
     directly at U-Boot's rk3288 addresses, one core, `nosmp`.
@@ -200,29 +201,50 @@ M8 and M9 are independent of each other and of M5–M7.
   no `/psci`.
 - `cli/src/serial_board.rs` (scripts, pacing, reset) and the pinned-fixture script pattern.
 
-## State (2026-11-17)
+## State (2026-11-18)
 
-`rockchip-rk3288` crate: `Machine` (four cores), `Soc` (with the 96 KiB on-chip SRAM at
-0xff700000), `cru` (CRU with core resets, GRF lock, PMU), `devices` (routing for `dwmmc`,
-`emmc`, `i2c`, `rk808`, `gpio`), `boot` (direct boot and `boot_from_card`); probe binary
-`rk3288-boot`; `sbc-emu run --board tinkerboard` with `--kernel`/`--dtb`/`--initrd` (direct) or
-`--sd IMAGE` / `--emmc IMAGE` (firmware-style; `--sd-persist` writes through, otherwise the
-card is copy-on-write).
+Milestones: M0–M4 and M8 done; M7 done for the panel board's DSI panel but not HDMI; M9 half
+done (the JIT, not threads); M5, M6 and M10 not started. The panel board profile runs the vendor's
+firmware to its application with display, touch, Wi-Fi and audio (`docs/panel-board.md`).
 
-Armbian 26.8.1 (M4): `scripts/tinkerboard-armbian.txt` passes in 22 min 45 s on an M-series
-host (one host thread, interpreter): 51.7 G instructions summed over the cores, 24.3 s
-virtual, of which about a minute of wall time is the first-login wizard waiting for a network
-address that cannot come (no GMAC model). Linux finds the SD card (`mmc0: new high speed SDHC card`,
-`mmcblk0: p1`), the RK808 (regulators, `rk808-rtc` sets the system clock), the empty SDIO0
-(Wi-Fi) and eMMC slots time out cleanly. Gaps seen on the way, none blocking the login:
-Ethernet (`rk_gmac-dwmac`: MDIO bus registration fails on the stub; the first-login wizard
-waits about a minute for a network address), Panfrost (probe times out on the stub GPU), the
-video codec IOMMUs, USB (DWC2 stubs), HDMI/VOP (stubs). Device tree overlays from
-armbianEnv.txt are not applied. `poweroff` halts instead of switching off: 6.18 registers the
-RK808 power-off as a POWER_OFF_PREPARE handler only (`kernel_can_power_off()` is false),
-so the model's DEV_OFF path is unit-tested but not reached by this kernel. The RK3288 machine
-runs `arm-a32` as an interpreter; the A32 JIT the Orange Pi One uses is not wired in yet
-(it needs the machine's run loop, RAM attachment and DMA code invalidation; M9).
+| Area | State | Where |
+|---|---|---|
+| Cores | Four Cortex-A12 with Thumb-2, VFP and NEON (#18), on the A32/T32 JIT by default (#45; `--no-jit` or `SBC_JIT=0` for the interpreter). All four run on one host thread. | `arm-a32`, `machine.rs` |
+| Interrupts, timers, SMP | GIC-400, the generic timer, the boot ROM SMP mailbox, TLB broadcast | `machine.rs` |
+| Clocks, power | CRU (PLLs, the I2S fractional divider), GRF/SGRF, PMU; RK808 (Tinker Board) or ACT8846, SYR827/828 and HYM8563 (panel board) on I2C | `cru.rs`, `i2c.rs`, `peripherals/` |
+| Storage | dw_mmc for SD (card detect on GPIO6_C6 for the panel board), eMMC and SDIO; boot from the card's `/boot` like the firmware | `dwmmc.rs`, `emmc.rs`, `boot.rs` |
+| Display | VOP (both, two windows), IOMMU, DW MIPI DSI to the panel board's panel; VNC and `--screenshot` | `vop.rs`, `dsi.rs` |
+| 2D and GPU | RGA; Mali-T760 MP4 for Panfrost + Mesa (kmscube, 25 of 25 GLES 2 scenes match softpipe) | `rga.rs`, `midgard/` |
+| Touch | ILI2116 on I2C4 (panel board) | `peripherals/src/ili2116.rs` |
+| Wi-Fi | BCM43455 on SDIO for brcmfmac: scan, open and WPA2 joins, DHCP and NAT on `sbc-net` (panel board) | `peripherals/src/bcm43455/` |
+| Audio | I2S fed by the PL330 DMA controller at 0xffb20000; `--audio-out FILE.wav` or a FIFO | `i2s.rs`, `peripherals/src/pl330.rs` |
+
+Not modelled yet, roughly in order of value:
+
+1. **USB** (DWC2 OTG and host, EHCI/OHCI; M6). The panel board's pads and controls are an STM32
+   on USB, and the Tinker Board needs it for a keyboard and sticks.
+2. **Speed: one host thread per core** (M9). The vendor application runs at about 30 % of real
+   time idle and 5 % while it plays a sample, too slow for live audio; recording with
+   `--audio-out` works. This touches `arm-a32` and needs its owner.
+3. **GMAC Ethernet** (M5). Armbian's first-login wizard waits about a minute for an address.
+4. **HDMI** (M7). The Tinker Board has no screen output; the VOP is there, the DW HDMI is not.
+5. The browser build and demo (M10).
+6. Smaller: the second PL330 (0xff250000), backlight PWM, the SAR ADC, Bluetooth, the
+   video codec IOMMUs, device tree overlays from `armbianEnv.txt`, LPAE kernels.
+
+The panel board's own open items (the start-up "Wifi and storage systems failed" dialog, the
+pads) are listed in `docs/panel-board.md`.
+
+Times on an M-series host, one host thread (2026-11-18): `scripts/tinkerboard-shell.txt`
+8 s, `scripts/tinkerboard-armbian.txt` 5 min 52 s, `scripts/panel-board-audio.txt` 2 min 13 s,
+all on the JIT.
+
+M4 state, kept for reference: Armbian 26.8.1 passed `scripts/tinkerboard-armbian.txt` in
+22 min 45 s on the interpreter (51.7 G instructions summed over the cores, 24.3 s virtual,
+about a minute of it the first-login wizard waiting for a network address). `poweroff` halts
+instead of switching off: 6.18 registers the RK808 power-off as a POWER_OFF_PREPARE handler
+only (`kernel_can_power_off()` is false), so the model's DEV_OFF path is unit-tested but not
+reached by this kernel.
 
 M3 state, kept for reference: The Debian 6.12.107 armmp kernel brings up four cores and
 reaches the initramfs shell after about 4.3 G instructions summed over the cores (3.5 s
@@ -235,16 +257,17 @@ publishes no A12 TRM; the A17 TRM still lists A12 values for FPSID and PMCR) and
 logs. Not verified for the A12 itself: the ID_*/CLIDR/CCSIDR values (A17 r1p1 values, consistent
 with everything RK3288 Linux prints) and CTR's IminLine (the TRM's IMINLN input; 0x84448004 is
 used). Deliberately not advertised: CP14 debug (ID_DFR0 debug fields 0; the kernel reports
-`hw-breakpoint: debug architecture 0x0 unsupported`), PMU event counters (PMCR.N = 0) and
-Advanced SIMD (MVFR1, until NEON lands).
+`hw-breakpoint: debug architecture 0x0 unsupported`) and PMU event counters (PMCR.N = 0).
+Advanced SIMD has been advertised in MVFR1 since NEON landed (#18).
 
 ## Core changes needed (arm-a32, owned by the Orange Pi One session)
 
 Done: the Cortex-A12 identity as an `arm_a32::CpuModel` preset (CTR, CLIDR, CCSIDR, ID
 registers, L2CTLR, PMCR IDCODE, FPSID, MVFR0/1) and the CP15 c15 diagnostic (op2 1) and internal
 feature (op2 2) registers; Thumb-2; per-core state and WFE/SEV for SMP; STM with the PC in
-the register list (M4, for frame-pointer kernels). Still needed: NEON for
-userland (then MVFR1's Advanced SIMD fields), LPAE for `armmp-lpae` kernels, CP14 debug and PMU
+the register list (M4, for frame-pointer kernels); NEON (#18); the A32/T32 JIT (#29, wired
+into the RK3288 machine in #45). Still needed: running the cores on separate host threads
+(M9), LPAE for `armmp-lpae` kernels, CP14 debug and PMU
 event counters if a guest needs them (both are hidden in the ID registers today).
 
 ## Risks

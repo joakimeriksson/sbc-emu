@@ -113,8 +113,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             cmdline: boot::DEFAULT_CMDLINE,
             card_boot: true,
             power: devices::Peripherals::attach_rk808,
-            banner: "experimental Rockchip RK3288: four Cortex-A12 (interpreter), GIC-400, UART2, CRU/GRF/PMU, \
-                     boot ROM SMP mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC; other devices are stubs",
+            banner: "experimental Rockchip RK3288: four Cortex-A12, GIC-400, UART2, CRU/GRF/PMU, boot ROM SMP \
+                     mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC, Mali-T760, RGA, I2S; no Ethernet, USB or \
+                     HDMI yet, other devices are stubs",
             setup: &|_| {},
             fixup_dtb: Ok,
             network: None,
@@ -184,8 +185,12 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let unix_now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
+    let no_jit = args.iter().any(|a| a == "--no-jit");
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::with_ram_size(ram);
+        if no_jit {
+            m.set_jit(false);
+        }
         (profile.setup)(&mut m);
         (profile.power)(&mut m.soc.periph, unix_now);
         if net != "none" {
@@ -219,6 +224,10 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         let blob = boot::prepare_device_tree(&dtb, ram as u64, cmdline, range)?;
         std::fs::write(path, blob).map_err(|e| e.to_string())?;
     }
-    eprintln!("[{tag}] {}", profile.banner);
+    let jit = !no_jit
+        && arm_a32::jit::available()
+        && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
+    let cores = if jit { "A32/T32 JIT" } else { "interpreter" };
+    eprintln!("[{tag}] {} (cores: {cores}, one host thread)", profile.banner);
     serial_board::run(config, make_machine)
 }
