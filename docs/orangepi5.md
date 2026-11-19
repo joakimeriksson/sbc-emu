@@ -1,6 +1,6 @@
 # Orange Pi 5 experimental direct boot
 
-The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. USB, display output, wireless and snapshots are not implemented.
+The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer (see below). USB, wireless and snapshots are not implemented.
 
 ## Cores
 
@@ -65,3 +65,18 @@ The reduced device tree exposes GMAC1 and an emulated YT8531 PHY. `--net local` 
 ```
 
 The GMAC model currently provides one DMA queue and basic descriptors, with software checksums. Advanced offloads, multiple queues, hardware timing and physical RGMII signalling are not modeled. The gateway ping is tested; broader application and NAT traffic on this board need additional validation.
+
+## HDMI
+
+The emulated firmware sets up HDMI0 as U-Boot does on boards whose display the kernel does not drive itself: one XRGB8888 framebuffer at the monitor's preferred mode in the top 16 MiB of RAM, described to Linux as a no-map `/reserved-memory` region and a `/chosen/framebuffer` `simple-framebuffer` node. Armbian's udev loads `simpledrm` for it; fbcon switches to 160x45 at 1280x720 and the tty1 getty draws on it.
+
+```sh
+./target/release/sbc-emu run --board orangepi5 --sd /path/to/armbian.img --vnc :1
+```
+
+`--vnc :N` shows the output to a VNC viewer, `--screenshot OUT.png` and the script's `screenshot FILE` save it, `--hdmi-mode 1280x720|1920x1080|640x480` picks the mode, and `--no-display` turns HDMI off. `scripts/orangepi5-hdmi.txt` boots the image to Armbian's first-run prompt and takes a screenshot. `--dump-dtb FILE` writes the device tree the run booted with, also for SD image boots.
+
+The VOP2 and the HDMI/eDP transmitters are not modelled, so mode setting and hot-plug do not work, and the kernel's own Rockchip DRM driver has no node to bind. There is no keyboard or pointer yet (USB is not modelled).
+
+![HDMI output](img/orangepi5-hdmi.png)
+

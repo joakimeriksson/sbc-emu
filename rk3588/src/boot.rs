@@ -8,11 +8,29 @@ pub const DTB:u64=0x03f0_0000;
 const CPU_PHANDLE:u32=0x10;
 pub const INITRD:u64=0x0400_0000;
 
-pub fn device_tree(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>, sd:bool)->Vec<u8> {
-    device_tree_gpu(ram,cmdline,initrd,sd,false,1)
+/// What the reduced DT describes besides the fixed devices.
+#[derive(Clone, Debug, Default)]
+pub struct Hardware {
+    /// a microSD card is in the slot (the DW MMC node)
+    pub sd: bool,
+    /// the Mali-G610 node (`--gpu probe`)
+    pub gpu: bool,
+    /// cores 0..cpus: 0..3 are Cortex-A55, 4..7 Cortex-A76
+    pub cpus: usize,
+    /// the firmware's HDMI framebuffer (address, mode)
+    pub framebuffer: Option<(u64, crate::display::Mode)>,
 }
-/// The reduced DT for `cpus` cores: cores 0..3 are Cortex-A55, 4..7 Cortex-A76.
-pub fn device_tree_gpu(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,sd:bool,gpu:bool,cpus:usize)->Vec<u8> {
+impl Hardware {
+    pub fn of(m:&Machine)->Self {
+        Self{sd:m.soc.mmc.card.present(),gpu:m.gpu_probe,cpus:m.cpus.len(),framebuffer:m.soc.display.scanout}
+    }
+}
+
+pub fn device_tree(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>, sd:bool)->Vec<u8> {
+    device_tree_for(ram,cmdline,initrd,&Hardware{sd,cpus:1,..Default::default()})
+}
+pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardware)->Vec<u8> {
+    let (sd,gpu,cpus)=(hw.sd,hw.gpu,hw.cpus);
     let mut f=Fdt::default();
     f.begin("");
     f.strs("compatible", &["xunlong,orangepi-5","rockchip,rk3588s"]);
@@ -21,7 +39,20 @@ pub fn device_tree_gpu(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,sd:bool,gpu
     f.begin("aliases");f.str("serial2","/serial@feb50000");f.end();
     f.begin("chosen");f.str("bootargs",cmdline);f.str("stdout-path","serial2:1500000n8");
     if let Some((a,b))=initrd {f.cells("linux,initrd-start",&[(a>>32) as u32,a as u32]);f.cells("linux,initrd-end",&[(b>>32) as u32,b as u32]);}
+    if let Some((addr,mode))=hw.framebuffer {
+        // The HDMI framebuffer the firmware set up, for simpledrm (its memory is reserved below).
+        f.cells("#address-cells",&[2]);f.cells("#size-cells",&[2]);f.empty("ranges");
+        f.begin(&format!("framebuffer@{addr:x}"));f.str("compatible","simple-framebuffer");
+        f.cells("reg",&[(addr>>32) as u32,addr as u32,0,crate::display::FB_SLOT as u32]);
+        f.cells("width",&[mode.width]);f.cells("height",&[mode.height]);f.cells("stride",&[mode.stride()]);
+        f.str("format","x8r8g8b8");f.str("status","okay");f.end();
+    }
     f.end();
+    if let Some((addr,_))=hw.framebuffer {
+        f.begin("reserved-memory");f.cells("#address-cells",&[2]);f.cells("#size-cells",&[2]);f.empty("ranges");
+        f.begin(&format!("framebuffer@{addr:x}"));f.cells("reg",&[(addr>>32) as u32,addr as u32,0,crate::display::FB_SLOT as u32]);f.empty("no-map");f.end();
+        f.end();
+    }
     f.begin("memory@0");f.str("device_type","memory");f.cells("reg",&[0,0,(ram>>32) as u32,ram as u32]);f.end();
     f.begin("cpus");f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);
     for k in 0..cpus {
@@ -97,9 +128,10 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
         if end>m.soc.ram.len() as u64 {return Err("initrd exceeds RAM".into());}
         m.soc.ram[INITRD as usize..end as usize].copy_from_slice(data);Some((INITRD,end))
     }else{None};
-    let dt=device_tree_gpu(m.soc.ram.len() as u64,cmdline,range,m.soc.mmc.card.present(),m.gpu_probe,m.cpus.len());
+    let dt=device_tree_for(m.soc.ram.len() as u64,cmdline,range,&Hardware::of(m));
     if DTB+dt.len() as u64>INITRD {return Err("device tree exceeds boot layout".into());}
     m.soc.ram[DTB as usize..DTB as usize+dt.len()].copy_from_slice(&dt);
+    m.dtb=dt;
     let c=m.cpu_mut();
     c.el=1; c.spsel=true; c.daif=0x3c0;c.pc=entry;
     c.x=[0;31];c.x[0]=DTB;c.sys.cpacr_el1=3<<20;

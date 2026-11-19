@@ -203,3 +203,20 @@ fn psci_cpu_on_starts_a_big_core_with_its_identity() {
     assert_eq!(m.cpus[4].x[2],0x414f_d0b0,"Cortex-A76");
     assert!(m.state.iter().enumerate().all(|(k,s)|k==0||k==4||*s==rk3588::CoreState::Off));
 }
+
+#[test]
+fn hdmi_framebuffer_is_handed_over_and_reserved() {
+    use rk3588::display::{framebuffer_addr, Mode};
+    let mut m=Machine::new(256<<20).unwrap();
+    m.enable_hdmi(Mode{width:1920,height:1080});
+    let mut image=vec![0;4096];image[56..60].copy_from_slice(b"ARMd");
+    rk3588::boot::boot_linux(&mut m,&image,None,"").unwrap();
+    let addr=framebuffer_addr(256<<20);
+    let has=|s:&[u8]|m.dtb.windows(s.len()).any(|w|w==s);
+    assert!(has(b"simple-framebuffer") && has(b"x8r8g8b8") && has(b"no-map"));
+    assert!(has(format!("framebuffer@{addr:x}").as_bytes()));
+    assert_eq!(m.soc.display.shown_size(),Some((1920,1080)));
+    let mut plain=Machine::new(256<<20).unwrap();
+    rk3588::boot::boot_linux(&mut plain,&image,None,"").unwrap();
+    assert!(!plain.dtb.windows(18).any(|w|w==b"simple-framebuffer"),"no HDMI, no handoff");
+}
