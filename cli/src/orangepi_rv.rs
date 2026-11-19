@@ -80,6 +80,10 @@ impl SerialBoard for Machine {
         if self.soc.sec.ops > 0 {
             eprintln!("[{tag}] PKA: {} operations", self.soc.sec.ops);
         }
+        let fw = &self.soc.gpu.fw;
+        if fw.boots > 0 {
+            eprintln!("[{tag}] GPU (PowerVR BXE-4-32): firmware booted {} times, {} kernel commands, {}", fw.boots, fw.commands, if fw.running { "running" } else { "powered off" });
+        }
         if !self.soc.stubs.is_empty() {
             let pages: Vec<String> = self.soc.stubs.keys().map(|p| format!("{p:#x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));

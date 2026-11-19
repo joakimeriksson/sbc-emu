@@ -82,7 +82,44 @@ pub fn prepare_device_tree(stock: &[u8], ram_bytes: u64, cmdline: &str, initrd: 
         fb.set_str("format", "x8r8g8b8");
         fb.set_str("status", "okay");
     }
+    add_gpu_node(&mut root);
     Ok(root.to_blob())
+}
+
+/// The PowerVR BXE-4-32 GPU's registers and interrupt.
+pub const GPU_BASE: u64 = 0x1800_0000;
+pub const IRQ_GPU: u32 = 82;
+
+/// Mainline's JH7110 device tree has no GPU node yet, so the firmware adds one from the
+/// board's resources, as mainline's `img,img-rogue` binding describes it. Xunlong's tree has
+/// its own node, for its vendor driver.
+fn add_gpu_node(root: &mut Node) {
+    let Some(soc) = root.children.iter_mut().find(|c| c.name == "soc") else { return };
+    if soc.children.iter().any(|c| c.name.starts_with("gpu@")) {
+        return;
+    }
+    let phandle = |prefix: &str| {
+        soc.children
+            .iter()
+            .find(|c| c.name.starts_with(prefix))
+            .and_then(|c| c.prop("phandle"))
+            .and_then(|p| p.get(..4))
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let (Some(syscrg), Some(pmu)) = (phandle("clock-controller@13020000"), phandle("power-controller@17030000")) else {
+        return;
+    };
+    let gpu = soc.child_mut(&format!("gpu@{GPU_BASE:x}"));
+    gpu.set("compatible", b"starfive,jh7110-gpu\0img,img-bxe-4-32\0img,img-rogue\0".to_vec());
+    gpu.set_cells("reg", &[0, GPU_BASE as u32, 0, 0x10_0000]);
+    // JH7110_SYSCLK_GPU_CORE_CLK, _NOC_BUS_GPU_AXI, _GPU_SYS_CLK
+    gpu.set_cells("clocks", &[syscrg, 46, syscrg, 50, syscrg, 47]);
+    gpu.set("clock-names", b"core\0mem\0sys\0".to_vec());
+    gpu.set_cells("interrupts", &[IRQ_GPU]);
+    // JH7110_PD_GPUA; JH7110_SYSRST_GPU_DOMA
+    gpu.set_cells("power-domains", &[pmu, 2]);
+    gpu.set_cells("resets", &[syscrg, 22]);
+    gpu.set_str("status", "okay");
 }
 
 /// The largest phandle in the tree.

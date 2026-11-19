@@ -100,6 +100,7 @@ them with its own DRM driver.
 | HDMI audio | **Xunlong's kernel:** I2STX_4CH0 (DesignWare I2S) fed by the AXI DMA controller into the Inno HDMI: `Starfive-HDMI-Sound-Card`. `speaker-test -D hw:1,0 -t sine -f 440` at 48 kHz reaches `--audio-out` as a 440 Hz sine; the I2S paces the DMA at the rate its clock dividers give | `scripts/orangepi-rv-hdmi-audio.txt` |
 | HDMI (mainline) | The firmware framebuffer under `simpledrm`: `fb0` at 1280x720 with fbcon. The whole board on mainline in one run, about 45 s wall: microSD read/write; Ethernet with DHCP, ping and HTTP; the USB stick; the HDMI console, where a shell on `tty1` runs a command typed on the USB keyboard | `scripts/orangepi-rv-board-mainline.txt` |
 | HDMI | **Xunlong's kernel:** StarFive's DRM driver binds the DC8200 and the Inno HDMI. The connector is `connected`, with the monitor's EDID offering 1280x720, 1920x1080 and 640x480. The HDMI PHY is programmed for 74.25 MHz; `fb0` carries the kernel console (160x45) at 1280x720 with vblank interrupts. Output goes to VNC (`--vnc :N`), `--screenshot` and the script's `screenshot FILE` | `scripts/orangepi-rv-hdmi.txt`, `scripts/orangepi-rv-board.txt` |
+| GPU (in progress) | The PowerVR BXE-4-32 with the open stack, in a mainline kernel built with the `powervr` driver (`scripts/orangepi-rv-gpu.sh`). The driver probes the GPU node the firmware adds and loads the firmware file (`FW version v1.0 (build 0 OS)`). It boots the firmware, played by the emulator: `Initialized powervr 1.0.0 for 18000000.gpu`. Runtime PM suspends the GPU and boots it again on demand. Mesa's PowerVR Vulkan driver finds `PowerVR B-Series BXE-4-32 MC1`. Rendering is not implemented yet | `scripts/orangepi-rv-gpu.txt` |
 | Board devices | Xunlong's kernel: the AXP15060 regulators (`hdmi_1p8`, `hdmi_0p9`, `vcc_3v3`, `cpu_vdd`, …) on I2C5; the 24C04 board EEPROM; the temperature sensor; the crypto engine's PKA, which verifies the kernel's X.509 certificates with RSA | `scripts/orangepi-rv-board.txt` |
 
 The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`, about 25 s wall):
@@ -142,6 +143,12 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - The PWM DAC: transfers to it are paced by its sample rate, computed from the SYSCRG dividers and CNT_N.
   - I2STX_4CH0, the DesignWare I2S that feeds the Inno HDMI: paced by MCLK over its dividers and the word length.
 - **`crypto.rs`:** the security engine's PKA, a Montgomery engine running the vendor driver's RSA sequence. The AES and SHA engines are not modelled.
+- **`powervr/`: the GPU**, a PowerVR BXE-4-32 (BVNC 36.50.54.182).
+  - Linux's `powervr` driver does not program the GPU's pipelines. It hands work to firmware on a MIPS microcontroller inside the GPU, through command rings in memory.
+  - The model has the registers the driver uses: BVNC, reset, idle and MMU status, the MIPS wrapper and its interrupt, and the MTS doorbell.
+  - It plays the firmware at that interface. It boots when the driver releases the MIPS core from reset, and finds the driver's init structures through the driver's MIPS page table. It reports the firmware started and idle, and serves the kernel command ring: power requests, MMU cache flushes, health checks and cleanups.
+  - Imagination publishes no open-driver firmware for this core, so `powervr::firmware` makes the file the driver loads. It has the header, the MIPS layout and the core's device info (errata, enhancements and features from Imagination's DDK table and Mesa's `bxe-4-32.h`), and no firmware code.
+  - The firmware adds a GPU node to mainline's device tree (`img,img-bxe-4-32`, `img,img-rogue`), which has none yet. The core is not on the driver's supported list, so it needs `powervr.exp_hw_support=1`.
 - **Boot devices** (`boot.rs`, `machine.rs`):
   - The boot ROM's SD path and the 2 MiB L2 LIM at 0x0800_0000. The MMC's IDMAC reaches the LIM, where SPL keeps its buffers.
   - The boot-mode straps (SD), the DDR controller's training handshake, and an idle QSPI controller.
@@ -159,8 +166,10 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 
 - **USB 2.0:** the SoC's own USB 2.0/OTG controller (Cadence, the board's USB-C data role) is not modelled. The devices are emulated: a keyboard, a tablet and a USB stick (`--usb-drive`; a guest reboot starts again from the image).
 - **Bluetooth on mainline:** mainline's DT leaves UART1 disabled and has no Bluetooth node. Bluetooth connections (ACL) are not modelled.
+- **GPU:**
+  - The open stack probes and runs to device enumeration. No GPU jobs execute yet: compute, geometry and fragment kicks, PDS and USC shaders, tiling and rasterisation are the next stages.
+  - Xunlong's kernel and its closed driver (`pvrsrvkm`) are not supported: their firmware is closed, and that driver gives up without it.
 - **Not modelled:**
-  - the PowerVR GPU (Xunlong's kernel loads no firmware, and the driver gives up);
   - MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
 - **Mainline HDMI:** only the firmware's fixed-mode framebuffer is available (no mode setting, no hot-plug). Mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
 - **Boot chain:**
