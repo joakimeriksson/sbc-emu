@@ -1,4 +1,4 @@
-//! Synchronous Valhall position/tiler execution. Opaque polygon lists live on
+//! Synchronous Valhall vertex/varying/tiler execution. Opaque polygon lists live on
 //! the host, keyed by VM and tiler context; shaders still write GPU-mapped data.
 use crate::{
     gpu_cs::Stop,
@@ -6,7 +6,7 @@ use crate::{
     gpu_resources::{Buffer, Resources},
     gpu_shader::{RegisterAllocation, Shader},
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 type Key = (u64, u64, u64);
 type Owner = (u32, u32);
 #[derive(Default)]
@@ -20,6 +20,7 @@ pub struct Draw {
     pub regs: [u32; 256],
     pub instruction: u64,
     pub triangles: Vec<[[f32; 4]; 3]>,
+    pub varyings: Option<(usize, Arc<[u8]>)>,
 }
 pub struct Frame {
     pub owner: Owner,
@@ -148,19 +149,21 @@ impl Tiler {
         owner: Owner,
     ) -> Result<(), Stop> {
         // Triangle lists, basic FIFO,
-        // no separate varying shader, draw IDs, multiview or primitive restart.
+        // no draw IDs, multiview or primitive restart.
         let flags = r[56] | instruction as u32;
         if std::env::var_os("SBC_MALI_TRACE").is_some() {
             eprintln!("[mali] IDVS flags={flags:08x} registers={:x?}", &r[32..60]);
         }
-        if instruction & 0x00ff_ffbd_0000_0000 != 0
-            || flags & !0x0043_830f != 0
+        if instruction & 0x00ff_ffa5_0000_0000 != 0
+            || flags & !0x0047_830f != 0
             || flags & 15 != 8
             || r[32] != 0
             || r[35] != 0
             || r[37] != 0
             || r[38] != 0
-            || r[48] != 0
+            || r[48] > 256
+            || r[48] % 16 != 0
+            || (r[48] != 0) != (flags & (1 << 18) != 0)
             || r[33] == 0
             || r[33] > 4096
             || r[33] % 3 != 0
@@ -222,63 +225,64 @@ impl Tiler {
         let output = pair(&tiler, 8) & !4095;
         let capacity = ((word(&tiler, 8) & 4095) as u64) << 12;
         let bytes = vertex_count * 16;
-        if output == 0 || bytes as u64 > capacity {
-            return Err(unsupported(6));
-        }
-        m.chunks(ram, output, bytes, Access::Write, true)
-            .map_err(Stop::Memory)?;
-        let mut spd = [0; 32];
-        m.read(ram, reg(r, 16), &mut spd, true)
-            .map_err(Stop::Memory)?;
-        if word(&spd, 0) & !((3 << 30) | (3 << 8)) != 0x38
-            || word(&spd, 1) & !0xf800 != 0
-            || spd[16..].iter().any(|&v| v != 0)
-        {
-            return Err(unsupported(6));
-        }
-        let allocation = match word(&spd, 0) >> 30 {
-            0 => RegisterAllocation::Registers64,
-            2 => RegisterAllocation::Registers32,
-            _ => return Err(unsupported(6)),
+        let vary_start = (bytes + 63) & !63;
+        let vary_bytes = vertex_count * r[48] as usize;
+        let required = if vary_bytes == 0 {
+            bytes
+        } else {
+            vary_start + vary_bytes
         };
-        let binary = pair(&spd, 2);
-        if binary & 7 != 0 {
-            return Err(Stop::InvalidStream);
-        }
-        let fau = reg(r, 8);
-        let count = (fau >> 56) as usize;
-        if count > 128 || fau & 0x00ff_0000_0000_0000 != 0 {
+        if output == 0 || required as u64 > capacity {
             return Err(unsupported(6));
         }
-        let mut data = vec![0; count * 8];
-        m.read(ram, fau & 0xffff_ffff_ffff, &mut data, true)
+        m.chunks(ram, output, required, Access::Write, true)
             .map_err(Stop::Memory)?;
-        let uniforms: Vec<u32> = data
-            .chunks_exact(4)
-            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
-            .collect();
-        let mut budget: usize = 1 << 22;
-        for invocation in 0..vertex_count {
-            let vertex = vertices[invocation % vertices.len()];
-            let instance = (invocation / vertices.len()) as u32;
-            let mut shader = Shader::with_allocation(binary, allocation);
-            shader.resources = Resources(reg(r, 0));
-            shader.position_output = Some(Buffer {
-                address: output,
-                size: bytes as u64,
-                stride: 4,
-            });
-            let values = [invocation as u32 * 4, vertex, instance, 0, 0];
-            for (n, &value) in values.iter().enumerate() {
-                if word(&spd, 1) & (1 << (11 + n)) != 0 {
-                    shader.regs[59 + n] = value;
-                }
-            }
-            shader
-                .run(m, ram, &uniforms, budget.min(4096))
-                .map_err(Stop::Shader)?;
-            budget -= shader.instructions as usize;
-        }
+        let mut budget = 1 << 22;
+        vertex_stage(
+            m,
+            ram,
+            Stage {
+                spd: reg(r, 16),
+                fau: reg(r, 8),
+                resources: reg(r, 0),
+                output: Buffer {
+                    address: output,
+                    size: bytes as u64,
+                    stride: 4,
+                },
+            },
+            &vertices,
+            r[34],
+            &mut budget,
+        )?;
+        let varyings = if vary_bytes != 0 {
+            let address = output
+                .checked_add(vary_start as u64)
+                .ok_or(Stop::InvalidStream)?;
+            vertex_stage(
+                m,
+                ram,
+                Stage {
+                    spd: reg(r, 18),
+                    fau: reg(r, if instruction & (1 << 36) != 0 { 10 } else { 8 }),
+                    resources: reg(r, if instruction & (1 << 35) != 0 { 2 } else { 0 }),
+                    output: Buffer {
+                        address,
+                        size: vary_bytes as u64,
+                        stride: r[48] / 4,
+                    },
+                },
+                &vertices,
+                r[34],
+                &mut budget,
+            )?;
+            let mut data = vec![0; vary_bytes];
+            m.read(ram, address, &mut data, true)
+                .map_err(Stop::Memory)?;
+            Some((r[48] as usize, Arc::from(data)))
+        } else {
+            None
+        };
         let mut data = vec![0; bytes];
         m.read(ram, output, &mut data, true).map_err(Stop::Memory)?;
         let mut vertices = Vec::with_capacity(vertex_count);
@@ -317,11 +321,76 @@ impl Tiler {
             regs: *r,
             instruction,
             triangles,
+            varyings,
         });
         frame.vertices += vertex_count;
         self.vertices += vertex_count;
         Ok(())
     }
+}
+
+struct Stage {
+    spd: u64,
+    fau: u64,
+    resources: u64,
+    output: Buffer,
+}
+fn vertex_stage(
+    m: &AddressSpace,
+    ram: &mut [u8],
+    stage: Stage,
+    vertices: &[u32],
+    instances: u32,
+    budget: &mut usize,
+) -> Result<(), Stop> {
+    let mut spd = [0; 32];
+    m.read(ram, stage.spd, &mut spd, true)
+        .map_err(Stop::Memory)?;
+    if word(&spd, 0) & !((3 << 30) | (3 << 8)) != 0x38
+        || word(&spd, 1) & !0xf800 != 0
+        || spd[16..].iter().any(|&v| v != 0)
+    {
+        return Err(unsupported(6));
+    }
+    let allocation = match word(&spd, 0) >> 30 {
+        0 => RegisterAllocation::Registers64,
+        2 => RegisterAllocation::Registers32,
+        _ => return Err(unsupported(6)),
+    };
+    let binary = pair(&spd, 2);
+    if binary & 7 != 0 {
+        return Err(Stop::InvalidStream);
+    }
+    let fau = stage.fau;
+    let count = (fau >> 56) as usize;
+    if count > 128 || fau & 0x00ff_0000_0000_0000 != 0 {
+        return Err(unsupported(6));
+    }
+    let mut data = vec![0; count * 8];
+    m.read(ram, fau & 0xffff_ffff_ffff, &mut data, true)
+        .map_err(Stop::Memory)?;
+    let uniforms: Vec<u32> = data
+        .chunks_exact(4)
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+        .collect();
+    for invocation in 0..vertices.len() * instances as usize {
+        let vertex = vertices[invocation % vertices.len()];
+        let instance = (invocation / vertices.len()) as u32;
+        let mut shader = Shader::with_allocation(binary, allocation);
+        shader.resources = Resources(stage.resources);
+        shader.position_output = Some(stage.output);
+        let values = [invocation as u32 * 4, vertex, instance, 0, 0];
+        for (n, &value) in values.iter().enumerate() {
+            if word(&spd, 1) & (1 << (11 + n)) != 0 {
+                shader.regs[59 + n] = value;
+            }
+        }
+        shader
+            .run(m, ram, &uniforms, (*budget).min(4096))
+            .map_err(Stop::Shader)?;
+        *budget -= shader.instructions as usize;
+    }
+    Ok(())
 }
 
 /// Decode element IDs before executing shaders. Hardware uses unsigned vertex
@@ -573,6 +642,244 @@ mod tests {
         // The aggregate boundary is accepted by the input decoder itself.
         r[34] = 1365;
         assert_eq!(draw_vertices(&m, &ram, &r, 8).unwrap().len(), 3);
+    }
+    fn with_varyings() -> (AddressSpace, Vec<u8>, [u32; 256]) {
+        let (m, mut ram, mut r) = fixture();
+        ram.copy_within(0x5000..0x5020, 0x5040);
+        ram[0x5048..0x5050].copy_from_slice(&0x6100u64.to_le_bytes());
+        let code = [
+            0x0866800412017d7cu64,
+            0x00b2c0000adada40,
+            0x00b2c1000adada41,
+            0x105e820440000d7b,
+            0x78614004aa000042,
+        ];
+        for (n, i) in code.into_iter().enumerate() {
+            ram[0x6100 + n * 8..0x6108 + n * 8].copy_from_slice(&i.to_le_bytes());
+        }
+        r[18] = 0x5040;
+        r[48] = 16;
+        (m, ram, r)
+    }
+    #[test]
+    fn secondary_shader_stores_gpu_varyings_and_snapshots_each_draw() {
+        let (m, mut ram, r) = with_varyings();
+        let mut t = Tiler::default();
+        t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0))
+            .unwrap();
+        let frame = &t.frames[&key(&m, 0x8000)];
+        let (stride, data) = frame.draws[0].varyings.as_ref().unwrap();
+        assert_eq!(*stride, 16);
+        for (n, expected) in [[0.125f32, 0.125], [0.875, 0.125], [0.5, 0.875]]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                [
+                    f32::from_bits(word(data, n * 4)),
+                    f32::from_bits(word(data, n * 4 + 1))
+                ],
+                *expected
+            );
+        }
+        assert_eq!(&ram[0x10040..0x10070], data.as_ref());
+        let saved = data.clone();
+        ram[0x4000..0x4004].copy_from_slice(&0f32.to_le_bytes());
+        t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0))
+            .unwrap();
+        let draws = &t.frames[&key(&m, 0x8000)].draws;
+        assert_eq!(draws[0].varyings.as_ref().unwrap().1, saved);
+        assert_ne!(draws[1].varyings.as_ref().unwrap().1, saved);
+        assert_eq!(t.vertices, 6);
+    }
+    #[test]
+    fn secondary_fault_and_combined_geometry_capacity_publish_no_draw() {
+        let (m, mut ram, mut r) = with_varyings();
+        r[34] = 86;
+        r[48] = 256;
+        ram[0x10000..0x10100].fill(0xa5);
+        let mut t = Tiler::default();
+        assert!(t
+            .idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0))
+            .is_err());
+        assert!(ram[0x10000..0x10100].iter().all(|&v| v == 0xa5));
+        r[34] = 1;
+        r[48] = 16;
+        ram[0x6100..0x6108].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0)),
+            Err(Stop::Shader(_))
+        ));
+        assert!(t.frames.is_empty());
+        assert_eq!(t.vertices, 0);
+    }
+    #[test]
+    fn secondary_fau_selector_is_independent_of_position_uniforms() {
+        let (m, mut ram, mut r) = with_varyings();
+        let code = [
+            0x0091c00000000080u64,
+            0x0091c10000000081,
+            0x105e820440000d7b,
+            0x78614004aa000042,
+        ];
+        for (n, i) in code.into_iter().enumerate() {
+            ram[0x6100 + n * 8..0x6108 + n * 8].copy_from_slice(&i.to_le_bytes());
+        }
+        ram[0x7200..0x7208].copy_from_slice(
+            &(0.25f32.to_bits() as u64 | ((0.75f32.to_bits() as u64) << 32)).to_le_bytes(),
+        );
+        r[10] = 0x7200;
+        r[11] = 1 << 24;
+        let mut t = Tiler::default();
+        t.idvs(&m, &mut ram, &r, 0x0600005200040008, (0, 0))
+            .unwrap();
+        let data = &t.frames[&key(&m, 0x8000)].draws[0]
+            .varyings
+            .as_ref()
+            .unwrap()
+            .1;
+        for n in 0..3 {
+            assert_eq!(word(data, n * 4), 0.25f32.to_bits());
+            assert_eq!(word(data, n * 4 + 1), 0.75f32.to_bits());
+        }
+    }
+    #[test]
+    fn secondary_resource_selector_reads_its_own_attribute_table() {
+        let (m, mut ram, mut r) = with_varyings();
+        ram.copy_within(0x1000..0x1040, 0x1100);
+        ram[0x1110..0x1118].copy_from_slice(&(0x2200u64 | (1 << 56)).to_le_bytes());
+        ram[0x1120..0x1128].copy_from_slice(&(0x3200u64 | (1 << 56)).to_le_bytes());
+        ram.copy_within(0x2000..0x2020, 0x2200);
+        ram.copy_within(0x3000..0x3020, 0x3200);
+        ram[0x3208..0x3210].copy_from_slice(&0x4200u64.to_le_bytes());
+        for (n, value) in [1f32, 1., -1., -1., 0., 0.].iter().enumerate() {
+            ram[0x4200 + n * 4..0x4204 + n * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        r[2] = 0x1103;
+        let mut t = Tiler::default();
+        t.idvs(&m, &mut ram, &r, 0x0600004a00040008, (0, 0))
+            .unwrap();
+        let frame = &t.frames[&key(&m, 0x8000)];
+        assert_eq!(frame.draws[0].triangles[0][0], [2., 2., 0.5, 1.]);
+        let data = &frame.draws[0].varyings.as_ref().unwrap().1;
+        for (n, expected) in [[1f32, 1.], [0., 0.], [0.5, 0.5]].iter().enumerate() {
+            assert_eq!(
+                [
+                    f32::from_bits(word(data, n * 4)),
+                    f32::from_bits(word(data, n * 4 + 1))
+                ],
+                *expected
+            );
+        }
+    }
+    #[test]
+    fn secondary_instance_ids_and_slots_match_native_attribute_divisors() {
+        let (m, mut ram, mut r) = with_varyings();
+        ram[0x2000..0x2004].copy_from_slice(&(0x25u32 | (((175 << 12) | 16) << 10)).to_le_bytes());
+        ram[0x2004..0x2008].copy_from_slice(&(2u32 | 64 | (2 << 24)).to_le_bytes());
+        r[34] = 5;
+        let mut t = Tiler::default();
+        t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0))
+            .unwrap();
+        let data = &t.frames[&key(&m, 0x8000)].draws[0]
+            .varyings
+            .as_ref()
+            .unwrap()
+            .1;
+        assert_eq!(data.len(), 15 * 16);
+        for n in 0..15 {
+            assert_eq!(
+                word(data, n * 4),
+                if n < 12 { 0.125f32 } else { 0.875f32 }.to_bits()
+            );
+            assert_eq!(word(data, n * 4 + 1), 0.125f32.to_bits());
+        }
+    }
+    #[test]
+    fn blended_writeback_is_ordered_and_a_late_fault_does_not_clear_the_target() {
+        let (m, mut ram, mut r) = fixture();
+        fn put(ram: &mut [u8], address: usize, words: &[u32]) {
+            for (n, v) in words.iter().enumerate() {
+                ram[address + n * 4..address + n * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        ram[0x5200..0x5500].fill(0);
+        put(
+            &mut ram,
+            0x5200,
+            &[0x80000128, 0x3000, 0x6200, 0, 0, 0, 0, 0],
+        );
+        put(&mut ram, 0x5300, &[0x201, 0xf0503503, 0x1a, 0xed000]);
+        put(&mut ram, 0x5400, &[7, 0, 0, 0, 7 << 29]);
+        let code = [
+            0x4110c038000000c0u64,
+            0x087dbc0208ea407c,
+            0x6891c000000000db,
+            0x4891c100000000da,
+            0x787f4004333c00f0,
+        ];
+        for (n, i) in code.iter().enumerate() {
+            ram[0x6200 + n * 8..0x6208 + n * 8].copy_from_slice(&i.to_le_bytes());
+        }
+        r[20] = 0x5200;
+        // Only four low bits encode RT count; address bits 4/5 are real.
+        ram.copy_within(0x5300..0x5310, 0x5330);
+        r[50] = 0x5331;
+        r[52] = 0x5400;
+        r[57] = 0x21aa;
+        r[58] = 0x1ffff;
+        r[43] = 0xf000f;
+        let mut t = Tiler::default();
+        for _ in 0..2 {
+            t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+                .unwrap();
+        }
+        ram[0xd000..0xd0c0].fill(0);
+        put(&mut ram, 0xd020, &[0xf000f, 0, 0xf000f, 2 << 6]);
+        put(&mut ram, 0xd038, &[0x8000, 0]);
+        put(
+            &mut ram,
+            0xd080,
+            &[1 << 26, 1 | (19 << 3) | (2 << 8) | (0x688 << 16)],
+        );
+        put(
+            &mut ram,
+            0xd0a0,
+            &[
+                0xe000, 0, 64, 0, 0xffdf8020, 0xffdf8020, 0xffdf8020, 0xffdf8020,
+            ],
+        );
+        let mut f = [0; 256];
+        f[40] = 0xd003;
+        f[43] = 0xf000f;
+        ram[0xe000..0xe400].fill(0x55);
+        let k = key(&m, 0x8000);
+        t.frames.get_mut(&k).unwrap().draws[1].regs[50] = 0x5501;
+        ram[0x5500..0x5510].fill(0); // unsupported blend shader mode
+        assert!(t.fragment(&m, &mut ram, &f, (0, 0)).is_err());
+        assert!(ram[0xe000..0xe400].iter().all(|&v| v == 0x55));
+        t.frames.get_mut(&k).unwrap().draws[1].regs[50] = 0x5301;
+        t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        assert_eq!(
+            &ram[0xe000 + (8 * 16 + 8) * 4..0xe004 + (8 * 16 + 8) * 4],
+            &[8, 224, 56, 159]
+        );
+        assert_eq!(&ram[0xe000..0xe004], &[32, 128, 223, 255]);
+        assert!(t.frames.is_empty());
+        assert_eq!(t.vertices, 0);
+        // All color channels disabled: Mesa supplies an Off descriptor and no
+        // fragment shader. Depth/stencil state still has to be side-effect-free.
+        put(&mut ram, 0x5500, &[0, 0, 3, 0]);
+        r[58] = 0xffff;
+        r[20] = 0;
+        r[50] = 0x5501;
+        t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0))
+            .unwrap();
+        t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        assert_eq!(
+            &ram[0xe000 + (8 * 16 + 8) * 4..0xe004 + (8 * 16 + 8) * 4],
+            &[32, 128, 223, 255]
+        );
     }
     #[test]
     fn opaque_heap_lifecycle_requires_order_and_valid_context() {

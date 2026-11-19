@@ -185,8 +185,10 @@ python3 tools/panthor-demo.py --gles --image <mesa-equipped-armbian.img> \
 
 The 512×512 image is read back from a real GLES framebuffer with
 `GL_RENDERER=Mali-G610 (Panfrost)`. Mesa compiles the shaders and submits the draw
-commands through Linux Panthor. Twenty-four opaque triangle draws, eight fragment
-programs, overlaps and multiple colors form the sun/mountain/prism scene. Interior
+commands through Linux Panthor. Seventy-two triangle draws, eleven fragment
+programs, overlaps and multiple colors form the sun/mountain/prism scene. Its
+checker floor uses sampled texture data and interpolated coordinates; the sun
+has three translucent halo layers blended over the background. Interior
 pixel probes and `glFinish`/`glReadPixels` verify the result before PNG export.
 There is no llvmpipe fallback. Use the Mesa-equipped fixture described above.
 
@@ -226,12 +228,100 @@ python3 tools/panthor-test.py --image <mesa-image> \
   --success-marker PANTHOR_GLES_INDEXED_OK --log out/gles-indexed.log
 ```
 
+Single-level, normalized 2D RGBA8 UNORM sampling now executes `TEX_SINGLE`
+against Mesa's resource tables and generic linear texture planes. Sampler and
+texture indices, GPU mappings, descriptor sizes, row strides and plane extents
+are checked before reading texels. Supported states are nearest or bilinear
+filtering with equal min/mag filters, clamp-to-edge/repeat/mirrored-repeat, and
+channel swizzles including zero/one. Result masks and float16/float32 output
+registers are decoded, including native half-float uniform conversion.
+
+The fragment descriptor's helper-thread flag is accepted for this path. With one
+mip level and identical min/mag filters, derivatives cannot change LOD or filter
+selection. Derivative instructions, mip selection and unequal min/mag filters
+remain unsupported. This does not simulate a fragment quad; varying inputs are described below.
+
+`tests/gpu/panthor-gles-texture.py` checks all pixels in 84 Linux/Mesa frames:
+texel centers, bilinear averages and edges, out-of-range coordinates and wrapping,
+two texture units and varying source alpha. The test uses uniform coordinates;
+the varying path below also exercises interpolated texture coordinates. Like the other
+GLES fixtures, it requests Mesa's linear layout with `PAN_MESA_DEBUG=sync,linear`.
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-texture.py \
+  --success-marker PANTHOR_GLES_TEXTURE_OK --log out/gles-texture.log
+```
+
+The IDVS secondary vertex stage now writes generic varyings through GPU mappings
+into a bounded hardware-output buffer, with separate SRT/FAU selectors. Position
+and varying stages share the invocation/instruction limits; combined buffer size
+is checked against Mesa's geometry allocation. Each draw retains an immutable
+snapshot of its shader-written varying data, so later draws cannot overwrite
+previous primitives' interpolation inputs.
+
+`LD_VAR_BUF_IMM` interpolates float32 or float16 source channels at the covered
+pixel center (or equivalent single-sample centroid), supports saved-position
+store/retrieve/clobber state, and writes float32 or packed float16 results. With
+W=1 this is affine barycentric interpolation; perspective correction is not yet
+supported. Byte offsets and all vertex spans are checked before destination
+registers change. Native half-source FMA, 64-bit stores and packed float conversion
+support Mesa's varying shaders without supplying vertex colors from the host.
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-varying.py \
+  --success-marker PANTHOR_GLES_VARYING_OK --log out/gles-varying.log
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-varying-texture.py \
+  --success-marker PANTHOR_GLES_VARYING_TEXTURE_OK --log out/gles-varying-texture.log
+```
+
+These Linux/Mesa fixtures check every pixel in six color-gradient frames
+(highp/mediump, both windings) and six textured frames (nearest/bilinear, both
+windings and multiple triangle sizes). Texture coordinates come from the native
+varying shader, not per-fragment CPU uniforms. Flat/integer varyings, indirect
+varying loads, sample/explicit interpolation positions and fused varying/texture
+instructions remain unsupported.
+
+Fixed-function blending now decodes Mali's `A + B × C` equations independently
+for RGB and alpha. Supported operands include source/destination color and alpha,
+source-times-two, inverse factors, and the descriptor's scalar blend constant.
+The constant follows Mesa's target-format scaling (RGBA8 uses `255 << 8`).
+Blend descriptor pointers reserve only their four low bits for RT count;
+addresses aligned to 16 bytes retain their remaining address bits. Channel masks
+and alpha-to-one are honored; a disabled Off descriptor can omit
+its fragment program when the render-target mask is zero and depth/stencil and
+occlusion have no side effects.
+
+Fragments composite in submission order against the clear color and earlier
+fragments, with RGBA8 conversion after each write. A bounded sparse color cache
+preserves overlapping draws; framebuffer clear/writeback remains deferred until
+all supported draws validate and finish. Shader memory side effects are not
+rolled back on faults. The native ATEST datum may be copied through a register;
+only the disabled, zero datum is supported.
+
+```sh
+python3 tools/panthor-test.py --image <mesa-image> \
+  --guest tests/gpu/panthor-gles-blend.py \
+  --success-marker PANTHOR_GLES_BLEND_OK --log out/gles-blend.log
+```
+
+The test checks all pixels in 16 frames, including three overlapping layers,
+straight/premultiplied alpha, separate RGB/alpha factors, addition, multiplication,
+constants, subtraction, channel masks, disabled color writes, and translucent
+rectangles with a shared edge and scissoring. Its oracle uses GL factors, not the
+Mali descriptor equation. Blend shaders, logic operations, sRGB conversion and
+framebuffer preload/incremental rendering remain unsupported; these draws share
+a clear-backed render pass.
+
 This is still a subset: triangle lists with basic position FIFO, W=1, finite
-supported coordinates and depth in [0,1], one linear RGBA8 target, no separate varying shader and opaque replacement blending.
+supported coordinates and depth in [0,1], one linear RGBA8 target and supported fixed-function blending.
 Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
 Nonzero global attribute/index/instance offsets, primitive restart, other
-primitive modes, perspective/clipping, varying interpolation, textures,
-blend shaders/general blending, depth/stencil, MSAA, framebuffer preload shaders,
+primitive modes, perspective/clipping, broader varying modes and texture
+formats/layouts, mipmaps, anisotropy, shadow/array/cube sampling,
+blend shaders, logic operations, depth/stencil, MSAA, framebuffer preload shaders,
 non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
 synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the
 demo does not establish general GLES, Vulkan or desktop support.

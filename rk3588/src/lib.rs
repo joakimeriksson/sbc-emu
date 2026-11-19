@@ -12,6 +12,8 @@ pub mod gpu_compute;
 pub mod gpu_resources;
 pub mod gpu_tiler;
 pub mod gpu_raster;
+pub mod gpu_blend;
+pub mod gpu_texture;
 pub mod uart;
 pub mod mmc;
 pub mod phy;
