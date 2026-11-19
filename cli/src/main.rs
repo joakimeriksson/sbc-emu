@@ -19,6 +19,7 @@ mod tinkerboard;
 mod panelboard;
 mod orangepi_rv;
 mod serial_board;
+mod script;
 
 use sbc_machine::Board;
 use std::io::Write;
