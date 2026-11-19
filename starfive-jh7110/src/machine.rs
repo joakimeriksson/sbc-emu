@@ -1,7 +1,7 @@
 //! The JH7110 machine: four U74 harts (hart 0, the S7 monitor core, is held in reset as
 //! the board's firmware leaves it) on one physical bus, scheduled round-robin in virtual
 //! time.
-use crate::devices::{sys_syscon, Clint, Crg, Plic, Pmu, Regs, TempSensor, HARTS};
+use crate::devices::{sys_syscon, Clint, Crg, Plic, Pmu, Regs, TempSensor, Trng, HARTS};
 use crate::i2c::{At24c04, Axp15060, DwI2c, PowerRequest};
 use crate::audio::{AxiDmac, I2s, Pwmdac, Sinks, DMA_BASE, DMA_SIZE, I2S0_BASE, I2S_SIZE, IRQ_DMA, PWMDAC_BASE, PWMDAC_SIZE};
 use crate::crypto::Sec;
@@ -25,6 +25,16 @@ pub enum AudioSource {
 }
 
 pub const RAM_BASE: u64 = 0x4000_0000;
+/// The U74 cluster's 2 MiB L2 loosely-integrated memory, where the boot ROM puts U-Boot SPL.
+pub const SRAM_BASE: u64 = 0x0800_0000;
+pub const SRAM_SIZE: usize = 0x20_0000;
+/// The DDR controller and its PHY (`starfive,jh7110-dmc`), which U-Boot SPL brings up.
+pub const DMC_CTRL: u64 = 0x1570_0000;
+pub const DMC_PHY: u64 = 0x1300_0000;
+/// The AON syscon register with the boot-mode straps.
+pub const BOOT_MODE_REG: u64 = 0x1702_002c;
+/// The Cadence QSPI controller's CONFIG register (the SPI NOR flash's controller).
+pub const QSPI_CTRL: u64 = 0x1301_0000;
 /// The DRAM's uncached alias (`uncached-offset = <0x4 0x0>` in StarFive's jh7110.dtsi): the
 /// same memory at +16 GiB, which the vendor kernel maps for DMA-coherent buffers.
 pub const DRAM_UNCACHED: u64 = 0x4_0000_0000;
@@ -45,6 +55,9 @@ pub const STG_SYSCON: u64 = 0x1024_0000;
 const STG_PCIE_LNKSTA: [u64; 2] = [0x48 + 0x170, 0x1f8 + 0x170];
 pub const IRQ_TEMP: usize = 81;
 pub const TEMP: u64 = 0x120e_0000;
+/// The true random number generator and its interrupt.
+pub const TRNG: u64 = 0x1600_c000;
+pub const IRQ_TRNG: usize = 30;
 pub const IRQ_GMAC0: usize = 7;
 pub const IRQ_GMAC1: usize = 78;
 pub const GMAC0: u64 = 0x1603_0000;
@@ -101,6 +114,10 @@ pub enum HartState {
 
 pub struct Soc {
     pub ram: FlatRam,
+    /// the L2 LIM (U-Boot SPL's code, data and stack)
+    pub sram: FlatRam,
+    /// reads of the DDR controller's training status (0x518)
+    dmc_status_reads: u32,
     pub clint: Clint,
     pub plic: Plic,
     pub uart: Uart,
@@ -129,6 +146,7 @@ pub struct Soc {
     pub temp: TempSensor,
     /// the output `--audio-out` records (the first to play)
     pub audio_source: Option<AudioSource>,
+    pub trng: Trng,
     /// the DC8200 display controller and the Inno HDMI transmitter with its monitor
     pub display: Display,
     /// GMAC0 with the YT8531C PHY (MDIO address 0) and GMAC1 (no PHY on this board)
@@ -163,12 +181,22 @@ impl Soc {
     pub fn new(ram_size: usize) -> Self {
         Soc {
             ram: FlatRam::new(RAM_BASE, ram_size),
+            sram: FlatRam::new(SRAM_BASE, SRAM_SIZE),
+            dmc_status_reads: 0,
             clint: Clint::default(),
             plic: Plic::default(),
             uart: Uart::default(),
             uart1: Uart::default(),
             bt: crate::bluetooth::Bluetooth::new(),
-            syscrg: Crg::new(0x10000, 0x2f8, 0x308, 4),
+            syscrg: Crg::new(0x10000, 0x2f8, 0x308, 4).with_dividers(&[
+                // the bus clocks under PLL2 (1188 MHz): nocstg_bus /3, axi_cfg0 /2,
+                // stg_axiahb /2, apb_bus /6, so the APB peripherals run at 49.5 MHz as on the
+                // board (U-Boot's DesignWare I2C timing overflows at the undivided rate)
+                (6, 3),
+                (7, 2),
+                (8, 2),
+                (11, 6),
+            ]),
             aoncrg: Crg::new(0x10000, 0x38, 0x3c, 1),
             stgcrg: Crg::new(0x10000, 0x74, 0x78, 1),
             ispcrg: Crg::new(0x10000, 0x38, 0x3c, 1),
@@ -180,7 +208,7 @@ impl Soc {
                     let mut bus = DwI2c::default();
                     if k == 5 {
                         bus.attach(PMIC_ADDR, Box::new(Axp15060::default()));
-                        let (lo, hi) = At24c04::pair([0xff; 512]);
+                        let (lo, hi) = At24c04::pair(crate::boot::board_eeprom(ram_size as u64));
                         bus.attach(EEPROM_ADDR, Box::new(lo));
                         bus.attach(EEPROM_ADDR + 1, Box::new(hi));
                     }
@@ -209,6 +237,7 @@ impl Soc {
             usb: Devices::default(),
             temp: TempSensor::default(),
             audio_source: None,
+            trng: Trng::default(),
             display: Display::new(Mode::MODES[0]),
             gmac0: Gmac::new(Some((0, Yt8531::default()))),
             gmac1: Gmac::new(None),
@@ -478,6 +507,27 @@ impl Soc {
             return r32(*self.stub(a) | link);
         }
         match a {
+            _ if (SRAM_BASE..SRAM_BASE + SRAM_SIZE as u64).contains(&a) => {
+                let o = (a - SRAM_BASE) as usize;
+                let n = (size as usize).min(SRAM_SIZE - o);
+                let mut b = [0u8; 8];
+                b[..n].copy_from_slice(&self.sram.mem[o..o + n]);
+                Ok(u64::from_le_bytes(b))
+            }
+            // DDR controller: the PHY's init is done (0x504 bit 31). Training (0x518 bit 1)
+            // shows as running once, for SPL's start check, then complete; the PHY then asks
+            // for no frequency changes.
+            // AON syscon: the boot-mode straps (bits 1:0) read 1, SD card (SDIO1), as the
+            // Orange Pi RV boots from its microSD slot
+            _ if a == BOOT_MODE_REG => r32((*self.stub(a) & !3) | 1),
+            // Cadence QSPI controller: always idle (CONFIG bit 31); no flash answers its
+            // JEDEC ID read, so U-Boot keeps its default environment
+            _ if a == QSPI_CTRL => r32(*self.stub(a) | 1 << 31),
+            _ if a == DMC_CTRL + 0x504 => r32(*self.stub(a) | 1 << 31),
+            _ if a == DMC_CTRL + 0x518 => {
+                self.dmc_status_reads += 1;
+                r32(if self.dmc_status_reads == 1 { 2 } else { 0 })
+            }
             _ if (CLINT..CLINT + 0x10000).contains(&a) => {
                 let t = self.mtime();
                 Ok(self.clint.read(a - CLINT, size, t))
@@ -505,6 +555,7 @@ impl Soc {
             _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => r32(self.pwmdac.read(a - PWMDAC_BASE)),
             _ if (I2S0_BASE..I2S0_BASE + I2S_SIZE).contains(&a) => r32(self.i2s.read(a - I2S0_BASE)),
             _ if (TEMP..TEMP + 0x10000).contains(&a) => r32(self.temp.read(a - TEMP)),
+            _ if (TRNG..TRNG + 0x4000).contains(&a) => r32(self.trng.read(a - TRNG)),
             _ if (GMAC0..GMAC0 + 0x10000).contains(&a) => r32(self.gmac0.read(a - GMAC0)),
             _ if (DC_BASE..DC_BASE + DC_SIZE).contains(&a) => {
                 let v = self.display.dc_read(a - DC_BASE);
@@ -594,6 +645,11 @@ impl Soc {
             }
         }
         match a {
+            _ if (SRAM_BASE..SRAM_BASE + SRAM_SIZE as u64).contains(&a) => {
+                let o = (a - SRAM_BASE) as usize;
+                let n = (size as usize).min(SRAM_SIZE - o);
+                self.sram.mem[o..o + n].copy_from_slice(&v.to_le_bytes()[..n]);
+            }
             _ if (CLINT..CLINT + 0x10000).contains(&a) => {
                 self.clint.write(a - CLINT, size, v);
                 self.irq_dirty = true;
@@ -608,7 +664,7 @@ impl Soc {
                 self.irq_dirty = true;
             }
             _ if self.sdio1.contains(a) => {
-                self.sdio1.write(a - SDIO1, v32, &mut self.ram);
+                self.sdio1.write_dma(a - SDIO1, v32, &mut crate::dwmmc::DmaMem { dram: &mut self.ram, sram: Some(&mut self.sram) });
                 self.update_devices();
                 self.irq_dirty = true;
             }
@@ -626,6 +682,12 @@ impl Soc {
             _ if (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&a) => {
                 let rate = self.sample_rate();
                 self.pwmdac.write(a - PWMDAC_BASE, v32, rate);
+            }
+            _ if (TRNG..TRNG + 0x4000).contains(&a) => {
+                self.trng.write(a - TRNG, v32);
+                let t = self.trng.irq();
+                self.plic.set_level(IRQ_TRNG, t);
+                self.irq_dirty = true;
             }
             _ if (TEMP..TEMP + 0x10000).contains(&a) => {
                 if self.temp.write(a - TEMP, v32) {
@@ -683,7 +745,7 @@ impl Soc {
                 self.irq_dirty = true;
             }
             _ if self.sdio0.contains(a) => {
-                self.sdio0.write(a - SDIO0, v32, &mut self.ram);
+                self.sdio0.write_dma(a - SDIO0, v32, &mut crate::dwmmc::DmaMem { dram: &mut self.ram, sram: Some(&mut self.sram) });
                 self.update_devices();
                 self.irq_dirty = true;
             }
