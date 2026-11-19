@@ -31,7 +31,7 @@ impl Board {
         match self {
             Self::Pi4 => "BCM2711 (4x Cortex-A72, GIC-400, UART, SD, USB keyboard, Ethernet, Wi-Fi, GPIO/I2C/SPI)",
             Self::Pi3 => "unverified: BCM2837 SoC model not yet implemented",
-            Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (4x A55 + 4x A76, GICv3, SD, Ethernet, Mali-G610)",
+            Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (4x A55 + 4x A76, GICv3, SD, Ethernet, Mali-G610, audio)",
             Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (one A7, GIC-400, UART0, direct Linux boot)",
             Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (four Cortex-A12s, GIC-400, UART2, direct Linux boot)",
             Self::PanelBoard => "experimental: RK3288 panel board / RK3288 (the vendor's own kernel and device tree, MIPI-DSI panel)",

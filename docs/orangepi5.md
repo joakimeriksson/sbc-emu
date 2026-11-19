@@ -96,3 +96,24 @@ Limits: the root hub reports four USB 2.0 and four USB 3.0 ports (the VL805's la
 
 Limits: the DesignWare PCIe controller, its PHY and MSI (through the GIC ITS) are not modelled, so the driver uses one I/O queue on INTx. Only an NVMe SSD can go in the slot.
 
+## Audio
+
+The board's two sound cards are there, as on the real board:
+
+- `rockchip,es8388` (card 0): the headphone jack. The ES8388 codec sits on I2C6 at 0x10 and masters the clocks of I2S1 (`rockchip,rk3588-i2s-tdm`) from its 12.288 MHz MCLK, so it plays the 48 kHz family of rates (8-96 kHz; ALSA's `plughw`/`default` resample others). The codec's DAC mute and volume, its output mixer, the power of the DAC and the outputs and the `Output 1` volume set what reaches the jack. Recording from it works and gives silence.
+- `hdmi0` (card 1): HDMI audio on I2S5, which is the clock master (any rate from 8 to 768 kHz; the divided fixed MCLK is snapped to the standard rate it approximates).
+
+DMA controllers DMAC0 and DMAC1 (Arm PL330, the shared model in `peripherals/`) feed the I2S FIFOs, which drain at the sample rate in virtual time. `--audio-out FILE` keeps what the headphone jack plays and `--hdmi-audio-out FILE` what HDMI plays: a `.wav` file, or raw 16-bit stereo for any other path (a named pipe for a live player, `ffplay -f s16le -ar RATE -ch_layout stereo PIPE`).
+
+```sh
+sbc-emu run --board orangepi5 --sd Armbian.img --audio-out hp.wav --hdmi-audio-out hdmi.wav
+# in the guest (the codec starts silent, as the real one does):
+amixer -c 0 sset PCM 0dB; amixer -c 0 sset 'Output 1' 0dB
+speaker-test -D plughw:0,0 -c 2 -t sine -f 1000 -l 1
+aplay -D hw:1,0 music.wav
+```
+
+On a full Armbian boot udev loads the drivers and `alsa-restore` restores the mixer. `scripts/orangepi5-audio.txt` (`--append init=/bin/bash`, which loads the modules itself) plays `seq 1 40000` as 16-bit stereo on both cards, at 48 kHz and 44.1 kHz, and records a second; the two WAV files start with exactly those bytes.
+
+Limits: HDMI audio does not go through the HDMI transmitter (the `dw-hdmi-qp` controller is not modelled while the firmware's framebuffer drives the display), so the `hdmi0` card's codec is a plain I2S transmitter (`linux,spdif-dit`) and there are no ELD or channel-map controls. The headphone jack has no detection GPIO. Of each stream, the first two channels are kept.
+

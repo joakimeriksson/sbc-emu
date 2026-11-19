@@ -1,0 +1,18 @@
+# Audio on the Armbian image: --sd Armbian.img --append init=/bin/bash
+#   --audio-out hp.wav --hdmi-audio-out hdmi.wav
+# The two sound cards (the ES8388 headphone codec on I2C6 + I2S1, HDMI0 on I2S5, both fed by
+# the PL330 DMA controllers) probe; `seq 1 40000` played as 16-bit stereo on each must come
+# out bit for bit at the start of hp.wav (48 kHz) and hdmi.wav (44.1 kHz), followed only by
+# silence:  seq 1 40000 > ref.raw; cmp -n 228892 ref.raw <(tail -c +45 hp.wav)
+# Recording from the codec gives a second of (silent) samples.
+# With init=/bin/bash nothing loads the sound modules, so the script does.
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs tmpfs /tmp; stty -echo; for m in snd-soc-simple-card snd-soc-rockchip-i2s-tdm snd-soc-es8328-i2c snd-soc-spdif-tx; do modprobe $m; done; sleep 1; cat /proc/asound/cards; echo CARDS_$(grep -c simple-card /proc/asound/cards)\n
+wait-serial CARDS_2
+serial seq 1 40000 > /tmp/a.raw; amixer -c 0 -q sset PCM 0dB; amixer -c 0 -q sset 'Output 1' 0dB; aplay -D hw:0,0 -f S16_LE -c 2 -r 48000 /tmp/a.raw; echo HEADPHONES_RC_$((100+$?))\n
+wait-serial HEADPHONES_RC_100
+serial aplay -D hw:1,0 -f S16_LE -c 2 -r 44100 /tmp/a.raw; echo HDMI_RC_$((100+$?))\n
+wait-serial HDMI_RC_100
+serial arecord -q -D hw:0,0 -f S16_LE -c 2 -r 16000 -d 1 /tmp/r.wav; echo RECORDED_$(($(stat -c %s /tmp/r.wav)-44))\n
+wait-serial RECORDED_64000
+quit

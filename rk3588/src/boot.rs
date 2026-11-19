@@ -123,6 +123,7 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
         f.cells("interrupt-map",&[0,0,0,1, 1,0,0, 0,(IRQ-32) as u32,4]);
         f.empty("dma-coherent");f.end();
     }
+    audio_nodes(&mut f);
     if sd {
         f.begin("mmc@fe2c0000");f.strs("compatible",&["rockchip,rk3588-dw-mshc","rockchip,rk3288-dw-mshc"]);
         f.cells("reg",&[0,0xfe2c0000,0,0x4000]);f.cells("interrupts",&[0,203,4]);
@@ -130,6 +131,53 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
         f.cells("bus-width",&[4]);f.cells("max-frequency",&[24000000]);f.empty("disable-wp");f.end();
     }
     f.end();f.finish()
+}
+
+/// Phandles of the audio nodes.
+const PH_I2S_MCLK:u32=8; const PH_CODEC_MCLK:u32=9;
+const PH_DMAC:[u32;2]=[0x20,0x21]; const PH_I2S1:u32=0x22; const PH_I2S5:u32=0x23;
+const PH_ES8388:u32=0x24; const PH_HDMI_TX:u32=0x25; const PH_MASTERDAI:u32=0x26;
+
+/// The two sound cards: the ES8388 headphone codec on I2C6 + I2S1 (named and routed as in
+/// the board's DT, without the jack-detect GPIO), and HDMI0 audio on I2S5. The HDMI
+/// transmitter is not modelled, so the HDMI card's codec is a plain I2S transmitter.
+fn audio_nodes(f:&mut Fdt) {
+    use crate::audio::*;
+    let reg=|f:&mut Fdt,base:u64,size:u64|f.cells("reg",&[0,base as u32,0,size as u32]);
+    f.begin("i2s-mclk");f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[I2S_MCLK as u32]);f.cells("phandle",&[PH_I2S_MCLK]);f.end();
+    f.begin("es8388-mclk");f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[crate::es8388::MCLK as u32]);f.cells("phandle",&[PH_CODEC_MCLK]);f.end();
+    for (k,base) in [DMAC0,DMAC1].into_iter().enumerate() {
+        f.begin(&format!("dma-controller@{base:x}"));f.strs("compatible",&["arm,pl330","arm,primecell"]);reg(f,base,DMAC_SIZE);
+        f.cells("interrupts",&[0,(DMAC_IRQS[k][0]-32) as u32,4,0,(DMAC_IRQS[k][1]-32) as u32,4]);f.empty("arm,pl330-periph-burst");
+        f.cells("clocks",&[2]);f.str("clock-names","apb_pclk");f.cells("#dma-cells",&[1]);f.cells("phandle",&[PH_DMAC[k]]);f.end();
+    }
+    let i2s=|f:&mut Fdt,base:u64,irq:usize,dmas:&[u32],names:&[&str],ph:u32|{
+        f.begin(&format!("i2s@{base:x}"));f.str("compatible","rockchip,rk3588-i2s-tdm");reg(f,base,crate::i2s_tdm::SIZE);
+        f.cells("interrupts",&[0,(irq-32) as u32,4]);f.cells("clocks",&[PH_I2S_MCLK,PH_I2S_MCLK,2]);f.strs("clock-names",&["mclk_tx","mclk_rx","hclk"]);
+        f.cells("dmas",dmas);f.strs("dma-names",names);f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[ph]);f.end();
+    };
+    i2s(f,I2S1,I2S1_IRQ,&[PH_DMAC[0],PERI_I2S1_TX as u32,PH_DMAC[0],PERI_I2S1_RX as u32],&["tx","rx"],PH_I2S1);
+    i2s(f,I2S5,I2S5_IRQ,&[PH_DMAC[1],PERI_I2S5_TX as u32],&["tx"],PH_I2S5);
+    f.begin(&format!("i2c@{I2C6:x}"));f.strs("compatible",&["rockchip,rk3588-i2c","rockchip,rk3399-i2c"]);reg(f,I2C6,0x1000);
+    f.cells("clocks",&[2,2]);f.strs("clock-names",&["i2c","pclk"]);f.cells("interrupts",&[0,(I2C6_IRQ-32) as u32,4]);
+    f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);
+    f.begin("audio-codec@10");f.strs("compatible",&["everest,es8388","everest,es8328"]);f.cells("reg",&[crate::es8388::ADDRESS as u32]);
+    f.cells("clocks",&[PH_CODEC_MCLK]);f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[PH_ES8388]);f.end();
+    f.end();
+    f.begin("hdmi0-audio-tx");f.str("compatible","linux,spdif-dit");f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[PH_HDMI_TX]);f.end();
+    f.begin("analog-sound");f.str("compatible","simple-audio-card");f.str("simple-audio-card,name","rockchip,es8388");
+    f.str("simple-audio-card,format","i2s");f.cells("simple-audio-card,bitclock-master",&[PH_MASTERDAI]);f.cells("simple-audio-card,frame-master",&[PH_MASTERDAI]);
+    f.strs("simple-audio-card,routing",&["Headphones","LOUT1","Headphones","ROUT1","LINPUT1","Microphone Jack","RINPUT1","Microphone Jack","LINPUT2","Onboard Microphone","RINPUT2","Onboard Microphone"]);
+    f.strs("simple-audio-card,widgets",&["Microphone","Microphone Jack","Microphone","Onboard Microphone","Headphone","Headphones"]);
+    f.begin("simple-audio-card,cpu");f.cells("sound-dai",&[PH_I2S1]);f.end();
+    // the codec runs from its fixed 12.288 MHz MCLK: the 48 kHz family of rates
+    f.begin("simple-audio-card,codec");f.cells("sound-dai",&[PH_ES8388]);f.cells("system-clock-frequency",&[crate::es8388::MCLK as u32]);f.cells("phandle",&[PH_MASTERDAI]);f.end();
+    f.end();
+    f.begin("hdmi0-sound");f.str("compatible","simple-audio-card");f.str("simple-audio-card,name","hdmi0");
+    f.str("simple-audio-card,format","i2s");f.cells("simple-audio-card,mclk-fs",&[128]);
+    f.begin("simple-audio-card,cpu");f.cells("sound-dai",&[PH_I2S5]);f.end();
+    f.begin("simple-audio-card,codec");f.cells("sound-dai",&[PH_HDMI_TX]);f.end();
+    f.end();
 }
 
 pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)->Result<(),String> {

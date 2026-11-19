@@ -11,6 +11,11 @@ impl SerialBoard for rk3588::Machine {
     fn now(&self) -> u64 { rk3588::Machine::now(self) }
     fn screen(&mut self) -> Option<&mut dyn Screen> { Some(self) }
     fn instret(&self) -> u64 { rk3588::Machine::instret(self) }
+    // --audio-out: the headphone jack (ES8388); --hdmi-audio-out: HDMI0
+    fn capture_audio(&mut self) -> bool { self.soc.audio.capture(true, false); true }
+    fn take_audio(&mut self) -> (u32, Vec<i16>) { let i = &mut self.soc.audio.i2s1; (i.rate, std::mem::take(&mut i.out)) }
+    fn capture_hdmi_audio(&mut self) -> bool { self.soc.audio.capture(false, true); true }
+    fn take_hdmi_audio(&mut self) -> (u32, Vec<i16>) { let i = &mut self.soc.audio.i2s5; (i.rate, std::mem::take(&mut i.out)) }
     fn report(&self, tag: &str) {
         let m = self;
         let pcs: Vec<String> = m.cpus.iter().zip(&m.state).map(|(c, s)| format!("{:#x}{}", c.pc, if *s == rk3588::CoreState::Off { "(off)" } else { "" })).collect();
@@ -23,6 +28,9 @@ impl SerialBoard for rk3588::Machine {
         eprintln!("[{tag}] USB: {}", usb.join(", "));
         if let Some(n) = m.soc.pcie.nvme.as_ref() { eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes", n.reads, n.writes); }
         if m.soc.display.frames.get() > 0 { eprintln!("[{tag}] HDMI: {} frames shown", m.soc.display.frames.get()); }
+        for (name, i) in [("headphones (ES8388, I2S1)", &m.soc.audio.i2s1), ("HDMI (I2S5)", &m.soc.audio.i2s5)] {
+            if i.frames > 0 || i.underruns > 0 { eprintln!("[{tag}] audio {name}: {} frames at {} Hz, {} underruns", i.frames, i.rate, i.underruns); }
+        }
     }
 }
 
@@ -40,7 +48,7 @@ pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme"])?;
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme", "--audio-out", "--hdmi-audio-out"])?;
     // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
     let multi=match arg(args,"--threads") { None|Some("single")=>false, Some("multi")=>true, Some(_)=>return Err("--threads single|multi".into()) };
     let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
@@ -95,7 +103,7 @@ fn execute(args:&[String])->Result<(),String> {
     if let Some(path)=arg(args,"--dump-dtb") {
         std::fs::write(path,&make_machine()?.dtb).map_err(|e|format!("{path}: {e}"))?;
     }
-    eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2, microSD, Ethernet, USB (keyboard, tablet{}), HDMI ({}); emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4),if arg(args,"--usb-drive").is_some() {", stick"} else {""},hdmi.map_or("off".to_string(),|m|format!("{}x{} framebuffer",m.width,m.height)));
+    eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2, microSD, Ethernet, USB (keyboard, tablet{}), HDMI ({}), audio (headphones, HDMI); emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4),if arg(args,"--usb-drive").is_some() {", stick"} else {""},hdmi.map_or("off".to_string(),|m|format!("{}x{} framebuffer",m.width,m.height)));
     serial_board::run(config, make_machine)
 }
 
