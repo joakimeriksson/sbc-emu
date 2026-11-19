@@ -11,7 +11,7 @@
 use crate::sdio::SdioCard;
 use emu_core::disk::Disk;
 use emu_core::sdcard::{Data, Reply, Response, SdCard, OUT_OF_RANGE};
-use emu_core::{Bus, FlatRam};
+use emu_core::FlatRam;
 use std::collections::VecDeque;
 
 pub const SIZE: u64 = 0x4000;
@@ -119,6 +119,37 @@ impl Card {
     }
 }
 
+/// The memory the IDMAC reaches: the DRAM, and the L2 LIM, where U-Boot SPL keeps its
+/// descriptors and buffers.
+pub struct DmaMem<'a> {
+    pub dram: &'a mut FlatRam,
+    pub sram: Option<&'a mut FlatRam>,
+}
+
+impl DmaMem<'_> {
+    fn region(&mut self, addr: u64, n: usize) -> Option<&mut [u8]> {
+        fn slice(r: &mut FlatRam, addr: u64, n: usize) -> Option<&mut [u8]> {
+            let o = addr.checked_sub(r.base)? as usize;
+            r.mem.get_mut(o..o.checked_add(n)?)
+        }
+        if let Some(sram) = self.sram.as_deref_mut() {
+            if let Some(s) = slice(sram, addr, n) {
+                return Some(s);
+            }
+        }
+        slice(self.dram, addr, n)
+    }
+    fn read32(&mut self, addr: u64) -> Result<u32, ()> {
+        self.region(addr, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or(())
+    }
+    fn write32(&mut self, addr: u64, v: u32) -> Result<(), ()> {
+        self.region(addr, 4).map(|b| b.copy_from_slice(&v.to_le_bytes())).ok_or(())
+    }
+    fn load(&mut self, addr: u64, data: &[u8]) -> bool {
+        self.region(addr, data.len()).map(|b| b.copy_from_slice(data)).is_some()
+    }
+}
+
 /// A PIO write in progress: the FIFO collects `bytes` before they go to the card.
 struct PioWrite {
     lba: Option<u64>,
@@ -146,9 +177,6 @@ pub struct DwMmc {
     idsts: u32,
     fifo: VecDeque<u32>,
     pio_write: Option<PioWrite>,
-    /// RAM ranges written by DMA since the machine last looked (compiled code there is
-    /// stale for a JIT).
-    pub dma_written: Vec<(u64, usize)>,
 }
 
 impl DwMmc {
@@ -171,7 +199,6 @@ impl DwMmc {
             idsts: 0,
             fifo: VecDeque::new(),
             pio_write: None,
-            dma_written: Vec::new(),
         }
     }
 
@@ -227,6 +254,11 @@ impl DwMmc {
     }
 
     pub fn write(&mut self, offset: u64, value: u32, ram: &mut FlatRam) {
+        self.write_dma(offset, value, &mut DmaMem { dram: ram, sram: None });
+    }
+
+    /// A register write, with the IDMAC reaching `ram` (DRAM and, on the JH7110, the L2 LIM).
+    pub fn write_dma(&mut self, offset: u64, value: u32, ram: &mut DmaMem) {
         let offset = offset as usize;
         match offset {
             CTRL => {
@@ -260,7 +292,7 @@ impl DwMmc {
         self.regs[CTRL / 4] & CTRL_USE_IDMAC != 0 && self.regs[BMOD / 4] & BMOD_ENABLE != 0
     }
 
-    fn command(&mut self, cmd: u32, ram: &mut FlatRam) {
+    fn command(&mut self, cmd: u32, ram: &mut DmaMem) {
         if self.sdio.is_some() {
             return self.sdio_command(cmd, ram);
         }
@@ -317,7 +349,7 @@ impl DwMmc {
 
     /// The SDIO card's commands (SDIO Simplified Specification 3.0): identification,
     /// CMD52 register access and CMD53 block/byte transfers of BYTCNT bytes.
-    fn sdio_command(&mut self, cmd: u32, ram: &mut FlatRam) {
+    fn sdio_command(&mut self, cmd: u32, ram: &mut DmaMem) {
         let index = cmd & 0x3f;
         let arg = self.regs[CMDARG / 4];
         let selected = self.sdio_selected;
@@ -402,17 +434,14 @@ impl DwMmc {
 
     /// Card -> host: through the IDMAC, or into the FIFO for PIO.
     #[allow(clippy::wrong_self_convention)]
-    fn to_host(&mut self, data: &[u8], ram: &mut FlatRam) -> bool {
+    fn to_host(&mut self, data: &[u8], ram: &mut DmaMem) -> bool {
         if self.uses_idmac() {
             let mut pos = 0;
-            let mut written = std::mem::take(&mut self.dma_written);
             let ok = self.walk(data.len(), ram, |ram, address, n| {
-                let ok = ram.load(address, &data[pos..pos + n]).is_ok();
-                written.push((address, n));
+                let ok = ram.load(address, &data[pos..pos + n]);
                 pos += n;
                 ok
             });
-            self.dma_written = written;
             if ok {
                 self.idsts |= IDMAC_RI | IDMAC_NI;
                 self.rintsts |= INT_DATA_OVER;
@@ -435,7 +464,7 @@ impl DwMmc {
 
     /// Host -> card: through the IDMAC at once, or collected from the FIFO (PIO).
     #[allow(clippy::wrong_self_convention)]
-    fn from_host(&mut self, lba: Option<u64>, bytes: usize, ram: &mut FlatRam) -> bool {
+    fn from_host(&mut self, lba: Option<u64>, bytes: usize, ram: &mut DmaMem) -> bool {
         if !self.uses_idmac() {
             self.pio_write = Some(PioWrite { lba, bytes, data: Vec::with_capacity(bytes) });
             self.rintsts |= INT_TXDR;
@@ -443,10 +472,9 @@ impl DwMmc {
         }
         let mut data = Vec::with_capacity(bytes);
         let ok = self.walk(bytes, ram, |ram, address, n| {
-            let start = address.checked_sub(ram.base).map(|o| o as usize);
-            match start.filter(|&s| s.checked_add(n).is_some_and(|e| e <= ram.mem.len())) {
-                Some(s) => {
-                    data.extend_from_slice(&ram.mem[s..s + n]);
+            match ram.region(address, n) {
+                Some(b) => {
+                    data.extend_from_slice(b);
                     true
                 }
                 None => false,
@@ -491,7 +519,7 @@ impl DwMmc {
     /// for each owned buffer until `bytes` are covered; descriptors are handed back to the
     /// host (OWN cleared). Chained (CH) descriptors follow DES3; ring descriptors follow
     /// each other, back to DBADDR after the one marked end-of-ring (ER).
-    fn walk(&mut self, mut bytes: usize, ram: &mut FlatRam, mut chunk: impl FnMut(&mut FlatRam, u64, usize) -> bool) -> bool {
+    fn walk(&mut self, mut bytes: usize, ram: &mut DmaMem, mut chunk: impl FnMut(&mut DmaMem, u64, usize) -> bool) -> bool {
         let base = self.regs[DBADDR / 4] as u64;
         let mut desc = base;
         for _ in 0..4096 {
@@ -546,6 +574,7 @@ impl DwMmc {
 mod tests {
     use super::*;
     use emu_core::disk::MemDisk;
+    use emu_core::Bus;
 
     const RAM: u64 = 0;
 
