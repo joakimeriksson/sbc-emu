@@ -15,6 +15,15 @@ use peripherals::Uart;
 use riscv64::{irq, Bus, Hart, Identity};
 use std::collections::BTreeMap;
 
+/// The board's two audio outputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioSource {
+    /// the headphone jack (PWM DAC)
+    Dac,
+    /// HDMI (I2S into the Inno HDMI)
+    Hdmi,
+}
+
 pub const RAM_BASE: u64 = 0x4000_0000;
 /// The DRAM's uncached alias (`uncached-offset = <0x4 0x0>` in StarFive's jh7110.dtsi): the
 /// same memory at +16 GiB, which the vendor kernel maps for DMA-coherent buffers.
@@ -118,6 +127,8 @@ pub struct Soc {
     /// the USB devices: keyboard and tablet on the VL805's ports, an optional USB drive
     pub usb: Devices,
     pub temp: TempSensor,
+    /// the output `--audio-out` records (the first to play)
+    pub audio_source: Option<AudioSource>,
     /// the DC8200 display controller and the Inno HDMI transmitter with its monitor
     pub display: Display,
     /// GMAC0 with the YT8531C PHY (MDIO address 0) and GMAC1 (no PHY on this board)
@@ -136,6 +147,9 @@ pub struct Soc {
     /// GPIO interrupts: the inputs at the last update and the latched edges
     gpio_prev: u64,
     gpio_edges: u64,
+    /// the interrupt configuration words SYSGPIO+0xe0..0x108 (IS, IC, IBE, IEV, IE pairs),
+    /// kept here so the per-quantum interrupt update needs no register-page lookups
+    gpio_cfg: [u32; 10],
     /// read-back stand-ins for unmodelled device pages
     pub stubs: BTreeMap<u64, Box<[u32; 1024]>>,
     /// virtual time (ns), kept here for `mtime`
@@ -177,6 +191,7 @@ impl Soc {
             gpio_reset: false,
             gpio_prev: 0,
             gpio_edges: 0,
+            gpio_cfg: [0; 10],
             sec: Sec::default(),
             dmac: AxiDmac::default(),
             pwmdac: Pwmdac::default(),
@@ -193,6 +208,7 @@ impl Soc {
             ],
             usb: Devices::default(),
             temp: TempSensor::default(),
+            audio_source: None,
             display: Display::new(Mode::MODES[0]),
             gmac0: Gmac::new(Some((0, Yt8531::default()))),
             gmac1: Gmac::new(None),
@@ -277,24 +293,27 @@ impl Soc {
 
     /// Bluetooth on UART1: what the host sent goes to the controller; what it answers
     /// fills the receive FIFO.
-    fn bt_pump(&mut self) {
+    /// Returns whether any byte reached UART1's receive FIFO.
+    fn bt_pump(&mut self) -> bool {
         if !self.uart1.out.is_empty() {
             let b = std::mem::take(&mut self.uart1.out);
             self.bt.receive(&b);
         }
+        let mut moved = false;
         while let Some(&b) = self.bt.tx.front() {
             if !self.uart1.push_rx(b) {
                 break;
             }
             self.bt.tx.pop_front();
+            moved = true;
         }
+        moved
     }
 
     /// Bluetooth time (LE advertising reports); returns the next deadline.
     pub fn bt_tick(&mut self) -> u64 {
         self.bt.tick(self.now);
-        if !self.bt.tx.is_empty() {
-            self.bt_pump();
+        if !self.bt.tx.is_empty() && self.bt_pump() {
             self.update_devices();
         }
         self.bt.next_event().unwrap_or(u64::MAX)
@@ -385,8 +404,9 @@ impl Soc {
     }
 
     /// A 64-bit GPIO interrupt register pair (low word at `off`, high word at `off + 4`).
-    fn gpio_reg(&mut self, off: u64) -> u64 {
-        *self.stub(SYSGPIO + off) as u64 | (*self.stub(SYSGPIO + off + 4) as u64) << 32
+    fn gpio_reg(&self, off: u64) -> u64 {
+        let i = ((off - 0xe0) / 4) as usize;
+        self.gpio_cfg[i] as u64 | (self.gpio_cfg[i + 1] as u64) << 32
     }
 
     /// Latch the edges the inputs made since the last update (IS = 1: edge; IBE: both;
@@ -401,13 +421,13 @@ impl Soc {
 
     /// Raw interrupt status: level-triggered pins (IS = 0) are active at the level IEV
     /// selects (0 high, 1 low); edge-triggered pins report their latched edges.
-    fn gpio_ris(&mut self) -> u64 {
+    fn gpio_ris(&self) -> u64 {
         let now = self.gpio_inputs();
         let (is, iev) = (self.gpio_reg(0xe0), self.gpio_reg(0xf8));
         (!is & (now ^ iev)) | (is & self.gpio_edges)
     }
 
-    fn gpio_mis(&mut self) -> u64 {
+    fn gpio_mis(&self) -> u64 {
         let ie = self.gpio_reg(0x100);
         self.gpio_ris() & ie
     }
@@ -619,11 +639,13 @@ impl Soc {
                 let shift = 8 * (a - SYSGPIO - 0xe8);
                 self.gpio_edges &= !(((v32 & !old) as u64) << shift);
                 *self.stub(a) = v32;
+                self.gpio_cfg[((a - SYSGPIO - 0xe0) / 4) as usize] = v32;
                 self.update_devices();
                 self.irq_dirty = true;
             }
             _ if (SYSGPIO + 0xe0..SYSGPIO + 0x108).contains(&a) => {
                 *self.stub(a & !3) = v32;
+                self.gpio_cfg[(((a & !3) - SYSGPIO - 0xe0) / 4) as usize] = v32;
                 self.update_devices();
                 self.irq_dirty = true;
             }
@@ -849,9 +871,10 @@ impl Machine {
             let usb = self.soc.usb_tick();
             let audio = self.soc.audio_tick();
             self.soc.sdio0.tick(self.soc.now);
+            let wifi = self.soc.sdio0.next_event();
             let bt = self.soc.bt_tick();
             if ran == 0 {
-                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb).min(audio).min(bt));
+                return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb).min(audio).min(bt).min(wifi));
             }
             self.soc.now += ran;
             left = left.saturating_sub(ran);

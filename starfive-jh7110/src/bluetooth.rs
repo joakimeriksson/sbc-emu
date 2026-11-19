@@ -94,7 +94,14 @@ impl Bluetooth {
         if self.trace { eprintln!("[bt] command {op:#06x} {p:02x?}"); }
         let ok = |v: &[u8]| { let mut r = vec![0u8]; r.extend_from_slice(v); r };
         let r: Vec<u8> = match op {
-            0x0c03 => { self.scan_enable = 0; self.le_scanning = false; ok(&[]) } // Reset
+            0x0c03 => {
+                // Reset: back to the power-on state
+                // (the bytes still queued in both directions, the clock and the counters stay)
+                let (rx, tx) = (std::mem::take(&mut self.rx), std::mem::take(&mut self.tx));
+                let (now, commands, trace) = (self.now, self.commands, self.trace);
+                *self = Bluetooth { rx, tx, now, next_adv: now, commands, trace, ..Bluetooth::new() };
+                ok(&[])
+            }
             0x1001 => ok(&[0x09, 0x00, 0x00, 0x09, 0x0f, 0x00, 0x19, 0x61]), // version 5.0, Broadcom, subversion 0x6119 (BCM4345C0)
             // Read Local Supported Commands: only LE Set Scan Parameters and LE Set Scan Enable
             // among the optional ones (Linux enables advertising report events for them), so
@@ -163,8 +170,11 @@ impl Bluetooth {
     /// Guest time passes: advertising reports while an LE scan runs.
     pub fn tick(&mut self, now: u64) {
         self.now = now;
-        if !self.le_scanning || now < self.next_adv || self.tx.len() > 4096 { return; }
+        if !self.le_scanning || now < self.next_adv { return; }
         self.next_adv = now + 100_000_000;
+        // a host that stopped reading (the line discipline detached mid-scan) loses the reports
+        // rather than piling them up; time keeps moving either way
+        if self.tx.len() > 4096 { return; }
         self.adv_count = self.adv_count.wrapping_add(1);
         let mut ad = vec![2, 0x01, 0x06]; // flags: LE general discoverable, no BR/EDR
         let name = b"sbc-emu sensor";
@@ -204,5 +214,36 @@ impl Bluetooth {
         self.le_event_mask = r.bytes()?.try_into().unwrap_or([0x1f, 0, 0, 0, 0, 0, 0, 0]);
         self.scan_enable = r.u8()?; self.le_scanning = r.bool()?; self.next_adv = r.u64()?; self.adv_count = r.u32()?; self.le_active = r.bool()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_backlog_does_not_stop_the_clock() {
+        let mut bt = Bluetooth::new();
+        // LE Set Scan Enable (0x200c): on
+        bt.receive(&[H4_CMD, 0x0c, 0x20, 2, 1, 0]);
+        // nobody reads: the host's side of the line is gone
+        for t in 1..200u64 {
+            bt.tick(t * 100_000_000);
+            let next = bt.next_event().unwrap();
+            assert!(next > t * 100_000_000, "the next report is always in the future");
+        }
+        assert!(bt.tx.len() <= 4096 + 64);
+    }
+
+    #[test]
+    fn reset_restores_the_defaults() {
+        let mut bt = Bluetooth::new();
+        // Write Local Name (0x0c13) then Reset (0x0c03)
+        let mut name = vec![H4_CMD, 0x13, 0x0c, 248];
+        name.extend_from_slice(b"renamed");
+        name.resize(4 + 248, 0);
+        bt.receive(&name);
+        bt.receive(&[H4_CMD, 0x03, 0x0c, 0]);
+        assert_eq!(bt.name, b"BCM4345C5");
     }
 }

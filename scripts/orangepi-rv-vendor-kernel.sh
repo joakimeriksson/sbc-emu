@@ -69,8 +69,9 @@ if [ -f "$BASE_INITRD" ]; then
     [ "$(shasum -a 256 "$work/dl/$name" | cut -d' ' -f1)" = "$sha" ] || { echo "$name: checksum mismatch" >&2; exit 1; }
   done
   (cd "$work/root" && gzip -dc "$BASE_INITRD" | cpio -id --quiet 2>/dev/null)
-  tar -xzf "$work/dl/$BLUEZ_APK" -C "$work/root" usr/bin/hciattach usr/bin/hciconfig usr/bin/hcitool 2>/dev/null
-  tar -xzf "$work/dl/$UDEV_APK" -C "$work/root" usr/lib/libudev.so.1 usr/lib/libudev.so.1.6.3 2>/dev/null
+  # (apk files are gzip tar streams with a signature segment first; tar warns about it)
+  tar -xzf "$work/dl/$BLUEZ_APK" -C "$work/root" usr/bin/hciattach usr/bin/hciconfig usr/bin/hcitool
+  tar -xzf "$work/dl/$UDEV_APK" -C "$work/root" usr/lib/libudev.so.1 usr/lib/libudev.so.1.6.3
   ver=$(ls "$OUT/modules/lib/modules")
   mkdir -p "$work/root/lib/modules/$ver/extra"
   for m in drivers/net/wireless/bcmdhd/bcmdhd.ko net/bluetooth/bluetooth.ko drivers/bluetooth/hci_uart.ko; do
@@ -80,6 +81,7 @@ if [ -f "$BASE_INITRD" ]; then
   # brcmfmac; Bluetooth is the H4 line discipline on UART1)
   sed -i.bak "s|^echo \"JH7110_BOOT_OK|for m in bcmdhd bluetooth hci_uart; do [ -f /lib/modules/\$(uname -r)/extra/\$m.ko ] \&\& insmod /lib/modules/\$(uname -r)/extra/\$m.ko 2>/dev/null; done\necho \"JH7110_BOOT_OK|" "$work/root/init"
   rm -f "$work/root/init.bak"
+  grep -q 'insmod /lib/modules/' "$work/root/init" || { echo "/init has no JH7110_BOOT_OK line: modules not hooked in" >&2; exit 1; }
   (cd "$work/root" && find . | LC_ALL=C sort | cpio -o -H newc -R 0:0 2>/dev/null) | gzip -9n > "$OUT/initramfs.cpio.gz"
   ls -l "$OUT/initramfs.cpio.gz"
 else

@@ -3,7 +3,7 @@
 //! would load them.
 use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use sbc_machine::Machine as HostMachine;
-use starfive_jh7110::{boot, display::{Display, Mode}, HartState, Machine};
+use starfive_jh7110::{boot, display::{Display, Mode}, AudioSource, HartState, Machine};
 use std::process::ExitCode;
 
 impl SerialBoard for Machine {
@@ -24,14 +24,24 @@ impl SerialBoard for Machine {
         self.soc.i2s.capture.on = true;
         true
     }
-    /// What the headphone jack (PWM DAC) plays, or else what goes to HDMI (I2S).
+    /// What one output plays: the first of the headphone jack (PWM DAC) and HDMI (I2S) to
+    /// produce samples is recorded for the rest of the run; the other's samples are dropped
+    /// (one WAV file holds one stream at one rate).
     fn take_audio(&mut self) -> (u32, Vec<i16>) {
-        let dac = &mut self.soc.pwmdac.capture;
-        if !dac.samples.is_empty() {
-            return (dac.rate, std::mem::take(&mut dac.samples));
+        let soc = &mut self.soc;
+        if soc.audio_source.is_none() {
+            if !soc.pwmdac.capture.samples.is_empty() {
+                soc.audio_source = Some(AudioSource::Dac);
+            } else if !soc.i2s.capture.samples.is_empty() {
+                soc.audio_source = Some(AudioSource::Hdmi);
+            }
         }
-        let i2s = &mut self.soc.i2s.capture;
-        (i2s.rate, std::mem::take(&mut i2s.samples))
+        let (keep, drop) = match soc.audio_source {
+            Some(AudioSource::Hdmi) => (&mut soc.i2s.capture, &mut soc.pwmdac.capture),
+            _ => (&mut soc.pwmdac.capture, &mut soc.i2s.capture),
+        };
+        drop.samples.clear();
+        (keep.rate, std::mem::take(&mut keep.samples))
     }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);

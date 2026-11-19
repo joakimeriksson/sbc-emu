@@ -115,19 +115,28 @@ impl Sinks<'_> {
     fn running(&self, addr: u64) -> bool {
         if addr == I2S0_BASE + I2S_TXDMA { self.i2s.running() } else { self.dac.enabled() }
     }
-    fn rate(&self, addr: u64) -> u32 {
-        if addr == I2S0_BASE + I2S_TXDMA { self.i2s_rate } else { self.dac_rate }
+    /// DMA items per second for a device: the DAC takes one frame per item; the I2S's frame
+    /// is one 32-bit word (16-bit samples) or two (longer samples), however many fit in an
+    /// item.
+    fn rate(&self, addr: u64, width: u64) -> u32 {
+        if addr == I2S0_BASE + I2S_TXDMA {
+            let frame_bytes = if self.i2s.word_bits() <= 16 { 4 } else { 8 };
+            (self.i2s_rate as u64 * frame_bytes / width.clamp(1, 8)).max(1) as u32
+        } else {
+            self.dac_rate
+        }
     }
     fn play(&mut self, addr: u64, data: &[u8], width: u64) {
         if addr == I2S0_BASE + I2S_TXDMA {
-            self.i2s.capture.push(data, width, self.i2s_rate);
+            let bits = self.i2s.word_bits();
+            self.i2s.capture.push_slots(data, bits, self.i2s_rate);
         } else {
             self.dac.play(data, width, self.dac_rate);
         }
     }
 }
 
-/// Samples kept for the host (16-bit stereo, interleaved).
+/// Samples kept for the host (16-bit stereo, interleaved). Recording runs only while `on`.
 #[derive(Default)]
 pub struct Capture {
     pub on: bool,
@@ -137,8 +146,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// `width` 4: 16-bit stereo frames; 2: 16-bit mono; 8: two 32-bit slots (the upper
-    /// 16 bits of each are the sample).
+    /// The PWM DAC's samples: `width` 4 is a 16-bit stereo frame, 2 a 16-bit mono sample.
     fn push(&mut self, data: &[u8], width: u64, rate: u32) {
         self.frames += data.len() as u64 / width.max(1);
         if !self.on {
@@ -146,12 +154,31 @@ impl Capture {
         }
         self.rate = rate;
         match width {
-            8 => self.samples.extend(data.as_chunks::<4>().0.iter().map(|b| i16::from_le_bytes([b[2], b[3]]))),
             4 => self.samples.extend(data.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]))),
             _ => self.samples.extend(data.as_chunks::<2>().0.iter().flat_map(|b| {
                 let v = i16::from_le_bytes([b[0], b[1]]);
                 [v, v]
             })),
+        }
+    }
+
+    /// What the I2S transmitter's TX FIFO takes, in 32-bit words: with a word length of 16
+    /// bits or less, one word is a stereo frame (left in the low half, right in the high
+    /// half); with longer words, one word is a channel slot (left, right, ...) holding the
+    /// sample in its low `bits` bits. Kept as 16-bit samples.
+    fn push_slots(&mut self, data: &[u8], bits: u32, rate: u32) {
+        let words = data.as_chunks::<4>().0;
+        let packed = bits <= 16;
+        self.frames += if packed { words.len() as u64 } else { words.len() as u64 / 2 };
+        if !self.on {
+            return;
+        }
+        self.rate = rate;
+        if packed {
+            self.samples.extend(words.iter().flat_map(|b| [i16::from_le_bytes([b[0], b[1]]), i16::from_le_bytes([b[2], b[3]])]));
+        } else {
+            let bits = bits.min(32);
+            self.samples.extend(words.iter().map(|b| ((u32::from_le_bytes(*b) << (32 - bits)) >> 16) as i16));
         }
     }
 }
@@ -190,7 +217,10 @@ impl I2s {
 
     pub fn write(&mut self, off: u64, v: u32, rate: u32) {
         match off {
-            I2S_TXDMA => self.capture.push(&v.to_le_bytes(), 4, rate),
+            I2S_TXDMA => {
+                let bits = self.word_bits();
+                self.capture.push_slots(&v.to_le_bytes(), bits, rate)
+            }
             _ => {
                 if let Some(r) = self.regs.get_mut((off / 4) as usize) {
                     *r = v;
@@ -375,7 +405,7 @@ impl AxiDmac {
             if !self.ch[k].enabled || !sinks.accepts(b.dar) || !sinks.running(b.dar) {
                 continue;
             }
-            let rate = sinks.rate(b.dar);
+            let rate = sinks.rate(b.dar, b.width);
             let c = &mut self.ch[k];
             c.owed += elapsed * rate as u64;
             let due = c.owed / 1_000_000_000;
@@ -405,6 +435,20 @@ impl AxiDmac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i2s_frames_by_word_length() {
+        let mut c = Capture { on: true, ..Capture::default() };
+        // 16-bit words: one 32-bit word per stereo frame (left low, right high)
+        c.push_slots(&[0x34, 0x12, 0x78, 0x56], 16, 48000);
+        assert_eq!(c.samples, vec![0x1234, 0x5678]);
+        assert_eq!(c.frames, 1);
+        // 24-bit words: one slot per channel, the sample in the low 24 bits
+        c.samples.clear();
+        c.push_slots(&[0x00, 0x34, 0x12, 0x00, 0x00, 0x78, 0x56, 0x00], 24, 48000);
+        assert_eq!(c.samples, vec![0x1234, 0x5678]);
+        assert_eq!(c.frames, 2);
+    }
 
     const BASE: u64 = 0x4000_0000;
 

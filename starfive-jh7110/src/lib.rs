@@ -18,4 +18,4 @@ pub mod sdio;
 pub mod wifi;
 pub mod xhci;
 
-pub use machine::{HartState, Machine, Soc, RAM_BASE, RAM_SIZE};
+pub use machine::{AudioSource, HartState, Machine, Soc, RAM_BASE, RAM_SIZE};

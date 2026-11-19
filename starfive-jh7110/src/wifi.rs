@@ -77,8 +77,8 @@ const BCME_UNSUPPORTED: i32 = -23;
 pub struct Bcm43456 {
     /// virtual time (ns) from the host's ticks
     now: u64,
-    /// a scan the host requested: (sync id, when its results are due)
-    pending_scan: Option<(u16, u64)>,
+    /// scans the host requested: (sync id, when the results are due), oldest first
+    pending_scans: VecDeque<(u16, u64)>,
     // function 0
     ioe: u8,
     ien: u8,
@@ -132,7 +132,7 @@ impl Default for Bcm43456 {
 impl Bcm43456 {
     pub fn new() -> Self {
         Bcm43456 {
-            now: 0, pending_scan: None,
+            now: 0, pending_scans: VecDeque::new(),
             ioe: 0, ien: 0, bus_if: 0, bus_speed: 0x01, brcm_cardctrl: 0, fn_blksize: [0; 3],
             window: 0, watermark: 0, devctl: 0, clkcsr: 0, pullup: 0, mesbusy: 0, sleepcsr: 0x03,
             ram: vec![0; RAM_SIZE as usize], regs: Default::default(), ram_written: false, running: false,
@@ -521,8 +521,15 @@ impl Bcm43456 {
             "escan" => {
                 // results come after the request's reply, as a real scan's do (Broadcom's
                 // bcmdhd ignores results that arrive before it has seen the reply)
+                // struct brcmf_escan_params_le { u32 version; u16 action; u16 sync_id; ... }:
+                // action 1 starts a scan, 3 aborts the ones in progress
+                let action = val.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(1);
                 let sync = val.get(6..8).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
-                self.pending_scan = Some((sync, self.now + 50_000_000));
+                if action == 3 {
+                    self.pending_scans.clear();
+                } else {
+                    self.pending_scans.push_back((sync, self.now + 50_000_000));
+                }
             }
             "event_msgs_ext" => {
                 // struct eventmsgs_ext { u8 ver, command, len, maxgetsize; u8 mask[] }:
@@ -782,16 +789,21 @@ impl SdioCard for Bcm43456 {
     fn set_trace(&mut self, on: bool) { self.trace = on; }
     fn tick(&mut self, now_ns: u64) {
         self.now = now_ns;
-        if let Some((sync, due)) = self.pending_scan {
-            if now_ns >= due {
-                self.pending_scan = None;
-                self.scan_results(sync);
+        while let Some(&(sync, due)) = self.pending_scans.front() {
+            if now_ns < due {
+                break;
             }
+            self.pending_scans.pop_front();
+            self.scan_results(sync);
         }
     }
 
+    fn next_event(&self) -> Option<u64> {
+        self.pending_scans.front().map(|&(_, due)| due)
+    }
+
     fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("bcm43456-v2");
+        w.tag("bcm43456-v3");
         for v in [self.ioe, self.ien, self.bus_if, self.bus_speed, self.brcm_cardctrl, self.watermark, self.devctl, self.clkcsr, self.pullup, self.mesbusy, self.sleepcsr, self.rx_seq, self.host_seq] { w.u8(v); }
         for v in self.fn_blksize { w.u16(v); }
         w.u32(self.window);
@@ -807,12 +819,16 @@ impl SdioCard for Bcm43456 {
         w.u64(self.net as u64);
         w.u8(match self.wpa { Wpa::Open => 0, Wpa::AwaitM2 => 1, Wpa::AwaitM4 => 2, Wpa::Installed => 3 });
         w.bytes(&self.pmk); w.bytes(&self.anonce); w.u64(self.replay);
+        w.u64(self.now);
+        w.u64(self.pending_scans.len() as u64);
+        for &(sync, due) in &self.pending_scans { w.u16(sync); w.u64(due); }
         // the firmware image in RAM is not needed once running (the emulated firmware replaces it)
     }
 
     fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
         let tag = r.bytes()?;
-        let v2 = tag == b"bcm43456-v2";
+        let v3 = tag == b"bcm43456-v3";
+        let v2 = v3 || tag == b"bcm43456-v2";
         if !v2 && tag != b"bcm43456-v1" { return Err(emu_core::snap::SnapError("snapshot layout mismatch: Wi-Fi chip".into())); }
         for v in [&mut self.ioe, &mut self.ien, &mut self.bus_if, &mut self.bus_speed, &mut self.brcm_cardctrl, &mut self.watermark, &mut self.devctl,
                   &mut self.clkcsr, &mut self.pullup, &mut self.mesbusy, &mut self.sleepcsr, &mut self.rx_seq, &mut self.host_seq] { *v = r.u8()?; }
@@ -832,6 +848,11 @@ impl SdioCard for Bcm43456 {
             self.pmk.copy_from_slice(&r.bytes()?[..32]);
             self.anonce.copy_from_slice(&r.bytes()?[..32]);
             self.replay = r.u64()?;
+        }
+        self.pending_scans.clear();
+        if v3 {
+            self.now = r.u64()?;
+            for _ in 0..r.u64()? { let sync = r.u16()?; let due = r.u64()?; self.pending_scans.push_back((sync, due)); }
         }
         self.rx_cur = None;
         self.tx_buf.clear();

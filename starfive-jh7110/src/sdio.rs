@@ -17,6 +17,10 @@ pub trait SdioCard {
     }
     /// time passes (ns): firmware timers, delayed events
     fn tick(&mut self, _now_ns: u64) {}
+    /// when the card next has something to do on its own (ns), for the machine's idle deadline
+    fn next_event(&self) -> Option<u64> {
+        None
+    }
     /// network frames the card transmitted (Ethernet II)
     fn take_tx(&mut self) -> Vec<Vec<u8>> { Vec::new() }
     /// a network frame for the card
