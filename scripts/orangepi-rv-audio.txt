@@ -1,0 +1,9 @@
+# Orange Pi RV audio: the PWM DAC (headphone jack) through the AXI DMA controller, with
+# mainline's jh7110_pwmdac and simple-audio-card. A 440 Hz sine plays for two periods of
+# speaker-test; the host writes what the DAC receives to --audio-out FILE.wav.
+wait-serial orangepi-rv#
+serial cat /proc/asound/cards | sed 's/^/CARD/'\n
+wait-serial CARD 0
+serial speaker-test -t sine -f 440 -c 2 -r 48000 -l 1 -s 1 2>&1 | grep -E 'Rate|Front' | sed 's/^/ST /'; echo AUDIO_""DONE\n
+wait-serial AUDIO_DONE
+quit

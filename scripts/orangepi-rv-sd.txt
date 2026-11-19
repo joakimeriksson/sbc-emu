@@ -1,0 +1,20 @@
+# Orange Pi RV microSD card (DesignWare MMC with IDMAC, card detect on GPIO41): an ext4 card made on the host, read,
+# written, verified after dropping the page cache (so data comes from the device), trimmed
+# (erase commands), and read again after a guest reboot.
+# Card: mkfs.ext4 -d DIR card.img 64M with DIR/hello.txt = HELLO_FROM_HOST, then
+#   sbc-emu run --board orangepi-rv ... --sd card.img --script scripts/orangepi-rv-sd.txt
+wait-serial orangepi-rv#
+serial cat /sys/block/mmcblk1/size | sed 's/^/SECTORS_/'\n
+wait-serial SECTORS_131072
+serial modprobe ext4; mount -t ext4 /dev/mmcblk1 /mnt && cat /mnt/hello.txt\n
+wait-serial HELLO_FROM_HOST
+serial echo guest-was-here > /mnt/guest.txt; dd if=/dev/urandom of=/mnt/blob bs=64k count=64 2>/dev/null; sha256sum /mnt/blob > /mnt/blob.sha; sync; echo 3 > /proc/sys/vm/drop_caches; sha256sum -c /mnt/blob.sha | sed 's/^/CHECK_/'\n
+wait-serial CHECK_/mnt/blob: OK
+serial fstrim -v /mnt && echo TRIM_DONE\n
+wait-serial TRIM_DONE
+serial umount /mnt; reboot -f\n
+wait-serial OpenSBI v1
+wait-serial orangepi-rv#
+serial modprobe ext4; mount -t ext4 /dev/mmcblk1 /mnt && cat /mnt/guest.txt && sha256sum -c /mnt/blob.sha | sed 's/^/AFTER_REBOOT_/'\n
+wait-serial AFTER_REBOOT_/mnt/blob: OK
+serial umount /mnt; poweroff -f\n

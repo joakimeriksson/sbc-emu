@@ -1,0 +1,25 @@
+# Orange Pi RV (JH7110) serial shell: OpenSBI + Alpine linux-stable + BusyBox initramfs.
+#   scripts/orangepi-rv-fixture.sh
+#   F=cache/orangepi-rv; sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $F/Image \
+#       --dtb $F/jh7110-orangepi-rv.dtb --initrd $F/initramfs.cpio.gz --script scripts/orangepi-rv-shell.txt
+wait-serial JH7110_BOOT_OK
+wait-serial orangepi-rv#
+serial uname -a\n
+wait-serial riscv64
+serial cat /proc/device-tree/model; echo\n
+wait-serial Orange Pi RV
+serial grep -c ^processor /proc/cpuinfo; grep -m1 isa /proc/cpuinfo; grep -m1 mmu /proc/cpuinfo\n
+wait-serial sv39
+serial free -m | head -2\n
+wait-serial Mem:
+serial awk 'BEGIN { x = atan2(1,1)*4; print "fp", x, sqrt(2) }'\n
+wait-serial fp 3.14159 1.41421
+serial date; sleep 1; date; echo SLEPT\n
+wait-serial SLEPT
+serial grep -E 'riscv-timer|serial|Rescheduling|Function call' /proc/interrupts\n
+wait-serial Function call interrupts
+serial for i in 1 2 3 4; do (n=0; while [ $n -lt 20000 ]; do n=$((n+1)); done; echo done$i) & done; wait; echo PAR_OK\n
+wait-serial PAR_OK
+serial echo SHELL_OK\n
+wait-serial SHELL_OK
+quit
