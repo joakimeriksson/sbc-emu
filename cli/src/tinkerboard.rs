@@ -5,7 +5,7 @@
 //! [`run_board`] is the RK3288 run loop shared with the RK3288 panel board (`panelboard.rs`): the
 //! boards differ only in their [`Profile`].
 use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
-use rockchip_rk3288::{boot, devices, Machine};
+use rockchip_rk3288::{boot, devices, HdmiMode as Mode, Machine};
 use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
 
@@ -35,7 +35,10 @@ impl SerialBoard for Machine {
         }
         let frames: u64 = self.soc.vop.iter().map(|v| v.frames).sum();
         if frames > 0 {
-            eprintln!("[{tag}] display: {frames} frames scanned out, {} DSI packets to the panel", self.soc.dsi.packets);
+            let size = self.soc.shown_size().map_or("off".to_string(), |(w, h)| format!("{w}x{h}"));
+            let dsi = self.soc.dsi.packets;
+            let panel = if dsi > 0 { format!(", {dsi} DSI packets to the panel") } else { String::new() };
+            eprintln!("[{tag}] display: {frames} frames scanned out, now {size}{panel}");
         }
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
@@ -100,6 +103,8 @@ pub(crate) struct Profile<'a> {
     /// The default `--net` mode (nat, local or none) when the board has a modelled network
     /// interface; None: no network and no `--net`.
     pub network: Option<&'static str>,
+    /// The HDMI port is in use: a monitor is connected (`--hdmi-mode WxH` picks its mode).
+    pub hdmi: bool,
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -114,11 +119,12 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             card_boot: true,
             power: devices::Peripherals::attach_rk808,
             banner: "experimental Rockchip RK3288: four Cortex-A12, GIC-400, UART2, CRU/GRF/PMU, boot ROM SMP \
-                     mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC, Mali-T760, RGA, I2S; no Ethernet, USB or \
-                     HDMI yet, other devices are stubs",
+                     mailbox, SD/eMMC (dw_mmc), I2C with the RK808 PMIC, VOP + DW HDMI with a monitor \
+                     (--hdmi-mode WxH), Mali-T760, RGA, I2S; no Ethernet or USB yet, other devices are stubs",
             setup: &|_| {},
             fixup_dtb: Ok,
             network: None,
+            hdmi: true,
         },
     )
 }
@@ -139,6 +145,10 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     if profile.network.is_some() {
         options.push("--net");
     }
+    if profile.hdmi {
+        options.push("--hdmi-mode");
+    }
+    let hdmi_mode = arg(args, "--hdmi-mode").map(Mode::parse).transpose()?.unwrap_or(Mode::MODES[1]);
     serial_board::validate_options(args, &options)?;
     let net = arg(args, "--net").or(profile.network).unwrap_or("none");
     if !matches!(net, "nat" | "local" | "none") {
@@ -192,6 +202,9 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
             m.set_jit(false);
         }
         (profile.setup)(&mut m);
+        if profile.hdmi {
+            m.connect_hdmi(&hdmi_mode);
+        }
         (profile.power)(&mut m.soc.periph, unix_now);
         if net != "none" {
             m.connect_network(net == "nat", trace_net);

@@ -1,7 +1,7 @@
 //! H3 display pipeline as Linux's `sun4i-drm` drives it: DE2 mixer 0 composes planes
 //! from RAM, TCON0 (the TV-timing "lcd-controller@1c0c000") produces vblank interrupts,
-//! and the Synopsys DesignWare HDMI controller with the H3 HDMI PHY reports a connected
-//! monitor whose EDID is read over the controller's DDC I2C master.
+//! and the Synopsys DesignWare HDMI controller (`peripherals::dw_hdmi`) with the H3 HDMI PHY
+//! reports a connected monitor whose EDID is read over the controller's DDC I2C master.
 //!
 //! Only what the drivers observe is modelled: register storage, the controller IDs, hot
 //! plug, EDID, PHY calibration status, interrupts. The frame shown is composed on demand
@@ -36,38 +36,8 @@ const TCON0_CTL: usize = 0x40 / 4;
 const TCON1_CTL: usize = 0x90 / 4;
 const ENABLE: u32 = 1 << 31;
 
-// DesignWare HDMI registers (byte offsets).
-const HDMI_DESIGN_ID: usize = 0x0000;
-const HDMI_IH_FIRST: usize = 0x0100;
-const HDMI_IH_LAST: usize = 0x0109;
-const HDMI_IH_PHY_STAT0: usize = 0x0104;
-const HDMI_IH_I2CM_STAT0: usize = 0x0105;
-const HDMI_IH_MUTE_FIRST: usize = 0x0180;
-const HDMI_IH_MUTE: usize = 0x01ff;
-const HDMI_PHY_STAT0: usize = 0x3004;
-const HDMI_PHY_MASK0: usize = 0x3006;
-const HDMI_PHY_POL0: usize = 0x3007;
-const HDMI_I2CM_SLAVE: usize = 0x7e00;
-const HDMI_I2CM_ADDRESS: usize = 0x7e01;
-const HDMI_I2CM_DATAI: usize = 0x7e03;
-const HDMI_I2CM_OPERATION: usize = 0x7e04;
-const HDMI_I2CM_SEGPTR: usize = 0x7e0a;
-const I2CM_READ: u8 = 0x01;
-const I2CM_READ_EXT: u8 = 0x02;
-const I2CM_WRITE: u8 = 0x10;
-const IH_I2CM_DONE: u8 = 0x02;
-const IH_I2CM_ERROR: u8 = 0x01;
-/// PHY_STAT0: TX PLL locked, hot plug detected, receiver sense on all four lanes.
-const PHY_STAT_CONNECTED: u8 = 0xf3;
-/// (PHY_STAT0 bit, IH_PHY_STAT0 bit): hot plug and the four receiver-sense lines.
-const PHY_INTERRUPTS: [(u8, u8); 5] = [
-    (0x02, 0x01),
-    (0x10, 0x04),
-    (0x20, 0x08),
-    (0x40, 0x10),
-    (0x80, 0x20),
-];
-const EDID_ADDRESS: u8 = 0x50;
+pub use peripherals::dw_hdmi::{edid, Mode};
+use peripherals::dw_hdmi::{DwHdmi, Identity};
 
 // H3 HDMI PHY: analog status (resistor calibration done, calibration and B values).
 const PHY_ANA_STS: usize = 0x38 / 4;
@@ -87,146 +57,12 @@ const CH_SIZE: u32 = 0x1000;
 const VI_CHANNELS: u32 = 1;
 const CHANNELS: u32 = 4;
 
-/// A display timing, as an EDID detailed timing descriptor describes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mode {
-    pub clock_khz: u32,
-    pub width: u32,
-    pub hfp: u32,
-    pub hsync: u32,
-    pub hbp: u32,
-    pub height: u32,
-    pub vfp: u32,
-    pub vsync: u32,
-    pub vbp: u32,
-    pub positive_sync: bool,
-}
-
-impl Mode {
-    /// The monitor modes offered as the EDID's preferred timing (`--hdmi-mode WxH`).
-    pub const MODES: [Mode; 3] = [
-        Mode {
-            clock_khz: 65_000,
-            width: 1024,
-            hfp: 24,
-            hsync: 136,
-            hbp: 160,
-            height: 768,
-            vfp: 3,
-            vsync: 6,
-            vbp: 29,
-            positive_sync: false,
-        },
-        Mode {
-            clock_khz: 74_250,
-            width: 1280,
-            hfp: 110,
-            hsync: 40,
-            hbp: 220,
-            height: 720,
-            vfp: 5,
-            vsync: 5,
-            vbp: 20,
-            positive_sync: true,
-        },
-        Mode {
-            clock_khz: 148_500,
-            width: 1920,
-            hfp: 88,
-            hsync: 44,
-            hbp: 148,
-            height: 1080,
-            vfp: 4,
-            vsync: 5,
-            vbp: 36,
-            positive_sync: true,
-        },
-    ];
-
-    pub fn find(width: u32, height: u32) -> Option<Mode> {
-        Self::MODES
-            .iter()
-            .copied()
-            .find(|m| m.width == width && m.height == height)
-    }
-
-    /// 18-byte EDID detailed timing descriptor.
-    fn descriptor(&self) -> [u8; 18] {
-        let hblank = self.hfp + self.hsync + self.hbp;
-        let vblank = self.vfp + self.vsync + self.vbp;
-        let (hmm, vmm) = (self.width * 520 / 1920, self.height * 290 / 1080);
-        let clock = (self.clock_khz / 10) as u16;
-        [
-            clock as u8,
-            (clock >> 8) as u8,
-            self.width as u8,
-            hblank as u8,
-            ((self.width >> 8) << 4 | hblank >> 8) as u8,
-            self.height as u8,
-            vblank as u8,
-            ((self.height >> 8) << 4 | vblank >> 8) as u8,
-            self.hfp as u8,
-            self.hsync as u8,
-            ((self.vfp & 0xf) << 4 | self.vsync & 0xf) as u8,
-            ((self.hfp >> 8) << 6 | (self.hsync >> 8) << 4 | (self.vfp >> 4) << 2 | self.vsync >> 4)
-                as u8,
-            hmm as u8,
-            vmm as u8,
-            ((hmm >> 8) << 4 | vmm >> 8) as u8,
-            0,
-            0,
-            // digital separate sync, with the polarities of the mode
-            0x18 | if self.positive_sync { 0x06 } else { 0 },
-        ]
-    }
-}
-
-/// A 128-byte EDID 1.3 for a DVI/HDMI monitor whose preferred mode is `mode`; it also lists
-/// 640x480, 800x600 and 1024x768 at 60 Hz.
-pub fn edid(mode: &Mode) -> [u8; 128] {
-    let mut e = [0u8; 128];
-    e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
-    let id = |c: u8| (c - b'A' + 1) as u16;
-    let maker = id(b'S') << 10 | id(b'B') << 5 | id(b'E');
-    e[8..10].copy_from_slice(&maker.to_be_bytes());
-    e[10..12].copy_from_slice(&1u16.to_le_bytes()); // product
-    e[16] = 1; // week
-    e[17] = (2026 - 1990) as u8;
-    e[18..20].copy_from_slice(&[1, 3]);
-    e[20] = 0x80; // digital input
-    e[21] = 52; // cm
-    e[22] = 29;
-    e[23] = 120; // gamma 2.2
-    e[24] = 0x0a; // RGB, preferred timing is the first descriptor
-    e[25..35].copy_from_slice(&[0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54]); // sRGB
-    e[35] = 0x21; // 640x480@60, 800x600@60
-    e[36] = 0x08; // 1024x768@60
-    for k in 0..8 {
-        e[38 + 2 * k] = 1;
-        e[39 + 2 * k] = 1;
-    }
-    e[54..72].copy_from_slice(&mode.descriptor());
-    // monitor name
-    e[72..77].copy_from_slice(&[0, 0, 0, 0xfc, 0]);
-    let name = b"sbc-emu HDMI\n";
-    e[77..77 + name.len()].copy_from_slice(name);
-    // range limits: 50-75 Hz, 30-83 kHz, 170 MHz
-    e[90..108].copy_from_slice(&[
-        0, 0, 0, 0xfd, 0, 50, 75, 30, 83, 17, 0, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    ]);
-    e[108..113].copy_from_slice(&[0, 0, 0, 0x10, 0]); // dummy descriptor
-    let sum = e[..127].iter().fold(0u8, |s, &b| s.wrapping_add(b));
-    e[127] = 0u8.wrapping_sub(sum);
-    e
-}
-
 /// The display pipeline's registers and state.
 pub struct Display {
     mixer: Vec<u32>,
     tcon: Vec<u32>,
-    hdmi: Vec<u8>,
+    hdmi: DwHdmi,
     phy: Vec<u32>,
-    edid: [u8; 128],
     /// The monitor's preferred mode.
     pub mode: Mode,
     /// Tick of the next vblank while TCON0 runs.
@@ -254,18 +90,11 @@ fn merge(old: u32, offset: u64, width: u64, value: u32) -> u32 {
 
 impl Display {
     pub fn new(mode: Mode) -> Self {
-        let mut hdmi = vec![0u8; HDMI_SIZE as usize];
-        // DesignWare HDMI TX v1.32a, vendor PHY (product 0xa0/0x01, CONFIG2 0xfe).
-        hdmi[HDMI_DESIGN_ID..HDMI_DESIGN_ID + 8]
-            .copy_from_slice(&[0x13, 0x2a, 0xa0, 0x01, 0, 0, 0xfe, 0]);
-        hdmi[HDMI_PHY_STAT0] = PHY_STAT_CONNECTED;
-        hdmi[HDMI_IH_MUTE] = 0x03;
         Self {
             mixer: vec![0; (MIXER_SIZE / 4) as usize],
             tcon: vec![0; (TCON_SIZE / 4) as usize],
-            hdmi,
+            hdmi: DwHdmi::new(Identity::H3, &mode),
             phy: vec![0; (HDMI_PHY_SIZE / 4) as usize],
-            edid: edid(&mode),
             mode,
             next_vblank: None,
             frames: 0,
@@ -300,7 +129,7 @@ impl Display {
         if Self::in_region(addr, width, HDMI_BASE, HDMI_SIZE) {
             let offset = (addr - HDMI_BASE) as usize;
             return Some(
-                (0..width as usize).fold(0, |v, k| v | (self.hdmi[offset + k] as u32) << (8 * k)),
+                (0..width as usize).fold(0, |v, k| v | (self.hdmi.read(offset + k) as u32) << (8 * k)),
             );
         }
         None
@@ -329,72 +158,15 @@ impl Display {
         if Self::in_region(addr, width, HDMI_BASE, HDMI_SIZE) {
             let offset = (addr - HDMI_BASE) as usize;
             for k in 0..width as usize {
-                self.hdmi_write(offset + k, (value >> (8 * k)) as u8);
+                self.hdmi.write(offset + k, (value >> (8 * k)) as u8);
             }
             return true;
         }
         false
     }
 
-    fn hdmi_write(&mut self, offset: usize, value: u8) {
-        match offset {
-            // identification and PHY status are read-only
-            0x0000..=0x0007 | HDMI_PHY_STAT0 => {}
-            // interrupt status: write one to clear
-            HDMI_IH_FIRST..=HDMI_IH_LAST => self.hdmi[offset] &= !value,
-            HDMI_I2CM_OPERATION => self.i2c_operation(value),
-            _ => self.hdmi[offset] = value,
-        }
-        self.phy_interrupts();
-    }
-
-    /// One DDC transfer of the I2C master: the monitor answers at the EDID address only.
-    fn i2c_operation(&mut self, op: u8) {
-        let device = self.hdmi[HDMI_I2CM_SLAVE] & 0x7f;
-        let register = self.hdmi[HDMI_I2CM_ADDRESS] as usize;
-        let status = if device != EDID_ADDRESS {
-            IH_I2CM_ERROR
-        } else if op & (I2CM_READ | I2CM_READ_EXT) != 0 {
-            let segment = if op & I2CM_READ_EXT != 0 {
-                self.hdmi[HDMI_I2CM_SEGPTR] as usize
-            } else {
-                0
-            };
-            self.hdmi[HDMI_I2CM_DATAI] = self
-                .edid
-                .get(segment * 256 + register)
-                .copied()
-                .unwrap_or(0xff);
-            IH_I2CM_DONE
-        } else if op & I2CM_WRITE != 0 {
-            IH_I2CM_DONE
-        } else {
-            return;
-        };
-        self.hdmi[HDMI_IH_I2CM_STAT0] |= status;
-    }
-
-    /// A PHY status line at the level PHY_POL0 selects raises its interrupt (the driver
-    /// flips the polarity after each hot plug or receiver-sense interrupt).
-    fn phy_interrupts(&mut self) {
-        let (stat, mask, pol) = (
-            self.hdmi[HDMI_PHY_STAT0],
-            self.hdmi[HDMI_PHY_MASK0],
-            self.hdmi[HDMI_PHY_POL0],
-        );
-        for (line, interrupt) in PHY_INTERRUPTS {
-            if mask & line == 0 && stat & line == pol & line {
-                self.hdmi[HDMI_IH_PHY_STAT0] |= interrupt;
-            }
-        }
-    }
-
     pub fn hdmi_irq(&self) -> bool {
-        if self.hdmi[HDMI_IH_MUTE] & 1 != 0 {
-            return false;
-        }
-        (HDMI_IH_FIRST..=HDMI_IH_LAST)
-            .any(|r| self.hdmi[r] & !self.hdmi[HDMI_IH_MUTE_FIRST + r - HDMI_IH_FIRST] != 0)
+        self.hdmi.irq()
     }
 
     fn tcon_running(&self) -> bool {
@@ -649,60 +421,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edid_is_valid_and_prefers_the_mode() {
-        let e = edid(&Mode::MODES[1]);
-        assert_eq!(e.iter().fold(0u8, |s, &b| s.wrapping_add(b)), 0, "checksum");
-        assert_eq!(&e[..8], &[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
-        assert_eq!(u16::from_le_bytes([e[54], e[55]]), 7425, "74.25 MHz");
-        assert_eq!(e[56] as u32 | (e[58] as u32 >> 4) << 8, 1280);
-        assert_eq!(e[59] as u32 | (e[61] as u32 >> 4) << 8, 720);
-    }
-
-    fn write_hdmi(d: &mut Display, reg: usize, value: u8) {
-        assert!(d.write(HDMI_BASE + reg as u64, 1, value as u32));
-    }
-
-    #[test]
-    fn hdmi_identifies_and_reads_edid_over_ddc() {
+    fn hdmi_controller_answers_on_the_bus() {
         let mut d = Display::default();
         assert_eq!(d.read(HDMI_BASE, 4), Some(0x01a0_2a13));
         assert_eq!(d.read(HDMI_BASE + 6, 1), Some(0xfe), "vendor PHY");
-        write_hdmi(&mut d, HDMI_IH_MUTE, 0);
-        write_hdmi(&mut d, HDMI_IH_MUTE_FIRST + 5, 0); // unmute I2CM
-        write_hdmi(&mut d, HDMI_I2CM_SLAVE, 0x50);
-        let mut bytes = Vec::new();
-        for register in 0..128u8 {
-            write_hdmi(&mut d, HDMI_I2CM_ADDRESS, register);
-            write_hdmi(&mut d, HDMI_I2CM_OPERATION, I2CM_READ);
-            assert!(d.hdmi_irq());
-            assert_eq!(
-                d.read(HDMI_BASE + HDMI_IH_I2CM_STAT0 as u64, 1),
-                Some(IH_I2CM_DONE as u32)
-            );
-            write_hdmi(&mut d, HDMI_IH_I2CM_STAT0, IH_I2CM_DONE);
-            assert!(!d.hdmi_irq());
-            bytes.push(d.read(HDMI_BASE + HDMI_I2CM_DATAI as u64, 1).unwrap() as u8);
-        }
-        assert_eq!(bytes, edid(&Mode::MODES[1]).to_vec());
-        write_hdmi(&mut d, HDMI_I2CM_SLAVE, 0x37);
-        write_hdmi(&mut d, HDMI_I2CM_OPERATION, I2CM_READ);
-        assert_eq!(
-            d.read(HDMI_BASE + HDMI_IH_I2CM_STAT0 as u64, 1),
-            Some(IH_I2CM_ERROR as u32)
-        );
-    }
-
-    #[test]
-    fn hot_plug_interrupt_follows_polarity() {
-        let mut d = Display::default();
-        write_hdmi(&mut d, HDMI_IH_MUTE, 0);
-        write_hdmi(&mut d, HDMI_PHY_MASK0, !0x02);
-        write_hdmi(&mut d, HDMI_PHY_POL0, 0x02); // interrupt while plugged
-        assert_ne!(d.hdmi[HDMI_IH_PHY_STAT0] & 1, 0);
+        assert!(d.write(HDMI_BASE + 0x01ff, 1, 0)); // unmute
+        assert!(d.write(HDMI_BASE + 0x3006, 1, !0x02)); // hot plug unmasked
+        assert!(d.write(HDMI_BASE + 0x3007, 1, 0x02)); // interrupt while plugged
         assert!(d.hdmi_irq());
-        write_hdmi(&mut d, HDMI_PHY_POL0, 0); // now wait for unplug
-        write_hdmi(&mut d, HDMI_IH_PHY_STAT0, 0xff);
-        assert!(!d.hdmi_irq());
     }
 
     #[test]

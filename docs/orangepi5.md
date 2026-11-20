@@ -121,7 +121,7 @@ The card numbers depend on which driver binds first, so use the names (`hw:CARD=
 - `rockchip,es8388` (`rockchipes8388`): the headphone jack. The ES8388 codec sits on I2C6 at 0x10 and masters the clocks of I2S1 (`rockchip,rk3588-i2s-tdm`) from its 12.288 MHz MCLK, so it plays the 48 kHz family of rates (8-96 kHz; ALSA's `plughw`/`default` resample others). The codec's DAC mute and volume, its output mixer, the power of the DAC and the outputs and the `Output 1` volume set what reaches the jack. Recording from it works and gives silence.
 - `hdmi0`: HDMI audio on I2S5, the clock master. The divided fixed MCLK is snapped to the standard rate it approximates. Its codec is the HDMI transmitter's (`hdmi-codec`), with the rates and channels of the monitor's EDID (32, 44.1 and 48 kHz stereo). With `--no-display`, a plain I2S transmitter stands in.
 
-DMA controllers DMAC0 and DMAC1 (Arm PL330, the shared model in `peripherals/`) feed the I2S FIFOs, which drain at the sample rate in virtual time. `--audio-out FILE` keeps what the headphone jack plays and `--hdmi-audio-out FILE` what HDMI plays: a `.wav` file, or raw 16-bit stereo for any other path (a named pipe for a live player, `ffplay -f s16le -ar RATE -ch_layout stereo PIPE`).
+DMA controllers DMAC0 (for I2S1) and DMAC2 (for I2S5), Arm PL330s (the shared model in `peripherals/`), feed the I2S FIFOs, which drain at the sample rate in virtual time. `--audio-out FILE` keeps what the headphone jack plays and `--hdmi-audio-out FILE` what HDMI plays: a `.wav` file, or raw 16-bit stereo for any other path (a named pipe for a live player, `ffplay -f s16le -ar RATE -ch_layout stereo PIPE`).
 
 ```sh
 sbc-emu run --board orangepi5 --sd Armbian.img --audio-out hp.wav --hdmi-audio-out hdmi.wav

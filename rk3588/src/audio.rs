@@ -2,7 +2,7 @@
 //!
 //! - the headphone jack: the ES8388 codec on I2C6 (`es8388`), its I2S on I2S1
 //!   (`i2s_tdm`, the codec masters the clocks), fed by DMAC0 (PL330) requests 2 (TX) and 3 (RX);
-//! - HDMI0: I2S5 (clock master, from a fixed 98.304 MHz MCLK), fed by DMAC1 request 2. The
+//! - HDMI0: I2S5 (clock master, from a fixed 98.304 MHz MCLK), fed by DMAC2 request 2. The
 //!   HDMI transmitter itself is not modelled (the firmware's framebuffer drives the display):
 //!   its I2S input is a plain transmitter codec in the DT, and what I2S5 sends is what the
 //!   monitor plays.
@@ -16,10 +16,11 @@ use crate::i2s_tdm::{self, I2sTdm};
 use peripherals::pl330::{Pl330, Pl330Bus};
 
 pub const DMAC0: u64 = 0xfea1_0000;
-pub const DMAC1: u64 = 0xfea3_0000;
+/// DMAC2 (DMAC1, at 0xfea30000, serves no modelled device and is left out).
+pub const DMAC2: u64 = 0xfed1_0000;
 pub const DMAC_SIZE: u64 = 0x4000;
 /// Each DMA controller's two interrupt lines (events 0 and 1).
-pub const DMAC_IRQS: [[usize; 2]; 2] = [[32 + 86, 32 + 87], [32 + 88, 32 + 89]];
+pub const DMAC_IRQS: [[usize; 2]; 2] = [[32 + 86, 32 + 87], [32 + 90, 32 + 91]];
 pub const I2S1: u64 = 0xfe48_0000;
 pub const I2S5: u64 = 0xfddf_0000;
 pub const I2S1_IRQ: usize = 32 + 181;
@@ -35,7 +36,7 @@ pub const PERI_I2S1_RX: u8 = 3;
 pub const PERI_I2S5_TX: u8 = 2;
 
 pub struct Audio {
-    /// DMAC0 and DMAC1
+    /// DMAC0 and DMAC2
     pub dmac: [Pl330; 2],
     /// I2S1 (headphones) and I2S5 (HDMI0)
     pub i2s1: I2sTdm,
@@ -119,7 +120,7 @@ impl Audio {
 
     /// Whether `addr` is one of the audio devices' registers.
     pub fn contains(addr: u64) -> bool {
-        [(DMAC0, DMAC_SIZE), (DMAC1, DMAC_SIZE), (I2S1, i2s_tdm::SIZE), (I2S5, i2s_tdm::SIZE), (I2C6, 0x1000)]
+        [(DMAC0, DMAC_SIZE), (DMAC2, DMAC_SIZE), (I2S1, i2s_tdm::SIZE), (I2S5, i2s_tdm::SIZE), (I2C6, 0x1000)]
             .iter()
             .any(|&(b, s)| (b..b + s).contains(&addr))
     }
@@ -127,7 +128,7 @@ impl Audio {
     pub fn read(&mut self, addr: u64) -> u32 {
         match addr {
             a if (DMAC0..DMAC0 + DMAC_SIZE).contains(&a) => self.dmac[0].read(a - DMAC0),
-            a if (DMAC1..DMAC1 + DMAC_SIZE).contains(&a) => self.dmac[1].read(a - DMAC1),
+            a if (DMAC2..DMAC2 + DMAC_SIZE).contains(&a) => self.dmac[1].read(a - DMAC2),
             a if (I2S1..I2S1 + i2s_tdm::SIZE).contains(&a) => self.i2s1.read(a - I2S1),
             a if (I2S5..I2S5 + i2s_tdm::SIZE).contains(&a) => self.i2s5.read(a - I2S5),
             a if (I2C6..I2C6 + 0x1000).contains(&a) => self.i2c6.read(a - I2C6),
@@ -142,9 +143,9 @@ impl Audio {
                 let Audio { dmac, i2s1, .. } = self;
                 dmac[0].write(a - DMAC0, value, &mut DmaBus { ram, i2s: i2s1, base: I2S1, peri: (PERI_I2S1_TX, Some(PERI_I2S1_RX)) });
             }
-            a if (DMAC1..DMAC1 + DMAC_SIZE).contains(&a) => {
+            a if (DMAC2..DMAC2 + DMAC_SIZE).contains(&a) => {
                 let Audio { dmac, i2s5, .. } = self;
-                dmac[1].write(a - DMAC1, value, &mut DmaBus { ram, i2s: i2s5, base: I2S5, peri: (PERI_I2S5_TX, None) });
+                dmac[1].write(a - DMAC2, value, &mut DmaBus { ram, i2s: i2s5, base: I2S5, peri: (PERI_I2S5_TX, None) });
             }
             a if (I2S1..I2S1 + i2s_tdm::SIZE).contains(&a) => self.i2s1.write(a - I2S1, value, now),
             a if (I2S5..I2S5 + i2s_tdm::SIZE).contains(&a) => self.i2s5.write(a - I2S5, value, now),
@@ -208,9 +209,16 @@ fn play(dmac: &mut Pl330, bus: &mut DmaBus, now: u64, codec: Option<u32>) {
             return;
         }
         let next = if dmac.waiting() { bus.i2s.next_deadline() } else { None };
+        // A DMA program that has ended with its interrupt pending waits for the guest's
+        // handler to start the next period. The threaded machine's I/O loop sees that
+        // restart only on a later call, so rather than underrun, the I2S clock holds when
+        // its FIFO runs dry (as an elastic buffer would).
+        let pending = !dmac.waiting() && (0..2).any(|l| dmac.irq(l));
+        let hold = if pending { bus.i2s.tx_dry_at() } else { None };
         let t = next.map_or(now, |d| d.min(now));
+        let t = hold.map_or(t, |h| h.min(t));
         bus.i2s.update(t, I2S_MCLK, codec);
-        if t >= now {
+        if t >= now || hold.is_some_and(|h| h <= t) {
             if dmac.waiting() {
                 dmac.run(bus);
             }

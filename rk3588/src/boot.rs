@@ -208,7 +208,7 @@ fn audio_nodes(f:&mut Fdt,hdmi:bool) {
     let reg=|f:&mut Fdt,base:u64,size:u64|f.cells("reg",&[0,base as u32,0,size as u32]);
     f.begin("i2s-mclk");f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[I2S_MCLK as u32]);f.cells("phandle",&[PH_I2S_MCLK]);f.end();
     f.begin("es8388-mclk");f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[crate::es8388::MCLK as u32]);f.cells("phandle",&[PH_CODEC_MCLK]);f.end();
-    for (k,base) in [DMAC0,DMAC1].into_iter().enumerate() {
+    for (k,base) in [DMAC0,DMAC2].into_iter().enumerate() {
         f.begin(&format!("dma-controller@{base:x}"));f.strs("compatible",&["arm,pl330","arm,primecell"]);reg(f,base,DMAC_SIZE);
         f.cells("interrupts",&[0,(DMAC_IRQS[k][0]-32) as u32,4,0,(DMAC_IRQS[k][1]-32) as u32,4]);f.empty("arm,pl330-periph-burst");
         f.cells("clocks",&[2]);f.str("clock-names","apb_pclk");f.cells("#dma-cells",&[1]);f.cells("phandle",&[PH_DMAC[k]]);f.end();
