@@ -1,5 +1,7 @@
-//! C ABI over the Pi 4B machine for the browser (no wasm-bindgen; see web/worker.js).
-//! Single-threaded: one machine per module instance, driven from a Web Worker.
+//! C ABI over the emulated boards for the browser (no wasm-bindgen; see web/worker.js): the
+//! Pi 4B, and the Tinker Board S (RK3288, `sbc_boot_tinker*`). Single-threaded: one machine
+//! per module instance, driven from a Web Worker. Exports for devices only one board has (the
+//! Pi's USB keyboard, GPIO, sensors, audio) do nothing on the other.
 #![allow(clippy::missing_safety_doc)]
 use emu_core::disk::Disk;
 use bcm2711::{Machine, Stop};
@@ -34,8 +36,37 @@ impl Disk for WebDisk {
     fn write(&mut self, lba: u64, data: &[u8]) { self.overlay.store(lba, data, self.sectors); }
 }
 
+/// The board this module instance runs.
+enum Board {
+    Pi(Machine),
+    Tinker(Box<rockchip_rk3288::Machine>, TinkerBoot),
+}
+
+/// How a Tinker Board was started, so a reset (`reboot`) starts it the same way.
+struct TinkerBoot {
+    /// The RTC's time at power-on (Unix seconds).
+    unix0: f64,
+    /// Direct boot (kernel, stock DTB, initrd, command line); None = from the SD card.
+    direct: Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, String)>,
+}
+
+impl Board {
+    fn run(&mut self, budget: u64) -> Stop {
+        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget) }
+    }
+    fn now(&self) -> u64 {
+        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now() }
+    }
+    fn idle_until(&mut self, t: u64) {
+        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t) }
+    }
+    fn instret(&self) -> u64 {
+        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret() }
+    }
+}
+
 struct State {
-    m: Machine,
+    m: Board,
     fb: Vec<u8>,
     fb_w: u32,
     fb_h: u32,
@@ -48,14 +79,21 @@ struct State {
     wall_offset: Option<f64>,
 }
 
+impl State {
+    fn new(m: Board, wall_offset: Option<f64>) -> State {
+        State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset }
+    }
+}
+
 thread_local! { static ST: RefCell<Option<State>> = const { RefCell::new(None) }; }
 thread_local! { static SMP: std::cell::Cell<usize> = const { std::cell::Cell::new(4) }; }
 // The HDMI monitor's preferred mode for machines booted with the display pipeline (0 = the
-// firmware framebuffer only, no vc4/V3D)
+// firmware framebuffer only, no vc4/V3D, on the Pi; the Tinker Board's monitor then offers 720p)
 thread_local! { static KMS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) }; }
 
 /// Machines booted after this call get the vc4 display pipeline (an HDMI monitor of `w`x`h`)
 /// and the V3D 3D GPU, as `dtoverlay=vc4-kms-v3d` asks; 0x0 leaves the firmware framebuffer.
+/// On the Tinker Board it picks the emulated monitor's mode (1024x768, 1280x720, 1920x1080).
 #[no_mangle]
 pub extern "C" fn sbc_kms(w: u32, h: u32) { KMS.with(|c| c.set((w, h))); }
 
@@ -74,6 +112,11 @@ pub extern "C" fn sbc_smp(n: u32) { SMP.with(|c| c.set((n as usize).clamp(1, 4))
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> { ST.with(|s| s.borrow_mut().as_mut().map(f)) }
 
+/// The Pi, if that is the board running (for the exports of its own devices).
+fn with_pi<R>(f: impl FnOnce(&mut Machine) -> R) -> Option<R> {
+    with(|s| match &mut s.m { Board::Pi(m) => Some(f(m)), Board::Tinker(..) => None }).flatten()
+}
+
 /// Allocate `len` bytes the page can copy a file into (leaked until the page reloads).
 #[no_mangle]
 pub extern "C" fn sbc_alloc(len: usize) -> *mut u8 { Box::leak(vec![0u8; len].into_boxed_slice()).as_mut_ptr() }
@@ -88,7 +131,7 @@ pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *co
     };
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     if bcm2711::boot::boot_linux(&mut m, kernel, initrd, &cmdline, true).is_err() { return -1; }
-    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi(m), Some(0.0))));
     0
 }
 
@@ -103,14 +146,73 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     m.connect_network(false, false);
     add_gpu(&mut m);
     if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { return -1; }
-    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: Some(0.0) }));
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi(m), Some(0.0))));
     0
 }
+
+/// A Tinker Board S as the CLI's `--board tinkerboard` builds it: the RK808 PMIC with its RTC
+/// at `unix` seconds, an HDMI monitor (`sbc_kms` picks its mode), user networking, the card.
+fn tinker_machine(ram_bytes: usize, unix: f64, disk: Option<Box<dyn Disk>>) -> rockchip_rk3288::Machine {
+    use rockchip_rk3288::HdmiMode;
+    let mut m = rockchip_rk3288::Machine::with_ram_size(ram_bytes);
+    let (w, h) = KMS.with(|c| c.get());
+    m.connect_hdmi(&HdmiMode::find(w, h).unwrap_or(HdmiMode::MODES[1]));
+    m.soc.periph.attach_rk808(unix as i64);
+    m.connect_network(false, false);
+    m.soc.periph.insert_sd(disk);
+    m
+}
+
+/// Boot a Tinker Board the way `how` says.
+fn tinker_boot(m: &mut rockchip_rk3288::Machine, how: &TinkerBoot) -> Result<(), String> {
+    match &how.direct {
+        Some((kernel, dtb, initrd, cmdline)) => rockchip_rk3288::boot::boot_linux(m, kernel, dtb, initrd.as_deref(), cmdline).map(|_| ()),
+        None => rockchip_rk3288::boot::boot_from_card(m, "").map(|_| ()),
+    }
+}
+
+/// Tinker Board S: boot a zImage with the stock device tree (patched the way U-Boot does) and
+/// an optional initramfs; an empty command line is the board's default (console on UART2).
+/// `unix_now` sets the RTC. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_tinker(ram_mb: u32, unix_now: f64, k: *const u8, klen: usize, d: *const u8, dlen: usize,
+                                         i: *const u8, ilen: usize, c: *const u8, clen: usize) -> i32 {
+    let kernel = std::slice::from_raw_parts(k, klen).to_vec();
+    let dtb = std::slice::from_raw_parts(d, dlen).to_vec();
+    let initrd = (ilen > 0).then(|| std::slice::from_raw_parts(i, ilen).to_vec());
+    let cmdline = if clen > 0 { String::from_utf8_lossy(std::slice::from_raw_parts(c, clen)).into_owned() } else {
+        rockchip_rk3288::boot::DEFAULT_CMDLINE.to_string()
+    };
+    let how = TinkerBoot { unix0: unix_now, direct: Some((kernel, dtb, initrd, cmdline)) };
+    let mut m = tinker_machine((ram_mb as usize) << 20, unix_now, None);
+    if tinker_boot(&mut m, &how).is_err() { return -1; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Tinker(Box::new(m), how), Some(0.0))));
+    0
+}
+
+/// Tinker Board S: boot an SD card image (Armbian and similar) served by the page, the way
+/// the board's U-Boot does (`/boot/armbianEnv.txt`, zImage, dtb, uInitrd). Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_tinker_sd(ram_mb: u32, unix_now: f64, sectors: f64) -> i32 {
+    let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
+    let how = TinkerBoot { unix0: unix_now, direct: None };
+    let mut m = tinker_machine((ram_mb as usize) << 20, unix_now, Some(disk));
+    if tinker_boot(&mut m, &how).is_err() { return -2; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Tinker(Box::new(m), how), Some(0.0))));
+    0
+}
+
+/// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board.
+#[no_mangle]
+pub extern "C" fn sbc_board() -> u32 { with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2 }).unwrap_or(0) }
 
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
 #[no_mangle]
 pub extern "C" fn sbc_jit(on: u32) -> u32 {
-    with(|s| { if on != 0 { s.m.enable_jit() as u32 } else { s.m.disable_jit(); 0 } }).unwrap_or(0)
+    with(|s| match &mut s.m {
+        Board::Pi(m) => if on != 0 { m.enable_jit() as u32 } else { m.disable_jit(); 0 },
+        Board::Tinker(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
+    }).unwrap_or(0)
 }
 
 /// JIT profiling: count the instructions compiled blocks hand to the interpreter (1 on).
@@ -128,21 +230,26 @@ pub unsafe extern "C" fn sbc_jit_fallbacks(out: *mut u64, n: usize) -> usize {
 
 /// JIT: executions before a block is compiled.
 #[no_mangle]
-pub extern "C" fn sbc_jit_hot(n: u32) { with(|s| { if let Some(j) = s.m.jit_mut() { j.hot = n.max(1); } }); }
+pub extern "C" fn sbc_jit_hot(n: u32) {
+    with(|s| match &mut s.m {
+        Board::Pi(m) => { if let Some(j) = m.jit_mut() { j.hot = n.max(1); } }
+        Board::Tinker(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
+    });
+}
 
 /// JIT: guest instructions retired inside compiled blocks (per mille of all).
 #[no_mangle]
-pub extern "C" fn sbc_jit_coverage() -> u32 { with(|s| s.m.jit().map_or(0, |j| (j.exec_insns * 1000 / s.m.instret().max(1)) as u32)).unwrap_or(0) }
+pub extern "C" fn sbc_jit_coverage() -> u32 { with_pi(|m| m.jit().map_or(0, |j| (j.exec_insns * 1000 / m.instret().max(1)) as u32)).unwrap_or(0) }
 
 /// JIT verify mode (every block re-run in the interpreter): 1 on.
 #[no_mangle]
-pub extern "C" fn sbc_jit_verify(on: u32) { with(|s| { if let Some(j) = s.m.jit_mut() { j.verify = on != 0; } }); }
+pub extern "C" fn sbc_jit_verify(on: u32) { with_pi(|m| { if let Some(j) = m.jit_mut() { j.verify = on != 0; } }); }
 
 /// The first JIT/interpreter mismatch found in verify mode (length; text via sbc_uart_ptr-style buffer).
 #[no_mangle]
 pub extern "C" fn sbc_jit_report(out: *mut u8, cap: usize) -> usize {
-    with(|s| {
-        let r = s.m.jit().and_then(|j| j.report.clone()).unwrap_or_default();
+    with_pi(|m| {
+        let r = m.jit().and_then(|j| j.report.clone()).unwrap_or_default();
         let n = r.len().min(cap);
         // SAFETY: the caller provides `cap` writable bytes
         unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), out, n) };
@@ -152,30 +259,40 @@ pub extern "C" fn sbc_jit_report(out: *mut u8, cap: usize) -> usize {
 
 /// JIT counters: compiled blocks.
 #[no_mangle]
-pub extern "C" fn sbc_jit_blocks() -> f64 { with(|s| s.m.jit().map(|j| j.compiled as f64).unwrap_or(0.0)).unwrap_or(0.0) }
+pub extern "C" fn sbc_jit_blocks() -> f64 {
+    with(|s| match &s.m {
+        Board::Pi(m) => m.jit().map(|j| j.compiled as f64).unwrap_or(0.0),
+        Board::Tinker(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
+    }).unwrap_or(0.0)
+}
 
 /// USB keyboard: press (down=1) or release (down=0) a key by HID usage code.
 #[no_mangle]
-pub extern "C" fn sbc_key(usage: u32, down: u32) { with(|s| s.m.soc.devs.kbd.key(usage as u8, down != 0)); }
+pub extern "C" fn sbc_key(usage: u32, down: u32) { with_pi(|m| m.soc.devs.kbd.key(usage as u8, down != 0)); }
 
-/// USB keyboard: type one byte of text (US layout).
 /// The USB tablet: buttons (bit 0 left, 1 right, 2 middle), position 0..=32767, wheel clicks.
 #[no_mangle]
 pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
-    with(|s| s.m.soc.devs.tablet.pointer(buttons as u8 & 7, x.min(32767) as u16, y.min(32767) as u16, wheel.clamp(-127, 127) as i8));
+    with_pi(|m| m.soc.devs.tablet.pointer(buttons as u8 & 7, x.min(32767) as u16, y.min(32767) as u16, wheel.clamp(-127, 127) as i8));
 }
 
 /// What the guest played on the I²S DAC since the last call: the number of 16-bit samples
 /// (interleaved stereo) now at `sbc_audio_ptr`, played at `sbc_audio_rate` Hz.
 #[no_mangle]
-pub extern "C" fn sbc_audio_take() -> usize { with(|s| { s.audio = std::mem::take(&mut s.m.soc.i2s.out); s.audio.len() }).unwrap_or(0) }
+pub extern "C" fn sbc_audio_take() -> usize {
+    with(|s| {
+        s.audio = match &mut s.m { Board::Pi(m) => std::mem::take(&mut m.soc.i2s.out), Board::Tinker(..) => Vec::new() };
+        s.audio.len()
+    }).unwrap_or(0)
+}
 #[no_mangle]
 pub extern "C" fn sbc_audio_ptr() -> *const i16 { with(|s| s.audio.as_ptr()).unwrap_or(std::ptr::null()) }
 #[no_mangle]
-pub extern "C" fn sbc_audio_rate() -> u32 { with(|s| s.m.soc.i2s.rate).unwrap_or(0) }
+pub extern "C" fn sbc_audio_rate() -> u32 { with_pi(|m| m.soc.i2s.rate).unwrap_or(0) }
 
+/// USB keyboard: type one byte of text (US layout).
 #[no_mangle]
-pub extern "C" fn sbc_type(b: u32) { with(|s| s.m.soc.devs.kbd.type_byte(b as u8)); }
+pub extern "C" fn sbc_type(b: u32) { with_pi(|m| m.soc.devs.kbd.type_byte(b as u8)); }
 
 /// Run up to `budget` instructions with the page's wall clock `wall_ns` (real-time pacing).
 /// Returns 0 = budget used, 1 = idle (wait `sbc_wait_ms()` or until input), 2 = stopped.
@@ -183,7 +300,7 @@ pub extern "C" fn sbc_type(b: u32) { with(|s| s.m.soc.devs.kbd.type_byte(b as u8
 pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
     with(|s| {
         if s.stop.is_some() { return 2; }
-        let off = *s.wall_offset.get_or_insert(s.m.now as f64 - wall_ns);
+        let off = *s.wall_offset.get_or_insert(s.m.now() as f64 - wall_ns);
         let wall = (wall_ns + off).max(0.0) as u64;
         let end = s.m.instret() + budget as u64;
         loop {
@@ -192,23 +309,25 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
             match s.m.run(left) {
                 Stop::Budget => break 0,
                 Stop::Idle(t) => {
-                    let target = t.min(wall.max(s.m.now));
-                    if target > s.m.now { s.m.idle_until(target); continue; }
-                    s.wait_ms = ((t - s.m.now) as f64 / 1e6).min(20.0);
+                    let now = s.m.now();
+                    let target = t.min(wall.max(now));
+                    if target > now {
+                        s.m.idle_until(target);
+                        // the Tinker Board's clock moves in whole timer ticks: a target between
+                        // two ticks leaves it where it was, so wait for the wall clock instead
+                        if s.m.now() > now { continue; }
+                    }
+                    s.wait_ms = (t.saturating_sub(now) as f64 / 1e6).min(20.0);
                     break 1;
                 }
                 Stop::Reset => {
-                    let disk = s.m.soc.sd.disk.take();
-                    match disk.map(|mut d| (bcm2711::boot::read_sd_boot(d.as_mut()), d)) {
-                        Some((Ok(b), d)) => {
-                            let ram = s.m.soc.ram.len();
-                            let mut m = Machine::with_cpus(ram, smp());
-                            m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(d));
-                            add_gpu(&mut m);
-                            if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { s.stop = Some(Stop::Reset); break 2; }
-                            s.m = m;
-                        }
-                        _ => { s.stop = Some(Stop::Reset); break 2; }
+                    let restarted = match &mut s.m {
+                        Board::Pi(old) => pi_restart(old).map(Board::Pi),
+                        Board::Tinker(old, how) => tinker_restart(old, how),
+                    };
+                    match restarted {
+                        Some(m) => s.m = m,
+                        None => { s.stop = Some(Stop::Reset); break 2; }
                     }
                 }
                 other => { s.stop = Some(other); break 2; }
@@ -217,14 +336,39 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
     }).unwrap_or(2)
 }
 
+/// Start the Pi again from its SD card (after a reset).
+fn pi_restart(old: &mut Machine) -> Option<Machine> {
+    let mut d = old.soc.sd.disk.take()?;
+    let b = bcm2711::boot::read_sd_boot(d.as_mut()).ok()?;
+    let mut m = Machine::with_cpus(old.soc.ram.len(), smp());
+    m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(d));
+    add_gpu(&mut m);
+    bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).ok()?;
+    Some(m)
+}
+
+/// Start a Tinker Board again the way it was started, with the same card (after a reset).
+fn tinker_restart(old: &mut rockchip_rk3288::Machine, how: &mut TinkerBoot) -> Option<Board> {
+    let disk = old.soc.periph.mmc[rockchip_rk3288::devices::SDMMC].card.take_disk();
+    let unix = how.unix0 + old.now() as f64 / 1e9;
+    let mut m = tinker_machine(old.soc.ram.mem.len(), unix, disk);
+    let jit = old.jit_enabled();
+    tinker_boot(&mut m, how).ok()?;
+    m.set_jit(jit);
+    let how = TinkerBoot { unix0: unix, direct: how.direct.take() };
+    Some(Board::Tinker(Box::new(m), how))
+}
+
 #[no_mangle]
 pub extern "C" fn sbc_wait_ms() -> f64 { with(|s| s.wait_ms).unwrap_or(0.0) }
 
 /// Advance idle time to at most `wall_ns` (after a wait) and re-evaluate interrupts.
 #[no_mangle]
-pub extern "C" fn sbc_wake(wall_ns: f64) { with(|s| { let t = ((wall_ns + s.wall_offset.unwrap_or(0.0)).max(0.0) as u64).max(s.m.now); s.m.idle_until(t) }); }
+pub extern "C" fn sbc_wake(wall_ns: f64) {
+    with(|s| { let t = ((wall_ns + s.wall_offset.unwrap_or(0.0)).max(0.0) as u64).max(s.m.now()); s.m.idle_until(t) });
+}
 
-/// Resume a snapshot (made natively with the same SD image) instead of cold-booting.
+/// Resume a Pi snapshot (made natively with the same SD image) instead of cold-booting.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8, len: usize) -> i32 {
     let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
@@ -232,30 +376,43 @@ pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8,
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
     if m.restore(std::slice::from_raw_parts(snap, len)).is_err() { return -1; }
-    ST.with(|s| *s.borrow_mut() = Some(State { m, fb: Vec::new(), fb_w: 0, fb_h: 0, uart: Vec::new(), audio: Vec::new(), wait_ms: 0.0, stop: None, wall_offset: None }));
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi(m), None)));
     0
 }
 
 #[no_mangle]
 pub extern "C" fn sbc_uart_in(b: u32) {
-    with(|s| { if s.m.soc.uart.rx_room() { s.m.soc.uart.push_rx(b as u8); s.m.soc.dirty = true; } });
+    with(|s| match &mut s.m {
+        Board::Pi(m) => { if m.soc.uart.rx_room() { m.soc.uart.push_rx(b as u8); m.soc.dirty = true; } }
+        Board::Tinker(m, _) => { m.serial_input(b as u8); }
+    });
 }
 
 #[no_mangle]
-pub extern "C" fn sbc_uart_room() -> i32 { with(|s| s.m.soc.uart.rx_room() as i32).unwrap_or(0) }
+pub extern "C" fn sbc_uart_room() -> i32 {
+    with(|s| match &s.m { Board::Pi(m) => m.soc.uart.rx_room() as i32, Board::Tinker(m, _) => m.soc.uart.rx_room() as i32 }).unwrap_or(0)
+}
 
 /// Move pending UART output to an internal buffer; returns its length (`sbc_uart_ptr` for data).
 #[no_mangle]
-pub extern "C" fn sbc_uart_take() -> usize { with(|s| { s.uart = std::mem::take(&mut s.m.soc.uart.out); s.uart.len() }).unwrap_or(0) }
+pub extern "C" fn sbc_uart_take() -> usize {
+    with(|s| {
+        s.uart = match &mut s.m { Board::Pi(m) => std::mem::take(&mut m.soc.uart.out), Board::Tinker(m, _) => m.take_serial_output() };
+        s.uart.len()
+    }).unwrap_or(0)
+}
 #[no_mangle]
 pub extern "C" fn sbc_uart_ptr() -> *const u8 { with(|s| s.uart.as_ptr()).unwrap_or(std::ptr::null()) }
 
 /// Render the framebuffer as RGBA; returns a pointer (0 if no framebuffer), see sbc_fb_w/h.
 #[no_mangle]
 pub extern "C" fn sbc_fb_render() -> *const u8 {
-    with(|s| match s.m.soc.render(&mut s.fb) {
-        Some((w, h)) => { s.fb_w = w; s.fb_h = h; s.fb.as_ptr() }
-        None => std::ptr::null(),
+    with(|s| {
+        let size = match &s.m { Board::Pi(m) => m.soc.render(&mut s.fb), Board::Tinker(m, _) => m.soc.render(&mut s.fb) };
+        match size {
+            Some((w, h)) => { s.fb_w = w; s.fb_h = h; s.fb.as_ptr() }
+            None => std::ptr::null(),
+        }
     }).unwrap_or(std::ptr::null())
 }
 #[no_mangle]
@@ -265,42 +422,47 @@ pub extern "C" fn sbc_fb_h() -> u32 { with(|s| s.fb_h).unwrap_or(0) }
 
 /// Render jobs the 3D GPU has finished (one per frame for most programs), 0 without a GPU.
 #[no_mangle]
-pub extern "C" fn sbc_gpu_frames() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.counters().0[1] as f64)).unwrap_or(0.0) }
+pub extern "C" fn sbc_gpu_frames() -> f64 { with_pi(|m| m.soc.v3d.as_ref().map_or(0.0, |g| g.counters().0[1] as f64)).unwrap_or(0.0) }
 /// Host milliseconds spent in GPU jobs.
 #[no_mangle]
-pub extern "C" fn sbc_gpu_ms() -> f64 { with(|s| s.m.soc.v3d.as_ref().map_or(0.0, |g| g.counters().2.iter().sum::<u64>() as f64 / 1e6)).unwrap_or(0.0) }
+pub extern "C" fn sbc_gpu_ms() -> f64 { with_pi(|m| m.soc.v3d.as_ref().map_or(0.0, |g| g.counters().2.iter().sum::<u64>() as f64 / 1e6)).unwrap_or(0.0) }
 
 #[no_mangle]
 pub extern "C" fn sbc_insns() -> f64 { with(|s| s.m.instret() as f64).unwrap_or(0.0) }
 #[no_mangle]
-pub extern "C" fn sbc_now_ns() -> f64 { with(|s| s.m.now as f64).unwrap_or(0.0) }
+pub extern "C" fn sbc_now_ns() -> f64 { with(|s| s.m.now() as f64).unwrap_or(0.0) }
 /// Stop reason: 0 running, 1 unimplemented instruction (see sbc_stop_pc), 2 other.
 #[no_mangle]
 pub extern "C" fn sbc_stop_kind() -> i32 { with(|s| match s.stop { None => 0, Some(Stop::Unimplemented(..)) => 1, _ => 2 }).unwrap_or(2) }
 #[no_mangle]
-pub extern "C" fn sbc_stop_pc() -> f64 { with(|s| match s.stop { Some(Stop::Unimplemented(pc, _)) => pc as f64, _ => s.m.cpu().pc as f64 }).unwrap_or(0.0) }
+pub extern "C" fn sbc_stop_pc() -> f64 {
+    with(|s| match s.stop {
+        Some(Stop::Unimplemented(pc, _)) => pc as f64,
+        _ => match &s.m { Board::Pi(m) => m.cpu().pc as f64, Board::Tinker(m, _) => m.cpus[m.last_stop_core].r[15] as f64 },
+    }).unwrap_or(0.0)
+}
 #[no_mangle]
 pub extern "C" fn sbc_stop_insn() -> u32 { with(|s| match s.stop { Some(Stop::Unimplemented(_, i)) => i, _ => 0 }).unwrap_or(0) }
 
 /// GPIO line level as the pins see it (0/1).
 #[no_mangle]
-pub extern "C" fn sbc_gpio_level(pin: u32) -> u32 { with(|s| s.m.soc.gpio.level(pin as usize) as u32).unwrap_or(0) }
+pub extern "C" fn sbc_gpio_level(pin: u32) -> u32 { with_pi(|m| m.soc.gpio.level(pin as usize) as u32).unwrap_or(0) }
 
 /// Drive a GPIO input from the page: 1 high, 0 low, -1 released (pull decides).
 #[no_mangle]
 pub extern "C" fn sbc_gpio_input(pin: u32, v: i32) {
-    with(|s| { s.m.soc.gpio.set_input(pin as usize, match v { 1 => Some(true), 0 => Some(false), _ => None }); s.m.soc.dirty = true; });
+    with_pi(|m| { m.soc.gpio.set_input(pin as usize, match v { 1 => Some(true), 0 => Some(false), _ => None }); m.soc.dirty = true; });
 }
 
 /// Sensor inputs: kind 0 temperature (degC), 1 pressure (hPa), 2 humidity (%RH).
 #[no_mangle]
 pub extern "C" fn sbc_set_sensor(kind: u32, v: f64) {
-    with(|s| s.m.set_sensor(match kind { 0 => "temp", 1 => "pressure", _ => "humidity" }, v));
+    with_pi(|m| m.set_sensor(match kind { 0 => "temp", 1 => "pressure", _ => "humidity" }, v));
 }
 
 /// MCP3008 channel input voltage.
 #[no_mangle]
-pub extern "C" fn sbc_set_adc(ch: u32, volts: f64) { with(|s| { if ch < 8 { s.m.soc.spi.adc.volts[ch as usize] = volts; } }); }
+pub extern "C" fn sbc_set_adc(ch: u32, volts: f64) { with_pi(|m| { if ch < 8 { m.soc.spi.adc.volts[ch as usize] = volts; } }); }
 
 /// Self-test for the JIT: run `len` bytes of A64 code at 0x1000 in a 1 MiB RAM (x1 = 0x80000
 /// as a data pointer) until `brk`, with the JIT compiling on first use (`jit` = 1) or not.
@@ -331,3 +493,52 @@ pub unsafe extern "C" fn sbc_selftest(code: *const u8, len: usize, jit: u32) -> 
     out[31] = cpu.nzcv as u64;
     out.as_ptr()
 }
+
+// The A32/T32 JIT's random differential test (arm-a32/tests/jit_diff.rs), here with the
+// wasm backend: tools/wasm-a32-jit-diff.mjs runs it.
+#[path = "../../arm-a32/tests/common/jit_gen.rs"]
+mod a32_jit_gen;
+
+thread_local! { static REPORT: RefCell<String> = const { RefCell::new(String::new()) }; }
+
+/// Run `cases` random cases from `seed`: A32 (`thumb` 0) or Thumb (1), straight-line
+/// (`loops` 0) or in loops (1; compiled regions may loop inside wasm). Returns the number of
+/// failures; the first one's description is at `sbc_report_ptr` (`sbc_report_len` bytes).
+#[no_mangle]
+pub extern "C" fn sbc_a32_jit_diff(thumb: u32, loops: u32, cases: u32, seed: f64) -> u32 {
+    use a32_jit_gen::*;
+    let mut rng = Rng(seed as u64 | 1);
+    let mut failures = 0;
+    for case in 0..cases {
+        let ((arm, code16), s) = match (thumb != 0, loops != 0) {
+            (false, false) => { let (c, s) = arm_case(&mut rng); ((c, Vec::new()), s) }
+            (false, true) => { let (c, s) = arm_loop_case(&mut rng); ((c, Vec::new()), s) }
+            (true, false) => { let (c, s) = thumb_case(&mut rng); ((Vec::new(), c), s) }
+            (true, true) => { let (c, s) = thumb_loop_case(&mut rng); ((Vec::new(), c), s) }
+        };
+        let chain = if loops != 0 { u64::MAX } else { 0 };
+        if let Err(e) = compare_case(thumb != 0, &arm, &code16, s, chain) {
+            if failures == 0 {
+                let dis: Vec<String> = if thumb != 0 { code16.iter().map(|h| format!("{h:04x}")).collect() } else { arm.iter().map(|w| format!("{w:08x}")).collect() };
+                REPORT.with(|r| *r.borrow_mut() = format!("case {case} (seed {s}): {e}\ncode {}", dis.join(" ")));
+            }
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// Run one case given as code (32-bit words for A32, halfwords for Thumb) from `seed`.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_a32_jit_case(thumb: u32, code: *const u32, len: usize, seed: f64, chain: u32) -> u32 {
+    let words = std::slice::from_raw_parts(code, len);
+    let code16: Vec<u16> = words.iter().map(|&w| w as u16).collect();
+    let r = a32_jit_gen::compare_case(thumb != 0, words, &code16, seed as u64, if chain != 0 { u64::MAX } else { 0 });
+    REPORT.with(|rep| *rep.borrow_mut() = r.as_ref().err().cloned().unwrap_or_default());
+    r.is_err() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn sbc_report_ptr() -> *const u8 { REPORT.with(|r| r.borrow().as_ptr()) }
+#[no_mangle]
+pub extern "C" fn sbc_report_len() -> usize { REPORT.with(|r| r.borrow().len()) }

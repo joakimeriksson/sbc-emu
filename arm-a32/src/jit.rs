@@ -21,7 +21,10 @@
 //! Code is invalidated by writes: pages holding compiled code are kept out of the write
 //! micro-TLB, so every store to them takes the slow path and drops the page's blocks on
 //! every core (`CodeWatch`); devices that write RAM report it through `CodeWatch::dma_write`.
-//! Thumb state is interpreted for now.
+//! Thumb code is compiled the same way (`jit_t32.rs`).
+//!
+//! In the browser (wasm32) the same blocks are compiled to WebAssembly instead
+//! (`jit_wasm.rs`).
 use crate::cpu::Cpu;
 use crate::mmu::{utlb_table, Access, UT, U_EXEC, U_READ, U_WRITE};
 use emu_core::{Bus, Trap};
@@ -119,19 +122,21 @@ mod host {
     pub const AVAILABLE: bool = true;
 }
 
+/// No native code buffer: the wasm32 build compiles through `jit_wasm` instead, other hosts
+/// interpret.
 #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
 mod host {
     pub struct CodeCache;
     impl CodeCache {
         pub fn new(_size: usize) -> Option<CodeCache> {
-            None
+            cfg!(target_arch = "wasm32").then_some(CodeCache)
         }
         pub fn reset(&mut self) {}
         pub fn write(&mut self, _w: &[u32]) -> Option<*const u8> {
             None
         }
     }
-    pub const AVAILABLE: bool = false;
+    pub const AVAILABLE: bool = cfg!(target_arch = "wasm32");
 }
 
 /// Whether this host can run compiled code.
@@ -215,6 +220,18 @@ impl CodeWatch {
         }
     }
 
+    /// Every core but `except` drops all its code (the browser's function table was freed as
+    /// a whole).
+    #[cfg(target_arch = "wasm32")]
+    fn reset_all(&self, except: usize) {
+        for (slot, list) in self.dirty.lock().unwrap().iter_mut().enumerate() {
+            if slot != except && list.last() != Some(&u32::MAX) {
+                list.push(u32::MAX);
+            }
+        }
+        self.epoch.fetch_add(1, Relaxed);
+    }
+
     fn register(&self) -> usize {
         let mut d = self.dirty.lock().unwrap();
         d.push(Vec::new());
@@ -249,6 +266,11 @@ const PROLOGUE_WORDS: usize = 7;
 
 const MAX_INSNS: u32 = 64;
 const CODE_BYTES: usize = 64 << 20;
+/// wasm: compiling a module costs far more than a native block, so wait for more runs
+#[cfg(target_arch = "wasm32")]
+const WASM_HOT: u32 = 256;
+#[cfg(not(target_arch = "wasm32"))]
+const WASM_HOT: u32 = 8;
 const FRONT: usize = 1 << 14;
 const HOTC: usize = 1 << 14;
 
@@ -276,7 +298,14 @@ pub struct Jit {
     pub compiled: u64,
     pub execs: u64,
     pub invalidated: u64,
+    /// wasm: blocks dropped since the last flush (their table slots stay used until then)
+    dead: usize,
 }
+
+/// wasm: compiled blocks (live and dropped) after which everything is flushed, freeing the
+/// function table slots (and the modules behind them).
+#[cfg(target_arch = "wasm32")]
+const WASM_SLOTS: usize = 16384;
 
 impl Jit {
     fn new(watch: Arc<CodeWatch>) -> Option<Box<Jit>> {
@@ -285,7 +314,7 @@ impl Jit {
         let hot = std::env::var("SBC_JIT_HOT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8);
+            .unwrap_or(if cfg!(target_arch = "wasm32") { WASM_HOT } else { 8 });
         let mut jit = Box::new(Jit {
             code,
             blocks: HashMap::new(),
@@ -301,6 +330,7 @@ impl Jit {
             compiled: 0,
             execs: 0,
             invalidated: 0,
+            dead: 0,
         });
         jit.write_dispatcher();
         Some(jit)
@@ -308,7 +338,8 @@ impl Jit {
 
     /// (Re)write the dispatcher at the start of the code buffer.
     fn write_dispatcher(&mut self) {
-        self.disp = if self.chain {
+        // wasm chains in `jit_run` instead
+        self.disp = if self.chain && !cfg!(target_arch = "wasm32") {
             self.code
                 .write(&dispatcher(&ctx()))
                 .map_or(0, |p| p as usize)
@@ -320,15 +351,28 @@ impl Jit {
     fn flush(&mut self) {
         self.code.reset();
         self.write_dispatcher();
+        self.clear();
+        // wasm: the page frees the whole function table, so every core drops its blocks
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.watch.reset_all(self.slot);
+            wasm::reset();
+        }
+    }
+
+    /// Forget every compiled block (the code itself is reset by `flush`).
+    fn clear(&mut self) {
         self.blocks.clear();
         self.pages.clear();
         self.front.fill(NO_FRONT);
         self.hotc.fill((u32::MAX, 0, 0));
+        self.dead = 0;
     }
 
     fn drop_page(&mut self, page: u32) {
         for k in self.pages.remove(&page).unwrap_or_default() {
             self.blocks.remove(&k);
+            self.dead += 1;
             let f = &mut self.front[front_slot(k.0)];
             if f.pc == k.0 && f.key == k.1 {
                 *f = NO_FRONT;
@@ -403,6 +447,10 @@ impl Cpu {
         jit.seen_epoch = epoch;
         let pages = jit.watch.take(jit.slot);
         if pages.contains(&u32::MAX) {
+            // wasm: another core freed the function table (`reset_all`)
+            #[cfg(target_arch = "wasm32")]
+            jit.clear();
+            #[cfg(not(target_arch = "wasm32"))]
             jit.flush();
             return;
         }
@@ -467,6 +515,10 @@ impl Cpu {
                 self.interp_run = true;
                 return None;
             }
+            #[cfg(target_arch = "wasm32")]
+            if jit.blocks.len() + jit.dead >= WASM_SLOTS {
+                jit.flush();
+            }
             let f = self.compile(pc, pa, privileged, thumb, host as *const u8)?;
             let jit = self.jit.as_mut()?;
             jit.blocks.insert(k, f);
@@ -505,16 +557,52 @@ impl Cpu {
             self.jit_disp = j.disp;
             self.jit_front = j.front.as_ptr();
         }
-        let r = unsafe { f(self as *mut Cpu) };
+        #[allow(unused_mut)]
+        let mut r = unsafe { f(self as *mut Cpu) };
+        // wasm: chain in Rust (native code chains through its own dispatcher): the next block
+        // from the front cache while the budget lasts; 2 = the interpreter ran something the
+        // machine must look at, so no chaining
+        #[cfg(target_arch = "wasm32")]
+        while r == 0 && self.instret < self.chain_until {
+            let Some(g) = self.front_block() else { break };
+            // SAFETY: as above
+            r = unsafe { g(self as *mut Cpu) };
+        }
         self.jit_bus = None;
         if let Some(j) = self.jit.as_mut() {
             j.execs += 1;
         }
-        if r == 0 {
+        if r != 1 {
             Ok(())
         } else {
             Err(self.jit_trap.take().unwrap_or(Trap::Wait))
         }
+    }
+
+    /// wasm: the compiled block for the current PC if the front cache has it (no IT block, no
+    /// pending invalidations, the fetch micro-TLB maps the page).
+    #[cfg(target_arch = "wasm32")]
+    #[inline(always)]
+    fn front_block(&self) -> Option<BlockFn> {
+        if self.cpsr & 0x0600_fc00 != 0 {
+            return None;
+        }
+        let jit = self.jit.as_ref()?;
+        if jit.watch.epoch.load(Relaxed) != jit.seen_epoch {
+            return None;
+        }
+        let pc = self.r[15];
+        let privileged = self.privileged();
+        let e = self.utlb[utlb_table(privileged, U_EXEC) * UT + (pc >> 12) as usize % UT];
+        if e.tag != (pc & !0xfff) as u64 {
+            return None;
+        }
+        let host = e.delta.wrapping_add(pc as u64);
+        let pa = (host - self.ram as u64) as u32 + self.ram_base;
+        let k = key(pa, privileged, self.thumb());
+        let f = jit.front[front_slot(pc)];
+        // SAFETY: front entries are only filled from `blocks`, which hold published code
+        (f.pc == pc && f.key == k).then(|| unsafe { std::mem::transmute::<usize, BlockFn>(f.entry) })
     }
 
     /// Translate the block at virtual `pc` (physical `pa`, host address `code`).
@@ -526,6 +614,12 @@ impl Cpu {
         thumb: bool,
         code: *const u8,
     ) -> Option<BlockFn> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = pa;
+            return self.compile_wasm(pc, privileged, thumb, code);
+        }
+        #[allow(unreachable_code)]
         let c = ctx();
         let mut e = Emit::new(&c);
         e.el0 = self.el1.is_some();
@@ -2027,6 +2121,10 @@ fn dispatcher(c: &Ctx) -> Vec<u32> {
 
 #[path = "jit_t32.rs"]
 mod t32;
+
+#[cfg(target_arch = "wasm32")]
+#[path = "jit_wasm.rs"]
+mod wasm;
 
 /// Does this (conditional-space, interpreted) instruction always write the PC?
 fn writes_pc(insn: u32) -> bool {

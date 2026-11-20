@@ -17,7 +17,7 @@ instruction, in the style of [esp32sim](https://github.com/mikroverk/esp32sim):
 | Orange Pi 5 | Rockchip RK3588S | **experimental**: one Cortex-A55, GICv3, UART, Ethernet; a Debian kernel to a BusyBox shell by direct boot | [docs/orangepi5.md](docs/orangepi5.md) |
 | Orange Pi One | Allwinner H3, 4× Cortex-A7 | **experimental**: four Cortex-A7s on the 32-bit core (`arm-a32`, with a JIT to AArch64), Thumb-2, VFPv4, NEON; the unmodified Armbian 26.8.1 SD image to its login prompt (Thumb-2 kernel, systemd), HDMI console over VNC with a USB keyboard and tablet, Ethernet with NAT, the Mali-400 GPU (Mesa's lima driver renders kmscube), or Alpine by direct boot | [docs/orangepi-one.md](docs/orangepi-one.md) |
 | Orange Pi RV | StarFive JH7110, 4× SiFive U74 (RV64GC) | **experimental**: four U74 harts on sbc-emu's own RV64 interpreter (`riscv64`, Sv39); real OpenSBI 1.8 with Alpine's mainline 7.1 kernel or Xunlong's own 5.15 kernel, directly or from the SD card through the board's boot chain (boot ROM → U-Boot SPL with DDR init → OpenSBI + U-Boot 2026.10 → extlinux): shell, SMP, microSD card, Gigabit Ethernet with NAT, USB 3.0 (PCIe → VL805: keyboard, tablet, USB stick), an NVMe SSD in the M.2 slot, Wi-Fi (AP6256: brcmfmac on mainline, bcmdhd on Xunlong's kernel), Bluetooth (HCI on UART1), audio (PWM DAC), HDMI console over VNC with the USB keyboard (DC8200 + Inno HDMI with HDMI audio on Xunlong's kernel, the firmware's framebuffer under simpledrm with mainline), reboot and power-off; the PowerVR BXE-4-32 GPU with mainline's powervr driver and Mesa's PowerVR Vulkan driver: compute, offscreen rendering and vkcube on HDMI | [docs/orangepi-rv.md](docs/orangepi-rv.md) |
-| ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12/A17 | **experimental**: four Cortex-A12s on `arm-a32` started through the boot ROM mailbox (`rockchip,rk3066-smp`); a Debian armmp kernel and the stock DTB to a BusyBox shell by direct boot (`scripts/tinkerboard-shell.txt`); an unmodified Armbian 26.8.1 SD image (mainline 6.18) to the console login and a root shell by emulated firmware boot, with dw_mmc SD/eMMC, rk3x I²C, the RK808 PMIC/RTC and HDMI (VOP + DesignWare HDMI, an emulated monitor at 1280x720 or `--hdmi-mode`, console and login on screen, VNC and `--screenshot`) (`scripts/tinkerboard-armbian.txt`, 5 min 52 s on the A32/T32 JIT, 23 min on the interpreter); the Mali-T760 GPU (Midgard) for the unmodified Panfrost kernel and Mesa drivers: kmscube on HDMI and all 25 GLES 2 test scenes matching softpipe (`scripts/mali-t760-gles2.txt`, [docs/mali-t760.md](docs/mali-t760.md)) | [docs/rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
+| ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12/A17 | **experimental**: four Cortex-A12s on `arm-a32` started through the boot ROM mailbox (`rockchip,rk3066-smp`); a Debian armmp kernel and the stock DTB to a BusyBox shell by direct boot (`scripts/tinkerboard-shell.txt`); an unmodified Armbian 26.8.1 SD image (mainline 6.18) to the console login and a root shell by emulated firmware boot, with dw_mmc SD/eMMC, rk3x I²C, the RK808 PMIC/RTC and HDMI (VOP + DesignWare HDMI, an emulated monitor at 1280x720 or `--hdmi-mode`, console and login on screen, VNC and `--screenshot`) (`scripts/tinkerboard-armbian.txt`, 5 min 52 s on the A32/T32 JIT, 23 min on the interpreter); the Mali-T760 GPU (Midgard) for the unmodified Panfrost kernel and Mesa drivers: kmscube on HDMI and all 25 GLES 2 test scenes matching softpipe (`scripts/mali-t760-gles2.txt`, [docs/mali-t760.md](docs/mali-t760.md)); in the browser too (`web/tinker.html`: Armbian from the SD image or BusyBox, with the A32/T32 JIT compiling to WebAssembly) | [docs/rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
 | ESP32-S31-Function-CoreBoard-1 | Espressif ESP32-S31, 2× RV32IMAC (M/S/U, Sv32) | **experimental**: Espressif's official Linux flash image, unmodified, through the real mask ROM, U-Boot SPL, OpenSBI and U-Boot to XIP Linux 6.18 on both harts and a root shell over UART0 (`scripts/esp32s31-shell.txt`), and `reboot` back through the ROM; no Ethernet PHY or SD yet | [docs/esp32s31.md](docs/esp32s31.md) |
 
 `sbc-emu boards list` shows what the build knows; `--board NAME` picks one (the Pi 4 is the
@@ -276,7 +276,7 @@ rk3588/     the experimental Orange Pi 5 machine (RK3588S): GICv3, UART2, timer
 sbc-machine/ the board catalogue and the host-facing machine layer the boards share
 sbc-net/    virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP (from esp32sim)
 cli/        the sbc-emu command
-wasm/       C ABI for the browser; web/ is the page and worker
+wasm/       C ABI for the browser (the Pi 4 and the Tinker Board); web/ is the pages and worker
 scripts/    action scripts (boots, demos, GPU tests, Ubuntu)
 ```
 
@@ -457,6 +457,21 @@ interpreted). Checks:
   mismatch, with the block's code; `SBC_JIT_PROFILE=1 node tools/wasm-smoke-sd.mjs ...` lists the
   instructions compiled code still hands to the interpreter, `SBC_JIT_HOT=n` sets the compile
   threshold and `SBC_WASM=path` picks another build (for before/after comparisons).
+
+The Tinker Board S runs in the same build: `web/tinker.html` boots the unmodified Armbian SD
+image (served like the Pi's, `tools/wasm-build.sh` links it from the fixture) or Debian's
+kernel with a BusyBox initramfs; HDMI is drawn on a canvas, and input is the serial console
+until the board has USB. Its 32-bit core has a WebAssembly backend of its own
+(`arm-a32/src/jit_wasm.rs`): the native A32/T32 JIT's instruction coverage, compiled per region
+as above, with the guest flags in wasm locals. In Node 26 on an M5:
+
+| | interpreter | JIT |
+|---|---|---|
+| Debian kernel to the BusyBox shell (`tools/wasm-smoke-tinker.mjs`) | 241 s (16 MIPS) | 5.7 s |
+| Armbian to `login:` (`tools/wasm-smoke-tinker.mjs 1500 --sd IMAGE`) | | 257 s (native: 218 s; both wait about 2 minutes for systemd's random seed) |
+
+`node tools/wasm-a32-jit-diff.mjs` runs `arm-a32/tests/jit_diff.rs`'s random A32 and Thumb cases,
+straight-line and in loops, through the wasm backend against the interpreter.
 
 ## License
 

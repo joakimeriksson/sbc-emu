@@ -166,9 +166,11 @@ dependencies = [
 name = "sbc-emu-wasm"
 version = "0.0.1"
 dependencies = [
+ "arm-a32",
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "rockchip-rk3288",
  "v3d",
 ]
 

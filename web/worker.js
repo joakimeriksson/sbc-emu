@@ -1,5 +1,6 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello', ramMb}, {type:'key', usage, down},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox', ramMb},
+//      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
 let ex;
@@ -72,6 +73,30 @@ async function start(os, ramMb, jit) {
   postMessage({ type: 'status', text: 'loading emulator…' });
   const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead, sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset, sbc_host_now_ms: () => performance.now() } });
   ex = instance.exports;
+  if (os === 'tinker-armbian' || os === 'tinker-busybox') {
+    // ASUS Tinker Board S (RK3288, four 32-bit Cortex-A12s): no USB yet, so input is the serial
+    // console; HDMI shows what the guest's DRM driver puts on the emulated 720p monitor
+    ex.sbc_kms(1280, 720);
+    if (os === 'tinker-armbian') {
+      imageUrl = 'assets/tinker-armbian.img';
+      const head = await fetch(imageUrl, { method: 'HEAD' });
+      const size = Number(head.headers.get('Content-Length'));
+      if (!head.ok || !size) throw new Error('SD image assets/tinker-armbian.img not found (see docs/rk3288-tinker-board-plan.md: the browser)');
+      postMessage({ type: 'status', text: `U-Boot: reading armbianEnv.txt, zImage and the device tree from the SD card (${(size / 2 ** 30).toFixed(2)} GiB image)…` });
+      if (ex.sbc_boot_tinker_sd(ramMb, Date.now() / 1000, size / 512) !== 0) throw new Error('SD boot failed (no Armbian /boot on the card?)');
+    } else {
+      postMessage({ type: 'status', text: 'loading the Debian kernel, device tree and BusyBox initramfs…' });
+      const kernel = await fetchBytes('assets/tinker/zImage', false);
+      const dtb = await fetchBytes('assets/tinker/rk3288-tinker-s.dtb', false);
+      const initrd = await fetchBytes('assets/tinker/initramfs.cpio.gz', false);
+      if (ex.sbc_boot_tinker(ramMb, Date.now() / 1000, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
+    }
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
   if (os === 'gpu-demo') {
     // Raspberry Pi OS with Mesa, logged in on HDMI, every demo run once (scripts/gpu-demo-snapshot.txt)
     imageUrl = 'assets/raspios-gpu.img';

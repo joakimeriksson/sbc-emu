@@ -165,6 +165,20 @@ stated output on the serial console, and a README table row with its evidence.
     `arm-a64`'s same-ISA JIT.
   - Target: Armbian to `login:` in a time comparable to the Pi 4 (about 30 s).
 - **M10: browser.** The WebAssembly build and a demo pad on the sbc-emu page, like the Pi 4's.
+  - Done (2026-11-20): `web/tinker.html` boots the board in the browser build, from the
+    Armbian SD image (read lazily over HTTP range requests) or the quick Debian + BusyBox
+    direct boot. What it took:
+    1. `wasm/`: the C ABI drives either machine (`sbc_boot_tinker`, `sbc_boot_tinker_sd`; the
+       common exports dispatch on the board; reset reboots the same way).
+    2. A WebAssembly backend for the A32/T32 JIT (`arm-a32/src/jit_wasm.rs`): the native
+       JIT's instruction coverage, emitted as wasm; a hot block becomes a region (the blocks
+       constant branches reach on its page) in one function that loops through a
+       `br_table`, so loops stay in wasm. Without it the browser interprets at 16 MIPS: 241 s
+       to the BusyBox shell. With it: 5.7 s (about 700 MIPS, the native JIT's speed).
+    3. Tests: `tools/wasm-a32-jit-diff.mjs` runs `tests/jit_diff.rs`'s random A32 and Thumb
+       cases (straight-line and in loops) through the wasm backend against the interpreter;
+       `tools/wasm-smoke-tinker.mjs` boots BusyBox or Armbian headless in Node.
+  - Input is the serial console until USB (M6) exists.
 
 ## Order and size
 
@@ -189,12 +203,13 @@ M8 and M9 are independent of each other and of M5–M7.
 
 ## State (2026-11-20)
 
-Milestones: M0–M4, M7 and M8 done; M9 half
-done (the JIT, not threads); M5, M6 and M10 not started.
+Milestones: M0–M4, M7, M8 and M10 done; M9 half
+done (the JIT, not threads); M5 and M6 not started.
 
 | Area | State | Where |
 |---|---|---|
 | Cores | Four Cortex-A12 with Thumb-2, VFP and NEON (#18), on the A32/T32 JIT by default (#45; `--no-jit` or `SBC_JIT=0` for the interpreter). All four run on one host thread. | `arm-a32`, `machine.rs` |
+| Browser | `web/tinker.html`: Armbian from the SD image or BusyBox by direct boot, HDMI on a canvas, the serial console; the JIT compiles to WebAssembly (`?jit=0` interprets) | `wasm/`, `web/`, `arm-a32/src/jit_wasm.rs` |
 | Interrupts, timers, SMP | GIC-400, the generic timer, the boot ROM SMP mailbox, TLB broadcast | `machine.rs` |
 | Clocks, power | CRU (PLLs, the I2S fractional divider), GRF/SGRF, PMU; RK808 on I2C (models of the ACT8846, SYR827/828 and HYM8563, which other RK3288 boards use, are in `peripherals/`) | `cru.rs`, `i2c.rs`, `peripherals/` |
 | Storage | dw_mmc for SD (card detect on GPIO6_C6 where the device tree uses it), eMMC and SDIO; boot from the card's `/boot` like the firmware | `dwmmc.rs`, `emmc.rs`, `boot.rs` |
@@ -209,8 +224,7 @@ Not modelled yet, roughly in order of value:
    sticks.
 2. **Speed: one host thread per core** (M9). This touches `arm-a32` and needs its owner.
 3. **GMAC Ethernet** (M5). Armbian's first-login wizard waits about a minute for an address.
-4. The browser build and demo (M10).
-5. Smaller: HDMI audio (the Tinker Board's I2S goes to the HDMI transmitter; its audio
+4. Smaller: HDMI audio (the Tinker Board's I2S goes to the HDMI transmitter; its audio
    registers are storage only), the second PL330 (0xff250000), backlight PWM, the SAR ADC, Bluetooth, the
    video codec IOMMUs, device tree overlays from `armbianEnv.txt`, LPAE kernels.
 
