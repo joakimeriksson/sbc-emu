@@ -84,6 +84,13 @@ impl Peripherals {
     }
 
     /// A card in the SD slot (or none): the controller's CDETECT and the card-detect pin.
+    /// A monitor on the HDMI port: its EDID EEPROM on I2C5, the DDC bus the RK3288 boards'
+    /// device trees name (`ddc-i2c-bus`). The transmitter itself reports it plugged in.
+    pub fn attach_hdmi_monitor(&mut self, mode: &peripherals::dw_hdmi::Mode) {
+        let eeprom = peripherals::dw_hdmi::EdidEeprom::new(mode);
+        self.i2c[5].2.attach(peripherals::dw_hdmi::EDID_ADDRESS, Box::new(eeprom));
+    }
+
     pub fn insert_sd(&mut self, disk: Option<Box<dyn Disk>>) {
         let present = disk.is_some();
         self.mmc[SDMMC].insert(disk);

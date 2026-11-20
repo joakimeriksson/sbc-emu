@@ -33,4 +33,9 @@ wait-serial RTC_rk808-rtc_20
 serial printf 'CPUS_%s\n' $(nproc); cat /sys/class/regulator/*/name | grep -c -e vccio_sd -e vcc33_sd | sed 's/^/SDREG_/'\r
 wait-serial CPUS_4
 wait-serial SDREG_2
+# HDMI: the monitor is connected and its EDID's preferred mode (1280x720 unless
+# --hdmi-mode says otherwise) drives the console on fb0.
+serial printf 'HDMI_%s_%s\n' "$(cat /sys/class/drm/card*-HDMI-A-1/status)" "$(head -n1 /sys/class/drm/card*-HDMI-A-1/modes)"; cat /sys/class/graphics/fb0/virtual_size\r
+wait-serial HDMI_connected_1280x720
+wait-serial 1280,720
 quit

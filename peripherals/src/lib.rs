@@ -11,6 +11,7 @@
 //! | `hym8563` | Haoyu HYM8563 RTC | panel board |
 //! | `ili2116` | Ilitek ILI2116 touch controller | panel board |
 //! | `bcm43455` | Broadcom BCM43455 Wi-Fi on SDIO (brcmfmac): backplane, cores, TCM, SDPCM; an emulated FullMAC dongle in place of the firmware (scans, open and WPA2-PSK joins, Ethernet to a network) | panel board |
+//! | `dw_hdmi` | Synopsys DesignWare HDMI TX with a connected monitor: IDs, hot plug, DDC and PHY I²C masters, interrupts; the EDID (`Mode`, `edid`, `EdidEeprom`) | Allwinner H3, Rockchip RK3288 |
 //! | `pl330` | Arm DMA-330 DMA controller: the channel threads run the driver's microcode | Rockchip RK3288 (audio) |
 //! | `sdio` | an SDIO card: CMD5/52/53, CCCR, FBR, CIS; the functions behind a trait | any SD host controller |
 //! | `timebase` | 24 MHz architectural timer ticks against nanoseconds | Allwinner H3, Rockchip RK3288 |
@@ -20,6 +21,7 @@
 
 pub mod act8846;
 pub mod bcm43455;
+pub mod dw_hdmi;
 pub mod gic;
 pub mod hym8563;
 pub mod i2c;

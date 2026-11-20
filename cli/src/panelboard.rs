@@ -99,6 +99,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             // the virtual network only: with `--net nat` the vendor application reaches the
             // internet (and its maker's servers) on its own
             network: Some("local"),
+            hdmi: false,
         },
     )
 }
