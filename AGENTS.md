@@ -41,7 +41,7 @@ Who is working where right now (update this table when you start or finish somet
 | Area | Crates / paths | Agent |
 |---|---|---|
 | Raspberry Pi 4: SoC, GPU (V3D), display, Ubuntu | `bcm2711/`, `v3d/`, `cli/src/vnc*.rs`, `web/` | Claude Code |
-| Multi-board foundation, Orange Pi 5 (RK3588S) | `sbc-machine/`, `rk3588/`, `boards/` | Codex |
+| Multi-board foundation, Orange Pi 5 (RK3588S) | `sbc-machine/`, `rk3588/`, `boards/` | Claude Code (taken over from Codex) |
 | Orange Pi One (H3), its Mali-400 GPU and the 32-bit core | `allwinner-h3/`, `mali400/`, `arm-a32/`, `cli/src/orangepi_one.rs` | Claude Code |
 | RK3288 / Tinker Board (plan: `docs/rk3288-tinker-board-plan.md`) | `rockchip-rk3288/` (storage, I²C, PMIC: `dwmmc.rs`, `i2c.rs`, `rk808.rs`), `cli/src/tinkerboard.rs`; `arm-a32` changes go through its owner | Claude Code (the Orange Pi One session, through a sub-agent on `claude/tinkerboard-*` branches) |
 | RK3288 panel board profile on the RK3288 (`docs/panel-board.md`); next: the pads (the STM32 on USB) | `rockchip-rk3288/` (display: `vop.rs`, `dsi.rs`; RGA: `rga.rs`; audio: `i2s.rs`; GPIO; the panel board's own devices), `peripherals/` (its chips: PMICs, RTC, touch, `sdio.rs`, `bcm43455/`, `pl330.rs`), `cli/src/panelboard.rs`, `docs/panel-board*.md` | Claude Code (the Orange Pi One session) |

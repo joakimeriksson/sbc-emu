@@ -265,6 +265,16 @@ impl I2sTdm {
         self.dmacr & DMACR_RDE != 0 && self.rx_level > (self.dmacr >> 16 & 0x1f) as usize
     }
 
+    /// When the transmit FIFO runs dry (virtual ns), while it plays from DMA: the time its
+    /// last whole frame has gone out.
+    pub fn tx_dry_at(&self) -> Option<u64> {
+        if self.xfer & XFER_TXS == 0 || self.dmacr & DMACR_TDE == 0 {
+            return None;
+        }
+        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        Some(self.tx_to + (self.tx.len() / self.tx_words()) as u64 * period)
+    }
+
     /// When the next DMA request rises (virtual ns), while a direction runs.
     pub fn next_deadline(&self) -> Option<u64> {
         let period = 1_000_000_000 / u64::from(self.rate.max(1));
