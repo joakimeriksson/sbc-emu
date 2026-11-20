@@ -2,7 +2,7 @@
 name = "esp32s31"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"  # from esp32sim, with co-authors: see LICENSE in riscv-rv32/ or espressif/
 description = "ESP32-S31 on esp_soc::Machine: dual-hart, DeviceSet peripherals, ROM and Flash-MMU app boot"
 
 [dependencies]

@@ -5,7 +5,7 @@ members = ["emu-core", "arm-a64", "arm-a32", "riscv-rv32", "espressif/emu-core",
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-license = "MIT"
+license = "BSD-3-Clause"
 
 [profile.release]
 opt-level = 3

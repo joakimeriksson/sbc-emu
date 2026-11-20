@@ -2,7 +2,7 @@
 name = "esp-periph"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT AND Apache-2.0"  # from esp32sim (../LICENSE); sar_adc.rs tables Apache-2.0 (LICENSE-ADC)
 description = "Register-level models of the peripheral IP Espressif chips share, and the Device/MMIO plumbing that mounts them"
 
 [dependencies]
