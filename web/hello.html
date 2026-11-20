@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sbc-emu hello</title>
+<meta name="description" content="A Raspberry Pi 4 running Linux in your browser: the Pi kernel and a busybox shell on an emulated AArch64 machine.">
+<style>
+  :root { --mask: #103b2c; --mask-3: #0b2a1f; --silk: #eef0e6; --silk-2: #9db5a8; --gold: #d4af5a; --copper: #c2774a; }
+  * { box-sizing: border-box; }
+  html { background: var(--mask); }
+  body { margin: 0; color: var(--silk); font: 16px/1.5 system-ui, -apple-system, sans-serif;
+    background: radial-gradient(circle at 1px 1px, rgba(238,240,230,.06) 1px, transparent 1.4px) 0 0 / 22px 22px, var(--mask); }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: clamp(26px, 5vw, 38px); line-height: 1.1; margin: 0 0 6px; }
+  h1 a { color: inherit; text-decoration: none; }
+  .lede { margin: 0 0 18px; color: var(--silk-2); }
+  a { color: var(--gold); }
+  .screen { position: relative; aspect-ratio: 4 / 3; background: #000; border: 2px solid var(--silk-2); border-radius: 6px; overflow: hidden; outline: none; }
+  .screen:focus-visible { border-color: var(--gold); }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .power { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 20px; text-align: center;
+    background: radial-gradient(ellipse at center, #0f2f24 0%, #000 75%); }
+  .power[hidden] { display: none; }
+  .power button { font: 700 22px/1 system-ui, sans-serif; color: var(--mask); background: var(--gold); border: 0; border-radius: 999px; padding: 16px 30px; cursor: pointer; }
+  .power button:disabled { cursor: progress; opacity: .7; }
+  .power p { margin: 0; color: var(--silk-2); font-size: 14px; max-width: 28rem; }
+  #status { margin: 8px 0 14px; color: var(--silk-2); font-size: 14px; font-variant-numeric: tabular-nums; min-height: 1.5em; }
+  form { display: flex; gap: 8px; }
+  input { flex: 1; min-width: 0; font: 15px ui-monospace, Menlo, monospace; padding: 9px 10px; border-radius: 6px; border: 1px solid var(--silk-2); background: var(--mask-3); color: var(--silk); }
+  button.go, .try button { font: 600 15px/1 system-ui, sans-serif; padding: 9px 14px; border-radius: 6px; border: 1px solid var(--gold); background: transparent; color: var(--gold); cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  .try { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; }
+  .try button { font: 14px ui-monospace, Menlo, monospace; border-color: var(--silk-2); color: var(--silk); }
+  .try button:not(:disabled):hover, button.go:not(:disabled):hover { border-color: var(--gold); color: var(--gold); }
+  footer { margin-top: 26px; color: var(--silk-2); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><a href="./">sbc-emu</a>: a Raspberry Pi 4 in your browser</h1>
+  <p class="lede">The Pi's own Linux kernel and a busybox shell, running on an emulated 4-core AArch64 machine compiled to WebAssembly. Nothing runs on a server.</p>
+  <div class="screen" id="screen" tabindex="0">
+    <canvas id="fb" width="1024" height="768"></canvas>
+    <div class="power" id="power">
+      <button id="powerbtn" type="button">Power on</button>
+      <p>Downloads a 15 MB snapshot of the Pi, already booted to its shell.</p>
+    </div>
+  </div>
+  <p id="status" aria-live="polite"></p>
+  <form id="cmd">
+    <input id="line" placeholder="type a command, e.g. uname -a" autocomplete="off" autocapitalize="off" spellcheck="false" disabled>
+    <button class="go" type="submit" disabled>Run</button>
+  </form>
+  <div class="try" id="try">
+    <button type="button" disabled>uname -a</button>
+    <button type="button" disabled>cat /proc/cpuinfo</button>
+    <button type="button" disabled>cat /proc/device-tree/model</button>
+    <button type="button" disabled>ls /bin | head -40</button>
+    <button type="button" disabled>free -m</button>
+    <button type="button" disabled>cat /dev/urandom &gt; /dev/fb0</button>
+  </div>
+  <footer>Click the screen to type on the Pi's USB keyboard, or use the box above. <a href="./">More demos</a>, including Raspberry Pi OS with its 3D GPU.</footer>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const canvas = $('fb'), ctx = canvas.getContext('2d'), screen = $('screen');
+let worker = null, state = '';
+const send = (text) => { worker?.postMessage({ type: 'type', text: text + '\n' }); screen.focus(); };
+function enable() { document.querySelectorAll('#cmd input, #cmd button, #try button').forEach((el) => el.disabled = false); }
+
+$('powerbtn').onclick = () => {
+  $('powerbtn').disabled = true;
+  worker = new Worker('worker.js');
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'status') {
+      state = m.text; $('status').textContent = state;
+      if (state === 'running') { $('power').hidden = true; enable(); screen.focus(); }
+      if (m.phase === 'error') $('powerbtn').disabled = false;
+    } else if (m.type === 'frame') {
+      if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
+    } else if (m.type === 'stats') {
+      $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s`;
+    }
+  };
+  worker.postMessage({ type: 'start', os: 'hello', ramMb: 512, jit: new URLSearchParams(location.search).get('jit') !== '0' });
+};
+$('cmd').onsubmit = (e) => { e.preventDefault(); const v = $('line').value; if (v) { send(v); $('line').value = ''; } };
+$('try').onclick = (e) => { if (e.target.tagName === 'BUTTON') send(e.target.textContent); };
+
+// keys on the screen go to the USB keyboard (KeyboardEvent.code -> HID usage)
+const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
+  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39, Home: 0x4a, PageUp: 0x4b,
+  Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f, ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52, IntlBackslash: 0x64,
+  ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6 };
+for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
+for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
+HID.Digit0 = 0x27;
+const held = new Set();
+const key = (u, down) => worker?.postMessage({ type: 'key', usage: u, down });
+screen.addEventListener('pointerdown', () => screen.focus());
+screen.addEventListener('keydown', (e) => {
+  const u = HID[e.code];
+  if (u === undefined || e.metaKey || !worker) return;
+  e.preventDefault();
+  if (!held.has(u)) { held.add(u); key(u, true); }
+});
+screen.addEventListener('keyup', (e) => { const u = HID[e.code]; if (u !== undefined && held.delete(u)) { e.preventDefault(); key(u, false); } });
+screen.addEventListener('blur', () => { for (const u of held) key(u, false); held.clear(); });
+if (new URLSearchParams(location.search).has('autostart')) $('powerbtn').click();
+</script>
+</body>
+</html>

@@ -204,7 +204,12 @@ ln -s ../../cache/os/raspios-lite.img web/assets/raspios-lite.img
 tools/serve.py                                    # needs HTTP Range support: use this, not http.server
 open http://127.0.0.1:8791/            # the sbc-emu page: live 3D demos on the Pi 4's GPU
 open http://127.0.0.1:8791/pi4.html    # the full Pi 4 console
+open http://127.0.0.1:8791/hello.html  # the smallest demo: a busybox shell in seconds
 ```
+
+`hello.html` is the one that runs from any static web server: it resumes a 15 MB snapshot of the
+Pi kernel and busybox booted to the shell (`web/assets/hello.snap`, made by
+`scripts/web-hello-snapshot.txt`), with no SD image and no range requests.
 
 `index.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
 scenes on the emulated V3D GPU (setup in [docs/gpu.md](docs/gpu.md#in-the-browser)).
