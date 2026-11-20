@@ -41,12 +41,12 @@ Who is working where right now (update this table when you start or finish somet
 | Area | Crates / paths | Agent |
 |---|---|---|
 | Raspberry Pi 4: SoC, GPU (V3D), display, Ubuntu | `bcm2711/`, `v3d/`, `cli/src/vnc*.rs`, `web/` | Claude Code |
-| Multi-board foundation, Orange Pi 5 (RK3588S) | `sbc-machine/`, `rk3588/`, `boards/` | Codex |
+| Multi-board foundation, Orange Pi 5 (RK3588S) and its Mali-G610 GPU (`docs/orangepi5.md`, `docs/orangepi5-gpu.md`) | `sbc-machine/`, `rk3588/`, `boards/` | Claude Code (taken over from Codex, 2026-11-19) |
 | Orange Pi One (H3), its Mali-400 GPU and the 32-bit core | `allwinner-h3/`, `mali400/`, `arm-a32/`, `cli/src/orangepi_one.rs` | Claude Code |
 | RK3288 / Tinker Board (plan: `docs/rk3288-tinker-board-plan.md`) | `rockchip-rk3288/` (storage, I²C, PMIC: `dwmmc.rs`, `i2c.rs`, `rk808.rs`), `cli/src/tinkerboard.rs`; `arm-a32` changes go through its owner | Claude Code (the Orange Pi One session, through a sub-agent on `claude/tinkerboard-*` branches) |
 | RK3288 panel board profile on the RK3288 (`docs/panel-board.md`); next: the pads (the STM32 on USB) | `rockchip-rk3288/` (display: `vop.rs`, `dsi.rs`; RGA: `rga.rs`; audio: `i2s.rs`; GPIO; the panel board's own devices), `peripherals/` (its chips: PMICs, RTC, touch, `sdio.rs`, `bcm43455/`, `pl330.rs`), `cli/src/panelboard.rs`, `docs/panel-board*.md` | Claude Code (the Orange Pi One session) |
 | Shared device models (`peripherals/`: GIC, UART, I²C chips, timebase); used by the H3 and RK3288 machines, open to every board | `peripherals/` | Claude Code (the Orange Pi One session); changes affect the H3 and RK3288 boards |
-| Orange Pi RV (StarFive JH7110) and the RV64 core | `riscv64/`, `starfive-jh7110/`, `cli/src/orangepi_rv.rs`, `docs/orangepi-rv.md` | Claude Code |
+| Orange Pi RV (StarFive JH7110) and the RV64 core | `riscv64/`, `starfive-jh7110/`, `powervr/`, `tests/gpu/pvr/`, `cli/src/orangepi_rv.rs`, `docs/orangepi-rv.md` | Claude Code |
 | Mali-T760 (Midgard) GPU of the RK3288 (`docs/mali-t760.md`) | `midgard/`, its hookup in `rockchip-rk3288/src/machine.rs`, `scripts/mali-t760-*` | Claude Code (the Orange Pi One session) |
 | RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); the RV64 boards are in the Orange Pi RV row | `riscv-rv32/`, `espressif/` | Claude Code (taken over from OpenCode) |
 

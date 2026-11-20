@@ -1,0 +1,24 @@
+# Orange Pi RV booting from its microSD card through the real boot chain: the boot ROM loads
+# U-Boot SPL (DDR init) into the L2 LIM; SPL loads OpenSBI and U-Boot from the card; U-Boot
+# reads the board EEPROM (XOPIRV), finds the card's extlinux.conf and boots mainline Linux.
+# Card: cache/orangepi-rv/uboot/sdcard.img from scripts/orangepi-rv-uboot.sh, e.g.
+#   sbc-emu run --board orangepi-rv --sd sdcard.img --script scripts/orangepi-rv-uboot.txt
+wait-serial U-Boot SPL 2026.10
+wait-serial DDR version
+wait-serial Trying to boot from MMC2
+wait-serial Model: Xunlong Orange Pi RV
+wait-serial eth0: ethernet@16030000
+wait-serial Booting bootflow 'mmc@16020000.bootdev.part_3' with extlinux
+wait-serial Starting kernel
+wait-serial Machine model: Xunlong Orange Pi RV
+wait-serial orangepi-rv#
+serial mount -o ro /dev/mmcblk1p3 /mnt && head -1 /mnt/boot/extlinux/extlinux.conf | sed 's/^/CARD_/'\n
+wait-serial CARD_default alpine
+# U-Boot puts the EEPROM's MAC address into the device tree it hands Linux
+serial cat /sys/class/net/eth0/address\n
+wait-serial 6c:cf:39:6c:de:ad
+serial ip link set eth0 up; sleep 3; udhcpc -i eth0 -n -q -t 5 2>&1 | tail -1\n
+wait-serial lease of 10.0.2.15
+serial echo UBOOT_""DONE\n
+wait-serial UBOOT_DONE
+quit

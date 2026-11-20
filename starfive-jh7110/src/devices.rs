@@ -239,6 +239,14 @@ impl Crg {
         Crg { regs, assert_off, status_off, banks }
     }
 
+    /// Reset values for clock dividers: (clock index, divisor), gate open.
+    pub fn with_dividers(mut self, dividers: &[(usize, u32)]) -> Self {
+        for &(i, d) in dividers {
+            self.regs[i] = 0x8000_0000 | d;
+        }
+        self
+    }
+
     pub fn read(&self, off: u64) -> u32 {
         if off >= self.status_off && off < self.status_off + 4 * self.banks {
             let a = self.regs[((off - self.status_off + self.assert_off) / 4) as usize];
@@ -391,5 +399,72 @@ impl TempSensor {
             self.conversions += 1;
         }
         start
+    }
+}
+
+/// The security block's true random number generator (`starfive,jh7110-trng`): seeded and
+/// idle; a generate command fills RAND0..7 and raises RAND_RDY, a reseed raises SEED_DONE.
+/// The numbers come from a deterministic generator (runs stay reproducible): they are not
+/// entropy.
+pub struct Trng {
+    ie: u32,
+    istat: u32,
+    mode: u32,
+    smode: u32,
+    rand: [u32; 8],
+    state: u64,
+}
+
+impl Default for Trng {
+    fn default() -> Self {
+        Trng { ie: 0, istat: 0, mode: 0, smode: 0, rand: [0; 8], state: 0x5bc0_e000_7110_2026 }
+    }
+}
+
+impl Trng {
+    const STAT_SEEDED: u32 = 1 << 9;
+    const ISTAT_RAND_RDY: u32 = 1 << 0;
+    const ISTAT_SEED_DONE: u32 = 1 << 1;
+    const IE_GLBL_EN: u32 = 1 << 31;
+
+    pub fn read(&mut self, off: u64) -> u32 {
+        match off {
+            // STAT: seeded, never busy; nonce/mission/256-bit modes as set in MODE/SMODE
+            0x04 => Self::STAT_SEEDED | (self.mode & (1 << 3)) | (self.smode & (1 << 2 | 1 << 8)),
+            0x08 => self.mode,
+            0x0c => self.smode,
+            0x10 => self.ie,
+            0x14 => self.istat,
+            0x20..=0x3c => self.rand[((off - 0x20) / 4) as usize],
+            _ => 0,
+        }
+    }
+
+    pub fn write(&mut self, off: u64, v: u32) {
+        match off {
+            0x00 => match v {
+                1 => {
+                    for r in self.rand.iter_mut() {
+                        // xorshift64*
+                        self.state ^= self.state >> 12;
+                        self.state ^= self.state << 25;
+                        self.state ^= self.state >> 27;
+                        *r = (self.state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as u32;
+                    }
+                    self.istat |= Self::ISTAT_RAND_RDY;
+                }
+                2 => self.istat |= Self::ISTAT_SEED_DONE,
+                _ => {}
+            },
+            0x08 => self.mode = v,
+            0x0c => self.smode = v,
+            0x10 => self.ie = v,
+            0x14 => self.istat &= !v,
+            _ => {}
+        }
+    }
+
+    pub fn irq(&self) -> bool {
+        self.ie & Self::IE_GLBL_EN != 0 && self.istat & self.ie & 0x13 != 0
     }
 }

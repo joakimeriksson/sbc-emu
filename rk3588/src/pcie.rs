@@ -73,7 +73,8 @@ impl Pcie {
     pub fn mem_write(&mut self, addr: u64, v: u32, ram: &mut [u8]) -> bool {
         let Some(bar) = self.bar() else { return false };
         let Some(off) = addr.checked_sub(bar).filter(|&o| o < NVME_BAR_SIZE) else { return false };
-        // DMA needs bus mastering; addresses are RAM offsets
+        // DMA addresses are RAM offsets (bus mastering is not checked: the nvme driver sets
+        // it before it enables the controller)
         if let Some(n) = self.nvme.as_mut() { n.write(off, v, ram, 0); }
         true
     }

@@ -3,7 +3,7 @@
 //! would load them.
 use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use sbc_machine::Machine as HostMachine;
-use starfive_jh7110::{boot, display::{Display, Mode}, HartState, Machine};
+use starfive_jh7110::{boot, display::{Display, Mode}, AudioSource, HartState, Machine};
 use std::process::ExitCode;
 
 impl SerialBoard for Machine {
@@ -20,11 +20,28 @@ impl SerialBoard for Machine {
         Some(self)
     }
     fn capture_audio(&mut self) -> bool {
-        self.soc.pwmdac.capture = true;
+        self.soc.pwmdac.capture.on = true;
+        self.soc.i2s.capture.on = true;
         true
     }
+    /// What one output plays: the first of the headphone jack (PWM DAC) and HDMI (I2S) to
+    /// produce samples is recorded for the rest of the run; the other's samples are dropped
+    /// (one WAV file holds one stream at one rate).
     fn take_audio(&mut self) -> (u32, Vec<i16>) {
-        (self.soc.pwmdac.rate, std::mem::take(&mut self.soc.pwmdac.samples))
+        let soc = &mut self.soc;
+        if soc.audio_source.is_none() {
+            if !soc.pwmdac.capture.samples.is_empty() {
+                soc.audio_source = Some(AudioSource::Dac);
+            } else if !soc.i2s.capture.samples.is_empty() {
+                soc.audio_source = Some(AudioSource::Hdmi);
+            }
+        }
+        let (keep, drop) = match soc.audio_source {
+            Some(AudioSource::Hdmi) => (&mut soc.i2s.capture, &mut soc.pwmdac.capture),
+            _ => (&mut soc.pwmdac.capture, &mut soc.i2s.capture),
+        };
+        drop.samples.clear();
+        (keep.rate, std::mem::take(&mut keep.samples))
     }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);
@@ -48,8 +65,11 @@ impl SerialBoard for Machine {
         if let Some(n) = self.soc.pcie[1].nvme.as_ref() {
             eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes; PCIe1: {} MSIs", n.reads, n.writes, self.soc.pcie[1].msis);
         }
-        if self.soc.pwmdac.frames > 0 {
-            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
+        if self.soc.pwmdac.capture.frames > 0 {
+            eprintln!("[{tag}] audio (PWM DAC): {} frames at {} Hz, {} DMA blocks", self.soc.pwmdac.capture.frames, self.soc.sample_rate(), self.soc.dmac.transfers);
+        }
+        if self.soc.i2s.capture.frames > 0 {
+            eprintln!("[{tag}] audio (HDMI, I2S): {} frames at {} Hz", self.soc.i2s.capture.frames, self.soc.i2s_rate());
         }
         if self.soc.display.frames > 0 {
             eprintln!("[{tag}] HDMI: {} frames", self.soc.display.frames);
@@ -59,6 +79,10 @@ impl SerialBoard for Machine {
         }
         if self.soc.sec.ops > 0 {
             eprintln!("[{tag}] PKA: {} operations", self.soc.sec.ops);
+        }
+        let fw = &self.soc.gpu.fw;
+        if fw.boots > 0 {
+            eprintln!("[{tag}] GPU (PowerVR BXE-4-32): firmware booted {} times, {} kernel commands, {}", fw.boots, fw.commands, if fw.running { "running" } else { "powered off" });
         }
         if !self.soc.stubs.is_empty() {
             let pages: Vec<String> = self.soc.stubs.keys().map(|p| format!("{p:#x}")).collect();
@@ -131,14 +155,35 @@ fn execute(args: &[String]) -> Result<(), String> {
         return Err("--net nat|local|none".into());
     }
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
-    let kernel = read(arg(args, "--kernel").ok_or("--kernel Image is required")?)?;
-    let dtb = read(arg(args, "--dtb").ok_or("--dtb jh7110-orangepi-rv.dtb is required")?)?;
-    let firmware = read(arg(args, "--firmware").ok_or("--firmware fw_dynamic.bin (OpenSBI, generic platform) is required")?)?;
+    // Without --kernel the board boots as it does from its microSD card: the boot ROM loads
+    // U-Boot SPL from --sd, and SPL, OpenSBI and U-Boot take it from there.
+    let direct = arg(args, "--kernel").is_some();
+    let (kernel, dtb, firmware) = if direct {
+        (
+            read(arg(args, "--kernel").unwrap())?,
+            read(arg(args, "--dtb").ok_or("--dtb jh7110-orangepi-rv.dtb is required with --kernel")?)?,
+            read(arg(args, "--firmware").ok_or("--firmware fw_dynamic.bin (OpenSBI, generic platform) is required with --kernel")?)?,
+        )
+    } else {
+        if arg(args, "--sd").is_none() {
+            return Err("--kernel Image (direct boot), or --sd CARD.img to boot from the card's U-Boot".into());
+        }
+        // the card's U-Boot loads the kernel, device tree and initrd itself
+        for opt in ["--dtb", "--firmware", "--initrd", "--append", "--dump-dtb"] {
+            if arg(args, opt).is_some() {
+                return Err(format!("{opt} applies to direct boot (--kernel); booting from the SD card, U-Boot takes these from the card"));
+            }
+        }
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     let initrd = arg(args, "--initrd").map(read).transpose()?;
     let cmdline = arg(args, "--append").unwrap_or(boot::DEFAULT_CMDLINE);
     let ram = serial_board::ram_bytes(args, starfive_jh7110::RAM_SIZE >> 20)?;
     if ram < (128 << 20) || ram > (16 << 30) {
         return Err("--ram-mb must be between 128 and 16384".into());
+    }
+    if !direct && !boot::uboot_ram_ok(ram as u64) {
+        return Err("booting from the SD card needs --ram-mb 2048, 4096, 8192 or 16384: U-Boot knows only the board's DRAM sizes".into());
     }
     let config = RunConfig::from_args("orangepi-rv", args)?;
     // The microSD card survives guest reboots (one disk shared by the successive machines).
@@ -162,11 +207,15 @@ fn execute(args: &[String]) -> Result<(), String> {
             m.soc.attach_nvme(Box::new(d));
         }
         if net != "none" {
-            m.connect_network(net == "nat", false);
+            m.connect_network(net == "nat", std::env::var_os("SBC_NET_LOG").is_some());
         }
         m.soc.sdio1.insert(disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>));
         m.soc.display = Display::new(mode);
-        boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
+        if direct {
+            boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
+        } else {
+            boot::boot_rom(&mut m)?;
+        }
         for h in smp + 1..m.harts.len() {
             m.state[h] = HartState::Off;
         }
@@ -180,7 +229,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi (AP6256), audio (PWM DAC, --audio-out), I2C, PKA; OpenSBI from --firmware; other devices are stubs"
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware, or the boot ROM, U-Boot SPL and U-Boot from --sd; other devices are stubs"
     );
     serial_board::run(config, make_machine)
 }

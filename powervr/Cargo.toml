@@ -1,0 +1,9 @@
+[package]
+name = "powervr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Imagination PowerVR Rogue GPU model (BXE-4-32 as in the StarFive JH7110): registers and the firmware interface for Linux's powervr driver"
+
+[dependencies]
+emu-core = { path = "../emu-core" }
