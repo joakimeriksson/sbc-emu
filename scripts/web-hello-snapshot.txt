@@ -1,0 +1,14 @@
+# The snapshot web/hello.html resumes: the Pi kernel and the busybox initramfs, booted to the
+# shell on the screen. No SD card, so the page works from any static web server (15 MB download).
+#   gunzip -c cache/fw/kernel8.img > out/Image
+#   sbc-emu run --kernel out/Image --initrd cache/initramfs.cpio --shell fb --input usb --ram-mb 512 \
+#       --script scripts/web-hello-snapshot.txt
+# (the page restores it with 512 MB; the kernel's messages at loglevel 6 don't reach the serial
+# port, so this waits on time, not on output)
+sleep 25
+wait-idle 4
+type uname -a\n
+sleep 2
+wait-idle 3
+save web/assets/hello.snap
+quit

@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox', ramMb}, {type:'key', usage, down},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello', ramMb}, {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
 let ex;
@@ -86,6 +86,18 @@ async function start(os, ramMb, jit) {
     if (jit) ex.sbc_jit(1);
     frameEvery = 33;
     postMessage({ type: 'status', text: 'running', phase: 'running' });
+    loop();
+    return;
+  }
+  if (os === 'hello') {
+    // the Pi kernel and the busybox initramfs, booted to the shell (scripts/web-hello-snapshot.txt):
+    // no SD card, so the page works from any static web server
+    postMessage({ type: 'status', text: 'loading the machine snapshot…' });
+    const snap = await fetchBytes('assets/hello.snap', false);
+    const r = ex.sbc_restore(ramMb, 0, copyIn(snap), snap.length);
+    if (r !== 0) throw new Error(`snapshot restore failed (${r})`);
+    if (jit) ex.sbc_jit(1);
+    postMessage({ type: 'status', text: 'running' });
     loop();
     return;
   }
