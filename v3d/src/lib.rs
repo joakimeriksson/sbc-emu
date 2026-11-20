@@ -93,12 +93,14 @@ impl Clock {
 }
 
 /// Decoded-instruction cache for QPU code (direct-mapped), valid for one job: BOs get remapped
-/// between jobs.
-/// Decoded QPU instructions, and whether a shader in the current job ran away.
+/// between jobs. Each slot holds the decoded instruction and its pre-decoded execution form
+/// (`qpu::Pre`: operand sources resolved, whether the fast path can run it), both made once
+/// when the instruction is first fetched.
 #[derive(Clone)]
 pub struct Code {
     tags: Vec<u32>,
     insts: Vec<qpu::Inst>,
+    pre: Vec<qpu::Pre>,
     /// A shader invocation hit its instruction budget (an endless loop): the rest of the job
     /// skips its shaders, as the kernel's GPU reset would end it on the hardware, instead of
     /// spending the budget again on every remaining batch.
@@ -108,20 +110,29 @@ pub struct Code {
 const CODE_SLOTS: usize = 16384;
 
 impl Default for Code {
-    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![qpu::Inst::Invalid(0); CODE_SLOTS], runaway: false } }
+    fn default() -> Self {
+        Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![qpu::Inst::Invalid(0); CODE_SLOTS], pre: vec![qpu::Pre::default(); CODE_SLOTS], runaway: false }
+    }
 }
 
 impl Code {
+    /// The cache slot holding the instruction at `pc`, decoding it on a miss.
     #[inline]
-    pub fn fetch(&mut self, pc: u32, env: &mut dyn qpu::Env) -> qpu::Inst {
+    pub fn slot(&mut self, pc: u32, env: &mut dyn qpu::Env) -> usize {
         let k = (pc >> 3) as usize & (CODE_SLOTS - 1);
-        if self.tags[k] == pc { return self.insts[k]; }
-        let w = env.read32(pc) as u64 | (env.read32(pc.wrapping_add(4)) as u64) << 32;
-        let i = qpu::decode(w);
-        self.tags[k] = pc;
-        self.insts[k] = i;
-        i
+        if self.tags[k] != pc {
+            let w = env.read32(pc) as u64 | (env.read32(pc.wrapping_add(4)) as u64) << 32;
+            let i = qpu::decode(w);
+            self.tags[k] = pc;
+            self.pre[k] = qpu::Pre::new(&i);
+            self.insts[k] = i;
+        }
+        k
     }
+    /// The instruction at `pc` (decoded, through the cache).
+    pub fn fetch(&mut self, pc: u32, env: &mut dyn qpu::Env) -> qpu::Inst { let k = self.slot(pc, env); self.insts[k] }
+    #[inline(always)]
+    pub(crate) fn get(&self, k: usize) -> (&qpu::Inst, &qpu::Pre) { (&self.insts[k], &self.pre[k]) }
     pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); self.runaway = false; tmu::clear_cache(); }
 }
 
