@@ -1,8 +1,6 @@
 # GLES 2 test scenes on the Mali-T760 vs softpipe (tests/gpu/gles2test.c, built in the
-# guest by /root/mali-t760-gles2.sh). With the image from scripts/mali-t760-fixture.sh:
-#   sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/panel-board/rk3288-panel.dtb \
-#       --emmc cache/mali-t760/debian-gpu.img --append "$(cat cache/mali-t760/cmdline)" \
-#       --script scripts/mali-t760-gles2.txt --timeout 7200
+# guest by /root/mali-t760-gles2.sh). With the image from scripts/mali-t760-fixture.sh
+# (docs/mali-t760.md; --timeout 7200).
 # The comparison is printed on the console; SBC_MALI_CAPTURE=dir records the GPU chains
 # for midgard's mali-replay.
 wait-serial root@

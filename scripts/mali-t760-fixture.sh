@@ -2,13 +2,10 @@
 # A Debian armhf root filesystem with Mesa (panfrost), kmscube, glmark2 and gcc for the
 # Mali-T760 tests, made from the Orange Pi One GPU image (scripts/armbian-gpu-fixture.sh;
 # both boards are armhf, and the userland has no board-specific parts the tests need).
-# It boots on the panel board profile with the vendor's kernel, which has Panfrost and the DSI
-# panel built in, so no kernel modules are copied. The GLES test program and its runner
-# are put in /root (there is no network on the RK3288 yet).
-#   scripts/panel-board-fixture.sh && scripts/armbian-gpu-fixture.sh && scripts/mali-t760-fixture.sh
-#   sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/panel-board/rk3288-panel.dtb \
-#       --emmc cache/mali-t760/debian-gpu.img --append "$(cat cache/mali-t760/cmdline)" \
-#       --script scripts/mali-t760-gpu.txt --timeout 1800
+# No kernel modules are copied: the kernel it boots with needs Panfrost built in. The GLES
+# test program and its runner are put in /root (there is no network on the RK3288 yet).
+# The board command is being moved to the Tinker Board profile (docs/mali-t760.md).
+#   scripts/armbian-gpu-fixture.sh && scripts/mali-t760-fixture.sh
 # Needs e2fsprogs (Homebrew: e2fsprogs).
 # Usage: scripts/mali-t760-fixture.sh [OUT]   (default cache/mali-t760)
 set -eu
@@ -42,7 +39,7 @@ wait-serial BUILT-42
 quit
 SCRIPT
 "$BIN" run --board orangepi-one --sd "$IMG" --sd-persist --append init=/bin/bash --script "$OUT/build.txt" --timeout 1800 >/dev/null
-# root by partition UUID: the vendor's kernel has no initramfs to find a filesystem UUID
+# root by partition UUID: the kernel has no initramfs to find a filesystem UUID
 SIG=$(od -An -tx4 -j440 -N4 "$IMG" | tr -d ' ')
 echo "earlycon=uart8250,mmio32,0xff690000 console=ttyS2,115200 root=PARTUUID=$SIG-01 rootwait rw init=/bin/bash" > "$OUT/cmdline"
 echo "$IMG"

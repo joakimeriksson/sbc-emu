@@ -2,8 +2,8 @@
 //! 32 pins with output data and direction registers, interrupt configuration that reads
 //! back, and the input level register EXT_PORT. Outputs read back what is driven; inputs
 //! read the level the board puts on them, high by default (pull-ups, released buttons,
-//! inactive-low interrupt lines such as the RK808's). Inputs the board changes (the panel
-//! board's touch controller) raise edge or level interrupts as INTEN/INTMASK/INTTYPE_LEVEL/
+//! inactive-low interrupt lines such as the RK808's). Inputs the board changes (a touch
+//! controller's interrupt line) raise edge or level interrupts as INTEN/INTMASK/INTTYPE_LEVEL/
 //! INT_POLARITY configure them; PORTA_EOI clears edge interrupts.
 //!
 //! The level matters: the Tinker Board's power button (`gpio-keys`, GPIO0_A5, active low)

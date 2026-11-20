@@ -16,7 +16,6 @@ mod terminal;
 mod orangepi;
 mod orangepi_one;
 mod tinkerboard;
-mod panelboard;
 mod orangepi_rv;
 mod serial_board;
 mod script;
@@ -92,7 +91,6 @@ fn run(args: &[String]) -> ExitCode {
         Board::OrangePi5 => orangepi::run(args),
         Board::OrangePiOne => orangepi_one::run(args),
         Board::TinkerBoard => tinkerboard::run(args),
-        Board::PanelBoard => panelboard::run(args),
         Board::OrangePiRv => orangepi_rv::run(args),
         Board::Pi3 => unreachable!("checked above"),
     }

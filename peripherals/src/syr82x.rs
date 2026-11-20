@@ -1,10 +1,10 @@
 //! Silergy SYR827/SYR828 step-down regulators on I²C (`silergy,syr827`/`syr828`, Linux
-//! `fan53555`): the panel board's vdd_cpu (0x40) and vdd_gpu (0x41). Two voltage selectors
+//! `fan53555`), as RK3288 boards use them for vdd_cpu (0x40) and vdd_gpu (0x41). Two voltage selectors
 //! (0.7125 V + 12.5 mV steps, bit 7 enables the output), a control register and the chip ID
 //! Linux checks (die 8, `SILERGY_SYR82X`).
 use crate::i2c::{I2cDevice, RegisterPointer};
 
-/// I²C addresses on the panel board.
+/// I²C addresses (vdd_cpu, vdd_gpu).
 pub const CPU_ADDRESS: u8 = 0x40;
 pub const GPU_ADDRESS: u8 = 0x41;
 

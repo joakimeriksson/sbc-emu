@@ -3,7 +3,7 @@
 The RK3288's GPU, emulated in the `midgard` crate for Linux's `panfrost` kernel driver and
 Mesa's `panfrost` Gallium driver, unmodified. It is part of the RK3288 SoC model
 (`rockchip-rk3288`, register window 0xffa30000, interrupts SPI 6/7/8 "job", "mmu",
-"gpu"), so the Tinker Board and the RK3288 panel board profiles both have it.
+"gpu"), so the Tinker Board profile has it.
 
 ## What is modelled
 
@@ -34,17 +34,13 @@ Things the encoding does not make obvious, learnt the hard way:
 
 ## Running it
 
-kmscube and a GLES 2 test suite run on Debian's Mesa (25.0.7) in a root filesystem made
-from the Orange Pi One's GPU image, booted on the panel board profile with the vendor's kernel (it
-has Panfrost and the DSI panel built in):
-
-```sh
-scripts/panel-board-fixture.sh && scripts/armbian-gpu-fixture.sh && scripts/mali-t760-fixture.sh
-sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/panel-board/rk3288-panel.dtb \
-    --emmc cache/mali-t760/debian-gpu.img --append "$(cat cache/mali-t760/cmdline)" \
-    --script scripts/mali-t760-gpu.txt --timeout 1800      # kmscube, screenshot
-    # or --script scripts/mali-t760-gles2.txt               # 25 scenes vs softpipe
-```
+kmscube and a GLES 2 test suite (25 scenes, all matching softpipe) ran on Debian's Mesa
+(25.0.7) in a root filesystem made from the Orange Pi One's GPU image
+(`scripts/armbian-gpu-fixture.sh`, then `scripts/mali-t760-fixture.sh`), with
+`scripts/mali-t760-gpu.txt` (kmscube, screenshot) and `scripts/mali-t760-gles2.txt`. They
+booted on a board profile that has since been removed; they are being moved to the Tinker
+Board profile with an Armbian kernel that has Panfrost, and until then have no documented
+board command.
 
 The fixture builds `gles2test` on the emulated Orange Pi One. gcc runs on the RK3288 too,
 but with `init=/bin/bash` the shell's default `PATH` is not exported: gcc then cannot

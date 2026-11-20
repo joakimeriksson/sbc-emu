@@ -12,8 +12,8 @@
 //!
 //! The timing generator runs (frame-start interrupts, scanout) once the display timings
 //! are programmed. Requesting standby raises DSP_HOLD_VALID, which Linux waits for before it
-//! gates the clocks; the standby bit itself does not stop the model's output. The panel board's
-//! kernel takes over the display the vendor's U-Boot set up for its splash and never writes the
+//! gates the clocks; the standby bit itself does not stop the model's output. A kernel that
+//! takes over a display the boot loader set up for its splash may never write the
 //! bit clear, so without that U-Boot it stays set from the VOP's reset state.
 
 use mali400::{mmu::Mmu, Memory};
@@ -313,7 +313,7 @@ mod tests {
         assert!(!vop.irq());
         vop.write(0x08, STANDBY, due);
         assert_ne!(vop.read(0x20) & DSP_HOLD_VALID, 0);
-        // A standby request while already in standby (the panel board's kernel never clears it)
+        // A standby request while already in standby (a kernel may never clear it)
         // is acknowledged too.
         vop.write(0x20, DSP_HOLD_VALID << 8 | DSP_HOLD_VALID << 4, due);
         assert!(!vop.irq());

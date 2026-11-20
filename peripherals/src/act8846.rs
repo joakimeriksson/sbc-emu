@@ -1,10 +1,10 @@
-//! Active-semi ACT8846 PMIC on I²C (`active-semi,act8846`, Linux `act8865-regulator`), the
-//! RK3288 panel board's power manager: twelve regulators (REG1-4 step-down, REG5-12 LDOs), each a
+//! Active-semi ACT8846 PMIC on I²C (`active-semi,act8846`, Linux `act8865-regulator`), found on
+//! RK3288 boards: twelve regulators (REG1-4 step-down, REG5-12 LDOs), each a
 //! voltage selector and an enable bit that read back what Linux writes, and the power-off
 //! bits of the global off register (`system-power-controller`).
 use crate::i2c::{I2cDevice, RegisterPointer};
 
-/// I²C address on the panel board (`act8846@5a`).
+/// I²C address (`act8846@5a`).
 pub const ADDRESS: u8 = 0x5a;
 
 /// Regulator on (bit 7 of each CTRL register).
@@ -28,7 +28,7 @@ const REGULATORS: [(usize, usize); 12] = [
     (0xa0, 0xa1),
 ];
 
-/// The panel board's rails as its boot loader leaves them, in microvolts (REG1-12: VCC_DDR,
+/// An RK3288 board's rails as its boot loader leaves them, in microvolts (REG1-12: VCC_DDR,
 /// VCC_IO, VDD_LOG, VCC_20, VCCIO_SD, VDD10_LCD, VCCA_CODEC, VCCA_TP, VCCIO_PMU, VDD_10,
 /// VCC_18, VCC18_LCD), each inside its device-tree constraints.
 const BOARD_MICROVOLTS: [u32; 12] = [

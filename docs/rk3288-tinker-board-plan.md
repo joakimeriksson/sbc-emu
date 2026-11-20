@@ -1,7 +1,7 @@
 # Plan: Rockchip RK3288 and the ASUS Tinker Board
 
-Status (2026-11-20): M0–M4, M7 (HDMI on the Tinker Board, DSI on the panel board) and M8
-(Mali-T760) done, M9 for the JIT only; the panel board profile runs the vendor's application with touch, Wi-Fi and audio. See "State"
+Status (2026-11-20): M0–M4, M7 (HDMI) and M8 (Mali-T760) done, M9 for the JIT
+only. See "State"
 below. M4 (Armbian from an unmodified SD image to a root shell) was reached on 2026-11-17, M3
 (four cores) on 2026-11-15. It follows the project's own-core
 decision (pure Rust, no QEMU, `docs/decisions.md` D1) and the multi-board foundation in
@@ -10,9 +10,6 @@ and this one only the RK3288.
 
 ## Why this board
 
-- **The RK3288 is the panel board's SoC.** Confirmed from the vendor's own update image (firmware 3.10.1 Gen 1):
-  `rk3288-panel.dtb` is `model = "RK3288 panel board"`, `compatible = "vendor,panel",
-  "vendor,board", "rockchip,rk3288"`. Details in `docs/panel-board-recon.md`.
 - **It is a well-documented, open target first.** Mainline Linux has device trees for the ASUS
   Tinker Board / Tinker Board S, Firefly-RK3288, Radxa Rock 2 and MQMaker MiQi, and Armbian
   ships images. The success criterion is the same as for the Pi 4: an unmodified image boots
@@ -94,8 +91,7 @@ stated output on the serial console, and a README table row with its evidence.
   asserting the reset stops the core (hotplug `cpu_kill`). The cores run in round-robin
   quanta of 1000 instructions on one host thread, as on the Orange Pi One; a parallel
   (`--threads multi`) mode waits for `arm-a32` to get the parallel-memory semantics `arm-a64`
-  has. The panel board's kernel runs with `isolcpus=2-3` and PREEMPT_RT, so its audio engine
-  expects all four cores.
+  has.
   - Pass (`scripts/tinkerboard-shell.txt`): `smp: Brought up 1 node, 4 CPUs` (also after
     `reboot -f`), `nproc` = 4, four parallel shell loops finish, plus everything M2 checked.
     The kernel log shows the A12 identity end to end: `CPU: PIPT / VIPT nonaliasing data
@@ -169,33 +165,6 @@ stated output on the serial console, and a README table row with its evidence.
     `arm-a64`'s same-ISA JIT.
   - Target: Armbian to `login:` in a time comparable to the Pi 4 (about 30 s).
 - **M10: browser.** The WebAssembly build and a demo pad on the sbc-emu page, like the Pi 4's.
-- **Stretch: panel board profile** (`vendor,panel`; findings in `docs/panel-board-recon.md`).
-  - **Kernel.** The vendor's firmware does *not* use the Rockchip 4.4/4.19 BSP: it is a 6.18.44
-    PREEMPT_RT kernel with mainline Rockchip drivers plus the vendor board drivers, booted by a
-    resident U-Boot (distro boot script, `bootz`). The profile must satisfy *that* kernel's
-    drivers and its device tree (`rk3288-panel.dtb`), which differ from the Tinker Board in:
-    - PMIC: **ACT8846** on I2C0 (+ SYR827 vdd_cpu, SYR828 vdd_gpu, HYM8563 RTC), not RK808;
-    - display: VOP-little -> **DW MIPI DSI** (0xff960000) -> URT UMO-P076MD-T panel rotated 270,
-      PWM backlight; HDMI disabled;
-    - touch: **Ilitek ILI2116** at 0x41 on I2C4 (out-of-tree driver; a firmware updater runs at
-      boot);
-    - audio: I2S (8 out / 2 in) to a vendor GPIO-controlled codec (`vendor,panel-audio`),
-      not USB;
-    - storage: 8-bit eMMC on `dwmmc@ff0f0000` (the root filesystem, A/B-style updates) + SD;
-    - Ethernet: GMAC RGMII like the Tinker Board; Wi-Fi/BT described but disabled;
-    - USB: EHCI/OHCI host0, DWC2 host1, OTG switchable to gadget (UAC2, MIDI, mass storage);
-    - control surface: an **STM32 on USB** (USB MIDI; enters the ST ROM DFU bootloader 0483:df11
-      via SysEx for updates). Its USB descriptors and report protocol are the next unknown.
-    - CPU errata: the config enables Cortex-A12/A17 errata that write **CP15 c15** registers
-      in early setup, which the Debian kernel does not.
-  - **Graphics.** The firmware kernel has **Panfrost built in and no `mali_kbase`**; userspace
-    is Mesa 24.0.7 with `panfrost_dri.so`. M8 validated against Panfrost is therefore exactly
-    what the panel board needs; matching Arm's blob is not required for this firmware.
-  - **Userland.** Yocto scarthgap (glibc, systemd). `/usr/bin/app` contains Thumb-2 functions
-    (801 of 4706 exported functions have Thumb addresses), so T32 is required; glibc itself is
-    ARM-mode.
-  - Boot: the vendor's own update image, locally, for research; it is not ours to redistribute and
-    nothing from it is committed.
 
 ## Order and size
 
@@ -221,40 +190,32 @@ M8 and M9 are independent of each other and of M5–M7.
 ## State (2026-11-20)
 
 Milestones: M0–M4, M7 and M8 done; M9 half
-done (the JIT, not threads); M5, M6 and M10 not started. The panel board profile runs the vendor's
-firmware to its application with display, touch, Wi-Fi and audio (`docs/panel-board.md`).
+done (the JIT, not threads); M5, M6 and M10 not started.
 
 | Area | State | Where |
 |---|---|---|
 | Cores | Four Cortex-A12 with Thumb-2, VFP and NEON (#18), on the A32/T32 JIT by default (#45; `--no-jit` or `SBC_JIT=0` for the interpreter). All four run on one host thread. | `arm-a32`, `machine.rs` |
 | Interrupts, timers, SMP | GIC-400, the generic timer, the boot ROM SMP mailbox, TLB broadcast | `machine.rs` |
-| Clocks, power | CRU (PLLs, the I2S fractional divider), GRF/SGRF, PMU; RK808 (Tinker Board) or ACT8846, SYR827/828 and HYM8563 (panel board) on I2C | `cru.rs`, `i2c.rs`, `peripherals/` |
-| Storage | dw_mmc for SD (card detect on GPIO6_C6 for the panel board), eMMC and SDIO; boot from the card's `/boot` like the firmware | `dwmmc.rs`, `emmc.rs`, `boot.rs` |
-| Display | VOP (both, two windows), IOMMU; DW HDMI with a monitor (EDID on I2C5, `--hdmi-mode`) on the Tinker Board, DW MIPI DSI to the panel board's panel; VNC and `--screenshot` | `vop.rs`, `dsi.rs`, `peripherals/src/dw_hdmi.rs` |
-| 2D and GPU | RGA; Mali-T760 MP4 for Panfrost + Mesa (kmscube, 25 of 25 GLES 2 scenes match softpipe) | `rga.rs`, `midgard/` |
-| Touch | ILI2116 on I2C4 (panel board) | `peripherals/src/ili2116.rs` |
-| Wi-Fi | BCM43455 on SDIO for brcmfmac: scan, open and WPA2 joins, DHCP and NAT on `sbc-net` (panel board) | `peripherals/src/bcm43455/` |
+| Clocks, power | CRU (PLLs, the I2S fractional divider), GRF/SGRF, PMU; RK808 on I2C (models of the ACT8846, SYR827/828 and HYM8563, which other RK3288 boards use, are in `peripherals/`) | `cru.rs`, `i2c.rs`, `peripherals/` |
+| Storage | dw_mmc for SD (card detect on GPIO6_C6 where the device tree uses it), eMMC and SDIO; boot from the card's `/boot` like the firmware | `dwmmc.rs`, `emmc.rs`, `boot.rs` |
+| Display | VOP (both, two windows), IOMMU; DW HDMI with a monitor (EDID on I2C5, `--hdmi-mode`) on the Tinker Board, DW MIPI DSI for panels; VNC and `--screenshot` | `vop.rs`, `dsi.rs`, `peripherals/src/dw_hdmi.rs` |
+| 2D and GPU | RGA; Mali-T760 MP4 for Panfrost + Mesa (kmscube, 25 of 25 GLES 2 scenes matched softpipe; the tests are being moved to the Tinker Board profile, `docs/mali-t760.md`) | `rga.rs`, `midgard/` |
+| Wi-Fi | BCM43455 on SDIO for brcmfmac: scan, open and WPA2 joins, DHCP and NAT on `sbc-net` (no board profile attaches it yet) | `peripherals/src/bcm43455/` |
 | Audio | I2S fed by the PL330 DMA controller at 0xffb20000; `--audio-out FILE.wav` or a FIFO | `i2s.rs`, `peripherals/src/pl330.rs` |
 
 Not modelled yet, roughly in order of value:
 
-1. **USB** (DWC2 OTG and host, EHCI/OHCI; M6). The panel board's pads and controls are an STM32
-   on USB, and the Tinker Board needs it for a keyboard and sticks.
-2. **Speed: one host thread per core** (M9). The vendor application runs at about 30 % of real
-   time idle and 5 % while it plays a sample, too slow for live audio; recording with
-   `--audio-out` works. This touches `arm-a32` and needs its owner.
+1. **USB** (DWC2 OTG and host, EHCI/OHCI; M6). The Tinker Board needs it for a keyboard and
+   sticks.
+2. **Speed: one host thread per core** (M9). This touches `arm-a32` and needs its owner.
 3. **GMAC Ethernet** (M5). Armbian's first-login wizard waits about a minute for an address.
 4. The browser build and demo (M10).
 5. Smaller: HDMI audio (the Tinker Board's I2S goes to the HDMI transmitter; its audio
    registers are storage only), the second PL330 (0xff250000), backlight PWM, the SAR ADC, Bluetooth, the
    video codec IOMMUs, device tree overlays from `armbianEnv.txt`, LPAE kernels.
 
-The panel board's own open items (the start-up "Wifi and storage systems failed" dialog, the
-pads) are listed in `docs/panel-board.md`.
-
 Times on an M-series host, one host thread (2026-11-18): `scripts/tinkerboard-shell.txt`
-8 s, `scripts/tinkerboard-armbian.txt` 5 min 52 s, `scripts/panel-board-audio.txt` 2 min 13 s,
-all on the JIT.
+8 s, `scripts/tinkerboard-armbian.txt` 5 min 52 s, both on the JIT.
 
 M4 state, kept for reference: Armbian 26.8.1 passed `scripts/tinkerboard-armbian.txt` in
 22 min 45 s on the interpreter (51.7 G instructions summed over the cores, 24.3 s virtual,
@@ -289,7 +250,7 @@ event counters if a guest needs them (both are hidden in the ID registers today)
 
 ## Risks
 
-- **Thumb-2 and NEON breadth.** Debian userland and the vendor application use both; gaps show up
+- **Thumb-2 and NEON breadth.** Debian userland uses both; gaps show up
   as random SIGILLs. Mitigation: the "interpreter proves it before the JIT emits it" rule from
   `arm-a64`, and a decode-coverage report.
 - **Clock tree.** Linux computes MMC, UART and display clocks from CRU registers. Wrong
@@ -301,4 +262,3 @@ event counters if a guest needs them (both are hidden in the ID registers today)
   intricate; budget for it separately and do not let it block M4–M7.
 - **Real boot ROM path.** Running U-Boot SPL means modelling DDR controller initialisation.
   Direct `/boot` loading first; the boot ROM + idbloader path is a later fidelity milestone.
-  The panel board's U-Boot is not in the update image; the profile will boot its kernel directly.

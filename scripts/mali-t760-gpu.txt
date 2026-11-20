@@ -1,9 +1,7 @@
 # The Mali-T760 GPU: Debian's Mesa (panfrost) renders kmscube through the emulated job
-# manager, Midgard shader core, tiler and fragment pipeline, shown on the panel board's DSI
-# panel. Needs the image from scripts/mali-t760-fixture.sh:
-#   sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/panel-board/rk3288-panel.dtb \
-#       --emmc cache/mali-t760/debian-gpu.img --append "$(cat cache/mali-t760/cmdline)" \
-#       --script scripts/mali-t760-gpu.txt --timeout 1800
+# manager, Midgard shader core, tiler and fragment pipeline, shown on the board's display.
+# Needs the image from scripts/mali-t760-fixture.sh, booted with --emmc and the
+# --append "$(cat cache/mali-t760/cmdline)" it writes (docs/mali-t760.md; --timeout 1800).
 # (the second kmscube's stdin is an idle pipe: in the background it would get /dev/null,
 # read EOF and stop after a frame)
 wait-serial root@

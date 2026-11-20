@@ -172,6 +172,6 @@ paths, results equal to the host's). Not modelled: cumulative floating-point exc
 flags (as in VFP), big-endian data (CPSR.E) for element accesses.
 
 **Not yet.** SD/MMC, EMAC, USB, display,
-a JIT, snapshots and the browser build. The RK3288 / panel board work builds on `arm-a32`;
+a JIT, snapshots and the browser build. The RK3288 work builds on `arm-a32`;
 `arm-a32` needs a per-board CPU identity (MIDR, cache and feature ID registers) before a
 second board uses it.
