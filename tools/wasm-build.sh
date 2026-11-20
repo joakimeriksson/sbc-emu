@@ -23,4 +23,9 @@ if [ -f cache/tinker-board/zImage ]; then
 fi
 armbian=$(ls cache/tinker-board-armbian/Armbian_*_Tinkerboard_*.img 2>/dev/null | head -n1)
 [ -n "$armbian" ] && [ ! -e web/assets/tinker-armbian.img ] && ln -s "../../$armbian" web/assets/tinker-armbian.img
+# the Orange Pi One's demo (scripts/orangepi-one-fixture.sh) for web/board.html
+if [ -f cache/orangepi-one/zImage ]; then
+  mkdir -p web/assets/orangepi-one
+  cp cache/orangepi-one/zImage cache/orangepi-one/sun8i-h3-orangepi-one.dtb cache/orangepi-one/initramfs.cpio.gz web/assets/orangepi-one/
+fi
 ls -la web/assets

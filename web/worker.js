@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one', ramMb},
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
@@ -73,6 +73,19 @@ async function start(os, ramMb, jit) {
   postMessage({ type: 'status', text: 'loading emulator…' });
   const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead, sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset, sbc_host_now_ms: () => performance.now() } });
   ex = instance.exports;
+  if (os === 'orangepi-one') {
+    // Orange Pi One (Allwinner H3, four 32-bit Cortex-A7s): Alpine's kernel and device tree and
+    // a BusyBox initramfs (scripts/orangepi-one-fixture.sh), shell on the serial console
+    postMessage({ type: 'status', text: 'loading the Alpine kernel, device tree and initramfs…' });
+    const [kernel, dtb, initrd] = await Promise.all(['zImage', 'sun8i-h3-orangepi-one.dtb', 'initramfs.cpio.gz']
+      .map((f) => fetchBytes(`assets/orangepi-one/${f}`, false)));
+    if (ex.sbc_boot_opi1(ramMb, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
   if (os === 'tinker-armbian' || os === 'tinker-busybox') {
     // ASUS Tinker Board S (RK3288, four 32-bit Cortex-A12s): no USB yet, so input is the serial
     // console; HDMI shows what the guest's DRM driver puts on the emulated 720p monitor

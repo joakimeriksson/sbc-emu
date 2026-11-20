@@ -103,7 +103,7 @@ Load addresses are U-Boot's sunxi defaults. Unlike the Pi 4 (D2) no reduced DT i
 generated: the mainline H3 tree works unmodified because unmodelled devices read back.
 
 **Fixture.** `scripts/orangepi-one-fixture.sh` downloads and verifies Alpine 3.24's
-`linux-lts-6.18.63-r0` (armv7) and `alpine-minirootfs-3.24.4-armhf`, extracts the zImage
+`linux-lts-6.18.64-r0` (armv7) and `alpine-minirootfs-3.24.4-armhf`, extracts the zImage
 and `sun8i-h3-orangepi-one.dtb` unmodified and builds the initramfs (minirootfs + a
 serial-shell `/init`).
 
@@ -112,7 +112,7 @@ serial-shell `/init`).
 | `zImage` (vmlinuz-lts) | `7bc559959b8eebc56c9417c92e5e4e50eb327ca43a2b78e40a691de3395f8a46` |
 | `sun8i-h3-orangepi-one.dtb` | `42e7943844553dd4c9b515ce762b290481eb33fecea08a3ddbf72a451463033e` |
 | `alpine-minirootfs-3.24.4-armhf.tar.gz` | `5d3c3debe55cbfca4f5b4252b0a3a7f75434bb6b6e3e1859fe917e02a4a326ed` |
-| `linux-lts-6.18.63-r0.apk` | `676ce55f608d0d19e18af783cadc70b80fd0da32dd01a85df589c2668daa485b` |
+| `linux-lts-6.18.64-r0.apk` | `57be01c377ddf77f3272f0d6825a60356d8fe7f43b24ab3c1be41d9a57046aff` |
 
 **Evidence.** `scripts/orangepi-one-shell.txt` passes end to end: prompt, `uname`, DT model,
 VFPv4 in `/proc/cpuinfo` and `awk` floating point, `sleep 1` and `/proc/interrupts`, tmpfs

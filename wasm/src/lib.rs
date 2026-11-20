@@ -1,5 +1,6 @@
 //! C ABI over the emulated boards for the browser (no wasm-bindgen; see web/worker.js): the
-//! Pi 4B, and the Tinker Board S (RK3288, `sbc_boot_tinker*`). Single-threaded: one machine
+//! Pi 4B, the Tinker Board S (RK3288, `sbc_boot_tinker*`) and the Orange Pi One (Allwinner H3,
+//! `sbc_boot_opi1`). Single-threaded: one machine
 //! per module instance, driven from a Web Worker. Exports for devices only one board has (the
 //! Pi's USB keyboard, GPIO, sensors, audio) do nothing on the other.
 #![allow(clippy::missing_safety_doc)]
@@ -40,7 +41,13 @@ impl Disk for WebDisk {
 enum Board {
     Pi(Machine),
     Tinker(Box<rockchip_rk3288::Machine>, TinkerBoot),
+    /// The Orange Pi One with what it was booted from (kernel, stock DTB, initrd, command line).
+    OrangePiOne(Box<allwinner_h3::Machine>, DirectBoot),
 }
+
+/// A direct boot's inputs: the kernel, the board's stock device tree, an initramfs and the
+/// command line.
+type DirectBoot = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, String);
 
 /// How a Tinker Board was started, so a reset (`reboot`) starts it the same way.
 struct TinkerBoot {
@@ -52,16 +59,16 @@ struct TinkerBoot {
 
 impl Board {
     fn run(&mut self, budget: u64) -> Stop {
-        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget) }
+        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget) }
     }
     fn now(&self) -> u64 {
-        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now() }
+        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now() }
     }
     fn idle_until(&mut self, t: u64) {
-        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t) }
+        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t) }
     }
     fn instret(&self) -> u64 {
-        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret() }
+        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret() }
     }
 }
 
@@ -114,7 +121,7 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> { ST.with(|s| s.borrow_
 
 /// The Pi, if that is the board running (for the exports of its own devices).
 fn with_pi<R>(f: impl FnOnce(&mut Machine) -> R) -> Option<R> {
-    with(|s| match &mut s.m { Board::Pi(m) => Some(f(m)), Board::Tinker(..) => None }).flatten()
+    with(|s| match &mut s.m { Board::Pi(m) => Some(f(m)), _ => None }).flatten()
 }
 
 /// Allocate `len` bytes the page can copy a file into (leaked until the page reloads).
@@ -202,9 +209,37 @@ pub unsafe extern "C" fn sbc_boot_tinker_sd(ram_mb: u32, unix_now: f64, sectors:
     0
 }
 
-/// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board.
+/// An Orange Pi One as the CLI's `--board orangepi-one` builds it: the HDMI monitor in its
+/// default mode, user networking, no SD card.
+fn opi1_machine(ram_bytes: usize) -> allwinner_h3::Machine {
+    let mut m = allwinner_h3::Machine::with_ram_size(ram_bytes);
+    m.connect_network(false, false);
+    m
+}
+
+/// Orange Pi One: boot a zImage with the stock device tree (patched the way U-Boot does) and an
+/// optional initramfs; an empty command line is the board's default (console on UART0).
+/// Returns 0 on success.
 #[no_mangle]
-pub extern "C" fn sbc_board() -> u32 { with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2 }).unwrap_or(0) }
+pub unsafe extern "C" fn sbc_boot_opi1(ram_mb: u32, k: *const u8, klen: usize, d: *const u8, dlen: usize,
+                                       i: *const u8, ilen: usize, c: *const u8, clen: usize) -> i32 {
+    let kernel = std::slice::from_raw_parts(k, klen).to_vec();
+    let dtb = std::slice::from_raw_parts(d, dlen).to_vec();
+    let initrd = (ilen > 0).then(|| std::slice::from_raw_parts(i, ilen).to_vec());
+    let cmdline = if clen > 0 { String::from_utf8_lossy(std::slice::from_raw_parts(c, clen)).into_owned() } else {
+        allwinner_h3::boot::DEFAULT_CMDLINE.to_string()
+    };
+    let mut m = opi1_machine((ram_mb as usize) << 20);
+    if allwinner_h3::boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), &cmdline).is_err() { return -1; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::OrangePiOne(Box::new(m), (kernel, dtb, initrd, cmdline)), Some(0.0))));
+    0
+}
+
+/// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board, 3 the Orange Pi One.
+#[no_mangle]
+pub extern "C" fn sbc_board() -> u32 {
+    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3 }).unwrap_or(0)
+}
 
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
 #[no_mangle]
@@ -212,6 +247,7 @@ pub extern "C" fn sbc_jit(on: u32) -> u32 {
     with(|s| match &mut s.m {
         Board::Pi(m) => if on != 0 { m.enable_jit() as u32 } else { m.disable_jit(); 0 },
         Board::Tinker(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
+        Board::OrangePiOne(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
     }).unwrap_or(0)
 }
 
@@ -234,6 +270,7 @@ pub extern "C" fn sbc_jit_hot(n: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => { if let Some(j) = m.jit_mut() { j.hot = n.max(1); } }
         Board::Tinker(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
+        Board::OrangePiOne(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
     });
 }
 
@@ -263,6 +300,7 @@ pub extern "C" fn sbc_jit_blocks() -> f64 {
     with(|s| match &s.m {
         Board::Pi(m) => m.jit().map(|j| j.compiled as f64).unwrap_or(0.0),
         Board::Tinker(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
+        Board::OrangePiOne(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
     }).unwrap_or(0.0)
 }
 
@@ -281,7 +319,7 @@ pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
 #[no_mangle]
 pub extern "C" fn sbc_audio_take() -> usize {
     with(|s| {
-        s.audio = match &mut s.m { Board::Pi(m) => std::mem::take(&mut m.soc.i2s.out), Board::Tinker(..) => Vec::new() };
+        s.audio = match &mut s.m { Board::Pi(m) => std::mem::take(&mut m.soc.i2s.out), _ => Vec::new() };
         s.audio.len()
     }).unwrap_or(0)
 }
@@ -324,6 +362,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                     let restarted = match &mut s.m {
                         Board::Pi(old) => pi_restart(old).map(Board::Pi),
                         Board::Tinker(old, how) => tinker_restart(old, how),
+                        Board::OrangePiOne(old, how) => opi1_restart(old, how),
                     };
                     match restarted {
                         Some(m) => s.m = m,
@@ -359,6 +398,15 @@ fn tinker_restart(old: &mut rockchip_rk3288::Machine, how: &mut TinkerBoot) -> O
     Some(Board::Tinker(Box::new(m), how))
 }
 
+/// Start an Orange Pi One again from what it was booted with (after a reset).
+fn opi1_restart(old: &allwinner_h3::Machine, how: &mut DirectBoot) -> Option<Board> {
+    let mut m = opi1_machine(old.soc.ram.mem.len());
+    let (kernel, dtb, initrd, cmdline) = std::mem::take(how);
+    allwinner_h3::boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), &cmdline).ok()?;
+    m.set_jit(old.jit_enabled());
+    Some(Board::OrangePiOne(Box::new(m), (kernel, dtb, initrd, cmdline)))
+}
+
 #[no_mangle]
 pub extern "C" fn sbc_wait_ms() -> f64 { with(|s| s.wait_ms).unwrap_or(0.0) }
 
@@ -385,19 +433,28 @@ pub extern "C" fn sbc_uart_in(b: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => { if m.soc.uart.rx_room() { m.soc.uart.push_rx(b as u8); m.soc.dirty = true; } }
         Board::Tinker(m, _) => { m.serial_input(b as u8); }
+        Board::OrangePiOne(m, _) => { m.serial_input(b as u8); }
     });
 }
 
 #[no_mangle]
 pub extern "C" fn sbc_uart_room() -> i32 {
-    with(|s| match &s.m { Board::Pi(m) => m.soc.uart.rx_room() as i32, Board::Tinker(m, _) => m.soc.uart.rx_room() as i32 }).unwrap_or(0)
+    with(|s| match &s.m {
+        Board::Pi(m) => m.soc.uart.rx_room() as i32,
+        Board::Tinker(m, _) => m.soc.uart.rx_room() as i32,
+        Board::OrangePiOne(m, _) => m.soc.uart.rx_room() as i32,
+    }).unwrap_or(0)
 }
 
 /// Move pending UART output to an internal buffer; returns its length (`sbc_uart_ptr` for data).
 #[no_mangle]
 pub extern "C" fn sbc_uart_take() -> usize {
     with(|s| {
-        s.uart = match &mut s.m { Board::Pi(m) => std::mem::take(&mut m.soc.uart.out), Board::Tinker(m, _) => m.take_serial_output() };
+        s.uart = match &mut s.m {
+            Board::Pi(m) => std::mem::take(&mut m.soc.uart.out),
+            Board::Tinker(m, _) => m.take_serial_output(),
+            Board::OrangePiOne(m, _) => m.take_serial_output(),
+        };
         s.uart.len()
     }).unwrap_or(0)
 }
@@ -408,7 +465,11 @@ pub extern "C" fn sbc_uart_ptr() -> *const u8 { with(|s| s.uart.as_ptr()).unwrap
 #[no_mangle]
 pub extern "C" fn sbc_fb_render() -> *const u8 {
     with(|s| {
-        let size = match &s.m { Board::Pi(m) => m.soc.render(&mut s.fb), Board::Tinker(m, _) => m.soc.render(&mut s.fb) };
+        let size = match &s.m {
+            Board::Pi(m) => m.soc.render(&mut s.fb),
+            Board::Tinker(m, _) => m.soc.render(&mut s.fb),
+            Board::OrangePiOne(m, _) => m.soc.render(&mut s.fb),
+        };
         match size {
             Some((w, h)) => { s.fb_w = w; s.fb_h = h; s.fb.as_ptr() }
             None => std::ptr::null(),
@@ -438,7 +499,11 @@ pub extern "C" fn sbc_stop_kind() -> i32 { with(|s| match s.stop { None => 0, So
 pub extern "C" fn sbc_stop_pc() -> f64 {
     with(|s| match s.stop {
         Some(Stop::Unimplemented(pc, _)) => pc as f64,
-        _ => match &s.m { Board::Pi(m) => m.cpu().pc as f64, Board::Tinker(m, _) => m.cpus[m.last_stop_core].r[15] as f64 },
+        _ => match &s.m {
+            Board::Pi(m) => m.cpu().pc as f64,
+            Board::Tinker(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
+            Board::OrangePiOne(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
+        },
     }).unwrap_or(0.0)
 }
 #[no_mangle]

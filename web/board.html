@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sbc-emu board</title>
+<meta name="description" content="A single-board computer booting Linux in your browser, on an emulator compiled to WebAssembly.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  :root { --mask: #103b2c; --mask-3: #0b2a1f; --silk: #eef0e6; --silk-2: #9db5a8; --gold: #d4af5a; }
+  * { box-sizing: border-box; }
+  html { background: var(--mask); }
+  body { margin: 0; color: var(--silk); font: 16px/1.5 system-ui, -apple-system, sans-serif;
+    background: radial-gradient(circle at 1px 1px, rgba(238,240,230,.06) 1px, transparent 1.4px) 0 0 / 22px 22px, var(--mask); }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: clamp(26px, 5vw, 38px); line-height: 1.1; margin: 0 0 6px; }
+  h1 a { color: inherit; text-decoration: none; }
+  .lede { margin: 0 0 18px; color: var(--silk-2); }
+  a { color: var(--gold); }
+  .term { position: relative; height: min(70vh, 520px); background: #0b0b0b; border: 2px solid var(--silk-2); border-radius: 6px; padding: 8px; overflow: hidden; }
+  .term:focus-within { border-color: var(--gold); }
+  #xterm { height: 100%; }
+  .power { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 20px; text-align: center;
+    background: radial-gradient(ellipse at center, #0f2f24 0%, #000 75%); z-index: 5; }
+  .power[hidden] { display: none; }
+  .power button { font: 700 22px/1 system-ui, sans-serif; color: var(--mask); background: var(--gold); border: 0; border-radius: 999px; padding: 16px 30px; cursor: pointer; }
+  .power button:disabled { cursor: progress; opacity: .7; }
+  .power p { margin: 0; color: var(--silk-2); font-size: 14px; max-width: 28rem; }
+  #status { margin: 8px 0 14px; color: var(--silk-2); font-size: 14px; font-variant-numeric: tabular-nums; min-height: 1.5em; }
+  .try { display: flex; flex-wrap: wrap; gap: 8px; }
+  .try button { font: 14px ui-monospace, Menlo, monospace; padding: 9px 14px; border-radius: 6px; border: 1px solid var(--silk-2); background: transparent; color: var(--silk); cursor: pointer; }
+  .try button:not(:disabled):hover { border-color: var(--gold); color: var(--gold); }
+  .try button:disabled { opacity: .45; cursor: default; }
+  footer { margin-top: 26px; color: var(--silk-2); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><a href="./">sbc-emu</a>: <span id="name">a board</span> in your browser</h1>
+  <p class="lede" id="lede"></p>
+  <div class="term">
+    <div id="xterm"></div>
+    <div class="power" id="power">
+      <button id="powerbtn" type="button">Power on</button>
+      <p id="powernote"></p>
+    </div>
+  </div>
+  <p id="status" aria-live="polite"></p>
+  <div class="try" id="try"></div>
+  <footer>The terminal is the board's serial console: click it and type.<br>
+    <a href="./">All boards</a> · <a href="https://github.com/joakimeriksson/sbc-emu">Source on GitHub</a> · <a href="sources.html">What runs here, and its licences</a> · <span id="tm"></span></footer>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script>
+// The boards whose demo is a shell on the serial console (worker.js boots them by `os`).
+const BOARDS = {
+  'orangepi-one': {
+    name: 'Orange Pi One', os: 'orangepi-one', ramMb: 512,
+    lede: 'Alpine Linux’s kernel and a BusyBox shell, booting from scratch on an emulated Allwinner H3: four 32-bit Cortex-A7 cores, translated to WebAssembly as they run. Nothing runs on a server.',
+    note: 'Downloads 14 MB (the emulator, Alpine’s kernel and a small initramfs) and boots Linux, in about 5 seconds on a fast computer.',
+    tm: 'Orange Pi is a trademark of Shenzhen Xunlong Software Co.; Allwinner is a trademark of Allwinner Technology. sbc-emu is not affiliated with either.',
+    try: ['uname -a', 'cat /proc/device-tree/model; echo', 'grep -c processor /proc/cpuinfo', 'cat /proc/cpuinfo | head -12', 'cat /proc/interrupts', 'free -m', 'dmesg | tail -15'],
+  },
+};
+const $ = (id) => document.getElementById(id);
+const id = new URLSearchParams(location.search).get('b') || 'orangepi-one';
+const board = BOARDS[id] || BOARDS['orangepi-one'];
+document.title = `sbc-emu ${board.name}`;
+$('name').textContent = `an ${board.name}`.replace(/^an ([^AEIOU])/, 'a $1');
+$('lede').textContent = board.lede;
+$('powernote').textContent = board.note;
+$('tm').textContent = board.tm;
+for (const c of board.try) { const b = document.createElement('button'); b.type = 'button'; b.disabled = true; b.textContent = c; $('try').append(b); }
+
+const term = new Terminal({ fontFamily: 'ui-monospace, Menlo, Consolas, monospace', fontSize: 14, cursorBlink: true, scrollback: 5000,
+  theme: { background: '#0b0b0b', foreground: '#d6d6d6', cursor: '#d4af5a' } });
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open($('xterm'));
+fit.fit();
+addEventListener('resize', () => fit.fit());
+let worker = null;
+const serial = (text) => worker?.postMessage({ type: 'serial', bytes: [...new TextEncoder().encode(text)] });
+term.onData(serial);
+$('try').onclick = (e) => { if (e.target.tagName === 'BUTTON') { serial(e.target.textContent + '\r'); term.focus(); } };
+
+$('powerbtn').onclick = () => {
+  $('powerbtn').disabled = true;
+  worker = new Worker('worker.js');
+  let state = '';
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'status') {
+      state = m.text; $('status').textContent = state;
+      if (state === 'booting…') { $('power').hidden = true; document.querySelectorAll('#try button').forEach((b) => b.disabled = false); term.focus(); }
+      if (m.phase === 'error') $('powerbtn').disabled = false;
+    } else if (m.type === 'uart') {
+      term.write(m.text);
+    } else if (m.type === 'stats') {
+      $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s` + (m.jit ? ` · ${m.jit} blocks compiled to WebAssembly` : '');
+    }
+  };
+  worker.postMessage({ type: 'start', os: board.os, ramMb: board.ramMb, jit: new URLSearchParams(location.search).get('jit') !== '0' });
+};
+if (new URLSearchParams(location.search).has('autostart')) $('powerbtn').click();
+</script>
+</body>
+</html>

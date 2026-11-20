@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sbc-emu boards</title>
+<meta name="description" content="Single-board computers emulated in your browser: pick a board, press Power on, and it runs Linux.">
+<style>
+  :root { --mask: #103b2c; --mask-2: #17493a; --silk: #eef0e6; --silk-2: #9db5a8; --gold: #d4af5a; }
+  * { box-sizing: border-box; }
+  html { background: var(--mask); }
+  body { margin: 0; color: var(--silk); font: 16px/1.5 system-ui, -apple-system, sans-serif;
+    background: radial-gradient(circle at 1px 1px, rgba(238,240,230,.06) 1px, transparent 1.4px) 0 0 / 22px 22px, var(--mask); }
+  main { max-width: 900px; margin: 0 auto; padding: 28px 16px 48px; }
+  h1 { font-size: clamp(30px, 6vw, 46px); line-height: 1.05; margin: 0 0 10px; }
+  .lede { margin: 0 0 26px; color: var(--silk-2); font-size: 18px; max-width: 40rem; }
+  a { color: var(--gold); }
+  .boards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  .card { display: flex; flex-direction: column; gap: 6px; padding: 18px; border: 2px solid var(--silk-2); border-radius: 8px; background: var(--mask-2); color: var(--silk); text-decoration: none; }
+  .card:hover, .card:focus-visible { border-color: var(--gold); }
+  .card h2 { margin: 0; font-size: 22px; }
+  .card .chip { color: var(--gold); font: 600 14px/1.3 ui-monospace, Menlo, monospace; }
+  .card p { margin: 0; color: var(--silk-2); font-size: 15px; }
+  .card .go { margin-top: auto; padding-top: 8px; color: var(--gold); font-weight: 600; }
+  .soon { margin: 26px 0 0; color: var(--silk-2); }
+  footer { margin-top: 30px; color: var(--silk-2); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>sbc-emu: single-board computers in your browser</h1>
+  <p class="lede">Each board is emulated down to the registers its Linux drivers use, by a pure-Rust emulator compiled to WebAssembly. Pick one and press Power on: it runs Linux on your computer, not on a server.</p>
+  <div class="boards">
+    <a class="card" href="hello.html">
+      <h2>Raspberry Pi 4</h2>
+      <span class="chip">Broadcom BCM2711 · 4× Cortex-A72 · 64-bit Arm</span>
+      <p>The Pi’s own kernel and a BusyBox shell on its HDMI screen, resumed from a snapshot. Type on its USB keyboard.</p>
+      <span class="go">Open · 16 MB</span>
+    </a>
+    <a class="card" href="board.html?b=orangepi-one">
+      <h2>Orange Pi One</h2>
+      <span class="chip">Allwinner H3 · 4× Cortex-A7 · 32-bit Arm</span>
+      <p>Alpine Linux’s kernel booting from scratch, in about 5 seconds, to a shell on the serial console.</p>
+      <span class="go">Open · 14 MB</span>
+    </a>
+  </div>
+  <p class="soon">Coming to this page: the ASUS Tinker Board, the Orange Pi 5 (eight cores) and the RISC-V Orange Pi RV. They already run in the native emulator, with their GPUs.</p>
+  <footer><a href="https://github.com/joakimeriksson/sbc-emu">Source on GitHub</a> · <a href="sources.html">What runs here, and its licences</a> · Raspberry Pi, Orange Pi, Broadcom and Allwinner are trademarks of their owners; sbc-emu is an independent project, not affiliated with any of them.</footer>
+</main>
+</body>
+</html>

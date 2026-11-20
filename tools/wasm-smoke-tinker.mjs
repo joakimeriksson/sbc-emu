@@ -5,7 +5,8 @@
 //   node tools/wasm-smoke-tinker.mjs [seconds] [dir]     (dir: cache/tinker-board)
 //   node tools/wasm-smoke-tinker.mjs [seconds] --sd IMAGE  (an Armbian image: to `login:`)
 // SBC_JIT=0 turns the JIT off, SBC_JIT_HOT=n sets the compile threshold, SBC_WASM picks another
-// build.
+// build. SBC_BOARD=orangepi-one runs the same check on the Orange Pi One instead (direct boot of
+// scripts/orangepi-one-fixture.sh's Alpine kernel, DTB and initramfs; dir: cache/orangepi-one).
 import fs from 'node:fs';
 
 let jitEx, jitFree = [], jitUsed = new Set();
@@ -19,7 +20,9 @@ function jitCompile(ptr, len) {
 function jitReset() { const t = jitEx.__indirect_function_table; for (const i of jitUsed) { t.set(i, null); jitFree.push(i); } jitUsed.clear(); }
 
 const secs = Number(process.argv[2] || 600);
-const sd = process.argv[3] === '--sd' ? process.argv[4] : null, dir = sd ? null : process.argv[3] || 'cache/tinker-board';
+const opi1 = process.env.SBC_BOARD === 'orangepi-one';
+const sd = process.argv[3] === '--sd' ? process.argv[4] : null, dir = sd ? null : process.argv[3] || (opi1 ? 'cache/orangepi-one' : 'cache/tinker-board');
+const prompt = opi1 ? 'orangepi-one#' : 'tinker-board#';
 let fd = sd ? fs.openSync(sd, 'r') : null;
 // the SD card, read like the worker's range requests (synchronously, into the emulator's memory)
 function diskRead(lba, count, ptr) { fs.readSync(fd, new Uint8Array(jitEx.memory.buffer, ptr, count * 512), 0, count * 512, lba * 512); }
@@ -31,6 +34,9 @@ const mem = () => new Uint8Array(ex.memory.buffer);
 const load = (f) => { const b = fs.readFileSync(f); const p = ex.sbc_alloc(b.length); mem().set(b, p); return [p, b.length]; };
 if (sd) {
   if (ex.sbc_boot_tinker_sd(1024, Date.now() / 1000, fs.fstatSync(fd).size / 512) !== 0) throw new Error('SD boot setup failed');
+} else if (opi1) {
+  const [kp, kl] = load(`${dir}/zImage`), [dp, dl] = load(`${dir}/sun8i-h3-orangepi-one.dtb`), [ip, il] = load(`${dir}/initramfs.cpio.gz`);
+  if (ex.sbc_boot_opi1(512, kp, kl, dp, dl, ip, il, 0, 0) !== 0) throw new Error('boot setup failed');
 } else {
   const [kp, kl] = load(`${dir}/zImage`), [dp, dl] = load(`${dir}/rk3288-tinker-s.dtb`), [ip, il] = load(`${dir}/initramfs.cpio.gz`);
   if (ex.sbc_boot_tinker(1024, Date.now() / 1000, kp, kl, dp, dl, ip, il, 0, 0) !== 0) throw new Error('boot setup failed');
@@ -43,8 +49,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const steps = sd ? [
   ['login:', null],
 ] : [
-  ['tinker-board#', 'uname -m; grep -c ^processor /proc/cpuinfo\r'],
-  ['tinker-board#', 'for i in 1 2 3 4; do (n=0; while [ $n -lt 3000 ]; do n=$((n+1)); done) & done; wait; echo PAR_DONE\r'],
+  [prompt, 'uname -m; grep -c ^processor /proc/cpuinfo\r'],
+  [prompt, 'for i in 1 2 3 4; do (n=0; while [ $n -lt 3000 ]; do n=$((n+1)); done) & done; wait; echo PAR_DONE\r'],
   ['PAR_DONE', null],
 ];
 let uart = '', seen = 0, step = 0, pending = [], lastProgress = 0;
