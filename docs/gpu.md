@@ -272,6 +272,9 @@ glmark2-es2-drm at 1024×768 from the browser demo snapshot, one render thread
 (Terrain, desktop and refract render more than one job per frame; their bin jobs fell by about
 as much as their render jobs, since the coordinate shaders run on the same fast path.)
 
+The full benchmark at 1920×1080 (`scripts/gpu-glmark2.txt`, default threads: 16 on this host)
+scores **117** with the fast path, from 2 fps (terrain) to 258 fps (build).
+
 The QPU part of a Phong frame fell from about 43 ms to 23 ms (fragment shaders 33 to 18 ms,
 vertex and coordinate shaders 10 to 6 ms); in jellyfish the fragment shaders fell from 68 to
 44 ms per frame while texturing stayed at about 100 ms.
