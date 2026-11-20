@@ -209,7 +209,10 @@ open http://127.0.0.1:8791/hello.html  # the smallest demo: a busybox shell in s
 
 `hello.html` is the one that runs from any static web server: it resumes a 15 MB snapshot of the
 Pi kernel and busybox booted to the shell (`web/assets/hello.snap`, made by
-`scripts/web-hello-snapshot.txt`), with no SD image and no range requests.
+`scripts/web-hello-snapshot.txt`), with no SD image and no range requests. `tools/site-build.sh`
+builds it as a site in `out/site` from pinned, checksummed downloads of the Pi kernel and BusyBox
+(about 16 MB; `web/sources.html` lists their licences and source), and
+`.github/workflows/site.yml` publishes that to GitHub Pages on every push to `main`.
 
 `index.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
 scenes on the emulated V3D GPU (setup in [docs/gpu.md](docs/gpu.md#in-the-browser)).
