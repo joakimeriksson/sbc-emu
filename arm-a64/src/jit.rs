@@ -992,7 +992,7 @@ impl Cpu {
             verify = false;
             if let Some(j) = self.jit.as_mut() { j.stale_skips += 1; }
         }
-        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl(), (self.el, self.spsel, self.daif), (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed)));
+        let before = verify.then(|| (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v, self.excl(), (self.el, self.spsel, self.daif), (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed), self.fpsr));
         if verify { self.store_log = Some(Vec::new()); }
         // SAFETY: the bus outlives the call; generated code only reaches it through h_step
         self.jit_bus = Some(unsafe { std::mem::transmute::<&mut dyn Bus, &'static mut dyn Bus>(bus) } as *mut dyn Bus);
@@ -1018,7 +1018,9 @@ impl Cpu {
             // the timers are restored too (MSR to them may end the block); compared via the registers
             (self.sys.vtimer, self.sys.ptimer, self.sys.timers_changed) = b.8;
             let n = after.4 - b.4;
+            let fpsr_after = self.fpsr;
             (self.x, self.sp, self.pc, self.nzcv, self.instret, self.v) = (b.0, b.1, b.2, b.3, b.4, b.5);
+            self.fpsr = b.9;
             self.set_excl(b.6);
             (self.el, self.spsel, self.daif) = b.7;
             let start_pc = self.pc;
@@ -1029,6 +1031,7 @@ impl Cpu {
             if self.pc != after.2 { diffs.push(format!("pc: jit {:#x} interp {:#x}", after.2, self.pc)); }
             if (self.el, self.spsel, self.daif) != after.7 { diffs.push(format!("el/spsel/daif: jit {:?} interp {:?}", after.7, (self.el, self.spsel, self.daif))); }
             if self.nzcv != after.3 { diffs.push(format!("nzcv: jit {:#x} interp {:#x}", after.3, self.nzcv)); }
+            if self.fpsr != fpsr_after { diffs.push(format!("fpsr: jit {fpsr_after:#x} interp {:#x}", self.fpsr)); }
             for k in 0..32 { if self.v[k] != after.5[k] { diffs.push(format!("v{k} differs")); } }
             for (off, bytes) in &wrote {
                 // SAFETY: inside guest RAM
@@ -1989,7 +1992,8 @@ fn stubs(c: &Ctx, front: u64) -> (Vec<u32>, usize, usize, usize, usize) {
     o.push(ldr_x(16, X_CPU, c.off_exit));
     o.push(0xd61f_0200); // br x16
     // micro-TLB refill stub (blr from a load/store slow path; x13 = VA, x15 = h_tlb's argument):
-    // keeps every host register but x16 (w16 = h_tlb's result) and x9-x12/x14/x15/x17
+    // keeps every host register but x16 (w16 = h_tlb's result) and x9-x12/x14/x15/x17. FPSR
+    // (the guest's, live) is not saved: h_tlb (a table walk) must not do floating point.
     let refill = o.len();
     const FRAME: u32 = 352; // x0-x9, x13, x30, q16-q31
     o.push(0xd100_0000 | (FRAME << 10) | (31 << 5) | 31); // sub sp, sp, #FRAME

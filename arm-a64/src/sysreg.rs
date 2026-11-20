@@ -174,7 +174,7 @@ impl Cpu {
             NZCV => self.nzcv as u64,
             DAIF => self.daif as u64,
             FPCR => self.fpcr,
-            FPSR => self.fpsr,
+            FPSR => self.fpsr | self.fpsr_nzcv,
             ESR_EL1 => self.esr[1],
             ESR_EL2 => self.esr[2],
             ESR_EL3 => self.esr[3],
@@ -254,7 +254,10 @@ impl Cpu {
             NZCV => self.nzcv = (v as u32) & 0xf000_0000,
             DAIF => self.daif = (v as u32) & 0x3c0,
             FPCR => self.fpcr = v,
-            FPSR => self.fpsr = v,
+            FPSR => {
+                self.fpsr = v & !crate::cpu::FPSR_NZCV;
+                self.fpsr_nzcv = v & crate::cpu::FPSR_NZCV;
+            }
             ESR_EL1 => self.esr[1] = v,
             ESR_EL2 => self.esr[2] = v,
             ESR_EL3 => self.esr[3] = v,

@@ -20,6 +20,9 @@ impl Exc {
     pub const BRK: u32 = 0x3c;
 }
 
+/// FPSR's AArch32-only bits (FPSCR N, Z, C, V): `Cpu::fpsr_nzcv`.
+pub(crate) const FPSR_NZCV: u64 = 0xf000_0000;
+
 /// A `chain_until` that never runs out (the largest the generated code's signed test allows).
 pub const UNBOUNDED: u64 = i64::MAX as u64;
 
@@ -78,7 +81,12 @@ pub struct Cpu {
     pub sctlr: [u64; 4],
     pub v: [u128; 32],
     pub fpcr: u64,
+    /// FPSR without bits 31:28. The JIT keeps it in the host's FPSR while compiled code runs.
     pub fpsr: u64,
+    /// FPSR bits 31:28: an AArch32 program's FPSCR N, Z, C, V, kept while AArch64 code runs
+    /// (which never changes them). Apart from `fpsr`, because a host without AArch32 treats
+    /// them as RES0 and would drop them.
+    pub fpsr_nzcv: u64,
     pub sys: crate::sysreg::SysRegs,
     pub irq: bool,
     pub fiq: bool,
@@ -202,6 +210,7 @@ impl Cpu {
             v: [0; 32],
             fpcr: 0,
             fpsr: 0,
+            fpsr_nzcv: 0,
             sys: crate::sysreg::SysRegs::default(),
             irq: false,
             fiq: false,
@@ -393,7 +402,7 @@ impl Cpu {
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
         w.tag("cpu-v1");
         // a 32-bit program running: its registers in their AArch64 places, its CPSR in `other`
-        let (mut x, mut v, mut fpsr, mut fpcr, mut pc) = (self.x, self.v, self.fpsr, self.fpcr, self.pc);
+        let (mut x, mut v, mut fpsr, mut fpcr, mut pc) = (self.x, self.v, self.fpsr | self.fpsr_nzcv, self.fpcr, self.pc);
         let mut cpsr = None;
         if let (true, Some(a)) = (self.aarch32, self.a32.as_ref()) {
             for (x, r) in x.iter_mut().zip(a.r.iter()).take(15) { *x = *r as u64; }
@@ -430,7 +439,7 @@ impl Cpu {
         self.pc = r.u64()?; self.nzcv = r.u32()?; self.daif = r.u32()?; self.el = r.u8()?; self.spsel = r.bool()?;
         for a in [&mut self.elr, &mut self.spsr, &mut self.esr, &mut self.far, &mut self.vbar, &mut self.sctlr] { for v in a.iter_mut() { *v = r.u64()?; } }
         for v in self.v.iter_mut() { *v = r.u128()?; }
-        self.fpcr = r.u64()?; self.fpsr = r.u64()?;
+        self.fpcr = r.u64()?; { let f = r.u64()?; self.fpsr = f & !FPSR_NZCV; self.fpsr_nzcv = f & FPSR_NZCV; }
         self.irq = r.bool()?; self.fiq = r.bool()?; self.instret = r.u64()?; { let e = r.opt_u64()?; self.set_excl(e); }
         self.brk_to_host = r.bool()?; self.firmware_calls_to_host = r.bool()?;
         let s = &mut self.sys;
