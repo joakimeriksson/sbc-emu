@@ -252,7 +252,8 @@ fn cross_page_link_unlinked_on_ic_ivau() {
     assert_eq!((i.x[5], i.x[6]), (1001, 999), "interpreter");
     let (j, _) = run(prog, true, &setup, 10_000_000);
     assert_eq!((j.x[5], j.x[6]), (1001, 999), "jit");
-    assert!(j.jit.as_ref().unwrap().linked > 0);
+    // the native JIT (AArch64 hosts) links the call into the other page
+    if let Some(jit) = j.jit.as_ref() { assert!(jit.linked > 0); }
 }
 
 #[test]
