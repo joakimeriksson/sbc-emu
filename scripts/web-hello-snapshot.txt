@@ -3,9 +3,10 @@
 #   gunzip -c cache/fw/kernel8.img > out/Image
 #   sbc-emu run --kernel out/Image --initrd cache/initramfs.cpio --shell fb --input usb --ram-mb 512 \
 #       --script scripts/web-hello-snapshot.txt
-# (the page restores it with 512 MB; the kernel's messages at loglevel 6 don't reach the serial
-# port, so this waits on time, not on output)
-sleep 25
+# (the page restores it with 512 MB). The last kernel message before /init, then the guest
+# going idle at the shell prompt: no fixed delays, so a slow host (CI, no JIT) gets the same
+# snapshot. tools/site-build.sh runs this for the demo site.
+wait-serial fscrypt-provisioning registered
 wait-idle 4
 type uname -a\n
 sleep 2
