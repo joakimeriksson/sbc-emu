@@ -1,4 +1,6 @@
 //! Valhall single-target linear RGBA8 clears and ordered blended writeback.
+//! The tile buffer is RGBA8; the render target's writeback swizzle orders the bytes in memory
+//! (identity for RGBA8, B,G,R,0 for the BGRA/BGRX formats of XRGB8888 scanout buffers).
 //! Compression, depth/stencil and MSAA remain unsupported.
 use crate::{
     gpu_cs::Stop,
@@ -72,11 +74,18 @@ pub fn fragment_frame(
     .map_err(Stop::Memory)?;
     let rt = &target[..];
     let ctl = word(rt, 1);
+    if std::env::var_os("SBC_MALI_TRACE").is_some() {
+        eprintln!("[mali] render target={:x?}", rt.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>());
+    }
+    // writeback swizzle: memory byte k takes channel sw[k] (0-3: R, G, B, A; 4: 0; 5: 1)
+    let sw: [u32; 4] = std::array::from_fn(|k| (ctl >> (16 + 3 * k)) & 7);
     if word(rt, 0) != (1 << 26)
-        || ctl & !((1 << 15) | (1 << 31)) != (1 | (19 << 3) | (2 << 8) | (0x688 << 16))
+        || ctl & !((1 << 15) | (1 << 31) | (0xfff << 16)) != (1 | (19 << 3) | (2 << 8))
+        || sw.iter().any(|&c| c > 5)
     {
         return Err(unsupported());
     }
+    let swizzle = |c: [u8; 4]| -> [u8; 4] { std::array::from_fn(|k| match sw[k] { 0..=3 => c[sw[k] as usize], 4 => 0, _ => 255 }) };
     let base = pair(rt, 8);
     let stride = word(rt, 10) as u64;
     if stride < (width as u64) * 4 {
@@ -94,7 +103,7 @@ pub fn fragment_frame(
     let color = word(rt, 12).to_le_bytes();
     let mut row = Vec::with_capacity((x1 - x0 + 1) as usize * 4);
     for _ in x0..=x1 {
-        row.extend_from_slice(&color);
+        row.extend_from_slice(&swizzle(color));
     }
     if (13..16).any(|i| word(rt, i) != word(rt, 12)) {
         return Err(unsupported());
@@ -161,7 +170,7 @@ pub fn fragment_frame(
         let address = base
             .checked_add(y as u64 * stride + x as u64 * 4)
             .ok_or(Stop::Memory(Fault::AddressSize))?;
-        m.write(ram, address, &color, true).map_err(Stop::Memory)?;
+        m.write(ram, address, &swizzle(color), true).map_err(Stop::Memory)?;
     }
     // A drawn tile is not a uniform clear. Invalidate its opaque checksum rather
     // than publishing the clear's checksum for non-uniform pixels.
@@ -262,6 +271,14 @@ mod tests {
         let before = r.clone();
         assert!(matches!(fragment(&m, &mut r, &regs), Err(Stop::Memory(_))));
         assert_eq!(r, before);
+    }
+    /// An XRGB8888 scanout buffer (Mesa's B8G8R8X8 writeback): blue first, alpha 0.
+    #[test]
+    fn bgrx_writeback_swizzle() {
+        let (m, mut r, regs) = fixture();
+        r[132..136].copy_from_slice(&(1u32 | (19 << 3) | (2 << 8) | (0x80a << 16)).to_le_bytes());
+        fragment(&m, &mut r, &regs).unwrap();
+        assert_eq!(&r[4096 + 16 + 4..4096 + 16 + 8], &[0x33, 0x22, 0x11, 0]);
     }
     #[test]
     fn unsupported_geometry_and_bad_destination_leave_memory_unchanged() {

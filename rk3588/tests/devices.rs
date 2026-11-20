@@ -208,7 +208,7 @@ fn psci_cpu_on_starts_a_big_core_with_its_identity() {
 fn hdmi_framebuffer_is_handed_over_and_reserved() {
     use rk3588::display::{framebuffer_addr, Mode};
     let mut m=Machine::new(256<<20).unwrap();
-    m.enable_hdmi(Mode{width:1920,height:1080});
+    m.enable_hdmi(Mode::find(1920,1080).unwrap());
     let mut image=vec![0;4096];image[56..60].copy_from_slice(b"ARMd");
     rk3588::boot::boot_linux(&mut m,&image,None,"").unwrap();
     let addr=framebuffer_addr(256<<20);
@@ -291,4 +291,32 @@ fn es8388_answers_on_i2c6() {
     assert_eq!(m.soc.audio.codec().regs[0x2e],0x1e);
     let dt=rk3588::boot::device_tree(128<<20,"",None,false);
     assert!(dt.windows(14).any(|w|w==b"everest,es8388") && dt.windows(15).any(|w|w==b"rockchip,es8388"));
+}
+
+#[test]
+fn hdmi_display_chain_for_rockchipdrm() {
+    use rk3588::{display::Mode, grf, scmi, vop2};
+    let mut m=Machine::new(256<<20).unwrap();
+    m.enable_hdmi(Mode::MODES[0]);
+    let mut image=vec![0;4096];image[56..60].copy_from_slice(b"ARMd");
+    rk3588::boot::boot_linux(&mut m,&image,None,"").unwrap();
+    let has=|s:&[u8]|m.dtb.windows(s.len()).any(|w|w==s);
+    for s in [&b"rockchip,rk3588-vop"[..],b"rockchip,display-subsystem",b"rockchip,rk3588-dw-hdmi-qp",b"rockchip,rk3588-hdptx-phy",b"arm,scmi-smc",b"arm,scmi-shmem"] { assert!(has(s),"{}",String::from_utf8_lossy(s)); }
+    assert!(!has(b"linux,spdif-dit"),"HDMI audio goes to the transmitter's codec");
+    // an SCMI rate set through the shared memory, as Linux's SMC transport sends it
+    let sh=scmi::SHMEM as usize;
+    assert_eq!(m.soc.ram[sh+4],1,"channel free at boot");
+    let msg=[0x10u32,(0x14<<10)|5,0,scmi::clk::DCLK_VP0,148_500_000,0];
+    for (i,w) in msg.iter().enumerate() { m.soc.ram[sh+0x14+4*i..][..4].copy_from_slice(&w.to_le_bytes()); }
+    m.soc.scmi_call();
+    assert_eq!(&m.soc.ram[sh+0x1c..sh+0x20],&[0;4],"SUCCESS");
+    assert_eq!(m.soc.scmi.rate(scmi::clk::DCLK_VP0),148_500_000);
+    // VOP2 identifies itself; the PHY's PLL locks once enabled
+    assert_eq!(m.soc.read32(vop2::BASE+4).unwrap(),0x4017_6786);
+    assert_eq!(m.soc.read32(grf::HDPTXPHY0_GRF+0x80).unwrap(),0);
+    m.soc.write32(grf::HDPTXPHY0_GRF,0x0080_0080).unwrap();
+    assert_eq!(m.soc.read32(grf::HDPTXPHY0_GRF+0x80).unwrap()&0xe,0xe);
+    assert_ne!(m.soc.read32(grf::SYS_GRF+0x384).unwrap()&(1<<16),0,"monitor plugged in");
+    // until Linux drives VOP2, the monitor shows the firmware's framebuffer
+    assert_eq!(m.soc.shown_size(),Some((1280,720)));
 }

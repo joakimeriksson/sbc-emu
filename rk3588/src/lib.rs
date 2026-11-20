@@ -1,5 +1,5 @@
 //! RK3588S / Orange Pi 5: up to four Cortex-A55 and four Cortex-A76 cores, GICv3, UART2 and RAM.
-//! Direct Linux boot, generated reduced DT, firmware PSCI services handled by host.
+//! Direct Linux boot, generated reduced DT, firmware PSCI and SCMI services handled by host.
 pub mod boot;
 pub mod gic;
 pub mod gpu_mmu;
@@ -28,6 +28,10 @@ pub mod i2c;
 pub mod i2s_tdm;
 pub mod es8388;
 pub mod audio;
+pub mod grf;
+pub mod hdmi_qp;
+pub mod scmi;
+pub mod vop2;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
@@ -61,6 +65,18 @@ pub struct Soc {
     pub usb: emu_core::usb::Devices,
     /// the headphone codec (ES8388 on I2C6, I2S1) and HDMI audio (I2S5), fed by the PL330s
     pub audio: audio::Audio,
+    /// the GRFs (syscons): SYS, VOP, VO1, HDPTXPHY0, PMU
+    pub grf: [grf::Grf; 5],
+    /// the display controller
+    pub vop2: vop2::Vop2,
+    /// the firmware's SCMI clocks and resets
+    pub scmi: scmi::Scmi,
+    /// virtual time (ns) at the last device update
+    pub now: u64,
+    /// HDMI0's transmitter (dw-hdmi-qp)
+    pub hdmi: hdmi_qp::HdmiQp,
+    /// HDMI0's PHY registers (Samsung HDPTX)
+    pub hdptx: Vec<u32>,
     /// virtual time of the network's next poll (ns)
     pub next_net_poll: u64,
     pub dirty: bool,
@@ -81,6 +97,10 @@ impl Soc {
         else if (pcie::MEM..pcie::MEM+pcie::MEM_SIZE).contains(&addr) { self.pcie.mem_read(addr&!3).unwrap_or(u32::MAX) }
         else if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
         else if audio::Audio::contains(addr) { self.audio.read(addr&!3) }
+        else if let Some((k,off))=Self::grf_at(addr) { self.grf_read(k,off) }
+        else if (hdmi_qp::BASE..hdmi_qp::BASE+hdmi_qp::SIZE).contains(&addr) { self.hdmi.read((addr-hdmi_qp::BASE)&!3) }
+        else if (vop2::BASE..vop2::BASE+vop2::SIZE).contains(&addr) { self.vop2.read((addr-vop2::BASE)&!3) }
+        else if (grf::HDPTXPHY0..grf::HDPTXPHY0+grf::HDPTXPHY_SIZE).contains(&addr) { self.hdptx[((addr-grf::HDPTXPHY0)/4) as usize] }
         else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
         else if (GICR..GICR+GICR_SIZE).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)}
@@ -109,6 +129,10 @@ impl Soc {
         else if (pcie::MEM..pcie::MEM+pcie::MEM_SIZE).contains(&addr) {self.pcie.mem_write(addr&!3,v,&mut self.ram);}
         else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
         else if audio::Audio::contains(addr) {self.audio.write(addr&!3,v,&mut self.ram);}
+        else if let Some((k,off))=Self::grf_at(addr) {self.grf[k].write(off,v);}
+        else if (hdmi_qp::BASE..hdmi_qp::BASE+hdmi_qp::SIZE).contains(&addr) {self.hdmi.write((addr-hdmi_qp::BASE)&!3,v);}
+        else if (vop2::BASE..vop2::BASE+vop2::SIZE).contains(&addr) {self.vop2.write((addr-vop2::BASE)&!3,v,self.now);}
+        else if (grf::HDPTXPHY0..grf::HDPTXPHY0+grf::HDPTXPHY_SIZE).contains(&addr) {self.hdptx[((addr-grf::HDPTXPHY0)/4) as usize]=v;}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
         else if (GICR..GICR+GICR_SIZE).contains(&addr) {self.gic.redist_write((addr-GICR)&!3,v);}
@@ -117,6 +141,21 @@ impl Soc {
     }
 }
 impl Soc {
+    /// The GRF holding `addr`: (index in `grf`, offset).
+    fn grf_at(addr: u64) -> Option<(usize,u64)> {
+        grf::BLOCKS.iter().position(|&(b,s)|(b..b+s).contains(&addr)).map(|k|(k,(addr-grf::BLOCKS[k].0)&!3))
+    }
+    /// A GRF register, with the status bits that come from other devices.
+    fn grf_read(&self, k: usize, off: u64) -> u32 {
+        let v=self.grf[k].read(off);
+        match (grf::BLOCKS[k].0,off) {
+            // the monitor is always plugged in
+            (grf::SYS_GRF,grf::SYS_GRF_SOC_STATUS1)=>v|grf::HDMI0_LEVEL,
+            // the PHY's PLL locks and its lanes come up as soon as the PLL is enabled
+            (grf::HDPTXPHY0_GRF,grf::HDPTX_STATUS)=>if self.grf[k].read(grf::HDPTX_CON0)&grf::HDPTX_PLL_EN!=0 {grf::HDPTX_READY} else {0},
+            _=>v,
+        }
+    }
     /// Device work up to time `now` (ns): Ethernet frames and the network's timers, USB polls.
     pub fn service(&mut self, now: u64) {
         self.gmac.service(&mut self.ram);
@@ -135,7 +174,21 @@ impl Soc {
         } else { self.gmac.tx_out.clear(); }
         self.xhci.tick(now,&mut self.ram,&mut self.usb);
         self.audio.service(now,&mut self.ram);
+        self.now=self.now.max(now);
+        self.vop2.tick(now,self.scmi.rate(scmi::clk::DCLK_VP0));
     }
+    /// What the HDMI monitor shows: VOP2's output once Linux drives it, else the firmware's
+    /// framebuffer.
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32,u32)> {
+        if self.vop2.running() && self.vop2.hdmi0() { return self.vop2.render(&self.ram,out); }
+        self.display.render(&self.ram,out)
+    }
+    pub fn shown_size(&self) -> Option<(u32,u32)> {
+        if self.vop2.running() && self.vop2.hdmi0() { return self.vop2.size(); }
+        self.display.shown_size()
+    }
+    /// The SCMI call (SMC 0x82000010) of a core.
+    pub fn scmi_call(&mut self) { let Soc{scmi,ram,..}=self; scmi.handle(ram); self.dirty=true; }
     /// The devices' interrupt lines into the GIC.
     pub fn device_lines(&mut self) {
         self.gic.set_line(XHCI_IRQ,self.xhci.irq());
@@ -144,6 +197,8 @@ impl Soc {
         self.gic.set_line(UART_IRQ,self.uart.irq());
         self.gic.set_line(32+203,self.mmc.irq());
         for (irq,level) in self.audio.lines() { self.gic.set_line(irq,level); }
+        self.gic.set_line(hdmi_qp::IRQ_MAIN,self.hdmi.irq());
+        self.gic.set_line(vop2::IRQ,self.vop2.irq());
         for (i,spi) in [92,93,94].into_iter().enumerate() { self.gic.set_line(32+spi,self.gpu.irq(i)); }
     }
 }
@@ -215,7 +270,7 @@ impl Machine {
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
-        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),audio:Default::default(),next_net_poll:0,dirty:true,unknown:Vec::new()};
+        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),audio:Default::default(),grf:grf::BLOCKS.map(|(_,s)|grf::Grf::new(s)),vop2:Default::default(),scmi:Default::default(),now:0,hdptx:vec![0;(grf::HDPTXPHY_SIZE/4) as usize],hdmi:hdmi_qp::HdmiQp::new(display::edid(&display::Mode::MODES[0])),next_net_poll:0,dirty:true,unknown:Vec::new()};
         let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,multi:false,#[cfg(not(target_arch = "wasm32"))] mt:None,irqs:0,exceptions:0};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
@@ -253,6 +308,8 @@ impl Machine {
         let addr=display::framebuffer_addr(self.soc.ram.len() as u64);
         self.soc.ram[addr as usize..].fill(0);
         self.soc.display=display::Display::new(addr,mode);
+        // the monitor's EDID prefers the same mode
+        self.soc.hdmi=hdmi_qp::HdmiQp::new(display::edid(&mode));
     }
     /// Plug a USB stick backed by `disk` in next to the keyboard and the tablet.
     pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
@@ -291,7 +348,7 @@ impl Machine {
     /// The earliest deadline after `t` that core `c` must notice: its own timers, those of
     /// sleeping cores and the network poll (cores waiting for their turn check their own).
     fn deadline_after(&self, t: u64, c: usize) -> Option<u64> {
-        let mut d=[self.soc.net.as_ref().map(|_|self.soc.next_net_poll),self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event()].into_iter().flatten().filter(|&x|x>t).min();
+        let mut d=[self.soc.net.as_ref().map(|_|self.soc.next_net_poll),self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event(),self.soc.vop2.next_event()].into_iter().flatten().filter(|&x|x>t).min();
         for (k,cpu) in self.cpus.iter().enumerate() {
             if self.state[k]==CoreState::Off || (k!=c && self.state[k]==CoreState::Run) {continue;}
             for ns in Self::timer_deadlines(cpu) { if ns>t { d=Some(d.map_or(ns,|x|x.min(ns))); } }
@@ -300,7 +357,7 @@ impl Machine {
     }
     /// The next timer deadline of any core that is on.
     fn next_deadline(&self) -> Option<u64> {
-        let dev=[self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event()];
+        let dev=[self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event(),self.soc.vop2.next_event()];
         self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(dev.into_iter().flatten()).min()
     }
     fn devices(&mut self) { self.soc.service(self.now); self.soc.device_lines(); }
@@ -436,7 +493,7 @@ impl Machine {
         const INVALID_PARAMETERS: u64 = -2i64 as u64;
         const ALREADY_ON: u64 = -4i64 as u64;
         let x=self.cpus[k].x;
-        let supported=|f:u32|matches!(f,0x8400_0000|0x8400_0002|0x8400_0003|0xc400_0003|0x8400_0004|0xc400_0004|0x8400_0006|0x8400_0008|0x8400_0009|0x8400_000a);
+        let supported=|f:u32|matches!(f,0x8000_0000|0x8400_0000|0x8400_0002|0x8400_0003|0xc400_0003|0x8400_0004|0xc400_0004|0x8400_0006|0x8400_0008|0x8400_0009|0x8400_000a);
         let ret=match x[0] as u32 {
             0x8400_0000=>0x10001,
             0x8400_0002=>{ self.state[k]=CoreState::Off; self.cpus[k].set_irq(false,false); return None; }
@@ -452,6 +509,7 @@ impl Machine {
             0x8400_000a=>if supported(x[1] as u32){0}else{NOT_SUPPORTED},
             // SMCCC_VERSION 1.1, other SMCCC services unsupported.
             0x8000_0000=>0x10001,
+            scmi::SMC_ID=>{ self.soc.scmi_call(); 0 },
             _=>NOT_SUPPORTED,
         };
         self.cpus[k].x[0]=ret; None

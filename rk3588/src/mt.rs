@@ -399,10 +399,11 @@ fn psci(sh: &Shared, k: usize) -> Option<Stop> {
         0x8400_0008 => return Some(Stop::PowerOff),
         0x8400_0009 => return Some(Stop::Reset),
         0x8400_000a => match x[1] as u32 {
-            0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003 | 0x8400_0004 | 0xc400_0004 | 0x8400_0006 | 0x8400_0008 | 0x8400_0009 | 0x8400_000a => 0,
+            0x8000_0000 | 0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003 | 0x8400_0004 | 0xc400_0004 | 0x8400_0006 | 0x8400_0008 | 0x8400_0009 | 0x8400_000a => 0,
             _ => NOT_SUPPORTED,
         },
         0x8000_0000 => 0x0001_0001, // SMCCC_VERSION 1.1
+        crate::scmi::SMC_ID => { unsafe { sh.soc() }.scmi_call(); 0 }
         _ => NOT_SUPPORTED,
     };
     cpu.x[0] = r;

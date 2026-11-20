@@ -48,11 +48,20 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
         f.str("format","x8r8g8b8");f.str("status","okay");f.end();
     }
     f.end();
+    f.begin("reserved-memory");f.cells("#address-cells",&[2]);f.cells("#size-cells",&[2]);f.empty("ranges");
     if let Some((addr,_))=hw.framebuffer {
-        f.begin("reserved-memory");f.cells("#address-cells",&[2]);f.cells("#size-cells",&[2]);f.empty("ranges");
         f.begin(&format!("framebuffer@{addr:x}"));f.cells("reg",&[(addr>>32) as u32,addr as u32,0,crate::display::FB_SLOT as u32]);f.empty("no-map");f.end();
-        f.end();
     }
+    // the SCMI channel's shared memory (Linux maps it as I/O memory)
+    f.begin(&format!("shmem@{:x}",crate::scmi::SHMEM));f.str("compatible","arm,scmi-shmem");
+    f.cells("reg",&[0,crate::scmi::SHMEM as u32,0,crate::scmi::SHMEM_SIZE as u32]);f.empty("no-map");f.cells("phandle",&[PH_SCMI_SHMEM]);f.end();
+    f.end();
+    // The firmware's SCMI clocks and resets over SMC (what TF-A provides on the RK3588).
+    f.begin("firmware");f.begin("scmi");f.str("compatible","arm,scmi-smc");f.cells("arm,smc-id",&[crate::scmi::SMC_ID]);
+    f.cells("shmem",&[PH_SCMI_SHMEM]);f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);
+    f.begin("protocol@14");f.cells("reg",&[0x14]);f.cells("#clock-cells",&[1]);f.cells("phandle",&[PH_SCMI_CLK]);f.end();
+    f.begin("protocol@16");f.cells("reg",&[0x16]);f.cells("#reset-cells",&[1]);f.cells("phandle",&[PH_SCMI_RESET]);f.end();
+    f.end();f.end();
     f.begin("memory@0");f.str("device_type","memory");f.cells("reg",&[0,0,(ram>>32) as u32,ram as u32]);f.end();
     f.begin("cpus");f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);
     for k in 0..cpus {
@@ -123,7 +132,8 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
         f.cells("interrupt-map",&[0,0,0,1, 1,0,0, 0,(IRQ-32) as u32,4]);
         f.empty("dma-coherent");f.end();
     }
-    audio_nodes(&mut f);
+    audio_nodes(&mut f,hw.framebuffer.is_some());
+    if hw.framebuffer.is_some() { display_nodes(&mut f); }
     if sd {
         f.begin("mmc@fe2c0000");f.strs("compatible",&["rockchip,rk3588-dw-mshc","rockchip,rk3288-dw-mshc"]);
         f.cells("reg",&[0,0xfe2c0000,0,0x4000]);f.cells("interrupts",&[0,203,4]);
@@ -133,15 +143,67 @@ pub fn device_tree_for(ram:u64,cmdline:&str,initrd:Option<(u64,u64)>,hw:&Hardwar
     f.end();f.finish()
 }
 
+/// Phandles of the SCMI and display nodes.
+const PH_SCMI_SHMEM:u32=0x30; const PH_SCMI_CLK:u32=0x31; const PH_SCMI_RESET:u32=0x32;
+const PH_SYS_GRF:u32=0x33; const PH_VOP_GRF:u32=0x34; const PH_VO1_GRF:u32=0x35; const PH_HDPTX_GRF:u32=0x36; const PH_PMU:u32=0x37;
+const PH_HDPTX:u32=0x38; const PH_VOP_PORTS:u32=0x39; const PH_VP0_HDMI0:u32=0x3a; const PH_HDMI0_IN:u32=0x3b; const PH_HDMI0:u32=0x3c;
+
+/// HDMI0 as Linux's rockchipdrm drives it: VOP2's video port 0, the DesignWare HDMI QP
+/// transmitter and its Samsung HDPTX PHY, with their GRFs, SCMI clocks and resets. No IOMMU:
+/// display buffers come from CMA. (The firmware framebuffer above stays until rockchipdrm
+/// takes the display over.)
+fn display_nodes(f:&mut Fdt) {
+    use crate::grf::*;
+    use crate::scmi::{clk,rst};
+    let reg=|f:&mut Fdt,base:u64,size:u64|f.cells("reg",&[0,base as u32,0,size as u32]);
+    for (name,compat,base,size,ph) in [("syscon","rockchip,rk3588-sys-grf",SYS_GRF,0x1000,PH_SYS_GRF),("syscon","rockchip,rk3588-vop-grf",VOP_GRF,0x2000,PH_VOP_GRF),
+        ("syscon","rockchip,rk3588-vo1-grf",VO1_GRF,0x4000,PH_VO1_GRF),("syscon","rockchip,rk3588-hdptxphy-grf",HDPTXPHY0_GRF,0x100,PH_HDPTX_GRF),("power-management","rockchip,rk3588-pmu",PMU,0x400,PH_PMU)] {
+        f.begin(&format!("{name}@{base:x}"));f.strs("compatible",&[compat,"syscon"]);reg(f,base,size);f.cells("phandle",&[ph]);f.end();
+    }
+    f.begin(&format!("phy@{HDPTXPHY0:x}"));f.str("compatible","rockchip,rk3588-hdptx-phy");reg(f,HDPTXPHY0,HDPTXPHY_SIZE);
+    f.cells("clocks",&[PH_SCMI_CLK,clk::HDPTX_REF,PH_SCMI_CLK,clk::HDPTX_APB]);f.strs("clock-names",&["ref","apb"]);
+    f.cells("resets",&[PH_SCMI_RESET,rst::HDPTX_APB,PH_SCMI_RESET,rst::HDPTX_INIT,PH_SCMI_RESET,rst::HDPTX_CMN,PH_SCMI_RESET,rst::HDPTX_LANE]);
+    f.strs("reset-names",&["apb","init","cmn","lane"]);f.cells("rockchip,grf",&[PH_HDPTX_GRF]);
+    f.cells("#clock-cells",&[0]);f.cells("#phy-cells",&[0]);f.cells("phandle",&[PH_HDPTX]);f.end();
+    {
+        use crate::hdmi_qp::*;
+        f.begin(&format!("hdmi@{BASE:x}"));f.str("compatible","rockchip,rk3588-dw-hdmi-qp");reg(f,BASE,SIZE);
+        f.cells("clocks",&[PH_SCMI_CLK,clk::HDMI0_PCLK,PH_SCMI_CLK,clk::HDMI0_EARC,PH_SCMI_CLK,clk::HDMI0_REF,PH_SCMI_CLK,clk::HDMI0_AUD,PH_SCMI_CLK,clk::HDMI0_HDP,PH_SCMI_CLK,clk::HCLK_VO1]);
+        f.strs("clock-names",&["pclk","earc","ref","aud","hdp","hclk_vo1"]);
+        let irqs:Vec<u32>=IRQS.iter().flat_map(|&i|[0,(i-32) as u32,4]).collect();
+        f.cells("interrupts",&irqs);f.strs("interrupt-names",&["avp","cec","earc","main","hpd"]);
+        f.cells("phys",&[PH_HDPTX]);f.cells("resets",&[PH_SCMI_RESET,rst::HDMI0_REF,PH_SCMI_RESET,rst::HDMI0_HDP]);f.strs("reset-names",&["ref","hdp"]);
+        f.cells("rockchip,grf",&[PH_SYS_GRF]);f.cells("rockchip,vo-grf",&[PH_VO1_GRF]);f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[PH_HDMI0]);
+        f.begin("ports");f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);
+        f.begin("port@0");f.cells("reg",&[0]);f.begin("endpoint");f.cells("remote-endpoint",&[PH_VP0_HDMI0]);f.cells("phandle",&[PH_HDMI0_IN]);f.end();f.end();
+        f.end();f.end();
+    }
+    {
+        use crate::vop2::*;
+        f.begin(&format!("vop@{BASE:x}"));f.str("compatible","rockchip,rk3588-vop");reg(f,BASE,SIZE);f.str("reg-names","vop");
+        f.cells("interrupts",&[0,(IRQ-32) as u32,4]);
+        f.cells("clocks",&[PH_SCMI_CLK,clk::ACLK_VOP,PH_SCMI_CLK,clk::HCLK_VOP,PH_SCMI_CLK,clk::DCLK_VP0,PH_SCMI_CLK,clk::DCLK_VP1,PH_SCMI_CLK,clk::DCLK_VP2,PH_SCMI_CLK,clk::DCLK_VP3,PH_SCMI_CLK,clk::PCLK_VOP]);
+        f.strs("clock-names",&["aclk","hclk","dclk_vp0","dclk_vp1","dclk_vp2","dclk_vp3","pclk_vop"]);
+        f.cells("rockchip,grf",&[PH_SYS_GRF]);f.cells("rockchip,vop-grf",&[PH_VOP_GRF]);f.cells("rockchip,vo1-grf",&[PH_VO1_GRF]);f.cells("rockchip,pmu",&[PH_PMU]);
+        f.begin("ports");f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);f.cells("phandle",&[PH_VOP_PORTS]);
+        f.begin("port@0");f.cells("#address-cells",&[1]);f.cells("#size-cells",&[0]);f.cells("reg",&[0]);
+        // endpoint 2: ROCKCHIP_VOP2_EP_HDMI0
+        f.begin("endpoint@2");f.cells("reg",&[2]);f.cells("remote-endpoint",&[PH_HDMI0_IN]);f.cells("phandle",&[PH_VP0_HDMI0]);f.end();
+        f.end();f.end();f.end();
+    }
+    f.begin("display-subsystem");f.str("compatible","rockchip,display-subsystem");f.cells("ports",&[PH_VOP_PORTS]);f.end();
+}
+
 /// Phandles of the audio nodes.
 const PH_I2S_MCLK:u32=8; const PH_CODEC_MCLK:u32=9;
 const PH_DMAC:[u32;2]=[0x20,0x21]; const PH_I2S1:u32=0x22; const PH_I2S5:u32=0x23;
 const PH_ES8388:u32=0x24; const PH_HDMI_TX:u32=0x25; const PH_MASTERDAI:u32=0x26;
 
 /// The two sound cards: the ES8388 headphone codec on I2C6 + I2S1 (named and routed as in
-/// the board's DT, without the jack-detect GPIO), and HDMI0 audio on I2S5. The HDMI
-/// transmitter is not modelled, so the HDMI card's codec is a plain I2S transmitter.
-fn audio_nodes(f:&mut Fdt) {
+/// the board's DT, without the jack-detect GPIO), and HDMI0 audio on I2S5 into the HDMI
+/// transmitter's codec (`hdmi`: the display chain is described; without it, a plain I2S
+/// transmitter stands in).
+fn audio_nodes(f:&mut Fdt,hdmi:bool) {
     use crate::audio::*;
     let reg=|f:&mut Fdt,base:u64,size:u64|f.cells("reg",&[0,base as u32,0,size as u32]);
     f.begin("i2s-mclk");f.str("compatible","fixed-clock");f.cells("#clock-cells",&[0]);f.cells("clock-frequency",&[I2S_MCLK as u32]);f.cells("phandle",&[PH_I2S_MCLK]);f.end();
@@ -164,7 +226,7 @@ fn audio_nodes(f:&mut Fdt) {
     f.begin("audio-codec@10");f.strs("compatible",&["everest,es8388","everest,es8328"]);f.cells("reg",&[crate::es8388::ADDRESS as u32]);
     f.cells("clocks",&[PH_CODEC_MCLK]);f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[PH_ES8388]);f.end();
     f.end();
-    f.begin("hdmi0-audio-tx");f.str("compatible","linux,spdif-dit");f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[PH_HDMI_TX]);f.end();
+    if !hdmi { f.begin("hdmi0-audio-tx");f.str("compatible","linux,spdif-dit");f.cells("#sound-dai-cells",&[0]);f.cells("phandle",&[PH_HDMI_TX]);f.end(); }
     f.begin("analog-sound");f.str("compatible","simple-audio-card");f.str("simple-audio-card,name","rockchip,es8388");
     f.str("simple-audio-card,format","i2s");f.cells("simple-audio-card,bitclock-master",&[PH_MASTERDAI]);f.cells("simple-audio-card,frame-master",&[PH_MASTERDAI]);
     f.strs("simple-audio-card,routing",&["Headphones","LOUT1","Headphones","ROUT1","LINPUT1","Microphone Jack","RINPUT1","Microphone Jack","LINPUT2","Onboard Microphone","RINPUT2","Onboard Microphone"]);
@@ -176,7 +238,7 @@ fn audio_nodes(f:&mut Fdt) {
     f.begin("hdmi0-sound");f.str("compatible","simple-audio-card");f.str("simple-audio-card,name","hdmi0");
     f.str("simple-audio-card,format","i2s");f.cells("simple-audio-card,mclk-fs",&[128]);
     f.begin("simple-audio-card,cpu");f.cells("sound-dai",&[PH_I2S5]);f.end();
-    f.begin("simple-audio-card,codec");f.cells("sound-dai",&[PH_HDMI_TX]);f.end();
+    f.begin("simple-audio-card,codec");f.cells("sound-dai",&[if hdmi {PH_HDMI0} else {PH_HDMI_TX}]);f.end();
     f.end();
 }
 
@@ -196,6 +258,7 @@ pub fn boot_linux(m:&mut Machine,kernel:&[u8],initrd:Option<&[u8]>,cmdline:&str)
     if DTB+dt.len() as u64>INITRD {return Err("device tree exceeds boot layout".into());}
     m.soc.ram[DTB as usize..DTB as usize+dt.len()].copy_from_slice(&dt);
     m.dtb=dt;
+    crate::scmi::Scmi::init_channel(&mut m.soc.ram);
     let c=m.cpu_mut();
     c.el=1; c.spsel=true; c.daif=0x3c0;c.pc=entry;
     c.x=[0;31];c.x[0]=DTB;c.sys.cpacr_el1=3<<20;

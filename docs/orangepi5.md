@@ -76,7 +76,23 @@ The emulated firmware sets up HDMI0 as U-Boot does on boards whose display the k
 
 `--vnc :N` shows the output to a VNC viewer, `--screenshot OUT.png` and the script's `screenshot FILE` save it, `--hdmi-mode 1280x720|1920x1080|640x480` picks the mode, and `--no-display` turns HDMI off. `scripts/orangepi5-hdmi.txt` boots the image to Armbian's first-run prompt and takes a screenshot. `--dump-dtb FILE` writes the device tree the run booted with, also for SD image boots.
 
-The VOP2 and the HDMI/eDP transmitters are not modelled, so mode setting and hot-plug do not work, and the kernel's own Rockchip DRM driver has no node to bind. The VNC keyboard and pointer are the USB keyboard and tablet.
+Linux's own display driver then takes over, as on a real board: udev loads `rockchipdrm`, which drives the emulated display chain, and Linux hands the console over from `simpledrm`. The chain consists of:
+
+- VOP2, the display controller (video port 0);
+- the DesignWare HDMI QP transmitter;
+- its Samsung HDPTX PHY;
+- the GRF syscons;
+- the SCMI clocks and resets that the firmware provides over SMC.
+
+The emulated monitor's EDID (an HDMI sink with 2-channel audio) offers the three modes, preferring `--hdmi-mode`'s. Mode setting, vblank interrupts and page flips work; KMS clients such as Weston or `modetest` get the whole mode list. VOP2 composes its enabled Cluster and Esmart windows from linear ARGB/XRGB/ABGR/XBGR8888, RGB888 and RGB565 buffers, scaled to their display size. The VNC keyboard and pointer are the USB keyboard and tablet.
+
+Limits of the display chain:
+
+- There is no IOMMU, so display buffers come from CMA (128 MiB in Armbian's kernel). The Rockchip driver then cannot import non-contiguous dma-bufs; Mesa allocates its scanout buffers on the display device, so it is not affected.
+- AFBC-compressed windows are not decoded and show black.
+- Only VP0 to HDMI0 is described; there is no DP, gamma LUT, interlaced output or HDR.
+- The monitor is always plugged in.
+- The HDMI transmitter's InfoFrames, HDCP and CEC registers are kept as written and do nothing.
 
 ![HDMI output](img/orangepi5-hdmi.png)
 
@@ -100,20 +116,22 @@ Limits: the DesignWare PCIe controller, its PHY and MSI (through the GIC ITS) ar
 
 The board's two sound cards are there, as on the real board:
 
-- `rockchip,es8388` (card 0): the headphone jack. The ES8388 codec sits on I2C6 at 0x10 and masters the clocks of I2S1 (`rockchip,rk3588-i2s-tdm`) from its 12.288 MHz MCLK, so it plays the 48 kHz family of rates (8-96 kHz; ALSA's `plughw`/`default` resample others). The codec's DAC mute and volume, its output mixer, the power of the DAC and the outputs and the `Output 1` volume set what reaches the jack. Recording from it works and gives silence.
-- `hdmi0` (card 1): HDMI audio on I2S5, which is the clock master (any rate from 8 to 768 kHz; the divided fixed MCLK is snapped to the standard rate it approximates).
+The card numbers depend on which driver binds first, so use the names (`hw:CARD=rockchipes8388`, `hw:CARD=hdmi0`).
+
+- `rockchip,es8388` (`rockchipes8388`): the headphone jack. The ES8388 codec sits on I2C6 at 0x10 and masters the clocks of I2S1 (`rockchip,rk3588-i2s-tdm`) from its 12.288 MHz MCLK, so it plays the 48 kHz family of rates (8-96 kHz; ALSA's `plughw`/`default` resample others). The codec's DAC mute and volume, its output mixer, the power of the DAC and the outputs and the `Output 1` volume set what reaches the jack. Recording from it works and gives silence.
+- `hdmi0`: HDMI audio on I2S5, the clock master. The divided fixed MCLK is snapped to the standard rate it approximates. Its codec is the HDMI transmitter's (`hdmi-codec`), with the rates and channels of the monitor's EDID (32, 44.1 and 48 kHz stereo). With `--no-display`, a plain I2S transmitter stands in.
 
 DMA controllers DMAC0 and DMAC1 (Arm PL330, the shared model in `peripherals/`) feed the I2S FIFOs, which drain at the sample rate in virtual time. `--audio-out FILE` keeps what the headphone jack plays and `--hdmi-audio-out FILE` what HDMI plays: a `.wav` file, or raw 16-bit stereo for any other path (a named pipe for a live player, `ffplay -f s16le -ar RATE -ch_layout stereo PIPE`).
 
 ```sh
 sbc-emu run --board orangepi5 --sd Armbian.img --audio-out hp.wav --hdmi-audio-out hdmi.wav
 # in the guest (the codec starts silent, as the real one does):
-amixer -c 0 sset PCM 0dB; amixer -c 0 sset 'Output 1' 0dB
-speaker-test -D plughw:0,0 -c 2 -t sine -f 1000 -l 1
-aplay -D hw:1,0 music.wav
+amixer -c rockchipes8388 sset PCM 0dB; amixer -c rockchipes8388 sset 'Output 1' 0dB
+speaker-test -D plughw:CARD=rockchipes8388 -c 2 -t sine -f 1000 -l 1
+aplay -D plughw:CARD=hdmi0 music.wav
 ```
 
-On a full Armbian boot udev loads the drivers and `alsa-restore` restores the mixer. `scripts/orangepi5-audio.txt` (`--append init=/bin/bash`, which loads the modules itself) plays `seq 1 40000` as 16-bit stereo on both cards, at 48 kHz and 44.1 kHz, and records a second; the two WAV files start with exactly those bytes.
+On a full Armbian boot udev loads the drivers and `alsa-restore` restores the mixer. `scripts/orangepi5-audio.txt` (`--append init=/bin/bash`, which loads the display and sound modules itself) plays `seq 1 40000` as 16-bit stereo on both cards, at 48 kHz and 44.1 kHz, and records a second; the two WAV files start with exactly those bytes.
 
-Limits: HDMI audio does not go through the HDMI transmitter (the `dw-hdmi-qp` controller is not modelled while the firmware's framebuffer drives the display), so the `hdmi0` card's codec is a plain I2S transmitter (`linux,spdif-dit`) and there are no ELD or channel-map controls. The headphone jack has no detection GPIO. Of each stream, the first two channels are kept.
+Limits: the HDMI transmitter does not check its audio packets, so whatever I2S5 sends is what the monitor plays. The headphone jack has no detection GPIO. Of each stream, the first two channels are kept.
 
