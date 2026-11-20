@@ -31,6 +31,15 @@ pub(crate) trait SerialBoard {
     fn take_audio(&mut self) -> (u32, Vec<i16>) {
         (0, Vec::new())
     }
+    /// Start keeping what the board plays on HDMI (for `--hdmi-audio-out`), when that is a
+    /// separate output from `--audio-out`'s; false: it has none.
+    fn capture_hdmi_audio(&mut self) -> bool {
+        false
+    }
+    /// The HDMI samples played since the last call: the rate (Hz) and 16-bit stereo.
+    fn take_hdmi_audio(&mut self) -> (u32, Vec<i16>) {
+        (0, Vec::new())
+    }
 }
 
 /// Where `--audio-out` goes: a WAV file, or raw 16-bit little-endian stereo for any other
@@ -113,6 +122,8 @@ pub(crate) struct RunConfig {
     pub vnc: Option<String>,
     /// What the board plays (`--audio-out FILE.wav`, or raw PCM to any other path).
     pub audio_out: Option<String>,
+    /// What the board plays on HDMI, for boards where that is a separate output.
+    pub hdmi_audio_out: Option<String>,
 }
 
 impl RunConfig {
@@ -135,7 +146,8 @@ impl RunConfig {
         }
         let (screenshot, vnc) = (arg(args, "--screenshot").map(str::to_owned), arg(args, "--vnc").map(str::to_owned));
         let audio_out = arg(args, "--audio-out").map(str::to_owned);
-        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out })
+        let hdmi_audio_out = arg(args, "--hdmi-audio-out").map(str::to_owned);
+        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out, hdmi_audio_out })
     }
 }
 
@@ -164,6 +176,11 @@ pub(crate) fn run<B: SerialBoard>(
     let mut audio = match config.audio_out.as_deref() {
         Some(path) if m.capture_audio() => Some(AudioOut::open(path).map_err(|e| format!("--audio-out {path}: {e}"))?),
         Some(_) => return Err("--audio-out: this board has no modelled audio output".into()),
+        None => None,
+    };
+    let mut hdmi_audio = match config.hdmi_audio_out.as_deref() {
+        Some(path) if m.capture_hdmi_audio() => Some(AudioOut::open(path).map_err(|e| format!("--hdmi-audio-out {path}: {e}"))?),
+        Some(_) => return Err("--hdmi-audio-out: this board has no separate HDMI audio output".into()),
         None => None,
     };
     let _terminal = crate::terminal::RawTty::enable();
@@ -305,6 +322,10 @@ pub(crate) fn run<B: SerialBoard>(
             let (rate, samples) = m.take_audio();
             a.push(rate, &samples);
         }
+        if let Some(a) = hdmi_audio.as_mut() {
+            let (rate, samples) = m.take_hdmi_audio();
+            a.push(rate, &samples);
+        }
         let bytes = m.host().take_serial_output();
         if !bytes.is_empty() {
             output.write_all(&bytes).map_err(|e| e.to_string())?;
@@ -329,6 +350,9 @@ pub(crate) fn run<B: SerialBoard>(
                 m = make_machine()?;
                 if audio.is_some() {
                     m.capture_audio();
+                }
+                if hdmi_audio.is_some() {
+                    m.capture_hdmi_audio();
                 }
                 anchor = Instant::now();
                 serial.clear();

@@ -129,6 +129,7 @@ version = "0.0.1"
 dependencies = [
  "arm-a64",
  "emu-core",
+ "peripherals",
  "sbc-net",
 ]
 

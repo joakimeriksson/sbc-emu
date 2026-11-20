@@ -260,3 +260,65 @@ fn m2_slot_is_an_ecam_host_with_an_intx_nvme() {
     m.soc.write8(ecam+0x3d,0).unwrap();
     assert_eq!(m.soc.read32(ecam+0x3c).unwrap()&0xff,42,"interrupt line kept");
 }
+
+#[test]
+fn hdmi_audio_dma_feeds_i2s5_at_the_sample_rate() {
+    use rk3588::audio::{DMAC2, I2S5};
+    let mut m=Machine::new(128<<20).unwrap();
+    m.soc.audio.capture(false,true);
+    // Linux's microcode for 4 bursts of 8 words from 0x2000 to I2S5's TXDR (request 2), SEV 0
+    let mut prog=Vec::new();
+    let ccr:u32=1|2<<1|7<<4|2<<15|7<<18;
+    prog.extend_from_slice(&[0xbc,1]);prog.extend_from_slice(&ccr.to_le_bytes());
+    prog.extend_from_slice(&[0xbc,0]);prog.extend_from_slice(&0x2000u32.to_le_bytes());
+    prog.extend_from_slice(&[0xbc,2]);prog.extend_from_slice(&((I2S5+0x24) as u32).to_le_bytes());
+    prog.extend_from_slice(&[0x22,3]);
+    let body=prog.len();
+    prog.extend_from_slice(&[0x32,2<<3,0x07,0x2b,2<<3]);
+    let back=(prog.len()-body) as u8;
+    prog.extend_from_slice(&[0x38|0x10|0x04,back,0x34,0,0x00]);
+    m.soc.ram[0x1000..0x1000+prog.len()].copy_from_slice(&prog);
+    for k in 0..32u32 { m.soc.ram[0x2000+4*k as usize..][..4].copy_from_slice(&((k<<16)|k).to_le_bytes()); }
+    // 48 kHz master from 98.304 MHz: bclk = MCLK / 32, 64 bits a frame; 16-bit stereo
+    for (off,v) in [(0x38,31),(0x08,63),(0x00,15),(0x10,1<<8|16),(0x1c,1)] { m.soc.write32(I2S5+off,v).unwrap(); }
+    m.soc.write32(DMAC2+0x20,1).unwrap();
+    m.soc.write32(DMAC2+0xd08,0xa0<<16).unwrap();
+    m.soc.write32(DMAC2+0xd0c,0x1000).unwrap();
+    m.soc.write32(DMAC2+0xd04,0).unwrap();
+    let period=1_000_000_000/48_000;
+    m.soc.service(32*period+1);
+    let i=&m.soc.audio.i2s5;
+    assert_eq!((i.rate,i.frames,i.underruns),(48_000,32,0));
+    assert_eq!(&i.out[..6],&[0,0,1,1,2,2]);
+    assert_eq!(&i.out[62..],&[31,31]);
+    assert!(m.soc.audio.dmac[1].irq(0),"SEV 0 at the end of the transfer");
+    // while that interrupt waits for the guest (which starts the next period from its
+    // handler), the FIFO runs dry and the clock holds instead of underrunning
+    m.soc.service(200*period);
+    let i=&m.soc.audio.i2s5;
+    assert_eq!((i.frames,i.underruns),(32,0));
+    // the guest takes the interrupt and does not go on: now silence goes out
+    m.soc.write32(DMAC2+0x2c,1).unwrap();
+    m.soc.service(210*period);
+    assert!(m.soc.audio.i2s5.underruns>0);
+    let dt=rk3588::boot::device_tree(128<<20,"",None,false);
+    let has=|s:&[u8]|dt.windows(s.len()).any(|w|w==s);
+    assert!(has(b"dma-controller@fed10000") && has(b"rockchip,rk3588-i2s-tdm") && has(b"linux,spdif-dit") && has(b"hdmi0-sound") && has(b"arm,pl330"));
+}
+
+#[test]
+fn es8388_answers_on_i2c6() {
+    use rk3588::audio::I2C6;
+    let mut m=Machine::new(128<<20).unwrap();
+    // rk3x: START, then address 0x10 (write), register 0x2e, value 0x1e; STOP
+    m.soc.write32(I2C6+0x18,0x7f).unwrap();
+    m.soc.write32(I2C6,1|1<<6|1<<3).unwrap();
+    m.soc.write32(I2C6,1|1<<6).unwrap();
+    m.soc.write32(I2C6+0x100,0x10<<1|0x2e<<8|0x1e<<16).unwrap();
+    m.soc.write32(I2C6+0x10,3).unwrap();
+    assert_eq!(m.soc.read32(I2C6+0x1c).unwrap()&(1<<2|1<<6),1<<2,"MBTF, no NAK");
+    m.soc.write32(I2C6,1|1<<6|1<<4).unwrap();
+    assert_eq!(m.soc.audio.codec().regs[0x2e],0x1e);
+    let dt=rk3588::boot::device_tree(128<<20,"",None,false);
+    assert!(dt.windows(14).any(|w|w==b"everest,es8388") && dt.windows(15).any(|w|w==b"rockchip,es8388"));
+}

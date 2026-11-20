@@ -24,6 +24,10 @@ mod mt;
 pub mod mmc;
 pub mod phy;
 pub mod gmac;
+pub mod i2c;
+pub mod i2s_tdm;
+pub mod es8388;
+pub mod audio;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
@@ -55,6 +59,8 @@ pub struct Soc {
     pub pcie: pcie::Pcie,
     /// the emulated USB devices: a keyboard and a tablet, and a stick with `--usb-drive`
     pub usb: emu_core::usb::Devices,
+    /// the headphone codec (ES8388 on I2C6, I2S1) and HDMI audio (I2S5), fed by the PL330s
+    pub audio: audio::Audio,
     /// virtual time of the network's next poll (ns)
     pub next_net_poll: u64,
     pub dirty: bool,
@@ -74,6 +80,7 @@ impl Soc {
         else if (pcie::ECAM..pcie::ECAM+pcie::ECAM_SIZE).contains(&addr) { self.pcie.cfg_read((addr-pcie::ECAM)&!3) }
         else if (pcie::MEM..pcie::MEM+pcie::MEM_SIZE).contains(&addr) { self.pcie.mem_read(addr&!3).unwrap_or(u32::MAX) }
         else if (MMC..MMC+0x4000).contains(&addr) { self.mmc.read((addr-MMC)&!3) }
+        else if audio::Audio::contains(addr) { self.audio.read(addr&!3) }
         else if (UART2..UART2+0x100).contains(&addr) { self.uart.read((addr-UART2)&!3) }
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
         else if (GICR..GICR+GICR_SIZE).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)}
@@ -105,6 +112,7 @@ impl Soc {
         else if (pcie::ECAM..pcie::ECAM+pcie::ECAM_SIZE).contains(&addr) {self.pcie.cfg_write((addr-pcie::ECAM)&!3,v);}
         else if (pcie::MEM..pcie::MEM+pcie::MEM_SIZE).contains(&addr) {self.pcie.mem_write(addr&!3,v,&mut self.ram);}
         else if (MMC..MMC+0x4000).contains(&addr) {self.mmc.write((addr-MMC)&!3,v);}
+        else if audio::Audio::contains(addr) {self.audio.write(addr&!3,v,&mut self.ram);}
         else if (UART2..UART2+0x100).contains(&addr) {self.uart.write((addr-UART2)&!3,v);}
         else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_write((addr-GICD)&!3,v);}
         else if (GICR..GICR+GICR_SIZE).contains(&addr) {self.gic.redist_write((addr-GICR)&!3,v);}
@@ -130,6 +138,7 @@ impl Soc {
             self.gmac.service(&mut self.ram);
         } else { self.gmac.tx_out.clear(); }
         self.xhci.tick(now,&mut self.ram,&mut self.usb);
+        self.audio.service(now,&mut self.ram);
     }
     /// The devices' interrupt lines into the GIC.
     pub fn device_lines(&mut self) {
@@ -138,6 +147,7 @@ impl Soc {
         self.gic.set_line(32+234,self.gmac.irq());
         self.gic.set_line(UART_IRQ,self.uart.irq());
         self.gic.set_line(32+203,self.mmc.irq());
+        for (irq,level) in self.audio.lines() { self.gic.set_line(irq,level); }
         for (i,spi) in [92,93,94].into_iter().enumerate() { self.gic.set_line(32+spi,self.gpu.irq(i)); }
     }
 }
@@ -209,7 +219,7 @@ impl Machine {
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self,String> {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
-        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),next_net_poll:0,dirty:true,unknown:Vec::new()};
+        let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),audio:Default::default(),next_net_poll:0,dirty:true,unknown:Vec::new()};
         let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,multi:false,#[cfg(not(target_arch = "wasm32"))] mt:None,irqs:0,exceptions:0};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
@@ -285,7 +295,7 @@ impl Machine {
     /// The earliest deadline after `t` that core `c` must notice: its own timers, those of
     /// sleeping cores and the network poll (cores waiting for their turn check their own).
     fn deadline_after(&self, t: u64, c: usize) -> Option<u64> {
-        let mut d=[self.soc.net.as_ref().map(|_|self.soc.next_net_poll),self.soc.xhci.next_event(&self.soc.usb)].into_iter().flatten().filter(|&x|x>t).min();
+        let mut d=[self.soc.net.as_ref().map(|_|self.soc.next_net_poll),self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event()].into_iter().flatten().filter(|&x|x>t).min();
         for (k,cpu) in self.cpus.iter().enumerate() {
             if self.state[k]==CoreState::Off || (k!=c && self.state[k]==CoreState::Run) {continue;}
             for ns in Self::timer_deadlines(cpu) { if ns>t { d=Some(d.map_or(ns,|x|x.min(ns))); } }
@@ -294,8 +304,8 @@ impl Machine {
     }
     /// The next timer deadline of any core that is on.
     fn next_deadline(&self) -> Option<u64> {
-        let usb=self.soc.xhci.next_event(&self.soc.usb);
-        self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(usb).min()
+        let dev=[self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event()];
+        self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(dev.into_iter().flatten()).min()
     }
     fn devices(&mut self) { self.soc.service(self.now); self.soc.device_lines(); }
     fn update(&mut self) {
