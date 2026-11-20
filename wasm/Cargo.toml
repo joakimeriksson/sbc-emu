@@ -3,7 +3,7 @@ name = "sbc-emu-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "sbc-emu in the browser: C ABI over the Pi 4B Machine, driven by web/worker.js"
+description = "sbc-emu in the browser: C ABI over the Pi 4B and Tinker Board machines, driven by web/worker.js"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,4 +12,6 @@ crate-type = ["cdylib", "rlib"]
 bcm2711 = { path = "../bcm2711" }
 v3d = { path = "../v3d" }
 arm-a64 = { path = "../arm-a64" }
+arm-a32 = { path = "../arm-a32" }
+rockchip-rk3288 = { path = "../rockchip-rk3288" }
 emu-core = { path = "../emu-core" }

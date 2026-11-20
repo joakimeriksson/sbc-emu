@@ -47,6 +47,11 @@ impl Uart {
         true
     }
 
+    /// Whether `push_rx` would accept a byte now.
+    pub fn rx_room(&self) -> bool {
+        self.rx.len() < RX_CAPACITY
+    }
+
     /// Interrupt output (level).
     pub fn irq(&self) -> bool {
         self.ier & IER_RDA != 0 && !self.rx.is_empty()

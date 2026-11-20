@@ -121,7 +121,9 @@ impl Cpu {
         let a = self.a32.get_or_insert_with(|| Box::new(arm_a32::Cpu::new_el0()));
         // SAFETY: the machine's guarantee for `ram` (see the field) covers this core too
         unsafe { a.el0_setup(ram, len, mt) };
-        if jit && !a.jit_enabled() && !ram.is_null() && arm_a32::jit::available() && !jit32_off() {
+        // not in the browser: there both JITs install their blocks in the page's one function
+        // table, and this core's flush frees all of it
+        if jit && !a.jit_enabled() && !ram.is_null() && arm_a32::jit::available() && !jit32_off() && !cfg!(target_arch = "wasm32") {
             // the 32-bit core's own JIT (A32/T32 to A64); it learns of code changes through
             // this core's instruction-cache maintenance (`code_changed`)
             a.enable_jit(arm_a32::CodeWatch::new(0, len.min(u32::MAX as u64) as u32));

@@ -137,6 +137,15 @@ impl Card {
         }
     }
 
+    /// Remove the medium (to put it in a new machine after a reset).
+    pub fn take_disk(&mut self) -> Option<Box<dyn Disk>> {
+        match self {
+            Card::Sd(c) => c.disk.take(),
+            Card::Emmc(c) => c.disk.take(),
+            Card::Sdio(_) => None,
+        }
+    }
+
     pub fn present(&self) -> bool {
         match self {
             Card::Sd(c) => c.present(),

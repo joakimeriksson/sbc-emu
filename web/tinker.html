@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sbc-emu Tinker Board</title>
+<style>
+  :root { --bg: #f4f4f1; --fg: #1d1d1b; --muted: #6b6b66; --panel: #ffffff; --line: #d9d9d3; --accent: #0f6fb8; --term-bg: #111; --term-fg: #d6d6d6; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; --accent: #4ea3e6; } }
+  :root[data-theme="dark"] { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; --accent: #4ea3e6; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  h1 span { color: var(--accent); }
+  .muted { color: var(--muted); }
+  #status { font-variant-numeric: tabular-nums; }
+  .screen { background: #000; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; outline: none; aspect-ratio: 16 / 9; }
+  .screen:focus { box-shadow: 0 0 0 2px var(--accent); }
+  canvas { display: block; width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; }
+  .hint { margin: 6px 0 14px; font-size: 13px; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  summary { cursor: pointer; padding: 8px 12px; }
+  pre { margin: 0; padding: 10px 12px; background: var(--term-bg); color: var(--term-fg); height: 300px; overflow: auto; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; outline: none; }
+  pre:focus { box-shadow: inset 0 0 0 2px var(--accent); }
+  .chooser { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .chooser button { text-align: left; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .chooser button span { color: var(--muted); font-size: 13px; }
+  .chooser button:hover { border-color: var(--accent); }
+  .serialform { display: flex; gap: 8px; padding: 8px 12px; }
+  .serialform input { flex: 1; min-width: 0; font: 13px ui-monospace, Menlo, monospace; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--fg); }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; }
+  code { font: 12.5px ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="./" style="color:inherit;text-decoration:none">sbc-emu</a> <span>ASUS Tinker Board S</span></h1>
+    <span class="muted">Rockchip RK3288, four 32-bit Cortex-A12s, emulated instruction by instruction in your browser</span>
+  </header>
+  <div id="chooser" class="chooser">
+    <button type="button" data-os="tinker-armbian"><strong>Armbian</strong><span>The unmodified Armbian SD card image: the board's U-Boot boot, mainline Linux 6.18, systemd, the login prompt on HDMI and on the serial console. The SD card is read as Linux needs it.</span></button>
+    <button type="button" data-os="tinker-busybox"><strong>Quick demo: Debian kernel + BusyBox</strong><span>Debian's armmp kernel and the board's own device tree with a tiny initramfs: a shell on the serial console in seconds.</span></button>
+  </div>
+  <p id="status" class="muted">choose a system to boot</p>
+  <div class="screen" id="screen" tabindex="0" aria-label="The board's HDMI output. Typing here goes to the serial console."><canvas id="fb" width="1280" height="720"></canvas></div>
+  <p class="hint muted">The emulated board has no USB yet, so the keyboard is the serial console: type on the screen or in the terminal below (both go to UART2, <code>ttyS2</code>). The screen is HDMI (VOP + DesignWare HDMI, a 720p monitor) and shows the console on <code>tty1</code>. The 32-bit ARM and Thumb code is translated to WebAssembly as it runs (<code>?jit=0</code> interprets it).</p>
+  <details open>
+    <summary>Serial console (UART2, 115200 baud) <button id="clear" type="button">clear</button></summary>
+    <pre id="term" tabindex="0" aria-label="Serial console. Typing here goes to the board."></pre>
+    <form id="serialform" class="serialform"><input id="serialin" placeholder="send a line to the serial console" autocomplete="off"><button type="submit">send</button></form>
+  </details>
+</main>
+<script>
+const canvas = document.getElementById('fb'), ctx = canvas.getContext('2d');
+const term = document.getElementById('term'), status = document.getElementById('status');
+const screen = document.getElementById('screen');
+const worker = new Worker('worker.js');
+let state = 'starting…';
+const strip = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\x1b[()][A-Z0-9]/g, '').replace(/\r/g, '');
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'status') { state = m.text; status.textContent = state; }
+  else if (m.type === 'uart') {
+    const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 4;
+    // backspace echo: drop the previous character
+    let text = term.textContent;
+    for (const ch of strip(m.text)) text = ch === '\b' ? text.slice(0, -1) : text + ch;
+    term.textContent = text.length > 200000 ? text.slice(-150000) : text;
+    if (atEnd) term.scrollTop = term.scrollHeight;
+  } else if (m.type === 'frame') {
+    if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
+  } else if (m.type === 'stats') {
+    if (state === 'booting…' || state === 'running') state = 'running';
+    status.textContent = `${state} · ${m.mips.toFixed(0)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '') + (m.jit ? ` · JIT ${m.jit} blocks` : '');
+  }
+};
+document.getElementById('clear').onclick = (e) => { e.preventDefault(); term.textContent = ''; };
+const send = (bytes) => worker.postMessage({ type: 'serial', bytes });
+// keys -> the bytes a serial terminal sends
+const SEQ = { Enter: [13], Backspace: [127], Tab: [9], Escape: [27], ArrowUp: [27, 91, 65], ArrowDown: [27, 91, 66], ArrowRight: [27, 91, 67],
+  ArrowLeft: [27, 91, 68], Home: [27, 91, 72], End: [27, 91, 70], Delete: [27, 91, 51, 126], PageUp: [27, 91, 53, 126], PageDown: [27, 91, 54, 126] };
+const typeKey = (e) => {
+  if (e.metaKey) return;
+  let bytes = SEQ[e.key];
+  if (!bytes && e.ctrlKey && /^[a-z]$/i.test(e.key)) bytes = [e.key.toUpperCase().charCodeAt(0) - 64];
+  else if (!bytes && e.key.length === 1 && !e.ctrlKey) bytes = [...new TextEncoder().encode(e.key)];
+  if (!bytes) return;
+  e.preventDefault();
+  send(bytes);
+};
+screen.addEventListener('keydown', typeKey);
+term.addEventListener('keydown', typeKey);
+screen.addEventListener('pointerdown', () => screen.focus());
+document.getElementById('serialform').onsubmit = (e) => {
+  e.preventDefault();
+  const inp = document.getElementById('serialin');
+  send([...new TextEncoder().encode(inp.value + '\r')]);
+  inp.value = '';
+};
+const params = new URLSearchParams(location.search);
+const boot = (os) => {
+  document.getElementById('chooser').hidden = true;
+  worker.postMessage({ type: 'start', os, ramMb: 1024, jit: params.get('jit') !== '0' }); // ?jit=0: interpreter only
+  term.focus();
+};
+document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));
+if (params.get('os')) boot(params.get('os'));
+</script>
+</body>
+</html>

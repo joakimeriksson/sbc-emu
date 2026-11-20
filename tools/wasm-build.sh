@@ -15,4 +15,12 @@ ls -la web/wasm/sbc-emu.wasm
 # guest: the pinned Pi kernel (gzip, decompressed in the page) and the busybox initramfs
 [ -f cache/fw/kernel8.img ] && cp cache/fw/kernel8.img web/assets/kernel8.img
 [ -f cache/initramfs.cpio ] && gzip -9 -c cache/initramfs.cpio > web/assets/initramfs.cpio.gz
+# the Tinker Board's quick demo (scripts/tinker-board-fixture.sh) and, if present, its
+# Armbian card (scripts/armbian-tinkerboard-fixture.sh) for web/tinker.html
+if [ -f cache/tinker-board/zImage ]; then
+  mkdir -p web/assets/tinker
+  cp cache/tinker-board/zImage cache/tinker-board/rk3288-tinker-s.dtb cache/tinker-board/initramfs.cpio.gz web/assets/tinker/
+fi
+armbian=$(ls cache/tinker-board-armbian/Armbian_*_Tinkerboard_*.img 2>/dev/null | head -n1)
+[ -n "$armbian" ] && [ ! -e web/assets/tinker-armbian.img ] && ln -s "../../$armbian" web/assets/tinker-armbian.img
 ls -la web/assets
