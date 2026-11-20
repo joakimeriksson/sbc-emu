@@ -372,6 +372,16 @@ pub fn f32_to_f16(f: f32) -> u16 {
     s | r as u16
 }
 
+/// A float result's NaN made the one quiet NaN, whatever the operands' NaNs were. Which operand's
+/// payload a host propagates depends on the host (x86 takes the first source, Arm the first
+/// NaN) and on the order the compiler puts the operands in, which differs between the fast and
+/// the general path's loops; partial (pack L/H) writes and integer ops would then carry the
+/// difference into ordinary bits.
+#[inline(always)]
+fn qnan(f: f32) -> f32 {
+    if f.is_nan() { f32::from_bits(0x7fc0_0000) } else { f }
+}
+
 #[inline(always)]
 fn ftz(f: f32) -> f32 {
     // denormals flush to a signed zero (branchless, so the lane loops vectorise)
@@ -426,14 +436,14 @@ fn f2i_sat(x: f32) -> u32 { if x.is_nan() { 0 } else { (x as i32) as u32 } }
 fn f2u_sat(x: f32) -> u32 { if x.is_nan() { 0 } else { x as u32 } }
 
 fn sfu(op: AddOp, x: f32) -> f32 {
-    match op {
+    qnan(match op {
         AddOp::Recip => 1.0 / x,
         AddOp::Rsqrt | AddOp::Rsqrt2 => 1.0 / x.sqrt(),
         AddOp::Exp => x.exp2(),
         AddOp::Log => x.log2(),
         AddOp::Sin => (x * std::f32::consts::PI).sin(),
         _ => x,
-    }
+    })
 }
 
 // ------------------------------------------------------------------------- execution
@@ -538,7 +548,7 @@ pub struct Thread {
 #[inline]
 fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
     let mut o = [0u32; LANES];
-    macro_rules! f2 { ($e:expr) => {{ let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = ftz($e(p[l], q[l])).to_bits(); } }} }
+    macro_rules! f2 { ($e:expr) => {{ let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = qnan(ftz($e(p[l], q[l]))).to_bits(); } }} }
     macro_rules! i2 { ($e:expr) => {{ for l in 0..LANES { o[l] = $e(a[l], b[l]); } }} }
     match op {
         AddOp::Fadd | AddOp::Faddnf => f2!(|p: f32, q: f32| p + q),
@@ -581,7 +591,7 @@ fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
 fn fast_mul(op: MulOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
     let mut o = [0u32; LANES];
     match op {
-        MulOp::Fmul => { let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = ftz(p[l] * q[l]).to_bits(); } }
+        MulOp::Fmul => { let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { o[l] = qnan(ftz(p[l] * q[l])).to_bits(); } }
         MulOp::Fmov => { let p = unpack_v(a, ua); for l in 0..LANES { o[l] = p[l].to_bits(); } }
         MulOp::Mov => o = *a,
         MulOp::Add => { for l in 0..LANES { o[l] = a[l].wrapping_add(b[l]); } }
@@ -949,7 +959,7 @@ impl Thread {
                     Fadd | Faddnf | Fsub | Fmin | Fmax | Fcmp => {
                         let (p, q) = (fl(&a_a, l, add.ua), fl(&a_b, l, add.ub));
                         let r = match add.op { Fadd | Faddnf => p + q, Fsub => p - q, Fmin => fmin(p, q), Fmax => fmax(p, q), _ => p - q };
-                        let r = ftz(r);
+                        let r = qnan(ftz(r));
                         if add.op == Fcmp {
                             z = p == q; n = p < q; c = p <= q;
                         } else { z = r == 0.0; n = r < 0.0; c = r > 0.0; }
@@ -1029,7 +1039,7 @@ impl Thread {
                         let q = l & !3;
                         let p = |k: usize| fl(&a_a, k, add.ua);
                         let d = if add.op == Fdx { p(q | 1 | (l & 2)) - p(q | (l & 2)) } else { p(q | 2 | (l & 1)) - p(q | (l & 1)) };
-                        ftz(d).to_bits()
+                        qnan(ftz(d)).to_bits()
                     }
                     Stvpmv | Stvpmd | Stvpmp => {
                         a_has = false;
@@ -1085,7 +1095,7 @@ impl Thread {
                 MulOp::Fmov => { let f = unpack_f32(x, mul.ua); z = f == 0.0; n = f < 0.0; f.to_bits() }
                 MulOp::Mov => x,
                 MulOp::Nop => 0,
-                MulOp::Fmul => { let f = ftz(unpack_f32(x, mul.ua) * unpack_f32(y, mul.ub)); z = f == 0.0; n = f < 0.0; c = f > 0.0; f.to_bits() }
+                MulOp::Fmul => { let f = qnan(ftz(unpack_f32(x, mul.ua) * unpack_f32(y, mul.ub))); z = f == 0.0; n = f < 0.0; c = f > 0.0; f.to_bits() }
             };
             if !matches!(mul.op, MulOp::Fmov | MulOp::Fmul) { z = res == 0; n = (res as i32) < 0; }
             mres[l] = res;
@@ -1329,33 +1339,26 @@ mod tests {
     /// zeros, small and large integers), flags and VPM rows.
     #[test]
     fn fast_path_matches_general_path() {
-        /// NaNs (f32, or either f16 half) made canonical, as the two paths may differ in their sign
-        /// and payload (the compiler may commute a float operation differently in each)
-        fn canon(v: &V) -> V {
-            v.map(|x| {
-                if x & 0x7f80_0000 == 0x7f80_0000 && x & 0x7f_ffff != 0 { return 0x7fc0_0000; }
-                let h = |h: u32| if h & 0x7c00 == 0x7c00 && h & 0x3ff != 0 { 0x7e00 } else { h };
-                h(x >> 16) << 16 | h(x & 0xffff)
-            })
-        }
         #[derive(Default)]
         struct Rec { log: Vec<String>, n: u32 }
         impl Env for Rec {
             fn read32(&mut self, va: u32) -> u32 { va.wrapping_mul(2654435761) ^ 0x3f80_0000 }
             fn write32(&mut self, va: u32, v: u32) { self.log.push(format!("w {va:#x} {v:#x}")); }
             fn tmu(&mut self, _t: &Thread, k: TmuKind, cfg: &[u32], req: &TmuReq, lanes: u16) -> Vec<V> {
-                self.log.push(format!("tmu {k:?} {cfg:?} {:?} {:?} {:?} {lanes:#x}", req.s.as_ref().map(canon), req.t.as_ref().map(canon), req.data.iter().map(canon).collect::<Vec<_>>()));
+                self.log.push(format!("tmu {k:?} {cfg:?} {:?} {:?} {:?} {lanes:#x}", req.s, req.t, req.data));
                 vec![[7; LANES]]
             }
             fn ldvary(&mut self, _t: &mut Thread) -> (V, V) { self.n += 1; ([self.n; LANES], [self.n * 3; LANES]) }
-            fn tlb_write(&mut self, _t: &mut Thread, lanes: u16, v: &V, cfg: Option<u32>) { self.log.push(format!("tlb {lanes:#x} {:?} {cfg:?}", canon(v))); }
+            fn tlb_write(&mut self, _t: &mut Thread, lanes: u16, v: &V, cfg: Option<u32>) { self.log.push(format!("tlb {lanes:#x} {v:?} {cfg:?}")); }
             fn tlb_read(&mut self, _t: &mut Thread, cfg: Option<u32>) -> V { self.n += 1; [self.n ^ cfg.unwrap_or(0); LANES] }
         }
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        // several seeds: a NaN-payload difference showed up only under one seed on x86 hosts
+        let (mut tested, mut flagged) = (0, 0);
+        for seed0 in [0x9e37_79b9_7f4a_7c15u64, 0x2545_f491_4f6c_dd1d, 0xd1b5_4a32_d192_ed03] {
+        let mut seed = seed0;
         let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
         const SPECIAL: [u32; 12] = [0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x0000_0001, 0x8000_0010, 0x7f80_0000, 0xff80_0000,
                                     0x7fc0_0000, 0x7f7f_ffff, 0x0000_001f, 0xffff_ffff];
-        let (mut tested, mut flagged) = (0, 0);
         for _ in 0..(if cfg!(debug_assertions) { 20_000 } else { 200_000 }) {
             let w = rnd();
             let Inst::Alu(i) = decode(w) else { continue };
@@ -1383,21 +1386,19 @@ mod tests {
             let what = format!("{w:#018x}: {:?}/{:?} sig {:?}", i.add, i.mul, i.sig);
             assert_eq!(b1, b2, "barrier {what}");
             assert_eq!((t.fa, t.fb), (u.fa, u.fb), "flags {what}");
-            // Equal, up to the sign and payload of NaNs: the compiler may commute a float addition
-            // (fadd(-NaN, +NaN)) differently in the two paths' loops.
-            let same = |x: u32, y: u32| canon(&[x; LANES])[0] == canon(&[y; LANES])[0];
-            let regs_same = (0..64).all(|k| (0..LANES).all(|l| same(t.rf[k][l], u.rf[k][l])))
-                && (0..6).all(|k| (0..LANES).all(|l| same(t.acc[k][l], u.acc[k][l])));
+            // bit for bit, NaNs included (float results' NaNs are canonical: `qnan`)
+            let regs_same = t.rf == u.rf && t.acc == u.acc;
             if !regs_same {
                 for k in 0..64 { if t.rf[k] != u.rf[k] { eprintln!("rf{k}: fast {:x?}\n      general {:x?}", t.rf[k], u.rf[k]); } }
                 for k in 0..6 { if t.acc[k] != u.acc[k] { eprintln!("r{k}: fast {:x?}\n      general {:x?}", t.acc[k], u.acc[k]); } }
                 panic!("registers {what}");
             }
             assert_eq!((t.unif, t.unifa, &t.tmu_cfg, t.vpm == u.vpm, &t.tmu_out), (u.unif, u.unifa, &u.tmu_cfg, true, &u.tmu_out), "state {what}");
-            assert_eq!(t.delayed_next.iter().map(|d| (d.0, canon(&d.1))).collect::<Vec<_>>(), u.delayed_next.iter().map(|d| (d.0, canon(&d.1))).collect::<Vec<_>>(), "delayed {what}");
+            assert_eq!(t.delayed_next, u.delayed_next, "delayed {what}");
             assert_eq!(e1.log, e2.log, "GPU accesses {what}");
         }
-        assert!(tested > 5_000 && flagged > 500, "{tested} fast instructions, {flagged} with flags");
+        }
+        assert!(tested > 15_000 && flagged > 1500, "{tested} fast instructions, {flagged} with flags");
     }
 
     /// A taken branch runs all three delay slots, then continues at the target (Mesa 25.2
