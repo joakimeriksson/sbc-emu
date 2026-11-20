@@ -199,7 +199,7 @@ done (the JIT, not threads); M5, M6 and M10 not started.
 | Clocks, power | CRU (PLLs, the I2S fractional divider), GRF/SGRF, PMU; RK808 on I2C (models of the ACT8846, SYR827/828 and HYM8563, which other RK3288 boards use, are in `peripherals/`) | `cru.rs`, `i2c.rs`, `peripherals/` |
 | Storage | dw_mmc for SD (card detect on GPIO6_C6 where the device tree uses it), eMMC and SDIO; boot from the card's `/boot` like the firmware | `dwmmc.rs`, `emmc.rs`, `boot.rs` |
 | Display | VOP (both, two windows), IOMMU; DW HDMI with a monitor (EDID on I2C5, `--hdmi-mode`) on the Tinker Board, DW MIPI DSI for panels; VNC and `--screenshot` | `vop.rs`, `dsi.rs`, `peripherals/src/dw_hdmi.rs` |
-| 2D and GPU | RGA; Mali-T760 MP4 for Panfrost + Mesa (kmscube, 25 of 25 GLES 2 scenes matched softpipe; the tests are being moved to the Tinker Board profile, `docs/mali-t760.md`) | `rga.rs`, `midgard/` |
+| 2D and GPU | RGA; Mali-T760 MP4 for Panfrost + Mesa (kmscube on HDMI, 25 of 25 GLES 2 scenes match softpipe; `docs/mali-t760.md`) | `rga.rs`, `midgard/` |
 | Wi-Fi | BCM43455 on SDIO for brcmfmac: scan, open and WPA2 joins, DHCP and NAT on `sbc-net` (no board profile attaches it yet) | `peripherals/src/bcm43455/` |
 | Audio | I2S fed by the PL330 DMA controller at 0xffb20000; `--audio-out FILE.wav` or a FIFO | `i2s.rs`, `peripherals/src/pl330.rs` |
 

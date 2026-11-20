@@ -34,13 +34,20 @@ Things the encoding does not make obvious, learnt the hard way:
 
 ## Running it
 
-kmscube and a GLES 2 test suite (25 scenes, all matching softpipe) ran on Debian's Mesa
-(25.0.7) in a root filesystem made from the Orange Pi One's GPU image
-(`scripts/armbian-gpu-fixture.sh`, then `scripts/mali-t760-fixture.sh`), with
-`scripts/mali-t760-gpu.txt` (kmscube, screenshot) and `scripts/mali-t760-gles2.txt`. They
-booted on a board profile that has since been removed; they are being moved to the Tinker
-Board profile with an Armbian kernel that has Panfrost, and until then have no documented
-board command.
+kmscube and a GLES 2 test suite run on the Tinker Board profile: Armbian's Tinker Board
+kernel (6.18.43, Panfrost as a module, loaded by the scripts) with Debian's Mesa (25.0.7) in
+a root filesystem made from the Orange Pi One's GPU image. The card boots like an Armbian
+card, with the kernel's own initramfs:
+
+```sh
+scripts/armbian-gpu-fixture.sh && scripts/armbian-tinkerboard-fixture.sh && scripts/mali-t760-fixture.sh
+sbc-emu run --board tinkerboard --sd cache/mali-t760/debian-gpu.img --append init=/bin/bash \
+    --script scripts/mali-t760-gpu.txt --timeout 1800      # kmscube on HDMI, screenshot
+    # or --script scripts/mali-t760-gles2.txt --timeout 7200  # 25 scenes vs softpipe
+```
+
+kmscube runs at 60 fps in virtual time and all 25 GLES 2 scenes match softpipe (2026-11-20,
+about 4 minutes for kmscube on an M-series host).
 
 The fixture builds `gles2test` on the emulated Orange Pi One. gcc runs on the RK3288 too,
 but with `init=/bin/bash` the shell's default `PATH` is not exported: gcc then cannot
