@@ -22,31 +22,45 @@
 </head>
 <body>
 <main>
-  <h1>What runs in the demo</h1>
-  <p><a href="./">Back to the demo</a></p>
+  <h1>What runs in the demos</h1>
+  <p><a href="./">Back to the boards</a></p>
 
   <h2>The emulator: sbc-emu</h2>
   <p>Written for this project, BSD 3-Clause licence. Source: <a href="https://github.com/joakimeriksson/sbc-emu">github.com/joakimeriksson/sbc-emu</a>. The page and the snapshot are built from it by <code>tools/site-build.sh</code>.</p>
 
-  <h2>The guest: Linux kernel</h2>
+  <h2>Raspberry Pi 4: Linux kernel</h2>
   <ul>
     <li><strong>Linux 6.18.50-v8+</strong>, the Raspberry Pi kernel <code>kernel8.img</code> from Raspberry Pi firmware release <a href="https://github.com/raspberrypi/firmware/tree/1.20260915">1.20260915</a>, unmodified (SHA-256 <code>f80aa8bb…da68b</code>).</li>
     <li>Licence: GNU GPL version 2.</li>
     <li>Source: <a href="https://github.com/raspberrypi/linux/tree/cff533aec2fa601846766b32ff57204e0a61bed7">raspberrypi/linux at commit cff533a</a>, the commit that release names in <code>extra/git_hash</code>.</li>
   </ul>
 
-  <h2>The guest: BusyBox</h2>
+  <h2>Raspberry Pi 4: BusyBox</h2>
   <ul>
     <li><strong>BusyBox 1.36.1</strong>, Alpine Linux's <code>busybox-static-1.36.1-r31</code> package for aarch64, unmodified (SHA-256 <code>1d8e7a7f…cfac70</code>).</li>
     <li>Licence: GNU GPL version 2.</li>
     <li>Source: <a href="https://busybox.net/downloads/busybox-1.36.1.tar.bz2">busybox-1.36.1.tar.bz2</a>, with Alpine's build recipe and patches in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.20-stable/main/busybox">aports, 3.20-stable</a>.</li>
   </ul>
 
-  <h2>The guest: start-up script</h2>
+  <h2>Raspberry Pi 4: start-up script</h2>
   <p>The initramfs's <code>/init</code> is a short shell script written for sbc-emu (<code>sbc-emu mkinitramfs</code>), under the project's BSD licence.</p>
 
+  <h2>Orange Pi One: Linux kernel and device tree</h2>
+  <ul>
+    <li><strong>Linux 6.18.64</strong>, Alpine Linux's <code>linux-lts-6.18.64-r0</code> package for armv7: its <code>vmlinuz-lts</code> and its <code>sun8i-h3-orangepi-one.dtb</code>, unmodified (SHA-256 of the package <code>57be01c3…7046aff</code>).</li>
+    <li>Licence: GNU GPL version 2.</li>
+    <li>Source: <a href="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.64.tar.xz">linux-6.18.64.tar.xz</a> from kernel.org, with Alpine's configuration and patches in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/linux-lts">aports, 3.24-stable</a>.</li>
+  </ul>
+
+  <h2>Orange Pi One: initramfs</h2>
+  <ul>
+    <li><strong>Alpine Linux 3.24.4 minirootfs</strong> for armhf (BusyBox, musl, apk-tools and their dependencies), unmodified, with the kernel's SD-card modules and a short <code>/init</code> written for sbc-emu (<code>scripts/orangepi-one-fixture.sh</code>).</li>
+    <li>Licences: GNU GPL version 2 (BusyBox, the kernel modules), MIT (musl) and others, as each package states.</li>
+    <li>Source: every package's recipe and patches are in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable">aports, 3.24-stable</a>; Alpine's source tarballs are linked from each recipe.</li>
+  </ul>
+
   <h2>Trademarks</h2>
-  <p>Raspberry Pi is a trademark of Raspberry Pi Ltd. sbc-emu is an independent project, not affiliated with or endorsed by Raspberry Pi Ltd; the name only says which hardware it emulates.</p>
+  <p>Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi is a trademark of Shenzhen Xunlong Software Co. Broadcom and Allwinner are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them; the names only say which hardware it emulates.</p>
 </main>
 </body>
 </html>

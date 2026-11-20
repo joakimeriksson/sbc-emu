@@ -212,7 +212,10 @@ Pi kernel and busybox booted to the shell (`web/assets/hello.snap`, made by
 `scripts/web-hello-snapshot.txt`), with no SD image and no range requests. `tools/site-build.sh`
 builds it as a site in `out/site` from pinned, checksummed downloads of the Pi kernel and BusyBox
 (about 16 MB; `web/sources.html` lists their licences and source), and
-`.github/workflows/site.yml` publishes that to GitHub Pages on every push to `main`.
+`.github/workflows/site.yml` publishes that to GitHub Pages on every push to `main`. The site's
+front page is `web/boards.html`; `web/board.html?b=orangepi-one` boots the Orange Pi One
+(`scripts/orangepi-one-fixture.sh`'s Alpine kernel and initramfs, staged by `tools/wasm-build.sh`)
+to a shell on its serial console in about 5 seconds, in an xterm.js terminal.
 
 `index.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
 scenes on the emulated V3D GPU (setup in [docs/gpu.md](docs/gpu.md#in-the-browser)).
