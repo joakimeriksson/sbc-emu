@@ -1,6 +1,6 @@
 # Orange Pi 5 GPU bring-up
 
-The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clears, bounded compute dispatch and an initial opaque triangle path are supported. The Mesa GLES demo below now executes real vertex and fragment shaders; broader graphics and scanout remain incomplete.
+The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clears, bounded compute dispatch and an initial opaque triangle path are supported. The Mesa GLES demo below now executes real vertex and fragment shaders, and its output can be shown on the HDMI screen through the Rockchip display driver; broader graphics remain incomplete.
 
 The first building blocks in `rk3588` are a GPU virtual-address walker for the 4 KiB AArch64 stage-1 page tables used by Panthor and a bounded interpreter for a small subset of Valhall command-stream instructions. Tests exercise memory mapping and faults, instructions and their interaction. The control register block is connected to guest MMIO and the three GPU interrupt lines. Address-space UPDATE commands latch the programmed translation settings. A synchronous CSF queue path now connects Linux submissions to the command interpreter, including kernel CALL and completion synchronization. Unsupported work raises a queue fault.
 
@@ -176,6 +176,18 @@ unsupported; basic opaque triangle draws are covered by the GLES demo below. `SB
 bring-up. Passing this clear test does not establish general OpenGL support.
 
 
+## On the HDMI screen
+
+```sh
+python3 tools/panthor-demo.py --kms --image <mesa-image> --output out/panthor-gles-hdmi.png
+```
+
+`tests/gpu/panthor-gles-kms.py` renders the scene below at the monitor's mode (1280x720) into a scanout buffer of the Rockchip display device. It uses GBM and EGL on `/dev/dri/card1`, where Mesa's kmsro pairs `rockchipdrm` with Panthor, as on a real board. It checks interior pixels in the buffer, then shows it with `drmModeAddFB` and `drmModeSetCrtc`. The PNG is the emulated monitor's picture, VOP2's scanout through HDMI0 (see `docs/orangepi5.md`).
+
+The buffer is XRGB8888: Mesa's render target writes it back with a B,G,R,0 swizzle, which the fragment writeback applies. The tile buffer stays RGBA8.
+
+![GLES on HDMI](img/orangepi5-gles-hdmi.png)
+
 ## Real Mesa GLES rendering demo
 
 ```sh
@@ -323,5 +335,5 @@ primitive modes, perspective/clipping, broader varying modes and texture
 formats/layouts, mipmaps, anisotropy, shadow/array/cube sampling,
 blend shaders, logic operations, depth/stencil, MSAA, framebuffer preload shaders,
 non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
-synchronization, GPU preemption and VOP2 scanout remain incomplete. Passing the
+synchronization and GPU preemption remain incomplete. Passing the
 demo does not establish general GLES, Vulkan or desktop support.

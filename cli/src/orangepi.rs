@@ -27,7 +27,9 @@ impl SerialBoard for rk3588::Machine {
         let usb: Vec<String> = m.soc.xhci.attached().iter().map(|d| format!("{d:?}")).collect();
         eprintln!("[{tag}] USB: {}", usb.join(", "));
         if let Some(n) = m.soc.pcie.nvme.as_ref() { eprintln!("[{tag}] NVMe (M.2): {} reads, {} writes", n.reads, n.writes); }
-        if m.soc.display.frames.get() > 0 { eprintln!("[{tag}] HDMI: {} frames shown", m.soc.display.frames.get()); }
+        if m.soc.display.frames.get() > 0 { eprintln!("[{tag}] HDMI (firmware framebuffer): {} frames shown", m.soc.display.frames.get()); }
+        if m.soc.vop2.frames > 0 { eprintln!("[{tag}] HDMI (VOP2): {} frames, {} shown, mode {:?}, EDID bytes read {}, SCMI calls {}", m.soc.vop2.frames, m.soc.vop2.shown.get(), m.soc.vop2.size(), m.soc.hdmi.ddc_reads, m.soc.scmi.calls); }
+        else if m.soc.scmi.calls > 0 { eprintln!("[{tag}] SCMI calls {}, EDID bytes read {}", m.soc.scmi.calls, m.soc.hdmi.ddc_reads); }
         for (name, i) in [("headphones (ES8388, I2S1)", &m.soc.audio.i2s1), ("HDMI (I2S5)", &m.soc.audio.i2s5)] {
             if i.frames > 0 || i.underruns > 0 { eprintln!("[{tag}] audio {name}: {} frames at {} Hz, {} underruns", i.frames, i.rate, i.underruns); }
         }
@@ -35,9 +37,9 @@ impl SerialBoard for rk3588::Machine {
 }
 
 impl Screen for rk3588::Machine {
-    fn shown_size(&self) -> Option<(u32, u32)> { self.soc.display.shown_size() }
-    fn display_size(&self) -> (u32, u32) { self.soc.display.shown_size().unwrap_or((1280, 720)) }
-    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.display.render(&self.soc.ram, out) }
+    fn shown_size(&self) -> Option<(u32, u32)> { self.soc.shown_size() }
+    fn display_size(&self) -> (u32, u32) { self.soc.shown_size().unwrap_or((1280, 720)) }
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.render(out) }
     fn name(&self) -> &'static str { "sbc-emu: Orange Pi 5" }
     fn key(&mut self, usage: u8, down: bool) { self.soc.usb.kbd.key(usage, down); self.soc.dirty = true; }
     fn type_byte(&mut self, b: u8) { self.soc.usb.kbd.type_byte(b); self.soc.dirty = true; }
