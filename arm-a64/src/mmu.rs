@@ -69,18 +69,20 @@ impl Cpu {
         if t[s + 1].0 == tag { t.swap(s, s + 1); return Some(s); }
         None
     }
-    /// Install `page` for `tag` in way 0 of `va`'s set (way 0's entry moves to way 1).
+    /// Install physical `page` for `tag` in way 0 of `va`'s set (way 0's entry moves to way
+    /// 1). The fetch table (0) keeps the page (blocks are keyed by PA); the load and store
+    /// tables keep PA - VA, so an access's PA is one add (`va + entry`) in generated code too.
     #[inline(always)]
     pub(crate) fn utlb_fill(&mut self, k: usize, va: u64, tag: u64, page: u64) -> usize {
         let s = crate::cpu::uti(va);
         let t = &mut self.utlb[k];
         t[s + 1] = t[s];
-        t[s] = (tag, page);
+        t[s] = (tag, if k == 0 { page } else { page.wrapping_sub(va & !0xfff) });
         s
     }
 
     pub fn tlb_flush(&mut self) {
-        self.utlb = [[(0, 0); UT]; 3];
+        self.utlb = [[crate::cpu::UTLB_EMPTY; UT]; 3];
         self.tlb_blocks = [(u64::MAX, 0); 2];
         self.utlb_asid = self.asid();
         self.utlb_unpriv = 0;
@@ -97,7 +99,7 @@ impl Cpu {
         let (lo, hi) = self.tlb_blocks[(va >> 55 & 1) as usize];
         if va >= lo && va < hi { return self.tlb_flush(); }
         let u = crate::cpu::uti(va);
-        for t in self.utlb.iter_mut() { t[u] = (0, 0); t[u + 1] = (0, 0); }
+        for t in self.utlb.iter_mut() { t[u] = crate::cpu::UTLB_EMPTY; t[u + 1] = crate::cpu::UTLB_EMPTY; }
         if let Some(a) = self.a32.as_mut() { a.utlb_invalidate(va & ((1 << 56) - 1)); }
         if let Some(t) = self.tlb.as_mut() { t[(va >> 12) as usize & (TLB_SIZE - 1)].tag = 0; }
     }
@@ -183,9 +185,9 @@ impl Cpu {
         self.utlb_unpriv = if a == self.utlb_asid { 0 } else { 1 << 59 };
         for t in self.utlb.iter_mut() {
             for e in t.iter_mut() {
-                // tag = (va >> 12) + 1 | el << 60: bit 43 is VA bit 55, which selects TTBR1
-                // (also for user pointers with a top-byte tag)
-                if e.0 & (1 << 43) == 0 && (other_space || e.0 >> 60 != 0) { *e = (0, 0); }
+                // tag = va >> 12 | el << 60 (`utag`): bit 43 is VA bit 55, which selects TTBR1
+                // (also for user pointers with a top-byte tag); empty entries have it set
+                if e.0 & (1 << 43) == 0 && (other_space || e.0 >> 60 != 0) { *e = crate::cpu::UTLB_EMPTY; }
             }
         }
     }

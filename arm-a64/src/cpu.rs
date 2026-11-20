@@ -27,13 +27,22 @@ pub const UNBOUNDED: u64 = i64::MAX as u64;
 /// fields laid out after the tables with short immediate offsets (512 breaks that).
 pub(crate) const UT: usize = 256;
 /// The micro-TLBs are 2-way set associative: set `s` is entries `2s` (way 0, most recently
-/// used) and `2s + 1`. Set of virtual address `va`, as its way-0 entry index: the page number
-/// XOR-folded with itself shifted by 8 (pages that differ only in high bits, like a program's
-/// data and its mmap heap at the same low page bits, would otherwise share a set). Generated
-/// code computes the same: `eor x, va, va, lsr #8; ubfx x, x, #12, #log2(UT / 2)`, entries
-/// 32 bytes apart.
+/// used) and `2s + 1`. Set of virtual address `va`, as its way-0 entry index: natively the
+/// page number's low bits (`ubfx x, va, #12, #log2(UT / 2)` in generated code, entries 32
+/// bytes apart). Pages P and P + 1 then never share a set, so a page-crossing access, whose
+/// tag is that of its last byte, cannot hit the first page's set and needs no separate check.
+/// Pages that differ only in high bits (a program's data and its mmap heap) do share one; the
+/// native JIT refills a missing entry cheaply (`jit::h_tlb`). The browser's JIT has no such
+/// refill (a miss runs the instruction in the interpreter), so there `UTLB_HASH` XOR-folds
+/// the page number with itself shifted by 8, and its generated code checks page crossings.
+pub(crate) const UTLB_HASH: bool = cfg!(target_arch = "wasm32");
 #[inline(always)]
-pub(crate) fn uti(va: u64) -> usize { (((va ^ (va >> 8)) >> 12) as usize & (UT / 2 - 1)) * 2 }
+pub(crate) fn uti(va: u64) -> usize { ((if UTLB_HASH { va ^ (va >> 8) } else { va } >> 12) as usize & (UT / 2 - 1)) * 2 }
+/// Micro-TLB tag of `va`'s page at exception level `el` (an entry's first word).
+#[inline(always)]
+pub(crate) fn utag(va: u64, el: u64) -> u64 { (va >> 12) | (el << 60) }
+/// An empty micro-TLB entry: no tag has bits 52..59 set.
+pub(crate) const UTLB_EMPTY: (u64, u64) = (u64::MAX, 0);
 
 /// Board-selected CPU identity. ISA feature registers still advertise implemented features only.
 #[derive(Clone, Copy, Debug)]
@@ -121,9 +130,12 @@ pub struct Cpu {
     /// set when an instruction run inside a block may need the machine's attention (device
     /// access, system register, exception level change, ...): the chain stops after the block
     pub(crate) chain_stop: bool,
-    /// the native JIT's block dispatcher and exit stub (code addresses)
+    /// the native JIT's block dispatcher, exit stub and the stubs that call the interpreter and
+    /// refill a micro-TLB (code addresses)
     pub(crate) jit_disp: u64,
     pub(crate) jit_exit: u64,
+    pub(crate) jit_interp: u64,
+    pub(crate) jit_refill: u64,
     /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
     pub last_wfe: bool,
     /// multi-threaded run: cores execute in parallel on shared memory, so barriers and
@@ -199,7 +211,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[(0, 0); UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[UTLB_EMPTY; UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, jit_interp: 0, jit_refill: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
         }
     }
 
@@ -466,7 +478,7 @@ impl Cpu {
     /// all cores.
     pub fn hand_jit_to(&mut self, other: &mut Cpu) {
         if other.jit.is_some() { return; } // it has its own (multi-threaded runs)
-        if let Some(j) = self.jit.take() { other.jit = Some(j); other.jit_disp = self.jit_disp; other.jit_exit = self.jit_exit; }
+        if let Some(j) = self.jit.take() { other.jit = Some(j); other.jit_disp = self.jit_disp; other.jit_exit = self.jit_exit; other.jit_interp = self.jit_interp; other.jit_refill = self.jit_refill; }
     }
 
     /// Address of `chain_until`: another thread may store 0 there (atomically) to make this core
