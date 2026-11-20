@@ -28,6 +28,8 @@ const DSP_HOLD_VALID: u32 = 1 << 6;
 const VP0: u64 = 0xc00;
 const DSP_CTRL: u64 = 0x00;
 const STANDBY: u32 = 1 << 31;
+/// The largest picture VP0 drives.
+const MAX_SIZE: (u32, u32) = (7680, 4320);
 const HTOTAL: u64 = 0x48;
 const HACT: u64 = 0x4c;
 const VTOTAL: u64 = 0x50;
@@ -56,11 +58,13 @@ pub struct Vop2 {
     pub frames: u64,
     /// frames shown to a viewer
     pub shown: std::cell::Cell<u64>,
+    /// VP0 has scanned out: Linux drives the display (the firmware's framebuffer is stale)
+    taken_over: bool,
 }
 
 impl Default for Vop2 {
     fn default() -> Self {
-        let mut v = Self { regs: vec![0; (SIZE / 4) as usize], raw: [0; 6], next_frame: None, frames: 0, shown: Default::default() };
+        let mut v = Self { regs: vec![0; (SIZE / 4) as usize], raw: [0; 6], next_frame: None, frames: 0, shown: Default::default(), taken_over: false };
         v.regs[((VP0 + DSP_CTRL) / 4) as usize] = STANDBY;
         v
     }
@@ -116,7 +120,10 @@ impl Vop2 {
         }
         if off == VP0 + DSP_CTRL {
             match (was_running, self.running()) {
-                (false, true) => self.next_frame = Some(now),
+                (false, true) => {
+                    self.next_frame = Some(now);
+                    self.taken_over = true;
+                }
                 (true, false) => {
                     self.next_frame = None;
                     self.raw[VP_INT0] |= DSP_HOLD_VALID;
@@ -137,11 +144,17 @@ impl Vop2 {
         e & (1 << 3) != 0 && (e >> 16) & 3 == 0
     }
 
-    /// VP0's active size.
+    /// VP0's active size (none beyond what VP0 can drive, 7680x4320).
     pub fn size(&self) -> Option<(u32, u32)> {
         let span = |r: u32| (r & 0xffff).saturating_sub(r >> 16);
         let (w, h) = (span(self.reg(VP0 + HACT)), span(self.reg(VP0 + VACT)));
-        (w > 0 && h > 0).then_some((w, h))
+        (w > 0 && h > 0 && w <= MAX_SIZE.0 && h <= MAX_SIZE.1).then_some((w, h))
+    }
+
+    /// Linux has driven the display: from then on the monitor shows VOP2's output, black
+    /// while VP0 is off, never the firmware's framebuffer again.
+    pub fn taken_over(&self) -> bool {
+        self.taken_over
     }
 
     /// Frame starts up to `now` with a pixel clock of `dclk` Hz.
@@ -210,18 +223,20 @@ impl Vop2 {
             .collect()
     }
 
-    /// The picture VP0 sends, as RGBA.
+    /// What the HDMI monitor gets, as RGBA: VP0's picture, black while VP0 is off or drives
+    /// another output (once Linux has driven it).
     pub fn render(&self, ram: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        if !self.running() {
+        if !self.taken_over {
             return None;
         }
         let (w, h) = self.size()?;
         out.clear();
-        out.resize((w * h * 4) as usize, 0);
+        out.resize(w as usize * h as usize * 4, 0);
         for px in out.chunks_exact_mut(4) {
             px[3] = 255;
         }
-        for (n, win) in self.layers().iter().enumerate() {
+        let layers = if self.running() && self.hdmi0() { self.layers() } else { Vec::new() };
+        for (n, win) in layers.iter().enumerate() {
             if win.afbc {
                 continue;
             }
@@ -239,8 +254,9 @@ impl Vop2 {
                         break;
                     }
                     let sx = i64::from(dx * win.src.0 / win.dst.0);
-                    let a = (line + sx * bpp) as usize;
-                    let Some(s) = ram.get(a..a + bpp as usize) else { continue };
+                    // (a Y-mirrored window starting low in memory reaches below 0)
+                    let Ok(a) = usize::try_from(line + sx * bpp) else { continue };
+                    let Some(s) = a.checked_add(bpp as usize).and_then(|e| ram.get(a..e)) else { continue };
                     // (r, g, b, alpha)
                     let (mut r, g, mut b, al) = match win.format {
                         0 => (s[2], s[1], s[0], s[3]),
@@ -316,6 +332,32 @@ mod tests {
         assert_eq!(v.read(REG_CFG_DONE), 0);
         v.write(VP0 + DSP_CTRL, STANDBY, 2000);
         assert_eq!(v.raw[VP_INT0] & DSP_HOLD_VALID, DSP_HOLD_VALID);
-        assert_eq!(v.render(&ram, &mut out), None);
+        // off: black, not the firmware's framebuffer
+        assert!(v.taken_over());
+        assert_eq!(v.render(&ram, &mut out), Some((1280, 720)));
+        assert!(out.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn nothing_before_linux_drives_it() {
+        let v = Vop2::default();
+        assert_eq!(v.render(&[], &mut Vec::new()), None);
+    }
+
+    /// Guest-chosen sizes and addresses: no overflow, no huge buffers.
+    #[test]
+    fn oversized_modes_and_mirrored_windows_at_0_are_safe() {
+        let mut v = Vop2::default();
+        let ram = vec![0u8; 8 << 20];
+        modeset(&mut v, 0);
+        v.write(VP0 + HACT, 0xffff, 0);
+        v.write(VP0 + VACT, 0xffff, 0);
+        assert!(!v.running());
+        assert_eq!(v.size(), None);
+        v.write(VP0 + HACT, 260 << 16 | (260 + 1280), 0);
+        v.write(VP0 + VACT, 25 << 16 | (25 + 720), 0);
+        v.write(0x1000 + 0x54, 1 << 3, 0); // Y mirror, YRGB_MST 0
+        let mut out = Vec::new();
+        assert_eq!(v.render(&ram, &mut out), Some((1280, 720)));
     }
 }

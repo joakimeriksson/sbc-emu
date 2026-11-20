@@ -181,14 +181,14 @@ impl Soc {
         self.now=self.now.max(now);
         self.vop2.tick(now,self.scmi.rate(scmi::clk::DCLK_VP0));
     }
-    /// What the HDMI monitor shows: VOP2's output once Linux drives it, else the firmware's
-    /// framebuffer.
+    /// What the HDMI monitor shows: the firmware's framebuffer until Linux drives VOP2, then
+    /// VOP2's output (black while it is off).
     pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32,u32)> {
-        if self.vop2.running() && self.vop2.hdmi0() { return self.vop2.render(&self.ram,out); }
+        if self.vop2.taken_over() { return self.vop2.render(&self.ram,out); }
         self.display.render(&self.ram,out)
     }
     pub fn shown_size(&self) -> Option<(u32,u32)> {
-        if self.vop2.running() && self.vop2.hdmi0() { return self.vop2.size(); }
+        if self.vop2.taken_over() { return self.vop2.size(); }
         self.display.shown_size()
     }
     /// The SCMI call (SMC 0x82000010) of a core.
