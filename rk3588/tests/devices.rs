@@ -228,7 +228,7 @@ fn initrd_stays_below_the_hdmi_framebuffer() {
     // 128 MiB: the framebuffer starts at 112 MiB, the initrd at 64 MiB, so 48 MiB fit
     let initrd=vec![0;49<<20];
     let mut m=Machine::new(128<<20).unwrap();
-    m.enable_hdmi(Mode{width:1280,height:720});
+    m.enable_hdmi(Mode::find(1280,720).unwrap());
     assert!(rk3588::boot::boot_linux(&mut m,&image,Some(&initrd),"").is_err());
     let mut plain=Machine::new(128<<20).unwrap();
     rk3588::boot::boot_linux(&mut plain,&image,Some(&initrd),"").unwrap();
