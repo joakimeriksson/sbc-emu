@@ -524,8 +524,12 @@ pub struct Thread {
     prev_thrsw: bool,
     end_in: Option<u8>,
     branch: Option<(u8, u32, Option<u32>)>,
-    /// delayed accumulator writes: (instructions left, accumulator, value)
-    delayed: Vec<(u8, u8, V)>,
+    /// delayed accumulator writes (accumulator, value), in the order they were made: `delayed`
+    /// lands at the end of this instruction, `delayed_next` (made during it) at the end of the
+    /// next one. Every delayed write (the C coefficient of `ldvary` to r5, SFU results to r4)
+    /// has a latency of one instruction.
+    delayed: Vec<(u8, V)>,
+    delayed_next: Vec<(u8, V)>,
     pub insns: u64,
     pub done: bool,
 }
@@ -538,7 +542,7 @@ fn fast_add(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
     macro_rules! i2 { ($e:expr) => {{ for l in 0..LANES { o[l] = $e(a[l], b[l]); } }} }
     match op {
         AddOp::Fadd | AddOp::Faddnf => f2!(|p: f32, q: f32| p + q),
-        AddOp::Fsub => f2!(|p: f32, q: f32| p - q),
+        AddOp::Fsub | AddOp::Fcmp => f2!(|p: f32, q: f32| p - q),
         AddOp::Fmin => f2!(fmin),
         AddOp::Fmax => f2!(fmax),
         AddOp::Add => i2!(|x: u32, y: u32| x.wrapping_add(y)),
@@ -587,6 +591,154 @@ fn fast_mul(op: MulOp, ua: Unpack, ub: Unpack, a: &V, b: &V) -> Option<V> {
     Some(o)
 }
 
+/// The zero/negative/carry lane masks of an add-ALU op `fast_add` ran (operands `a`, `b`, result
+/// `r`), as the general path computes them.
+fn add_flags(op: AddOp, ua: Unpack, ub: Unpack, a: &V, b: &V, r: &V) -> (u16, u16, u16) {
+    use AddOp::*;
+    let (mut z, mut n, mut c) = (0u16, 0u16, 0u16);
+    let mut set = |l: usize, zl: bool, nl: bool, cl: bool| { z |= (zl as u16) << l; n |= (nl as u16) << l; c |= (cl as u16) << l; };
+    match op {
+        Fadd | Faddnf | Fsub | Fmin | Fmax => for l in 0..LANES { let f = f32::from_bits(r[l]); set(l, f == 0.0, f < 0.0, f > 0.0); },
+        Fcmp => { let (p, q) = (unpack_v(a, ua), unpack_v(b, ub)); for l in 0..LANES { set(l, p[l] == q[l], p[l] < q[l], p[l] <= q[l]); } }
+        Recip | Rsqrt | Exp | Log | Sin | Rsqrt2 | Itof | Utof | Ffloor | Fceil | Ftrunc =>
+            for l in 0..LANES { let f = f32::from_bits(r[l]); set(l, f == 0.0, f < 0.0, false); },
+        Add => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, a[l].overflowing_add(b[l]).1); },
+        Sub => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, a[l].overflowing_sub(b[l]).1); },
+        Min | Max => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, (a[l] as i32) > (b[l] as i32)); },
+        Umin | Umax => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, a[l] > b[l]); },
+        _ => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, false); },
+    }
+    (z, n, c)
+}
+
+/// The zero/negative/carry lane masks of a mul-ALU op `fast_mul` ran, as the general path
+/// computes them.
+fn mul_flags(op: MulOp, a: &V, b: &V, r: &V) -> (u16, u16, u16) {
+    let (mut z, mut n, mut c) = (0u16, 0u16, 0u16);
+    let mut set = |l: usize, zl: bool, nl: bool, cl: bool| { z |= (zl as u16) << l; n |= (nl as u16) << l; c |= (cl as u16) << l; };
+    match op {
+        MulOp::Fmul => for l in 0..LANES { let f = f32::from_bits(r[l]); set(l, f == 0.0, f < 0.0, f > 0.0); },
+        MulOp::Fmov => for l in 0..LANES { let f = f32::from_bits(r[l]); set(l, f == 0.0, f < 0.0, false); },
+        MulOp::Add => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, a[l].overflowing_add(b[l]).1); },
+        MulOp::Sub => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, a[l].overflowing_sub(b[l]).1); },
+        _ => for l in 0..LANES { set(l, r[l] == 0, (r[l] as i32) < 0, false); },
+    }
+    (z, n, c)
+}
+
+/// A flag push (`pf`: A becomes the new condition, the old A moves to B) and/or update (`uf`:
+/// A combined with the condition).
+fn update_flags(fa: &mut u16, fb: &mut u16, pf: Pf, uf: Uf, z: u16, n: u16, c: u16) {
+    match pf {
+        Pf::None => {}
+        Pf::Z => { *fb = *fa; *fa = z; }
+        Pf::N => { *fb = *fa; *fa = n; }
+        Pf::C => { *fb = *fa; *fa = c; }
+    }
+    use Uf::*;
+    let a = *fa;
+    *fa = match uf {
+        None => a,
+        Andz => a & z, Andnz => a & !z, Nornz => !a & z, Norz => !a & !z,
+        Andn => a & n, Andnn => a & !n, Nornn => !a & n, Norn => !a & !n,
+        Andc => a & c, Andnc => a & !c, Nornc => !a & c, Norc => !a & !c,
+    };
+}
+
+/// The pre-decoded execution form of an instruction, made once when it enters the code cache.
+///
+/// Most instructions of real shaders (glmark2, the desktop, Firefox) are plain lane-parallel ALU
+/// work, maybe with a flag push, a condition or a uniform or varying load. Those run on
+/// `Thread::exec_fast`, which reads its operands in place through the resolved sources below
+/// instead of decoding muxes and copying four operand vectors, writes plain registers directly
+/// and computes flags with one loop per op instead of a `match` per lane. Everything else
+/// (branches, multiply-op sequences, setmsf, lane-dependent ops, rotates, ...) stays on the
+/// general path; both give the same results.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pre {
+    /// runs on the fast path (an ALU instruction it covers)
+    pub fast: bool,
+    /// the instruction has the thread-switch signal
+    pub thrsw: bool,
+    /// the add-ALU op writes a result (not a no-op or a VPM store)
+    pub add_writes: bool,
+    /// the mul-ALU op writes a result
+    pub mul_writes: bool,
+    /// operand sources of add a, add b, mul a, mul b: 0-63 register file, `SRC_ACC + n` accumulator
+    /// rn, `SRC_IMM` the small immediate
+    pub src: [u8; 4],
+    /// where the add and mul results go when that is a plain register write (as `src`), or
+    /// `DST_OTHER` (magic registers, packed results: through `write_reg`)
+    pub dst: [u8; 2],
+    /// has signals handled before the ALU writes (uniform loads, `wrtmuc`) / after them
+    /// (`ldtmu`, `ldvary`, `ldtlb`)
+    pub sig_before: bool,
+    pub sig_after: bool,
+    /// updates the flags (a flag push or update on either ALU)
+    pub flags: bool,
+    /// the small immediate (when the instruction has one)
+    pub imm: u32,
+}
+
+/// `SBC_V3D_QPU_FAST=0` runs every instruction on the general path (to rule the fast path out
+/// when chasing a rendering difference).
+fn fast_path_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SBC_V3D_QPU_FAST").map_or(true, |v| v != "0"))
+}
+
+const SRC_ACC: u8 = 64;
+const SRC_IMM: u8 = 70;
+const DST_OTHER: u8 = 0xff;
+
+/// Add-ALU ops the fast path runs: those of `fast_add`, the no-ops and the VPM accesses.
+fn add_fast_op(op: AddOp) -> bool {
+    use AddOp::*;
+    matches!(op, Fadd | Faddnf | Fsub | Fmin | Fmax | Add | Sub | And | Or | Xor | Shl | Shr | Asr | Min | Max | Umin | Umax
+        | Vfpack | Recip | Rsqrt | Exp | Log | Sin | Rsqrt2 | Itof | Utof | Ftoiz | Ftoin | Ffloor | Fceil | Ftrunc | Not | Neg
+        | Eidx | Nop | Tmuwt | Vpmwt | Vpmsetup | LdvpmvIn | LdvpmvOut | LdvpmdIn | LdvpmdOut | Stvpmv | Stvpmd | Stvpmp)
+}
+
+impl Pre {
+    pub fn new(inst: &Inst) -> Pre {
+        let Inst::Alu(i) = inst else { return Pre::default() };
+        let imm = if i.sig.small_imm_b { SMALL_IMM.get(i.raddr_b as usize).copied().unwrap_or(0) } else { 0 };
+        let src = |mux: u8| -> u8 {
+            match mux {
+                0..=5 => SRC_ACC + mux,
+                6 => i.raddr_a,
+                _ => if i.sig.small_imm_b { SRC_IMM } else { i.raddr_b },
+            }
+        };
+        use AddOp::*;
+        let add_writes = !matches!(i.add.op, Nop | Tmuwt | Vpmwt | Vpmsetup | Stvpmv | Stvpmd | Stvpmp);
+        let mul_writes = !matches!(i.mul.op, MulOp::Nop | MulOp::Multop);
+        let (add_flags, mul_flags) = (i.add.pf != Pf::None || i.add.uf != Uf::None, i.mul.pf != Pf::None || i.mul.uf != Uf::None);
+        // flags only from ops that produce a result through fast_add/fast_mul (Fcmp only with flags:
+        // without them it is an ordinary subtraction to the general path's eyes as well)
+        let add_ok = (add_fast_op(i.add.op) || i.add.op == Fcmp)
+            && (!add_flags || (add_writes && !matches!(i.add.op, LdvpmvIn | LdvpmvOut | LdvpmdIn | LdvpmdOut)));
+        let mul_ok = matches!(i.mul.op, MulOp::Nop | MulOp::Fmul | MulOp::Fmov | MulOp::Mov | MulOp::Add | MulOp::Sub) && (!mul_flags || mul_writes);
+        let fast = !i.sig.rotate && add_ok && mul_ok && fast_path_enabled();
+        let dst = |waddr: u8, magic: bool, pack: Pack| -> u8 {
+            match (magic, pack) {
+                (false, Pack::None) => waddr,
+                (true, Pack::None) if waddr <= 5 => SRC_ACC + waddr,
+                _ => DST_OTHER,
+            }
+        };
+        let g = i.sig;
+        Pre {
+            fast, thrsw: g.thrsw, add_writes, mul_writes, imm,
+            src: [src(i.add.a), src(i.add.b), src(i.mul.a), src(i.mul.b)],
+            dst: [dst(i.add.waddr, i.add.magic, i.add.pack), dst(i.mul.waddr, i.mul.magic, i.mul.pack)],
+            sig_before: g.ldunif || g.ldunifrf || g.ldunifa || g.ldunifarf || g.wrtmuc,
+            sig_after: g.ldtmu || g.ldvary || g.ldtlb || g.ldtlbu,
+            flags: add_flags || mul_flags,
+        }
+    }
+}
+
 #[inline]
 fn lanes_of(mask: u16) -> impl Iterator<Item = usize> { (0..LANES).filter(move |l| mask & (1 << l) != 0) }
 
@@ -597,7 +749,7 @@ impl Thread {
             pc, unif, unifa: 0, lr: 0, rtop: [0; LANES], valid: 0xffff, tmu_cfg: Vec::new(), tmu_req: TmuReq::default(),
             tmu_out: Default::default(), last_tmu: (TmuKind::General, [0; 3], 0), vpm: Vec::new(), vpm_out_base: 0, xcd: [0; LANES], ycd: [0; LANES],
             fx: [0.0; LANES], fy: [0.0; LANES], tidx: 0, barrier_id: 0, final_section, prev_thrsw: false, end_in: None,
-            branch: None, delayed: Vec::new(), insns: 0, done: false, start: (pc, unif),
+            branch: None, delayed: Vec::new(), delayed_next: Vec::new(), insns: 0, done: false, start: (pc, unif),
         }
     }
 
@@ -610,7 +762,7 @@ impl Thread {
         self.tmu_cfg.clear(); self.tmu_req = TmuReq::default(); self.tmu_out.clear();
         self.vpm.clear(); self.vpm_out_base = 0;
         self.tidx = 0; self.barrier_id = 0; self.final_section = final_section; self.prev_thrsw = false; self.end_in = None;
-        self.branch = None; self.delayed.clear(); self.done = false; self.start = (pc, unif);
+        self.branch = None; self.delayed.clear(); self.delayed_next.clear(); self.done = false; self.start = (pc, unif);
     }
 
     /// With SBC_V3D_DUMP=DIR: write this invocation's code (from its start to a little past the
@@ -665,7 +817,8 @@ impl Thread {
         let tracing = crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0;
         while !self.done {
             if self.insns >= stop_at { return Stop::Budget; }
-            let inst = code.fetch(self.pc, env);
+            let k = code.slot(self.pc, env);
+            let (inst, pre) = code.get(k);
             self.insns += 1;
             if self.insns & 0xf_ffff == 0 { crate::progress(); }
             let snap = if tracing { Some((self.rf.clone(), self.acc)) } else { None };
@@ -673,25 +826,24 @@ impl Thread {
             self.pc = self.pc.wrapping_add(8);
             let mut barrier = false;
             let mut thrsw = false;
-            match inst {
+            if pre.fast {
+                if let Inst::Alu(i) = inst { barrier = self.exec_fast(i, pre, env); }
+                thrsw = pre.thrsw;
+            } else { match *inst {
                 Inst::Invalid(w) => {
                     if crate::log_first(&format!("v3d: invalid QPU instruction {w:#018x} at {this_pc:#x} (shader {:#x})", self.start.0)) { self.dump_shader(env); }
                     self.done = true;
                     return Stop::Fault;
                 }
-                Inst::Branch(b) => self.branch_inst(&b, this_pc, env),
-                Inst::Alu(i) => { barrier = self.alu(&i, env); thrsw = i.sig.thrsw; }
-            }
+                Inst::Branch(ref b) => self.branch_inst(b, this_pc, env),
+                Inst::Alu(ref i) => { barrier = self.alu(i, env); thrsw = i.sig.thrsw; }
+            } }
             // delayed accumulator writes land at the end of the instruction they are due in
             if !self.delayed.is_empty() {
-                let mut k = 0;
-                while k < self.delayed.len() {
-                    if self.delayed[k].0 == 0 {
-                        let (_, a, v) = self.delayed.remove(k);
-                        self.acc[a as usize] = v;
-                    } else { self.delayed[k].0 -= 1; k += 1; }
-                }
+                for &(a, v) in &self.delayed { self.acc[a as usize] = v; }
+                self.delayed.clear();
             }
+            if !self.delayed_next.is_empty() { std::mem::swap(&mut self.delayed, &mut self.delayed_next); }
             // thread switches: a pair marks the last one; in the final section the next one ends
             // the thread once its two delay slots have run
             if let Some(n) = self.end_in {
@@ -713,7 +865,7 @@ impl Thread {
                 let mut ch = String::new();
                 for k in 0..64 { if rf[k][0] != self.rf[k][0] { ch += &format!(" rf{k}={:#x}({})", self.rf[k][0], f32::from_bits(self.rf[k][0])); } }
                 for k in 0..6 { if acc[k][0] != self.acc[k][0] { ch += &format!(" r{k}={:#x}({})", self.acc[k][0], f32::from_bits(self.acc[k][0])); } }
-                let d = match inst { Inst::Alu(i) => format!("{:?}/{:?} a{}b{} ra{} rb{} {:?}{:?} sig{}", i.add.op, i.mul.op, i.add.a, i.add.b, i.raddr_a, i.raddr_b, i.mul.a, i.mul.b, i.sig.ldunif as u8), x => format!("{x:?}") };
+                let d = match *inst { Inst::Alu(i) => format!("{:?}/{:?} a{}b{} ra{} rb{} {:?}{:?} sig{}", i.add.op, i.mul.op, i.add.a, i.add.b, i.raddr_a, i.raddr_b, i.mul.a, i.mul.b, i.sig.ldunif as u8), x => format!("{x:?}") };
                 eprintln!("\rqpu {this_pc:#x} {d} fa={:#x} |{ch}\r", self.fa);
             }
             if barrier { return Stop::Barrier; }
@@ -943,42 +1095,38 @@ impl Thread {
         }
         }
 
-        // ---- signals that read uniforms come before ALU writes using them (TLBU/TMUAU take theirs after)
-        let sig = i.sig;
-        if sig.ldunif { let u = self.next_uniform(env); self.acc[5] = [u; LANES]; }
-        if sig.ldunifrf { let u = self.next_uniform(env); self.write_reg(i.sig_addr, i.sig_magic, &[u; LANES], 0xffff, Pack::None, env, &mut barrier); }
-        if sig.ldunifa || sig.ldunifarf {
-            let u = env.read32(self.unifa);
-            self.unifa = self.unifa.wrapping_add(4);
-            if sig.ldunifa { self.acc[5] = [u; LANES]; } else { self.write_reg(i.sig_addr, i.sig_magic, &[u; LANES], 0xffff, Pack::None, env, &mut barrier); }
-        }
-        if sig.wrtmuc { let u = self.next_uniform(env); self.tmu_cfg.push(u); }
+        self.signals_before_writes(i, env, &mut barrier);
 
         // ---- ALU writes
         if a_has { self.write_alu(add.waddr, add.magic, &ares, acond, add.pack, env, &mut barrier); }
         if m_has { self.write_alu(mul.waddr, mul.magic, &mres, mcond, mul.pack, env, &mut barrier); }
 
         // ---- flags
-        let update = |fa: &mut u16, fb: &mut u16, pf: Pf, uf: Uf, z: u16, n: u16, c: u16| {
-            match pf {
-                Pf::None => {}
-                Pf::Z => { *fb = *fa; *fa = z; }
-                Pf::N => { *fb = *fa; *fa = n; }
-                Pf::C => { *fb = *fa; *fa = c; }
-            }
-            use Uf::*;
-            let a = *fa;
-            *fa = match uf {
-                None => a,
-                Andz => a & z, Andnz => a & !z, Nornz => !a & z, Norz => !a & !z,
-                Andn => a & n, Andnn => a & !n, Nornn => !a & n, Norn => !a & !n,
-                Andc => a & c, Andnc => a & !c, Nornc => !a & c, Norc => !a & !c,
-            };
-        };
-        update(&mut self.fa, &mut self.fb, add.pf, add.uf, az, an, ac);
-        update(&mut self.fa, &mut self.fb, mul.pf, mul.uf, mz, mn, mc);
+        update_flags(&mut self.fa, &mut self.fb, add.pf, add.uf, az, an, ac);
+        update_flags(&mut self.fa, &mut self.fb, mul.pf, mul.uf, mz, mn, mc);
 
-        // ---- result-returning signals
+        self.signals_after_writes(i, env, &mut barrier);
+        barrier
+    }
+
+    /// Signals that read uniforms come before ALU writes using them (TLBU/TMUAU take theirs after).
+    #[inline(always)]
+    fn signals_before_writes(&mut self, i: &AluInst, env: &mut dyn Env, barrier: &mut bool) {
+        let sig = i.sig;
+        if sig.ldunif { let u = self.next_uniform(env); self.acc[5] = [u; LANES]; }
+        if sig.ldunifrf { let u = self.next_uniform(env); self.write_reg(i.sig_addr, i.sig_magic, &[u; LANES], 0xffff, Pack::None, env, barrier); }
+        if sig.ldunifa || sig.ldunifarf {
+            let u = env.read32(self.unifa);
+            self.unifa = self.unifa.wrapping_add(4);
+            if sig.ldunifa { self.acc[5] = [u; LANES]; } else { self.write_reg(i.sig_addr, i.sig_magic, &[u; LANES], 0xffff, Pack::None, env, barrier); }
+        }
+        if sig.wrtmuc { let u = self.next_uniform(env); self.tmu_cfg.push(u); }
+    }
+
+    /// Result-returning signals, after the ALU writes and flag updates.
+    #[inline(always)]
+    fn signals_after_writes(&mut self, i: &AluInst, env: &mut dyn Env, barrier: &mut bool) {
+        let sig = i.sig;
         if sig.ldtmu {
             let v = match self.tmu_out.pop_front() {
                 Some(v) => v,
@@ -990,19 +1138,85 @@ impl Thread {
                     [0; LANES]
                 }
             };
-            self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, &mut barrier);
+            self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, barrier);
         }
         if sig.ldvary {
             let (v, c) = env.ldvary(self);
-            self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, &mut barrier);
-            self.delayed.push((1, 5, c));
+            self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, barrier);
+            self.delayed_next.push((5, c));
         }
         if sig.ldtlb || sig.ldtlbu {
             let cfg = if sig.ldtlbu { Some(self.next_uniform(env)) } else { None };
             let v = env.tlb_read(self, cfg);
-            self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, &mut barrier);
+            self.write_reg(i.sig_addr, i.sig_magic, &v, 0xffff, Pack::None, env, barrier);
         }
+    }
+
+    /// An operand in place: a register, an accumulator or the small immediate (`imm`).
+    #[inline(always)]
+    fn src<'a>(&'a self, s: u8, imm: &'a V) -> &'a V {
+        if s < SRC_ACC { &self.rf[s as usize] } else if s < SRC_IMM { &self.acc[(s - SRC_ACC) as usize] } else { imm }
+    }
+
+    /// Execute an instruction `Pre::new` marked fast: the same results as `alu`, in the same
+    /// order (operands read first, uniform signals, add then mul writes, flags, result signals),
+    /// for instructions without rotation whose ops `fast_add`/`fast_mul` cover.
+    /// True if it hit a barrier.
+    #[inline(always)]
+    fn exec_fast(&mut self, i: &AluInst, p: &Pre, env: &mut dyn Env) -> bool {
+        let imm = [p.imm; LANES];
+        let (add, mul) = (&i.add, &i.mul);
+        let acond = self.cond_mask(add.cond);
+        let mut ares = [0u32; LANES];
+        if p.add_writes {
+            use AddOp::*;
+            match add.op {
+                LdvpmvIn | LdvpmdIn | LdvpmvOut | LdvpmdOut => {
+                    let base = if matches!(add.op, LdvpmvOut | LdvpmdOut) { self.vpm_out_base } else { 0 };
+                    let x = self.src(p.src[0], &imm);
+                    for l in 0..LANES { ares[l] = self.vpm.get(base + x[l] as usize).map_or(0, |r| r[l]); }
+                }
+                _ => if let Some(r) = fast_add(add.op, add.ua, add.ub, self.src(p.src[0], &imm), self.src(p.src[1], &imm)) { ares = r; },
+            }
+        } else if matches!(add.op, AddOp::Stvpmv | AddOp::Stvpmd) {
+            let (x, y) = (*self.src(p.src[0], &imm), *self.src(p.src[1], &imm));
+            for l in 0..LANES {
+                if acond & (1 << l) != 0 {
+                    let row = self.vpm_out_base + x[l] as usize;
+                    if self.vpm.len() <= row { self.vpm.resize(row + 1, [0; LANES]); }
+                    self.vpm[row][l] = y[l];
+                }
+            }
+        }
+        let mres = if p.mul_writes { fast_mul(mul.op, mul.ua, mul.ub, self.src(p.src[2], &imm), self.src(p.src[3], &imm)).unwrap_or([0; LANES]) } else { [0; LANES] };
+        // flags from the operands as they were before any write
+        let fl = if p.flags {
+            let af = if add.pf != Pf::None || add.uf != Uf::None { add_flags(add.op, add.ua, add.ub, self.src(p.src[0], &imm), self.src(p.src[1], &imm), &ares) } else { (0, 0, 0) };
+            let mf = if mul.pf != Pf::None || mul.uf != Uf::None { mul_flags(mul.op, self.src(p.src[2], &imm), self.src(p.src[3], &imm), &mres) } else { (0, 0, 0) };
+            Some((af, mf))
+        } else { None };
+        let mut barrier = false;
+        if p.sig_before { self.signals_before_writes(i, env, &mut barrier); }
+        if p.add_writes {
+            if p.dst[0] != DST_OTHER { self.put(p.dst[0], &ares, acond); } else { self.write_alu(add.waddr, add.magic, &ares, acond, add.pack, env, &mut barrier); }
+        }
+        if p.mul_writes {
+            let mcond = self.cond_mask(mul.cond);
+            if p.dst[1] != DST_OTHER { self.put(p.dst[1], &mres, mcond); } else { self.write_alu(mul.waddr, mul.magic, &mres, mcond, mul.pack, env, &mut barrier); }
+        }
+        if let Some(((az, an, ac), (mz, mn, mc))) = fl {
+            update_flags(&mut self.fa, &mut self.fb, add.pf, add.uf, az, an, ac);
+            update_flags(&mut self.fa, &mut self.fb, mul.pf, mul.uf, mz, mn, mc);
+        }
+        if p.sig_after { self.signals_after_writes(i, env, &mut barrier); }
         barrier
+    }
+
+    /// A plain register or accumulator write (`Pre::dst`) of the lanes in `mask`.
+    #[inline(always)]
+    fn put(&mut self, d: u8, v: &V, mask: u16) {
+        let r = if d < SRC_ACC { &mut self.rf[d as usize] } else { &mut self.acc[(d - SRC_ACC) as usize] };
+        if mask == 0xffff { *r = *v; } else { for l in 0..LANES { if mask & (1 << l) != 0 { r[l] = v[l]; } } }
     }
 
     fn write_alu(&mut self, waddr: u8, magic: bool, v: &V, mask: u16, pack: Pack, env: &mut dyn Env, barrier: &mut bool) {
@@ -1060,7 +1274,7 @@ impl Thread {
                 let op = [AddOp::Recip, AddOp::Rsqrt, AddOp::Exp, AddOp::Log, AddOp::Sin, AddOp::Rsqrt2][(waddr - 19) as usize];
                 let mut out = [0u32; LANES];
                 for l in 0..LANES { out[l] = ftz(sfu(op, f32::from_bits(v[l]))).to_bits(); }
-                self.delayed.push((1, 4, out));
+                self.delayed_next.push((4, out));
             }
             32 => self.tmu_cfg.push(v[0]),
             33 | 40 | 41 | 42 | 43 | 44 | 45 | 46 => {
@@ -1107,6 +1321,83 @@ mod tests {
             Inst::Alu(i) => { assert_eq!(i.add.op, AddOp::Nop); assert_eq!(i.mul.op, MulOp::Nop); }
             x => panic!("{x:?}"),
         }
+    }
+
+    /// The fast path (`Thread::exec_fast`) and the general path (`Thread::alu`) leave the same
+    /// state behind for every instruction `Pre::new` sends to the fast path: random instruction
+    /// words on random register contents (floats including denormals, NaNs, infinities and signed
+    /// zeros, small and large integers), flags and VPM rows.
+    #[test]
+    fn fast_path_matches_general_path() {
+        /// NaNs (f32, or either f16 half) made canonical, as the two paths may differ in their sign
+        /// and payload (the compiler may commute a float operation differently in each)
+        fn canon(v: &V) -> V {
+            v.map(|x| {
+                if x & 0x7f80_0000 == 0x7f80_0000 && x & 0x7f_ffff != 0 { return 0x7fc0_0000; }
+                let h = |h: u32| if h & 0x7c00 == 0x7c00 && h & 0x3ff != 0 { 0x7e00 } else { h };
+                h(x >> 16) << 16 | h(x & 0xffff)
+            })
+        }
+        #[derive(Default)]
+        struct Rec { log: Vec<String>, n: u32 }
+        impl Env for Rec {
+            fn read32(&mut self, va: u32) -> u32 { va.wrapping_mul(2654435761) ^ 0x3f80_0000 }
+            fn write32(&mut self, va: u32, v: u32) { self.log.push(format!("w {va:#x} {v:#x}")); }
+            fn tmu(&mut self, _t: &Thread, k: TmuKind, cfg: &[u32], req: &TmuReq, lanes: u16) -> Vec<V> {
+                self.log.push(format!("tmu {k:?} {cfg:?} {:?} {:?} {:?} {lanes:#x}", req.s.as_ref().map(canon), req.t.as_ref().map(canon), req.data.iter().map(canon).collect::<Vec<_>>()));
+                vec![[7; LANES]]
+            }
+            fn ldvary(&mut self, _t: &mut Thread) -> (V, V) { self.n += 1; ([self.n; LANES], [self.n * 3; LANES]) }
+            fn tlb_write(&mut self, _t: &mut Thread, lanes: u16, v: &V, cfg: Option<u32>) { self.log.push(format!("tlb {lanes:#x} {:?} {cfg:?}", canon(v))); }
+            fn tlb_read(&mut self, _t: &mut Thread, cfg: Option<u32>) -> V { self.n += 1; [self.n ^ cfg.unwrap_or(0); LANES] }
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        const SPECIAL: [u32; 12] = [0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x0000_0001, 0x8000_0010, 0x7f80_0000, 0xff80_0000,
+                                    0x7fc0_0000, 0x7f7f_ffff, 0x0000_001f, 0xffff_ffff];
+        let (mut tested, mut flagged) = (0, 0);
+        for _ in 0..(if cfg!(debug_assertions) { 20_000 } else { 200_000 }) {
+            let w = rnd();
+            let Inst::Alu(i) = decode(w) else { continue };
+            let pre = Pre::new(&Inst::Alu(i));
+            if !pre.fast { continue; }
+            tested += 1;
+            if pre.flags { flagged += 1; }
+            let mut t = Thread::new(0x1000, 0x2000, false);
+            let mut val = |r: u64| -> u32 { match r % 4 { 0 => SPECIAL[(r >> 8) as usize % SPECIAL.len()], 1 => (r >> 16) as u32 & 0x3f, _ => (r >> 20) as u32 } };
+            for k in 0..64 { for l in 0..LANES { t.rf[k][l] = val(rnd()); } }
+            for k in 0..6 { for l in 0..LANES { t.acc[k][l] = val(rnd()); } }
+            if matches!(i.add.op, AddOp::Stvpmv | AddOp::Stvpmd | AddOp::Stvpmp) {
+                // VPM row addresses within reach (the VPM grows to the rows written)
+                for r in t.rf.iter_mut().chain(t.acc.iter_mut()) { for x in r.iter_mut() { *x &= 15; } }
+            }
+            t.fa = rnd() as u16; t.fb = rnd() as u16;
+            t.vpm = (0..8).map(|_| { let mut r = [0; LANES]; for l in 0..LANES { r[l] = rnd() as u32; } r }).collect();
+            t.vpm_out_base = 2;
+            t.tmu_out.extend([[1; LANES], [2; LANES]]);
+            t.unifa = 0x3000;
+            let mut u = t.clone();
+            let (mut e1, mut e2) = (Rec::default(), Rec::default());
+            let b1 = t.exec_fast(&i, &pre, &mut e1);
+            let b2 = u.alu(&i, &mut e2);
+            let what = format!("{w:#018x}: {:?}/{:?} sig {:?}", i.add, i.mul, i.sig);
+            assert_eq!(b1, b2, "barrier {what}");
+            assert_eq!((t.fa, t.fb), (u.fa, u.fb), "flags {what}");
+            // Equal, up to the sign and payload of NaNs: the compiler may commute a float addition
+            // (fadd(-NaN, +NaN)) differently in the two paths' loops.
+            let same = |x: u32, y: u32| canon(&[x; LANES])[0] == canon(&[y; LANES])[0];
+            let regs_same = (0..64).all(|k| (0..LANES).all(|l| same(t.rf[k][l], u.rf[k][l])))
+                && (0..6).all(|k| (0..LANES).all(|l| same(t.acc[k][l], u.acc[k][l])));
+            if !regs_same {
+                for k in 0..64 { if t.rf[k] != u.rf[k] { eprintln!("rf{k}: fast {:x?}\n      general {:x?}", t.rf[k], u.rf[k]); } }
+                for k in 0..6 { if t.acc[k] != u.acc[k] { eprintln!("r{k}: fast {:x?}\n      general {:x?}", t.acc[k], u.acc[k]); } }
+                panic!("registers {what}");
+            }
+            assert_eq!((t.unif, t.unifa, &t.tmu_cfg, t.vpm == u.vpm, &t.tmu_out), (u.unif, u.unifa, &u.tmu_cfg, true, &u.tmu_out), "state {what}");
+            assert_eq!(t.delayed_next.iter().map(|d| (d.0, canon(&d.1))).collect::<Vec<_>>(), u.delayed_next.iter().map(|d| (d.0, canon(&d.1))).collect::<Vec<_>>(), "delayed {what}");
+            assert_eq!(e1.log, e2.log, "GPU accesses {what}");
+        }
+        assert!(tested > 5_000 && flagged > 500, "{tested} fast instructions, {flagged} with flags");
     }
 
     /// A taken branch runs all three delay slots, then continues at the target (Mesa 25.2

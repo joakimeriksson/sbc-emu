@@ -202,6 +202,92 @@ glmark2-es2-drm at 1024×768 (5 s per scene, from the browser demo snapshot, App
 every worker. Terrain and refract also bin a lot of geometry, and the binning after the
 coordinate shader is still serial.
 
+### QPU fast path
+
+Profiling glmark2 on one render thread (`samply`, November 2026) showed where the time of a
+render job went before this change. In `shading:shading=phong`, 69% of the GPU's host time was
+the QPU interpreter (52% fragment shaders, 17% vertex and coordinate shaders), 14% binning,
+7% rasterization, 5% tile loads and stores, 4% TLB writes and blending, under 1% texturing.
+In `jellyfish`, 46% was the TMU (texture fetch and filtering), 31% the QPU interpreter, 10% TLB
+writes and blending, 10% rasterization. Within the interpreter, little more than a third was
+the lane arithmetic itself; the rest was overhead per instruction:
+
+- the decoded `Inst` (about 50 bytes of fields) was copied out of the instruction cache and
+  spilled field by field in the large loop function, on every instruction (21% of interpreter
+  time in Phong);
+- an add-ALU `nop` (a third of all instructions) was not in the lane-parallel fast path, so it
+  ran the general path's per-lane loop, with a `match` on the op and flag computation per lane;
+  so did every instruction that pushed or updated flags;
+- each operand was copied (64 bytes each) through a mux decode, every result went through the
+  general register-write function, and delayed writes were kept in a vector scanned with
+  `remove`.
+
+Glmark2's shaders are almost entirely plain ALU work: 73% of the Phong scene's instructions have
+no flag updates, conditions, packing, magic-register writes or signals other than uniform loads
+and small immediates, and branches and multiply sequences are rare.
+
+So the instruction cache (`Code`) now keeps a pre-decoded form of each instruction next to the
+decoded one, made once when the instruction is first fetched (`qpu::Pre`): its operand sources
+resolved to a register, accumulator or the small immediate, its destinations resolved to a plain
+register or accumulator write where possible, which signals it has, and whether the fast path
+runs it. `Thread::exec_fast` runs instructions whose add and mul ops are among the lane-parallel
+ones (float and integer arithmetic, conversions, SFU ops, moves, VPM loads and stores, the
+no-ops, and `fcmp`), including flag pushes and updates (computed with one loop per op over the
+16 lanes), conditions, packing and every signal except rotation; it reads operands in place,
+writes plain registers directly, and uses the general path's code for magic registers and
+signals, in the same order. Everything else (branches, `multop`/`umul24`, `setmsf`, the
+lane-dependent ops such as `fdx`, rotates) stays on the general path. Delayed writes (the C
+coefficient of `ldvary`, SFU results through the magic registers) all have a latency of one
+instruction, so they are now a list for "the end of this instruction" and one for "the end of
+the next".
+
+This is portable Rust: the WebAssembly build runs the same code. `SBC_V3D_QPU_FAST=0` sends every
+instruction to the general path. A unit test (`fast_path_matches_general_path`) runs random
+instruction words that the fast path takes on random register contents (denormals, NaNs,
+infinities, signed zeros, integers), through both paths, and compares registers, flags, VPM,
+uniform pointers, TMU and TLB accesses; the two can only differ in the sign or payload of a NaN
+(the compiler may commute a float addition differently in the two loops).
+
+**Check:** the GL scenes give byte-identical images to the interpreter before the change, on 1
+and 16 threads, and so do the scenes under the Ubuntu snap's Mesa (`tests/gpu/run-snap-mesa.sh`).
+`atlas_pbo` fails as before.
+
+glmark2-es2-drm at 1024×768 from the browser demo snapshot, one render thread
+(`SBC_V3D_THREADS=1`), Apple M5 Max; host time per render job and glmark2's frame rate
+(guest time), before and after (median of runs alternated between the two builds):
+
+| Scene | render job, before | after | change | frame time, before | after |
+|---|---|---|---|---|---|
+| build | 13.7 ms | 11.6 ms | −15% | 13.7 ms | 11.6 ms |
+| texture (linear) | 26.0 ms | 22.5 ms | −13% | 26.0 ms | 22.6 ms |
+| shading (phong) | 52.9 ms | 36.4 ms | −31% | 53.1 ms | 36.6 ms |
+| effect2d (3×3 kernel) | 61.5 ms | 53.2 ms | −13% | 61.6 ms | 53.3 ms |
+| jellyfish | 216.0 ms | 188.1 ms | −13% | 216.3 ms | 188.6 ms |
+| terrain | 422.0 ms | 373.1 ms | −12% | 1112.9 ms | 1017.5 ms |
+| conditionals (`fragment-steps=5:vertex-steps=0`) | 59.8 ms | 36.4 ms | −39% | 60.0 ms | 36.5 ms |
+| loop (`fragment-steps=5:fragment-uniform=true:vertex-steps=5`) | 59.5 ms | 36.1 ms | −39% | 59.7 ms | 36.2 ms |
+| desktop (shadow) | 103.5 ms | 95.3 ms | −8% | 234.3 ms | 215.3 ms |
+| refract | 255.5 ms | 212.0 ms | −17% | 477.8 ms | 458.8 ms |
+
+(Terrain, desktop and refract render more than one job per frame; their bin jobs fell by about
+as much as their render jobs, since the coordinate shaders run on the same fast path.)
+
+The QPU part of a Phong frame fell from about 43 ms to 23 ms (fragment shaders 33 to 18 ms,
+vertex and coordinate shaders 10 to 6 ms); in jellyfish the fragment shaders fell from 68 to
+44 ms per frame while texturing stayed at about 100 ms.
+
+**Where the time goes now** (Phong, one thread): QPU fragment shaders 41%, binning and vertex
+setup outside the shaders 20% (allocation per batch of 16 vertices and per vertex output, and
+the clipping arithmetic), vertex and coordinate shaders 13%, rasterization 11%, tile loads and
+stores 8%, TLB writes and blending 5%. Jellyfish: TMU 51%, fragment shaders 22%, TLB writes and
+blending 13%, rasterization 11%. Within the fast path, about half of the time is now the lane
+arithmetic; the rest is dispatch (the op `match`, operand and destination selection, signal
+handling, the per-instruction bookkeeping of thread switches, branches and delayed writes).
+A native code generator (AArch64, with each 16-lane register as four NEON q-registers) could
+remove most of that and keep values in registers across instructions: it would roughly halve
+the QPU time again in ALU-bound scenes (perhaps 20–25% of a Phong frame), much less in
+texture-bound ones, where the TMU is the next target.
+
 ## In the browser
 
 `web/index.html` runs the 3D demos in the WebAssembly build: it restores a snapshot of Raspberry
@@ -253,5 +339,7 @@ filtering instead.
   equations, depth and stencil, early Z, fragment shader address) and per distinct tile store
   format: what an application asks of the GPU, without tracing every draw.
 - `SBC_GPU_TIME=X`: scale the guest time GPU jobs take (default 1: their host time; 0: instant).
+- `SBC_V3D_QPU_FAST=0`: run every QPU instruction on the interpreter's general path instead of
+  the pre-decoded fast path (see [QPU fast path](#qpu-fast-path)); the images are the same.
 - `SBC_V3D_THREADS=N`: host threads for rendering (1: everything on one thread, as before
   [parallel rendering](#parallel-rendering); useful to tell a threading problem from another).
