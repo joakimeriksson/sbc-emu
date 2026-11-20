@@ -53,6 +53,7 @@ fn execute(args:&[String])->Result<(),String> {
     let multi=match arg(args,"--threads") { None|Some("single")=>false, Some("multi")=>true, Some(_)=>return Err("--threads single|multi".into()) };
     let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
     // HDMI: the firmware's framebuffer at the monitor's preferred mode, unless --no-display
+    if arg(args,"--hdmi-mode").is_some() && args.iter().any(|a|a=="--no-display") {return Err("--hdmi-mode and --no-display contradict each other".into());}
     let hdmi=match arg(args,"--hdmi-mode") {
         Some(spec)=>{
             let (w,h)=spec.split_once('x').ok_or("--hdmi-mode WxH")?;

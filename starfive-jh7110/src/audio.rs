@@ -72,13 +72,8 @@ impl Chan {
 #[derive(Default)]
 pub struct Pwmdac {
     ctrl: u32,
-    /// samples received (frames)
-    pub frames: u64,
-    /// keep what is played (16-bit stereo, interleaved) for the host
-    pub capture: bool,
-    pub samples: Vec<i16>,
-    /// the rate of the samples kept
-    pub rate: u32,
+    /// what it plays, kept for the host
+    pub capture: Capture,
 }
 
 impl Pwmdac {
@@ -94,26 +89,167 @@ impl Pwmdac {
         }
     }
 
-    fn enabled(&self) -> bool {
+    pub fn enabled(&self) -> bool {
         self.ctrl & 1 != 0
     }
 
 
     /// Samples into the DAC: `width` 4 = 16-bit stereo frames, 2 = 16-bit mono.
     fn play(&mut self, data: &[u8], width: u64, rate: u32) {
+        self.capture.push(data, width, rate);
+    }
+}
+
+/// The audio devices DMA transfers are paced by, with their current sample rates.
+pub struct Sinks<'a> {
+    pub dac: &'a mut Pwmdac,
+    pub dac_rate: u32,
+    pub i2s: &'a mut I2s,
+    pub i2s_rate: u32,
+}
+
+impl Sinks<'_> {
+    fn accepts(&self, addr: u64) -> bool {
+        (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&addr) || addr == I2S0_BASE + I2S_TXDMA
+    }
+    fn running(&self, addr: u64) -> bool {
+        if addr == I2S0_BASE + I2S_TXDMA { self.i2s.running() } else { self.dac.enabled() }
+    }
+    /// DMA items per second for a device: the DAC takes one frame per item; the I2S's frame
+    /// is one 32-bit word (16-bit samples) or two (longer samples), however many fit in an
+    /// item.
+    fn rate(&self, addr: u64, width: u64) -> u32 {
+        if addr == I2S0_BASE + I2S_TXDMA {
+            let frame_bytes = if self.i2s.word_bits() <= 16 { 4 } else { 8 };
+            (self.i2s_rate as u64 * frame_bytes / width.clamp(1, 8)).max(1) as u32
+        } else {
+            self.dac_rate
+        }
+    }
+    fn play(&mut self, addr: u64, data: &[u8], width: u64) {
+        if addr == I2S0_BASE + I2S_TXDMA {
+            let bits = self.i2s.word_bits();
+            self.i2s.capture.push_slots(data, bits, self.i2s_rate);
+        } else {
+            self.dac.play(data, width, self.dac_rate);
+        }
+    }
+}
+
+/// Samples kept for the host (16-bit stereo, interleaved). Recording runs only while `on`.
+#[derive(Default)]
+pub struct Capture {
+    pub on: bool,
+    pub samples: Vec<i16>,
+    pub rate: u32,
+    pub frames: u64,
+}
+
+impl Capture {
+    /// The PWM DAC's samples: `width` 4 is a 16-bit stereo frame, 2 a 16-bit mono sample.
+    fn push(&mut self, data: &[u8], width: u64, rate: u32) {
         self.frames += data.len() as u64 / width.max(1);
-        if !self.capture {
+        if !self.on {
             return;
         }
         self.rate = rate;
-        let pcm = data.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]));
-        if width >= 4 {
-            self.samples.extend(pcm);
-        } else {
-            // mono: the same sample on both channels
-            self.samples.extend(pcm.flat_map(|s| [s, s]));
+        match width {
+            4 => self.samples.extend(data.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]]))),
+            _ => self.samples.extend(data.as_chunks::<2>().0.iter().flat_map(|b| {
+                let v = i16::from_le_bytes([b[0], b[1]]);
+                [v, v]
+            })),
         }
     }
+
+    /// What the I2S transmitter's TX FIFO takes, in 32-bit words: with a word length of 16
+    /// bits or less, one word is a stereo frame (left in the low half, right in the high
+    /// half); with longer words, one word is a channel slot (left, right, ...) holding the
+    /// sample in its low `bits` bits. Kept as 16-bit samples.
+    fn push_slots(&mut self, data: &[u8], bits: u32, rate: u32) {
+        let words = data.as_chunks::<4>().0;
+        let packed = bits <= 16;
+        self.frames += if packed { words.len() as u64 } else { words.len() as u64 / 2 };
+        if !self.on {
+            return;
+        }
+        self.rate = rate;
+        if packed {
+            self.samples.extend(words.iter().flat_map(|b| [i16::from_le_bytes([b[0], b[1]]), i16::from_le_bytes([b[2], b[3]])]));
+        } else {
+            let bits = bits.min(32);
+            self.samples.extend(words.iter().map(|b| ((u32::from_le_bytes(*b) << (32 - bits)) >> 16) as i16));
+        }
+    }
+}
+
+pub const I2S0_BASE: u64 = 0x120b_0000;
+pub const I2S_SIZE: u64 = 0x1000;
+const I2S_TXDMA: u64 = 0x1c8;
+
+/// The JH7110's I2STX_4CH0 (`snps,designware-i2s`), the HDMI audio path in StarFive's 5.15
+/// kernel: the DesignWare I2S transmitter's registers and its TX DMA port; what it
+/// sends goes to the capture.
+pub struct I2s {
+    regs: Vec<u32>,
+    pub capture: Capture,
+}
+
+impl Default for I2s {
+    fn default() -> Self {
+        I2s { regs: vec![0; 0x200 / 4], capture: Capture::default() }
+    }
+}
+
+impl I2s {
+    pub fn read(&self, off: u64) -> u32 {
+        match off {
+            // TX enabled, master, 4 channels, 32-bit words, 16-deep FIFO, 32-bit APB
+            0x1f4 => (5 << 16) | (1 << 9) | (1 << 5) | (1 << 4) | (3 << 2) | 2,
+            0x1f0 => 0,
+            0x1f8 => 0x3130_302a,
+            0x1fc => 0x4457_01a0,
+            // ISR: the TX FIFO is always empty
+            o if (0x20..0x120).contains(&o) && (o - 0x20) % 0x40 == 0x18 => 1 << 4,
+            _ => self.regs.get((off / 4) as usize).copied().unwrap_or(0),
+        }
+    }
+
+    pub fn write(&mut self, off: u64, v: u32, rate: u32) {
+        match off {
+            I2S_TXDMA => {
+                let bits = self.word_bits();
+                self.capture.push_slots(&v.to_le_bytes(), bits, rate)
+            }
+            _ => {
+                if let Some(r) = self.regs.get_mut((off / 4) as usize) {
+                    *r = v;
+                }
+            }
+        }
+    }
+
+    /// Enabled with the transmitter on (IER and ITER).
+    fn running(&self) -> bool {
+        self.regs[0] & 1 != 0 && self.regs[2] & 1 != 0
+    }
+
+    /// Word length of channel 0 (TCR WLEN: 0 ignore, 1 12, 2 16, 3 20, 4 24, 5 32 bits).
+    pub fn word_bits(&self) -> u32 {
+        match self.regs[(0x34 / 4) as usize] & 7 {
+            1 => 12,
+            3 => 20,
+            4 => 24,
+            5 => 32,
+            _ => 16,
+        }
+    }
+}
+
+/// The standard rate nearest `raw` Hz.
+pub fn snap_rate(raw: u64) -> u32 {
+    const RATES: [u32; 7] = [8000, 11025, 16000, 22050, 32000, 44100, 48000];
+    RATES.into_iter().min_by_key(|&r| (r as i64 - raw as i64).abs()).unwrap()
 }
 
 #[derive(Default)]
@@ -130,9 +266,7 @@ pub struct AxiDmac {
 /// snapped to the nearest standard rate.
 pub fn sample_rate(pll2_hz: u64, audio_root_div: u32, pwmdac_div: u32, cnt_n: u32) -> u32 {
     let core = pll2_hz / audio_root_div.max(1) as u64 / pwmdac_div.max(1) as u64;
-    let raw = core / (256 * cnt_n.max(1) as u64);
-    const RATES: [u32; 7] = [8000, 11025, 16000, 22050, 32000, 44100, 48000];
-    RATES.into_iter().min_by_key(|&r| (r as i64 - raw as i64).abs()).unwrap()
+    snap_rate(core / (256 * cnt_n.max(1) as u64))
 }
 
 impl AxiDmac {
@@ -161,7 +295,7 @@ impl AxiDmac {
         }
     }
 
-    pub fn write(&mut self, off: u64, v: u32, ram: &mut [u8], ram_base: u64, dac: &mut Pwmdac, rate: u32) {
+    pub fn write(&mut self, off: u64, v: u32, ram: &mut [u8], ram_base: u64, sinks: &mut Sinks) {
         match off {
             DMAC_CFG => self.cfg = v,
             DMAC_CHEN => {
@@ -171,7 +305,7 @@ impl AxiDmac {
                         if on && !self.ch[k].enabled {
                             self.ch[k].enabled = true;
                             self.fetch(k, ram, ram_base);
-                            self.run_now(k, ram, ram_base, dac, rate);
+                            self.run_now(k, ram, ram_base, sinks);
                         } else if !on {
                             self.ch[k].enabled = false;
                             self.ch[k].block = None;
@@ -230,14 +364,11 @@ impl AxiDmac {
         c.block = Some(Block { sar, dar, items: block_ts + 1, done: 0, width, last: ctl_hi & LLI_LAST != 0, next });
     }
 
-    fn to_dac(b: &Block) -> bool {
-        (PWMDAC_BASE..PWMDAC_BASE + PWMDAC_SIZE).contains(&b.dar)
-    }
 
     /// Memory-to-memory blocks complete as soon as the channel starts.
-    fn run_now(&mut self, k: usize, ram: &mut [u8], ram_base: u64, dac: &mut Pwmdac, rate: u32) {
+    fn run_now(&mut self, k: usize, ram: &mut [u8], ram_base: u64, sinks: &mut Sinks) {
         while let Some(b) = self.ch[k].block {
-            if Self::to_dac(&b) {
+            if sinks.accepts(b.dar) {
                 return;
             }
             let n = (b.items * b.width) as usize;
@@ -245,11 +376,11 @@ impl AxiDmac {
             if s.checked_add(n).is_some_and(|e| e <= ram.len()) && d.checked_add(n).is_some_and(|e| e <= ram.len()) {
                 ram.copy_within(s..s + n, d);
             }
-            self.finish_block(k, ram, ram_base, dac, rate);
+            self.finish_block(k, ram, ram_base, sinks);
         }
     }
 
-    fn finish_block(&mut self, k: usize, ram: &mut [u8], ram_base: u64, dac: &mut Pwmdac, rate: u32) {
+    fn finish_block(&mut self, k: usize, ram: &mut [u8], ram_base: u64, sinks: &mut Sinks) {
         let Some(b) = self.ch[k].block.take() else { return };
         self.transfers += 1;
         self.ch[k].regs[(CH_LLP / 8) as usize] = b.next;
@@ -259,21 +390,22 @@ impl AxiDmac {
             self.raise(k, IRQ_DMA_TRF);
         } else {
             self.fetch(k, ram, ram_base);
-            self.run_now(k, ram, ram_base, dac, rate);
+            self.run_now(k, ram, ram_base, sinks);
         }
     }
 
     /// Move the samples due by `now` (ns) into the DAC. Returns the next deadline while
     /// a transfer to the DAC runs.
-    pub fn update(&mut self, now: u64, ram: &mut [u8], ram_base: u64, dac: &mut Pwmdac, rate: u32) -> Option<u64> {
+    pub fn update(&mut self, now: u64, ram: &mut [u8], ram_base: u64, sinks: &mut Sinks) -> Option<u64> {
         let elapsed = now.saturating_sub(self.last);
         self.last = now;
         let mut next = None;
         for k in 0..NCH {
             let Some(b) = self.ch[k].block else { continue };
-            if !self.ch[k].enabled || !Self::to_dac(&b) || !dac.enabled() {
+            if !self.ch[k].enabled || !sinks.accepts(b.dar) || !sinks.running(b.dar) {
                 continue;
             }
+            let rate = sinks.rate(b.dar, b.width);
             let c = &mut self.ch[k];
             c.owed += elapsed * rate as u64;
             let due = c.owed / 1_000_000_000;
@@ -284,12 +416,12 @@ impl AxiDmac {
                 let len = (n * b.width) as usize;
                 if let Some(data) = ram.get(s..s + len) {
                     let data = data.to_vec();
-                    dac.play(&data, b.width, rate);
+                    sinks.play(b.dar, &data, b.width);
                 }
                 self.ch[k].block.as_mut().unwrap().done += n;
             }
             if self.ch[k].block.is_some_and(|b| b.done >= b.items) {
-                self.finish_block(k, ram, ram_base, dac, rate);
+                self.finish_block(k, ram, ram_base, sinks);
             }
             if let Some(b) = self.ch[k].block.filter(|_| self.ch[k].enabled) {
                 let left = b.items - b.done;
@@ -303,6 +435,20 @@ impl AxiDmac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i2s_frames_by_word_length() {
+        let mut c = Capture { on: true, ..Capture::default() };
+        // 16-bit words: one 32-bit word per stereo frame (left low, right high)
+        c.push_slots(&[0x34, 0x12, 0x78, 0x56], 16, 48000);
+        assert_eq!(c.samples, vec![0x1234, 0x5678]);
+        assert_eq!(c.frames, 1);
+        // 24-bit words: one slot per channel, the sample in the low 24 bits
+        c.samples.clear();
+        c.push_slots(&[0x00, 0x34, 0x12, 0x00, 0x00, 0x78, 0x56, 0x00], 24, 48000);
+        assert_eq!(c.samples, vec![0x1234, 0x5678]);
+        assert_eq!(c.frames, 2);
+    }
 
     const BASE: u64 = 0x4000_0000;
 
@@ -328,31 +474,32 @@ mod tests {
         let mut ram = vec![0u8; 0x10000];
         let mut dac = Pwmdac::default();
         dac.write(4, 1 | (1 << 4), 48000);
+        let mut i2s = I2s::default();
         let mut d = AxiDmac::default();
         // two 480-frame periods, each block marked last, chained in a ring
         lli(&mut ram, BASE + 0x100, BASE + 0x1000, PWMDAC_BASE, 480, BASE + 0x140, true);
         lli(&mut ram, BASE + 0x140, BASE + 0x1000 + 1920, PWMDAC_BASE, 480, BASE + 0x100, true);
         let ch0 = 0x100;
-        d.write(DMAC_CFG, 3, &mut ram, BASE, &mut dac, 48000);
-        d.write(ch0 + CH_LLP, (BASE + 0x100) as u32, &mut ram, BASE, &mut dac, 48000);
-        d.write(ch0 + CH_LLP + 4, 0, &mut ram, BASE, &mut dac, 48000);
-        d.write(ch0 + CH_INTSIGNAL_ENA, IRQ_DMA_TRF, &mut ram, BASE, &mut dac, 48000);
-        d.write(DMAC_CHEN, 0x101, &mut ram, BASE, &mut dac, 48000);
+        d.write(DMAC_CFG, 3, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        d.write(ch0 + CH_LLP, (BASE + 0x100) as u32, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        d.write(ch0 + CH_LLP + 4, 0, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        d.write(ch0 + CH_INTSIGNAL_ENA, IRQ_DMA_TRF, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        d.write(DMAC_CHEN, 0x101, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
         assert_eq!(d.read(DMAC_CHEN) & 1, 1);
         // 5 ms: 240 frames, half a period
-        assert!(d.update(5_000_000, &mut ram, BASE, &mut dac, 48000).is_some());
-        assert_eq!(dac.frames, 240);
+        assert!(d.update(5_000_000, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 }).is_some());
+        assert_eq!(dac.capture.frames, 240);
         assert!(!d.irq());
         // 10 ms: the first period is done; the channel stopped with DMA_TRF
-        d.update(10_000_000, &mut ram, BASE, &mut dac, 48000);
-        assert_eq!(dac.frames, 480);
+        d.update(10_000_000, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        assert_eq!(dac.capture.frames, 480);
         assert!(d.irq());
         assert_eq!(d.read(DMAC_CHEN) & 1, 0);
         assert_eq!(d.read(ch0 + CH_LLP) as u64, BASE + 0x140);
         // the driver acknowledges and re-enables: the second period follows
-        d.write(ch0 + CH_INTCLEAR, !0, &mut ram, BASE, &mut dac, 48000);
-        d.write(DMAC_CHEN, 0x101, &mut ram, BASE, &mut dac, 48000);
-        d.update(20_000_000, &mut ram, BASE, &mut dac, 48000);
-        assert_eq!(dac.frames, 960);
+        d.write(ch0 + CH_INTCLEAR, !0, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        d.write(DMAC_CHEN, 0x101, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        d.update(20_000_000, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        assert_eq!(dac.capture.frames, 960);
     }
 }

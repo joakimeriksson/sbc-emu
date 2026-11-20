@@ -8,8 +8,8 @@
 //! Registers: CAP (64 queue entries, 4 KiB pages, NVM command set), VS, CC/CSTS (enable and
 //! shutdown complete at once), AQA/ASQ/ACQ and the doorbells (stride 4). Commands run when
 //! their submission queue's tail doorbell is written; each completion is posted to the
-//! queue's completion queue with its phase tag, and a completion queue with interrupts
-//! enabled asks for an MSI. Data moves through PRP1/PRP2 and PRP lists.
+//! queue's completion queue with its phase tag; a completion queue with interrupts enabled
+//! holds INTx high until the host consumes its entries. Data moves through PRP1/PRP2 and PRP lists.
 //! Admin: Identify (controller, namespace, active namespace list, descriptors), Create/Delete
 //! I/O SQ and CQ, Get/Set Features (number of queues and the rest stored), Get Log Page
 //! (zeroes), Asynchronous Event Request (held), Abort. I/O: Read, Write, Flush, Write
@@ -68,7 +68,8 @@ fn rd(ram: &[u8], base: u64, a: u64, n: usize) -> Option<&[u8]> {
 
 fn wr(ram: &mut [u8], base: u64, a: u64, data: &[u8]) -> bool {
     let Some(o) = a.checked_sub(base).map(|o| o as usize) else { return false };
-    match ram.get_mut(o..o + data.len()) {
+    let Some(end) = o.checked_add(data.len()) else { return false };
+    match ram.get_mut(o..end) {
         Some(d) => {
             d.copy_from_slice(data);
             true
@@ -234,9 +235,10 @@ impl Nvme {
             out.push((prp2, left));
             return Some(out);
         }
-        // PRP list (possibly chained through its last entry)
+        // PRP list (possibly chained through its last entry); a list page that makes no
+        // progress (one entry, the chain pointer) can loop forever, so bound the list pages
         let mut list = prp2;
-        loop {
+        for _ in 0..=len / PAGE as usize + 1 {
             let entries = ((PAGE - (list & (PAGE - 1))) / 8) as usize;
             for k in 0..entries {
                 let e = le64(rd(ram, base, list + 8 * k as u64, 8)?, 0);
@@ -252,6 +254,7 @@ impl Nvme {
                 }
             }
         }
+        None
     }
 
     fn to_guest(&self, cmd: &[u8], data: &[u8], ram: &mut [u8], base: u64) -> bool {
@@ -356,24 +359,30 @@ impl Nvme {
             }
             0x01 => {
                 let (qid, size, cqid) = ((cdw10 & 0xffff) as usize, (cdw10 >> 16) + 1, (cdw11 >> 16) as usize);
-                if qid == 0 || qid >= MAX_QUEUES || cqid >= MAX_QUEUES || !self.cq[cqid].live {
-                    return Some((0x101, 0));
+                if qid == 0 || qid >= MAX_QUEUES {
+                    return Some((0x101, 0)); // invalid queue identifier
+                }
+                if cqid == 0 || cqid >= MAX_QUEUES || !self.cq[cqid].live {
+                    return Some((0x100, 0)); // completion queue invalid
                 }
                 self.sq[qid] = Sq { base: le64(cmd, 24) & !0xfff, size, head: 0, tail: 0, cq: cqid, live: true };
                 (0, 0)
             }
-            0x00 => {
-                if let Some(s) = self.sq.get_mut((cdw10 & 0xffff) as usize) {
+            // delete I/O SQ / CQ (the admin queues, 0, are not I/O queues)
+            0x00 => match self.sq.get_mut((cdw10 & 0xffff) as usize) {
+                Some(s) if cdw10 & 0xffff != 0 => {
                     s.live = false;
+                    (0, 0)
                 }
-                (0, 0)
-            }
-            0x04 => {
-                if let Some(c) = self.cq.get_mut((cdw10 & 0xffff) as usize) {
+                _ => return Some((0x101, 0)),
+            },
+            0x04 => match self.cq.get_mut((cdw10 & 0xffff) as usize) {
+                Some(c) if cdw10 & 0xffff != 0 => {
                     c.live = false;
+                    (0, 0)
                 }
-                (0, 0)
-            }
+                _ => return Some((0x101, 0)),
+            },
             0x09 => {
                 let fid = cdw10 as u8;
                 if fid == 7 {

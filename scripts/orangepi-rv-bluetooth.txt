@@ -1,0 +1,16 @@
+# Orange Pi RV Bluetooth on Xunlong's kernel: the AP6256's BCM4345C5 as an HCI controller on
+# UART1 (H4). Xunlong's DT has no serdev node, so user space attaches it: hciattach, then
+# the HCI core initialises it; an LE scan finds the virtual peripheral "sbc-emu sensor".
+# Needs the initramfs from scripts/orangepi-rv-vendor-kernel.sh (bluetooth, hci_uart, BlueZ).
+wait-serial orangepi-rv#
+serial hciattach -s 115200 /dev/ttyS1 any 115200 noflow && echo BT_""ATTACHED\n
+wait-serial BT_ATTACHED
+serial sleep 1; hciconfig hci0 up; hciconfig hci0 | grep -E 'BD Address|UP RUNNING'\n
+wait-serial UP RUNNING
+serial hciconfig hci0 name | grep Name\n
+wait-serial BCM4345C5
+serial timeout 3 hcitool lescan 2>&1 | sort -u | head -4\n
+wait-serial sbc-emu sensor
+serial echo BT_""DONE\n
+wait-serial BT_DONE
+quit

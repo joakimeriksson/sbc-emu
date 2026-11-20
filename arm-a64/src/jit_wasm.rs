@@ -696,9 +696,9 @@ fn wasm_ldst(w: &mut W, i: u32, pc: u64, verify: bool) -> bool {
     w.lset(L_B);
     // tag check and page-crossing check -> i32 condition
     let k = if load { 1 } else { 2 };
-    // L_ST = &utlb[k][(va >> 12) % UT] - cpu offset (an i32 address)
+    // L_ST = &utlb[k][uti(va)] - cpu offset (an i32 address)
     let ent = w.off_utlb + (16 * UT * k) as u32;
-    w.lget(L_CPU); w.lget(L_B); w.i64c(12); w.op(0x88); w.op(0xa7); w.i32c(UT as i32 - 1); w.op(0x71); w.i32c(4); w.op(0x74); w.op(0x6a); w.lset(L_ST);
+    w.lget(L_CPU); w.lget(L_B); w.lget(L_B); w.i64c(8); w.op(0x88); w.op(0x85); w.i64c(12); w.op(0x88); w.op(0xa7); w.i32c(UT as i32 / 2 - 1); w.op(0x71); w.i32c(5); w.op(0x74); w.op(0x6a); w.lset(L_ST); // way 0 of the set
     w.lget(L_B); w.i64c(12); w.op(0x88); w.i64c(1); w.op(0x7c); w.i64c(((w.el as u64) << 60) as i64); w.op(0x84);
     w.lget(L_ST); w.op(0x29); uleb(&mut w.c, 3); uleb(&mut w.c, ent as u64); w.op(0x51); // eq
     w.lget(L_B); w.i64c(0xfff); w.op(0x83); w.i64c(span as i64 - 1); w.op(0x7c); w.i64c(12); w.op(0x88); w.op(0x50); // no crossing

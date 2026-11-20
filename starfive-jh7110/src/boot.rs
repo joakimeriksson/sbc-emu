@@ -4,7 +4,7 @@
 //! adjusted as U-Boot adjusts it (`/chosen` command line and initrd, `/memory`). Load
 //! addresses are U-Boot's `starfive_visionfive2` defaults (`kernel_addr_r`, `fdt_addr_r`,
 //! `ramdisk_addr_r`).
-use crate::machine::{HartState, Machine, RAM_BASE};
+use crate::machine::{HartState, Machine, RAM_BASE, SRAM_BASE, SRAM_SIZE};
 use emu_core::fdt::Node;
 
 pub const OPENSBI_ADDR: u64 = 0x4000_0000;
@@ -82,7 +82,44 @@ pub fn prepare_device_tree(stock: &[u8], ram_bytes: u64, cmdline: &str, initrd: 
         fb.set_str("format", "x8r8g8b8");
         fb.set_str("status", "okay");
     }
+    add_gpu_node(&mut root);
     Ok(root.to_blob())
+}
+
+/// The PowerVR BXE-4-32 GPU's registers and interrupt.
+pub const GPU_BASE: u64 = 0x1800_0000;
+pub const IRQ_GPU: u32 = 82;
+
+/// Mainline's JH7110 device tree has no GPU node yet, so the firmware adds one from the
+/// board's resources, as mainline's `img,img-rogue` binding describes it. Xunlong's tree has
+/// its own node, for its vendor driver.
+fn add_gpu_node(root: &mut Node) {
+    let Some(soc) = root.children.iter_mut().find(|c| c.name == "soc") else { return };
+    if soc.children.iter().any(|c| c.name.starts_with("gpu@")) {
+        return;
+    }
+    let phandle = |prefix: &str| {
+        soc.children
+            .iter()
+            .find(|c| c.name.starts_with(prefix))
+            .and_then(|c| c.prop("phandle"))
+            .and_then(|p| p.get(..4))
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let (Some(syscrg), Some(pmu)) = (phandle("clock-controller@13020000"), phandle("power-controller@17030000")) else {
+        return;
+    };
+    let gpu = soc.child_mut(&format!("gpu@{GPU_BASE:x}"));
+    gpu.set("compatible", b"starfive,jh7110-gpu\0img,img-bxe-4-32\0img,img-rogue\0".to_vec());
+    gpu.set_cells("reg", &[0, GPU_BASE as u32, 0, 0x10_0000]);
+    // JH7110_SYSCLK_GPU_CORE_CLK, _NOC_BUS_GPU_AXI, _GPU_SYS_CLK
+    gpu.set_cells("clocks", &[syscrg, 46, syscrg, 50, syscrg, 47]);
+    gpu.set("clock-names", b"core\0mem\0sys\0".to_vec());
+    gpu.set_cells("interrupts", &[IRQ_GPU]);
+    // JH7110_PD_GPUA; JH7110_SYSRST_GPU_DOMA
+    gpu.set_cells("power-domains", &[pmu, 2]);
+    gpu.set_cells("resets", &[syscrg, 22]);
+    gpu.set_str("status", "okay");
 }
 
 /// The largest phandle in the tree.
@@ -134,4 +171,210 @@ pub fn boot_linux(m: &mut Machine, opensbi: &[u8], kernel: &[u8], stock_dtb: &[u
         m.state[h] = HartState::Run;
     }
     Ok(dtb)
+}
+
+/// The board's 24C04 EEPROM in StarFive's HAT-style format, which U-Boot reads to tell the
+/// board (`XOPIRV`) and its DRAM size: a header (`SFVF`), the vendor atom with the product
+/// string, and the custom atom with the PCB revision and MAC addresses, each with U-Boot's
+/// CRC-16. The rest reads as erased.
+pub fn board_eeprom(ram_bytes: u64) -> [u8; 512] {
+    let mut e = [0xffu8; 512];
+    // U-Boot knows the board's DRAM sizes only (2, 4, 8 or 16 GiB): the largest that fits
+    let gib = eeprom_ram_gib(ram_bytes);
+    let pstr = format!("XOPIRVA1-2450-D{gib:03X}E000-00000001");
+    let mut out = Vec::new();
+    // header: signature, format version (2, as U-Boot writes it), reserved, number of
+    // atoms, total length
+    out.extend_from_slice(b"SFVF");
+    out.extend_from_slice(&[2, 0]);
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&136u32.to_le_bytes());
+    // atom 1, vendor info: uuid, product id/version, string lengths, vendor and product
+    let mut a1 = Vec::new();
+    a1.extend_from_slice(&[0u8; 16]);
+    a1.extend_from_slice(&0u16.to_le_bytes());
+    a1.extend_from_slice(&0u16.to_le_bytes());
+    a1.extend_from_slice(&[32, 32]);
+    let mut vstr = [0u8; 32];
+    let vendor = b"Shenzhen Xunlong Software Co.";
+    vstr[..vendor.len()].copy_from_slice(vendor);
+    a1.extend_from_slice(&vstr);
+    let mut p = [0u8; 32];
+    p[..pstr.len()].copy_from_slice(pstr.as_bytes());
+    a1.extend_from_slice(&p);
+    // atom 4, custom data: format version, PCB and BOM revision, MAC0/MAC1, Wi-Fi/BT module
+    let mut a4 = Vec::new();
+    a4.extend_from_slice(&2u16.to_le_bytes());
+    a4.extend_from_slice(&[0xa1, b'A']);
+    a4.extend_from_slice(&[0x6c, 0xcf, 0x39, 0x6c, 0xde, 0xad]);
+    a4.extend_from_slice(&[0x6c, 0xcf, 0x39, 0x6c, 0xde, 0xae]);
+    a4.extend_from_slice(&[1, 0]);
+    for (ty, count, data) in [(1u16, 1u16, a1), (4, 2, a4)] {
+        let start = out.len();
+        out.extend_from_slice(&ty.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&((data.len() + 2) as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        let crc = crc16(&out[start..]);
+        out.extend_from_slice(&crc.to_le_bytes());
+    }
+    e[..out.len()].copy_from_slice(&out);
+    e
+}
+
+/// The DRAM size the EEPROM names: U-Boot accepts 2, 4, 8 and 16 GiB.
+pub fn eeprom_ram_gib(ram_bytes: u64) -> u64 {
+    [16, 8, 4, 2].into_iter().find(|&g| ram_bytes >= g << 30).unwrap_or(2)
+}
+
+/// Whether U-Boot can run with this much RAM (it takes the size from the EEPROM).
+pub fn uboot_ram_ok(ram_bytes: u64) -> bool {
+    [2u64, 4, 8, 16].iter().any(|&g| ram_bytes == g << 30)
+}
+
+/// U-Boot's `crc16`: polynomial 0x8005, reflected, initial value 0.
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc ^= b as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xa001 } else { crc >> 1 };
+        }
+    }
+    crc
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// Where the boot ROM looks for SPL on an SD card: at the start of the card, then at the
+/// header's backup offset (2 MiB, the start of the `spl` partition on StarFive's layout).
+const SPL_COPIES: [u64; 2] = [0, 0x20_0000];
+const SPL_VERSION: u32 = 0x0101_0101;
+
+/// The JH7110 boot ROM's SD path. The U74s start in the mask ROM, which reads U-Boot SPL
+/// (`u-boot-spl.bin.normal.out`: a 0x400-byte header with version, size and CRC-32 at
+/// 0x284) from the card, copies it into the L2 LIM and jumps there on every U74.
+pub fn boot_rom(m: &mut Machine) -> Result<(), String> {
+    let disk = m.soc.sdio1.card.disk_mut().ok_or("no SD card: the boot ROM boots from --sd (or give --kernel)")?;
+    let mut found = None;
+    for off in SPL_COPIES {
+        let mut hdr = [0u8; 0x400];
+        if off / 512 + 2 > disk.sectors() {
+            continue;
+        }
+        disk.read(off / 512, &mut hdr);
+        let word = |o: usize| u32::from_le_bytes(hdr[o..o + 4].try_into().unwrap());
+        let (version, size, hdr_size, crc) = (word(0x284), word(0x288) as usize, word(0x28c) as u64, word(0x290));
+        if version != SPL_VERSION || size == 0 || size > SRAM_SIZE || hdr_size % 512 != 0 {
+            continue;
+        }
+        let mut body = vec![0u8; size.div_ceil(512) * 512];
+        if (off + hdr_size) / 512 + body.len() as u64 / 512 > disk.sectors() {
+            continue;
+        }
+        disk.read((off + hdr_size) / 512, &mut body);
+        body.truncate(size);
+        if crc32(&body) == crc {
+            found = Some(body);
+            break;
+        }
+    }
+    let spl = found.ok_or("no valid U-Boot SPL on the SD card (boot ROM header at 0 or 2 MiB)")?;
+    m.soc.sram.mem[..spl.len()].copy_from_slice(&spl);
+    for h in 1..m.harts.len() {
+        m.harts[h].reset(SRAM_BASE);
+        m.harts[h].x[10] = h as u64;
+        m.state[h] = HartState::Run;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_core::disk::MemDisk;
+
+    /// A `u-boot-spl.bin.normal.out`-style image of `body`.
+    fn spl_image(body: &[u8]) -> Vec<u8> {
+        let mut img = vec![0u8; 0x400];
+        img[0..4].copy_from_slice(&0x240u32.to_le_bytes());
+        img[4..8].copy_from_slice(&0x20_0000u32.to_le_bytes());
+        img[0x284..0x288].copy_from_slice(&SPL_VERSION.to_le_bytes());
+        img[0x288..0x28c].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        img[0x28c..0x290].copy_from_slice(&0x400u32.to_le_bytes());
+        img[0x290..0x294].copy_from_slice(&crc32(body).to_le_bytes());
+        img.extend_from_slice(body);
+        img
+    }
+
+    fn machine_with_card(image: &[u8], at: usize) -> Machine {
+        let mut disk = MemDisk::new(8192);
+        disk.0[at..at + image.len()].copy_from_slice(image);
+        let mut m = Machine::new(128 << 20);
+        m.soc.sdio1.insert(Some(Box::new(disk)));
+        m
+    }
+
+    #[test]
+    fn boot_rom_loads_spl_from_the_backup_copy() {
+        let body: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        // sector 0 holds a protective MBR, as on a GPT card: the ROM falls back to 2 MiB
+        let mut img = vec![0u8; 512];
+        img[446 + 4] = 0xee; // one partition of type 0xEE (GPT protective) covering the disk
+        img[446 + 8] = 1;
+        img[446 + 12..446 + 16].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        img[510] = 0x55;
+        img[511] = 0xaa;
+        img.resize(0x20_0000, 0);
+        img.extend_from_slice(&spl_image(&body));
+        let mut m = machine_with_card(&img, 0);
+        boot_rom(&mut m).unwrap();
+        assert_eq!(&m.soc.sram.mem[..body.len()], &body[..]);
+        for h in 1..m.harts.len() {
+            assert_eq!(m.harts[h].pc, SRAM_BASE);
+            assert_eq!(m.harts[h].x[10], h as u64);
+            assert_eq!(m.state[h], HartState::Run);
+        }
+        assert_eq!(m.state[0], HartState::Off, "the S7 stays in reset");
+    }
+
+    #[test]
+    fn boot_rom_rejects_a_bad_crc() {
+        let mut img = spl_image(&[1, 2, 3, 4]);
+        img[0x400] ^= 0xff;
+        let mut m = machine_with_card(&img, 0);
+        assert!(boot_rom(&mut m).is_err());
+    }
+
+    #[test]
+    fn eeprom_names_a_size_uboot_knows() {
+        assert_eq!(eeprom_ram_gib(4 << 30), 4);
+        assert_eq!(eeprom_ram_gib(3 << 30), 2);
+        assert_eq!(eeprom_ram_gib(1 << 30), 2);
+        assert!(uboot_ram_ok(8 << 30) && !uboot_ram_ok(3 << 30));
+    }
+
+    #[test]
+    fn eeprom_identifies_the_board() {
+        let e = board_eeprom(4 << 30);
+        assert_eq!(&e[0..4], b"SFVF");
+        // atom 1's product string starts at 12 + 8 + 16 + 2 + 2 + 2 + 32
+        let pstr = &e[74..74 + 31];
+        assert!(pstr.starts_with(b"XOPIRV"));
+        // U-Boot's DDR size: hex digits at pstr[14..], bits 23:16
+        let hex = std::str::from_utf8(&pstr[14..22]).unwrap();
+        assert_eq!((u32::from_str_radix(hex, 16).unwrap() >> 16) & 0xff, 4);
+        // each atom's CRC-16 covers its header and data
+        assert_eq!(u16::from_le_bytes([e[106], e[107]]), crc16(&e[12..106]));
+        assert_eq!(u16::from_le_bytes([e[134], e[135]]), crc16(&e[108..134]));
+    }
 }

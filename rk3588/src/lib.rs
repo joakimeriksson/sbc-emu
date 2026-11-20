@@ -98,7 +98,11 @@ impl Soc {
             let shift=(addr&3)*8; let mask=((1u32<<(size*8))-1)<<shift;
             let off = if (GICD..GICD+0x10000).contains(&addr) { addr-GICD } else { (addr.wrapping_sub(GICR) % gic::FRAME).wrapping_sub(0x10000) };
             let is_write_one = (0x100..0x400).contains(&off);
-            let old=if (GMAC..GMAC+0x10000).contains(&addr) {if (addr-GMAC)&!3==0x1160 {0}else{self.gmac.read((addr-GMAC)&!3)}} else if is_write_one { 0 } else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
+            let old=if (GMAC..GMAC+0x10000).contains(&addr) {if (addr-GMAC)&!3==0x1160 {0}else{self.gmac.read((addr-GMAC)&!3)}}
+                // config space: Linux's generic ECAM host writes bytes and halfwords (the status
+                // half of word 1 is write-one-to-clear and never stored, so merging is safe)
+                else if (pcie::ECAM..pcie::ECAM+pcie::ECAM_SIZE).contains(&addr) {self.pcie.cfg_read((addr-pcie::ECAM)&!3)}
+                else if is_write_one { 0 } else if (GICD..GICD+0x10000).contains(&addr) {self.gic.dist_read((addr-GICD)&!3)}
                 else if (GICR..GICR+GICR_SIZE).contains(&addr) {self.gic.redist_read((addr-GICR)&!3)} else {0};
             (old & !mask) | ((value as u32)<<shift)
         } else {value as u32};
