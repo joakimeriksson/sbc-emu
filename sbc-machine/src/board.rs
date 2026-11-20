@@ -7,13 +7,12 @@ pub enum Board {
     OrangePi5,
     OrangePiOne,
     TinkerBoard,
-    PanelBoard,
     OrangePiRv,
 }
 
 impl Board {
-    pub const ALL: [Self; 7] =
-        [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne, Self::TinkerBoard, Self::PanelBoard, Self::OrangePiRv];
+    pub const ALL: [Self; 6] =
+        [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne, Self::TinkerBoard, Self::OrangePiRv];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -22,7 +21,6 @@ impl Board {
             Self::OrangePi5 => "orangepi5",
             Self::OrangePiOne => "orangepi-one",
             Self::TinkerBoard => "tinkerboard",
-            Self::PanelBoard => "panel-board",
             Self::OrangePiRv => "orangepi-rv",
         }
     }
@@ -34,13 +32,12 @@ impl Board {
             Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (4x A55 + 4x A76, GICv3, SD, Ethernet, Mali-G610, audio)",
             Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (one A7, GIC-400, UART0, direct Linux boot)",
             Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (four Cortex-A12s, GIC-400, UART2, direct Linux boot)",
-            Self::PanelBoard => "experimental: RK3288 panel board / RK3288 (the vendor's own kernel and device tree, MIPI-DSI panel)",
             Self::OrangePiRv => "experimental: Orange Pi RV / StarFive JH7110 (four RV64GC U74s, CLINT, PLIC, UART0, OpenSBI + direct Linux boot)",
         }
     }
 
     pub fn require_implemented(self) -> Result<(), String> {
-        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::PanelBoard | Self::OrangePiRv) {
+        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::OrangePiRv) {
             Ok(())
         } else {
             Err(format!(

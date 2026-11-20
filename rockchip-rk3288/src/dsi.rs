@@ -4,8 +4,8 @@
 //! The picture itself reaches the panel from the VOP over DPI, so the model only has to
 //! satisfy the driver: the PHY reports lock and stop state, the generic command FIFO is
 //! always ready, and commands the panel driver sends (DCS and generic writes) are counted
-//! and, with `SBC_VOP_LOG=1`, printed with every register write. (The panel board's panel
-//! driver sends none: it takes over the panel the vendor's U-Boot initialised for its splash.) Reads get a short reply from a cooperative panel: the power mode reads back as "on",
+//! and, with `SBC_VOP_LOG=1`, printed with every register write. (A panel driver that
+//! takes over a panel the boot loader initialised for its splash sends none.) Reads get a short reply from a cooperative panel: the power mode reads back as "on",
 //! anything else as zeros.
 
 pub const DSI_SIZE: u64 = 0x4000;

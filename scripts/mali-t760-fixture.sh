@@ -1,21 +1,25 @@
 #!/bin/sh
 # A Debian armhf root filesystem with Mesa (panfrost), kmscube, glmark2 and gcc for the
-# Mali-T760 tests, made from the Orange Pi One GPU image (scripts/armbian-gpu-fixture.sh;
-# both boards are armhf, and the userland has no board-specific parts the tests need).
-# It boots on the panel board profile with the vendor's kernel, which has Panfrost and the DSI
-# panel built in, so no kernel modules are copied. The GLES test program and its runner
-# are put in /root (there is no network on the RK3288 yet).
-#   scripts/panel-board-fixture.sh && scripts/armbian-gpu-fixture.sh && scripts/mali-t760-fixture.sh
-#   sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/panel-board/rk3288-panel.dtb \
-#       --emmc cache/mali-t760/debian-gpu.img --append "$(cat cache/mali-t760/cmdline)" \
+# Mali-T760 tests on the Tinker Board profile. The userland is the Orange Pi One GPU image's
+# (scripts/armbian-gpu-fixture.sh; both boards are armhf, and the userland has no
+# board-specific parts the tests need); /boot (kernel, device trees, initramfs,
+# armbianEnv.txt) and /lib/modules come from the Tinker Board's Armbian image
+# (scripts/armbian-tinkerboard-fixture.sh), whose kernel has Panfrost as a module. The card
+# then boots like an Armbian card. The GLES test program and its runner are put in /root
+# (there is no network on the RK3288 yet).
+#   scripts/armbian-gpu-fixture.sh && scripts/armbian-tinkerboard-fixture.sh && scripts/mali-t760-fixture.sh
+#   sbc-emu run --board tinkerboard --sd cache/mali-t760/debian-gpu.img --append init=/bin/bash \
 #       --script scripts/mali-t760-gpu.txt --timeout 1800
+#       # or --script scripts/mali-t760-gles2.txt --timeout 7200
 # Needs e2fsprogs (Homebrew: e2fsprogs).
 # Usage: scripts/mali-t760-fixture.sh [OUT]   (default cache/mali-t760)
 set -eu
 OUT=${1:-cache/mali-t760}
 SRC=${MALI_GPU_IMAGE:-cache/mali/armbian-gpu.img}
 PATH="$PATH:/opt/homebrew/opt/e2fsprogs/sbin:/usr/local/opt/e2fsprogs/sbin:/sbin:/usr/sbin"
+TINKER=cache/tinker-board-armbian/Armbian_26.8.1_Tinkerboard_trixie_current_6.18.43_minimal.img
 [ -f "$SRC" ] || { echo "$SRC missing: run scripts/armbian-gpu-fixture.sh" >&2; exit 1; }
+[ -f "$TINKER" ] || { echo "$TINKER missing: run scripts/armbian-tinkerboard-fixture.sh" >&2; exit 1; }
 mkdir -p "$OUT"
 IMG=$OUT/debian-gpu.img
 rm -f "$IMG"
@@ -42,7 +46,19 @@ wait-serial BUILT-42
 quit
 SCRIPT
 "$BIN" run --board orangepi-one --sd "$IMG" --sd-persist --append init=/bin/bash --script "$OUT/build.txt" --timeout 1800 >/dev/null
-# root by partition UUID: the vendor's kernel has no initramfs to find a filesystem UUID
+# Then the Tinker Board's kernel: boot its Armbian card with this image as the eMMC and copy
+# /boot and /lib/modules over, pointing armbianEnv.txt's rootdev at this filesystem. The
+# Armbian card is a throwaway clone: --sd-persist, which the eMMC needs, applies to it too.
 SIG=$(od -An -tx4 -j440 -N4 "$IMG" | tr -d ' ')
-echo "earlycon=uart8250,mmio32,0xff690000 console=ttyS2,115200 root=PARTUUID=$SIG-01 rootwait rw init=/bin/bash" > "$OUT/cmdline"
+CARD=$OUT/tinker-card.img
+rm -f "$CARD"
+cp -c "$TINKER" "$CARD" 2>/dev/null || cp "$TINKER" "$CARD"
+cat > "$OUT/kernel.txt" <<SCRIPT
+wait-serial root@
+serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; D=\$(findfs PARTUUID=$SIG-01) && mount \$D /mnt && rm -f /mnt/boot/zImage /mnt/boot/uInitrd /mnt/boot/dtb && cp -a /boot/. /mnt/boot/ && cp -a /lib/modules/. /mnt/lib/modules/ && sed -i "s/^rootdev=.*/rootdev=UUID=\$(blkid -s UUID -o value \$D)/; s/^overlays=.*/overlays=/" /mnt/boot/armbianEnv.txt && umount /mnt && echo COPIED-\$((6*7))\\n
+wait-serial COPIED-42
+quit
+SCRIPT
+"$BIN" run --board tinkerboard --sd "$CARD" --emmc "$IMG" --sd-persist --append init=/bin/bash --script "$OUT/kernel.txt" --timeout 1800 >/dev/null
+rm -f "$CARD"
 echo "$IMG"

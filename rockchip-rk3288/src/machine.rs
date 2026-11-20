@@ -36,7 +36,7 @@ pub const GPU_IRQS: [(midgard::Irq, usize); 3] =
 /// RGA 2D accelerator and its interrupt (SPI 18).
 pub const RGA_BASE: u64 = 0xff92_0000;
 pub const RGA_IRQ: usize = 32 + 18;
-/// MIPI DSI host 0 (the panel board's panel).
+/// MIPI DSI host 0 (a panel behind VOP-little).
 pub const DSI0_BASE: u64 = 0xff96_0000;
 /// DesignWare HDMI TX (`reg-io-width = <4>`: byte registers on a 4-byte stride) and its
 /// interrupt (SPI 103). The EDID is read over I2C5 (`ddc-i2c-bus`), where the board puts
@@ -96,7 +96,7 @@ pub struct Soc {
     /// RAM pages holding compiled code (shared by the cores' JITs): devices that write RAM
     /// report it here.
     pub code_watch: Arc<CodeWatch>,
-    /// RGA 2D accelerator (rotates the vendor application's frames onto the panel).
+    /// RGA 2D accelerator (rotations, scaling and format conversion for V4L2).
     pub rga: Rga,
     /// Mali-T760 GPU (`midgard`).
     pub gpu: midgard::MaliT760,
@@ -249,7 +249,7 @@ impl Soc {
         Self::in_region(addr, width, SRAM_BASE, SRAM_SIZE as u64)
     }
 
-    /// The running VOP (VOP-little first: it drives the panel board's panel).
+    /// The running VOP (VOP-little first: it drives a DSI panel).
     fn active_vop(&self) -> Option<&Vop> {
         [&self.vop[1], &self.vop[0]].into_iter().find(|v| v.shown_size().is_some())
     }
@@ -263,21 +263,6 @@ impl Soc {
     /// The display as RGBA, turned by the panel's mounting rotation.
     pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         self.active_vop()?.render(&self.ram.mem, self.ram.base, self.display_rotation, out)
-    }
-
-    /// A touch at (`x`, `y`) on the display as the user sees it: turned back by the panel's
-    /// mounting rotation to the touch layer's own coordinates.
-    pub fn touch(&mut self, down: bool, x: u16, y: u16) {
-        let (w, h) = self.active_vop().and_then(|v| v.shown_size()).unwrap_or((800, 1280));
-        let (w, h) = (w as u16, h as u16);
-        let (px, py) = match self.display_rotation % 360 {
-            90 => (w.saturating_sub(1).saturating_sub(y), x),
-            180 => (w.saturating_sub(1).saturating_sub(x), h.saturating_sub(1).saturating_sub(y)),
-            270 => (y, h.saturating_sub(1).saturating_sub(x)),
-            _ => (x, y),
-        };
-        self.periph.touch(down, px, py);
-        self.dirty = true;
     }
 
     /// A word of on-chip SRAM (the boot ROM's view of the SMP mailbox).

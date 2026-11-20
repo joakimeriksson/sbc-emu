@@ -1,6 +1,6 @@
 //! The RK3288's RGA (raster graphics accelerator, 0xff920000) as Linux's `rockchip-rga`
-//! V4L2 mem2mem driver uses it: the vendor's application draws its UI in software and has the
-//! RGA rotate each frame onto the panel, which is mounted sideways.
+//! V4L2 mem2mem driver uses it, for example to rotate frames drawn in software onto a
+//! panel that is mounted sideways.
 //!
 //! The driver writes a 32-word command buffer (the image of registers 0x100-0x17c) to
 //! memory, points RGA_CMD_BASE at it and starts it with RGA_CMD_CTRL. The model runs the

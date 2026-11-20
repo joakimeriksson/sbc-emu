@@ -5,7 +5,7 @@
 //! The transmit side consumes frames at the sample rate. As the clock master (CKR.MSS),
 //! MCLK (the CRU's `i2s_pre`) / (CKR.MDIV + 1) is the bit clock, / (CKR.TSD + 1) the frame
 //! rate. As a slave, the codec makes the clocks from the MCLK it is given (`i2s0_clkout`,
-//! the same clock): the panel board's codec (the vendor's `codec`, clock and frame master) runs at
+//! the same clock): a codec that is clock and frame master at
 //! 256 fs, so the kernel sets 11.2896 MHz for 44.1 kHz. Each frame takes one
 //! FIFO word per channel (TXCR.CSR: 2-8 channels), or one word per two channels for 16-bit
 //! samples with TXCR.HWT; the first two channels are kept as 16-bit stereo. The receive

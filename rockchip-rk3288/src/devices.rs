@@ -5,13 +5,8 @@
 use crate::dwmmc::{CardKind, DwMmc};
 use crate::gpio::{self, GpioBank};
 use crate::i2c::Rk3xI2c;
-use peripherals::act8846::{self, Act8846};
-use peripherals::hym8563::{self, Hym8563};
-use peripherals::ili2116::{self, Ili2116};
 use peripherals::rk808::{self, Rk808};
 use peripherals::bcm43455::Bcm43455;
-use peripherals::sdio::SdioCard;
-use peripherals::syr82x::{self, Syr82x};
 use emu_core::{disk::Disk, Fault, FlatRam};
 
 /// SD card slot (`sdmmc`, SPI 32).
@@ -19,19 +14,15 @@ pub const SDMMC_BASE: u64 = 0xff0c_0000;
 /// SDIO0 (Wi-Fi on the Tinker Board, SPI 33), SDIO1 (SPI 34).
 pub const SDIO0_BASE: u64 = 0xff0d_0000;
 pub const SDIO1_BASE: u64 = 0xff0e_0000;
-/// eMMC (`emmc`, SPI 35; 8-bit, the Tinker Board S and the panel board).
+/// eMMC (`emmc`, SPI 35; 8-bit, the Tinker Board S).
 pub const EMMC_BASE: u64 = 0xff0f_0000;
 /// GPIO0-8 interrupts: SPI 81-89.
 const GPIO_IRQ_BASE: usize = 32 + 81;
-/// The panel board's touch interrupt: GPIO7_A6.
-const TOUCH_GPIO: (usize, u32) = (7, 6);
-/// The panel board's Wi-Fi host-wake interrupt: GPIO4_D6.
+/// A Wi-Fi chip's host-wake interrupt: GPIO4_D6.
 const WIFI_GPIO: (usize, u32) = (4, 30);
 /// The SD slot's card-detect pin, GPIO6_C6 (active low): the RK3288's `sdmmc-cd`, which
-/// the panel board's device tree uses (`cd-gpios`); the Tinker Board's slot is `broken-cd`.
+/// device trees with `cd-gpios` use; the Tinker Board's slot is `broken-cd`.
 const SD_DETECT_GPIO: (usize, u32) = (6, 22);
-/// The panel board's Wi-Fi MAC address (locally administered).
-const WIFI_MAC: [u8; 6] = [0x02, 0x4d, 0x50, 0x43, 0x01, 0x01];
 /// I²C0 (PMU domain: the PMIC), SPI 60.
 pub const I2C0_BASE: u64 = 0xff65_0000;
 
@@ -97,21 +88,6 @@ impl Peripherals {
         self.gpio[SD_DETECT_GPIO.0].set_input(SD_DETECT_GPIO.1, !present);
     }
 
-    /// The RK3288 panel board's power chips on I²C0: the ACT8846 PMIC, the SYR827 (vdd_cpu) and
-    /// SYR828 (vdd_gpu) regulators and the HYM8563 RTC, which starts at `unix_seconds`.
-    pub fn attach_panel_board_power(&mut self, unix_seconds: i64) {
-        let bus = &mut self.i2c[0].2;
-        bus.attach(act8846::ADDRESS, Box::new(Act8846::default()));
-        bus.attach(syr82x::CPU_ADDRESS, Box::new(Syr82x::default()));
-        bus.attach(syr82x::GPU_ADDRESS, Box::new(Syr82x::default()));
-        bus.attach(hym8563::ADDRESS, Box::new(Hym8563::new(unix_seconds)));
-        // the touchscreen on I²C4, its interrupt on GPIO7_A6
-        self.i2c[4].2.attach(ili2116::ADDRESS, Box::new(Ili2116::default()));
-        // the BCM43455 Wi-Fi on SDIO0, host-wake on GPIO4_D6
-        self.mmc[SDIO0].insert_sdio(SdioCard::new(Box::new(Bcm43455::new(WIFI_MAC))));
-        self.sync_wifi_irq();
-    }
-
     fn wifi(&mut self) -> Option<&mut Bcm43455> {
         self.mmc[SDIO0].sdio_mut()?.device_mut::<Bcm43455>()
     }
@@ -156,32 +132,10 @@ impl Peripherals {
         joined
     }
 
-    /// A touch (or release) at `x`, `y` on the panel board's touchscreen, if it has one.
-    pub fn touch(&mut self, down: bool, x: u16, y: u16) {
-        if let Some(t) = self.i2c[4].2.device_mut::<Ili2116>(ili2116::ADDRESS) {
-            t.touch(down, x, y);
-        }
-        self.sync_touch_irq();
-    }
-
-    /// The touch controller's interrupt line (active low) onto GPIO7_A6.
-    fn sync_touch_irq(&mut self) {
-        let (asserted, edge) = match self.i2c[4].2.device_mut::<Ili2116>(ili2116::ADDRESS) {
-            Some(t) => (t.irq_asserted(), t.take_edge()),
-            None => return,
-        };
-        let gpio = &mut self.gpio[TOUCH_GPIO.0];
-        if edge {
-            gpio.set_input(TOUCH_GPIO.1, true);
-        }
-        gpio.set_input(TOUCH_GPIO.1, !asserted);
-    }
-
     /// The PMIC was told to switch the board off.
     pub fn power_off_requested(&mut self) -> bool {
         let bus = &mut self.i2c[0].2;
         bus.device_mut::<Rk808>(rk808::ADDRESS).is_some_and(|pmic| pmic.power_off)
-            || bus.device_mut::<Act8846>(act8846::ADDRESS).is_some_and(|pmic| pmic.power_off)
     }
 
     /// Interrupt lines (GIC number, level).
@@ -221,10 +175,7 @@ impl Peripherals {
         }
         let (base, _, i2c) = self.i2c.iter_mut().find(|(base, ..)| addr.wrapping_sub(*base) < crate::i2c::SIZE)?;
         i2c.now_ns = now_ns;
-        let result = word(addr, width).map(|_| i2c.write(addr - *base, value));
-        // a transfer may have consumed the touch controller's records
-        self.sync_touch_irq();
-        Some(result)
+        Some(word(addr, width).map(|_| i2c.write(addr - *base, value)))
     }
 }
 

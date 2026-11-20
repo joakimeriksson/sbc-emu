@@ -1,5 +1,5 @@
-//! Haoyu HYM8563 real-time clock on I²C (`haoyu,hym8563`, Linux `rtc-hym8563`), the panel
-//! board's battery-backed clock at 0x51: a PCF8563-style chip with BCD time registers from
+//! Haoyu HYM8563 real-time clock on I²C (`haoyu,hym8563`, Linux `rtc-hym8563`), a
+//! battery-backed clock at 0x51: a PCF8563-style chip with BCD time registers from
 //! 0x02 (seconds, minutes, hours, day, weekday, month, year), a STOP bit in CTL1 while the
 //! time is set, and alarm/timer/clock-out registers that read back what Linux writes.
 //!
@@ -8,7 +8,7 @@
 use crate::i2c::{I2cDevice, RegisterPointer};
 use crate::rk808::{bcd, date_of, seconds_of, unbcd};
 
-/// I²C address on the panel board (`hym8563@51`).
+/// I²C address (`hym8563@51`).
 pub const ADDRESS: u8 = 0x51;
 
 const CTL1: usize = 0x00;

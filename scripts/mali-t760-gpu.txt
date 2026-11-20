@@ -1,13 +1,13 @@
 # The Mali-T760 GPU: Debian's Mesa (panfrost) renders kmscube through the emulated job
-# manager, Midgard shader core, tiler and fragment pipeline, shown on the panel board's DSI
-# panel. Needs the image from scripts/mali-t760-fixture.sh:
-#   sbc-emu run --board panel-board --kernel cache/panel-board/zImage --dtb cache/panel-board/rk3288-panel.dtb \
-#       --emmc cache/mali-t760/debian-gpu.img --append "$(cat cache/mali-t760/cmdline)" \
+# manager, Midgard shader core, tiler and fragment pipeline, shown on the Tinker Board's HDMI
+# monitor. Needs the image from scripts/mali-t760-fixture.sh:
+#   sbc-emu run --board tinkerboard --sd cache/mali-t760/debian-gpu.img --append init=/bin/bash \
 #       --script scripts/mali-t760-gpu.txt --timeout 1800
+# (no udev under init=/bin/bash: panfrost, a module in Armbian's kernel, is loaded by hand)
 # (the second kmscube's stdin is an idle pipe: in the background it would get /dev/null,
 # read EOF and stop after a frame)
 wait-serial root@
-serial mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp; mount -t tmpfs run /run; dmesg | grep -E 'mali-t760 id|Initialized [p]anfrost'; echo READY-$((6*7))\n
+serial mount -o remount,rw /; mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp; mount -t tmpfs run /run; modprobe panfrost; dmesg | grep -E 'mali-t760 id|Initialized [p]anfrost'; echo READY-$((6*7))\n
 wait-serial Initialized panfrost
 wait-serial READY-42
 serial kmscube -c 20 2>&1 | grep -E 'renderer|Rendered'; echo GL-$((6*7))\n

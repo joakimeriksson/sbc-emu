@@ -2,8 +2,7 @@
 //! zImage with the stock device tree, patched as U-Boot's distro boot would patch it, or
 //! firmware-style boot of an SD card or eMMC image (Armbian's /boot).
 //!
-//! [`run_board`] is the RK3288 run loop shared with the RK3288 panel board (`panelboard.rs`): the
-//! boards differ only in their [`Profile`].
+//! [`run_board`] is the RK3288 run loop; what a board adds to the SoC is its [`Profile`].
 use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use rockchip_rk3288::{boot, devices, HdmiMode as Mode, Machine};
 use sbc_machine::Machine as HostMachine;
@@ -69,13 +68,6 @@ impl Screen for Machine {
     }
     fn name(&self) -> &'static str {
         self.soc.display_name
-    }
-    /// The pointer (absolute, 0..32767 across the picture shown) as a finger on the
-    /// touchscreen (the panel board's; boards without one ignore it).
-    fn pointer(&mut self, buttons: u8, x: u16, y: u16, _wheel: i8) {
-        let (w, h) = self.display_size();
-        let pixel = |v: u16, n: u32| (v as u32 * n.saturating_sub(1) / 32767) as u16;
-        self.soc.touch(buttons & 1 != 0, pixel(x, w), pixel(y, h));
     }
 }
 
