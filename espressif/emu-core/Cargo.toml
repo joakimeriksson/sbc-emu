@@ -2,7 +2,7 @@
 name = "esp32sim-emu-core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"  # from esp32sim, with co-authors: see LICENSE in riscv-rv32/ or espressif/
 description = "esp32sim 32-bit bus/core API used by the imported RV32 core and the ESP32-S31 machine"
 
 [dependencies]

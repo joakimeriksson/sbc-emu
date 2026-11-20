@@ -2,7 +2,7 @@
 name = "esp-soc"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"  # from esp32sim, with co-authors: see LICENSE in riscv-rv32/ or espressif/
 description = "The machine around an Espressif SoC: scheduler, device time, console, scripts, web push, loaders, boards — generic over the chip"
 
 [dependencies]

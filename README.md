@@ -449,3 +449,19 @@ interpreted). Checks:
   mismatch, with the block's code; `SBC_JIT_PROFILE=1 node tools/wasm-smoke-sd.mjs ...` lists the
   instructions compiled code still hands to the interpreter, `SBC_JIT_HOT=n` sets the compile
   threshold and `SBC_WASM=path` picks another build (for before/after comparisons).
+
+## License
+
+BSD 3-Clause ([LICENSE](LICENSE)), except the crates that came from esp32sim, which keep its MIT
+license and co-authors: `riscv-rv32/` ([its LICENSE](riscv-rv32/LICENSE)) and `espressif/`
+([its LICENSE](espressif/LICENSE); the SAR ADC calibration tables in `esp-periph` are Apache-2.0,
+[LICENSE-ADC](espressif/esp-periph/LICENSE-ADC)).
+
+sbc-emu includes no operating system images or vendor firmware binaries; you bring your own. (The
+RV32 decoder tests compare against sampled `objdump` listings of Espressif's published ROM ELFs, and
+the PowerVR "firmware" file is a stand-in the emulator generates, with no Imagination code.)
+
+Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi, ASUS Tinker Board, Rockchip,
+Allwinner, StarFive, Broadcom, Arm, Mali, Espressif, ESP32 and Ubuntu are trademarks of their
+respective owners. sbc-emu is an independent project, not affiliated with or endorsed by any of
+them; the names only say which hardware it emulates.
