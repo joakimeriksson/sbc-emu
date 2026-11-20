@@ -166,6 +166,7 @@ dependencies = [
 name = "sbc-emu-wasm"
 version = "0.0.1"
 dependencies = [
+ "allwinner-h3",
  "arm-a32",
  "arm-a64",
  "bcm2711",
