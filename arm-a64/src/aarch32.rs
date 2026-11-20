@@ -137,7 +137,7 @@ impl Cpu {
             a.vfp.d[2 * n] = self.v[n] as u64;
             a.vfp.d[2 * n + 1] = (self.v[n] >> 64) as u64;
         }
-        a.vfp.fpscr = (self.fpsr | self.fpcr) as u32;
+        a.vfp.fpscr = (self.fpsr | self.fpsr_nzcv | self.fpcr) as u32;
         a.exclusive_addr = None;
         self.pc = a.r[15] as u64;
         self.aarch32 = true;
@@ -165,7 +165,8 @@ impl Cpu {
             self.v[n] = a.vfp.d[2 * n] as u128 | (a.vfp.d[2 * n + 1] as u128) << 64;
         }
         let fpscr = a.vfp.fpscr as u64;
-        self.fpsr = fpscr & 0xf800_009f;
+        self.fpsr = fpscr & 0x0800_009f;
+        self.fpsr_nzcv = fpscr & crate::cpu::FPSR_NZCV;
         self.fpcr = fpscr & 0x07ff_9f00;
         self.pc = a.r[15] as u64;
         self.nzcv = a.cpsr & 0xf000_0000;

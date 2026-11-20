@@ -195,7 +195,7 @@ impl Cpu {
         let fast = !unpriv || (self.el <= 1 && self.utlb_unpriv == 0);
         if fast && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let el = if unpriv { 0 } else { self.el as u64 };
-            let tag = ((va >> 12) + 1) | (el << 60);
+            let tag = crate::cpu::utag(va, el);
             let ti = match self.utlb_hit(1, va, tag) {
                 Some(t) => t,
                 None => {
@@ -207,7 +207,7 @@ impl Cpu {
                 }
             };
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
-            let p = unsafe { self.ram.add((self.utlb[1][ti].1 | (va & 0xfff)) as usize) };
+            let p = unsafe { self.ram.add(self.utlb[1][ti].1.wrapping_add(va) as usize) };
             let v = unsafe {
                 match size {
                     1 => *p as u64,
@@ -274,7 +274,7 @@ impl Cpu {
         let fast = !unpriv || (self.el <= 1 && self.utlb_unpriv == 0);
         if fast && size <= 16 && (va & 0xfff) + size as u64 <= 0x1000 {
             let el = if unpriv { 0 } else { self.el as u64 };
-            let tag = ((va >> 12) + 1) | (el << 60);
+            let tag = crate::cpu::utag(va, el);
             let ti = match self.utlb_hit(2, va, tag) {
                 Some(t) => t,
                 None => {
@@ -291,7 +291,7 @@ impl Cpu {
                 }
             }
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
-            let off = (self.utlb[2][ti].1 | (va & 0xfff)) as usize;
+            let off = self.utlb[2][ti].1.wrapping_add(va) as usize;
             let p = unsafe { self.ram.add(off) };
             if let Some(log) = self.store_log.as_mut() {
                 // JIT verify mode: remember the bytes this store overwrites
@@ -376,7 +376,7 @@ impl Cpu {
         if pc & 3 != 0 {
             return Err(self.sync_exception(Exc::PC_ALIGN, 0, pc, Some(pc)));
         }
-        let tag = ((pc >> 12) + 1) | ((self.el as u64) << 60);
+        let tag = crate::cpu::utag(pc, self.el as u64);
         let insn = if let Some(ti) = self.utlb_hit(0, pc, tag) {
             // SAFETY: the page was checked to lie inside guest RAM when the entry was filled
             unsafe { (self.ram.add((self.utlb[0][ti].1 | (pc & 0xfff)) as usize) as *const u32).read_unaligned() }

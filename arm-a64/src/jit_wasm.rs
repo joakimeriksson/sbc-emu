@@ -9,7 +9,7 @@
 //! The page compiles the bytes synchronously (`new WebAssembly.Module` in a worker) and installs
 //! the function in the table (`sbc_jit_compile`); Rust then calls it as a function pointer.
 #![cfg(target_arch = "wasm32")]
-use crate::cpu::UT;
+use crate::cpu::{UT, UTLB_HASH};
 use crate::cpu::Cpu;
 
 #[link(wasm_import_module = "env")]
@@ -698,16 +698,16 @@ fn wasm_ldst(w: &mut W, i: u32, pc: u64, verify: bool) -> bool {
     let k = if load { 1 } else { 2 };
     // L_ST = &utlb[k][uti(va)] - cpu offset (an i32 address)
     let ent = w.off_utlb + (16 * UT * k) as u32;
-    w.lget(L_CPU); w.lget(L_B); w.lget(L_B); w.i64c(8); w.op(0x88); w.op(0x85); w.i64c(12); w.op(0x88); w.op(0xa7); w.i32c(UT as i32 / 2 - 1); w.op(0x71); w.i32c(5); w.op(0x74); w.op(0x6a); w.lset(L_ST); // way 0 of the set
-    w.lget(L_B); w.i64c(12); w.op(0x88); w.i64c(1); w.op(0x7c); w.i64c(((w.el as u64) << 60) as i64); w.op(0x84);
+    w.lget(L_CPU); w.lget(L_B); if UTLB_HASH { w.lget(L_B); w.i64c(8); w.op(0x88); w.op(0x85); } w.i64c(12); w.op(0x88); w.op(0xa7); w.i32c(UT as i32 / 2 - 1); w.op(0x71); w.i32c(5); w.op(0x74); w.op(0x6a); w.lset(L_ST); // way 0 of the set
+    w.lget(L_B); w.i64c(12); w.op(0x88); w.i64c(((w.el as u64) << 60) as i64); w.op(0x84);
     w.lget(L_ST); w.op(0x29); uleb(&mut w.c, 3); uleb(&mut w.c, ent as u64); w.op(0x51); // eq
     w.lget(L_B); w.i64c(0xfff); w.op(0x83); w.i64c(span as i64 - 1); w.op(0x7c); w.i64c(12); w.op(0x88); w.op(0x50); // no crossing
     w.op(0x71);
     if !load { w.load64(w.off_excl); w.op(0x50); w.op(0x71); }
     w.op(0x04); w.op(0x40); // if fast
-    // host address (i32) in L_ST: ram + page + (va & 0xfff)
+    // host address (i32) in L_ST: ram + (PA - VA of the page) + va
     w.load32(w.off_ram);
-    w.lget(L_ST); w.op(0x29); uleb(&mut w.c, 3); uleb(&mut w.c, ent as u64 + 8); w.lget(L_B); w.i64c(0xfff); w.op(0x83); w.op(0x84); w.op(0xa7);
+    w.lget(L_ST); w.op(0x29); uleb(&mut w.c, 3); uleb(&mut w.c, ent as u64 + 8); w.lget(L_B); w.op(0x7c); w.op(0xa7);
     w.op(0x6a); w.lset(L_ST);
     let ld_op = |sz: u32, sign: u32| -> u8 { match (sz, sign != 0) { (0, false) => 0x31, (0, true) => 0x30, (1, false) => 0x33, (1, true) => 0x32, (2, false) => 0x35, (2, true) => 0x34, _ => 0x29 } };
     let st_op = |sz: u32| -> u8 { match sz { 0 => 0x3c, 1 => 0x3d, 2 => 0x3e, _ => 0x37 } };
