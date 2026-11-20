@@ -372,6 +372,10 @@ pub fn f32_to_f16(f: f32) -> u16 {
     s | r as u16
 }
 
+/// The most VPM rows a store reaches (the VPM grows to the rows written; a shader's own jobs use a
+/// few hundred). A row beyond it, from a stray address, is dropped rather than allocated.
+const VPM_MAX_ROWS: usize = 4096;
+
 /// A float result's NaN made the one quiet NaN, whatever the operands' NaNs were. Which operand's
 /// payload a host propagates depends on the host (x86 takes the first source, Arm the first
 /// NaN) and on the order the compiler puts the operands in, which differs between the fast and
@@ -1045,8 +1049,10 @@ impl Thread {
                         a_has = false;
                         if acond & (1 << l) != 0 && add.op != Stvpmp {
                             let row = self.vpm_out_base + x as usize;
-                            if self.vpm.len() <= row { self.vpm.resize(row + 1, [0; LANES]); }
-                            self.vpm[row][l] = y;
+                            if row < VPM_MAX_ROWS {
+                                if self.vpm.len() <= row { self.vpm.resize(row + 1, [0; LANES]); }
+                                self.vpm[row][l] = y;
+                            }
                         }
                         0
                     }
@@ -1193,8 +1199,10 @@ impl Thread {
             for l in 0..LANES {
                 if acond & (1 << l) != 0 {
                     let row = self.vpm_out_base + x[l] as usize;
-                    if self.vpm.len() <= row { self.vpm.resize(row + 1, [0; LANES]); }
-                    self.vpm[row][l] = y[l];
+                    if row < VPM_MAX_ROWS {
+                        if self.vpm.len() <= row { self.vpm.resize(row + 1, [0; LANES]); }
+                        self.vpm[row][l] = y[l];
+                    }
                 }
             }
         }
@@ -1395,6 +1403,7 @@ mod tests {
             }
             assert_eq!((t.unif, t.unifa, &t.tmu_cfg, t.vpm == u.vpm, &t.tmu_out), (u.unif, u.unifa, &u.tmu_cfg, true, &u.tmu_out), "state {what}");
             assert_eq!(t.delayed_next, u.delayed_next, "delayed {what}");
+            assert!(t.vpm.len() <= VPM_MAX_ROWS.max(8), "VPM grown to {} rows {what}", t.vpm.len());
             assert_eq!(e1.log, e2.log, "GPU accesses {what}");
         }
         }
