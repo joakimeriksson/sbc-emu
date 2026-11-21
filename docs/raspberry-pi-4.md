@@ -187,7 +187,10 @@ builds it as a site in `out/site` from pinned, checksummed downloads of the Pi k
 `.github/workflows/site.yml` publishes that to GitHub Pages on every push to `main`. The site's
 front page is `web/boards.html`; `web/board.html?b=orangepi-one` boots the Orange Pi One
 (`scripts/orangepi-one-fixture.sh`'s Alpine kernel and initramfs, staged by `tools/wasm-build.sh`)
-to a shell on its serial console in about 5 seconds, in an xterm.js terminal.
+to a shell on its serial console, in an xterm.js terminal, and `web/board.html?b=tinker-board`
+the Tinker Board S (`scripts/tinker-board-fixture.sh`'s Debian kernel and BusyBox initramfs): each
+reaches its shell in 6–9 seconds in Chrome and Safari on an M-series Mac. (With the browser's
+debugger attached, as browser-automation tools do, WebAssembly runs several times slower.)
 
 `index.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
 scenes on the emulated V3D GPU (setup in [docs/gpu.md](gpu.md#in-the-browser)).
