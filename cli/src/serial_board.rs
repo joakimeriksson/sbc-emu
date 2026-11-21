@@ -199,6 +199,9 @@ pub(crate) fn run<B: SerialBoard>(
     let mut pending = VecDeque::new();
     let mut output = std::io::stdout();
     let mut serial = String::new();
+    // how much of `serial` the current wait-serial has searched without a match (searching
+    // all of it again on every pass made long boots quadratic)
+    let mut searched = 0usize;
     let start = Instant::now();
     let mut anchor = Instant::now();
     let mut escape = false;
@@ -229,14 +232,23 @@ pub(crate) fn run<B: SerialBoard>(
             let (cmd, rest) = line.split_once(' ').unwrap_or((&line, ""));
             let mut consumed = 0;
             let done = match cmd {
-                "wait-serial" => match serial.find(rest) {
-                    // Keep output after the match: the next wait may already be in it.
-                    Some(position) => {
-                        consumed = position + rest.len();
-                        true
+                "wait-serial" => {
+                    let mut from = searched.saturating_sub(rest.len());
+                    while !serial.is_char_boundary(from) {
+                        from -= 1;
                     }
-                    None => false,
-                },
+                    match serial[from..].find(rest) {
+                        // Keep output after the match: the next wait may already be in it.
+                        Some(position) => {
+                            consumed = from + position + rest.len();
+                            true
+                        }
+                        None => {
+                            searched = serial.len();
+                            false
+                        }
+                    }
+                }
                 "serial" => {
                     // \x03 is Ctrl-C (SIGINT through the guest's tty)
                     pending.extend(
@@ -248,6 +260,7 @@ pub(crate) fn run<B: SerialBoard>(
                     m = make_machine()?;
                     anchor = Instant::now();
                     serial.clear();
+                    searched = 0;
                     pending.clear();
                     true
                 }
@@ -292,6 +305,7 @@ pub(crate) fn run<B: SerialBoard>(
             if done {
                 eprintln!("[{tag} script] {line}");
                 script.pop_front();
+                searched = 0;
                 if cmd == "wait-serial" {
                     serial.drain(..consumed);
                 }
@@ -356,6 +370,7 @@ pub(crate) fn run<B: SerialBoard>(
                 }
                 anchor = Instant::now();
                 serial.clear();
+                searched = 0;
                 pending.clear();
             }
             Stop::PowerOff => {

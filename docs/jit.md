@@ -101,3 +101,12 @@ as above, with the guest flags in wasm locals. In Node 26 on an M5:
 
 `node tools/wasm-a32-jit-diff.mjs` runs `arm-a32/tests/jit_diff.rs`'s random A32 and Thumb cases,
 straight-line and in loops, through the wasm backend against the interpreter.
+
+## The RV64 JIT (Orange Pi RV)
+
+`riscv64/src/jit.rs` drives a separate JIT for the RISC-V core with two code generators: RV64 to
+AArch64 (`jit_a64.rs`) and RV64 to WebAssembly (`jit_wasm.rs`). Its regions are keyed by physical
+address and shared by the four harts, stay valid until `fence.i` (then are compared with the bytes
+they were compiled from), and probe a per-mode micro-TLB for loads and stores. Four busy shell
+loops run 8.5 times faster than in the interpreter (about 1.6 G RISC-V instructions per second on
+an M5). The design, its tests and timings are in [orangepi-rv.md](orangepi-rv.md#the-jit).

@@ -5,7 +5,7 @@
 Xunlong's Orange Pi RV: the StarFive JH7110 with four SiFive U74 cores (RV64GC, Sv39) and
 an S7 monitor core, 4 GiB of LPDDR4, a microSD slot, SPI NOR, Gigabit Ethernet, four USB
 3.0 ports (a VL805 on PCIe), HDMI 2.0 and an M.2 slot. sbc-emu runs it on its own RV64
-interpreter (`riscv64/`, no QEMU) and SoC model (`starfive-jh7110/`). The CPU, the microSD
+interpreter and JIT (`riscv64/`, no QEMU) and SoC model (`starfive-jh7110/`). The CPU, the microSD
 card, Gigabit Ethernet, the four USB 3.0 ports (PCIe → VL805) with a keyboard, tablet and USB
 stick, an NVMe SSD in the M.2 slot, Wi-Fi and Bluetooth (the AP6256), audio from the
 headphone jack's PWM DAC, the HDMI output with HDMI audio, and the PowerVR GPU (Vulkan) work.
@@ -138,7 +138,7 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 ## What is modelled
 
 - **`riscv64/`: the hart.**
-  - An interpreter with a fetch-page cache and a 1024-entry TLB.
+  - An interpreter with a fetch-page cache and a 1024-entry TLB, and the JIT (below).
   - Floating point runs on host IEEE arithmetic with RISC-V NaN boxing and canonical NaNs. The other rounding modes and the exception flags come from exact error terms.
 - **`starfive-jh7110/`: interrupts and timers.** The CLINT (`mtime` at 4 MHz) and the PLIC (136 sources, 9 contexts).
 - **`starfive-jh7110/`: the DRAM.** It is visible at 0x4000_0000 and through its uncached alias at +0x4_0000_0000, which the vendor kernel uses for coherent DMA.
@@ -208,11 +208,18 @@ node tools/wasm-smoke-opirv.mjs                         # the same boot, headles
 node tools/wasm-rv-jit-diff.mjs                         # the JIT against the interpreter
 ```
 
-**The JIT** (`riscv64/src/jit.rs`, `jit_wasm.rs`) translates RV64 code to WebAssembly:
+## The JIT
+
+The harts run through a block JIT (`riscv64/src/jit.rs`) with two code generators: RISC-V to
+AArch64 natively on AArch64 macOS and Linux hosts (`jit_a64.rs`; on by default, `--no-jit` or
+`SBC_JIT=0` turns it off) and RISC-V to WebAssembly in the browser build (`jit_wasm.rs`). Other
+hosts interpret.
+
 - **Regions.** A hot entry (64 executions) is compiled with the basic blocks its constant branches
-  reach on the same 4 KiB page, into one wasm function with a dispatch loop, so loops run inside
-  wasm. RV64I, M (not `mulh*`), Zba and Zbb (not `orc.b`, `rev8`) are compiled; CSRs, privileged
-  instructions, AMOs and floating point go to the interpreter one instruction at a time.
+  reach on the same 4 KiB page, so loops run inside compiled code while the cycle budget lasts.
+  Compiled: RV64I, M, Zba and Zbb (natively also `mulh*` and `rev8`; neither backend `orc.b`).
+  CSRs, privileged instructions, AMOs and floating point go to the interpreter one instruction at
+  a time; those that can change the mode, the address space or interrupt lines end the block.
 - **Shared and keyed by physical address.** The four harts share the code, and a page mapped at
   several virtual addresses is compiled once; the code computes PCs from the page's virtual
   address.
@@ -220,20 +227,31 @@ node tools/wasm-rv-jit-diff.mjs                         # the JIT against the in
   the interpreter's page walks; misaligned and device accesses take the interpreter's path.
 - **`fence.i`.** Code stays valid until a `fence.i`, as on the U74. After one, a region is
   compared with the bytes it was compiled from the first time it runs again, so code written by
-  DMA is caught as well as stores.
+  DMA is caught as well as stores. (Linux issues about 9,000 `fence.i`s while it boots, so
+  dropping everything at each one is not an option.)
 
-| Mainline to the BusyBox shell (Node 26, M5) | Wall time | Instructions |
+`cargo test -p riscv64` (natively, with the AArch64 backend; `SBC_JIT_CASES=n` for more) and
+`node tools/wasm-rv-jit-diff.mjs` (the WebAssembly backend) run random programs (integer, M, Zba,
+Zbb, loads and stores with misaligned, page-straddling and device accesses, AMOs, CSRs, compressed
+instructions, branches, jumps and loops) in M mode and in S mode with Sv39, and compare
+registers, counters, CSRs and memory with the interpreter: 120,000 cases natively and 18,000 in
+WebAssembly match.
+
+| Mainline to the BusyBox shell (M5) | Wall time | Instructions |
 |---|---|---|
-| Browser build, interpreter | 53.8 s (118 MIPS) | 6.6 G |
+| Native, interpreter | 29.1 s | 6.7 G |
+| Native, JIT | 7.7 s: the guest's own waits (7.7 s of guest time) now set the pace | 6.7 G |
+| Browser build (Node 26), interpreter | 53.8 s (118 MIPS) | 6.6 G |
 | Browser build, JIT | 9.9 s | 6.6 G |
 | Browser build, JIT, the demo's initramfs | 4.6 s | 1.9 G |
-| Native interpreter, for comparison | 29.1 s | 6.7 G |
 
-`tools/wasm-rv-jit-diff.mjs` runs random programs (integer, M, Zba, Zbb, loads and stores with
-misaligned, page-straddling and device accesses, AMOs, CSRs, compressed instructions, branches,
-jumps and loops) in M mode and in S mode with Sv39, and compares registers, counters, CSRs and
-memory with the interpreter: 18,000 cases match. Natively, `cargo test -p riscv64` runs the same
-programs through the JIT's driver.
+Canonical's Ubuntu 24.04.5 image (`scripts/orangepi-rv-ubuntu.txt`: boot, login, network and
+system checks, 104 G instructions, 112 s of guest time) takes 536 s interpreted and 162 s with
+the native JIT.
+
+CPU-bound, four shell loops of 300,000 iterations on the four harts (about 16 G instructions)
+take 121.5 s interpreted and 14.3 s with the native JIT (8.5 times faster, about 1.6 G
+instructions per second).
 
 ## Not working yet
 
@@ -255,6 +273,6 @@ programs through the JIT's driver.
   - **No HDMI console for mainline after an SD boot.** Mainline U-Boot has no JH7110 display driver, so no framebuffer is handed over and `simpledrm` has nothing to drive. The same is true on the board. Xunlong's kernel on a card drives HDMI itself, and direct boot hands mainline the firmware framebuffer.
   - SD boot needs `--ram-mb` 2048, 4096, 8192 or 16384: U-Boot takes the DRAM size from the EEPROM and knows only those.
 - **Distribution images:** Ubuntu 24.04.5 boots (above). Its own SD-card firmware (`loader1`/`loader2`, U-Boot 2025.10) cannot start on this board: its FIT has configurations for the VisionFive 2, Mars, Star64 and DeepComputing boards only, so SPL stops with error -38, as it would on a real Orange Pi RV; the board's flash firmware boots the image instead. Ubuntu 25.10 and later need the RVA23 profile, which the U74 lacks. Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried.
-- **Speed natively:** interpreter only, about 125 M instructions per second, all harts on one host
-  thread. The JIT exists only in the browser build so far (below), where it reaches the shell about
-  three times sooner than the native interpreter.
+- **Speed:** all harts share one host thread (no `--threads multi` as on the Raspberry Pi 4 and the
+  Orange Pi 5). The JIT keeps guest registers in memory and goes through the driver at every
+  region exit; x86-64 hosts interpret.

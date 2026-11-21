@@ -1,7 +1,7 @@
 //! A differential test of the block JIT: random programs run in the interpreter and through
-//! [`crate::jit::run`], then registers, CSRs, counters and memory are compared. Natively the
-//! driver interprets everything (no code generator), which checks the driver; the browser
-//! build compiles the programs (`tools/wasm-rv-jit-diff.mjs`).
+//! [`crate::jit::run`], then registers, CSRs, counters and memory are compared: natively with
+//! the AArch64 code generator (`cargo test -p riscv64`; elsewhere the driver alone), and in
+//! the browser build with the WebAssembly one (`tools/wasm-rv-jit-diff.mjs`).
 use crate::jit::{self, Jit};
 use crate::{prv, Bus, Hart, Identity};
 
@@ -389,10 +389,14 @@ pub fn run_cases(cases: u32, seed: u64, loops: bool, smode: bool, hot: u32) -> (
 
 #[cfg(test)]
 mod tests {
+    /// On AArch64 hosts this runs the native code generator; elsewhere the driver alone.
+    /// SBC_JIT_CASES sets the cases per configuration (default 300).
     #[test]
-    fn driver_matches_the_interpreter() {
-        for (loops, smode) in [(false, false), (true, false), (false, true), (true, true)] {
-            let (fails, first) = super::run_cases(300, 0x5eed + loops as u64 * 7 + smode as u64 * 13, loops, smode, 1);
+    fn jit_matches_the_interpreter() {
+        let cases = std::env::var("SBC_JIT_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        for (loops, smode, hot) in [(false, false, 1), (true, false, 1), (false, true, 1), (true, true, 1), (true, false, 2), (true, true, 3)] {
+            let seed = 0x5eed + loops as u64 * 7 + smode as u64 * 13 + hot as u64;
+            let (fails, first) = super::run_cases(cases, seed, loops, smode, hot);
             assert_eq!(fails, 0, "{}", first.unwrap_or_default());
         }
     }

@@ -1,8 +1,9 @@
 //! The block JIT's driver: which code is compiled, when compiled code is still valid, and the
 //! loop that runs a hart through compiled blocks and the interpreter.
 //!
-//! Only browser builds have a code generator so far (`jit_wasm.rs`: RISC-V to WebAssembly);
-//! elsewhere [`AVAILABLE`] is false and [`run`] is never used.
+//! Two code generators share this driver: `jit_a64.rs` (RISC-V to AArch64, on AArch64 macOS
+//! and Linux hosts) and `jit_wasm.rs` (RISC-V to WebAssembly, browser builds). Elsewhere
+//! [`AVAILABLE`] is false and [`run`] interprets everything.
 //!
 //! - **Keyed by physical address.** A compiled region lies in one 4 KiB page and is found by
 //!   the physical address of its entry, so the four harts share it and a page mapped at
@@ -20,9 +21,50 @@
 use crate::mmu::{UT, UT_TABLES, U_EMPTY};
 use crate::{rvc, Access, Bus, Hart};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
-/// Whether this build can compile (browser builds).
-pub const AVAILABLE: bool = cfg!(target_arch = "wasm32");
+/// A hasher for physical addresses (the default SipHash dominated the dispatch).
+#[derive(Default)]
+struct PaHasher(u64);
+
+impl Hasher for PaHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(self.0 ^ b as u64);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (v ^ self.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn finish(&self) -> u64 {
+        self.0 ^ self.0 >> 29
+    }
+}
+
+type Map<V> = HashMap<u64, V, BuildHasherDefault<PaHasher>>;
+
+/// Entries of the direct-mapped front cache of compiled regions.
+const FRONT: usize = 4096;
+
+/// A front-cache entry: a region checked in `epoch`, for the entry at physical `pa`.
+#[derive(Clone, Copy)]
+struct Front {
+    pa: u64,
+    f: usize,
+    epoch: u64,
+}
+
+const FRONT_EMPTY: Front = Front { pa: u64::MAX, f: 0, epoch: u64::MAX };
+
+fn front_slot(pa: u64) -> usize {
+    (pa >> 1) as usize & (FRONT - 1)
+}
+
+/// Whether this build can compile (AArch64 macOS and Linux hosts, browser builds).
+pub const AVAILABLE: bool = cfg!(any(target_arch = "wasm32", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))));
+
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+use crate::jit_a64 as native;
 
 /// Executions of a block's entry before it is compiled.
 pub const DEFAULT_HOT: u32 = 64;
@@ -43,7 +85,6 @@ struct Region {
 }
 
 enum Entry {
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     Code(Region),
     /// the entry cannot be compiled (its first instruction straddles the page)
     Never,
@@ -51,8 +92,10 @@ enum Entry {
 
 /// The compiled code of a machine's harts.
 pub struct Jit {
-    blocks: HashMap<u64, Entry>,
-    heat: HashMap<u64, u32>,
+    blocks: Map<Entry>,
+    heat: Map<u32>,
+    /// regions checked in the current epoch, by entry
+    front: Vec<Front>,
     pub hot: u32,
     /// regions compiled since the start
     pub compiled: u64,
@@ -63,19 +106,25 @@ pub struct Jit {
     epoch: u64,
     /// functions installed and not yet freed by a flush
     slots: usize,
+    /// the native code buffer (allocated at the first compile)
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    code: Option<native::CodeCache>,
 }
 
 impl Default for Jit {
     fn default() -> Self {
         Jit {
-            blocks: HashMap::new(),
-            heat: HashMap::new(),
+            blocks: Map::default(),
+            heat: Map::default(),
+            front: vec![FRONT_EMPTY; FRONT],
             hot: DEFAULT_HOT,
             compiled: 0,
             invalidated: 0,
             flushes: 0,
             epoch: 0,
             slots: 0,
+            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            code: None,
         }
     }
 }
@@ -89,9 +138,14 @@ impl Jit {
     pub fn flush(&mut self) {
         self.blocks.clear();
         self.heat.clear();
+        self.front.fill(FRONT_EMPTY);
         if self.slots > 0 {
             #[cfg(target_arch = "wasm32")]
             crate::jit_wasm::reset();
+            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            if let Some(c) = self.code.as_mut() {
+                c.reset();
+            }
             self.flushes += 1;
         }
         self.slots = 0;
@@ -157,6 +211,12 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
             continue;
         }
         let page = (off & !0xfff) as usize;
+        let slot = front_slot(pa);
+        let fr = jit.front[slot];
+        if fr.pa == pa && fr.epoch == jit.epoch {
+            call(h, fr.f);
+            continue;
+        }
         match jit.blocks.get_mut(&pa) {
             Some(Entry::Code(r)) => {
                 if r.epoch != jit.epoch {
@@ -170,13 +230,8 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
                     }
                     r.epoch = jit.epoch;
                 }
-                let f = r.f;
-                h.jit_ut = h.tlb.utlb.as_ptr() as usize + h.utlb_table() * 2 * UT * std::mem::size_of::<crate::mmu::UEntry>();
-                // SAFETY: `f` is a compiled region (in browser builds a function table index of
-                // type (i32) -> i32, which is this ABI); it reads and writes the hart through the
-                // pointer and calls `h_step` with the bus in `jit_bus`, which outlive the call
-                let f: BlockFn = unsafe { std::mem::transmute::<usize, BlockFn>(f) };
-                f(h as *mut Hart);
+                jit.front[slot] = Front { pa, f: r.f, epoch: jit.epoch };
+                call(h, r.f);
             }
             Some(Entry::Never) => interpret_bb(h, bus, end),
             None => {
@@ -187,10 +242,10 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
                     continue;
                 }
                 jit.heat.remove(&pa);
-                if jit.slots >= SLOTS {
+                if cfg!(target_arch = "wasm32") && jit.slots >= SLOTS {
                     jit.flush();
                 }
-                let entry = compile(h, &ram[page..page + 0x1000], pc);
+                let entry = compile(jit, h, &ram[page..page + 0x1000], pc);
                 if let Entry::Code(_) = entry {
                     jit.compiled += 1;
                     jit.slots += 1;
@@ -202,12 +257,39 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
     h.cycle.wrapping_sub(c0)
 }
 
+/// Run the compiled region `f` (the hart's pc is its entry).
+#[inline(always)]
+fn call(h: &mut Hart, f: usize) {
+    h.jit_ut = h.tlb.utlb.as_ptr() as usize + h.utlb_table() * 2 * UT * std::mem::size_of::<crate::mmu::UEntry>();
+    // SAFETY: `f` is a compiled region (natively its address; in browser builds a function
+    // table index of type (i32) -> i32, which is this ABI); it reads and writes the hart through
+    // the pointer and calls `h_step` with the bus in `jit_bus`, which outlive the call
+    let f: BlockFn = unsafe { std::mem::transmute::<usize, BlockFn>(f) };
+    f(h as *mut Hart);
+}
+
 /// Compile the region entered at `pc` (whose page holds `code`).
 #[allow(unused_variables)]
-fn compile(h: &Hart, code: &[u8], pc: u64) -> Entry {
+fn compile(jit: &mut Jit, h: &Hart, code: &[u8], pc: u64) -> Entry {
+    let region = |(f, lo, hi): (usize, u16, u16)| Entry::Code(Region { f, epoch: u64::MAX, lo, bytes: code[lo as usize..hi as usize].into() });
     #[cfg(target_arch = "wasm32")]
-    if let Some((f, lo, hi)) = crate::jit_wasm::compile(code, pc, h.jit_step as u32) {
-        return Entry::Code(Region { f, epoch: u64::MAX, lo, bytes: code[lo as usize..hi as usize].into() });
+    if let Some(r) = crate::jit_wasm::compile(code, pc, h.jit_step as u32) {
+        return region(r);
+    }
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    {
+        if jit.code.is_none() {
+            jit.code = native::CodeCache::new(native::CODE_BYTES);
+        }
+        for _ in 0..2 {
+            let Some(cache) = jit.code.as_mut() else { break };
+            match native::compile(cache, code, pc, h.jit_step) {
+                Ok(r) => return region(r),
+                Err(native::Fail::Never) => break,
+                // the buffer is full: start again with an empty one
+                Err(native::Fail::Full) => jit.flush(),
+            }
+        }
     }
     Entry::Never
 }
@@ -296,7 +378,7 @@ extern "C" fn h_step<B: Bus>(hart: *mut Hart, info: i32) -> i32 {
                 if o < ram.len() as u64 {
                     let host = ram.as_ptr() as usize + (o as usize & !0xfff);
                     let table = h.utlb_table();
-                    h.tlb.ufill(table, store, va, host as u32);
+                    h.tlb.ufill(table, store, va, host as u64);
                 }
             }
         }

@@ -45,6 +45,9 @@ impl SerialBoard for Machine {
     }
     fn report(&self, tag: &str) {
         eprintln!("[{tag}] insns={} virtual={:.3}s", Machine::instret(self), self.now() as f64 / 1e9);
+        if let Some((compiled, invalidated, flushes)) = self.jit_stats() {
+            eprintln!("[{tag}] JIT: {compiled} regions compiled, {invalidated} dropped after their code changed, {flushes} full flushes");
+        }
         for (h, hart) in self.harts.iter().enumerate() {
             if self.state[h] == HartState::Off {
                 continue;
@@ -198,8 +201,11 @@ fn execute(args: &[String]) -> Result<(), String> {
     let usb_drive = arg(args, "--usb-drive");
     // --nvme IMAGE: an NVMe SSD in the M.2 slot (copy-on-write; each boot starts from the image)
     let nvme = arg(args, "--nvme");
+    // the RV64 JIT (AArch64 hosts): on unless --no-jit or SBC_JIT=0
+    let jit = riscv64::jit::AVAILABLE && !args.iter().any(|a| a == "--no-jit") && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::new(ram);
+        m.set_jit(jit);
         if let Some(path) = usb_drive {
             let d = crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?;
             m.soc.attach_usb_drive(Box::new(d));
@@ -236,8 +242,9 @@ fn execute(args: &[String]) -> Result<(), String> {
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(
-        "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC interpreter, Sv39), CLINT, PLIC, UART0, \
-         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware, or the boot ROM, U-Boot SPL and U-Boot from --sd; other devices are stubs"
+        "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC, Sv39, {}), CLINT, PLIC, UART0, \
+         clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware, or the boot ROM, U-Boot SPL and U-Boot from --sd; other devices are stubs",
+        if jit { "JIT to AArch64" } else { "interpreter" }
     );
     serial_board::run(config, make_machine)
 }
