@@ -3,49 +3,400 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sbc-emu boards</title>
-<meta name="description" content="Single-board computers emulated in your browser: pick a board, press Power on, and it runs Linux.">
+<title>sbc-emu</title>
+<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. Two of them boot in your browser.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  :root { --mask: #103b2c; --mask-2: #17493a; --silk: #eef0e6; --silk-2: #9db5a8; --gold: #d4af5a; }
+  :root {
+    --mask: #103b2c;        /* solder mask */
+    --mask-3: #0b2a1f;      /* recessed */
+    --drill: #061a13;       /* a hole through the board */
+    --silk: #eef0e6;        /* silkscreen */
+    --silk-2: #9db5a8;      /* faded silkscreen */
+    --gold: #d4af5a;        /* ENIG pads: everything you can press */
+    --copper: #c2774a;      /* traces */
+    --lit: #ff9d57;         /* a power LED that is on */
+    --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+    --body: "Atkinson Hyperlegible", system-ui, sans-serif;
+    --edge: var(--silk-2);
+    --mm: 2.05px;           /* drawing scale: one millimetre of board */
+  }
   * { box-sizing: border-box; }
   html { background: var(--mask); }
-  body { margin: 0; color: var(--silk); font: 16px/1.5 system-ui, -apple-system, sans-serif;
-    background: radial-gradient(circle at 1px 1px, rgba(238,240,230,.06) 1px, transparent 1.4px) 0 0 / 22px 22px, var(--mask); }
-  main { max-width: 900px; margin: 0 auto; padding: 28px 16px 48px; }
-  h1 { font-size: clamp(30px, 6vw, 46px); line-height: 1.05; margin: 0 0 10px; }
-  .lede { margin: 0 0 26px; color: var(--silk-2); font-size: 18px; max-width: 40rem; }
-  a { color: var(--gold); }
-  .boards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
-  .card { display: flex; flex-direction: column; gap: 6px; padding: 18px; border: 2px solid var(--silk-2); border-radius: 8px; background: var(--mask-2); color: var(--silk); text-decoration: none; }
-  .card:hover, .card:focus-visible { border-color: var(--gold); }
-  .card h2 { margin: 0; font-size: 22px; }
-  .card .chip { color: var(--gold); font: 600 14px/1.3 ui-monospace, Menlo, monospace; }
-  .card p { margin: 0; color: var(--silk-2); font-size: 15px; }
-  .card .go { margin-top: auto; padding-top: 8px; color: var(--gold); font-weight: 600; }
-  .soon { margin: 26px 0 0; color: var(--silk-2); }
-  footer { margin-top: 30px; color: var(--silk-2); font-size: 14px; }
+  body {
+    margin: 0; color: var(--silk); font: 17px/1.55 var(--body);
+    background:
+      radial-gradient(circle at 1px 1px, rgba(238,240,230,.06) 1px, transparent 1.4px) 0 0 / 22px 22px,
+      var(--mask);
+  }
+  a { color: var(--gold); text-underline-offset: 3px; }
+  a:hover { color: var(--silk); }
+  :focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px; }
+
+  header.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 0 0; }
+  .mark { display: flex; align-items: center; gap: 12px; text-decoration: none; color: var(--silk); }
+  .mark b { font: 700 28px/1 var(--display); letter-spacing: .02em; }
+  nav.top { display: flex; gap: 22px; font: 600 18px/1 var(--display); letter-spacing: .03em; }
+  nav.top a { color: var(--silk-2); text-decoration: none; }
+  nav.top a:hover { color: var(--gold); }
+
+  /* hero */
+  .intro { padding: 56px 0 34px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 30rem); gap: 28px 56px; align-items: end; }
+  h1 { font: 800 clamp(52px, 8.6vw, 128px)/.86 var(--display); letter-spacing: -.012em; margin: 0; text-wrap: balance; max-width: 10ch; }
+  .intro p { margin: 0; color: var(--silk-2); font-size: 19px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px 22px; align-items: center; margin-top: 28px; }
+  .pad-btn { display: inline-flex; align-items: center; gap: 10px; font: 700 22px/1 var(--display); letter-spacing: .04em; color: var(--mask); background: var(--gold);
+    border-radius: 999px; padding: 15px 26px; text-decoration: none; box-shadow: inset 0 -3px 0 rgba(0,0,0,.25); }
+  .pad-btn:hover { background: #e3c374; color: var(--mask); }
+  .pad-btn .via { width: 12px; height: 12px; border-radius: 50%; background: var(--mask); box-shadow: 0 0 0 3px rgba(16,59,44,.3); }
+  .quiet { font: 600 19px/1 var(--display); letter-spacing: .03em; color: var(--silk-2); text-decoration: none; }
+  .quiet:hover { color: var(--gold); }
+  .tally { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 8px 12px; margin: 24px 0 0; font: 600 20px/1.1 var(--display); letter-spacing: .02em; color: var(--silk-2); }
+  .tally dt { color: var(--silk); font-weight: 800; font-size: 40px; line-height: .9; text-align: right; font-variant-numeric: tabular-nums; }
+  .tally dd { margin: 0; align-self: center; }
+
+  /* the bench: every board drawn at the same scale, a lit LED where it runs on this site */
+  .bench { position: relative; border: 2px solid rgba(157,181,168,.45); border-radius: 18px; padding: 38px 30px 22px; background: rgba(11,42,31,.55); }
+  .fid { position: absolute; width: 14px; height: 14px; border-radius: 50%; background: radial-gradient(circle, var(--copper) 0 3px, var(--mask-3) 3.5px 5px, var(--copper) 5.5px); opacity: .8; }
+  .fid.a { top: 12px; left: 12px; } .fid.b { top: 12px; right: 12px; } .fid.c { bottom: 12px; left: 12px; }
+  .lineup { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: center; gap: 26px 22px; }
+  .unit { display: grid; justify-items: center; gap: 10px; text-decoration: none; color: var(--silk-2); font: 600 17px/1.1 var(--display); letter-spacing: .03em; text-align: center; }
+  .unit svg { width: calc(var(--w) * var(--mm)); height: auto; display: block; overflow: visible; }
+  .unit:hover, .unit:focus-visible { --edge: var(--gold); color: var(--gold); }
+  .legend { margin: 24px 0 0; display: flex; flex-wrap: wrap; justify-content: center; gap: 6px 26px; font-size: 15px; color: var(--silk-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .legend i { width: 11px; height: 11px; border-radius: 50%; background: var(--lit); box-shadow: 0 0 8px var(--lit); }
+  .legend i.off { background: #3d2b20; box-shadow: none; }
+
+  /* board drawing parts (these rules also style the <use> copies) */
+  .pcb { fill: #0d3024; stroke: var(--edge); stroke-width: .6; transition: stroke .15s; }
+  .hole { fill: var(--drill); stroke: var(--silk-2); stroke-width: .35; }
+  .chip { fill: #091d16; stroke: var(--silk); stroke-width: .4; }
+  .ram { fill: #091d16; stroke: var(--silk-2); stroke-width: .35; }
+  .can { fill: rgba(238,240,230,.10); stroke: var(--silk-2); stroke-width: .4; }
+  .port { fill: rgba(238,240,230,.07); stroke: var(--silk-2); stroke-width: .45; }
+  .hdr { fill: url(#pins); stroke: var(--silk-2); stroke-width: .3; }
+  .trace { fill: none; stroke: var(--copper); stroke-width: .38; opacity: .6; stroke-linecap: round; stroke-linejoin: round; }
+  .fin { stroke: var(--silk-2); stroke-width: .35; }
+  .lbl { fill: var(--silk); font-family: var(--display); font-weight: 600; font-size: 2.7px; text-anchor: middle; }
+  .lbl.s { font-size: 2.1px; fill: var(--silk-2); }
+  .led { fill: #3d2b20; }
+  .glow { fill: url(#glow); opacity: 0; }
+  .on .led { fill: var(--lit); animation: power .25s ease-out both; animation-delay: calc(var(--i) * 300ms + 500ms); }
+  .on .glow { opacity: 1; animation: glow .25s ease-out both; animation-delay: calc(var(--i) * 300ms + 500ms); }
+  @keyframes power { from { fill: #3d2b20; } to { fill: var(--lit); } }
+  @keyframes glow { from { opacity: 0; } to { opacity: 1; } }
+
+  /* the spec sheets */
+  .section { padding: 72px 0 8px; }
+  .section > h2 { font: 800 clamp(38px, 4.8vw, 60px)/.95 var(--display); margin: 0 0 12px; }
+  .section > p.lede { color: var(--silk-2); max-width: 44rem; margin: 0 0 30px; }
+  .sheet { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 20px 44px; padding: 34px 0; border-top: 1px solid rgba(157,181,168,.25); scroll-margin-top: 16px; }
+  .sheet:target { --edge: var(--gold); }
+  .sheet .art { --mm: 3.3px; }
+  .sheet .art svg { display: block; width: min(100%, calc(var(--w) * var(--mm))); height: auto; overflow: visible; }
+  .sheet h3 { font: 700 clamp(30px, 3.4vw, 40px)/1 var(--display); margin: 0 0 6px; letter-spacing: .005em; }
+  .status { font: 600 18px/1.2 var(--display); letter-spacing: .03em; color: var(--silk-2); margin: 0 0 18px; display: flex; align-items: center; gap: 9px; }
+  .status i { width: 10px; height: 10px; border-radius: 50%; background: #3d2b20; flex: none; }
+  .sheet.live .status { color: var(--lit); }
+  .sheet.live .status i { background: var(--lit); box-shadow: 0 0 8px var(--lit); }
+  .sheet.live .led { fill: var(--lit); }
+  .sheet.live .glow { opacity: 1; }
+  .spec { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0 0 18px; border: 1.5px solid rgba(157,181,168,.45); border-radius: 10px; overflow: hidden; }
+  .spec div { padding: 10px 14px; border-right: 1px solid rgba(157,181,168,.25); }
+  .spec div:last-child { border-right: 0; }
+  .spec dt { font: 600 15px/1.2 var(--display); letter-spacing: .04em; color: var(--silk-2); }
+  .spec dd { margin: 2px 0 0; font: 600 19px/1.2 var(--display); letter-spacing: .01em; }
+  .sheet p { margin: 0 0 10px; max-width: 46rem; }
+  .run { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; margin-top: 18px; }
+  .run .pad-btn { font-size: 20px; padding: 13px 22px; }
+  .run small { color: var(--silk-2); font-size: 15px; max-width: 30rem; }
+
+  /* the cores */
+  .cores { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 2px solid var(--silk-2); border-radius: 14px; overflow: hidden; }
+  .core { padding: 20px; border-right: 1px solid rgba(157,181,168,.3); }
+  .core:last-child { border-right: 0; }
+  .core h3 { font: 700 26px/1 var(--display); margin: 0 0 4px; color: var(--gold); }
+  .core code { font: 14px ui-monospace, "SF Mono", Menlo, monospace; color: var(--silk-2); }
+  .core p { margin: 12px 0 0; font-size: 15px; color: var(--silk-2); line-height: 1.45; }
+  .core p strong { color: var(--silk); }
+
+  footer { margin-top: 72px; padding: 30px 0 48px; color: var(--silk-2); font-size: 15px; border-top: 1px solid rgba(157,181,168,.25); }
+  footer p { margin: 0 0 8px; max-width: 56rem; }
+
+  @media (max-width: 1100px) { :root { --mm: 1.9px; } }
+  @media (max-width: 920px) {
+    .intro { grid-template-columns: 1fr; padding-top: 34px; }
+    .sheet { grid-template-columns: 1fr; }
+    .sheet .art { --mm: 2.6px; }
+    .spec { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .spec div:nth-child(2) { border-right: 0; }
+    .spec div:nth-child(-n+2) { border-bottom: 1px solid rgba(157,181,168,.25); }
+    .cores { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .core:nth-child(2) { border-right: 0; }
+    .core:nth-child(-n+2) { border-bottom: 1px solid rgba(157,181,168,.3); }
+  }
+  @media (max-width: 640px) {
+    :root { --mm: 1.45px; }
+    .wrap { padding: 0 16px; }
+    nav.top { gap: 14px; font-size: 17px; }
+    .tally { grid-template-columns: auto 1fr; }
+    .bench { padding: 32px 10px 18px; }
+    .lineup { gap: 20px 14px; }
+    .unit { font-size: 15px; }
+    .cores { grid-template-columns: 1fr; }
+    .core { border-right: 0; border-bottom: 1px solid rgba(157,181,168,.3); }
+    .core:last-child { border-bottom: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { .on .led, .on .glow { animation: none; } }
 </style>
 </head>
 <body>
-<main>
-  <h1>sbc-emu: single-board computers in your browser</h1>
-  <p class="lede">Each board is emulated down to the registers its Linux drivers use, by a pure-Rust emulator compiled to WebAssembly. Pick one and press Power on: it runs Linux on your computer, not on a server.</p>
-  <div class="boards">
-    <a class="card" href="hello.html">
-      <h2>Raspberry Pi 4</h2>
-      <span class="chip">Broadcom BCM2711 · 4× Cortex-A72 · 64-bit Arm</span>
-      <p>The Pi’s own kernel and a BusyBox shell on its HDMI screen, resumed from a snapshot. Type on its USB keyboard.</p>
-      <span class="go">Open · 16 MB</span>
+<!-- The boards, drawn once in millimetres and reused: outline, mounting holes, SoC, RAM, connectors. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <pattern id="pins" width="2.54" height="2.54" patternUnits="userSpaceOnUse"><rect x=".52" y=".52" width="1.5" height="1.5" rx=".2" fill="#d4af5a"/></pattern>
+    <radialGradient id="glow"><stop offset="0" stop-color="#ff9d57" stop-opacity=".75"/><stop offset="1" stop-color="#ff9d57" stop-opacity="0"/></radialGradient>
+
+    <symbol id="b-pi4" viewBox="0 0 85 56">
+      <rect class="pcb" x=".3" y=".3" width="84.4" height="55.4" rx="3"/>
+      <circle class="hole" cx="3.5" cy="3.5" r="1.4"/><circle class="hole" cx="61.5" cy="3.5" r="1.4"/><circle class="hole" cx="3.5" cy="52.5" r="1.4"/><circle class="hole" cx="61.5" cy="52.5" r="1.4"/>
+      <rect class="hdr" transform="translate(7.6 1)" width="50.8" height="5.08"/>
+      <path class="trace" d="M37 30h8l4 4h14M37 22h6l3-3h20M27 33v10l-4 4v2M33 33v12M22 25h-8l-4 4v12"/>
+      <rect class="chip" x="22" y="18" width="15" height="15" rx=".6"/><text class="lbl" x="29.5" y="26.4">BCM2711</text>
+      <rect class="ram" x="42" y="12" width="12" height="11" rx=".5"/>
+      <rect class="port" x="66" y="3" width="18.7" height="14" rx=".6"/><rect class="port" x="66" y="20.5" width="18.7" height="14" rx=".6"/><rect class="port" x="63.5" y="38" width="21.2" height="16" rx=".6"/>
+      <rect class="port" x="6.5" y="48.5" width="9" height="7.2" rx="2.5"/><rect class="port" x="22" y="50" width="7" height="5.7" rx="1"/><rect class="port" x="35.5" y="50" width="7" height="5.7" rx="1"/><rect class="port" x="50" y="47" width="7" height="8.7" rx="3.5"/>
+    </symbol>
+
+    <symbol id="b-opi1" viewBox="0 0 69 48">
+      <rect class="pcb" x=".3" y=".3" width="68.4" height="47.4" rx="2.5"/>
+      <circle class="hole" cx="3" cy="3" r="1.4"/><circle class="hole" cx="66" cy="3" r="1.4"/><circle class="hole" cx="3" cy="45" r="1.4"/><circle class="hole" cx="66" cy="45" r="1.4"/>
+      <rect class="hdr" transform="translate(7.6 .8)" width="50.8" height="5.08"/>
+      <path class="trace" d="M28 27h4M21 31v6l3 3v1M28 21h6l3-3h14M14 24H9l-2 2v6"/>
+      <rect class="chip" x="14" y="17" width="14" height="14" rx=".6"/><text class="lbl" x="21" y="25">H3</text>
+      <rect class="ram" x="32" y="22" width="9" height="11" rx=".5"/>
+      <rect class="port" x="53" y="9" width="15.7" height="13" rx=".6"/><rect class="port" x="51" y="26" width="17.7" height="15" rx=".6"/>
+      <rect class="port" x="17" y="41" width="15" height="6.7" rx="1"/><rect class="port" x="38" y="42.5" width="8" height="5.2" rx="1"/>
+    </symbol>
+
+    <symbol id="b-rv" viewBox="0 0 89 56">
+      <rect class="pcb" x=".3" y=".3" width="88.4" height="55.4" rx="3"/>
+      <circle class="hole" cx="3.5" cy="3.5" r="1.4"/><circle class="hole" cx="61.5" cy="3.5" r="1.4"/><circle class="hole" cx="3.5" cy="52.5" r="1.4"/><circle class="hole" cx="61.5" cy="52.5" r="1.4"/>
+      <rect class="hdr" transform="translate(7.6 1)" width="50.8" height="5.08"/>
+      <path class="trace" d="M36 30h10l4 4h17M36 21h8l3-3h23M27 33v12M20 26h-7l-3 3v10"/>
+      <rect class="chip" x="20" y="17" width="16" height="16" rx=".6"/><text class="lbl" x="28" y="25.4">JH7110</text><text class="lbl s" x="28" y="28.6">RISC-V</text>
+      <rect class="ram" x="41" y="21" width="12" height="11" rx=".5"/>
+      <rect class="port" x="70" y="3" width="18.7" height="14" rx=".6"/><rect class="port" x="70" y="20.5" width="18.7" height="14" rx=".6"/><rect class="port" x="67.5" y="38" width="21.2" height="16" rx=".6"/>
+      <rect class="port" x="6.5" y="48.5" width="9" height="7.2" rx="2.5"/><rect class="port" x="22" y="49" width="15" height="6.7" rx="1"/>
+      <rect class="ram" x="42" y="38" width="20" height="8" rx=".8"/><text class="lbl s" x="52" y="42.8">M.2</text>
+    </symbol>
+
+    <symbol id="b-tinker" viewBox="0 0 85 56">
+      <rect class="pcb" x=".3" y=".3" width="84.4" height="55.4" rx="3"/>
+      <circle class="hole" cx="3.5" cy="3.5" r="1.4"/><circle class="hole" cx="61.5" cy="3.5" r="1.4"/><circle class="hole" cx="3.5" cy="52.5" r="1.4"/><circle class="hole" cx="61.5" cy="52.5" r="1.4"/>
+      <rect class="hdr" transform="translate(7.6 1)" width="50.8" height="5.08"/>
+      <path class="trace" d="M41 30h6l4 4h12M41 22h4l3-3h18M30 38v11M17 28h-5l-2 2v10"/>
+      <rect class="can" x="17" y="12" width="24" height="26" rx="1"/>
+      <path class="fin" d="M19 14v22M22 14v22M25 14v22M28 14v22M31 14v22M34 14v22M37 14v22"/>
+      <rect class="chip" x="22.5" y="19.5" width="13" height="11" rx=".5"/><text class="lbl" x="29" y="26">RK3288</text>
+      <rect class="port" x="66" y="3" width="18.7" height="14" rx=".6"/><rect class="port" x="66" y="20.5" width="18.7" height="14" rx=".6"/><rect class="port" x="63.5" y="38" width="21.2" height="16" rx=".6"/>
+      <rect class="port" x="6" y="50" width="8" height="5.7" rx="1"/><rect class="port" x="23" y="49" width="15" height="6.7" rx="1"/><rect class="port" x="50" y="47" width="7" height="8.7" rx="3.5"/>
+    </symbol>
+
+    <symbol id="b-opi5" viewBox="0 0 100 62">
+      <rect class="pcb" x=".3" y=".3" width="99.4" height="61.4" rx="3"/>
+      <circle class="hole" cx="3.5" cy="3.5" r="1.4"/><circle class="hole" cx="96.5" cy="3.5" r="1.4"/><circle class="hole" cx="3.5" cy="58.5" r="1.4"/><circle class="hole" cx="96.5" cy="58.5" r="1.4"/>
+      <rect class="hdr" transform="translate(35.6 1)" width="33.02" height="5.08"/>
+      <path class="trace" d="M47 34h12l5 5h14M47 25h12l4-4h18M38 41v10l-3 3v1M44 41v14M28 30h-12l-4 4v10"/>
+      <rect class="chip" x="28" y="21" width="19" height="20" rx=".7"/><text class="lbl" x="37.5" y="30.4">RK3588S</text><text class="lbl s" x="37.5" y="34">8 cores</text>
+      <rect class="ram" x="52" y="10" width="11" height="9" rx=".5"/><rect class="ram" x="52" y="42" width="11" height="9" rx=".5"/>
+      <rect class="port" x="81" y="4" width="18.7" height="13" rx=".6"/><rect class="port" x="81" y="20" width="18.7" height="15" rx=".6"/><rect class="port" x="78.5" y="39" width="21.2" height="16" rx=".6"/>
+      <rect class="port" x="10" y="55" width="9" height="6.7" rx="2.5"/><rect class="port" x="40" y="55" width="15" height="6.7" rx="1"/><rect class="port" x="62" y="55" width="9" height="6.7" rx="2.5"/>
+    </symbol>
+
+    <symbol id="b-s31" viewBox="0 0 26 58">
+      <rect class="pcb" x=".3" y=".3" width="25.4" height="57.4" rx="1.6"/>
+      <rect class="hdr" transform="translate(.5 3)" width="2.54" height="50.8"/><rect class="hdr" transform="translate(22.96 3)" width="2.54" height="50.8"/>
+      <path class="trace" d="M11 25v6l-3 3v10M15 25v8l2 2v9"/>
+      <rect class="can" x="5" y="3.5" width="16" height="21" rx=".6"/><text class="lbl" x="13" y="13">ESP32</text><text class="lbl" x="13" y="16.4">S31</text>
+      <rect class="ram" x="8" y="33" width="10" height="7" rx=".5"/>
+      <rect class="port" x="6" y="44" width="4" height="3" rx=".5"/><rect class="port" x="16" y="44" width="4" height="3" rx=".5"/>
+      <rect class="port" x="8.5" y="50.5" width="9" height="7.2" rx="2.5"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <header class="top">
+    <a class="mark" href="./" aria-label="sbc-emu home">
+      <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><rect x="5" y="5" width="24" height="24" rx="3" fill="none" stroke="#eef0e6" stroke-width="2"/><rect x="11" y="11" width="12" height="12" rx="1" fill="#d4af5a"/><g stroke="#eef0e6" stroke-width="2" stroke-linecap="round"><path d="M12 1v4M17 1v4M22 1v4M12 29v4M17 29v4M22 29v4M1 12h4M1 17h4M1 22h4M29 12h4M29 17h4M29 22h4"/></g></svg>
+      <b>sbc-emu</b>
     </a>
-    <a class="card" href="board.html?b=orangepi-one">
-      <h2>Orange Pi One</h2>
-      <span class="chip">Allwinner H3 · 4× Cortex-A7 · 32-bit Arm</span>
-      <p>Alpine Linux’s kernel booting from scratch, in about 5 seconds, to a shell on the serial console.</p>
-      <span class="go">Open · 14 MB</span>
-    </a>
-  </div>
-  <p class="soon">Coming to this page: the ASUS Tinker Board, the Orange Pi 5 (eight cores) and the RISC-V Orange Pi RV. They already run in the native emulator, with their GPUs.</p>
-  <footer><a href="https://github.com/joakimeriksson/sbc-emu">Source on GitHub</a> · <a href="sources.html">What runs here, and its licences</a> · Raspberry Pi, Orange Pi, Broadcom and Allwinner are trademarks of their owners; sbc-emu is an independent project, not affiliated with any of them.</footer>
-</main>
+    <nav class="top" aria-label="Site">
+      <a href="#boards">Boards</a>
+      <a href="#cores">Cores</a>
+      <a href="https://github.com/joakimeriksson/sbc-emu">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="intro">
+    <div>
+      <h1>Real boards, emulated to the register</h1>
+      <div class="actions">
+        <a class="pad-btn" href="hello.html"><span class="via" aria-hidden="true"></span>Power on a Raspberry Pi 4</a>
+        <a class="quiet" href="#boards">See all six boards</a>
+      </div>
+    </div>
+    <div>
+      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. Two of the boards boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
+      <dl class="tally">
+        <dt>6</dt><dd>boards</dd>
+        <dt>4</dt><dd>instruction sets</dd>
+        <dt>5</dt><dd>GPUs</dd>
+        <dt>0</dt><dd>lines of QEMU</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="bench" aria-label="The boards, drawn to the same scale">
+    <span class="fid a" aria-hidden="true"></span><span class="fid b" aria-hidden="true"></span><span class="fid c" aria-hidden="true"></span>
+    <ul class="lineup">
+      <li><a class="unit on" href="#pi4" style="--w:85;--i:0"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-pi4"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Raspberry Pi 4</a></li>
+      <li><a class="unit on" href="#orangepi-one" style="--w:69;--i:1"><svg viewBox="0 0 69 48" aria-hidden="true"><use href="#b-opi1"/><circle class="glow" cx="5" cy="37" r="4"/><circle class="led" cx="5" cy="37" r="1.1"/></svg>Orange Pi One</a></li>
+      <li><a class="unit" href="#orangepi-rv" style="--w:89"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
+      <li><a class="unit" href="#tinkerboard" style="--w:85"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
+      <li><a class="unit" href="#orangepi5" style="--w:100"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
+      <li><a class="unit" href="#esp32s31" style="--w:26"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
+    </ul>
+    <p class="legend"><span><i aria-hidden="true"></i>Boots in your browser, on this site</span><span><i class="off" aria-hidden="true"></i>Runs in the native emulator</span></p>
+  </section>
+
+  <section class="section" id="boards" aria-labelledby="boards-h">
+    <h2 id="boards-h">The boards</h2>
+    <p class="lede">Each board is modelled down to the registers its Linux drivers touch: interrupt controller, timers, storage, display, USB, network and, on most of them, the GPU. The goal everywhere is the stock image, booted unmodified.</p>
+
+    <article class="sheet live" id="pi4">
+      <div class="art"><svg viewBox="0 0 85 56" style="--w:85" aria-hidden="true"><use href="#b-pi4"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg></div>
+      <div>
+        <h3>Raspberry Pi 4 Model B</h3>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>Broadcom BCM2711</dd></div>
+          <div><dt>CPU</dt><dd>4 × Cortex-A72</dd></div>
+          <div><dt>Instruction set</dt><dd>64-bit Arm</dd></div>
+          <div><dt>GPU</dt><dd>V3D 4.2: GLES 3.1, Vulkan 1.3</dd></div>
+        </dl>
+        <p>The furthest along. Unmodified Raspberry Pi OS, and Ubuntu 26.04 Desktop with GNOME on Wayland drawn by Mesa on the emulated GPU. HDMI, USB, Ethernet, Wi-Fi, Bluetooth, audio, GPIO, I²C and SPI all run on their stock drivers.</p>
+        <div class="run">
+          <a class="pad-btn" href="hello.html"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>The Pi’s own kernel and a BusyBox shell on its HDMI screen, resumed from a 16 MB snapshot.</small>
+        </div>
+      </div>
+    </article>
+
+    <article class="sheet live" id="orangepi-one">
+      <div class="art"><svg viewBox="0 0 69 48" style="--w:69" aria-hidden="true"><use href="#b-opi1"/><circle class="glow" cx="5" cy="37" r="4"/><circle class="led" cx="5" cy="37" r="1.1"/></svg></div>
+      <div>
+        <h3>Orange Pi One</h3>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>Allwinner H3</dd></div>
+          <div><dt>CPU</dt><dd>4 × Cortex-A7</dd></div>
+          <div><dt>Instruction set</dt><dd>32-bit Arm, Thumb-2</dd></div>
+          <div><dt>GPU</dt><dd>Mali-400: kmscube on lima</dd></div>
+        </dl>
+        <p>The unmodified Armbian image to its login prompt, with the HDMI console, a USB keyboard and Ethernet. Its 32-bit core has its own JIT, to AArch64 natively and to WebAssembly in the browser.</p>
+        <div class="run">
+          <a class="pad-btn" href="board.html?b=orangepi-one"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>Alpine’s kernel boots from scratch to a serial shell in about five seconds. A 14 MB download.</small>
+        </div>
+      </div>
+    </article>
+
+    <article class="sheet" id="orangepi-rv">
+      <div class="art"><svg viewBox="0 0 89 56" style="--w:89" aria-hidden="true"><use href="#b-rv"/><circle class="led" cx="5" cy="42" r="1.1"/></svg></div>
+      <div>
+        <h3>Orange Pi RV</h3>
+        <p class="status"><i aria-hidden="true"></i>Native emulator; browser version on its way</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>StarFive JH7110</dd></div>
+          <div><dt>CPU</dt><dd>4 × SiFive U74</dd></div>
+          <div><dt>Instruction set</dt><dd>64-bit RISC-V</dd></div>
+          <div><dt>GPU</dt><dd>PowerVR BXE-4-32: Vulkan, vkcube</dd></div>
+        </dl>
+        <p>The board’s whole boot chain from the SD card: boot ROM, U-Boot SPL with DDR init, OpenSBI and U-Boot, then Alpine’s mainline kernel or Xunlong’s own. Wi-Fi, Bluetooth, USB 3.0, an NVMe SSD and HDMI.</p>
+        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/orangepi-rv.md">How it boots</a></div>
+      </div>
+    </article>
+
+    <article class="sheet" id="tinkerboard">
+      <div class="art"><svg viewBox="0 0 85 56" style="--w:85" aria-hidden="true"><use href="#b-tinker"/><circle class="led" cx="5" cy="44" r="1.1"/></svg></div>
+      <div>
+        <h3>ASUS Tinker Board S</h3>
+        <p class="status"><i aria-hidden="true"></i>Native emulator; browser version on its way</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>Rockchip RK3288</dd></div>
+          <div><dt>CPU</dt><dd>4 × Cortex-A12</dd></div>
+          <div><dt>Instruction set</dt><dd>32-bit Arm, Thumb-2</dd></div>
+          <div><dt>GPU</dt><dd>Mali-T760: Panfrost</dd></div>
+        </dl>
+        <p>The unmodified Armbian image from the SD card or eMMC to a login on its HDMI screen, with the RK808 power controller and real-time clock. Mesa’s Panfrost driver renders kmscube and all 25 scenes of the GLES 2 test suite, matching software rendering.</p>
+        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/rk3288-tinker-board-plan.md">How it boots</a></div>
+      </div>
+    </article>
+
+    <article class="sheet" id="orangepi5">
+      <div class="art"><svg viewBox="0 0 100 62" style="--w:100" aria-hidden="true"><use href="#b-opi5"/><circle class="led" cx="6" cy="48" r="1.1"/></svg></div>
+      <div>
+        <h3>Orange Pi 5</h3>
+        <p class="status"><i aria-hidden="true"></i>Native emulator</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>Rockchip RK3588S</dd></div>
+          <div><dt>CPU</dt><dd>4 × Cortex-A76, 4 × Cortex-A55</dd></div>
+          <div><dt>Instruction set</dt><dd>64-bit Arm</dd></div>
+          <div><dt>GPU</dt><dd>Mali-G610: first GLES frames</dd></div>
+        </dl>
+        <p>Eight cores, big and little, on GICv3. Armbian to its login prompt, with HDMI, USB 3.0, an NVMe SSD in the M.2 slot, Ethernet and audio. Mesa’s first GLES frames from the Mali-G610 reach its HDMI screen.</p>
+        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/orangepi5.md">How it boots</a></div>
+      </div>
+    </article>
+
+    <article class="sheet" id="esp32s31">
+      <div class="art"><svg viewBox="0 0 26 58" style="--w:26" aria-hidden="true"><use href="#b-s31"/><circle class="led" cx="13" cy="29" r="1.1"/></svg></div>
+      <div>
+        <h3>ESP32-S31 Function CoreBoard</h3>
+        <p class="status"><i aria-hidden="true"></i>Native emulator</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>Espressif ESP32-S31</dd></div>
+          <div><dt>CPU</dt><dd>2 × RV32IMAC</dd></div>
+          <div><dt>Instruction set</dt><dd>32-bit RISC-V</dd></div>
+          <div><dt>GPU</dt><dd>None</dd></div>
+        </dl>
+        <p>A microcontroller that runs Linux. Espressif’s official flash image, unmodified, through the chip’s own mask ROM, U-Boot SPL, OpenSBI and U-Boot, to Linux 6.18 executing in place from flash, on both harts.</p>
+        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/esp32s31.md">How it boots</a></div>
+      </div>
+    </article>
+  </section>
+
+  <section class="section" id="cores" aria-labelledby="cores-h">
+    <h2 id="cores-h">Four CPU cores, written from scratch</h2>
+    <p class="lede">The boards share their cores, the snapshot format, the virtual network and this site. A new board is mostly its SoC: the devices between the CPU and the connectors.</p>
+    <div class="cores">
+      <div class="core"><h3>64-bit Arm</h3><code>arm-a64</code><p><strong>Raspberry Pi 4, Orange Pi 5.</strong> ARMv8-A with FP and NEON, exact to Arm’s rounding and NaN rules. A block JIT to AArch64 natively, and to WebAssembly in the browser.</p></div>
+      <div class="core"><h3>32-bit Arm</h3><code>arm-a32</code><p><strong>Orange Pi One, Tinker Board S</strong>, and 32-bit programs on the Pi 4. A32, Thumb-2, VFPv4 and NEON, with JITs to AArch64 and WebAssembly.</p></div>
+      <div class="core"><h3>64-bit RISC-V</h3><code>riscv64</code><p><strong>Orange Pi RV.</strong> RV64GC with the U74’s bit-manipulation extensions and Sv39 paging, under real OpenSBI.</p></div>
+      <div class="core"><h3>32-bit RISC-V</h3><code>riscv-rv32</code><p><strong>ESP32-S31.</strong> RV32IMAC with machine, supervisor and user modes and Sv32 paging, from the esp32sim project.</p></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>The demos run on your computer: the emulator is WebAssembly in a Web Worker, and no server runs the boards. sbc-emu is open source under the BSD 3-Clause licence: <a href="https://github.com/joakimeriksson/sbc-emu">source on GitHub</a>. <a href="sources.html">What runs in the demos, and its licences</a>.</p>
+    <p>Raspberry Pi, Orange Pi, ASUS, Tinker Board, Broadcom, Allwinner, Rockchip, StarFive, SiFive, Arm and Espressif are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them. The board drawings are simplified outlines.</p>
+  </footer>
+</div>
 </body>
 </html>
