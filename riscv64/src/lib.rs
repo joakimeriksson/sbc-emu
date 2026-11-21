@@ -13,6 +13,10 @@
 
 mod exec;
 mod fpu;
+pub mod jit;
+pub mod jit_check;
+#[cfg(target_arch = "wasm32")]
+mod jit_wasm;
 pub mod mmu;
 pub mod rvc;
 
@@ -181,6 +185,19 @@ pub struct Hart {
     fetch_off: usize,
     /// traps taken (exceptions and interrupts), for reports
     pub traps: u64,
+    /// `fence.i` instructions executed, for reports
+    pub fence_i: u64,
+    /// the last instruction went to a device (not RAM): the block JIT leaves after it
+    pub dev_access: bool,
+    /// for compiled code (see `jit.rs`): the micro-TLB table of the current mode (host
+    /// address), the bus and the `h_step` for it, and the cycle count up to which compiled
+    /// regions may loop
+    pub jit_ut: usize,
+    pub jit_bus: usize,
+    pub jit_step: usize,
+    pub chain_until: u64,
+    /// `fence_i` when the JIT last looked
+    pub jit_fence_seen: u64,
     /// the last illegal instruction (pc, encoding), for reports
     pub last_illegal: Option<(u64, u32)>,
 }
@@ -225,6 +242,13 @@ impl Hart {
             fetch_page: u64::MAX,
             fetch_off: 0,
             traps: 0,
+            fence_i: 0,
+            dev_access: false,
+            jit_ut: 0,
+            jit_bus: 0,
+            jit_step: 0,
+            chain_until: 0,
+            jit_fence_seen: 0,
             last_illegal: None,
         }
     }

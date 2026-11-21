@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sbc-emu</title>
-<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. Three of them boot in your browser.">
+<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. Four of them boot in your browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -252,7 +252,7 @@
       </div>
     </div>
     <div>
-      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. Three of the boards boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
+      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. Four of the boards boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
       <dl class="tally">
         <dt>6</dt><dd>boards</dd>
         <dt>4</dt><dd>instruction sets</dd>
@@ -267,8 +267,8 @@
     <ul class="lineup">
       <li><a class="unit on" href="#pi4" style="--w:85;--i:0"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-pi4"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Raspberry Pi 4</a></li>
       <li><a class="unit on" href="#orangepi-one" style="--w:69;--i:1"><svg viewBox="0 0 69 48" aria-hidden="true"><use href="#b-opi1"/><circle class="glow" cx="5" cy="37" r="4"/><circle class="led" cx="5" cy="37" r="1.1"/></svg>Orange Pi One</a></li>
-      <li><a class="unit" href="#orangepi-rv" style="--w:89"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
-      <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:2"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
+      <li><a class="unit on" href="#orangepi-rv" style="--w:89;--i:2"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
+      <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:3"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
       <li><a class="unit" href="#orangepi5" style="--w:100"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
       <li><a class="unit" href="#esp32s31" style="--w:26"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
     </ul>
@@ -317,11 +317,11 @@
       </div>
     </article>
 
-    <article class="sheet" id="orangepi-rv">
-      <div class="art"><svg viewBox="0 0 89 56" style="--w:89" aria-hidden="true"><use href="#b-rv"/><circle class="led" cx="5" cy="42" r="1.1"/></svg></div>
+    <article class="sheet live" id="orangepi-rv">
+      <div class="art"><svg viewBox="0 0 89 56" style="--w:89" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg></div>
       <div>
         <h3>Orange Pi RV</h3>
-        <p class="status"><i aria-hidden="true"></i>Native emulator; browser version on its way</p>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
         <dl class="spec">
           <div><dt>SoC</dt><dd>StarFive JH7110</dd></div>
           <div><dt>CPU</dt><dd>4 × SiFive U74</dd></div>
@@ -329,7 +329,10 @@
           <div><dt>GPU</dt><dd>PowerVR BXE-4-32: Vulkan, vkcube</dd></div>
         </dl>
         <p>The board’s whole boot chain from the SD card: boot ROM, U-Boot SPL with DDR init, OpenSBI and U-Boot, then Alpine’s mainline kernel or Xunlong’s own. Wi-Fi, Bluetooth, USB 3.0, an NVMe SSD and HDMI.</p>
-        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/orangepi-rv.md">How it boots</a></div>
+        <div class="run">
+          <a class="pad-btn" href="board.html?b=orangepi-rv"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>OpenSBI and Alpine’s mainline kernel boot from scratch to a serial shell in about five seconds. A 17 MB download.</small>
+        </div>
       </div>
     </article>
 
@@ -391,7 +394,7 @@
     <div class="cores">
       <div class="core"><h3>64-bit Arm</h3><code>arm-a64</code><p><strong>Raspberry Pi 4, Orange Pi 5.</strong> ARMv8-A with FP and NEON, exact to Arm’s rounding and NaN rules. A block JIT to AArch64 natively, and to WebAssembly in the browser.</p></div>
       <div class="core"><h3>32-bit Arm</h3><code>arm-a32</code><p><strong>Orange Pi One, Tinker Board S</strong>, and 32-bit programs on the Pi 4. A32, Thumb-2, VFPv4 and NEON, with JITs to AArch64 and WebAssembly.</p></div>
-      <div class="core"><h3>64-bit RISC-V</h3><code>riscv64</code><p><strong>Orange Pi RV.</strong> RV64GC with the U74’s bit-manipulation extensions and Sv39 paging, under real OpenSBI.</p></div>
+      <div class="core"><h3>64-bit RISC-V</h3><code>riscv64</code><p><strong>Orange Pi RV.</strong> RV64GC with the U74’s bit-manipulation extensions and Sv39 paging, under real OpenSBI. A block JIT to WebAssembly in the browser.</p></div>
       <div class="core"><h3>32-bit RISC-V</h3><code>riscv-rv32</code><p><strong>ESP32-S31.</strong> RV32IMAC with machine, supervisor and user modes and Sv32 paging, from the esp32sim project.</p></div>
     </div>
   </section>

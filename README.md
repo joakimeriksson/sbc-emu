@@ -7,8 +7,8 @@ cores and register-level models of each board's chips, and runs the boards' own 
 systems unmodified: Raspberry Pi OS, Ubuntu, Armbian, Alpine. No QEMU.
 
 **Try it in your browser: [joakimeriksson.github.io/sbc-emu](https://joakimeriksson.github.io/sbc-emu/).**
-The Raspberry Pi 4, the Orange Pi One and the ASUS Tinker Board S boot there in seconds, on your
-own computer.
+The Raspberry Pi 4, the Orange Pi One, the ASUS Tinker Board S and the RISC-V Orange Pi RV boot
+there in seconds, on your own computer.
 
 <table>
 <tr>
@@ -30,7 +30,7 @@ own computer.
 | Raspberry Pi 4 Model B | Broadcom BCM2711, 4× Cortex-A72 | Raspberry Pi OS and Ubuntu 26.04 Desktop; the V3D GPU with OpenGL ES 3.1 and Vulkan 1.3; HDMI, USB, network, audio. Also in the browser. | [raspberry-pi-4.md](docs/raspberry-pi-4.md) |
 | Orange Pi 5 | Rockchip RK3588S, 4× Cortex-A76 + 4× A55 | Armbian to its login prompt on eight cores; HDMI, USB 3.0, NVMe, audio; the Mali-G610 GPU in bring-up, GLES scenes on HDMI | [orangepi5.md](docs/orangepi5.md) |
 | Orange Pi One | Allwinner H3, 4× Cortex-A7 | Armbian to its login prompt; HDMI, USB, Ethernet; the Mali-400 GPU. Also in the browser. | [orangepi-one.md](docs/orangepi-one.md) |
-| Orange Pi RV | StarFive JH7110, 4× SiFive U74 (RISC-V) | the board's own boot chain from the SD card to Alpine or Xunlong's kernel; Wi-Fi, NVMe; the PowerVR GPU with Vulkan | [orangepi-rv.md](docs/orangepi-rv.md) |
+| Orange Pi RV | StarFive JH7110, 4× SiFive U74 (RISC-V) | the board's own boot chain from the SD card to Alpine or Xunlong's kernel; Wi-Fi, NVMe; the PowerVR GPU with Vulkan. Also in the browser. | [orangepi-rv.md](docs/orangepi-rv.md) |
 | ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12 | Armbian from SD or eMMC to a login on HDMI; the Mali-T760 GPU with Panfrost. Also in the browser. | [rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
 | ESP32-S31 Function CoreBoard | Espressif ESP32-S31, 2× RV32IMAC | Espressif's official Linux flash image, from the mask ROM to a shell | [esp32s31.md](docs/esp32s31.md) |
 
@@ -60,7 +60,7 @@ tools/site-build.sh && python3 -m http.server -d out/site 8792
 - **Four CPU cores, written for this project:** 64-bit Arm (`arm-a64`), 32-bit Arm with Thumb-2
   (`arm-a32`), 64-bit RISC-V (`riscv64`) and 32-bit RISC-V (`riscv-rv32`, from
   [esp32sim](https://github.com/mikroverk/esp32sim)). The Arm cores have JITs to AArch64 and to
-  WebAssembly ([jit.md](docs/jit.md)).
+  WebAssembly ([jit.md](docs/jit.md)); the RV64 core has one to WebAssembly.
 - **One model per SoC:** the interrupt controller, timers, storage, display, USB, network and
   GPU, down to the registers the stock Linux drivers use.
 - **One deterministic virtual clock:** by default the same run gives the same result every time.

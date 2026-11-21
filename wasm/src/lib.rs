@@ -1,6 +1,6 @@
 //! C ABI over the emulated boards for the browser (no wasm-bindgen; see web/worker.js): the
 //! Pi 4B, the Tinker Board S (RK3288, `sbc_boot_tinker*`) and the Orange Pi One (Allwinner H3,
-//! `sbc_boot_opi1`). Single-threaded: one machine
+//! `sbc_boot_opi1`) and the Orange Pi RV (StarFive JH7110, `sbc_boot_opirv`). Single-threaded: one machine
 //! per module instance, driven from a Web Worker. Exports for devices only one board has (the
 //! Pi's USB keyboard, GPIO, sensors, audio) do nothing on the other.
 #![allow(clippy::missing_safety_doc)]
@@ -43,6 +43,8 @@ enum Board {
     Tinker(Box<rockchip_rk3288::Machine>, TinkerBoot),
     /// The Orange Pi One with what it was booted from (kernel, stock DTB, initrd, command line).
     OrangePiOne(Box<allwinner_h3::Machine>, DirectBoot),
+    /// The Orange Pi RV with OpenSBI and what it was booted from.
+    OrangePiRv(Box<starfive_jh7110::Machine>, Vec<u8>, DirectBoot),
 }
 
 /// A direct boot's inputs: the kernel, the board's stock device tree, an initramfs and the
@@ -59,16 +61,16 @@ struct TinkerBoot {
 
 impl Board {
     fn run(&mut self, budget: u64) -> Stop {
-        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget) }
+        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget) }
     }
     fn now(&self) -> u64 {
-        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now() }
+        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now() }
     }
     fn idle_until(&mut self, t: u64) {
-        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t) }
+        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t) }
     }
     fn instret(&self) -> u64 {
-        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret() }
+        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret() }
     }
 }
 
@@ -235,10 +237,43 @@ pub unsafe extern "C" fn sbc_boot_opi1(ram_mb: u32, k: *const u8, klen: usize, d
     0
 }
 
-/// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board, 3 the Orange Pi One.
+/// An Orange Pi RV as the CLI's `--board orangepi-rv` builds it: an HDMI monitor at the mode
+/// `sbc_kms` picked (720p by default), user networking, the USB keyboard and tablet.
+fn opirv_machine(ram_bytes: usize) -> starfive_jh7110::Machine {
+    use starfive_jh7110::display::{Display, Mode};
+    let mut m = starfive_jh7110::Machine::new(ram_bytes);
+    let (w, h) = KMS.with(|c| c.get());
+    m.soc.display = Display::new(Mode::find(w, h).unwrap_or(Mode::MODES[0]));
+    m.connect_network(false, false);
+    m
+}
+
+/// Orange Pi RV: boot OpenSBI (`fw_dynamic`, generic platform) and a RISC-V Linux `Image` with the
+/// stock device tree (completed the way U-Boot does; mainline's gets the firmware framebuffer on
+/// HDMI) and an optional initramfs; an empty command line is the board's default (console on
+/// UART0). Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_opirv(ram_mb: u32, f: *const u8, flen: usize, k: *const u8, klen: usize, d: *const u8, dlen: usize,
+                                        i: *const u8, ilen: usize, c: *const u8, clen: usize) -> i32 {
+    let firmware = std::slice::from_raw_parts(f, flen).to_vec();
+    let kernel = std::slice::from_raw_parts(k, klen).to_vec();
+    let dtb = std::slice::from_raw_parts(d, dlen).to_vec();
+    let initrd = (ilen > 0).then(|| std::slice::from_raw_parts(i, ilen).to_vec());
+    let cmdline = if clen > 0 { String::from_utf8_lossy(std::slice::from_raw_parts(c, clen)).into_owned() } else {
+        starfive_jh7110::boot::DEFAULT_CMDLINE.to_string()
+    };
+    let mut m = opirv_machine((ram_mb as usize) << 20);
+    if starfive_jh7110::boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), &cmdline).is_err() { return -1; }
+    for h in smp() + 1..m.harts.len() { m.state[h] = starfive_jh7110::HartState::Off; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::OrangePiRv(Box::new(m), firmware, (kernel, dtb, initrd, cmdline)), Some(0.0))));
+    0
+}
+
+/// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board, 3 the Orange Pi One, 4 the
+/// Orange Pi RV.
 #[no_mangle]
 pub extern "C" fn sbc_board() -> u32 {
-    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3 }).unwrap_or(0)
+    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4 }).unwrap_or(0)
 }
 
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
@@ -248,6 +283,7 @@ pub extern "C" fn sbc_jit(on: u32) -> u32 {
         Board::Pi(m) => if on != 0 { m.enable_jit() as u32 } else { m.disable_jit(); 0 },
         Board::Tinker(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiOne(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
+        Board::OrangePiRv(m, ..) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
     }).unwrap_or(0)
 }
 
@@ -271,6 +307,7 @@ pub extern "C" fn sbc_jit_hot(n: u32) {
         Board::Pi(m) => { if let Some(j) = m.jit_mut() { j.hot = n.max(1); } }
         Board::Tinker(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiOne(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
+        Board::OrangePiRv(m, ..) => m.set_jit_hot(n),
     });
 }
 
@@ -301,17 +338,29 @@ pub extern "C" fn sbc_jit_blocks() -> f64 {
         Board::Pi(m) => m.jit().map(|j| j.compiled as f64).unwrap_or(0.0),
         Board::Tinker(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiOne(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
+        Board::OrangePiRv(m, ..) => m.jit_compiled() as f64,
     }).unwrap_or(0.0)
 }
 
 /// USB keyboard: press (down=1) or release (down=0) a key by HID usage code.
 #[no_mangle]
-pub extern "C" fn sbc_key(usage: u32, down: u32) { with_pi(|m| m.soc.devs.kbd.key(usage as u8, down != 0)); }
+pub extern "C" fn sbc_key(usage: u32, down: u32) {
+    with(|s| match &mut s.m {
+        Board::Pi(m) => m.soc.devs.kbd.key(usage as u8, down != 0),
+        Board::OrangePiRv(m, ..) => m.soc.usb.kbd.key(usage as u8, down != 0),
+        _ => {}
+    });
+}
 
 /// The USB tablet: buttons (bit 0 left, 1 right, 2 middle), position 0..=32767, wheel clicks.
 #[no_mangle]
 pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
-    with_pi(|m| m.soc.devs.tablet.pointer(buttons as u8 & 7, x.min(32767) as u16, y.min(32767) as u16, wheel.clamp(-127, 127) as i8));
+    let (b, x, y, w) = (buttons as u8 & 7, x.min(32767) as u16, y.min(32767) as u16, wheel.clamp(-127, 127) as i8);
+    with(|s| match &mut s.m {
+        Board::Pi(m) => m.soc.devs.tablet.pointer(b, x, y, w),
+        Board::OrangePiRv(m, ..) => m.soc.usb.tablet.pointer(b, x, y, w),
+        _ => {}
+    });
 }
 
 /// What the guest played on the I²S DAC since the last call: the number of 16-bit samples
@@ -330,7 +379,13 @@ pub extern "C" fn sbc_audio_rate() -> u32 { with_pi(|m| m.soc.i2s.rate).unwrap_o
 
 /// USB keyboard: type one byte of text (US layout).
 #[no_mangle]
-pub extern "C" fn sbc_type(b: u32) { with_pi(|m| m.soc.devs.kbd.type_byte(b as u8)); }
+pub extern "C" fn sbc_type(b: u32) {
+    with(|s| match &mut s.m {
+        Board::Pi(m) => m.soc.devs.kbd.type_byte(b as u8),
+        Board::OrangePiRv(m, ..) => m.soc.usb.kbd.type_byte(b as u8),
+        _ => {}
+    });
+}
 
 /// Run up to `budget` instructions with the page's wall clock `wall_ns` (real-time pacing).
 /// Returns 0 = budget used, 1 = idle (wait `sbc_wait_ms()` or until input), 2 = stopped.
@@ -363,6 +418,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                         Board::Pi(old) => pi_restart(old).map(Board::Pi),
                         Board::Tinker(old, how) => tinker_restart(old, how),
                         Board::OrangePiOne(old, how) => opi1_restart(old, how),
+                        Board::OrangePiRv(old, fw, how) => opirv_restart(old, fw, how),
                     };
                     match restarted {
                         Some(m) => s.m = m,
@@ -407,6 +463,17 @@ fn opi1_restart(old: &allwinner_h3::Machine, how: &mut DirectBoot) -> Option<Boa
     Some(Board::OrangePiOne(Box::new(m), (kernel, dtb, initrd, cmdline)))
 }
 
+/// Start an Orange Pi RV again from what it was booted with (after `reboot`).
+fn opirv_restart(old: &starfive_jh7110::Machine, firmware: &mut Vec<u8>, how: &mut DirectBoot) -> Option<Board> {
+    let mut m = opirv_machine(old.soc.ram.mem.len());
+    let firmware = std::mem::take(firmware);
+    let (kernel, dtb, initrd, cmdline) = std::mem::take(how);
+    starfive_jh7110::boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), &cmdline).ok()?;
+    for (h, s) in old.state.iter().enumerate() { if *s == starfive_jh7110::HartState::Off { m.state[h] = *s; } }
+    m.set_jit(old.jit_enabled());
+    Some(Board::OrangePiRv(Box::new(m), firmware, (kernel, dtb, initrd, cmdline)))
+}
+
 #[no_mangle]
 pub extern "C" fn sbc_wait_ms() -> f64 { with(|s| s.wait_ms).unwrap_or(0.0) }
 
@@ -434,6 +501,7 @@ pub extern "C" fn sbc_uart_in(b: u32) {
         Board::Pi(m) => { if m.soc.uart.rx_room() { m.soc.uart.push_rx(b as u8); m.soc.dirty = true; } }
         Board::Tinker(m, _) => { m.serial_input(b as u8); }
         Board::OrangePiOne(m, _) => { m.serial_input(b as u8); }
+        Board::OrangePiRv(m, ..) => { m.serial_input(b as u8); }
     });
 }
 
@@ -443,6 +511,7 @@ pub extern "C" fn sbc_uart_room() -> i32 {
         Board::Pi(m) => m.soc.uart.rx_room() as i32,
         Board::Tinker(m, _) => m.soc.uart.rx_room() as i32,
         Board::OrangePiOne(m, _) => m.soc.uart.rx_room() as i32,
+        Board::OrangePiRv(m, ..) => m.soc.uart.rx_room() as i32,
     }).unwrap_or(0)
 }
 
@@ -454,6 +523,7 @@ pub extern "C" fn sbc_uart_take() -> usize {
             Board::Pi(m) => std::mem::take(&mut m.soc.uart.out),
             Board::Tinker(m, _) => m.take_serial_output(),
             Board::OrangePiOne(m, _) => m.take_serial_output(),
+            Board::OrangePiRv(m, ..) => m.take_serial_output(),
         };
         s.uart.len()
     }).unwrap_or(0)
@@ -469,6 +539,7 @@ pub extern "C" fn sbc_fb_render() -> *const u8 {
             Board::Pi(m) => m.soc.render(&mut s.fb),
             Board::Tinker(m, _) => m.soc.render(&mut s.fb),
             Board::OrangePiOne(m, _) => m.soc.render(&mut s.fb),
+            Board::OrangePiRv(m, ..) => m.soc.render(&mut s.fb),
         };
         match size {
             Some((w, h)) => { s.fb_w = w; s.fb_h = h; s.fb.as_ptr() }
@@ -503,6 +574,7 @@ pub extern "C" fn sbc_stop_pc() -> f64 {
             Board::Pi(m) => m.cpu().pc as f64,
             Board::Tinker(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
             Board::OrangePiOne(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
+            Board::OrangePiRv(m, ..) => m.harts.iter().map(|h| h.pc).next().unwrap_or(0) as f64,
         },
     }).unwrap_or(0.0)
 }
@@ -607,3 +679,15 @@ pub unsafe extern "C" fn sbc_a32_jit_case(thumb: u32, code: *const u32, len: usi
 pub extern "C" fn sbc_report_ptr() -> *const u8 { REPORT.with(|r| r.borrow().as_ptr()) }
 #[no_mangle]
 pub extern "C" fn sbc_report_len() -> usize { REPORT.with(|r| r.borrow().len()) }
+
+/// The RV64 JIT's random differential test (riscv64::jit_check) with the wasm backend:
+/// `cases` random programs from `seed`, in loops (`loops` 1) or straight, in S mode with Sv39
+/// (`smode` 1) or M mode, compiling an entry after `hot` executions. Returns the number of
+/// failures; the first one's description is at `sbc_report_ptr` (`sbc_report_len` bytes).
+/// tools/wasm-rv-jit-diff.mjs runs it.
+#[no_mangle]
+pub extern "C" fn sbc_rv_jit_diff(loops: u32, smode: u32, cases: u32, seed: f64, hot: u32) -> u32 {
+    let (fails, first) = riscv64::jit_check::run_cases(cases, seed as u64, loops != 0, smode != 0, hot.max(1));
+    REPORT.with(|r| *r.borrow_mut() = first.unwrap_or_default());
+    fails
+}

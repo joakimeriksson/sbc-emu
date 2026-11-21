@@ -7,6 +7,8 @@
 #   OUT/initramfs.cpio.gz           Alpine riscv64 minirootfs + a serial-shell /init, with the
 #                                   SD/Ethernet/USB HID/Wi-Fi/audio modules, the BCM43456 firmware,
 #                                   iw, aplay and speaker-test
+#   OUT/web/initramfs.cpio.gz       the same without Wi-Fi, audio and SD: Ethernet and USB HID
+#                                   modules only, for the browser demo (web/board.html?b=orangepi-rv)
 # Usage: scripts/orangepi-rv-fixture.sh [OUT]   (default cache/orangepi-rv)
 # Downloads are verified against SHA-256; Alpine eventually removes superseded
 # package versions, so update the pins together.
@@ -112,7 +114,7 @@ tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
     'lib/modules/*/kernel/drivers/hid/usbhid/*' 'lib/modules/*/kernel/drivers/input/evdev.ko.gz' \
     'lib/modules/*/kernel/drivers/net/wireless/broadcom/brcm80211/*' 'lib/modules/*/kernel/net/wireless/*' \
     'lib/modules/*/kernel/drivers/i2c/busses/i2c-designware-*' 'lib/modules/*/kernel/drivers/mfd/axp20x*' \
-    'lib/modules/*/kernel/drivers/regulator/axp20x-regulator.ko.gz' 'lib/modules/*/kernel/drivers/mmc/core/*' \
+    'lib/modules/*/kernel/drivers/regulator/axp20x-regulator.ko.gz' \
     'lib/modules/*/kernel/drivers/regulator/fixed.ko.gz' 'lib/modules/*/kernel/net/rfkill/*' \
     'lib/modules/*/kernel/sound/*'
 # ALSA: aplay and speaker-test for the PWM DAC (headphone jack)
@@ -155,4 +157,35 @@ chmod 755 "$work/rootfs/init"
 (cd "$work/rootfs" && find . | LC_ALL=C sort | cpio -o -H newc -R 0:0 2>/dev/null) |
     gzip -9n > "$OUT/initramfs.cpio.gz"
 
-shasum -a 256 "$OUT/Image" "$OUT/$DTB" "$OUT/fw_dynamic.bin" "$OUT/initramfs.cpio.gz"
+
+# The browser demo's initramfs: no Wi-Fi firmware, ALSA, iw or the SD, Wi-Fi and sound modules
+# (the browser build has no SD card in direct boot, and a smaller download boots sooner).
+cp -R "$work/rootfs" "$work/web"
+rm -rf "$work"/web/lib/firmware "$work"/web/usr/share/alsa "$work"/web/usr/bin/aplay "$work"/web/usr/bin/speaker-test \
+    "$work"/web/usr/sbin/iw "$work"/web/usr/lib/libasound* "$work"/web/usr/lib/libnl* \
+    "$work"/web/lib/modules/*/kernel/sound "$work"/web/lib/modules/*/kernel/drivers/net/wireless \
+    "$work"/web/lib/modules/*/kernel/net/wireless "$work"/web/lib/modules/*/kernel/net/rfkill \
+    "$work"/web/lib/modules/*/kernel/drivers/mmc "$work"/web/lib/modules/*/kernel/fs \
+    "$work"/web/lib/modules/*/kernel/drivers/mfd "$work"/web/lib/modules/*/kernel/drivers/regulator \
+    "$work"/web/lib/modules/*/kernel/drivers/i2c
+cat > "$work/web/init" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t tmpfs tmpfs /tmp
+export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin PS1='orangepi-rv# '
+# Gigabit Ethernet (stmmac, the StarFive glue, the Motorcomm PHY) and the USB keyboard and
+# tablet on the VL805 are modules
+modprobe dwmac-starfive 2>/dev/null; modprobe motorcomm 2>/dev/null; modprobe af_packet 2>/dev/null
+modprobe usbhid 2>/dev/null; modprobe hid-generic 2>/dev/null; modprobe evdev 2>/dev/null
+echo "JH7110_BOOT_OK: RV64 Linux BusyBox shell"
+exec /bin/busybox setsid -c /bin/sh
+INIT
+chmod 755 "$work/web/init"
+mkdir -p "$OUT/web"
+(cd "$work/web" && find . | LC_ALL=C sort | cpio -o -H newc -R 0:0 2>/dev/null) |
+    gzip -9n > "$OUT/web/initramfs.cpio.gz"
+
+shasum -a 256 "$OUT/Image" "$OUT/$DTB" "$OUT/fw_dynamic.bin" "$OUT/initramfs.cpio.gz" "$OUT/web/initramfs.cpio.gz"

@@ -171,7 +171,9 @@ dependencies = [
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "riscv64",
  "rockchip-rk3288",
+ "starfive-jh7110",
  "v3d",
 ]
 
