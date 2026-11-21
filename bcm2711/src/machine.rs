@@ -1022,7 +1022,13 @@ impl Machine {
     pub fn restore(&mut self, snap: &[u8]) -> Result<(), String> {
         if snap.len() < 8 || &snap[..8] != SNAP_MAGIC { return Err("not an sbc-emu snapshot".into()); }
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
-        let mut r = emu_core::snap::R::new(&raw);
+        self.restore_raw(&raw)
+    }
+
+    /// Restore from a snapshot's body after the magic, already inflated: the browser build takes
+    /// snapshots recompressed with zstd (`tools/snap-zstd.sh`), a third smaller than deflate.
+    pub fn restore_raw(&mut self, raw: &[u8]) -> Result<(), String> {
+        let mut r = emu_core::snap::R::new(raw);
         let e = |e: emu_core::snap::SnapError| e.0;
         let v10 = r.tag("machine-v10").is_ok();
         if !v10 { r.p = 0; }

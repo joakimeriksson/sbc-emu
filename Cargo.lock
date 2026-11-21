@@ -146,6 +146,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+
+[[package]]
 name = "sbc-emu"
 version = "0.0.1"
 dependencies = [
@@ -173,6 +179,7 @@ dependencies = [
  "emu-core",
  "riscv64",
  "rockchip-rk3288",
+ "ruzstd",
  "starfive-jh7110",
  "v3d",
 ]

@@ -1,6 +1,9 @@
 # The browser GPU demo snapshot: Raspberry Pi OS logged in on the HDMI console (a 1024x768
-# monitor), every demo run once so its binaries and Mesa are in RAM. Made on a frozen copy of the
-# GPU test image, which the page then serves:
+# monitor), every demo on web/gpu.html run once so its binaries, Mesa and the shader cache are in
+# RAM, and nothing else: the page cache is dropped before the demos run, and the free memory is
+# zeroed before the snapshot (it skips zero pages), so the download is as small as it can be.
+# The demos then never read the SD card (tools/wasm-gpu-bench.mjs counts it). Made on a frozen
+# copy of the GPU test image, which a local page can serve:
 #   cp -c cache/os/raspios-gpu.img cache/os/raspios-gpu-demo.img
 #   sbc-emu run --sd cache/os/raspios-gpu-demo.img --hdmi-mode 1024x768 --script scripts/gpu-demo-snapshot.txt
 wait-serial raspberrypi login:
@@ -18,8 +21,15 @@ wait-idle 4
 serial raspberry\n
 sleep 3
 wait-idle 6
-serial kmscube -c 20 > /dev/null 2>&1; for b in build shading:shading=phong shading:shading=cel jellyfish refract desktop:effect=shadow bump:bump-render=normals pulsar shadow terrain; do glmark2-es2-drm -b $b:duration=1 2>&1 | grep FPS; done; echo WARM-""DONE\n
+# services the demos do not need go; the page cache is emptied; the demos run once, and what the
+# HDMI console reads that the serial one does not (its terminfo; libzstd, for Mesa's shader cache)
+# is read whole
+serial echo raspberry | sudo -S true; sudo systemctl stop bluetooth wpa_supplicant avahi-daemon cron triggerhappy ModemManager systemd-timesyncd rpi-eeprom-update 2>/dev/null; free -m; sync; echo 3 | sudo tee /proc/sys/vm/drop_caches; kmscube -c 20 > /dev/null 2>&1; for b in build shading:shading=phong shading:shading=cel jellyfish refract desktop:effect=shadow; do clear > /dev/null; glmark2-es2-drm -b $b:duration=1 2>&1 | grep FPS; done; cat /usr/share/terminfo/l/linux /usr/lib/aarch64-linux-gnu/libzstd.so.1 > /dev/null; TERM=linux clear > /dev/null; echo WARM-""DONE\n
 wait-serial WARM-DONE
+sleep 2
+# all free memory but a margin, written with zeros in a tmpfs and given back
+serial F=$(awk '/MemFree/ { print int($2 / 1024) - 48 }' /proc/meminfo); sudo mount -t tmpfs -o size=${F}m tmpfs /mnt && sudo dd if=/dev/zero of=/mnt/zero bs=1M count=$F status=none; sudo umount /mnt; free -m; echo ZERO-""DONE\n
+wait-serial ZERO-DONE
 type clear\n
 sleep 3
 wait-idle 6
