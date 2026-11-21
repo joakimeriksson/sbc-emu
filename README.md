@@ -9,7 +9,7 @@ systems unmodified: Raspberry Pi OS, Ubuntu, Armbian, Alpine.
 **Try it in your browser: [joakimeriksson.github.io/sbc-emu](https://joakimeriksson.github.io/sbc-emu/).**
 All six boards boot there, on your own computer: the Raspberry Pi 4, the Orange Pi One, the ASUS
 Tinker Board S, the Orange Pi 5 and the RISC-V Orange Pi RV in seconds, and the ESP32-S31 through
-its whole boot chain in about 20.
+its whole boot chain in about 10.
 
 <table>
 <tr>
