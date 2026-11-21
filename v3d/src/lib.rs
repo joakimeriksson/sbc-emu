@@ -287,12 +287,58 @@ impl Exec {
     }
 }
 
-/// The GPU thread: jobs in, finished jobs out.
+/// A job for a GPU thread: the job, guest RAM, the page table base, MMU on, the reset generation.
+#[cfg(not(target_arch = "wasm32"))]
+type Queued = (Job, RamPtr, u64, bool, u64);
+
+/// The GPU threads: jobs in, finished jobs out. Bin, render and compute jobs run in order on one
+/// thread; TFU jobs on another. On the chip the TFU is a unit of its own beside the control-list
+/// threads, so a texture conversion never waits for a render job to end, and Linux counts on that:
+/// its TFU timeout (500 ms) resets the GPU without looking for progress. Queued behind a render
+/// job that takes the host most of a second (a big frame, or a slow host), a TFU job reached
+/// that timeout; the reset path then oopsed in the Ubuntu 7.0 kernel. Linux orders TFU jobs and
+/// the jobs around them through buffer fences, so running them side by side is what the
+/// hardware does too.
 #[cfg(not(target_arch = "wasm32"))]
 struct Worker {
-    tx: std::sync::mpsc::Sender<(Job, RamPtr, u64, bool, u64)>,
+    tx: std::sync::mpsc::Sender<Queued>,
+    tfu_tx: std::sync::mpsc::Sender<Queued>,
     done: std::sync::Arc<std::sync::Mutex<Vec<Done>>>,
     busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Start a GPU thread running `run` on the jobs sent to it; finished jobs go to `done`, and `busy`
+/// counts down as each job leaves the thread.
+#[cfg(not(target_arch = "wasm32"))]
+fn gpu_thread(name: &str, done: std::sync::Arc<std::sync::Mutex<Vec<Done>>>, busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+              gen_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+              run: impl Fn(&Job, &mut [u8], u64, bool, u64) -> Done + Send + 'static) -> std::sync::mpsc::Sender<Queued> {
+    let (tx, rx) = std::sync::mpsc::channel::<Queued>();
+    std::thread::Builder::new().name(name.into()).spawn(move || {
+        for (job, ram, pt, mmu, gen) in rx {
+            // SAFETY: guest RAM lives as long as the machine, which outlives its jobs
+            let ram = unsafe { std::slice::from_raw_parts_mut(ram.0, ram.1) };
+            if gen == gen_now.load(std::sync::atomic::Ordering::Acquire) {
+                let d = run(&job, ram, pt, mmu, gen);
+                done.lock().unwrap_or_else(|e| e.into_inner()).push(d);
+            }
+            busy.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+    }).expect("v3d thread");
+    tx
+}
+
+/// A TFU job on its own thread: it needs neither the shader cache nor the tile lists, so it does
+/// not wait for the lock a render job holds.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_tfu(job: &Job, ram: &mut [u8], pt: u64, mmu: bool, gen: u64, stats: &[std::sync::atomic::AtomicU64; 2]) -> Done {
+    let Job::Tfu { regs, irq } = job else { unreachable!("only TFU jobs go to the TFU thread") };
+    let t0 = Clock::now();
+    tfu::run(regs, &mut Gmem::new(ram, pt, mmu));
+    let ns = t0.elapsed().as_nanos() as u64;
+    stats[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stats[1].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    Done { gen, hub: true, bits: if *irq { HUB_INT_TFUC } else { 0 }, reg: None, counter: None, ns }
 }
 
 /// Guest RAM for the GPU thread. The cores already share it through raw pointers; the GPU
@@ -308,6 +354,8 @@ pub struct V3d {
     pub exec: std::sync::Arc<std::sync::Mutex<Exec>>,
     #[cfg(not(target_arch = "wasm32"))]
     worker: Option<Worker>,
+    /// TFU jobs run on the TFU thread and the host time they took (statistics)
+    tfu_stats: std::sync::Arc<[std::sync::atomic::AtomicU64; 2]>,
     /// bumped by a reset: jobs still running from before it are dropped when they finish
     gen: u64,
     /// the same, for the GPU thread: jobs still queued from before a reset are not run at all
@@ -335,7 +383,7 @@ impl V3d {
         if let Some(n) = std::env::var("SBC_V3D_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, std::sync::atomic::Ordering::Relaxed); }
         let exec = Exec { code: Code::default(), binned: HashMap::new(), bin_jobs: HashMap::new(), jobs: [0; 4], insns: 0, host_ns: [0; 4], bins: 0 };
         let mut v = V3d { hub: vec![0; 0x4000 / 4], core: vec![0; 0x4000 / 4], exec: std::sync::Arc::new(std::sync::Mutex::new(exec)),
-            #[cfg(not(target_arch = "wasm32"))] worker: None, gen: 0, gen_now: Default::default(), powered: true, now: 0, pending: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))] worker: None, tfu_stats: Default::default(), gen: 0, gen_now: Default::default(), powered: true, now: 0, pending: Vec::new(),
             time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false };
         // (std::env is empty in the browser: the defaults apply)
         v.reset();
@@ -362,7 +410,13 @@ impl V3d {
     fn exec(&self) -> std::sync::MutexGuard<'_, Exec> { self.exec.lock().unwrap_or_else(|e| e.into_inner()) }
 
     /// Statistics: (jobs per kind, QPU instructions, host ns per kind).
-    pub fn counters(&self) -> ([u64; 4], u64, [u64; 4]) { let e = self.exec(); (e.jobs, e.insns, e.host_ns) }
+    pub fn counters(&self) -> ([u64; 4], u64, [u64; 4]) {
+        let e = self.exec();
+        let (mut jobs, mut host_ns) = (e.jobs, e.host_ns);
+        jobs[2] += self.tfu_stats[0].load(std::sync::atomic::Ordering::Relaxed);
+        host_ns[2] += self.tfu_stats[1].load(std::sync::atomic::Ordering::Relaxed);
+        (jobs, e.insns, host_ns)
+    }
 
     /// Whether the GPU thread has a job in hand.
     fn running(&self) -> bool {
@@ -406,28 +460,22 @@ impl V3d {
         #[cfg(not(target_arch = "wasm32"))]
         if self.wall_clock {
             let w = self.worker.get_or_insert_with(|| {
-                let (tx, rx) = std::sync::mpsc::channel::<(Job, RamPtr, u64, bool, u64)>();
                 let done = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                 let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let (exec, d2, b2, g2) = (self.exec.clone(), done.clone(), busy.clone(), self.gen_now.clone());
-                std::thread::Builder::new().name("v3d".into()).spawn(move || {
-                    for (job, ram, pt, mmu, gen) in rx {
-                        // SAFETY: guest RAM lives as long as the machine, which outlives its jobs
-                        let ram = unsafe { std::slice::from_raw_parts_mut(ram.0, ram.1) };
-                        if gen == g2.load(std::sync::atomic::Ordering::Acquire) {
-                            let d = exec.lock().unwrap_or_else(|e| e.into_inner()).run(&job, ram, pt, mmu, gen);
-                            d2.lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                        }
-                        b2.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                    }
-                }).expect("v3d thread");
-                Worker { tx, done, busy }
+                let exec = self.exec.clone();
+                let tx = gpu_thread("v3d", done.clone(), busy.clone(), self.gen_now.clone(),
+                    move |job, ram, pt, mmu, gen| exec.lock().unwrap_or_else(|e| e.into_inner()).run(job, ram, pt, mmu, gen));
+                let stats = self.tfu_stats.clone();
+                let tfu_tx = gpu_thread("v3d-tfu", done.clone(), busy.clone(), self.gen_now.clone(),
+                    move |job, ram, pt, mmu, gen| run_tfu(job, ram, pt, mmu, gen, &stats));
+                Worker { tx, tfu_tx, done, busy }
             });
             w.busy.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            match w.tx.send((job, RamPtr(ram.as_mut_ptr(), ram.len()), pt, mmu, gen)) {
+            let tx = if matches!(job, Job::Tfu { .. }) { &w.tfu_tx } else { &w.tx };
+            match tx.send((job, RamPtr(ram.as_mut_ptr(), ram.len()), pt, mmu, gen)) {
                 Ok(()) => return,
                 Err(e) => {
-                    // the GPU thread is gone (it panicked): run here from now on
+                    // a GPU thread is gone (it panicked): run here from now on
                     w.busy.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     self.worker = None;
                     let (job, ..) = e.0;
@@ -637,5 +685,35 @@ mod tests {
         v.drain();
         assert!(seen.len() > 1, "the batch register did not move while the job ran: {seen:?}");
         assert_eq!(v.read(0x4000 + CSD_CURRENT_CFG4 as u64), 7, "after the job it reads as written");
+    }
+
+    /// A TFU job does not wait for a long job on the control-list thread: on the chip the TFU is
+    /// a unit of its own, and Linux resets the GPU when a TFU job takes 500 ms, progress or not.
+    #[test]
+    fn tfu_does_not_wait_for_long_jobs() {
+        let mut ram = vec![0u8; 0x4000];
+        let nop = 0x3c00_3186_bb80_0000u64;
+        let thrsw = nop | 1 << 53;
+        for (k, w) in [thrsw, thrsw, nop, thrsw, nop, nop].iter().enumerate() { ram[0x1000 + k * 8..0x1008 + k * 8].copy_from_slice(&w.to_le_bytes()); }
+        let mut v = V3d::new();
+        v.wall_clock = true;
+        // a long compute job, as in long_job_shows_progress
+        let cfg = [65535u32 << 16, 8 << 16, 1 << 16, 16 | 1 << 8, 7, 0x1000, 0x2000];
+        for k in (1..7).rev() { v.write(0x4000 + (CSD_QUEUED_CFG0 + 4 * k) as u64, cfg[k], &mut ram); }
+        v.write(0x4000 + CSD_QUEUED_CFG0 as u64, cfg[0], &mut ram);
+        // then a 1x1 TFU copy from 0x2800 to 0x3000, interrupt on completion
+        v.write((TFU_CS + 4 * 3) as u64, 0x2800, &mut ram);
+        v.write((TFU_CS + 4 * 7) as u64, 0x3000, &mut ram);
+        v.write((TFU_CS + 4 * 8) as u64, 1 << 16 | 1, &mut ram);
+        v.write(TFU_ICFG as u64, 1, &mut ram);
+        let t0 = std::time::Instant::now();
+        while v.hub[HUB_INT_STS / 4] & HUB_INT_TFUC == 0 {
+            v.tick(0);
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "no TFU interrupt");
+        }
+        assert_eq!(v.core[CTL_INT_STS / 4] & INT_CSDDONE, 0, "the TFU job waited for the compute job");
+        v.drain();
+        assert_ne!(v.core[CTL_INT_STS / 4] & INT_CSDDONE, 0, "the compute job finished");
+        assert_eq!(v.counters().0[2], 1, "the TFU job counts in the statistics");
     }
 }
