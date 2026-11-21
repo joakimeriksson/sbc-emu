@@ -100,6 +100,9 @@ pub struct Xhci {
     ports: [Port; NPORTS],
     iman: u32,
     imod: u32,
+    /// interrupt moderation: no interrupt is signalled before this time (ns), IMODI after the
+    /// pending bit last cleared (xHCI 1.0, 4.17.2)
+    irq_hold: u64,
     erstsz: u32,
     erstba: u64,
     erdp: u64,
@@ -139,7 +142,7 @@ impl Xhci {
     pub fn new() -> Self {
         let mut x = Xhci {
             usbcmd: 0, usbsts: STS_HCH, dnctrl: 0, config: 0, crcr: 0, cmd_deq: 0, cmd_ccs: true, crr: false, dcbaap: 0,
-            ports: [Port::default(); NPORTS], iman: 0, imod: 4000, erstsz: 0, erstba: 0, erdp: 0, ev_seg: 0, ev_idx: 0, ev_pcs: true,
+            ports: [Port::default(); NPORTS], iman: 0, imod: 4000, irq_hold: 0, erstsz: 0, erstba: 0, erdp: 0, ev_seg: 0, ev_idx: 0, ev_pcs: true,
             slots: [Slot::default(); MAX_SLOTS + 1], now: 0, next_poll: 0, transfers: 0, trace: std::env::var_os("SBC_TRACE_XHCI").is_some(),
         };
         x.reset_ports();
@@ -199,9 +202,18 @@ impl Xhci {
     /// clears by itself (xHCI 1.0, 5.5.2.1), and Linux relies on it (`ip_autoclear`).
     pub fn msi_sent(&mut self) {
         self.iman &= !1;
+        self.moderate();
     }
 
-    pub fn irq(&self) -> bool { self.usbcmd & CMD_INTE != 0 && self.iman & 3 == 3 }
+    /// The pending bit cleared: the moderation counter reloads from IMODI (250 ns units).
+    /// Without it an interrupt the driver leaves pending (Linux 5.15's handler returns early
+    /// while its controller state still says halted) would fire again at once, and the CPU
+    /// that is about to change that state would never get to run.
+    fn moderate(&mut self) {
+        self.irq_hold = self.now + (self.imod & 0xffff) as u64 * 250;
+    }
+
+    pub fn irq(&self) -> bool { self.usbcmd & CMD_INTE != 0 && self.iman & 3 == 3 && self.now >= self.irq_hold }
 
     // ------------------------------------------------------------------ registers
 
@@ -298,7 +310,13 @@ impl Xhci {
                     _ => {}
                 }
             }
-            0x620 => { self.iman = (self.iman & !(v & 1)) & 1 | (v & 2); }
+            0x620 => {
+                let was = self.iman & 1;
+                self.iman = (self.iman & !(v & 1)) & 1 | (v & 2);
+                if was != 0 && self.iman & 1 == 0 {
+                    self.moderate();
+                }
+            }
             0x624 => self.imod = v,
             0x628 => self.erstsz = v & 0xffff,
             0x630 | 0x634 => {
@@ -694,7 +712,12 @@ impl Xhci {
     /// The next poll, while an attached device has input waiting.
     pub fn next_event(&self, devs: &Devices) -> Option<u64> {
         let waiting = self.usbcmd & CMD_RS != 0 && self.ports.iter().any(|p| p.dev.is_some_and(|d| devs.has_input(d)));
-        waiting.then_some(self.next_poll)
+        // a pending interrupt held back by moderation
+        let held = (self.usbcmd & CMD_INTE != 0 && self.iman & 3 == 3 && self.now < self.irq_hold).then_some(self.irq_hold);
+        match (waiting.then_some(self.next_poll), held) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     // ------------------------------------------------------------------ snapshots

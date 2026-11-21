@@ -63,16 +63,16 @@ pub const UT_NONE: usize = 4;
 
 /// A micro-TLB entry: an access of `size` bytes at `va` hits when
 /// `va & (!0xfff | (size - 1)) == tag` (so misaligned accesses miss), and its host address is
-/// then the low 32 bits of `va` plus `delta` (browser builds: wasm32 linear memory).
+/// then `va + delta` (wrapping; browser builds use the low 32 bits of both, wasm32 linear
+/// memory being 32-bit).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct UEntry {
     pub tag: u64,
-    pub delta: u32,
-    pub pad: u32,
+    pub delta: u64,
 }
 
-pub const U_EMPTY: UEntry = UEntry { tag: u64::MAX, delta: 0, pad: 0 };
+pub const U_EMPTY: UEntry = UEntry { tag: u64::MAX, delta: 0 };
 
 #[derive(Default)]
 pub struct Tlb {
@@ -104,7 +104,7 @@ impl Tlb {
     }
 
     /// Install a micro-TLB entry in `table` (read or `write`) for the page of `va`.
-    pub fn ufill(&mut self, table: usize, write: bool, va: u64, host_page: u32) {
+    pub fn ufill(&mut self, table: usize, write: bool, va: u64, host_page: u64) {
         if self.utlb.is_empty() || table == UT_NONE {
             return;
         }
@@ -112,7 +112,7 @@ impl Tlb {
         if self.utlb[i].tag == U_EMPTY.tag {
             self.ufilled.push(i as u32);
         }
-        self.utlb[i] = UEntry { tag: va & !0xfff, delta: host_page.wrapping_sub(va as u32 & !0xfff), pad: 0 };
+        self.utlb[i] = UEntry { tag: va & !0xfff, delta: host_page.wrapping_sub(va & !0xfff) };
     }
 }
 
