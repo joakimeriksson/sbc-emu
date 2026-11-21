@@ -10,6 +10,9 @@ readme = "README.md"
 # The WebAssembly JIT backend: needs a host that provides `env.sbc_jit_compile` and
 # `env.sbc_jit_reset` (sbc-emu's page, web/worker.js)
 wasm-jit = []
+# The same backend for esp32sim's page (`web/wasm/jit.mjs`: `env.host_jit_compile`,
+# `env.host_jit_release`)
+wasm-jit-host = []
 
 [dependencies]
 emu-core = { package = "esp32sim-emu-core", path = "../espressif/emu-core" }

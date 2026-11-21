@@ -235,10 +235,10 @@ pub(crate) fn region<B: Bus>(cpu: &Cpu, bus: &mut B, pc: u32, phys: u32, insns: 
 
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub use a64::{Jit, AVAILABLE};
-#[cfg(all(target_arch = "wasm32", feature = "wasm-jit"))]
+#[cfg(all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))]
 pub use wasm::{Jit, AVAILABLE};
 
-#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", feature = "wasm-jit"))))]
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))))]
 mod none {
     use super::*;
     pub const AVAILABLE: bool = false;
@@ -255,7 +255,7 @@ mod none {
         pub unsafe fn call<B: Bus>(&self, _code: u32, _cpu: &mut Cpu, _bus: &mut B, _ctx: &mut Ctx, _budget: u32) -> u64 { unreachable!() }
     }
 }
-#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", feature = "wasm-jit"))))]
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))))]
 pub use none::{Jit, AVAILABLE};
 
 /// Counts not yet added to the Cpu: instructions (`insn_count`, `cycle_count`) and those retired
@@ -670,7 +670,7 @@ mod a64 {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm-jit"))]
+#[cfg(all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))]
 mod wasm {
     //! Each region is a module with one function `(cpu, bus, ctx, budget: i32) -> i64` that
     //! imports the emulator's memory and function table; the page compiles it and installs it in
@@ -683,34 +683,65 @@ mod wasm {
 
     pub const AVAILABLE: bool = true;
 
-    #[link(wasm_import_module = "env")]
-    extern "C" {
-        fn sbc_jit_compile(ptr: *const u8, len: usize) -> i32;
-        fn sbc_jit_reset();
+    /// The page's side: esp32sim's (`web/wasm/jit.mjs`: a slot per module, released one by one)
+    /// with `wasm-jit-host`, sbc-emu's (`web/worker.js`: one reset for everything) otherwise.
+    #[cfg(feature = "wasm-jit-host")]
+    mod host {
+        #[link(wasm_import_module = "env")]
+        extern "C" {
+            fn host_jit_compile(ptr: *const u8, len: usize) -> u32;
+            fn host_jit_release(slot: u32);
+        }
+        pub const EXPORT: &[u8] = b"run";
+        /// A reset only discards this core's modules.
+        pub const SHARED_RESET: bool = false;
+        // SAFETY: the import reads `len` bytes of the module; 0 is its failure
+        pub fn compile(m: &[u8]) -> Option<u32> { let s = unsafe { host_jit_compile(m.as_ptr(), m.len()) }; (s != 0).then_some(s) }
+        // SAFETY: each slot came from `compile` and is released once
+        pub fn release(slots: &[u32]) { for &s in slots { unsafe { host_jit_release(s) } } }
+    }
+    #[cfg(not(feature = "wasm-jit-host"))]
+    mod host {
+        #[link(wasm_import_module = "env")]
+        extern "C" {
+            fn sbc_jit_compile(ptr: *const u8, len: usize) -> i32;
+            fn sbc_jit_reset();
+        }
+        pub const EXPORT: &[u8] = b"f";
+        /// A reset discards every core's modules (`EPOCH`).
+        pub const SHARED_RESET: bool = true;
+        // SAFETY: the import reads `len` bytes of the module; negative is its failure
+        pub fn compile(m: &[u8]) -> Option<u32> { let s = unsafe { sbc_jit_compile(m.as_ptr(), m.len()) }; (s >= 0).then_some(s as u32) }
+        // SAFETY: the import takes no arguments
+        pub fn release(_slots: &[u32]) { unsafe { sbc_jit_reset() } }
     }
 
-    /// Bumped whenever the page discards every compiled module: a core whose JIT saw an older
-    /// value must forget its blocks' code (another core's reset discarded it).
+    /// Bumped whenever the page discards every compiled module (`host::SHARED_RESET`): a core
+    /// whose JIT saw an older value must forget its blocks' code.
     static EPOCH: AtomicU32 = AtomicU32::new(0);
-    /// Modules per epoch before everything is discarded (the page's table only grows).
+    /// Modules before everything is discarded (the page's table only grows).
     const MAX_MODULES: u32 = 16384;
     static MODULES: AtomicU32 = AtomicU32::new(0);
 
-    pub struct Jit { epoch: u32, tables: Vec<Box<[Insn]>> }
+    pub struct Jit { epoch: u32, tables: Vec<Box<[Insn]>>, slots: Vec<u32> }
 
     impl Jit {
-        pub fn new() -> Option<Box<Jit>> { Some(Box::new(Jit { epoch: EPOCH.load(Ordering::Relaxed), tables: Vec::new() })) }
-        /// Discard all compiled code (every core's: the page frees all its slots).
+        pub fn new() -> Option<Box<Jit>> { Some(Box::new(Jit { epoch: EPOCH.load(Ordering::Relaxed), tables: Vec::new(), slots: Vec::new() })) }
+        /// Discard this core's compiled code (every core's where the page can only reset all).
         pub fn reset(&mut self) {
-            // SAFETY: the import takes no arguments
-            unsafe { sbc_jit_reset() };
-            MODULES.store(0, Ordering::Relaxed);
-            self.epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+            host::release(&self.slots);
+            if host::SHARED_RESET {
+                MODULES.store(0, Ordering::Relaxed);
+                self.epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+            } else {
+                MODULES.fetch_sub(self.slots.len() as u32, Ordering::Relaxed);
+            }
+            self.slots.clear();
             self.tables.clear();
         }
         /// False once any core has discarded the compiled code: forget it (`Blocks::code`).
         pub fn valid(&self) -> bool { self.epoch == EPOCH.load(Ordering::Relaxed) }
-        pub fn adopt_epoch(&mut self) { self.epoch = EPOCH.load(Ordering::Relaxed); self.tables.clear(); }
+        pub fn adopt_epoch(&mut self) { self.epoch = EPOCH.load(Ordering::Relaxed); self.tables.clear(); self.slots.clear(); }
 
         /// # Safety
         /// `code` must come from `compile` in the current epoch (the module's table index
@@ -726,12 +757,11 @@ mod wasm {
             if MODULES.load(Ordering::Relaxed) >= MAX_MODULES || r.blocks.len() > 32 { return None; }
             let tables: Vec<Box<[Insn]>> = r.blocks.iter().map(|b| b.insns.clone().into_boxed_slice()).collect();
             let module = emit::<B>(r, &tables);
-            // SAFETY: the import reads `len` bytes of the module
-            let idx = unsafe { sbc_jit_compile(module.as_ptr(), module.len()) };
-            if idx < 0 { return None; }
+            let idx = host::compile(&module)?;
             MODULES.fetch_add(1, Ordering::Relaxed);
+            self.slots.push(idx);
             self.tables.extend(tables);
-            Some((0..r.blocks.len() as u32).map(|k| (idx as u32) << 5 | k).collect())
+            Some((0..r.blocks.len() as u32).map(|k| idx << 5 | k).collect())
         }
     }
 
@@ -1048,7 +1078,10 @@ mod wasm {
         }
         section(&mut m, 2, &imp);
         section(&mut m, 3, &[1, 0]);
-        section(&mut m, 7, &[1, 1, b'f', 0x00, 0]);
+        let mut exp = vec![1, host::EXPORT.len() as u8];
+        exp.extend_from_slice(host::EXPORT);
+        exp.extend_from_slice(&[0x00, 0]);
+        section(&mut m, 7, &exp);
         // locals after the 5 params: ST, DONE, PV, TLB (i32), V64 (i64)
         let mut f = vec![2, 4, I, 1, L];
         f.extend_from_slice(body);
