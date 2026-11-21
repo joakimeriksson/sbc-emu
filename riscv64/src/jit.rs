@@ -16,9 +16,12 @@
 //!   from with memory, and is dropped if they changed. This also catches code written by
 //!   DMA, which no store tracking would see.
 //! - **Exits.** A block returns when it leaves its region, when an instruction it hands to
-//!   the interpreter (`h_step`) needs the machine to look (a device access, a CSR, a trap),
-//!   or when the cycle budget is used. Interrupts are taken between blocks.
-use crate::mmu::{UT, UT_TABLES, U_EMPTY};
+//!   the interpreter (`h_step`) needs the machine to look (a device access, a CSR write, a
+//!   trap), or when the cycle budget is used. Interrupts are taken between blocks. Native
+//!   code goes on to the next region by itself where the hart's jump cache knows it (see
+//!   `jit_a64.rs`), as long as it only leaves through control flow: nothing that changes
+//!   interrupts, the mode or the address space happens without a return here.
+use crate::mmu::{JC, JC_TABLES, J_EMPTY, UT, UT_NONE, UT_TABLES, U_EMPTY};
 use crate::{rvc, Access, Bus, Hart};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -104,6 +107,9 @@ pub struct Jit {
     /// full flushes (the function table was full)
     pub flushes: u64,
     epoch: u64,
+    /// bumped whenever a jump cache entry could point at code that is no longer valid (a new
+    /// epoch, a region dropped, a flush): a hart empties its jump cache when it sees a change
+    generation: u64,
     /// functions installed and not yet freed by a flush
     slots: usize,
     /// the native code buffer (allocated at the first compile)
@@ -122,6 +128,7 @@ impl Default for Jit {
             invalidated: 0,
             flushes: 0,
             epoch: 0,
+            generation: 0,
             slots: 0,
             #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
             code: None,
@@ -139,6 +146,7 @@ impl Jit {
         self.blocks.clear();
         self.heat.clear();
         self.front.fill(FRONT_EMPTY);
+        self.generation += 1;
         if self.slots > 0 {
             #[cfg(target_arch = "wasm32")]
             crate::jit_wasm::reset();
@@ -184,6 +192,9 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
     if h.tlb.utlb.is_empty() {
         h.tlb.utlb = vec![U_EMPTY; UT_TABLES * 2 * UT];
     }
+    if LINKS && h.tlb.jc.is_empty() {
+        h.tlb.jc = vec![J_EMPTY; JC_TABLES * JC];
+    }
     h.jit_bus = bus as *mut B as usize;
     h.jit_step = h_step::<B> as *const () as usize;
     h.chain_until = end;
@@ -194,6 +205,11 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
         if h.fence_i != h.jit_fence_seen {
             h.jit_fence_seen = h.fence_i;
             jit.epoch += 1;
+            jit.generation += 1;
+        }
+        if h.jit_gen != jit.generation {
+            h.jit_gen = jit.generation;
+            h.tlb.jflush();
         }
         let pc = h.pc;
         let pa = match h.translate(bus, pc, Access::Fetch) {
@@ -224,6 +240,7 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
                     if ram[lo..lo + r.bytes.len()] != *r.bytes {
                         jit.blocks.remove(&pa);
                         jit.invalidated += 1;
+                        jit.generation += 1;
                         // compile the new code at once: it ran before
                         jit.heat.insert(pa, jit.hot);
                         continue;
@@ -257,10 +274,23 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
     h.cycle.wrapping_sub(c0)
 }
 
+/// Whether compiled code links regions through the jump cache (native code).
+const LINKS: bool = cfg!(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")));
+
 /// Run the compiled region `f` (the hart's pc is its entry).
 #[inline(always)]
 fn call(h: &mut Hart, f: usize) {
-    h.jit_ut = h.tlb.utlb.as_ptr() as usize + h.utlb_table() * 2 * UT * std::mem::size_of::<crate::mmu::UEntry>();
+    // while an LR reservation is held, every access takes the interpreter's path (a store to
+    // the reserved address clears it); LR and SC leave compiled code, so this is re-decided
+    let table = if h.reservation != u64::MAX { UT_NONE } else { h.utlb_table() };
+    h.jit_ut = h.tlb.utlb.as_ptr() as usize + table * 2 * UT * std::mem::size_of::<crate::mmu::UEntry>();
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    {
+        // fetches are made in the current mode: the region's code for this pc in this mode
+        let table = h.prv as usize;
+        h.tlb.jfill(table, h.pc, (f + native::LINKED) as u64);
+        h.jit_jc = h.tlb.jc.as_ptr() as usize + crate::mmu::Tlb::jslot(table, 0) * std::mem::size_of::<crate::mmu::JEntry>();
+    }
     // SAFETY: `f` is a compiled region (natively its address; in browser builds a function
     // table index of type (i32) -> i32, which is this ABI); it reads and writes the hart through
     // the pointer and calls `h_step` with the bus in `jit_bus`, which outlive the call
@@ -318,6 +348,8 @@ fn mem_access(i: u32) -> Option<(usize, u64, u8, bool)> {
         0x07 if f3 == 2 || f3 == 3 => Some((rs1, imm_i, 1 << f3, false)),
         0x23 if f3 < 4 => Some((rs1, imm_s, 1 << f3, true)),
         0x27 if f3 == 2 || f3 == 3 => Some((rs1, imm_s, 1 << f3, true)),
+        // AMOs: LR reads, the others write
+        0x2f if f3 == 2 || f3 == 3 => Some((rs1, 0, 1 << f3, i >> 27 != 0x02)),
         _ => None,
     }
 }
@@ -355,8 +387,25 @@ extern "C" fn h_step<B: Bus>(hart: *mut Hart, info: i32) -> i32 {
         return 2;
     }
     let mut st = match i & 0x7f {
-        0x73 => 2, // CSRs, privileged instructions, ecall
+        // CSR reads, and writes of CSRs compiled code does not depend on, go on in the block;
+        // other CSR writes, privileged instructions and ecall leave
+        0x73 => {
+            let f = (i >> 12) & 7;
+            let writes = match f {
+                1 | 5 => true,
+                2 | 3 | 6 | 7 => (i >> 15) & 31 != 0,
+                _ => true,
+            };
+            let harmless = matches!(i >> 20, 0x001..=0x003 | 0x140 | 0x340); // fflags, frm, fcsr, s/mscratch
+            if f != 0 && (!writes || harmless) {
+                0
+            } else {
+                2
+            }
+        }
         0x0f if (i >> 12) & 7 != 0 => 2, // fence.i: the driver starts a new epoch
+        // LR and SC: compiled code picks its fast path by whether a reservation is held
+        0x2f if matches!(i >> 27, 0x02 | 0x03) => 2,
         0x2f => {
             // an AMO on a device (no AMO in RAM changes what the machine must look at)
             let va = amo.unwrap_or(0);
