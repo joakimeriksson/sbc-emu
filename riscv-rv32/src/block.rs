@@ -41,6 +41,9 @@ const NO_PAGE: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 struct Entry {
     pc: u32,
+    /// the physical address `pc` fetched from when the block was built (= `pc` untranslated):
+    /// a lookup translates `pc` again and only takes the block if it still lands here
+    phys: u32,
     start: u32,
     n: u8,
     /// arena slots this entry owns from `start` (>= n)
@@ -53,7 +56,7 @@ struct Entry {
     vidx: [u32; 2],
     ver: [u32; 2],
 }
-const EMPTY: Entry = Entry { pc: 1, start: 0, n: 0, cap: 0, writes: 0, plain_end: false, vidx: [0; 2], ver: [0; 2] };
+const EMPTY: Entry = Entry { pc: 1, phys: 1, start: 0, n: 0, cap: 0, writes: 0, plain_end: false, vidx: [0; 2], ver: [0; 2] };
 
 /// The core's decoded-block cache. Empty until used: `Cpu::new` stays cheap.
 pub struct Blocks {
@@ -102,19 +105,30 @@ fn ends_block(i: &Insn) -> bool {
 }
 
 impl Cpu {
-    /// Blocks run untranslated code only: on a core with S and U, in M without MPRV.
+    /// Blocks run everywhere but in M with MPRV on a core with S and U. In S and U code is
+    /// fetched through Sv32 (`lookup`: a block lies on one virtual page, translated as its
+    /// first instruction's fetch would be).
     #[inline(always)]
     pub fn blocks_allowed(&self) -> bool {
-        !self.privileged || (self.priv_mode == crate::state::privilege::MACHINE && self.mstatus & crate::state::mstatus::MPRV == 0)
+        !self.privileged || self.priv_mode != crate::state::privilege::MACHINE || self.mstatus & crate::state::mstatus::MPRV == 0
     }
     /// Whether `step_outcome` would do something other than execute the instruction at pc:
     /// sleep, or take the interrupt the SoC presents.
     #[inline(always)]
     fn irq_acts(&self) -> bool {
-        match self.irq {
-            None => false,
-            Some(line) => self.mie_enabled() && (!self.clic || (line >> crate::exec::CLIC_IRQ_LEVEL_SHIFT) & 0xff > self.mil.max(self.mintthresh)),
+        use crate::state::{mstatus, privilege};
+        let Some(line) = self.irq else { return false };
+        let level = (line >> crate::exec::CLIC_IRQ_LEVEL_SHIFT) & 0xff;
+        if self.privileged {
+            // `exec::priv_irq`'s predicate
+            return if line & crate::exec::CLIC_IRQ_SMODE != 0 {
+                self.priv_mode < privilege::SUPERVISOR
+                    || (self.priv_mode == privilege::SUPERVISOR && self.mstatus & mstatus::SIE != 0 && level > self.sil.max(self.sintthresh))
+            } else {
+                self.priv_mode < privilege::MACHINE || (self.mie_enabled() && level > self.mil.max(self.mintthresh))
+            };
         }
+        self.mie_enabled() && (!self.clic || level > self.mil.max(self.mintthresh))
     }
 }
 
@@ -122,22 +136,28 @@ impl Cpu {
 #[inline(always)]
 fn lookup<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32) -> Option<Entry> {
     if cpu.blocks.entries.is_empty() { cpu.blocks.entries = vec![EMPTY; ENTRIES]; }
+    // Through Sv32, the translation the interpreter's fetch makes first (a TLB hit, or the same
+    // walk with the same A-bit update); a fault is the interpreter's to take.
+    let translated = cpu.translating(crate::mmu::Access::Fetch);
+    let phys = if translated { cpu.translate(bus, pc, crate::mmu::Access::Fetch).ok()? } else { pc };
     let ei = (pc >> 1) as usize & (ENTRIES - 1);
     let e = cpu.blocks.entries[ei];
-    if e.pc == pc {
+    if e.pc == pc && e.phys == phys {
         let pv = bus.page_versions();
         if pv.get(e.vidx[0] as usize) == Some(&e.ver[0]) && pv.get(e.vidx[1] as usize) == Some(&e.ver[1]) { return Some(e); }
     }
-    build(cpu, bus, pc, ei)
+    build(cpu, bus, pc, phys, translated, ei)
 }
 
 #[cold]
 #[inline(never)]
-fn build<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32, ei: usize) -> Option<Entry> {
+fn build<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32, phys: u32, translated: bool, ei: usize) -> Option<Entry> {
     let isa = cpu.isa();
     let b = &mut cpu.blocks;
     if b.isa != isa || b.arena.len() + MAX_LEN > ARENA_CAP { b.flush(); b.isa = isa; }
-    let v0 = bus.code_page(pc);
+    // the physical address of virtual `at` (the block keeps to `pc`'s virtual page when translated)
+    let pa = |at: u32| phys.wrapping_add(at.wrapping_sub(pc));
+    let v0 = bus.code_page(phys);
     if v0 == NO_PAGE { return None; }
     let mut v1 = v0;
     const NOP: Insn = Insn { op: Op::Illegal, rd: 0, rs1: 0, rs2: 0, imm: 0, len: 4, comp: Comp::None, raw: 0 };
@@ -148,11 +168,14 @@ fn build<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32, ei: usize) -> Option<Entry
     let mut at = pc;
     for (k, slot) in buf.iter_mut().enumerate() {
         if k > 0 && cpu.boundary_bloom & pc_bit(at) != 0 { break; }
-        let Some(bytes) = bus.fetch_ahead(at) else { break; };
+        let Some(bytes) = bus.fetch_ahead(pa(at)) else { break; };
         let i = decode_for(isa, at, bytes);
         let last = at.wrapping_add(i.len as u32 - 1);
+        // translated: the whole instruction on `pc`'s virtual page (a 32-bit one in its last
+        // halfword is fetched from two translations: the interpreter's)
+        if translated && last >> 12 != pc >> 12 { break; }
         // both ends of the instruction must lie on the block's (at most two) pages
-        let (pa, pb) = (bus.code_page(at), bus.code_page(last));
+        let (pa, pb) = (bus.code_page(pa(at)), bus.code_page(pa(last)));
         if pa == NO_PAGE || pb == NO_PAGE { break; }
         let mut fits = true;
         for p in [pa, pb] {
@@ -182,7 +205,7 @@ fn build<B: Bus>(cpu: &mut Cpu, bus: &mut B, pc: u32, ei: usize) -> Option<Entry
         (start, n as u8)
     };
     b.arena[start..start + n].copy_from_slice(&buf[..n]);
-    let e = Entry { pc, start: start as u32, n: n as u8, cap, writes, plain_end, vidx: [v0, v1], ver: [ver0, ver1] };
+    let e = Entry { pc, phys, start: start as u32, n: n as u8, cap, writes, plain_end, vidx: [v0, v1], ver: [ver0, ver1] };
     b.entries[ei] = e;
     b.builds += 1;
     Some(e)
