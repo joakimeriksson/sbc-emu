@@ -14,6 +14,7 @@ pub mod i2c;
 pub mod machine;
 pub mod nvme;
 pub mod pcie;
+pub mod qspi;
 pub mod sdio;
 pub mod wifi;
 pub mod xhci;

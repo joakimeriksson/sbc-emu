@@ -3,6 +3,9 @@
 # recognises the board by its EEPROM product ID "XOPIRV"), built in Docker:
 #   cache/orangepi-rv/uboot/u-boot-spl.bin.normal.out  SPL with the JH7110 boot ROM header
 #   cache/orangepi-rv/uboot/u-boot.itb                 U-Boot + OpenSBI (fw_dynamic) FIT
+#   cache/orangepi-rv/uboot/spi-flash.img              the board's 16 MiB SPI NOR flash with
+#       both, in the upstream device tree's layout (SPL at 0, the environment at 0xf0000,
+#       the FIT at 1 MiB): --spi-flash boots from it, as the board boots from its flash
 # OpenSBI is the fixture's (scripts/orangepi-rv-fixture.sh), so run that first.
 set -eu
 cd "$(dirname "$0")/.."
@@ -37,6 +40,16 @@ chmod +x "$OUT/build.sh"
 docker volume create sbc-emu-opirv-uboot >/dev/null
 docker run --rm -v sbc-emu-opirv-uboot:/work -v "$OUT":/out debian:bookworm /out/build.sh
 ls -l "$OUT/u-boot-spl.bin.normal.out" "$OUT/u-boot.itb"
+python3 -I - "$OUT" <<'PY'
+import sys
+out = sys.argv[1]
+flash = bytearray(b'\xff' * (16 << 20))
+for path, at in (('u-boot-spl.bin.normal.out', 0), ('u-boot.itb', 0x100000)):
+    data = open(f'{out}/{path}', 'rb').read()
+    flash[at:at + len(data)] = data
+open(f'{out}/spi-flash.img', 'wb').write(flash)
+PY
+ls -l "$OUT/spi-flash.img"
 
 # A bootable microSD image in StarFive's layout, with the mainline fixture's kernel:
 #   partition 1 (2 MiB, type "HiFive/StarFive SPL")  u-boot-spl.bin.normal.out; the boot ROM

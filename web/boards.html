@@ -328,7 +328,7 @@
           <div><dt>Instruction set</dt><dd>64-bit RISC-V</dd></div>
           <div><dt>GPU</dt><dd>PowerVR BXE-4-32: Vulkan, vkcube</dd></div>
         </dl>
-        <p>The board’s whole boot chain from the SD card: boot ROM, U-Boot SPL with DDR init, OpenSBI and U-Boot, then Alpine’s mainline kernel or Xunlong’s own. Wi-Fi, Bluetooth, USB 3.0, an NVMe SSD and HDMI.</p>
+        <p>The board’s whole boot chain from its SPI flash or the SD card: boot ROM, U-Boot SPL with DDR init, OpenSBI and U-Boot, then Alpine’s mainline kernel, Xunlong’s own, or Canonical’s Ubuntu 24.04.5 server image, unmodified. Wi-Fi, Bluetooth, USB 3.0, an NVMe SSD and HDMI.</p>
         <div class="run">
           <a class="pad-btn" href="board.html?b=orangepi-rv"><span class="via" aria-hidden="true"></span>Power on</a>
           <small>OpenSBI and Alpine’s mainline kernel boot from scratch to a serial shell in about five seconds. A 17 MB download.</small>

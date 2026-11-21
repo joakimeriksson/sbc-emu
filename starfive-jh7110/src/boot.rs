@@ -260,35 +260,36 @@ fn crc32(data: &[u8]) -> u32 {
 const SPL_COPIES: [u64; 2] = [0, 0x20_0000];
 const SPL_VERSION: u32 = 0x0101_0101;
 
-/// The JH7110 boot ROM's SD path. The U74s start in the mask ROM, which reads U-Boot SPL
+/// The JH7110 boot ROM. The U74s start in the mask ROM, which reads U-Boot SPL
 /// (`u-boot-spl.bin.normal.out`: a 0x400-byte header with version, size and CRC-32 at
-/// 0x284) from the card, copies it into the L2 LIM and jumps there on every U74.
+/// 0x284) from the device the boot-mode straps select, copies it into the L2 LIM and jumps
+/// there on every U74:
+/// - the SPI NOR flash (`BOOT_MODE_SPI`, with `--spi-flash`): SPL at offset 0, where the
+///   board's firmware keeps it;
+/// - the microSD card (`BOOT_MODE_SD`): at the start of the card, or at the header's backup
+///   offset (2 MiB, StarFive's `spl` partition).
 pub fn boot_rom(m: &mut Machine) -> Result<(), String> {
-    let disk = m.soc.sdio1.card.disk_mut().ok_or("no SD card: the boot ROM boots from --sd (or give --kernel)")?;
-    let mut found = None;
-    for off in SPL_COPIES {
-        let mut hdr = [0u8; 0x400];
-        if off / 512 + 2 > disk.sectors() {
-            continue;
-        }
-        disk.read(off / 512, &mut hdr);
-        let word = |o: usize| u32::from_le_bytes(hdr[o..o + 4].try_into().unwrap());
-        let (version, size, hdr_size, crc) = (word(0x284), word(0x288) as usize, word(0x28c) as u64, word(0x290));
-        if version != SPL_VERSION || size == 0 || size > SRAM_SIZE || hdr_size % 512 != 0 {
-            continue;
-        }
-        let mut body = vec![0u8; size.div_ceil(512) * 512];
-        if (off + hdr_size) / 512 + body.len() as u64 / 512 > disk.sectors() {
-            continue;
-        }
-        disk.read((off + hdr_size) / 512, &mut body);
-        body.truncate(size);
-        if crc32(&body) == crc {
-            found = Some(body);
-            break;
-        }
-    }
-    let spl = found.ok_or("no valid U-Boot SPL on the SD card (boot ROM header at 0 or 2 MiB)")?;
+    let spl = if m.soc.boot_mode == crate::machine::BOOT_MODE_SPI {
+        let flash = m.soc.qspi.flash.as_ref().ok_or("the boot straps select the SPI flash, but there is none")?;
+        find_spl(|off, out| {
+            let o = off as usize;
+            let end = o.checked_add(out.len()).filter(|&e| e <= flash.data.len())?;
+            out.copy_from_slice(&flash.data[o..end]);
+            Some(())
+        }, &[0])
+        .ok_or("no valid U-Boot SPL at the start of the SPI flash (boot ROM header)")?
+    } else {
+        let disk = m.soc.sdio1.card.disk_mut().ok_or("no SD card: the boot ROM boots from --sd (or give --kernel or --spi-flash)")?;
+        let sectors = disk.sectors();
+        find_spl(|off, out| {
+            if off % 512 != 0 || out.len() % 512 != 0 || (off + out.len() as u64) / 512 > sectors {
+                return None;
+            }
+            disk.read(off / 512, out);
+            Some(())
+        }, &SPL_COPIES)
+        .ok_or("no valid U-Boot SPL on the SD card (boot ROM header at 0 or 2 MiB)")?
+    };
     m.soc.sram.mem[..spl.len()].copy_from_slice(&spl);
     for h in 1..m.harts.len() {
         m.harts[h].reset(SRAM_BASE);
@@ -296,6 +297,30 @@ pub fn boot_rom(m: &mut Machine) -> Result<(), String> {
         m.state[h] = HartState::Run;
     }
     Ok(())
+}
+
+/// The first valid SPL image at one of `offsets`, read through `read(offset, buffer)`.
+fn find_spl(mut read: impl FnMut(u64, &mut [u8]) -> Option<()>, offsets: &[u64]) -> Option<Vec<u8>> {
+    for &off in offsets {
+        let mut hdr = [0u8; 0x400];
+        if read(off, &mut hdr).is_none() {
+            continue;
+        }
+        let word = |o: usize| u32::from_le_bytes(hdr[o..o + 4].try_into().unwrap());
+        let (version, size, hdr_size, crc) = (word(0x284), word(0x288) as usize, word(0x28c) as u64, word(0x290));
+        if version != SPL_VERSION || size == 0 || size > SRAM_SIZE || hdr_size % 512 != 0 {
+            continue;
+        }
+        let mut body = vec![0u8; size.div_ceil(512) * 512];
+        if read(off + hdr_size, &mut body).is_none() {
+            continue;
+        }
+        body.truncate(size);
+        if crc32(&body) == crc {
+            return Some(body);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
