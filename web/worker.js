@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5', ramMb},
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
@@ -28,8 +28,9 @@ function chunk(idx) {
   if (chunks.size > MAX_CHUNKS) chunks.delete(chunks.keys().next().value);
   return c;
 }
+// Pointers into the emulator's memory arrive as i32: `>>> 0` keeps those above 2 GiB positive.
 function diskRead(lba, count, ptr) {
-  let off = lba * 512, left = count * 512, dst = ptr;
+  let off = lba * 512, left = count * 512, dst = ptr >>> 0;
   const m = mem8();
   if (!imageUrl) {
     // a snapshot published without its SD card (the 3D demos never read it): reads see zeros
@@ -77,11 +78,12 @@ async function fetchParts(url, label) {
   for (const b of bufs) { out.set(b, o); o += b.length; }
   return { bytes: out, extra };
 }
-function copyIn(bytes) { const p = ex.sbc_alloc(bytes.length); mem8().set(bytes, p); return p; }
+function copyIn(bytes) { const p = ex.sbc_alloc(bytes.length) >>> 0; mem8().set(bytes, p); return p; }
 
 // ---- JIT: each compiled block is a small module installed in the emulator's function table
 let jitFree = [], jitUsed = [];
 function jitCompile(ptr, len) {
+  ptr >>>= 0;
   try {
     const mod = new WebAssembly.Module(mem8().slice(ptr, ptr + len));
     const t = ex.__indirect_function_table;
@@ -123,6 +125,21 @@ async function start(os, ramMb, jit) {
     const [fw, kernel, dtb, initrd] = await Promise.all([['fw_dynamic.bin', false], ['Image.gz', true], ['jh7110-orangepi-rv.dtb', false], ['initramfs.cpio.gz', false]]
       .map(([f, gz]) => fetchBytes(`assets/orangepi-rv/${f}`, gz)));
     if (ex.sbc_boot_opirv(ramMb, copyIn(fw), fw.length, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
+  if (os === 'orangepi5') {
+    // Orange Pi 5 (Rockchip RK3588S, four Cortex-A55s and four Cortex-A76s; the first four
+    // here): Debian's arm64 kernel with the emulator's device tree and an Alpine/BusyBox
+    // initramfs (scripts/orangepi5-fixture.sh), shell on the serial console; the kernel
+    // arrives gzip'd
+    postMessage({ type: 'status', text: 'loading the Debian kernel and initramfs…' });
+    const [kernel, initrd] = await Promise.all([['Image.gz', true], ['initramfs.cpio.gz', false]]
+      .map(([f, gz]) => fetchBytes(`assets/orangepi5/${f}`, gz)));
+    if (ex.sbc_boot_opi5(ramMb, copyIn(kernel), kernel.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
     if (jit) ex.sbc_jit(1);
     frameEvery = 100;
     postMessage({ type: 'status', text: 'booting…' });
@@ -229,15 +246,15 @@ function loop() {
   // what the guest played on the I²S DAC goes to the page's WebAudio
   const na = ex.sbc_audio_take();
   if (na) {
-    const samples = new Int16Array(mem8().buffer.slice(ex.sbc_audio_ptr(), ex.sbc_audio_ptr() + 2 * na));
+    const samples = new Int16Array(mem8().buffer.slice(ex.sbc_audio_ptr() >>> 0, (ex.sbc_audio_ptr() >>> 0) + 2 * na));
     postMessage({ type: 'audio', rate: ex.sbc_audio_rate(), samples }, [samples.buffer]);
   }
   const n = ex.sbc_uart_take();
-  if (n) postMessage({ type: 'uart', text: dec.decode(mem8().slice(ex.sbc_uart_ptr(), ex.sbc_uart_ptr() + n)) });
+  if (n) postMessage({ type: 'uart', text: dec.decode(mem8().slice(ex.sbc_uart_ptr() >>> 0, (ex.sbc_uart_ptr() >>> 0) + n)) });
   const now = performance.now();
   if (now - lastFrame > frameEvery) {
     lastFrame = now;
-    const p = ex.sbc_fb_render();
+    const p = ex.sbc_fb_render() >>> 0;
     if (p) {
       const w = ex.sbc_fb_w(), h = ex.sbc_fb_h();
       const data = mem8().slice(p, p + w * h * 4);
