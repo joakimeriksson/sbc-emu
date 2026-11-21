@@ -5,9 +5,10 @@
 # (scripts/orangepi-one-fixture.sh), the Tinker Board's Debian kernel and BusyBox initramfs
 # (scripts/tinker-board-fixture.sh), the Orange Pi RV's OpenSBI, Alpine kernel and initramfs
 # (scripts/orangepi-rv-fixture.sh) and the Orange Pi 5's Debian kernel and initramfs
-# (scripts/orangepi5-fixture.sh), all pinned; and the Pi 4 3D demos' snapshot (gpu.html), from a
-# release asset. boards.html is the front page. Every file is a whole-file fetch, so any static
-# web server can serve the site:
+# (scripts/orangepi5-fixture.sh), and the ESP32-S31's mask ROM (Espressif's esp-rom-elfs) and
+# Linux flash image (scripts/esp32s31-fixture.sh; a release asset, as its build takes an hour), all
+# pinned; and the Pi 4 3D demos' snapshot (gpu.html), from a release asset. boards.html is the
+# front page. Every file is a whole-file fetch, so any static web server can serve the site:
 #   tools/site-build.sh && python3 -m http.server -d out/site 8792
 set -eu
 cd "$(dirname "$0")/.."
@@ -24,6 +25,11 @@ BUSYBOX_SHA256=1d8e7a7fc2ed69bdb8eb7be9d962489c21a0f75b72d8a325437c8a09d4cfac70
 # tools/snap-zstd.sh, which only the browser build reads.
 GPU_SNAP_URL=https://github.com/joakimeriksson/sbc-emu/releases/download/web-gpu-demo-1/gpu-demo.snap.zst
 GPU_SNAP_SHA256=ff3b8fcb11751fc32f26d6c5e5f575342915aa912318a59d2317216a910425fb
+S31_ROM_URL=https://github.com/espressif/esp-rom-elfs/releases/download/20260528/esp-rom-elfs-20260528.tar.gz
+S31_ROM_TGZ_SHA256=caa463d3cbef2430a5a35847c1d9f2f152403b17a802050927ff60c8da54fe46
+S31_ROM_SHA256=a52ad7513deb656a910a5740125f1cce2c7941f11ce57213b7b43aea93d5ab87
+S31_FLASH_URL=https://github.com/joakimeriksson/sbc-emu/releases/download/esp32s31-linux-1/s31_full_flash.bin.gz
+S31_FLASH_SHA256=90210bf84f6f66760bde41a34f94efb05b2da4170bc34c3e9971680fa6dd522b
 DL=cache/site
 OUT=out/site
 
@@ -43,6 +49,14 @@ python3 -I -c 'import sys, tarfile
 t = tarfile.open(sys.argv[1], "r:gz", ignore_zeros=True)
 open(sys.argv[2], "wb").write(t.extractfile("bin/busybox.static").read())' "$DL/busybox-static.apk" "$DL/busybox.static"
 gzip -dc "$DL/kernel8.img" > "$DL/Image"
+# the ESP32-S31: Espressif's mask ROM out of esp-rom-elfs, and the flash image as published
+fetch "$S31_ROM_URL" "$DL/esp-rom-elfs.tar.gz" "$S31_ROM_TGZ_SHA256"
+python3 -I -c 'import sys, tarfile
+t = tarfile.open(sys.argv[1], "r:gz")
+m = next(m for m in t.getmembers() if m.name.endswith("/esp32s31_rev0_rom.elf") or m.name == "esp32s31_rev0_rom.elf")
+open(sys.argv[2], "wb").write(t.extractfile(m).read())' "$DL/esp-rom-elfs.tar.gz" "$DL/esp32s31_rev0_rom.elf"
+echo "$S31_ROM_SHA256  $DL/esp32s31_rev0_rom.elf" | shasum -a 256 -c
+fetch "$S31_FLASH_URL" "$DL/s31_full_flash.bin.gz" "$S31_FLASH_SHA256"
 
 cargo build --release -p sbc-emu
 ./target/release/sbc-emu mkinitramfs --busybox "$DL/busybox.static" -o "$DL/initramfs.cpio"
@@ -66,7 +80,7 @@ tools/wasm-build.sh
 SBC_SNAP="$DL/gpu-demo.snap.zst" SBC_SD=/nonexistent node tools/wasm-gpu-bench.mjs 3 cube
 
 rm -rf "$OUT"
-mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5"
+mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/esp32s31"
 cp web/boards.html "$OUT/index.html"
 cp web/hello.html web/board.html web/gpu.html web/sources.html web/worker.js "$OUT/"
 cp web/wasm/sbc-emu.wasm "$OUT/wasm/"
@@ -81,5 +95,6 @@ cp web/assets/orangepi-one/zImage web/assets/orangepi-one/sun8i-h3-orangepi-one.
 cp web/assets/tinker/zImage web/assets/tinker/rk3288-tinker-s.dtb web/assets/tinker/initramfs.cpio.gz "$OUT/assets/tinker/"
 cp web/assets/orangepi-rv/fw_dynamic.bin web/assets/orangepi-rv/Image.gz web/assets/orangepi-rv/jh7110-orangepi-rv.dtb web/assets/orangepi-rv/initramfs.cpio.gz "$OUT/assets/orangepi-rv/"
 cp web/assets/orangepi5/Image.gz web/assets/orangepi5/initramfs.cpio.gz "$OUT/assets/orangepi5/"
+cp "$DL/esp32s31_rev0_rom.elf" "$DL/s31_full_flash.bin.gz" "$OUT/assets/esp32s31/"
 touch "$OUT/.nojekyll"
 find "$OUT" -type f -exec ls -l {} + | awk '{ print $5, $9 }'

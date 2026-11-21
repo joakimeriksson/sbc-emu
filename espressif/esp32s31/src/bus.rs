@@ -618,6 +618,15 @@ impl S31Bus {
                 return Ok(());
             }
             if Cache::is_memory(address) {
+                // one translation when the store lies in one MMU page (`Cache::write_span`), with
+                // the code versions of its first and last byte bumped as below
+                if address >= crate::cache::PSRAM_VADDR && self.cache_window_ready() {
+                    if let Some(phys) = self.cache.write_span(address, value, bytes) {
+                        bump_psram(&mut self.code_ver, phys);
+                        bump_psram(&mut self.code_ver, phys + bytes - 1);
+                        return Ok(());
+                    }
+                }
                 self.cache_window_write(address, value, bytes)?;
                 for a in [address, address + bytes as u32 - 1] { if let Some(phys) = self.cache.psram_phys(a) { bump_psram(&mut self.code_ver, phys); } }
                 return Ok(());
@@ -686,6 +695,7 @@ impl S31Bus {
     fn cache_window_read(&mut self, address: u32, bytes: usize) -> Result<u32, Fault> {
         if address >= crate::cache::PSRAM_VADDR && (!self.clocks.psram_on() || !self.power.policy.psram_enabled() || self.mspi_pads.check_transfer(self.psram_controller.mode().is_some()).is_err() || self.psram_controller.memory_ready(false).is_err()) { return self.fault(address, bytes, false, false, Fault::Prohibited); }
         if address < crate::cache::PSRAM_VADDR && !self.mspi.flash_accessible() { return self.fault(address, bytes, false, false, Fault::Prohibited); }
+        if let Some(v) = self.cache.read_span(address, bytes, self.hart) { return Ok(v); }
         let mut value = [0; 4];
         for (i, byte) in value.iter_mut().take(bytes).enumerate() {
             match address.checked_add(i as u32).ok_or(Fault::Unmapped).and_then(|a| self.cache.read_byte_core(a, false, self.hart)) {
@@ -693,6 +703,11 @@ impl S31Bus {
             }
         }
         Ok(u32::from_le_bytes(value))
+    }
+    /// The PSRAM window's preconditions for a CPU store (`cache_window_write`'s first test).
+    #[inline(always)]
+    fn cache_window_ready(&mut self) -> bool {
+        self.clocks.psram_on() && self.power.policy.psram_enabled() && self.mspi_pads.check_transfer(self.psram_controller.mode().is_some()).is_ok() && self.psram_controller.memory_ready(true).is_ok()
     }
     /// A CPU store to the cache windows (the flash window refuses it).
     fn cache_window_write(&mut self, address: u32, value: u32, bytes: usize) -> Result<(), Fault> {

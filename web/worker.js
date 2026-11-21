@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'esp32s31', ramMb},
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
@@ -141,6 +141,20 @@ async function start(os, ramMb, jit) {
       .map(([f, gz]) => fetchBytes(`assets/orangepi5/${f}`, gz)));
     if (ex.sbc_boot_opi5(ramMb, copyIn(kernel), kernel.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
     if (jit) ex.sbc_jit(1);
+    frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
+  if (os === 'esp32s31') {
+    // ESP32-S31-Function-CoreBoard-1 (two 32-bit RISC-V harts, 16 MiB PSRAM): Espressif's mask
+    // ROM and its official Linux flash image (scripts/esp32s31-fixture.sh), booting through the
+    // ROM, U-Boot SPL, OpenSBI and U-Boot to Linux; shell on UART0. The image arrives gzip'd
+    postMessage({ type: 'status', text: 'loading Espressif’s ROM and the Linux flash image…' });
+    const [rom, flash] = await Promise.all([['esp32s31_rev0_rom.elf', false], ['s31_full_flash.bin.gz', true]]
+      .map(([f, gz]) => fetchBytes(`assets/esp32s31/${f}`, gz)));
+    if (ex.sbc_boot_s31(copyIn(rom), rom.length, copyIn(flash), flash.length) !== 0) throw new Error('boot setup failed');
+    ex.sbc_jit(jit ? 1 : 0);
     frameEvery = 100;
     postMessage({ type: 'status', text: 'booting…' });
     loop();

@@ -40,4 +40,10 @@ if [ -f cache/orangepi5/Image.gz ]; then
   mkdir -p web/assets/orangepi5
   cp cache/orangepi5/Image.gz cache/orangepi5/initramfs.cpio.gz web/assets/orangepi5/
 fi
+# the ESP32-S31's demo (scripts/esp32s31-fixture.sh) for web/board.html?b=esp32s31
+if [ -f cache/esp32s31/images/s31_full_flash.bin ]; then
+  mkdir -p web/assets/esp32s31
+  cp cache/esp32s31/esp32s31_rev0_rom.elf web/assets/esp32s31/
+  gzip -9n -c cache/esp32s31/images/s31_full_flash.bin > web/assets/esp32s31/s31_full_flash.bin.gz
+fi
 ls -la web/assets

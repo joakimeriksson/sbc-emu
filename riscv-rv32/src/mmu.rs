@@ -29,7 +29,9 @@ pub mod pte {
 
 const TLB_SIZE: usize = 256;
 
+/// `repr(C)`: compiled code (`jit`) reads `tag`, `page` and `flags` at offsets 0, 4 and 8.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct TlbEntry {
     /// virtual page number + 1 (0 = empty)
     tag: u32,
@@ -51,6 +53,12 @@ impl Default for Tlb {
 
 impl Tlb {
     pub fn flush(&mut self) { self.entries.clear(); }
+    /// The slot that holds `va`'s translation (`tag`, `page`, `flags` as u32s), null while the TLB
+    /// is empty. It stays put until the TLB is flushed (`sfence.vma`, a `satp` write).
+    pub(crate) fn slot_ptr(&self, va: u32) -> *const u32 {
+        if self.entries.is_empty() { return std::ptr::null(); }
+        (&self.entries[((va >> 12) as usize) & (TLB_SIZE - 1)]) as *const TlbEntry as *const u32
+    }
 }
 
 impl Cpu {

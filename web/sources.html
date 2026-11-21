@@ -112,8 +112,21 @@
     <li><strong>Alpine Linux 3.24.4 minirootfs</strong> for aarch64, unmodified, with a short <code>/init</code> written for sbc-emu (<code>scripts/orangepi5-fixture.sh</code>). Licences and source as for the Orange Pi One's initramfs above.</li>
   </ul>
 
+  <h2>ESP32-S31: mask ROM</h2>
+  <ul>
+    <li><strong>The ESP32-S31 mask ROM</strong>, Espressif's <code>esp32s31_rev0_rom.elf</code> from <a href="https://github.com/espressif/esp-rom-elfs/releases/tag/20260528">esp-rom-elfs 20260528</a>, unmodified (SHA-256 <code>a52ad751…93d5ab87</code>).</li>
+    <li>Licence: Apache 2.0, as the <a href="https://github.com/espressif/esp-rom-elfs">esp-rom-elfs</a> repository states.</li>
+  </ul>
+
+  <h2>ESP32-S31: Linux flash image</h2>
+  <ul>
+    <li><strong>Espressif's ESP32-S31 Linux image</strong> for the Function CoreBoard-1 (<code>s31_full_flash.bin</code>, served gzip'd), built unmodified with <code>scripts/esp32s31-fixture.sh</code> from Espressif's <a href="https://github.com/espressif/esp-buildroot-external/tree/d75370b">esp-buildroot-external d75370b</a> (<code>espressif_esp32s31_function_core_board_nor_defconfig</code>) on Buildroot 2025.02.x. It holds U-Boot SPL and U-Boot, OpenSBI, Linux 6.18 and a cramfs root filesystem with BusyBox.</li>
+    <li>Licences: GNU GPL version 2 (Linux, U-Boot, BusyBox), BSD 2-Clause (OpenSBI), and others as each Buildroot package states.</li>
+    <li>Source: <a href="https://github.com/espressif/linux/tree/19629799">espressif/linux 19629799</a> (integration/v6.18-esp32s31), <a href="https://github.com/espressif/u-boot/tree/e5dff8d3">espressif/u-boot e5dff8d3</a> (integration/v2024.07-esp32s31), <a href="https://github.com/espressif/opensbi/tree/5395e03e">espressif/opensbi 5395e03e</a> (integration/v1.6-esp32s31), and <a href="https://gitlab.com/buildroot.org/buildroot/-/tree/2025.02.x">Buildroot 2025.02.x</a> for the root filesystem's packages.</li>
+  </ul>
+
   <h2>Trademarks</h2>
-  <p>Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi is a trademark of Shenzhen Xunlong Software Co. ASUS and Tinker Board are trademarks of ASUSTeK Computer Inc. Broadcom, Allwinner, Rockchip and StarFive are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them; the names only say which hardware it emulates.</p>
+  <p>Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi is a trademark of Shenzhen Xunlong Software Co. ASUS and Tinker Board are trademarks of ASUSTeK Computer Inc. Broadcom, Allwinner, Rockchip, StarFive, Espressif and ESP32 are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them; the names only say which hardware it emulates.</p>
 </main>
 </body>
 </html>
