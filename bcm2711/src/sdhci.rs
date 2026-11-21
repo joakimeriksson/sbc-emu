@@ -521,7 +521,10 @@ impl Sdhci {
 
     fn csd(&self) -> u128 {
         let sectors = self.disk.as_ref().map(|d| d.sectors()).unwrap_or(0);
-        let c_size = (sectors / 1024).saturating_sub(1) as u128 & 0x3f_ffff;
+        // capacity in 512 KiB units, rounded up: an image whose size is not a multiple (Ubuntu
+        // Server's is 9380.56 units) would otherwise end inside its last partition, and Linux
+        // drops that partition. The rest of the last unit reads as zeros (load_block).
+        let c_size = sectors.div_ceil(1024).saturating_sub(1) as u128 & 0x3f_ffff;
         let mut v: u128 = 1 << 126; // CSD 2.0
         v |= 0x0e << 112; // TAAC
         v |= 0x32 << 96; // TRAN_SPEED 25 MHz
@@ -578,5 +581,24 @@ impl Sdhci {
             d.restore_overlay(sectors);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_core::disk::MemDisk;
+
+    /// The capacity the CSD reports, in sectors: (C_SIZE + 1) × 512 KiB.
+    fn csd_sectors(sectors: usize) -> u64 {
+        let s = Sdhci::new(Some(Box::new(MemDisk(vec![0; sectors * 512]))));
+        (((s.csd() >> 48) & 0x3f_ffff) as u64 + 1) * 1024
+    }
+
+    #[test]
+    fn capacity_covers_an_image_that_is_not_a_whole_number_of_units() {
+        assert_eq!(csd_sectors(4096), 4096); // a whole number of 512 KiB units: exact
+        assert_eq!(csd_sectors(4097), 5120); // not: rounded up, never short of the last partition
+        assert_eq!(csd_sectors(1), 1024);
     }
 }

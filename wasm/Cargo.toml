@@ -24,3 +24,5 @@ riscv64 = { path = "../riscv64" }
 emu-core = { path = "../emu-core" }
 # zstd-recompressed snapshots for the public site (tools/snap-zstd.sh): pure Rust, decode only
 ruzstd = { version = "0.7", default-features = false, features = ["std"] }
+# SD images dropped on the page as .img.xz (web/worker.js reads them a block at a time): pure Rust
+lzma-rs = { version = "0.3", default-features = false }
