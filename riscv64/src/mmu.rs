@@ -74,6 +74,23 @@ pub struct UEntry {
 
 pub const U_EMPTY: UEntry = UEntry { tag: u64::MAX, delta: 0 };
 
+/// Entries per table of the jump cache: the native JIT's compiled code goes from one region
+/// to the next through it without returning to the driver.
+pub const JC: usize = 2048;
+/// Jump cache tables, one per privilege mode (indexed by `prv`; S and U run different code).
+pub const JC_TABLES: usize = 4;
+
+/// A jump cache entry: the region entered at virtual address `pc` in this table's mode, and
+/// its linked entry point (`pc` is `u64::MAX` when empty: never a valid, even, pc).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct JEntry {
+    pub pc: u64,
+    pub code: u64,
+}
+
+pub const J_EMPTY: JEntry = JEntry { pc: u64::MAX, code: 0 };
+
 #[derive(Default)]
 pub struct Tlb {
     entries: Vec<Entry>,
@@ -83,12 +100,44 @@ pub struct Tlb {
     pub utlb: Vec<UEntry>,
     /// indices of the filled micro-TLB entries (a flush clears just these)
     pub ufilled: Vec<u32>,
+    /// the jump cache, when the native JIT uses it: `JC_TABLES` tables of `JC` entries
+    pub jc: Vec<JEntry>,
+    pub jfilled: Vec<u32>,
 }
 
 impl Tlb {
     pub fn flush(&mut self) {
         self.entries.clear();
         self.uflush();
+        self.jflush();
+    }
+
+    /// Empty the jump cache (the address space or the compiled code changed).
+    pub fn jflush(&mut self) {
+        if self.jfilled.len() > 256 {
+            self.jc.fill(J_EMPTY);
+        } else {
+            for &i in &self.jfilled {
+                self.jc[i as usize] = J_EMPTY;
+            }
+        }
+        self.jfilled.clear();
+    }
+
+    /// The jump cache slot of `pc` in table `table`.
+    #[inline(always)]
+    pub fn jslot(table: usize, pc: u64) -> usize {
+        table * JC + ((pc >> 1) as usize & (JC - 1))
+    }
+
+    /// Remember that the region entered at `pc` in mode `table` has its linked entry at `code`.
+    #[inline(always)]
+    pub fn jfill(&mut self, table: usize, pc: u64, code: u64) {
+        let i = Self::jslot(table, pc);
+        if self.jc[i].pc == u64::MAX {
+            self.jfilled.push(i as u32);
+        }
+        self.jc[i] = JEntry { pc, code };
     }
 
     /// Empty the micro-TLB.

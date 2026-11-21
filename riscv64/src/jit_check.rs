@@ -119,7 +119,7 @@ fn value(rng: &mut Rng) -> u64 {
 
 fn random_insn(rng: &mut Rng, items: &mut Vec<Item>) {
     let (rd, a, b) = (reg(rng), rng.below(32) as u32, rng.below(32) as u32);
-    let item = match rng.below(20) {
+    let item = match rng.below(22) {
         0..=3 => {
             let (f7, f3) = rng.pick(&[
                 (0, 0), (0x20, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0x20, 5), (0, 6), (0, 7),
@@ -216,6 +216,27 @@ fn random_insn(rng: &mut Rng, items: &mut Vec<Item>) {
                 Item::Fwd(r_type(0, rng.pick(&[0, 1, 4, 5, 6, 7]), 0x63, 0, a, b), k)
             }
         }
+        19 => {
+            // flw, fld, fsw, fsd around the data pointer (the FPU is off in some cases)
+            let off = rng.below(4096) as i32 - 2048;
+            let off = if rng.below(4) == 0 { off } else { off & !7 };
+            let f3 = rng.pick(&[2, 3]);
+            let f = rng.below(32) as u32;
+            if rng.below(2) == 0 {
+                Item::I32(i_type(off, f3, 0x07, f, 5))
+            } else {
+                Item::I32(s_type(off, f3, 5, f) & !0x7f | 0x27)
+            }
+        }
+        20 => {
+            // LR and SC at the data pointer (a held reservation sends AMOs to the interpreter)
+            let f3 = rng.pick(&[2, 3]);
+            if rng.below(2) == 0 {
+                Item::I32(r_type(0x02 << 2, f3, 0x2f, rd, 5, 0))
+            } else {
+                Item::I32(r_type(0x03 << 2, f3, 0x2f, rd, 5, b))
+            }
+        }
         _ => Item::Jalr(i_type(0, 0, 0x67, rd, 8), 1 + rng.below(3) as usize),
     };
     items.push(item);
@@ -288,11 +309,13 @@ pub fn random_program(rng: &mut Rng, loops: bool) -> Vec<u8> {
 /// Sv39 (identity gigapages) when `smode`.
 fn setup(code: &[u8], seed: u64, smode: bool) -> (Hart, TestBus) {
     let mut rng = Rng(seed | 1);
+    // anywhere in its page, so that some programs run on into the next one
+    let at = CODE + (seed >> 8) % 0x400 * 4;
     let mut bus = TestBus { ram: vec![0; RAM_SIZE], dev: seed };
     for b in bus.ram.iter_mut() {
         *b = rng.next_u64() as u8;
     }
-    let c = (CODE - RAM_BASE) as usize;
+    let c = (at - RAM_BASE) as usize;
     bus.ram[c..c + code.len()].copy_from_slice(code);
     let mut h = Hart::new(Identity::sifive_u74(0));
     for r in 1..32 {
@@ -301,9 +324,15 @@ fn setup(code: &[u8], seed: u64, smode: bool) -> (Hart, TestBus) {
     h.x[5] = DATA + (rng.below(256) & !7);
     h.x[9] = h.x[5];
     h.x[6] = DEV;
-    h.pc = CODE;
+    for r in 0..32 {
+        h.f[r] = value(&mut rng);
+    }
+    if seed & 0x30 != 0 {
+        h.mstatus |= 1 << 13; // FS = initial
+    }
+    h.pc = at;
     // a trap ends the run at the final wfi
-    let wfi = CODE + code.len() as u64 - 4;
+    let wfi = at + code.len() as u64 - 4;
     h.mtvec = wfi;
     h.stvec = wfi;
     h.mcounteren = u64::MAX;
@@ -342,6 +371,9 @@ pub fn compare(code: &[u8], seed: u64, smode: bool, hot: u32) -> Result<(), Stri
         if a.x[r] != b.x[r] {
             diffs.push(format!("x{r}: {:#x} (interpreter) {:#x} (JIT)", a.x[r], b.x[r]));
         }
+        if a.f[r] != b.f[r] {
+            diffs.push(format!("f{r}: {:#x} (interpreter) {:#x} (JIT)", a.f[r], b.f[r]));
+        }
     }
     for (name, x, y) in [
         ("pc", a.pc, b.pc),
@@ -350,6 +382,7 @@ pub fn compare(code: &[u8], seed: u64, smode: bool, hot: u32) -> Result<(), Stri
         ("mscratch", a.mscratch, b.mscratch),
         ("sscratch", a.sscratch, b.sscratch),
         ("mcause", a.mcause, b.mcause),
+        ("mstatus", a.mstatus, b.mstatus),
         ("scause", a.scause, b.scause),
         ("device", abus.dev, bbus.dev),
         ("wfi", a.wfi as u64, b.wfi as u64),

@@ -198,6 +198,13 @@ pub struct Hart {
     pub jit_bus: usize,
     pub jit_step: usize,
     pub chain_until: u64,
+    /// the jump cache table of the current mode (host address; native JIT)
+    pub jit_jc: usize,
+    /// the JIT's generation of compiled code the jump cache was filled from
+    pub jit_gen: u64,
+    /// compiled code's scratch: a return address and a count kept across `h_step`
+    pub jit_lr: u64,
+    pub jit_tmp: u64,
     /// `fence_i` when the JIT last looked
     pub jit_fence_seen: u64,
     /// the last illegal instruction (pc, encoding), for reports
@@ -250,6 +257,10 @@ impl Hart {
             jit_bus: 0,
             jit_step: 0,
             chain_until: 0,
+            jit_jc: 0,
+            jit_gen: 0,
+            jit_lr: 0,
+            jit_tmp: 0,
             jit_fence_seen: 0,
             last_illegal: None,
         }

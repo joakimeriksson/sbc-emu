@@ -217,14 +217,25 @@ hosts interpret.
 
 - **Regions.** A hot entry (64 executions) is compiled with the basic blocks its constant branches
   reach on the same 4 KiB page, so loops run inside compiled code while the cycle budget lasts.
-  Compiled: RV64I, M, Zba and Zbb (natively also `mulh*` and `rev8`; neither backend `orc.b`).
-  CSRs, privileged instructions, AMOs and floating point go to the interpreter one instruction at
-  a time; those that can change the mode, the address space or interrupt lines end the block.
+  Compiled: RV64I, M, Zba and Zbb (natively also `mulh*`, `rev8`, floating-point loads and
+  stores, and AMOs other than LR/SC; neither backend `orc.b`). CSRs, privileged instructions and
+  floating-point arithmetic go to the interpreter one instruction at a time; those that can change
+  the mode, the address space or interrupt lines end the block (CSR reads, and writes of `fcsr`
+  and the scratch registers, do not).
+- **Natively, regions are linked and keep registers in host registers.** An exit to a pc the
+  hart's jump cache knows (one table per mode, filled with each region the driver enters, emptied
+  on `satp` writes, `sfence.vma`, `fence.i` and flushes) jumps straight into that region while the
+  budget lasts, so control flow between compiled regions, calls and returns included, does not
+  come back to the driver. A region keeps the guest registers it uses more than once (up to 14)
+  and the cycle count in host registers; they are written back before an instruction goes to the
+  interpreter and on the way out.
 - **Shared and keyed by physical address.** The four harts share the code, and a page mapped at
   several virtual addresses is compiled once; the code computes PCs from the page's virtual
   address.
 - **Loads and stores** go through a 256-entry micro-TLB per mode (U, S, S with SUM, M), filled by
-  the interpreter's page walks; misaligned and device accesses take the interpreter's path.
+  the interpreter's page walks; device accesses, page-straddling ones (natively; in WebAssembly
+  all misaligned ones) and every access while an LR reservation is held (so a store to the
+  reserved address clears it) take the interpreter's path.
 - **`fence.i`.** Code stays valid until a `fence.i`, as on the U74. After one, a region is
   compared with the bytes it was compiled from the first time it runs again, so code written by
   DMA is caught as well as stores. (Linux issues about 9,000 `fence.i`s while it boots, so
@@ -232,10 +243,11 @@ hosts interpret.
 
 `cargo test -p riscv64` (natively, with the AArch64 backend; `SBC_JIT_CASES=n` for more) and
 `node tools/wasm-rv-jit-diff.mjs` (the WebAssembly backend) run random programs (integer, M, Zba,
-Zbb, loads and stores with misaligned, page-straddling and device accesses, AMOs, CSRs, compressed
-instructions, branches, jumps and loops) in M mode and in S mode with Sv39, and compare
-registers, counters, CSRs and memory with the interpreter: 120,000 cases natively and 18,000 in
-WebAssembly match.
+Zbb, loads and stores with misaligned, page-straddling and device accesses, floating-point loads
+and stores with the FPU on and off, AMOs, LR/SC, CSRs, compressed instructions, branches, jumps
+and loops, placed anywhere in a page so some run on into the next) in M mode and in S mode with
+Sv39, and compare registers (integer and floating point), counters, CSRs and memory with the
+interpreter: 120,000 cases natively and 18,000 in WebAssembly match.
 
 | Mainline to the BusyBox shell (M5) | Wall time | Instructions |
 |---|---|---|
@@ -246,12 +258,14 @@ WebAssembly match.
 | Browser build, JIT, the demo's initramfs | 4.6 s | 1.9 G |
 
 Canonical's Ubuntu 24.04.5 image (`scripts/orangepi-rv-ubuntu.txt`: boot, login, network and
-system checks, 104 G instructions, 112 s of guest time) takes 536 s interpreted and 162 s with
-the native JIT.
+system checks, about 90 G instructions) takes 536 s interpreted and 99 s with the native JIT,
+about as long as its 97 s of guest time.
 
 CPU-bound, four shell loops of 300,000 iterations on the four harts (about 16 G instructions)
-take 121.5 s interpreted and 14.3 s with the native JIT (8.5 times faster, about 1.6 G
-instructions per second).
+take 121.5 s interpreted and 7.4 s with the native JIT (16 times faster, about 2.2 G
+instructions per second). Linking regions, host registers, compiling floating-point loads and
+stores and AMOs, and updating device interrupt lines only after a device access halved this
+(from 14.4 s; the processes' CPU time went from 13.9 s to 6.6 s).
 
 ## Not working yet
 
@@ -274,5 +288,5 @@ instructions per second).
   - SD boot needs `--ram-mb` 2048, 4096, 8192 or 16384: U-Boot takes the DRAM size from the EEPROM and knows only those.
 - **Distribution images:** Ubuntu 24.04.5 boots (above). Its own SD-card firmware (`loader1`/`loader2`, U-Boot 2025.10) cannot start on this board: its FIT has configurations for the VisionFive 2, Mars, Star64 and DeepComputing boards only, so SPL stops with error -38, as it would on a real Orange Pi RV; the board's flash firmware boots the image instead. Ubuntu 25.10 and later need the RVA23 profile, which the U74 lacks. Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried.
 - **Speed:** all harts share one host thread (no `--threads multi` as on the Raspberry Pi 4 and the
-  Orange Pi 5). The JIT keeps guest registers in memory and goes through the driver at every
-  region exit; x86-64 hosts interpret.
+  Orange Pi 5), and they take turns every 1,000 instructions. The browser's JIT keeps guest
+  registers in memory and goes through the driver at every region exit; x86-64 hosts interpret.

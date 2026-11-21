@@ -107,6 +107,8 @@ straight-line and in loops, through the wasm backend against the interpreter.
 `riscv64/src/jit.rs` drives a separate JIT for the RISC-V core with two code generators: RV64 to
 AArch64 (`jit_a64.rs`) and RV64 to WebAssembly (`jit_wasm.rs`). Its regions are keyed by physical
 address and shared by the four harts, stay valid until `fence.i` (then are compared with the bytes
-they were compiled from), and probe a per-mode micro-TLB for loads and stores. Four busy shell
-loops run 8.5 times faster than in the interpreter (about 1.6 G RISC-V instructions per second on
-an M5). The design, its tests and timings are in [orangepi-rv.md](orangepi-rv.md#the-jit).
+they were compiled from), and probe a per-mode micro-TLB for loads and stores. Natively, regions
+are linked through a per-hart jump cache and keep the guest registers they use most in host
+registers. Four busy shell loops run 16 times faster than in the interpreter (about 2.2 G RISC-V
+instructions per second on an M5). The design, its tests and timings are in
+[orangepi-rv.md](orangepi-rv.md#the-jit).

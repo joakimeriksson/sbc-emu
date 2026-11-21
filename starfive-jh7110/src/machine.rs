@@ -187,6 +187,9 @@ pub struct Soc {
     /// the hart whose accesses are being executed
     pub cur: usize,
     irq_dirty: bool,
+    /// a device register was read or written since `update_devices` last ran (device
+    /// interrupt levels change only then, or when time moves between rounds)
+    dev_touched: bool,
 }
 
 impl Soc {
@@ -271,6 +274,7 @@ impl Soc {
             now: 0,
             cur: 1,
             irq_dirty: false,
+            dev_touched: false,
         }
     }
 
@@ -502,6 +506,7 @@ impl Soc {
     }
 
     fn dev_read(&mut self, a: u64, size: u8) -> Result<u64, ()> {
+        self.dev_touched = true;
         let r32 = |v: u32| Ok(v as u64);
         for k in 0..2 {
             let p = &mut self.pcie[k];
@@ -642,6 +647,7 @@ impl Soc {
     }
 
     fn dev_write(&mut self, a: u64, size: u8, v: u64) -> Result<(), ()> {
+        self.dev_touched = true;
         let v32 = v as u32;
         for k in 0..2 {
             if self.pcie[k].in_bar(a) {
@@ -949,13 +955,17 @@ impl Machine {
         let mut left = budget;
         while left > 0 {
             let mut ran = 0;
+            // time moved (or devices ticked) since the last round
+            self.soc.dev_touched = true;
             for _ in 0..HARTS {
                 let h = self.rr;
                 self.rr = (self.rr + 1) % HARTS;
                 if self.state[h] != HartState::Run {
                     continue;
                 }
-                self.soc.update_devices();
+                if std::mem::take(&mut self.soc.dev_touched) {
+                    self.soc.update_devices();
+                }
                 let lines = self.soc.lines(h);
                 let hart = &mut self.harts[h];
                 hart.irq_lines = lines;
