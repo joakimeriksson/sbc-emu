@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sbc-emu</title>
-<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. Two of them boot in your browser.">
+<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. Three of them boot in your browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -252,7 +252,7 @@
       </div>
     </div>
     <div>
-      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. Two of the boards boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
+      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. Three of the boards boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
       <dl class="tally">
         <dt>6</dt><dd>boards</dd>
         <dt>4</dt><dd>instruction sets</dd>
@@ -268,7 +268,7 @@
       <li><a class="unit on" href="#pi4" style="--w:85;--i:0"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-pi4"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Raspberry Pi 4</a></li>
       <li><a class="unit on" href="#orangepi-one" style="--w:69;--i:1"><svg viewBox="0 0 69 48" aria-hidden="true"><use href="#b-opi1"/><circle class="glow" cx="5" cy="37" r="4"/><circle class="led" cx="5" cy="37" r="1.1"/></svg>Orange Pi One</a></li>
       <li><a class="unit" href="#orangepi-rv" style="--w:89"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
-      <li><a class="unit" href="#tinkerboard" style="--w:85"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
+      <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:2"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
       <li><a class="unit" href="#orangepi5" style="--w:100"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
       <li><a class="unit" href="#esp32s31" style="--w:26"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
     </ul>
@@ -312,7 +312,7 @@
         <p>The unmodified Armbian image to its login prompt, with the HDMI console, a USB keyboard and Ethernet. Its 32-bit core has its own JIT, to AArch64 natively and to WebAssembly in the browser.</p>
         <div class="run">
           <a class="pad-btn" href="board.html?b=orangepi-one"><span class="via" aria-hidden="true"></span>Power on</a>
-          <small>Alpine’s kernel boots from scratch to a serial shell in about five seconds. A 14 MB download.</small>
+          <small>Alpine’s kernel boots from scratch to a serial shell in under ten seconds. A 15 MB download.</small>
         </div>
       </div>
     </article>
@@ -333,11 +333,11 @@
       </div>
     </article>
 
-    <article class="sheet" id="tinkerboard">
-      <div class="art"><svg viewBox="0 0 85 56" style="--w:85" aria-hidden="true"><use href="#b-tinker"/><circle class="led" cx="5" cy="44" r="1.1"/></svg></div>
+    <article class="sheet live" id="tinkerboard">
+      <div class="art"><svg viewBox="0 0 85 56" style="--w:85" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg></div>
       <div>
         <h3>ASUS Tinker Board S</h3>
-        <p class="status"><i aria-hidden="true"></i>Native emulator; browser version on its way</p>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
         <dl class="spec">
           <div><dt>SoC</dt><dd>Rockchip RK3288</dd></div>
           <div><dt>CPU</dt><dd>4 × Cortex-A12</dd></div>
@@ -345,7 +345,10 @@
           <div><dt>GPU</dt><dd>Mali-T760: Panfrost</dd></div>
         </dl>
         <p>The unmodified Armbian image from the SD card or eMMC to a login on its HDMI screen, with the RK808 power controller and real-time clock. Mesa’s Panfrost driver renders kmscube and all 25 scenes of the GLES 2 test suite, matching software rendering.</p>
-        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/rk3288-tinker-board-plan.md">How it boots</a></div>
+        <div class="run">
+          <a class="pad-btn" href="board.html?b=tinker-board"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>Debian’s kernel and the board’s own device tree boot from scratch to a serial shell in under ten seconds. An 11 MB download.</small>
+        </div>
       </div>
     </article>
 

@@ -7,17 +7,31 @@ cores and register-level models of each board's chips, and runs the boards' own 
 systems unmodified: Raspberry Pi OS, Ubuntu, Armbian, Alpine. No QEMU.
 
 **Try it in your browser: [joakimeriksson.github.io/sbc-emu](https://joakimeriksson.github.io/sbc-emu/).**
-The Raspberry Pi 4 and the Orange Pi One boot there in seconds, on your own computer.
+The Raspberry Pi 4, the Orange Pi One and the ASUS Tinker Board S boot there in seconds, on your
+own computer.
+
+<table>
+<tr>
+<td><img src="docs/img/glmark2-1080p.png" alt="glmark2 scenes rendered on the emulated V3D GPU" width="280"></td>
+<td><img src="docs/img/orangepi5-gles-hdmi.png" alt="A GLES scene rendered by Mesa on the emulated Mali-G610, on HDMI" width="280"></td>
+<td><img src="docs/img/orangepi-rv-vkcube.png" alt="vkcube on the emulated PowerVR GPU" width="280"></td>
+</tr>
+<tr>
+<td>Raspberry Pi 4: glmark2 on the V3D GPU, stock Raspberry Pi OS and Mesa</td>
+<td>Orange Pi 5: Mesa's Panfrost rendering on the Mali-G610, shown on HDMI</td>
+<td>Orange Pi RV (RISC-V): vkcube on the PowerVR GPU with Mesa's Vulkan driver</td>
+</tr>
+</table>
 
 ## Boards
 
 | Board | Chip | What runs | Details |
 |---|---|---|---|
 | Raspberry Pi 4 Model B | Broadcom BCM2711, 4× Cortex-A72 | Raspberry Pi OS and Ubuntu 26.04 Desktop; the V3D GPU with OpenGL ES 3.1 and Vulkan 1.3; HDMI, USB, network, audio. Also in the browser. | [raspberry-pi-4.md](docs/raspberry-pi-4.md) |
-| Orange Pi 5 | Rockchip RK3588S, 4× Cortex-A76 + 4× A55 | Armbian to its login prompt on eight cores; HDMI, USB 3.0, NVMe; the first Mali-G610 frames | [orangepi5.md](docs/orangepi5.md) |
+| Orange Pi 5 | Rockchip RK3588S, 4× Cortex-A76 + 4× A55 | Armbian to its login prompt on eight cores; HDMI, USB 3.0, NVMe, audio; the Mali-G610 GPU in bring-up, GLES scenes on HDMI | [orangepi5.md](docs/orangepi5.md) |
 | Orange Pi One | Allwinner H3, 4× Cortex-A7 | Armbian to its login prompt; HDMI, USB, Ethernet; the Mali-400 GPU. Also in the browser. | [orangepi-one.md](docs/orangepi-one.md) |
 | Orange Pi RV | StarFive JH7110, 4× SiFive U74 (RISC-V) | the board's own boot chain from the SD card to Alpine or Xunlong's kernel; Wi-Fi, NVMe; the PowerVR GPU with Vulkan | [orangepi-rv.md](docs/orangepi-rv.md) |
-| ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12 | Armbian from SD or eMMC to a login on HDMI; the Mali-T760 GPU with Panfrost | [rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
+| ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12 | Armbian from SD or eMMC to a login on HDMI; the Mali-T760 GPU with Panfrost. Also in the browser. | [rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
 | ESP32-S31 Function CoreBoard | Espressif ESP32-S31, 2× RV32IMAC | Espressif's official Linux flash image, from the mask ROM to a shell | [esp32s31.md](docs/esp32s31.md) |
 
 The Raspberry Pi 4 is complete enough for real use; the other boards are experimental. Each
