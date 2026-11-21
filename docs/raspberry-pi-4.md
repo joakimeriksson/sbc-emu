@@ -2,7 +2,7 @@
 
 The first board, and the furthest along: an instruction-level BCM2711 that boots the unmodified
 **Raspberry Pi OS Lite (trixie, arm64) SD-card image** and Ubuntu 26.04 Desktop, natively and in
-the browser (WebAssembly). The [sbc-emu page](../web/index.html) runs its 3D demos in a browser tab.
+the browser (WebAssembly). The [3D demo page](../web/gpu.html) runs its GPU demos in a browser tab.
 
 ## What runs today
 
@@ -174,7 +174,8 @@ frozen copy of the image (`cache/os/ubuntu-desktop-base.img`, never written), lo
 tools/wasm-build.sh                               # web/wasm/sbc-emu.wasm + web/assets
 ln -s ../../cache/os/raspios-lite.img web/assets/raspios-lite.img
 tools/serve.py                                    # needs HTTP Range support: use this, not http.server
-open http://127.0.0.1:8791/            # the sbc-emu page: live 3D demos on the Pi 4's GPU
+open http://127.0.0.1:8791/            # the front page (web/boards.html)
+open http://127.0.0.1:8791/gpu.html    # live 3D demos on the Pi 4's GPU
 open http://127.0.0.1:8791/pi4.html    # the full Pi 4 console
 open http://127.0.0.1:8791/hello.html  # the smallest demo: a busybox shell in seconds
 ```
@@ -196,8 +197,9 @@ WebAssembly (`tools/wasm-smoke-opirv.mjs` boots it in Node, `tools/wasm-rv-jit-d
 against the interpreter). (With the browser's
 debugger attached, as browser-automation tools do, WebAssembly runs several times slower.)
 
-`index.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
-scenes on the emulated V3D GPU (setup in [docs/gpu.md](gpu.md#in-the-browser)).
+`gpu.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
+scenes on the emulated V3D GPU, also on the public site, from the snapshot alone (setup in
+[docs/gpu.md](gpu.md#in-the-browser)).
 `pi4.html` offers a cold boot of the SD image, a resume from `web/assets/raspios-lite.snap` (if
 present) and the quick busybox demo. Click the screen to type on the USB keyboard; the mouse
 over the screen is the USB tablet, and what the guest plays on the DAC comes out of the page

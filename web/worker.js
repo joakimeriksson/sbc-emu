@@ -12,7 +12,7 @@ const serialQueue = [];
 
 // ---- SD card image, read lazily with synchronous range requests (allowed in workers)
 const CHUNK = 1 << 20, MAX_CHUNKS = 384;
-let imageUrl = null, chunks = new Map(), fetched = 0;
+let imageUrl = null, chunks = new Map(), fetched = 0, noCardWarned = false;
 function chunk(idx) {
   let c = chunks.get(idx);
   if (c) { chunks.delete(idx); chunks.set(idx, c); return c; }
@@ -31,6 +31,12 @@ function chunk(idx) {
 function diskRead(lba, count, ptr) {
   let off = lba * 512, left = count * 512, dst = ptr;
   const m = mem8();
+  if (!imageUrl) {
+    // a snapshot published without its SD card (the 3D demos never read it): reads see zeros
+    m.fill(0, dst, dst + left);
+    if (!noCardWarned) { noCardWarned = true; postMessage({ type: 'status', text: 'the guest read its SD card, which this page does not have: programs other than the demos may fail', phase: 'nocard' }); }
+    return;
+  }
   while (left > 0) {
     const idx = Math.floor(off / CHUNK), within = off % CHUNK;
     const c = chunk(idx);
@@ -47,6 +53,29 @@ async function fetchBytes(url, gz) {
   if (!r.ok) throw new Error(`${url}: ${r.status}`);
   const body = gz ? r.body.pipeThrough(new DecompressionStream('gzip')) : r.body;
   return new Uint8Array(await new Response(body).arrayBuffer());
+}
+// a large file, either whole or (on GitHub Pages, which takes files up to 100 MB) in the parts a
+// JSON manifest lists; reports the download's progress
+async function fetchParts(url, label) {
+  let parts = [url], total = 0, extra = {};
+  const man = await fetch(url + '.json');
+  if (man.ok) { extra = await man.json(); parts = extra.parts.map((p) => new URL(p, new URL(url, location.href)).href); total = extra.bytes; }
+  const bufs = []; let got = 0;
+  for (const p of parts) {
+    const r = await fetch(p);
+    if (!r.ok) throw new Error(`${p}: ${r.status}`);
+    total ||= Number(r.headers.get('Content-Length')) || 0;
+    const rd = r.body.getReader();
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      bufs.push(value); got += value.length;
+      if (total) postMessage({ type: 'status', text: `${label}: ${(got / 1e6).toFixed(0)} of ${(total / 1e6).toFixed(0)} MB`, phase: 'download', got, total });
+    }
+  }
+  const out = new Uint8Array(got); let o = 0;
+  for (const b of bufs) { out.set(b, o); o += b.length; }
+  return { bytes: out, extra };
 }
 function copyIn(bytes) { const p = ex.sbc_alloc(bytes.length); mem8().set(bytes, p); return p; }
 
@@ -126,12 +155,17 @@ async function start(os, ramMb, jit) {
   }
   if (os === 'gpu-demo') {
     // Raspberry Pi OS with Mesa, logged in on HDMI, every demo run once (scripts/gpu-demo-snapshot.txt)
-    imageUrl = 'assets/raspios-gpu.img';
-    const head = await fetch(imageUrl, { method: 'HEAD' });
-    const size = Number(head.headers.get('Content-Length'));
-    if (!head.ok || !size) throw new Error('SD image assets/raspios-gpu.img not found (see docs/gpu.md: the browser demos)');
+    // the SD card if it is served next to the page (tools/wasm-build.sh); the public site has only
+    // the snapshot, whose demos run from the guest's page cache (tools/site-build.sh)
+    const head = await fetch('assets/raspios-gpu.img', { method: 'HEAD' });
+    let size = Number(head.headers.get('Content-Length'));
+    if (head.ok && size) imageUrl = 'assets/raspios-gpu.img';
     postMessage({ type: 'status', text: 'loading the machine snapshot…', phase: 'snapshot' });
-    const snap = await fetchBytes('assets/gpu-demo.snap', false);
+    const { bytes: snap, extra } = await fetchParts('assets/gpu-demo.snap', 'downloading the snapshot');
+    if (!imageUrl) {
+      if (!extra.sectors) throw new Error('no SD image (assets/raspios-gpu.img) and no snapshot manifest (assets/gpu-demo.snap.json): see docs/gpu.md');
+      size = extra.sectors * 512;
+    }
     postMessage({ type: 'status', text: 'restoring the Pi…', phase: 'restore' });
     const r = ex.sbc_restore(ramMb, size / 512, copyIn(snap), snap.length);
     if (r !== 0) throw new Error(`snapshot restore failed (${r})`);

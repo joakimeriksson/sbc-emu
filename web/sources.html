@@ -45,6 +45,20 @@
   <h2>Raspberry Pi 4: start-up script</h2>
   <p>The initramfs's <code>/init</code> is a short shell script written for sbc-emu (<code>sbc-emu mkinitramfs</code>), under the project's BSD licence.</p>
 
+  <h2>Raspberry Pi 4 3D demos: the snapshot</h2>
+  <p>The 3D demo page resumes a snapshot of an emulated Pi 4’s memory. It holds the programs below as they were running, and parts of many others from the same system.</p>
+  <ul>
+    <li><strong>Raspberry Pi OS Lite</strong> (trixie, arm64), the <a href="https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-10-06/">2026-10-06 image</a>, unmodified (SHA-256 of the <code>.img.xz</code> <code>483db18a…ff422843</code>), after its first boot. Its 703 packages are under their own licences, which each states in <code>/usr/share/doc/<em>package</em>/copyright</code>.</li>
+    <li>Installed on it with <code>apt</code> from the Raspberry Pi OS and Debian archives (<code>scripts/raspios-gpu-setup.txt</code>):
+      <ul>
+        <li><strong>Mesa 26.2.6</strong> (<code>26.2.6-1~bpo13+0~rpt2</code>), MIT licence; source: <a href="https://archive.raspberrypi.com/debian/pool/main/m/mesa/">mesa_26.2.6-1~bpo13+0~rpt2.dsc</a> in the Raspberry Pi archive.</li>
+        <li><strong>glmark2 2023.01</strong> (<code>2023.01+dfsg-2</code>), GNU GPL version 3; source: <a href="https://snapshot.debian.org/package/glmark2/2023.01%2Bdfsg-2/">Debian’s glmark2 2023.01+dfsg-2</a>.</li>
+        <li><strong>kmscube</strong> (<code>0.0.0~git20210103-1</code>), MIT licence; source: <a href="https://snapshot.debian.org/package/kmscube/0.0.0~git20210103-1/">Debian’s kmscube 0.0.0~git20210103-1</a>.</li>
+      </ul></li>
+    <li><strong>Linux 6.18.50</strong>, the Raspberry Pi OS kernel package (<code>1:6.18.50-1+rpt1</code>), GNU GPL version 2; source: <a href="https://archive.raspberrypi.com/debian/pool/main/l/linux/">linux_6.18.50-1+rpt1.dsc</a> in the Raspberry Pi archive.</li>
+    <li>Source for every other package: the same version’s source package in the <a href="https://archive.raspberrypi.com/debian/pool/main/">Raspberry Pi archive</a> (versions with <code>rpt</code>) or on <a href="https://snapshot.debian.org/">snapshot.debian.org</a> (Debian’s).</li>
+  </ul>
+
   <h2>Orange Pi One: Linux kernel and device tree</h2>
   <ul>
     <li><strong>Linux 6.18.64</strong>, Alpine Linux's <code>linux-lts-6.18.64-r0</code> package for armv7: its <code>vmlinuz-lts</code> and its <code>sun8i-h3-orangepi-one.dtb</code>, unmodified (SHA-256 of the package <code>57be01c3…7046aff</code>).</li>
