@@ -275,6 +275,40 @@ impl Cache {
         } else { Err(Fault::Unmapped) }
     }
     pub fn read_byte(&mut self, address: u32, fetch: bool) -> Result<u8, Fault> { self.read_byte_core(address, fetch, 0) }
+    /// `physical` once for an access of `bytes` that lies in one MMU page: every byte passes the
+    /// same domain, freeze and entry checks there and maps to the next offset, so this is the
+    /// per-byte translation's result whenever it returns `Some` (the last byte inside the
+    /// backing store too). `None` leaves the access, and any fault, to the per-byte path.
+    #[inline(always)]
+    fn span(&self, address: u32, bytes: usize, write: bool, hart: usize) -> Option<(bool, usize)> {
+        let psram = address >= PSRAM_VADDR;
+        let base = if psram { PSRAM_VADDR } else { FLASH_VADDR };
+        let mmu = if psram { &self.psram_mmu } else { &self.flash_mmu };
+        let page = mmu.page_size(psram);
+        if (address.wrapping_sub(base) as usize % page) + bytes > page { return None; }
+        let (p, off) = self.physical(address, false, write, hart).ok()?;
+        let store = if p { &self.psram } else { &self.flash };
+        (off + bytes <= store.len()).then_some((p, off))
+    }
+    /// A data read of `bytes` (1..=4) through `span`; `None`: use `read_byte_core` per byte.
+    #[inline(always)]
+    pub fn read_span(&self, address: u32, bytes: usize, hart: usize) -> Option<u32> {
+        let (p, off) = self.span(address, bytes, false, hart)?;
+        let store = if p { &self.psram } else { &self.flash };
+        let mut v = [0u8; 4];
+        v[..bytes].copy_from_slice(&store[off..off + bytes]);
+        Some(u32::from_le_bytes(v))
+    }
+    /// `write` through `span`: the PSRAM offset of the first byte written, or `None` (nothing
+    /// written: use `write`).
+    #[inline(always)]
+    pub fn write_span(&mut self, address: u32, value: u32, bytes: usize) -> Option<usize> {
+        if bytes > 4 { return None; }
+        let (p, off) = self.span(address, bytes, true, 0)?;
+        if !p { return None; }
+        self.psram[off..off + bytes].copy_from_slice(&value.to_le_bytes()[..bytes]);
+        Some(off)
+    }
     pub fn read_byte_core(&mut self, address: u32, fetch: bool, hart: usize) -> Result<u8, Fault> {
         let (psram, off) = match self.physical(address, fetch, false, hart) {
             Ok(v) => v, Err(e) => { if hart < 2 { self.failed_access(address, fetch, hart); } return Err(e); }

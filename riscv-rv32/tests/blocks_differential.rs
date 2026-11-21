@@ -159,6 +159,8 @@ fn one(seed: u64, kind: u32) -> (u64, u64, u64) {
     }
     a.x = regs; b.x = regs;
     b.set_jit(false);
+    // compile every block on its first whole run (the JIT, where the host has a backend)
+    a.blocks.jit_hot = 1;
     let mut bus_b = bus.clone();
     let mut calls = 0;
     for _ in 0..300 {
@@ -181,8 +183,11 @@ fn one(seed: u64, kind: u32) -> (u64, u64, u64) {
         // the interpreter oracle must not have been using blocks
         assert_eq!(b.blocks.builds, 0);
     }
+    COMPILED.fetch_add(a.blocks.compiled, std::sync::atomic::Ordering::Relaxed);
     (calls, a.blocks.builds, a.insn_count)
 }
+
+static COMPILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[test]
 fn blocks_match_the_interpreter_on_random_programs() {
@@ -194,7 +199,9 @@ fn blocks_match_the_interpreter_on_random_programs() {
             programs += 1; calls += c; blocks += b; insns += i;
         }
     }
-    eprintln!("blocks differential: {programs} programs, {calls} run calls compared, {blocks} blocks built, {insns} instructions");
+    let compiled = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("blocks differential: {programs} programs, {calls} run calls compared, {blocks} blocks built, {compiled} compiled, {insns} instructions");
+    if riscv_rv32::jit::AVAILABLE && std::env::var_os("RV32_JIT").is_none() { assert!(compiled > programs, "the programs must exercise the JIT"); }
     assert!(blocks > programs, "the programs must exercise blocks");
 }
 

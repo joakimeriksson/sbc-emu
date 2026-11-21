@@ -46,6 +46,7 @@ fn main() {
             s => { eprintln!("\n[s31] stop {s:?} pc={:#x}", m.cores[0].pc); break; }
         }
     }
+    for (k, c) in m.cores.iter().enumerate() { eprintln!("[s31] hart {k}: {} blocks compiled, {} code-cache resets", c.blocks.compiled, c.blocks.jit_resets); }
     let c = &m.cores[0];
     eprintln!("\n[s31] pc={:#x} priv={} satp={:#x} mepc={:#x} mcause={:#x} mtval={:#x} sepc={:#x} scause={:#x} stval={:#x} insns={} walks={} fault={:?}",
         c.pc, c.priv_mode, c.satp, c.mepc, c.mcause, c.mtval, c.sepc, c.scause, c.stval, c.insn_count, c.tlb.walks, m.bus.last_fault());
