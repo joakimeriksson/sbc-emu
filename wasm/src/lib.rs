@@ -490,7 +490,21 @@ pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8,
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
     m.connect_network(false, false);
-    if m.restore(std::slice::from_raw_parts(snap, len)).is_err() { return -1; }
+    let snap = std::slice::from_raw_parts(snap, len);
+    // a zstd frame holds the snapshot's inflated body (tools/snap-zstd.sh); otherwise it is the
+    // emulator's own deflate format
+    let r = if snap.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        // the frame records the unpacked size (tools/snap-zstd.sh): one allocation, not a vector
+        // that doubles past the browser's memory limit
+        let size = ruzstd::frame::read_frame_header(snap).map(|(f, _)| f.header.frame_content_size()).unwrap_or(0);
+        let mut raw = Vec::with_capacity(size as usize);
+        let ok = ruzstd::StreamingDecoder::new(snap).map_err(|e| e.to_string())
+            .and_then(|mut d| std::io::Read::read_to_end(&mut d, &mut raw).map_err(|e| e.to_string()));
+        match ok { Ok(_) => m.restore_raw(&raw), Err(e) => Err(e) }
+    } else {
+        m.restore(snap)
+    };
+    if r.is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi(m), None)));
     0
 }

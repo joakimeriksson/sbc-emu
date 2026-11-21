@@ -4,7 +4,8 @@
 //   node tools/wasm-gpu-bench.mjs [seconds-per-demo] [demo ...]
 // SBC_SNAP and SBC_SD pick other files. Without the SD image (the public site has none) the card
 // reads as zeros, with SBC_SECTORS sectors (default 8 GiB), and every read is counted: the demos
-// should run from the snapshot's page cache alone. Exits 1 if a demo drew no frames.
+// should run from the snapshot's page cache alone (SBC_DISKLOG=1 lists each read). Exits 1 if a
+// demo drew no frames.
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 let ex, jitFree = [], jitUsed = [];
@@ -22,6 +23,7 @@ let diskBytes = 0;
 const env = { sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset, sbc_host_now_ms: () => performance.now(),
   sbc_disk_read: (lba, count, ptr) => {
     const b = Buffer.from(ex.memory.buffer, ptr, count * 512); diskBytes += count * 512;
+    if (process.env.SBC_DISKLOG) console.log(`SD read: sector ${lba}, ${count} sectors`);
     const n = fd !== null ? fs.readSync(fd, b, 0, count * 512, lba * 512) : 0; if (n < count * 512) b.fill(0, n);
   } };
 ex = (await WebAssembly.instantiate(fs.readFileSync('web/wasm/sbc-emu.wasm'), { env })).instance.exports;

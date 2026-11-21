@@ -308,14 +308,24 @@ tools/wasm-build.sh && tools/serve.py     # http://127.0.0.1:8791/gpu.html  (?de
 
 The demos never read the SD card once the snapshot is restored: the programs, Mesa and the shader
 cache are all in the guest's memory. So the public site serves the snapshot alone, and the page
-gives the guest a card that reads as zeros (other commands may fail; the page says so). The
-snapshot is too big for the repository and is made from an 8 GiB image CI cannot build, so it is
-a release asset (`web-gpu-demo-1`), pinned by checksum in `tools/site-build.sh`. The site build
-splits it into parts under GitHub Pages' 100 MB file limit, listed in `gpu-demo.snap.json`, and
+gives the guest a card that reads as zeros (other commands may fail; the page says so).
+
+The snapshot script keeps it small: it stops services the demos do not need, empties the page
+cache, runs each demo once (and reads whole the two files only the HDMI console's path needs),
+then writes the free memory with zeros, which the snapshot skips. That leaves about 300 MB of the
+guest's 1 GiB, which `tools/snap-zstd.sh` recompresses with zstd to 63 MB (deflate at its best:
+82 MB; xz: 55 MB, but four times slower to unpack); the browser build restores it in about a
+second. Before this the snapshot held everything since first boot: 454 MB, 120 MB compressed.
+
+It is too big for the repository and is made from an 8 GiB image CI cannot build, so it is a
+release asset (`web-gpu-demo-1`), pinned by checksum in `tools/site-build.sh`. The site build
 first runs `kmscube` on it with the new build (`SBC_SNAP=… SBC_SD=/nonexistent node
 tools/wasm-gpu-bench.mjs 3 cube`), so a build that can no longer restore it fails before it is
-published. To update it: make a new snapshot as above, check it without the card the same way,
-upload it to a new release and change the URL and checksum.
+published, and serves it in parts under GitHub Pages' 100 MB file limit, listed in
+`gpu-demo.snap.json`. To update it: make a new snapshot as above, `tools/snap-zstd.sh` it, check
+it without the card (the bench must report 0 MB read with every demo; with the card and
+`SBC_DISKLOG=1` it lists the sectors read, which `debugfs`'s `icheck` and `ncheck` turn into
+file names), upload it to a new release and change the URL and checksum.
 
 `--hdmi-mode WxH` plugs in a monitor whose preferred mode is 1920×1080, 1280×720, 1024×768,
 800×600 or 640×480; the console, `kmscube` and `glmark2` use it. The demos use 1024×768: at
