@@ -200,8 +200,17 @@ debugger attached, as browser-automation tools do, WebAssembly runs several time
 `gpu.html` restores a Raspberry Pi OS snapshot with Mesa and runs `kmscube` and `glmark2`
 scenes on the emulated V3D GPU, also on the public site, from the snapshot alone (setup in
 [docs/gpu.md](gpu.md#in-the-browser)).
-`pi4.html` offers a cold boot of the SD image, a resume from `web/assets/raspios-lite.snap` (if
-present) and the quick busybox demo. Click the screen to type on the USB keyboard; the mouse
+`pi4.html` boots an SD card image the visitor drops on it or chooses, also on the public site:
+the file stays on their computer, and `web/worker.js` reads it where it is, synchronously
+(`FileReaderSync`), as the guest's SD reads ask for it. An `.img` is read directly. An `.img.xz`
+whose blocks are all one small size, as Canonical's are (1 MiB), is read without unpacking: the
+worker parses the index at the end of the file and has each block decoded when first read
+(`sbc_xz_block`, LZMA2 with `lzma-rs`), keeping the recent ones. Other `.xz` files (Raspberry Pi
+OS's blocks are 184 MiB) and `.img.gz` are unpacked once into the browser's private file storage
+(OPFS), which a later visit with the same file reuses. What the guest writes stays in the
+emulator's memory. The guest gets 1 GiB of RAM: 32-bit WebAssembly cannot allocate 2 GiB in one
+piece. Locally, the page also offers a cold boot of `web/assets/raspios-lite.img`, a resume from
+`web/assets/raspios-lite.snap` and the quick busybox demo, when those files are there. Click the screen to type on the USB keyboard; the mouse
 over the screen is the USB tablet, and what the guest plays on the DAC comes out of the page
 (after the first click or key press, as browsers require). The browser build runs the cores in
 turns on one thread: a thread per core would need WebAssembly threads, which need a standard

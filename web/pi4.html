@@ -27,6 +27,15 @@
   .chooser button { text-align: left; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
   .chooser button span { color: var(--muted); font-size: 13px; }
   .chooser button:hover { border-color: var(--accent); }
+  .chooser button[hidden] { display: none; }
+  .drop { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 8px; padding: 16px; border: 2px dashed var(--line); border-radius: 6px; background: var(--panel); }
+  .drop.over { border-color: var(--accent); }
+  .drop h2 { margin: 0; font-size: 16px; }
+  .drop p, .drop li { margin: 0; color: var(--muted); font-size: 13px; }
+  .drop ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+  .drop label.pick { align-self: flex-start; padding: 8px 14px; border: 1px solid var(--accent); border-radius: 4px; color: var(--accent); font-weight: 600; cursor: pointer; }
+  .drop input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .drop a { color: var(--accent); }
   .board { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 4px 0 6px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
   .board label { display: flex; align-items: center; gap: 6px; }
   .board input[type=range] { width: 120px; }
@@ -45,6 +54,16 @@
     <span class="muted">Linux in an instruction-level AArch64 emulator, running in your browser</span>
   </header>
   <div id="chooser" class="chooser">
+    <section class="drop" id="drop" aria-labelledby="drop-h">
+      <h2 id="drop-h">Your own SD card</h2>
+      <p>Drop a Raspberry Pi 4 SD card image here, as you downloaded it (<code>.img.xz</code>, <code>.img.gz</code> or <code>.img</code>), or choose it. It stays on your computer: the emulator reads it where it is, and what the Pi writes is kept in memory until you close the tab.</p>
+      <label class="pick">Choose an image… <input type="file" id="sdfile" accept=".img,.xz,.gz,application/x-xz,application/gzip"></label>
+      <ul>
+        <li><strong>Ubuntu Server 26.04 LTS</strong>: the 64-bit Raspberry Pi image from <a href="https://ubuntu.com/download/raspberry-pi">ubuntu.com/download/raspberry-pi</a> (1.5 GB). Drop the <code>.img.xz</code> unopened: the page reads it without unpacking. The login prompt appears after about 6 minutes on a fast computer; give first-boot setup a few minutes more, then log in as <code>ubuntu</code> / <code>ubuntu</code> and choose a new password when asked.</li>
+        <li><strong>Raspberry Pi OS Lite (64-bit)</strong> from <a href="https://www.raspberrypi.com/software/operating-systems/">raspberrypi.com</a> (0.5 GB). The page unpacks it once into your browser’s storage (3 GB, about a minute), and reuses that on your next visit. On first boot it asks for your keyboard layout, then for a user name and password: click the screen and use your keyboard.</li>
+        <li>Server and Lite images, not desktops: the Pi here has 1 GB of RAM and runs at a fraction of a real one’s speed.</li>
+      </ul>
+    </section>
     <button type="button" data-os="raspios-snap"><strong>Resume Raspberry Pi OS Lite</strong><span>A snapshot of the same SD-card boot taken after first-boot setup: the login prompt in seconds. Log in as <code>pi</code> / <code>raspberry</code>.</span></button>
     <button type="button" data-os="raspios"><strong>Raspberry Pi OS Lite</strong><span>Boots the unmodified trixie SD card image: firmware-style boot, systemd, first-boot setup. Cold boot to the setup screen takes several minutes.</span></button>
     <button type="button" data-os="busybox"><strong>Quick demo: Pi kernel + busybox</strong><span>The same Pi kernel with a tiny initramfs: a shell on the screen in about a minute.</span></button>
@@ -71,11 +90,15 @@ const canvas = document.getElementById('fb'), ctx = canvas.getContext('2d');
 const term = document.getElementById('term'), status = document.getElementById('status');
 const screen = document.getElementById('screen');
 const worker = new Worker('worker.js');
-let state = 'starting…';
+let state = 'starting…', started = false;
 const strip = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
 worker.onmessage = (e) => {
   const m = e.data;
-  if (m.type === 'status') { state = m.text; status.textContent = state; }
+  if (m.type === 'status') {
+    state = m.text; status.textContent = state;
+    if (m.text === 'booting…' || m.text === 'resumed') started = true;
+    if (m.phase === 'error' && !started) document.getElementById('chooser').hidden = false; // try another image
+  }
   else if (m.type === 'uart') {
     const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 4;
     term.textContent += strip(m.text);
@@ -160,12 +183,31 @@ slider('temp', 'tempv', (v) => `${v} °C`, (v) => worker.postMessage({ type: 'se
 slider('hum', 'humv', (v) => `${v} %`, (v) => worker.postMessage({ type: 'sensor', kind: 2, value: v }));
 slider('adc0', 'adcv', (v) => `${v.toFixed(2)} V`, (v) => worker.postMessage({ type: 'adc', ch: 0, volts: v }));
 const params = new URLSearchParams(location.search);
-const boot = (os) => {
+const boot = (os, file) => {
   document.getElementById('chooser').hidden = true;
-  worker.postMessage({ type: 'start', os, ramMb: os === 'raspios' ? 1024 : 512, jit: params.get('jit') !== '0' }); // ?jit=0: interpreter only
+  // a dropped card gets 1 GiB (WebAssembly can not allocate 2 GiB in one piece)
+  worker.postMessage({ type: 'start', os, file, ramMb: os === 'raspios' || file ? 1024 : 512, jit: params.get('jit') !== '0' }); // ?jit=0: interpreter only
   screen.focus();
 };
 document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));
+// your own SD card: chosen or dropped anywhere on the page
+const drop = document.getElementById('drop');
+document.getElementById('sdfile').onchange = (e) => { const f = e.target.files[0]; if (f) boot('sd-file', f); };
+addEventListener('dragover', (e) => { if (!document.getElementById('chooser').hidden) { e.preventDefault(); drop.classList.add('over'); } });
+addEventListener('dragleave', (e) => { if (!e.relatedTarget) drop.classList.remove('over'); });
+addEventListener('drop', (e) => {
+  e.preventDefault(); drop.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f && !document.getElementById('chooser').hidden) boot('sd-file', f);
+});
+// the other choices need files a local build stages (tools/wasm-build.sh); the public site has
+// only the dropped card
+const need = { 'raspios-snap': ['assets/raspios-lite.img', 'assets/raspios-lite.snap'], raspios: ['assets/raspios-lite.img'], busybox: ['assets/kernel8.img'] };
+for (const [os, files] of Object.entries(need)) {
+  const b = document.querySelector(`#chooser button[data-os="${os}"]`);
+  b.hidden = true;
+  Promise.all(files.map((f) => fetch(f, { method: 'HEAD' }).then((r) => r.ok, () => false))).then((ok) => { b.hidden = !ok.every(Boolean); });
+}
 if (params.get('os')) boot(params.get('os'));
 </script>
 </body>

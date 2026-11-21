@@ -139,6 +139,64 @@ fn with_pi<R>(f: impl FnOnce(&mut Machine) -> R) -> Option<R> {
 #[no_mangle]
 pub extern "C" fn sbc_alloc(len: usize) -> *mut u8 { Box::leak(vec![0u8; len].into_boxed_slice()).as_mut_ptr() }
 
+// ---- xz, for SD images dropped on the page (web/worker.js). An .xz file is a series of blocks;
+// the worker parses the index at its end, and has one block at a time decoded here: on demand
+// when the blocks are small (Ubuntu's are 1 MiB, so the card is read without unpacking it),
+// or all of them once into the browser's file storage when they are large (Raspberry Pi OS's).
+// Called from the worker's disk-read import, inside sbc_run, so it touches only its own state.
+thread_local! {
+    static XZ_IN: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static XZ_OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A buffer of `len` bytes for the next block's compressed bytes (header included).
+#[no_mangle]
+pub extern "C" fn sbc_xz_in(len: usize) -> *mut u8 {
+    XZ_IN.with(|b| { let mut b = b.borrow_mut(); b.clear(); b.resize(len, 0); b.as_mut_ptr() })
+}
+
+/// Decode the block in `sbc_xz_in`'s buffer, `size` bytes uncompressed (from the index): its
+/// length, or -1 (a filter other than LZMA2, such as a BCJ, or corrupt data). The bytes are at
+/// `sbc_xz_out_ptr` until the next call.
+#[no_mangle]
+pub extern "C" fn sbc_xz_block(size: usize) -> f64 {
+    XZ_IN.with(|i| XZ_OUT.with(|o| {
+        let (i, mut o) = (i.borrow(), o.borrow_mut());
+        o.clear();
+        o.reserve(size);
+        match xz_block(&i, &mut o) { Ok(()) if o.len() == size => o.len() as f64, _ => -1.0 }
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn sbc_xz_out_ptr() -> *const u8 { XZ_OUT.with(|o| o.borrow().as_ptr()) }
+
+/// One xz block: its header (one LZMA2 filter, no others), then LZMA2 data, whose end marker
+/// ends the decode (the padding and check after it are not read).
+fn xz_block(b: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+    let hsize = (*b.first().ok_or(())? as usize + 1) * 4;
+    if b[0] == 0 || b.len() < hsize { return Err(()); }
+    let flags = b[1];
+    if flags & 3 != 0 { return Err(()); } // more than one filter
+    let mut p = 2;
+    let mut varint = || -> Result<u64, ()> {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let c = *b.get(p).ok_or(())?;
+            p += 1;
+            v |= u64::from(c & 0x7f) << shift;
+            if c & 0x80 == 0 { return Ok(v); }
+            shift += 7;
+            if shift > 63 { return Err(()); }
+        }
+    };
+    if flags & 0x40 != 0 { varint()?; } // compressed size
+    if flags & 0x80 != 0 { varint()?; } // uncompressed size
+    if varint()? != 0x21 { return Err(()); } // LZMA2
+    let mut data = &b[hsize..];
+    lzma_rs::lzma2_decompress(&mut data, out).map_err(|_| ())
+}
+
 /// Boot Linux. Returns 0 on success.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *const u8, ilen: usize, c: *const u8, clen: usize) -> i32 {
