@@ -17,8 +17,10 @@ pub struct Uart {
 }
 
 impl Uart {
+    /// Whether the RX FIFO can take another byte.
+    pub fn rx_room(&self) -> bool { self.rx.len() < 64 }
     pub fn input(&mut self, b: u8) -> bool {
-        if self.rx.len() >= 64 { return false; }
+        if !self.rx_room() { return false; }
         self.rx.push_back(b);
         true
     }

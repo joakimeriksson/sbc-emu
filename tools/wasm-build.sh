@@ -35,4 +35,9 @@ if [ -f cache/orangepi-rv/web/initramfs.cpio.gz ]; then
   cp cache/orangepi-rv/web/initramfs.cpio.gz web/assets/orangepi-rv/
   gzip -9n -c cache/orangepi-rv/Image > web/assets/orangepi-rv/Image.gz
 fi
+# the Orange Pi 5's demo (scripts/orangepi5-fixture.sh) for web/board.html?b=orangepi5
+if [ -f cache/orangepi5/Image.gz ]; then
+  mkdir -p web/assets/orangepi5
+  cp cache/orangepi5/Image.gz cache/orangepi5/initramfs.cpio.gz web/assets/orangepi5/
+fi
 ls -la web/assets

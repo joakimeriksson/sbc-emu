@@ -3,8 +3,9 @@
 # the browser build; the snapshot hello.html resumes (the Raspberry Pi 4), made here from pinned,
 # checksummed downloads; the Orange Pi One's Alpine kernel and initramfs
 # (scripts/orangepi-one-fixture.sh), the Tinker Board's Debian kernel and BusyBox initramfs
-# (scripts/tinker-board-fixture.sh) and the Orange Pi RV's OpenSBI, Alpine kernel and initramfs
-# (scripts/orangepi-rv-fixture.sh), all pinned; and the Pi 4 3D demos' snapshot (gpu.html), from a
+# (scripts/tinker-board-fixture.sh), the Orange Pi RV's OpenSBI, Alpine kernel and initramfs
+# (scripts/orangepi-rv-fixture.sh) and the Orange Pi 5's Debian kernel and initramfs
+# (scripts/orangepi5-fixture.sh), all pinned; and the Pi 4 3D demos' snapshot (gpu.html), from a
 # release asset. boards.html is the front page. Every file is a whole-file fetch, so any static
 # web server can serve the site:
 #   tools/site-build.sh && python3 -m http.server -d out/site 8792
@@ -57,13 +58,15 @@ sh scripts/orangepi-one-fixture.sh cache/orangepi-one
 sh scripts/tinker-board-fixture.sh cache/tinker-board
 # the Orange Pi RV (wasm-build.sh stages it into web/assets/orangepi-rv)
 sh scripts/orangepi-rv-fixture.sh cache/orangepi-rv
+# the Orange Pi 5 (wasm-build.sh stages it into web/assets/orangepi5)
+sh scripts/orangepi5-fixture.sh cache/orangepi5
 
 tools/wasm-build.sh
 # this build must still restore the 3D snapshot and draw with it, without an SD card
 SBC_SNAP="$DL/gpu-demo.snap.zst" SBC_SD=/nonexistent node tools/wasm-gpu-bench.mjs 3 cube
 
 rm -rf "$OUT"
-mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv"
+mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5"
 cp web/boards.html "$OUT/index.html"
 cp web/hello.html web/board.html web/gpu.html web/sources.html web/worker.js "$OUT/"
 cp web/wasm/sbc-emu.wasm "$OUT/wasm/"
@@ -77,5 +80,6 @@ json.dump({"parts": parts, "bytes": sum(os.path.getsize(os.path.join(d, p)) for 
 cp web/assets/orangepi-one/zImage web/assets/orangepi-one/sun8i-h3-orangepi-one.dtb web/assets/orangepi-one/initramfs.cpio.gz "$OUT/assets/orangepi-one/"
 cp web/assets/tinker/zImage web/assets/tinker/rk3288-tinker-s.dtb web/assets/tinker/initramfs.cpio.gz "$OUT/assets/tinker/"
 cp web/assets/orangepi-rv/fw_dynamic.bin web/assets/orangepi-rv/Image.gz web/assets/orangepi-rv/jh7110-orangepi-rv.dtb web/assets/orangepi-rv/initramfs.cpio.gz "$OUT/assets/orangepi-rv/"
+cp web/assets/orangepi5/Image.gz web/assets/orangepi5/initramfs.cpio.gz "$OUT/assets/orangepi5/"
 touch "$OUT/.nojekyll"
 find "$OUT" -type f -exec ls -l {} + | awk '{ print $5, $9 }'

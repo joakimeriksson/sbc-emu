@@ -45,7 +45,13 @@ enum Board {
     OrangePiOne(Box<allwinner_h3::Machine>, DirectBoot),
     /// The Orange Pi RV with OpenSBI and what it was booted from.
     OrangePiRv(Box<starfive_jh7110::Machine>, Vec<u8>, DirectBoot),
+    /// The Orange Pi 5 with what it was booted from (kernel, initrd, command line; the device
+    /// tree is the emulator's own).
+    OrangePi5(Box<rk3588::Machine>, Opi5Boot),
 }
+
+/// An Orange Pi 5 direct boot's inputs: the kernel, an initramfs and the command line.
+type Opi5Boot = (Vec<u8>, Option<Vec<u8>>, String);
 
 /// A direct boot's inputs: the kernel, the board's stock device tree, an initramfs and the
 /// command line.
@@ -61,16 +67,16 @@ struct TinkerBoot {
 
 impl Board {
     fn run(&mut self, budget: u64) -> Stop {
-        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget) }
+        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget), Board::OrangePi5(m, _) => m.run(budget) }
     }
     fn now(&self) -> u64 {
-        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now() }
+        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now(), Board::OrangePi5(m, _) => m.now() }
     }
     fn idle_until(&mut self, t: u64) {
-        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t) }
+        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t), Board::OrangePi5(m, _) => m.idle_until(t) }
     }
     fn instret(&self) -> u64 {
-        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret() }
+        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret(), Board::OrangePi5(m, _) => m.instret() }
     }
 }
 
@@ -269,11 +275,35 @@ pub unsafe extern "C" fn sbc_boot_opirv(ram_mb: u32, f: *const u8, flen: usize, 
     0
 }
 
+/// An Orange Pi 5 as the CLI's `--board orangepi5 --no-display --net local` builds it, with the
+/// first `sbc_smp` cores: the serial console is the demo, so no HDMI framebuffer.
+fn opi5_machine(ram_bytes: usize) -> Option<rk3588::Machine> {
+    let mut m = rk3588::Machine::with_cpus(ram_bytes, smp().min(rk3588::MAX_CPUS)).ok()?;
+    m.connect_network(false, false);
+    Some(m)
+}
+
+/// Orange Pi 5: boot an arm64 Linux `Image` with the emulator's generated device tree and an
+/// optional initramfs; an empty command line is the board's default (console on UART2).
+/// Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_opi5(ram_mb: u32, k: *const u8, klen: usize, i: *const u8, ilen: usize, c: *const u8, clen: usize) -> i32 {
+    let kernel = std::slice::from_raw_parts(k, klen).to_vec();
+    let initrd = (ilen > 0).then(|| std::slice::from_raw_parts(i, ilen).to_vec());
+    let cmdline = if clen > 0 { String::from_utf8_lossy(std::slice::from_raw_parts(c, clen)).into_owned() } else {
+        rk3588::boot::DEFAULT_CMDLINE.to_string()
+    };
+    let Some(mut m) = opi5_machine((ram_mb as usize) << 20) else { return -1 };
+    if rk3588::boot::boot_linux(&mut m, &kernel, initrd.as_deref(), &cmdline).is_err() { return -1; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::OrangePi5(Box::new(m), (kernel, initrd, cmdline)), Some(0.0))));
+    0
+}
+
 /// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board, 3 the Orange Pi One, 4 the
-/// Orange Pi RV.
+/// Orange Pi RV, 5 the Orange Pi 5.
 #[no_mangle]
 pub extern "C" fn sbc_board() -> u32 {
-    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4 }).unwrap_or(0)
+    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4, Board::OrangePi5(..) => 5 }).unwrap_or(0)
 }
 
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
@@ -284,6 +314,7 @@ pub extern "C" fn sbc_jit(on: u32) -> u32 {
         Board::Tinker(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiOne(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiRv(m, ..) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
+        Board::OrangePi5(m, _) => if on != 0 { m.enable_jit() as u32 } else { for c in &mut m.cpus { c.jit = None; } 0 },
     }).unwrap_or(0)
 }
 
@@ -308,6 +339,7 @@ pub extern "C" fn sbc_jit_hot(n: u32) {
         Board::Tinker(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiOne(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiRv(m, ..) => m.set_jit_hot(n),
+        Board::OrangePi5(m, _) => for c in &mut m.cpus { if let Some(j) = c.jit.as_deref_mut() { j.hot = n.max(1); } },
     });
 }
 
@@ -339,6 +371,7 @@ pub extern "C" fn sbc_jit_blocks() -> f64 {
         Board::Tinker(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiOne(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiRv(m, ..) => m.jit_compiled() as f64,
+        Board::OrangePi5(m, _) => m.cpus.iter().filter_map(|c| c.jit.as_ref()).map(|j| j.compiled as f64).sum(),
     }).unwrap_or(0.0)
 }
 
@@ -348,6 +381,7 @@ pub extern "C" fn sbc_key(usage: u32, down: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => m.soc.devs.kbd.key(usage as u8, down != 0),
         Board::OrangePiRv(m, ..) => m.soc.usb.kbd.key(usage as u8, down != 0),
+        Board::OrangePi5(m, _) => { m.soc.usb.kbd.key(usage as u8, down != 0); m.soc.dirty = true; }
         _ => {}
     });
 }
@@ -359,6 +393,7 @@ pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => m.soc.devs.tablet.pointer(b, x, y, w),
         Board::OrangePiRv(m, ..) => m.soc.usb.tablet.pointer(b, x, y, w),
+        Board::OrangePi5(m, _) => { m.soc.usb.tablet.pointer(b, x, y, w); m.soc.dirty = true; }
         _ => {}
     });
 }
@@ -383,6 +418,7 @@ pub extern "C" fn sbc_type(b: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => m.soc.devs.kbd.type_byte(b as u8),
         Board::OrangePiRv(m, ..) => m.soc.usb.kbd.type_byte(b as u8),
+        Board::OrangePi5(m, _) => { m.soc.usb.kbd.type_byte(b as u8); m.soc.dirty = true; }
         _ => {}
     });
 }
@@ -419,6 +455,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                         Board::Tinker(old, how) => tinker_restart(old, how),
                         Board::OrangePiOne(old, how) => opi1_restart(old, how),
                         Board::OrangePiRv(old, fw, how) => opirv_restart(old, fw, how),
+                        Board::OrangePi5(old, how) => opi5_restart(old, how),
                     };
                     match restarted {
                         Some(m) => s.m = m,
@@ -474,6 +511,15 @@ fn opirv_restart(old: &starfive_jh7110::Machine, firmware: &mut Vec<u8>, how: &m
     Some(Board::OrangePiRv(Box::new(m), firmware, (kernel, dtb, initrd, cmdline)))
 }
 
+/// Start an Orange Pi 5 again from what it was booted with (after `reboot`).
+fn opi5_restart(old: &rk3588::Machine, how: &mut Opi5Boot) -> Option<Board> {
+    let mut m = opi5_machine(old.soc.ram.len())?;
+    let (kernel, initrd, cmdline) = std::mem::take(how);
+    rk3588::boot::boot_linux(&mut m, &kernel, initrd.as_deref(), &cmdline).ok()?;
+    if old.cpus.iter().any(|c| c.jit.is_some()) { m.enable_jit(); }
+    Some(Board::OrangePi5(Box::new(m), (kernel, initrd, cmdline)))
+}
+
 #[no_mangle]
 pub extern "C" fn sbc_wait_ms() -> f64 { with(|s| s.wait_ms).unwrap_or(0.0) }
 
@@ -516,6 +562,7 @@ pub extern "C" fn sbc_uart_in(b: u32) {
         Board::Tinker(m, _) => { m.serial_input(b as u8); }
         Board::OrangePiOne(m, _) => { m.serial_input(b as u8); }
         Board::OrangePiRv(m, ..) => { m.serial_input(b as u8); }
+        Board::OrangePi5(m, _) => { m.serial_input(b as u8); }
     });
 }
 
@@ -526,6 +573,7 @@ pub extern "C" fn sbc_uart_room() -> i32 {
         Board::Tinker(m, _) => m.soc.uart.rx_room() as i32,
         Board::OrangePiOne(m, _) => m.soc.uart.rx_room() as i32,
         Board::OrangePiRv(m, ..) => m.soc.uart.rx_room() as i32,
+        Board::OrangePi5(m, _) => m.soc.uart.rx_room() as i32,
     }).unwrap_or(0)
 }
 
@@ -538,6 +586,7 @@ pub extern "C" fn sbc_uart_take() -> usize {
             Board::Tinker(m, _) => m.take_serial_output(),
             Board::OrangePiOne(m, _) => m.take_serial_output(),
             Board::OrangePiRv(m, ..) => m.take_serial_output(),
+            Board::OrangePi5(m, _) => std::mem::take(&mut m.soc.uart.out),
         };
         s.uart.len()
     }).unwrap_or(0)
@@ -554,6 +603,7 @@ pub extern "C" fn sbc_fb_render() -> *const u8 {
             Board::Tinker(m, _) => m.soc.render(&mut s.fb),
             Board::OrangePiOne(m, _) => m.soc.render(&mut s.fb),
             Board::OrangePiRv(m, ..) => m.soc.render(&mut s.fb),
+            Board::OrangePi5(m, _) => m.soc.render(&mut s.fb),
         };
         match size {
             Some((w, h)) => { s.fb_w = w; s.fb_h = h; s.fb.as_ptr() }
@@ -589,6 +639,7 @@ pub extern "C" fn sbc_stop_pc() -> f64 {
             Board::Tinker(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
             Board::OrangePiOne(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
             Board::OrangePiRv(m, ..) => m.harts.iter().map(|h| h.pc).next().unwrap_or(0) as f64,
+            Board::OrangePi5(m, _) => m.cpu().pc as f64,
         },
     }).unwrap_or(0.0)
 }

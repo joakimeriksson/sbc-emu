@@ -9,6 +9,19 @@ The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four
 By default the cores take turns on one host thread in rounds of 20 µs of virtual time, as on the Raspberry Pi 4 board, so runs are repeatable. `--threads multi` runs each core on its own host thread instead (as QEMU's MTTCG, using the Pi 4's `mt.rs` design): RAM is shared directly, the devices and the GIC's CPU interface are behind one lock, and guest time follows the host clock, so runs are no longer repeatable. Eight busy shell loops pinned to the eight cores finish in 0.94 s of wall time with threads; the single-threaded run takes about 5 G instructions for the same work. Boot is mostly serial: login in 27 s against 39 s. The Armbian image reaches its login prompt in about 7.8 s of guest time on eight cores (37 s wall on an M-series Mac), against 15.2 s guest and 25 s wall on one core. `scripts/orangepi5-smp.txt` (Armbian, `--append init=/bin/bash`) checks the core count, the part numbers, work pinned to each core, per-core timer and IPI counts and the capacities.
 
 
+## In the browser
+
+The demo site's [Orange Pi 5 page](https://joakimeriksson.github.io/sbc-emu/board.html?b=orangepi5) boots the board from scratch in the WebAssembly build: Debian's arm64 kernel, unmodified, with the generated device tree and an Alpine/BusyBox initramfs, to a shell on the serial console (UART2). It runs the first four cores (the Cortex-A55s) on the page's one thread, with 512 MiB of RAM, no HDMI and the A64 JIT compiling to WebAssembly. `scripts/orangepi5-fixture.sh` builds the kernel and initramfs from pinned downloads; `tools/wasm-build.sh` stages them.
+
+```sh
+sh scripts/orangepi5-fixture.sh cache/orangepi5
+./target/release/sbc-emu run --board orangepi5 --kernel cache/orangepi5/Image --initrd cache/orangepi5/initramfs.cpio.gz \
+    --script scripts/orangepi-shell.txt --timeout 60          # the same guest, natively
+tools/wasm-build.sh && node tools/wasm-smoke-opi5.mjs         # headless, as the page runs it
+```
+
+On an M-series Mac the headless check reaches the shell after 4.4 s, runs commands on all four cores and reboots back to the shell (about 125 million instructions/s).
+
 ## SD root filesystem fixture
 
 A direct-boot initramfs can load the MMC and ext4 modules, mount an ext4 filesystem on the emulated SD card, and switch to its `/sbin/init`. The following reproducible fixture tests that path, including an ext4 write, `sync`, guest reboot and reading the write from the same copy-on-write overlay. The original SD image remains unchanged. This fixture uses a filesystem directly on the card, not a partition table or vendor distribution.
