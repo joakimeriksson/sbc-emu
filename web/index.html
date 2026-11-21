@@ -211,7 +211,7 @@
 
   <section class="section" id="inside" aria-labelledby="inside-h">
     <h2 id="inside-h">Inside the emulated BCM2711</h2>
-    <p class="lede">No QEMU, no host GPU: every block below is modelled in Rust, compiled to WebAssembly for this page, and driven by the unmodified Linux drivers.</p>
+    <p class="lede">Every block below, the GPU included, is modelled in Rust, compiled to WebAssembly for this page, and driven by the unmodified Linux drivers.</p>
     <div class="soc">
       <div class="blk"><h3>4 × Cortex-A72</h3><p>ARMv8-A cores with FP and NEON, an MMU and timers. A block JIT translates guest code to WebAssembly.</p></div>
       <div class="blk gpu"><h3>V3D 4.2 GPU</h3><p>The binner, rasterizer, tile buffer, texture unit and QPU shader cores. Mesa's OpenGL ES 3.1 and Vulkan drivers run on it.</p></div>
