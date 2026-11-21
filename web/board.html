@@ -86,7 +86,7 @@ const BOARDS = {
   'esp32s31': {
     name: 'ESP32-S31 Function CoreBoard', os: 'esp32s31', ramMb: 0,
     lede: 'A microcontroller running Linux: Espressif’s official flash image boots through the chip’s own mask ROM, U-Boot, OpenSBI and U-Boot again to Linux, on an emulated ESP32-S31 with two 32-bit RISC-V cores and 16 MB of RAM. Nothing runs on a server.',
-    note: 'Downloads 10 MB (the emulator, Espressif’s ROM and the 16 MB flash image, compressed) and boots the whole chain to a root shell in about 40 seconds on a fast computer.',
+    note: 'Downloads 10 MB (the emulator, Espressif’s ROM and the 16 MB flash image, compressed) and boots the whole chain to a root shell in about 20 seconds on a fast computer.',
     tm: 'Espressif and ESP32 are trademarks of Espressif Systems (Shanghai) Co., Ltd. sbc-emu is not affiliated with Espressif.',
     try: ['uname -a', 'cat /proc/device-tree/model; echo', 'cat /proc/cpuinfo', 'cat /proc/meminfo | head -3', 'cat /proc/interrupts', 'ls /', 'dmesg | tail -15'],
   },
