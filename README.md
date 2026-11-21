@@ -4,7 +4,7 @@
 
 **Single-board computers, emulated instruction by instruction in Rust.** sbc-emu has its own CPU
 cores and register-level models of each board's chips, and runs the boards' own operating
-systems unmodified: Raspberry Pi OS, Ubuntu, Armbian, Alpine. No QEMU.
+systems unmodified: Raspberry Pi OS, Ubuntu, Armbian, Alpine.
 
 **Try it in your browser: [joakimeriksson.github.io/sbc-emu](https://joakimeriksson.github.io/sbc-emu/).**
 The Raspberry Pi 4, the Orange Pi One, the ASUS Tinker Board S and the RISC-V Orange Pi RV boot
@@ -73,7 +73,7 @@ tools/site-build.sh && python3 -m http.server -d out/site 8792
 - [The GPUs](docs/gpu.md) (V3D), [Mali-T760](docs/mali-t760.md), [Orange Pi 5's Mali-G610](docs/orangepi5-gpu.md)
 - [The JIT](docs/jit.md)
 - [Tests and source layout](docs/development.md)
-- [Why not QEMU](docs/decisions.md), [the overall plan](SBC-EMUPLAN.md) and
+- [Design decisions](docs/decisions.md), [the overall plan](SBC-EMUPLAN.md) and
   [how the boards share code](docs/multi-board-foundation.md)
 
 ## Contributing
