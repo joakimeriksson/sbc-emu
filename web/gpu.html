@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sbc-emu</title>
-<meta name="description" content="Real single-board computers, emulated in your browser: a Raspberry Pi 4 running unmodified Raspberry Pi OS, with its 3D GPU.">
+<title>sbc-emu 3D demos</title>
+<meta name="description" content="3D demos on an emulated Raspberry Pi 4 in your browser: Raspberry Pi OS and Mesa's own V3D driver, on a GPU model compiled to WebAssembly.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
@@ -124,21 +124,20 @@
 <body>
 <div class="wrap">
   <header class="top">
-    <a class="mark" href="./" aria-label="sbc-emu home">
+    <a class="mark" href="./" aria-label="sbc-emu: all boards">
       <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><rect x="5" y="5" width="24" height="24" rx="3" fill="none" stroke="#eef0e6" stroke-width="2"/><rect x="11" y="11" width="12" height="12" rx="1" fill="#d4af5a"/><g stroke="#eef0e6" stroke-width="2" stroke-linecap="round"><path d="M12 1v4M17 1v4M22 1v4M12 29v4M17 29v4M22 29v4M1 12h4M1 17h4M1 22h4M29 12h4M29 17h4M29 22h4"/></g></svg>
       <b>sbc-emu</b>
     </a>
     <nav class="top" aria-label="Site">
-      <a href="hello.html">Hello shell</a>
-      <a href="pi4.html">Pi 4 console</a>
-      <a href="#bench">Devices</a>
+      <a href="./">All boards</a>
+      <a href="hello.html">Pi 4 shell</a>
       <a href="#inside">Inside</a>
     </nav>
   </header>
 
   <section class="intro">
-    <h1>Real boards, booted in a browser tab</h1>
-    <p>sbc-emu emulates single-board computers instruction by instruction, with their peripherals, and runs their stock operating systems. First on the bench is the Raspberry Pi 4. It runs unmodified Raspberry Pi OS, and now its VideoCore VI 3D GPU as well.</p>
+    <h1>3D on an emulated Raspberry Pi 4</h1>
+    <p>Raspberry Pi OS draws these demos with Mesa’s own V3D driver, on a model of the Pi 4’s VideoCore VI GPU: its binner, rasterizer and shader cores, compiled to WebAssembly and running on your computer.</p>
   </section>
 
   <section class="stage" aria-label="Live Raspberry Pi 4">
@@ -149,7 +148,7 @@
           <canvas id="fb" width="1024" height="768"></canvas>
           <div class="power" id="power">
             <button id="powerbtn" type="button">Power on the Pi 4</button>
-            <p id="powernote">Downloads a 135 MB snapshot of Raspberry Pi OS with Mesa, logged in and ready, then reads the rest of the SD card as it needs it.</p>
+            <p id="powernote">Downloads a 120 MB snapshot of Raspberry Pi OS with Mesa, logged in with every demo loaded. Nothing more is downloaded: the demos run from the snapshot’s memory.</p>
           </div>
         </div>
       </div>
@@ -169,49 +168,9 @@
     </aside>
   </section>
 
-  <section class="section" id="bench" aria-labelledby="bench-h">
-    <h2 id="bench-h">On the bench</h2>
-    <p class="lede">One board so far, modelled down to the registers its Linux drivers touch. Each new board reuses the CPU cores, the snapshot format and this page.</p>
-    <div class="bench">
-      <article class="slot live">
-        <svg viewBox="0 0 260 172" aria-hidden="true">
-          <rect x="2" y="2" width="256" height="168" rx="10" fill="#0b2a1f" stroke="#9db5a8" stroke-width="2"/>
-          <g fill="none" stroke="#9db5a8" stroke-width="2"><circle cx="16" cy="16" r="5"/><circle cx="160" cy="16" r="5"/><circle cx="16" cy="156" r="5"/><circle cx="160" cy="156" r="5"/></g>
-          <g fill="#d4af5a"><rect x="30" y="8" width="118" height="10" rx="1"/></g>
-          <g fill="#0b2a1f" stroke="#eef0e6" stroke-width="1.5"><rect x="78" y="62" width="44" height="44" rx="3"/></g>
-          <text x="100" y="89" fill="#eef0e6" font-family="Barlow Condensed, sans-serif" font-size="11" text-anchor="middle">BCM2711</text>
-          <g fill="none" stroke="#eef0e6" stroke-width="1.5"><rect x="132" y="66" width="20" height="34" rx="2"/><rect x="34" y="120" width="34" height="22" rx="2"/></g>
-          <g fill="#c2774a"><rect x="206" y="10" width="50" height="38" rx="2"/><rect x="206" y="62" width="50" height="38" rx="2"/><rect x="206" y="114" width="50" height="48" rx="2"/></g>
-          <g fill="#d4af5a"><rect x="40" y="162" width="16" height="8" rx="1"/><rect x="82" y="162" width="14" height="8" rx="1"/><rect x="104" y="162" width="14" height="8" rx="1"/></g>
-        </svg>
-        <span class="state">Live in this page</span>
-        <h3>Raspberry Pi 4 Model B</h3>
-        <ul>
-          <li>Four Cortex-A72 cores, booting the stock Raspberry Pi OS card image</li>
-          <li>HDMI through the stock vc4 KMS driver, and the V3D 3D GPU</li>
-          <li>USB keyboard and tablet, Ethernet with NAT, Wi-Fi, Bluetooth LE</li>
-          <li>GPIO, I²C and SPI sensors, I²S audio</li>
-        </ul>
-        <p><a href="pi4.html">Open the full Pi 4 console</a> for the serial port, the LED, the button and the sensors.</p>
-      </article>
-      <article class="slot next">
-        <svg viewBox="0 0 260 172" aria-hidden="true"><rect x="2" y="2" width="256" height="168" rx="10" fill="none" stroke="#9db5a8" stroke-width="2" stroke-dasharray="6 6"/><rect x="82" y="62" width="40" height="40" rx="3" fill="none" stroke="#9db5a8" stroke-width="1.5" stroke-dasharray="4 4"/><text x="102" y="86" fill="#9db5a8" font-family="Barlow Condensed, sans-serif" font-size="11" text-anchor="middle">BCM2837</text></svg>
-        <span class="state">Planned</span>
-        <h3>Raspberry Pi 3 Model B</h3>
-        <p>Listed in the emulator's board table; the BCM2837 SoC model is not written yet.</p>
-      </article>
-      <article class="slot next">
-        <svg viewBox="0 0 260 172" aria-hidden="true"><rect x="2" y="2" width="256" height="168" rx="10" fill="none" stroke="#9db5a8" stroke-width="2" stroke-dasharray="6 6"/><path d="M118 86h24M130 74v24" stroke="#9db5a8" stroke-width="2"/></svg>
-        <span class="state">Open slot</span>
-        <h3>Your next board</h3>
-        <p>New boards plug into the same CPU cores, device-tree generator, snapshots and web page.</p>
-      </article>
-    </div>
-  </section>
-
   <section class="section" id="inside" aria-labelledby="inside-h">
     <h2 id="inside-h">Inside the emulated BCM2711</h2>
-    <p class="lede">No QEMU, no host GPU: every block below is modelled in Rust, compiled to WebAssembly for this page, and driven by the unmodified Linux drivers.</p>
+    <p class="lede">Every block below, the GPU included, is modelled in Rust, compiled to WebAssembly for this page, and driven by the unmodified Linux drivers.</p>
     <div class="soc">
       <div class="blk"><h3>4 × Cortex-A72</h3><p>ARMv8-A cores with FP and NEON, an MMU and timers. A block JIT translates guest code to WebAssembly.</p></div>
       <div class="blk gpu"><h3>V3D 4.2 GPU</h3><p>The binner, rasterizer, tile buffer, texture unit and QPU shader cores. Mesa's OpenGL ES 3.1 and Vulkan drivers run on it.</p></div>
@@ -223,8 +182,8 @@
   </section>
 
   <footer>
-    <p>sbc-emu runs entirely in this tab: the emulator is WebAssembly in a Web Worker, and the SD card image is read in 1 MiB pieces as the guest asks for them.</p>
-    <p>The 3D demos are <code>kmscube</code> and scenes from <code>glmark2</code>, from the Raspberry Pi OS and Debian archives. Frame rates are what the emulated GPU manages on your computer, not a real Pi 4.</p>
+    <p>sbc-emu runs entirely in this tab: the emulator is WebAssembly in a Web Worker. This page has no SD card: the snapshot was taken with the demos’ programs, Mesa and their shaders already in the guest’s memory, so commands other than the demos may fail.</p>
+    <p>The 3D demos are <code>kmscube</code> and scenes from <code>glmark2</code>, from the Raspberry Pi OS and Debian archives (<a href="sources.html">versions, licences and sources</a>). Frame rates are what the emulated GPU manages on your computer, not a real Pi 4.</p>
   </footer>
 </div>
 

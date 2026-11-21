@@ -293,7 +293,7 @@ texture-bound ones, where the TMU is the next target.
 
 ## In the browser
 
-`web/index.html` runs the 3D demos in the WebAssembly build: it restores a snapshot of Raspberry
+`web/gpu.html` runs the 3D demos in the WebAssembly build: it restores a snapshot of Raspberry
 Pi OS with Mesa, logged in on the HDMI console with every demo already run once (so the program
 files, Mesa and the shader cache are in the guest's page cache), and types each demo's command
 on the USB keyboard. The V3D model is the same Rust code as natively; in WebAssembly the job
@@ -303,8 +303,19 @@ timing uses `performance.now()` through the `sbc_host_now_ms` import.
 cp -c cache/os/raspios-gpu.img cache/os/raspios-gpu-demo.img   # frozen: the snapshot refers to it
 sbc-emu run --sd cache/os/raspios-gpu-demo.img --hdmi-mode 1024x768 --script scripts/gpu-demo-snapshot.txt
 ln -s ../../cache/os/raspios-gpu-demo.img web/assets/raspios-gpu.img
-tools/wasm-build.sh && tools/serve.py     # http://127.0.0.1:8791/  (?demo=cube starts one at once)
+tools/wasm-build.sh && tools/serve.py     # http://127.0.0.1:8791/gpu.html  (?demo=cube starts one at once)
 ```
+
+The demos never read the SD card once the snapshot is restored: the programs, Mesa and the shader
+cache are all in the guest's memory. So the public site serves the snapshot alone, and the page
+gives the guest a card that reads as zeros (other commands may fail; the page says so). The
+snapshot is too big for the repository and is made from an 8 GiB image CI cannot build, so it is
+a release asset (`web-gpu-demo-1`), pinned by checksum in `tools/site-build.sh`. The site build
+splits it into parts under GitHub Pages' 100 MB file limit, listed in `gpu-demo.snap.json`, and
+first runs `kmscube` on it with the new build (`SBC_SNAP=… SBC_SD=/nonexistent node
+tools/wasm-gpu-bench.mjs 3 cube`), so a build that can no longer restore it fails before it is
+published. To update it: make a new snapshot as above, check it without the card the same way,
+upload it to a new release and change the URL and checksum.
 
 `--hdmi-mode WxH` plugs in a monitor whose preferred mode is 1920×1080, 1280×720, 1024×768,
 800×600 or 640×480; the console, `kmscube` and `glmark2` use it. The demos use 1024×768: at

@@ -66,7 +66,7 @@ barriers, PRFM and thread-pointer/`SP_EL0` reads; everything else calls the inte
 instruction. Execution counting before compilation uses a direct-mapped table (no hashing on the
 interpreter's path).
 
-On by default (`pi4.html?jit=0` or `index.html?jit=0` turns it off). Raspberry Pi OS cold boot to `login:` in the
+On by default (`pi4.html?jit=0` or `gpu.html?jit=0` turns it off). Raspberry Pi OS cold boot to `login:` in the
 browser build (`tools/wasm-smoke-sd.mjs`, Node 26, M5, runs alone):
 
 | Step | `login:` after |
