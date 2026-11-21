@@ -141,7 +141,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             checked.push(a.clone());
         }
     }
-    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme", "--audio-out"])?;
+    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme", "--audio-out", "--spi-flash"])?;
     let mode = match arg(args, "--hdmi-mode") {
         Some(spec) => {
             let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
@@ -155,9 +155,11 @@ fn execute(args: &[String]) -> Result<(), String> {
         return Err("--net nat|local|none".into());
     }
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
-    // Without --kernel the board boots as it does from its microSD card: the boot ROM loads
-    // U-Boot SPL from --sd, and SPL, OpenSBI and U-Boot take it from there.
+    // Without --kernel the board boots as it does from its own firmware: the boot ROM loads
+    // U-Boot SPL from the SPI NOR flash (--spi-flash, a 16 MiB image of the board's flash) or,
+    // without one, from --sd, and SPL, OpenSBI and U-Boot take it from there.
     let direct = arg(args, "--kernel").is_some();
+    let spi_flash = arg(args, "--spi-flash").map(read).transpose()?;
     let (kernel, dtb, firmware) = if direct {
         (
             read(arg(args, "--kernel").unwrap())?,
@@ -165,8 +167,8 @@ fn execute(args: &[String]) -> Result<(), String> {
             read(arg(args, "--firmware").ok_or("--firmware fw_dynamic.bin (OpenSBI, generic platform) is required with --kernel")?)?,
         )
     } else {
-        if arg(args, "--sd").is_none() {
-            return Err("--kernel Image (direct boot), or --sd CARD.img to boot from the card's U-Boot".into());
+        if arg(args, "--sd").is_none() && spi_flash.is_none() {
+            return Err("--kernel Image (direct boot), --spi-flash FLASH.img (the board's firmware) or --sd CARD.img to boot from the card's U-Boot".into());
         }
         // the card's U-Boot loads the kernel, device tree and initrd itself
         for opt in ["--dtb", "--firmware", "--initrd", "--append", "--dump-dtb"] {
@@ -211,6 +213,12 @@ fn execute(args: &[String]) -> Result<(), String> {
         }
         m.soc.sdio1.insert(disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>));
         m.soc.display = Display::new(mode);
+        if let Some(img) = spi_flash.as_deref() {
+            m.soc.qspi.flash = Some(starfive_jh7110::qspi::SpiNor::new(img)?);
+            if !direct {
+                m.soc.boot_mode = starfive_jh7110::machine::BOOT_MODE_SPI;
+            }
+        }
         if direct {
             boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
         } else {

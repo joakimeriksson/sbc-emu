@@ -33,8 +33,10 @@ pub const DMC_CTRL: u64 = 0x1570_0000;
 pub const DMC_PHY: u64 = 0x1300_0000;
 /// The AON syscon register with the boot-mode straps.
 pub const BOOT_MODE_REG: u64 = 0x1702_002c;
-/// The Cadence QSPI controller's CONFIG register (the SPI NOR flash's controller).
-pub const QSPI_CTRL: u64 = 0x1301_0000;
+/// Boot-mode strap values (AON syscon 0x2c bits 1:0, as U-Boot's `spl_boot_device` reads
+/// them): the QSPI NOR flash or the microSD card (SDIO1).
+pub const BOOT_MODE_SPI: u32 = 0;
+pub const BOOT_MODE_SD: u32 = 1;
 /// The DRAM's uncached alias (`uncached-offset = <0x4 0x0>` in StarFive's jh7110.dtsi): the
 /// same memory at +16 GiB, which the vendor kernel maps for DMA-coherent buffers.
 pub const DRAM_UNCACHED: u64 = 0x4_0000_0000;
@@ -176,6 +178,10 @@ pub struct Soc {
     gpio_cfg: [u32; 10],
     /// read-back stand-ins for unmodelled device pages
     pub stubs: BTreeMap<u64, Box<[u32; 1024]>>,
+    /// the Cadence QSPI controller and the board's SPI NOR flash (`--spi-flash`)
+    pub qspi: crate::qspi::Qspi,
+    /// the boot-mode straps: `BOOT_MODE_SD`, or `BOOT_MODE_SPI` when the flash holds firmware
+    pub boot_mode: u32,
     /// virtual time (ns), kept here for `mtime`
     pub now: u64,
     /// the hart whose accesses are being executed
@@ -222,6 +228,8 @@ impl Soc {
                 })
                 .collect(),
             stubs: BTreeMap::new(),
+            qspi: Default::default(),
+            boot_mode: BOOT_MODE_SD,
             gpio_reset: false,
             gpio_prev: 0,
             gpio_edges: 0,
@@ -294,6 +302,8 @@ impl Soc {
             let l = self.pcie[k].irq_level();
             self.plic.set_level(self.pcie[k].irq, l);
         }
+        let q = self.qspi.irq();
+        self.plic.set_level(crate::qspi::IRQ_QSPI, q);
         let (g0, g1) = (self.gmac0.irq(), self.gmac1.irq());
         self.plic.set_level(IRQ_GMAC0, g0);
         self.plic.set_level(IRQ_GMAC1, g1);
@@ -521,12 +531,18 @@ impl Soc {
                 b[..n].copy_from_slice(&self.sram.mem[o..o + n]);
                 Ok(u64::from_le_bytes(b))
             }
-            // AON syscon: the boot-mode straps (bits 1:0) read 1, SD card (SDIO1), as the
-            // Orange Pi RV boots from its microSD slot
-            _ if a == BOOT_MODE_REG => r32((*self.stub(a) & !3) | 1),
-            // Cadence QSPI controller: always idle (CONFIG bit 31); no flash answers its
-            // JEDEC ID read, so U-Boot keeps its default environment
-            _ if a == QSPI_CTRL => r32(*self.stub(a) | 1 << 31),
+            // AON syscon: the boot-mode straps (bits 1:0): the SPI NOR flash or the microSD card
+            _ if a == BOOT_MODE_REG => r32((*self.stub(a) & !3) | self.boot_mode),
+            _ if (crate::qspi::QSPI_BASE..crate::qspi::QSPI_BASE + crate::qspi::QSPI_SIZE).contains(&a) => {
+                r32(self.qspi.read(a - crate::qspi::QSPI_BASE))
+            }
+            _ if (crate::qspi::QSPI_AHB..crate::qspi::QSPI_AHB + crate::qspi::QSPI_AHB_SIZE).contains(&a) => {
+                let v = self.qspi.ahb_read(a - crate::qspi::QSPI_AHB, size);
+                let l = self.qspi.irq();
+                self.plic.set_level(crate::qspi::IRQ_QSPI, l);
+                self.irq_dirty = true;
+                Ok(v)
+            }
             // DDR controller: the PHY's init is done (0x504 bit 31). Training (0x518 bit 1),
             // started by SPL's write to 0x514, shows as running for the first read after the
             // start (SPL's start check), then complete. The PHY's frequency-change request
@@ -663,6 +679,18 @@ impl Soc {
                 let o = (a - SRAM_BASE) as usize;
                 let n = (size as usize).min(SRAM_SIZE - o);
                 self.sram.mem[o..o + n].copy_from_slice(&v.to_le_bytes()[..n]);
+            }
+            _ if (crate::qspi::QSPI_BASE..crate::qspi::QSPI_BASE + crate::qspi::QSPI_SIZE).contains(&a) => {
+                self.qspi.write(a - crate::qspi::QSPI_BASE, v32);
+                let l = self.qspi.irq();
+                self.plic.set_level(crate::qspi::IRQ_QSPI, l);
+                self.irq_dirty = true;
+            }
+            _ if (crate::qspi::QSPI_AHB..crate::qspi::QSPI_AHB + crate::qspi::QSPI_AHB_SIZE).contains(&a) => {
+                self.qspi.ahb_write(size, v);
+                let l = self.qspi.irq();
+                self.plic.set_level(crate::qspi::IRQ_QSPI, l);
+                self.irq_dirty = true;
             }
             _ if (CLINT..CLINT + 0x10000).contains(&a) => {
                 self.clint.write(a - CLINT, size, v);

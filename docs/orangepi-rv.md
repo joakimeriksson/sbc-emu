@@ -38,9 +38,27 @@ sbc-emu run --board orangepi-rv --firmware $F/fw_dynamic.bin --kernel $V/Image \
 # SBC_NET_LOG=1 in the environment logs the NAT's DHCP, ARP, TCP and UDP relaying
 ```
 
-There are two ways to boot.
+There are three ways to boot.
 
-**From the microSD card, through the board's own boot chain** (no `--kernel`):
+**From the board's SPI flash, as the board boots** (`--spi-flash`, no `--kernel`): the flash holds
+the board's firmware (U-Boot SPL at 0, U-Boot's environment at 0xf0000, U-Boot and OpenSBI at
+1 MiB), and that U-Boot boots whatever is on the microSD card, NVMe or USB: an unmodified
+distribution image (Ubuntu, below), or the card described next.
+
+```sh
+scripts/orangepi-rv-uboot.sh   # also writes cache/orangepi-rv/uboot/spi-flash.img (16 MiB)
+scripts/orangepi-rv-ubuntu.sh  # Ubuntu 24.04.5 for JH7110 boards (1.1 GB download, checked) -> cache/orangepi-rv/ubuntu/
+sbc-emu run --board orangepi-rv --spi-flash cache/orangepi-rv/uboot/spi-flash.img \
+    --sd cache/orangepi-rv/ubuntu/ubuntu-24.04.5-preinstalled-server-riscv64+jh7110.img --ram-mb 4096
+#   log in as ubuntu / ubuntu (the image asks for a new password at first login)
+sbc-emu run --board orangepi-rv --spi-flash cache/orangepi-rv/uboot/spi-flash.img --sd CARD.img --ram-mb 4096
+```
+
+The boot-mode straps then select the QSPI flash, and the boot ROM loads SPL from it; SPL loads
+U-Boot from the flash through the Cadence QSPI controller, and U-Boot keeps its environment
+there (`saveenv` works). Writes to the flash stay in memory: the file is never changed.
+
+**From the microSD card, through the board's own boot chain** (no `--kernel`, no `--spi-flash`):
 
 ```sh
 scripts/orangepi-rv-uboot.sh   # mainline U-Boot v2026.10 in Docker, and a bootable card -> cache/orangepi-rv/uboot/
@@ -89,6 +107,7 @@ them with its own DRM driver.
 | CPU | RV64IMAFDC + Zicsr, Zifencei, Zicntr, Zba, Zbb (the U74's `rv64imafdc_zba_zbb`), M/S/U at privileged 1.11, Sv39 with superpages and hardware A/D, no ASIDs; all 166 riscv-tests in the U74's ISA pass (`rv64ui/um/ua/uc/uf/ud/si/mi/uzba/uzbb -p`) | `scripts/riscv-tests.sh`, `cargo test -p riscv64` |
 | Firmware | OpenSBI 1.8.1 reports `Platform Name: Xunlong Orange Pi RV`, 4 harts, aclint-mswi/mtimer, uart8250, `pm-reset` | `scripts/orangepi-rv-shell.txt` |
 | Boot chain | From the SD card: the boot ROM loads U-Boot SPL 2026.10. SPL brings up DDR and loads OpenSBI and U-Boot from the card. U-Boot reports `Model: Xunlong Orange Pi RV` and `eth0: ethernet@16030000`, then boots Linux from the card's `extlinux.conf`. Linux mounts the card, has the EEPROM's MAC address on `eth0`, and gets a DHCP lease. About 72 s wall, 20 s guest time | `scripts/orangepi-rv-uboot.txt` |
+| Ubuntu | **Canonical's Ubuntu 24.04.5 LTS server image for JH7110 boards, unmodified** (`scripts/orangepi-rv-ubuntu.sh` fetches and checks it). From the SPI flash: U-Boot 2026.10 finds the image's EFI system partition and starts its GRUB 2.12 over EFI; GRUB starts Ubuntu's kernel (`7.0.0-31-generic`, the 24.04.5 HWE kernel) and initrd; the kernel takes U-Boot's device tree (`Machine model: Xunlong Orange Pi RV`), mounts the card's root filesystem, and systemd and cloud-init run to `ubuntu login:`. The script logs in as the image's default user (`ubuntu`/`ubuntu`, changed at first login as the image requires), and checks the release, the kernel, the model, four CPUs, the flash in `/proc/mtd`, a DHCP lease and ping over Ethernet (`end0`), and `systemctl is-system-running` (`running`, no failed units). About 9 minutes wall on an M-series Mac with the interpreter (100 G instructions, 105 s guest time); `ubuntu login:` comes after about 77 G. Ubuntu's PWM DAC sound card does not come up: its `dw_axi_dmac` is a module that loads after the DAC probes, and the card gives up instead of waiting | `scripts/orangepi-rv-ubuntu.txt` |
 | Shell | **mainline:** reaches the `orangepi-rv#` BusyBox prompt at about 3.3 s guest time (about 3.8 G instructions, 30 s wall on an M-series Mac). Checked in the script: `uname -a`; the DT model `Xunlong Orange Pi RV`; 4 CPUs with `rv64imafdc_…_zba_zbb` and `mmu: sv39`; `free -m` 3934 MB; double-precision `awk` math; `sleep 1`; timer and IPI interrupts on all four CPUs; four parallel shell loops | `scripts/orangepi-rv-shell.txt` |
 | Reset | `reboot -f` resets through Linux's `gpio-restart` (GPIO35), and OpenSBI and Linux boot again. `poweroff -f` goes through OpenSBI SRST, then the AXP15060 PMIC's power register over I2C5, and the run ends | `scripts/orangepi-rv-reboot.txt` |
 | microSD | DesignWare MMC (SDIO1, IDMAC) with card detect on GPIO41: `mmc1: new high speed SDHC card`. A host-made ext4 card mounts; a 4 MiB file written by the guest verifies after dropping the page cache; `fstrim` works; the data survives a guest reboot. The same works on Xunlong's kernel | `scripts/orangepi-rv-sd.txt`, `scripts/orangepi-rv-board.txt` |
@@ -161,8 +180,9 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - Anything unmodelled faults loudly rather than rendering something wrong.
   - The firmware adds a GPU node to mainline's device tree (`img,img-bxe-4-32`, `img,img-rogue`), which has none yet. The core is not on the driver's supported list, so it needs `powervr.exp_hw_support=1`.
 - **Boot devices** (`boot.rs`, `machine.rs`):
-  - The boot ROM's SD path and the 2 MiB L2 LIM at 0x0800_0000. The MMC's IDMAC reaches the LIM, where SPL keeps its buffers.
-  - The boot-mode straps (SD), the DDR controller's training handshake, and an idle QSPI controller.
+  - The boot ROM's SPI flash and SD paths and the 2 MiB L2 LIM at 0x0800_0000. The MMC's IDMAC reaches the LIM, where SPL keeps its buffers.
+  - The boot-mode straps (the SPI flash with `--spi-flash`, otherwise SD) and the DDR controller's training handshake.
+  - `qspi.rs`: the Cadence QSPI controller (STIG commands; indirect reads and writes through the SRAM FIFO and the AHB trigger window, as U-Boot and Linux use them; direct reads; its interrupt) and the board's 16 MiB SPI NOR flash, a GigaDevice GD25LQ128 (JEDEC ID, status registers, write enable, page program, 4/32/64 KiB and chip erase, the single, dual and quad reads). U-Boot's `sf` and Linux's `spi-nor` find it.
   - The 24C04 EEPROM in StarFive's format (`SFVF`, product `XOPIRVA1-2450-D004E000-…` with the DRAM size, MAC addresses, CRC-16s).
   - The bus clock dividers at the board's rates (APB 49.5 MHz from PLL2).
 - **Other devices:**
@@ -225,16 +245,16 @@ programs through the JIT's driver.
   - **No OpenGL:** OpenGL through Zink is not set up.
   - Xunlong's kernel and its closed driver (`pvrsrvkm`) are not supported: their firmware is closed, and that driver gives up without it.
 - **Not modelled:**
-  - MIPI-DSI/CSI, SPI NOR (Cadence QSPI), the RTC.
+  - MIPI-DSI/CSI, the RTC (Ubuntu's clock starts from its last saved time until NTP, which the isolated network does not offer).
 - **Mainline HDMI:** only the firmware's fixed-mode framebuffer is available (no mode setting, no hot-plug). Mainline Linux has no JH7110 display nodes or Inno HDMI support yet.
 - **Boot chain:**
-  - The mask ROM is modelled, not executed (StarFive's ROM image is not public), and only its SD path is.
+  - The mask ROM is modelled, not executed (StarFive's ROM image is not public), and only its SPI flash and SD paths are.
+  - The flash's contents are what `scripts/orangepi-rv-uboot.sh` builds (mainline U-Boot 2026.10), not Xunlong's factory firmware, which is not published.
   - The DDR controller completes training at once, and its PHY reports no frequency changes.
-  - The SPI NOR flash is absent: the QSPI controller answers, but no flash returns a JEDEC ID, so U-Boot keeps its default environment and cannot boot from SPI.
   - The SDIO slot holds the Wi-Fi chip, so U-Boot's probe of it as an SD card fails with "Card did not respond to voltage select". That is harmless.
   - **No HDMI console for mainline after an SD boot.** Mainline U-Boot has no JH7110 display driver, so no framebuffer is handed over and `simpledrm` has nothing to drive. The same is true on the board. Xunlong's kernel on a card drives HDMI itself, and direct boot hands mainline the firmware framebuffer.
   - SD boot needs `--ram-mb` 2048, 4096, 8192 or 16384: U-Boot takes the DRAM size from the EEPROM and knows only those.
-- **Distribution images:** Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried. The kernel they use is the one built here.
+- **Distribution images:** Ubuntu 24.04.5 boots (above). Its own SD-card firmware (`loader1`/`loader2`, U-Boot 2025.10) cannot start on this board: its FIT has configurations for the VisionFive 2, Mars, Star64 and DeepComputing boards only, so SPL stops with error -38, as it would on a real Orange Pi RV; the board's flash firmware boots the image instead. Ubuntu 25.10 and later need the RVA23 profile, which the U74 lacks. Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried.
 - **Speed natively:** interpreter only, about 125 M instructions per second, all harts on one host
   thread. The JIT exists only in the browser build so far (below), where it reaches the shell about
   three times sooner than the native interpreter.

@@ -1,0 +1,35 @@
+# Orange Pi RV: Canonical's Ubuntu 24.04.5 LTS server image for JH7110 boards, unmodified,
+# booted the way the board boots it: the boot ROM loads U-Boot SPL from the SPI NOR flash
+# (the board's firmware: scripts/orangepi-rv-uboot.sh's spi-flash.img), U-Boot starts the
+# image's GRUB over EFI, GRUB its kernel (Ubuntu's 7.0 HWE kernel) with the firmware's device
+# tree. Logs in as the image's default user (ubuntu/ubuntu, which must be changed at first
+# login) and checks the system.
+#   scripts/orangepi-rv-ubuntu.sh; U=cache/orangepi-rv/uboot
+#   sbc-emu run --board orangepi-rv --spi-flash $U/spi-flash.img \
+#       --sd cache/orangepi-rv/ubuntu/ubuntu-24.04.5-preinstalled-server-riscv64+jh7110.img \
+#       --ram-mb 4096 --net local --script scripts/orangepi-rv-ubuntu.txt --timeout 3600
+wait-serial Trying to boot from SPI
+wait-serial Model: Xunlong Orange Pi RV
+wait-serial GNU GRUB
+wait-serial Machine model: Xunlong Orange Pi RV
+wait-serial ubuntu login:
+# cloud-init sets the default user's password in its last stage
+wait-serial finished at
+serial ubuntu\n
+wait-serial Password:
+serial ubuntu\n
+wait-serial Current password:
+serial ubuntu\n
+wait-serial New password:
+serial sbc-emu-RV-2026\n
+wait-serial Retype new password:
+serial sbc-emu-RV-2026\n
+wait-serial ubuntu@ubuntu
+serial cat /etc/os-release | head -2; uname -r; cat /proc/device-tree/model; echo; nproc\n
+wait-serial Xunlong Orange Pi RV
+serial echo FLASH; cat /proc/mtd; cat /sys/class/mtd/mtd0/name 2>&1; echo DMA; lsmod | grep -i -E 'axi|pwmdac'; dmesg | grep -i -E 'axi-dma|dw_axi|spi-nor' | tail -5\n
+serial ip -br -4 addr; ping -c 2 10.0.2.2 | tail -2\n
+wait-serial packets transmitted
+serial systemctl is-system-running; systemctl --failed --no-legend | head; echo UBUNTU_$((40+2))\n
+wait-serial UBUNTU_42
+quit

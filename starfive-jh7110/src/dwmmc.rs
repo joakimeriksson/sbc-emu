@@ -222,7 +222,10 @@ impl DwMmc {
     }
 
     fn status(&self) -> u32 {
-        let count = self.fifo.len() as u32;
+        // the model queues a whole PIO read at once; the hardware's FIFO holds at most
+        // `fifo_depth` words, and STATUS's 13-bit count must not overflow (U-Boot reads that
+        // many words, then looks again)
+        let count = self.fifo.len().min(self.fifo_depth) as u32;
         let mut status = count << 17;
         if count == 0 {
             status |= 1 << 2; // FIFO empty
@@ -237,6 +240,14 @@ impl DwMmc {
     }
 
     pub fn read(&mut self, offset: u64) -> u32 {
+        let v = self.read_reg(offset);
+        if self.trace && std::env::var_os("SBC_MMC_REGS").is_some() && (offset as usize) < 0x100 {
+            eprintln!("[dwmmc] read {offset:#x} = {v:#x}");
+        }
+        v
+    }
+
+    fn read_reg(&mut self, offset: u64) -> u32 {
         let offset = offset as usize;
         match offset {
             MINTSTS => self.rint() & self.regs[INTMASK / 4],
@@ -260,6 +271,9 @@ impl DwMmc {
     /// A register write, with the IDMAC reaching `ram` (DRAM and, on the JH7110, the L2 LIM).
     pub fn write_dma(&mut self, offset: u64, value: u32, ram: &mut DmaMem) {
         let offset = offset as usize;
+        if self.trace && std::env::var_os("SBC_MMC_REGS").is_some() && offset < 0x100 {
+            eprintln!("[dwmmc] write {offset:#x} = {value:#x}");
+        }
         match offset {
             CTRL => {
                 // Resets complete at once.
@@ -318,6 +332,9 @@ impl DwMmc {
         }
         let bytes = self.regs[BYTCNT / 4] as usize;
         let write = cmd & CMD_DAT_WR != 0;
+        if self.trace {
+            eprintln!("[dwmmc] CMD{index} data: {bytes} bytes, BLKSIZ {}, idmac {}, CTRL {:#x}, cmd {cmd:#x}", self.regs[BLKSIZ / 4], self.uses_idmac(), self.regs[CTRL / 4]);
+        }
         let ok = bytes <= MAX_TRANSFER
             && match reply.data {
                 Data::Bytes(mut data) if !write => {
@@ -335,6 +352,9 @@ impl DwMmc {
                 _ => false,
             };
         if !ok {
+            if self.trace {
+                eprintln!("[dwmmc] data command {index} failed: {bytes} bytes, BLKSIZ {}, idmac {}, DBADDR {:#x}", self.regs[BLKSIZ / 4], self.uses_idmac(), self.regs[DBADDR / 4]);
+            }
             self.regs[RESP0 / 4] |= OUT_OF_RANGE;
             self.rintsts |= INT_DRTO | if write { INT_EBE } else { 0 };
             if self.uses_idmac() {
@@ -545,6 +565,9 @@ impl DwMmc {
                 let n = size.min(bytes);
                 if n > 0 {
                     if !chunk(ram, address, n) {
+                        if self.trace {
+                            eprintln!("[dwmmc] IDMAC buffer {address:#x}+{n:#x} (descriptor {desc:#x}) is outside RAM");
+                        }
                         return false;
                     }
                     bytes -= n;
