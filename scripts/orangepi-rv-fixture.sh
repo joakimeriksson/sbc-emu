@@ -114,7 +114,7 @@ tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
     'lib/modules/*/kernel/drivers/hid/usbhid/*' 'lib/modules/*/kernel/drivers/input/evdev.ko.gz' \
     'lib/modules/*/kernel/drivers/net/wireless/broadcom/brcm80211/*' 'lib/modules/*/kernel/net/wireless/*' \
     'lib/modules/*/kernel/drivers/i2c/busses/i2c-designware-*' 'lib/modules/*/kernel/drivers/mfd/axp20x*' \
-    'lib/modules/*/kernel/drivers/regulator/axp20x-regulator.ko.gz' 'lib/modules/*/kernel/drivers/mmc/core/*' \
+    'lib/modules/*/kernel/drivers/regulator/axp20x-regulator.ko.gz' \
     'lib/modules/*/kernel/drivers/regulator/fixed.ko.gz' 'lib/modules/*/kernel/net/rfkill/*' \
     'lib/modules/*/kernel/sound/*'
 # ALSA: aplay and speaker-test for the PWM DAC (headphone jack)
