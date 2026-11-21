@@ -7,8 +7,9 @@ cores and register-level models of each board's chips, and runs the boards' own 
 systems unmodified: Raspberry Pi OS, Ubuntu, Armbian, Alpine.
 
 **Try it in your browser: [joakimeriksson.github.io/sbc-emu](https://joakimeriksson.github.io/sbc-emu/).**
-The Raspberry Pi 4, the Orange Pi One, the ASUS Tinker Board S, the Orange Pi 5 and the RISC-V
-Orange Pi RV boot there in seconds, on your own computer.
+All six boards boot there, on your own computer: the Raspberry Pi 4, the Orange Pi One, the ASUS
+Tinker Board S, the Orange Pi 5 and the RISC-V Orange Pi RV in seconds, and the ESP32-S31 through
+its whole boot chain in about 40.
 
 <table>
 <tr>
@@ -32,7 +33,7 @@ Orange Pi RV boot there in seconds, on your own computer.
 | Orange Pi One | Allwinner H3, 4× Cortex-A7 | Armbian to its login prompt; HDMI, USB, Ethernet; the Mali-400 GPU. Also in the browser. | [orangepi-one.md](docs/orangepi-one.md) |
 | Orange Pi RV | StarFive JH7110, 4× SiFive U74 (RISC-V) | the board's own boot chain from its SPI flash or SD card to Alpine, Xunlong's kernel or Canonical's Ubuntu 24.04.5, unmodified; Wi-Fi, NVMe; the PowerVR GPU with Vulkan; a JIT to AArch64. Also in the browser. | [orangepi-rv.md](docs/orangepi-rv.md) |
 | ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12 | Armbian from SD or eMMC to a login on HDMI; the Mali-T760 GPU with Panfrost. Also in the browser. | [rk3288-tinker-board-plan.md](docs/rk3288-tinker-board-plan.md) |
-| ESP32-S31 Function CoreBoard | Espressif ESP32-S31, 2× RV32IMAC | Espressif's official Linux flash image, from the mask ROM to a shell | [esp32s31.md](docs/esp32s31.md) |
+| ESP32-S31 Function CoreBoard | Espressif ESP32-S31, 2× RV32IMAC | Espressif's official Linux flash image, from the mask ROM to a shell. Also in the browser. | [esp32s31.md](docs/esp32s31.md) |
 
 The Raspberry Pi 4 is complete enough for real use; the other boards are experimental. Each
 board's page says exactly what works, how it was tested and what is missing.

@@ -177,6 +177,8 @@ dependencies = [
  "arm-a64",
  "bcm2711",
  "emu-core",
+ "esp-soc",
+ "esp32s31",
  "riscv64",
  "rk3588",
  "rockchip-rk3288",

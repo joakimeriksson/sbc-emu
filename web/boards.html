@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sbc-emu</title>
-<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. Five of them boot in your browser.">
+<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. All of them boot in your browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -253,12 +253,12 @@
       </div>
     </div>
     <div>
-      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. Five of the boards boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
+      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. All six boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
       <dl class="tally">
         <dt>6</dt><dd>boards</dd>
         <dt>4</dt><dd>instruction sets</dd>
         <dt>5</dt><dd>GPUs</dd>
-        <dt>5</dt><dd>boot in your browser</dd>
+        <dt>6</dt><dd>boot in your browser</dd>
       </dl>
     </div>
   </section>
@@ -271,9 +271,9 @@
       <li><a class="unit on" href="#orangepi-rv" style="--w:89;--i:2"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
       <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:3"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
       <li><a class="unit on" href="#orangepi5" style="--w:100;--i:4"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
-      <li><a class="unit" href="#esp32s31" style="--w:26"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
+      <li><a class="unit on" href="#esp32s31" style="--w:26;--i:5"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
     </ul>
-    <p class="legend"><span><i aria-hidden="true"></i>Boots in your browser, on this site</span><span><i class="off" aria-hidden="true"></i>Runs in the native emulator</span></p>
+    <p class="legend"><span><i aria-hidden="true"></i>Boots in your browser, on this site</span></p>
   </section>
 
   <section class="section" id="boards" aria-labelledby="boards-h">
@@ -379,11 +379,11 @@
       </div>
     </article>
 
-    <article class="sheet" id="esp32s31">
-      <div class="art"><svg viewBox="0 0 26 58" style="--w:26" aria-hidden="true"><use href="#b-s31"/><circle class="led" cx="13" cy="29" r="1.1"/></svg></div>
+    <article class="sheet live" id="esp32s31">
+      <div class="art"><svg viewBox="0 0 26 58" style="--w:26" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg></div>
       <div>
         <h3>ESP32-S31 Function CoreBoard</h3>
-        <p class="status"><i aria-hidden="true"></i>Native emulator</p>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
         <dl class="spec">
           <div><dt>SoC</dt><dd>Espressif ESP32-S31</dd></div>
           <div><dt>CPU</dt><dd>2 × RV32IMAC</dd></div>
@@ -391,7 +391,10 @@
           <div><dt>GPU</dt><dd>None</dd></div>
         </dl>
         <p>A microcontroller that runs Linux. Espressif’s official flash image, unmodified, through the chip’s own mask ROM, U-Boot SPL, OpenSBI and U-Boot, to Linux 6.18 executing in place from flash, on both harts.</p>
-        <div class="run"><a class="quiet" href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/esp32s31.md">How it boots</a></div>
+        <div class="run">
+          <a class="pad-btn" href="board.html?b=esp32s31"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>The official flash image boots through the ROM, U-Boot and OpenSBI to a root shell in about 40 seconds. A 10 MB download.</small>
+        </div>
       </div>
     </article>
   </section>
