@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Static file server for web/ with HTTP Range support (the browser reads SD images lazily).
-   tools/serve.py [port]   -> http://127.0.0.1:8791/"""
+   tools/serve.py [port]   -> http://127.0.0.1:8791/  (/ is boards.html, the front page, as on the site)"""
 import http.server, os, re, sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'web')
@@ -14,7 +14,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         super().end_headers()
 
+    def front(self):
+        if self.path == '/' or self.path.startswith('/?'):
+            self.path = '/boards.html' + self.path[1:]
+
     def do_GET(self):
+        self.front()
         rng = self.headers.get('Range')
         path = self.translate_path(self.path)
         m = rng and re.match(r'bytes=(\d+)-(\d*)$', rng)
@@ -40,6 +45,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 left -= len(chunk)
 
     def do_HEAD(self):
+        self.front()
         return super().do_HEAD()
 
 http.server.ThreadingHTTPServer.allow_reuse_address = True
