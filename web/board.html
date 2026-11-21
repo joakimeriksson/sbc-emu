@@ -69,6 +69,13 @@ const BOARDS = {
     tm: 'ASUS and Tinker Board are trademarks of ASUSTeK Computer Inc.; Rockchip is a trademark of Rockchip Electronics Co., Ltd. sbc-emu is not affiliated with either.',
     try: ['uname -a', 'cat /proc/device-tree/model; echo', 'grep -c processor /proc/cpuinfo', 'cat /proc/cpuinfo | head -12', 'cat /proc/interrupts', 'free -m', 'dmesg | tail -15'],
   },
+  'orangepi-rv': {
+    name: 'Orange Pi RV', os: 'orangepi-rv', ramMb: 1024,
+    lede: 'OpenSBI and Alpine Linux’s mainline kernel booting from scratch on an emulated StarFive JH7110: four 64-bit RISC-V cores, translated to WebAssembly as they run. Nothing runs on a server.',
+    note: 'Downloads 17 MB (the emulator, OpenSBI, Alpine’s kernel and a small initramfs) and boots Linux, in about 5 seconds on a fast computer.',
+    tm: 'Orange Pi is a trademark of Shenzhen Xunlong Software Co.; StarFive is a trademark of StarFive Technology. sbc-emu is not affiliated with either.',
+    try: ['uname -a', 'cat /proc/device-tree/model; echo', 'cat /proc/cpuinfo | head -12', 'ip link set eth0 up; sleep 3; udhcpc -i eth0 -n -q', 'ping -c 3 10.0.2.2', 'lsusb 2>/dev/null || ls /sys/bus/usb/devices', 'free -m', 'dmesg | tail -15'],
+  },
 };
 const $ = (id) => document.getElementById(id);
 const id = new URLSearchParams(location.search).get('b') || 'orangepi-one';

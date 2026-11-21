@@ -71,8 +71,23 @@
     <li><strong>Alpine Linux 3.24.4 minirootfs</strong> for armhf, unmodified, with a short <code>/init</code> written for sbc-emu (<code>scripts/tinker-board-fixture.sh</code>). Licences and source as for the Orange Pi One's initramfs above.</li>
   </ul>
 
+  <h2>Orange Pi RV: firmware, Linux kernel and device tree</h2>
+  <ul>
+    <li><strong>OpenSBI 1.8.1</strong>, Alpine Linux's <code>opensbi-1.8.1-r0</code> package for riscv64: its generic platform's <code>fw_dynamic.bin</code>, unmodified (SHA-256 of the package <code>b1086a0b…ac47664</code>).</li>
+    <li>Licence: BSD 2-Clause. Source: <a href="https://github.com/riscv-software-src/opensbi/tree/v1.8.1">riscv-software-src/opensbi v1.8.1</a>, with Alpine's recipe in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/main/opensbi">aports, 3.24-stable</a>.</li>
+    <li><strong>Linux 7.1.5</strong>, Alpine Linux's <code>linux-stable-7.1.5-r0</code> package for riscv64: its kernel <code>Image</code> (served gzip'd) and its <code>jh7110-orangepi-rv.dtb</code>, unmodified (SHA-256 of the package <code>48712755…cb9eb401</code>).</li>
+    <li>Licence: GNU GPL version 2. Source: <a href="https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.5.tar.xz">linux-7.1.5.tar.xz</a> from kernel.org, with Alpine's configuration and patches in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable/community/linux-stable">aports, 3.24-stable</a>.</li>
+  </ul>
+
+  <h2>Orange Pi RV: initramfs</h2>
+  <ul>
+    <li><strong>Alpine Linux 3.24.4 minirootfs</strong> for riscv64 (BusyBox, musl, apk-tools and their dependencies), unmodified, with the kernel's Ethernet and USB HID modules and a short <code>/init</code> written for sbc-emu (<code>scripts/orangepi-rv-fixture.sh</code>).</li>
+    <li>Licences: GNU GPL version 2 (BusyBox, the kernel modules), MIT (musl) and others, as each package states.</li>
+    <li>Source: every package's recipe and patches are in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.24-stable">aports, 3.24-stable</a>; Alpine's source tarballs are linked from each recipe.</li>
+  </ul>
+
   <h2>Trademarks</h2>
-  <p>Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi is a trademark of Shenzhen Xunlong Software Co. ASUS and Tinker Board are trademarks of ASUSTeK Computer Inc. Broadcom, Allwinner and Rockchip are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them; the names only say which hardware it emulates.</p>
+  <p>Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi is a trademark of Shenzhen Xunlong Software Co. ASUS and Tinker Board are trademarks of ASUSTeK Computer Inc. Broadcom, Allwinner, Rockchip and StarFive are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them; the names only say which hardware it emulates.</p>
 </main>
 </body>
 </html>

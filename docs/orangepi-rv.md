@@ -8,7 +8,8 @@ an S7 monitor core, 4 GiB of LPDDR4, a microSD slot, SPI NOR, Gigabit Ethernet, 
 interpreter (`riscv64/`, no QEMU) and SoC model (`starfive-jh7110/`). The CPU, the microSD
 card, Gigabit Ethernet, the four USB 3.0 ports (PCIe → VL805) with a keyboard, tablet and USB
 stick, an NVMe SSD in the M.2 slot, Wi-Fi and Bluetooth (the AP6256), audio from the
-headphone jack's PWM DAC, and the HDMI output with HDMI audio work. The GPU does not.
+headphone jack's PWM DAC, the HDMI output with HDMI audio, and the PowerVR GPU (Vulkan) work.
+It also runs in the browser (below).
 
 Two unmodified kernels boot on it:
 
@@ -172,6 +173,48 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - Each hart runs at 1 ns per instruction, round-robin in 1000-instruction slices.
   - When every hart waits in WFI, time skips to the next `mtimecmp`, vblank or network poll.
 
+## In the browser
+
+`web/board.html?b=orangepi-rv` boots the board in a browser tab: the WebAssembly build of the same
+machine (`wasm/`, `sbc_boot_opirv`) with OpenSBI, Alpine's mainline kernel and device tree and a
+small initramfs (`scripts/orangepi-rv-fixture.sh` writes it to `web/initramfs.cpio.gz`: Ethernet
+and USB HID modules, no Wi-Fi, audio or SD), to a shell on the serial console. The browser's
+network is isolated (DHCP, DNS and local services: `udhcpc` and `ping 10.0.2.2` work).
+
+```sh
+scripts/orangepi-rv-fixture.sh && tools/wasm-build.sh   # stages web/assets/orangepi-rv
+tools/serve.py; open 'http://127.0.0.1:8791/board.html?b=orangepi-rv'
+node tools/wasm-smoke-opirv.mjs                         # the same boot, headless (SBC_JIT=0: no JIT)
+node tools/wasm-rv-jit-diff.mjs                         # the JIT against the interpreter
+```
+
+**The JIT** (`riscv64/src/jit.rs`, `jit_wasm.rs`) translates RV64 code to WebAssembly:
+- **Regions.** A hot entry (64 executions) is compiled with the basic blocks its constant branches
+  reach on the same 4 KiB page, into one wasm function with a dispatch loop, so loops run inside
+  wasm. RV64I, M (not `mulh*`), Zba and Zbb (not `orc.b`, `rev8`) are compiled; CSRs, privileged
+  instructions, AMOs and floating point go to the interpreter one instruction at a time.
+- **Shared and keyed by physical address.** The four harts share the code, and a page mapped at
+  several virtual addresses is compiled once; the code computes PCs from the page's virtual
+  address.
+- **Loads and stores** go through a 256-entry micro-TLB per mode (U, S, S with SUM, M), filled by
+  the interpreter's page walks; misaligned and device accesses take the interpreter's path.
+- **`fence.i`.** Code stays valid until a `fence.i`, as on the U74. After one, a region is
+  compared with the bytes it was compiled from the first time it runs again, so code written by
+  DMA is caught as well as stores.
+
+| Mainline to the BusyBox shell (Node 26, M5) | Wall time | Instructions |
+|---|---|---|
+| Browser build, interpreter | 53.8 s (118 MIPS) | 6.6 G |
+| Browser build, JIT | 9.9 s | 6.6 G |
+| Browser build, JIT, the demo's initramfs | 4.6 s | 1.9 G |
+| Native interpreter, for comparison | 29.1 s | 6.7 G |
+
+`tools/wasm-rv-jit-diff.mjs` runs random programs (integer, M, Zba, Zbb, loads and stores with
+misaligned, page-straddling and device accesses, AMOs, CSRs, compressed instructions, branches,
+jumps and loops) in M mode and in S mode with Sv39, and compares registers, counters, CSRs and
+memory with the interpreter: 18,000 cases match. Natively, `cargo test -p riscv64` runs the same
+programs through the JIT's driver.
+
 ## Not working yet
 
 - **USB 2.0:** the SoC's own USB 2.0/OTG controller (Cadence, the board's USB-C data role) is not modelled. The devices are emulated: a keyboard, a tablet and a USB stick (`--usb-drive`; a guest reboot starts again from the image).
@@ -192,4 +235,6 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
   - **No HDMI console for mainline after an SD boot.** Mainline U-Boot has no JH7110 display driver, so no framebuffer is handed over and `simpledrm` has nothing to drive. The same is true on the board. Xunlong's kernel on a card drives HDMI itself, and direct boot hands mainline the firmware framebuffer.
   - SD boot needs `--ram-mb` 2048, 4096, 8192 or 16384: U-Boot takes the DRAM size from the EEPROM and knows only those.
 - **Distribution images:** Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried. The kernel they use is the one built here.
-- **Speed:** interpreter only, about 125 M instructions per second, all harts on one host thread.
+- **Speed natively:** interpreter only, about 125 M instructions per second, all harts on one host
+  thread. The JIT exists only in the browser build so far (below), where it reaches the shell about
+  three times sooner than the native interpreter.

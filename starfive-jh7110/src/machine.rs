@@ -871,12 +871,14 @@ pub struct Machine {
     pub soc: Soc,
     /// virtual nanoseconds not yet added to `soc.now` (1 ns per instruction per hart)
     rr: usize,
+    /// the block JIT (shared by the harts: compiled code is keyed by physical address)
+    jit: Option<Box<riscv64::jit::Jit>>,
 }
 
 impl Machine {
     pub fn new(ram_size: usize) -> Self {
         let harts = (0..HARTS as u64).map(|h| Hart::new(Identity::sifive_u74(h))).collect();
-        Machine { harts, state: [HartState::Off; HARTS], soc: Soc::new(ram_size), rr: 0 }
+        Machine { harts, state: [HartState::Off; HARTS], soc: Soc::new(ram_size), rr: 0, jit: None }
     }
 
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), String> {
@@ -935,7 +937,10 @@ impl Machine {
                 self.soc.cur = h;
                 // another hart may have written the reserved location since
                 hart.reservation = u64::MAX;
-                let n = hart.run(&mut self.soc, QUANTUM.min(left));
+                let n = match self.jit.as_mut() {
+                    Some(jit) => riscv64::jit::run(hart, &mut self.soc, jit, QUANTUM.min(left)),
+                    None => hart.run(&mut self.soc, QUANTUM.min(left)),
+                };
                 ran = ran.max(n);
             }
             if std::mem::take(&mut self.soc.gpio_reset) {
@@ -979,6 +984,33 @@ impl Machine {
         if let Some((_, phy)) = self.soc.gmac0.phy.as_mut() {
             phy.set_link(true);
         }
+    }
+
+    /// Turn the block JIT on or off (browser builds have one: `riscv64::jit`).
+    pub fn set_jit(&mut self, on: bool) {
+        if !on {
+            self.jit = None;
+        } else if self.jit.is_none() && riscv64::jit::AVAILABLE {
+            self.jit = Some(Box::default());
+        }
+    }
+    pub fn jit_enabled(&self) -> bool {
+        self.jit.is_some()
+    }
+    /// Executions before a block is compiled.
+    pub fn set_jit_hot(&mut self, n: u32) {
+        if let Some(j) = self.jit.as_mut() {
+            j.hot = n.max(1);
+        }
+    }
+    /// Regions compiled so far.
+    pub fn jit_compiled(&self) -> u64 {
+        self.jit.as_ref().map_or(0, |j| j.compiled)
+    }
+    /// The JIT's counters: (regions compiled, regions dropped because their code changed,
+    /// full flushes).
+    pub fn jit_stats(&self) -> Option<(u64, u64, u64)> {
+        self.jit.as_ref().map(|j| (j.compiled, j.invalidated, j.flushes))
     }
 
     pub fn serial_input(&mut self, byte: u8) -> bool {

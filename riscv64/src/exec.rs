@@ -73,6 +73,7 @@ impl Hart {
                 _ => u64::from_le_bytes(ram[o..o + 8].try_into().unwrap()),
             });
         }
+        self.dev_access = true;
         bus.read(pa, size).map_err(|_| Exception { cause: exc::LOAD_ACCESS, tval: va })
     }
 
@@ -107,6 +108,7 @@ impl Hart {
             }
             return Ok(());
         }
+        self.dev_access = true;
         bus.write(pa, size, v).map_err(|_| Exception { cause: exc::STORE_ACCESS, tval: va })
     }
 
@@ -348,6 +350,9 @@ impl Hart {
             0x0f => {
                 // fence, fence.i: memory is sequentially consistent; instructions are
                 // decoded from memory on every fetch
+                if f3(i) == 1 {
+                    self.fence_i += 1;
+                }
             }
             0x2f => self.amo(bus, i, x1, x2)?,
             0x73 => return self.system(bus, i, len),

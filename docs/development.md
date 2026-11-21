@@ -43,7 +43,7 @@ mali400/      the Mali-400 MP2 GPU (Utgard): GP vertex shader and PLBU, PP fragm
 peripherals/  device models shared between boards: GIC-400, DesignWare UART, the I²C device interface and I²C chips (RK808, ACT8846, SYR827/828 regulators, HYM8563 RTC), the 24 MHz timebase
 midgard/      the Mali-T760 MP4 GPU (Midgard) of the RK3288: job manager, MMU, Midgard shader core, tiler, fragment pipeline, textures, as Linux's and Mesa's panfrost drivers use it; mali-replay for captured job chains
 allwinner-h3/ the experimental Orange Pi One machine (H3): four cores, GIC-400, UART0, CCU, timers, SD/MMC, HDMI (DE2 mixer, TCON, DW-HDMI), USB (OHCI with keyboard and tablet, EHCI), Ethernet (EMAC, internal PHY), host PSCI, U-Boot-style DTB patching
-riscv64/      an RV64GC hart (IMAFDC, Zba, Zbb; M/S/U; Sv39) and its riscv-tests suite
+riscv64/      an RV64GC hart (IMAFDC, Zba, Zbb; M/S/U; Sv39), its riscv-tests suite and a block JIT to WebAssembly (browser builds)
 starfive-jh7110/ the experimental Orange Pi RV machine (JH7110): four U74 harts, CLINT, PLIC, UART0, clock/reset generators, PMU, DW MMC (microSD), GMAC + YT8531C PHY, PLDA PCIe + VL805 xHCI, M.2 NVMe, SDIO Wi-Fi (BCM43456), Bluetooth on UART1, GPIO interrupts, AXI DMA + PWM DAC and HDMI I2S audio, DC8200 + Inno HDMI, I²C with the AXP15060 PMIC and EEPROM, the PKA crypto engine, TRNG, the boot ROM's SD path with the L2 LIM and DDR controller (U-Boot), OpenSBI direct boot
 powervr/        Imagination PowerVR Rogue GPU (BXE-4-32): registers and the firmware interface for Linux's powervr driver
 v3d/        the V3D 4.2 3D GPU (packets generated from Mesa's v3d_packet.xml by tools/gen_v3d_packets.py)
@@ -53,6 +53,6 @@ rk3588/     the experimental Orange Pi 5 machine (RK3588S): GICv3, UART2, timer
 sbc-machine/ the board catalogue and the host-facing machine layer the boards share
 sbc-net/    virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP (from esp32sim)
 cli/        the sbc-emu command
-wasm/       C ABI for the browser (the Pi 4 and the Tinker Board); web/ is the pages and worker
+wasm/       C ABI for the browser (the Pi 4, the Tinker Board, the Orange Pi One and the Orange Pi RV); web/ is the pages and worker
 scripts/    action scripts (boots, demos, GPU tests, Ubuntu)
 ```

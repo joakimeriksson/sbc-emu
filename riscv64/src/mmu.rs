@@ -54,20 +54,83 @@ struct Entry {
     flags: u64,
 }
 
+/// Micro-TLB entries per table (the block JIT's load and store fast path).
+pub const UT: usize = 256;
+/// Micro-TLB tables: U, S, S with SUM, M (no translation), and one that is never filled
+/// (MXR or MPRV set: every access takes the slow path).
+pub const UT_TABLES: usize = 5;
+pub const UT_NONE: usize = 4;
+
+/// A micro-TLB entry: an access of `size` bytes at `va` hits when
+/// `va & (!0xfff | (size - 1)) == tag` (so misaligned accesses miss), and its host address is
+/// then the low 32 bits of `va` plus `delta` (browser builds: wasm32 linear memory).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct UEntry {
+    pub tag: u64,
+    pub delta: u32,
+    pub pad: u32,
+}
+
+pub const U_EMPTY: UEntry = UEntry { tag: u64::MAX, delta: 0, pad: 0 };
+
 #[derive(Default)]
 pub struct Tlb {
     entries: Vec<Entry>,
     pub walks: u64,
+    /// the micro-TLB, when the JIT uses it: `UT_TABLES` tables of `UT` read entries followed by
+    /// `UT` write entries
+    pub utlb: Vec<UEntry>,
+    /// indices of the filled micro-TLB entries (a flush clears just these)
+    pub ufilled: Vec<u32>,
 }
 
 impl Tlb {
     pub fn flush(&mut self) {
         self.entries.clear();
+        self.uflush();
+    }
+
+    /// Empty the micro-TLB.
+    pub fn uflush(&mut self) {
+        if self.ufilled.len() > 256 {
+            self.utlb.fill(U_EMPTY);
+        } else {
+            for &i in &self.ufilled {
+                self.utlb[i as usize] = U_EMPTY;
+            }
+        }
+        self.ufilled.clear();
+    }
+
+    /// Install a micro-TLB entry in `table` (read or `write`) for the page of `va`.
+    pub fn ufill(&mut self, table: usize, write: bool, va: u64, host_page: u32) {
+        if self.utlb.is_empty() || table == UT_NONE {
+            return;
+        }
+        let i = table * 2 * UT + if write { UT } else { 0 } + ((va >> 12) as usize & (UT - 1));
+        if self.utlb[i].tag == U_EMPTY.tag {
+            self.ufilled.push(i as u32);
+        }
+        self.utlb[i] = UEntry { tag: va & !0xfff, delta: host_page.wrapping_sub(va as u32 & !0xfff), pad: 0 };
     }
 }
 
 impl Hart {
     /// The privilege a data access is made with: MPRV substitutes MPP in M mode.
+    /// The micro-TLB table data accesses use in the current mode.
+    pub fn utlb_table(&self) -> usize {
+        if self.mstatus & (mstatus::MXR | mstatus::MPRV) != 0 {
+            return UT_NONE;
+        }
+        match self.prv {
+            prv::M => 3,
+            prv::S if self.mstatus & mstatus::SUM != 0 => 2,
+            prv::S => 1,
+            _ => 0,
+        }
+    }
+
     #[inline(always)]
     fn data_prv(&self) -> u64 {
         if self.prv == prv::M && self.mstatus & mstatus::MPRV != 0 {

@@ -50,8 +50,8 @@ impl SerialBoard for Machine {
                 continue;
             }
             eprintln!(
-                "[{tag}] hart {h}: pc={:#x} prv={} insns={} traps={} satp={:#x} sepc={:#x} scause={:#x} stval={:#x} mepc={:#x} mcause={:#x}{}",
-                hart.pc, hart.prv, hart.instret, hart.traps, hart.satp, hart.sepc, hart.scause, hart.stval, hart.mepc, hart.mcause,
+                "[{tag}] hart {h}: pc={:#x} prv={} insns={} traps={} fence.i={} satp={:#x} sepc={:#x} scause={:#x} stval={:#x} mepc={:#x} mcause={:#x}{}",
+                hart.pc, hart.prv, hart.instret, hart.traps, hart.fence_i, hart.satp, hart.sepc, hart.scause, hart.stval, hart.mepc, hart.mcause,
                 if hart.wfi { " (wfi)" } else { "" }
             );
             if let Some((pc, insn)) = hart.last_illegal {

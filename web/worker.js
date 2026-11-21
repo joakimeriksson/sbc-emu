@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv', ramMb},
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
@@ -80,6 +80,20 @@ async function start(os, ramMb, jit) {
     const [kernel, dtb, initrd] = await Promise.all(['zImage', 'sun8i-h3-orangepi-one.dtb', 'initramfs.cpio.gz']
       .map((f) => fetchBytes(`assets/orangepi-one/${f}`, false)));
     if (ex.sbc_boot_opi1(ramMb, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
+  if (os === 'orangepi-rv') {
+    // Orange Pi RV (StarFive JH7110, four 64-bit RISC-V U74s): OpenSBI and Alpine's mainline
+    // kernel with the stock device tree and a BusyBox initramfs (scripts/orangepi-rv-fixture.sh:
+    // web/initramfs.cpio.gz), shell on the serial console; the kernel arrives gzip'd
+    postMessage({ type: 'status', text: 'loading OpenSBI, the Alpine kernel, device tree and initramfs…' });
+    const [fw, kernel, dtb, initrd] = await Promise.all([['fw_dynamic.bin', false], ['Image.gz', true], ['jh7110-orangepi-rv.dtb', false], ['initramfs.cpio.gz', false]]
+      .map(([f, gz]) => fetchBytes(`assets/orangepi-rv/${f}`, gz)));
+    if (ex.sbc_boot_opirv(ramMb, copyIn(fw), fw.length, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
     if (jit) ex.sbc_jit(1);
     frameEvery = 100;
     postMessage({ type: 'status', text: 'booting…' });
