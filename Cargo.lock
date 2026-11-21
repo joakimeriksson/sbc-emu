@@ -179,6 +179,7 @@ dependencies = [
  "emu-core",
  "esp-soc",
  "esp32s31",
+ "riscv-rv32",
  "riscv64",
  "rk3588",
  "rockchip-rk3288",

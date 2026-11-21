@@ -193,8 +193,10 @@ static COMPILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 fn blocks_match_the_interpreter_on_random_programs() {
     let seeds: u64 = std::env::var("RV_BLOCK_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
     let (mut programs, mut calls, mut blocks, mut insns) = (0, 0, 0, 0);
+    let only: Option<u64> = std::env::var("RV_BLOCK_SEED").ok().and_then(|s| s.parse().ok());
     for kind in 0..4 {
         for seed in 0..seeds {
+            if let Some(o) = only { if seed * 4 + kind as u64 != o { continue; } }
             let (c, b, i) = one(seed * 4 + kind as u64, kind);
             programs += 1; calls += c; blocks += b; insns += i;
         }

@@ -354,7 +354,7 @@ pub extern "C" fn sbc_jit(on: u32) -> u32 {
         Board::OrangePiOne(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiRv(m, ..) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePi5(m, _) => if on != 0 { m.enable_jit() as u32 } else { for c in &mut m.cpus { c.jit = None; } 0 },
-        Board::Esp32S31(..) => 0,
+        Board::Esp32S31(m, _) => { for c in &mut m.cores { c.blocks.jit_on = on != 0 && riscv_rv32::jit::AVAILABLE; } (on != 0 && riscv_rv32::jit::AVAILABLE) as u32 }
     }).unwrap_or(0)
 }
 
@@ -380,7 +380,7 @@ pub extern "C" fn sbc_jit_hot(n: u32) {
         Board::OrangePiOne(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiRv(m, ..) => m.set_jit_hot(n),
         Board::OrangePi5(m, _) => for c in &mut m.cpus { if let Some(j) = c.jit.as_deref_mut() { j.hot = n.max(1); } },
-        Board::Esp32S31(..) => {}
+        Board::Esp32S31(m, _) => for c in &mut m.cores { c.blocks.jit_hot = n.clamp(1, u16::MAX as u32) as u16; },
     });
 }
 
@@ -413,7 +413,7 @@ pub extern "C" fn sbc_jit_blocks() -> f64 {
         Board::OrangePiOne(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiRv(m, ..) => m.jit_compiled() as f64,
         Board::OrangePi5(m, _) => m.cpus.iter().filter_map(|c| c.jit.as_ref()).map(|j| j.compiled as f64).sum(),
-        Board::Esp32S31(..) => 0.0,
+        Board::Esp32S31(m, _) => m.cores.iter().map(|c| c.blocks.compiled as f64).sum(),
     }).unwrap_or(0.0)
 }
 

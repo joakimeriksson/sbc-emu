@@ -19,6 +19,7 @@ starfive-jh7110 = { path = "../starfive-jh7110" }
 rk3588 = { path = "../rk3588" }
 esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }
+riscv-rv32 = { path = "../riscv-rv32", features = ["wasm-jit"] }
 riscv64 = { path = "../riscv64" }
 emu-core = { path = "../emu-core" }
 # zstd-recompressed snapshots for the public site (tools/snap-zstd.sh): pure Rust, decode only

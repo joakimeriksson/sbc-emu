@@ -6,5 +6,10 @@ license = "MIT"  # from esp32sim, with co-authors: see LICENSE in riscv-rv32/ or
 description = "RV32IMC(A)(F)(Zb*, Zcb, Zcmp) interpreter reused from esp32sim"
 readme = "README.md"
 
+[features]
+# The WebAssembly JIT backend: needs a host that provides `env.sbc_jit_compile` and
+# `env.sbc_jit_reset` (sbc-emu's page, web/worker.js)
+wasm-jit = []
+
 [dependencies]
 emu-core = { package = "esp32sim-emu-core", path = "../espressif/emu-core" }

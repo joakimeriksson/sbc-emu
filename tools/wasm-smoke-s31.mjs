@@ -4,7 +4,7 @@
 // reports the times.
 //   node tools/wasm-smoke-s31.mjs [seconds] [rom.elf] [flash.bin]
 //   (default cache/esp32s31/esp32s31_rev0_rom.elf, cache/esp32s31/images/s31_full_flash.bin)
-// SBC_WASM picks another build, SBC_PROGRESS=1 reports every 10 s.
+// SBC_JIT=0 turns the JIT off, SBC_WASM picks another build, SBC_PROGRESS=1 reports every 10 s.
 import fs from 'node:fs';
 
 let ex, jitFree = [], jitUsed = new Set();
@@ -27,6 +27,8 @@ const mem = () => new Uint8Array(ex.memory.buffer);
 const load = (f) => { const b = fs.readFileSync(f); const p = ex.sbc_alloc(b.length) >>> 0; mem().set(b, p); return [p, b.length]; };
 const [rp, rl] = load(romFile), [fp, fl] = load(flashFile);
 if (ex.sbc_boot_s31(rp, rl, fp, fl) !== 0) throw new Error('boot setup failed');
+console.log('jit', ex.sbc_jit(process.env.SBC_JIT === '0' ? 0 : 1) ? 'on' : 'off');
+if (process.env.SBC_JIT_HOT) ex.sbc_jit_hot(Number(process.env.SBC_JIT_HOT));
 
 const t0 = performance.now(), wall = () => (performance.now() - t0) * 1e6;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -1,30 +1,38 @@
-//! Block JIT: a decoded block (`block.rs`) compiled to host code. The compiled block is the
-//! block loop of `block::run` unrolled, with the same boundaries and exit rules, so the block
-//! interpreter (and below it `exec::step`) stays the oracle and the two must leave bit-identical
-//! machine state:
+//! Block JIT: decoded blocks (`block.rs`) compiled to host code, in regions. A region is a hot
+//! block and the blocks its branches, jumps and fall-throughs reach on the same virtual page;
+//! compiled code goes from one to the next itself. Each block is the block loop of `block::run`
+//! unrolled, with the same exit rules, so the block interpreter (and below it `exec::step`)
+//! stays the oracle and the two must leave bit-identical machine state:
 //!
-//! - It runs only whole blocks (a budget cut runs the block loop), never while a hardware loop
-//!   is counting (`hwlp::retire` then acts after every instruction) and never when the bus
-//!   already asks for a break.
+//! - The dispatch loop enters a region only for a whole block, with no hardware loop counting
+//!   and no break pending. Inside, going to the next block re-checks what the loop's `lookup`
+//!   would: that the block fits the budget whole (else the loop runs it partly), that its code
+//!   versions have not moved, and, translated, that the TLB still holds the page with fetch
+//!   permission for the current mode (else the loop's `translate` walks again). Boundaries
+//!   (`boundary_bloom`) are not entered: a region only goes to blocks outside the bloom. The
+//!   interrupt test is not repeated: its inputs only change through the instructions that end a
+//!   region (CSR writes, `mret`, `sret`, `wfi`, traps), and the SoC moves `irq` only between runs.
 //! - Integer, multiply/divide, bit-manipulation and control-transfer instructions are host code.
 //!   Loads and stores call `h_load`/`h_store`, which make the interpreter's translation, bus
-//!   access and trap exactly; everything else calls `h_exec` (`exec::exec_insn`). After each
-//!   helper the block ends as the loop would end it: on a trap, on `block_break`, after a store
-//!   that moved the block's code versions, after a hardware-loop instruction.
-//! - The counters (`insn_count`, `cycle_count`, `retired_count`) are added in batches: before
-//!   `h_exec`, which may read them (CSRs), and at every exit, so whoever looks next sees the
-//!   values the loop would have left.
-//! - The bus sees `note_pc` before every access (in the helpers) and once more for the last
-//!   instruction at exit (`Ctx::last_pc`), which is where the loop leaves it.
+//!   access and trap exactly; everything else calls `h_exec` (`exec::exec_insn`). The region ends
+//!   after a helper as the loop would end it: on a trap, on `block_break`, after a hardware-loop
+//!   instruction, and (checked in the compiled code) after a store that moved its block's code
+//!   versions with instructions left in the block.
+//! - Counters (`insn_count`, `cycle_count`, `retired_count`) are added per block, before
+//!   `h_exec` (which may read them) and at every exit. `note_pc` is made before every access (in
+//!   the helpers) and for the last instruction at exit (`Ctx::last_pc`).
 //!
-//! Backends: AArch64 on macOS and Linux (`a64` below). Elsewhere [`AVAILABLE`] is false.
+//! Backends: AArch64 on macOS and Linux, WebAssembly with the `wasm-jit` feature (the page
+//! compiles the modules). Elsewhere [`AVAILABLE`] is false.
+use crate::block::{decode_block, Decoded};
 use crate::bus::Bus;
 use crate::decode::{Insn, Op};
 use crate::state::{exc, Cpu};
+use emu_core::core::pc_bit;
 use emu_core::Trap;
 
-/// How a compiled block ended (the high word of its result; the low word is the instructions
-/// it used, a trapping one included).
+/// How compiled code ended (the high word of its result; the low word is the instructions it
+/// used, a trapping one included).
 pub const END: u32 = 0;
 pub const TRAP: u32 = 1;
 /// `block_break` after the last instruction used: the dispatch ends.
@@ -32,34 +40,39 @@ pub const STOP: u32 = 2;
 /// The rest of the block must not run (stale code, a hardware loop): look up `pc` again.
 pub const LEAVE: u32 = 3;
 
-/// Instructions a block runs before it is compiled (`Blocks::jit_hot`).
-pub const HOT: u16 = 8;
+/// Whole runs of a block before its region is compiled (`Blocks::jit_hot`); compiling a wasm
+/// module costs the page far more than a native region.
+pub const HOT: u16 = if cfg!(target_arch = "wasm32") { 256 } else { 32 };
+/// Blocks per region.
+const MAX_BLOCKS: usize = 24;
 
-/// What a compiled block and its helpers share for one call.
+/// What compiled code and its helpers share for one call.
 #[repr(C)]
 pub struct Ctx {
-    /// the pc of the last instruction the block used (`note_pc` at exit)
+    /// the pc of the last instruction used (`note_pc` at exit)
     pub last_pc: u32,
-    /// the block's code pages and the versions it was built against
-    pub vidx: [u32; 2],
-    pub ver: [u32; 2],
+    /// fetch permission the TLB entry must give in the current mode: X, and U in U mode
+    pub need: u32,
+    /// the bus's code versions (`Bus::page_versions`)
+    pub pv: *const u32,
+    /// the TLB slot of the region's page while fetches are translated, else null
+    pub tlb: *const u32,
     pub trap: Option<Trap>,
 }
 
 impl Ctx {
-    pub fn new(vidx: [u32; 2], ver: [u32; 2]) -> Ctx { Ctx { last_pc: 0, vidx, ver, trap: None } }
-    #[inline(always)]
-    fn stale<B: Bus>(&self, bus: &B) -> bool {
-        let pv = bus.page_versions();
-        pv.get(self.vidx[0] as usize) != Some(&self.ver[0]) || pv.get(self.vidx[1] as usize) != Some(&self.ver[1])
+    pub fn new<B: Bus>(cpu: &Cpu, bus: &B, pc: u32) -> Ctx {
+        use crate::mmu::{pte, Access};
+        let translated = cpu.translating(Access::Fetch);
+        let user = cpu.priv_mode == crate::state::privilege::USER;
+        Ctx {
+            last_pc: 0,
+            need: pte::X | if user { pte::U } else { 0 },
+            pv: bus.page_versions().as_ptr(),
+            tlb: if translated { cpu.tlb.slot_ptr(pc) } else { std::ptr::null() },
+            trap: None,
+        }
     }
-}
-
-/// Instructions after which the rest of a block may be stale (`block::may_write`).
-#[inline(always)]
-fn may_write(op: Op) -> bool {
-    use Op::*;
-    matches!(op, Sb | Sh | Sw | ScW | AmoSwapW | AmoAddW | AmoXorW | AmoAndW | AmoOrW | AmoMinW | AmoMaxW | AmoMinuW | AmoMaxuW | CmPush | Fsw) || op.is_pie()
 }
 
 // ---------------------------------------------------------------- helpers called from compiled code
@@ -68,7 +81,7 @@ fn may_write(op: Op) -> bool {
 /// counting, which the compiled code has done.
 extern "C" fn h_exec<B: Bus>(cpu: *mut Cpu, bus: *mut B, ctx: *mut Ctx, i: *const Insn, pc: u32) -> u32 {
     // SAFETY: compiled code passes the exclusive pointers `run` received, and the instruction
-    // table the block was compiled with, which lives as long as its code.
+    // table the region was compiled with, which lives as long as its code.
     let (cpu, bus, ctx, i) = unsafe { (&mut *cpu, &mut *bus, &mut *ctx, &*i) };
     bus.note_pc(pc);
     if let Err(t) = crate::exec::exec_insn(cpu, bus, i, pc) { ctx.trap = Some(t); return TRAP; }
@@ -77,7 +90,6 @@ extern "C" fn h_exec<B: Bus>(cpu: *mut Cpu, bus: *mut B, ctx: *mut Ctx, i: *cons
     crate::hwlp::retire(cpu, pc);
     if bus.block_break() { return STOP; }
     if cpu.pc != next || i.op.is_hwlp() || cpu.hwlp_count[0] | cpu.hwlp_count[1] != 0 { return LEAVE; }
-    if may_write(i.op) && ctx.stale(bus) { return LEAVE; }
     END
 }
 
@@ -126,25 +138,12 @@ extern "C" fn h_store<B: Bus>(cpu: *mut Cpu, bus: *mut B, ctx: *mut Ctx, va: u32
         cpu.trap(c, va, pc); ctx.trap = Some(Trap::Exception(c)); return TRAP;
     }
     cpu.retired_count += 1;
-    if bus.block_break() { return STOP; }
-    if ctx.stale(bus) { return LEAVE; }
-    END
+    if bus.block_break() { STOP } else { END }
 }
 
-/// The helper table compiled code calls through (field order = the offsets the backends use).
-#[repr(C)]
-pub struct Helpers { exec: *const (), load: *const (), store: *const () }
-const H_EXEC: u32 = 0;
-const H_LOAD: u32 = 8;
-const H_STORE: u32 = 16;
+// ---------------------------------------------------------------- regions
 
-impl Helpers {
-    pub fn new<B: Bus>() -> Helpers {
-        Helpers { exec: h_exec::<B> as *const (), load: h_load::<B> as *const (), store: h_store::<B> as *const () }
-    }
-}
-
-/// How a block's instructions are compiled.
+/// How an instruction is compiled.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind { Native, Load(u32), Store(u32), Exec }
 
@@ -164,10 +163,82 @@ fn kind(op: Op) -> Kind {
     }
 }
 
+/// Instructions after which the rest of a block may be stale (`block::may_write`).
+fn may_write(op: Op) -> bool {
+    use Op::*;
+    matches!(op, Sb | Sh | Sw | ScW | AmoSwapW | AmoAddW | AmoXorW | AmoAndW | AmoOrW | AmoMinW | AmoMaxW | AmoMinuW | AmoMaxuW | CmPush | Fsw) || op.is_pie()
+}
+
+/// Where execution goes after a block.
+#[derive(Clone, Copy)]
+enum Succ {
+    /// the last instruction set the pc (`jalr`, the interpreter's instructions): leave
+    Gone,
+    /// on to `pc` (a block cut short, or `jal`)
+    To(u32),
+    /// a conditional branch on (rs1, rs2)
+    Branch { op: Op, rs1: u8, rs2: u8, taken: u32, not: u32 },
+}
+
+/// A block of a region.
+struct RBlock { pc: u32, insns: Vec<Insn>, vidx: [u32; 2], ver: [u32; 2], succ: Succ }
+
+impl RBlock {
+    fn new(pc: u32, insns: &[Insn], vidx: [u32; 2], ver: [u32; 2]) -> RBlock {
+        let last = insns[insns.len() - 1];
+        let next = insns.iter().fold(pc, |p, i| p.wrapping_add(i.len as u32));
+        let succ = match last.op {
+            Op::Jal => Succ::To(last.imm as u32),
+            Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => Succ::Branch { op: last.op, rs1: last.rs1, rs2: last.rs2, taken: last.imm as u32, not: next },
+            _ if kind(last.op) == Kind::Exec && crate::block::ends_block_pub(&last) => Succ::Gone,
+            Op::Jalr => Succ::Gone,
+            _ => Succ::To(next),
+        };
+        RBlock { pc, insns: insns.to_vec(), vidx, ver, succ }
+    }
+    fn targets(&self) -> Vec<u32> {
+        match self.succ { Succ::Gone => vec![], Succ::To(t) => vec![t], Succ::Branch { taken, not, .. } => vec![not, taken] }
+    }
+    fn last_pc(&self) -> u32 { self.insns[..self.insns.len() - 1].iter().fold(self.pc, |p, i| p.wrapping_add(i.len as u32)) }
+}
+
+/// A hot block and the blocks reachable from it on its virtual page; `phys_page` is the physical
+/// page the entry was fetched from.
+pub struct Region { blocks: Vec<RBlock>, vpn: u32, phys_page: u32, bloom: u64 }
+
+impl Region {
+    /// Each block's (pc, physical address, length, code pages, versions), in entry order.
+    pub(crate) fn members(&self) -> impl Iterator<Item = (u32, u32, usize, [u32; 2], [u32; 2])> + '_ {
+        self.blocks.iter().map(|b| (b.pc, (self.phys_page | (b.pc & 0xfff)), b.insns.len(), b.vidx, b.ver))
+    }
+    fn index(&self, pc: u32) -> Option<usize> { self.blocks.iter().position(|b| b.pc == pc) }
+    /// The block a transition to `pc` may enter: none at a boundary (the dispatch loop stops
+    /// there), the region's own entry included, which a run may start on.
+    fn target(&self, pc: u32) -> Option<usize> { if self.bloom & pc_bit(pc) != 0 { None } else { self.index(pc) } }
+}
+
+/// Build the region of the block at `pc` (fetched from `phys`): its instructions, code pages
+/// and versions, and the blocks it reaches on its virtual page.
+pub(crate) fn region<B: Bus>(cpu: &Cpu, bus: &mut B, pc: u32, phys: u32, insns: &[Insn], vidx: [u32; 2], ver: [u32; 2]) -> Region {
+    let mut r = Region { blocks: vec![RBlock::new(pc, insns, vidx, ver)], vpn: pc >> 12, phys_page: phys & !0xfff, bloom: cpu.boundary_bloom };
+    let mut work = r.blocks[0].targets();
+    while let Some(t) = work.pop() {
+        if r.blocks.len() >= MAX_BLOCKS { break; }
+        if t >> 12 != pc >> 12 || cpu.boundary_bloom & pc_bit(t) != 0 || r.index(t).is_some() { continue; }
+        let Some(Decoded { insns, n, vidx, ver, .. }) = decode_block(cpu, bus, t, phys.wrapping_add(t.wrapping_sub(pc)), true) else { continue };
+        let b = RBlock::new(t, &insns[..n], vidx, ver);
+        work.extend(b.targets());
+        r.blocks.push(b);
+    }
+    r
+}
+
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub use a64::{Jit, AVAILABLE};
+#[cfg(all(target_arch = "wasm32", feature = "wasm-jit"))]
+pub use wasm::{Jit, AVAILABLE};
 
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", feature = "wasm-jit"))))]
 mod none {
     use super::*;
     pub const AVAILABLE: bool = false;
@@ -175,15 +246,23 @@ mod none {
     pub struct Jit;
     impl Jit {
         pub fn new() -> Option<Box<Jit>> { None }
-        pub fn compile(&mut self, _pc: u32, _insns: &[Insn]) -> Option<u32> { None }
+        pub fn compile<B: Bus>(&mut self, _r: &Region) -> Option<Vec<u32>> { None }
         pub fn reset(&mut self) {}
+        pub fn valid(&self) -> bool { true }
+        pub fn adopt_epoch(&mut self) {}
         /// # Safety
         /// Never called: no code exists.
-        pub unsafe fn call<B: Bus>(&self, _code: u32, _cpu: &mut Cpu, _bus: &mut B, _ctx: &mut Ctx) -> u64 { unreachable!() }
+        pub unsafe fn call<B: Bus>(&self, _code: u32, _cpu: &mut Cpu, _bus: &mut B, _ctx: &mut Ctx, _budget: u32) -> u64 { unreachable!() }
     }
 }
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", feature = "wasm-jit"))))]
 pub use none::{Jit, AVAILABLE};
+
+/// Counts not yet added to the Cpu: instructions (`insn_count`, `cycle_count`) and those retired
+/// by host code (helpers count their own).
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+struct Pending { insns: u32, retired: u32 }
 
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 mod a64 {
@@ -194,6 +273,16 @@ mod a64 {
 
     pub const AVAILABLE: bool = true;
 
+    /// The helper table compiled code calls through (field order = the offsets below).
+    #[repr(C)]
+    pub struct Helpers { exec: *const (), load: *const (), store: *const () }
+    const H_EXEC: u32 = 0;
+    const H_LOAD: u32 = 8;
+    const H_STORE: u32 = 16;
+    impl Helpers {
+        fn new<B: Bus>() -> Helpers { Helpers { exec: h_exec::<B> as *const (), load: h_load::<B> as *const (), store: h_store::<B> as *const () } }
+    }
+
     extern "C" {
         fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
         fn munmap(addr: *mut c_void, len: usize) -> c_int;
@@ -202,7 +291,7 @@ mod a64 {
         #[cfg(target_os = "linux")] fn __clear_cache(start: *mut c_void, end: *mut c_void);
     }
 
-    /// Executable memory for one core's blocks, and the instruction tables `h_exec` reads.
+    /// Executable memory for one core's regions, and the instruction tables `h_exec` reads.
     pub struct Jit { base: *mut u8, size: usize, used: usize, tables: Vec<Box<[Insn]>> }
     // SAFETY: the mapping and the tables are owned by this value and only reached through it.
     unsafe impl Send for Jit {}
@@ -212,7 +301,7 @@ mod a64 {
         fn drop(&mut self) { unsafe { munmap(self.base as *mut c_void, self.size); } }
     }
 
-    const CODE_BYTES: usize = 16 << 20;
+    const CODE_BYTES: usize = 32 << 20;
 
     impl Jit {
         pub fn new() -> Option<Box<Jit>> {
@@ -225,6 +314,9 @@ mod a64 {
         }
         /// Forget all code (the caller forgets every block that refers to it).
         pub fn reset(&mut self) { self.used = 0; self.tables.clear(); }
+        /// Code stays valid until `reset`.
+        pub fn valid(&self) -> bool { true }
+        pub fn adopt_epoch(&mut self) {}
 
         fn write(&mut self, words: &[u32]) -> Option<u32> {
             let bytes = words.len() * 4;
@@ -243,25 +335,27 @@ mod a64 {
             Some(off as u32)
         }
 
-        /// Run the block compiled at `code`.
+        /// Run the region compiled at `code` with `budget` instructions left (at least its
+        /// entry block's).
         /// # Safety
-        /// `code` must come from `compile` on this `Jit` since its last `reset`, for a block
-        /// whose instructions are still the ones in memory (the caller's version check).
-        pub unsafe fn call<B: Bus>(&self, code: u32, cpu: &mut Cpu, bus: &mut B, ctx: &mut Ctx) -> u64 {
+        /// `code` must come from `compile` on this `Jit` since its last `reset`, for a region
+        /// whose entry block is still the one in memory (the caller's version check).
+        pub unsafe fn call<B: Bus>(&self, code: u32, cpu: &mut Cpu, bus: &mut B, ctx: &mut Ctx, budget: u32) -> u64 {
             let h = Helpers::new::<B>();
-            type F<B> = unsafe extern "C" fn(*mut Cpu, *mut B, *const Helpers, *mut Ctx) -> u64;
+            type F<B> = unsafe extern "C" fn(*mut Cpu, *mut B, *const Helpers, *mut Ctx, u32) -> u64;
             let f: F<B> = std::mem::transmute(self.base.add(code as usize));
-            f(cpu, bus, &h, ctx)
+            f(cpu, bus, &h, ctx, budget)
         }
 
-        /// Compile the block of `insns` at `pc`; `None` when the code cache is full (the caller
-        /// resets it) or the layout does not fit the encodings used.
-        pub fn compile(&mut self, pc: u32, insns: &[Insn]) -> Option<u32> {
-            let table: Box<[Insn]> = insns.into();
-            let words = emit(pc, &table)?;
+        /// Compile a region: the code of each of its blocks as an entry (`Region::members`
+        /// order); `None` when the code cache is full (the caller resets it) or the layout does
+        /// not fit the encodings used.
+        pub fn compile<B: Bus>(&mut self, r: &Region) -> Option<Vec<u32>> {
+            let tables: Vec<Box<[Insn]>> = r.blocks.iter().map(|b| b.insns.clone().into_boxed_slice()).collect();
+            let (words, entries) = emit(r, &tables)?;
             let off = self.write(&words)?;
-            self.tables.push(table);
-            Some(off)
+            self.tables.extend(tables);
+            Some(entries.into_iter().map(|w| off + 4 * w as u32).collect())
         }
     }
 
@@ -270,16 +364,19 @@ mod a64 {
     const BUS: Reg = 20;
     const HLP: Reg = 21;
     const CTX: Reg = 22;
+    /// instructions the region has used before the current block
+    const DONE: Reg = 23;
+    /// budget left at the current block's start
+    const REM: Reg = 24;
+    /// the code versions and the TLB slot (`Ctx`)
+    const PV: Reg = 25;
+    const TLB: Reg = 26;
     /// a helper's status, from its return to the exit
     const STATUS: Reg = 11;
 
     fn xo(r: u8) -> u32 { offset_of!(Cpu, x) as u32 + 4 * r as u32 }
-
-    /// Load guest register `r` into `d` (x0 reads as zero).
     fn ld(a: &mut Asm, d: Reg, r: u8) { if r == 0 { a.mov(d, ZR) } else { a.ldr(d, CPU, xo(r)) } }
-    /// Store `s` to guest register `r` (writes to x0 are dropped).
     fn st(a: &mut Asm, s: Reg, r: u8) { if r != 0 { a.str(s, CPU, xo(r)) } }
-
     fn raw(a: &mut Asm, w: u32) { a.code.push(w); }
     fn orn(a: &mut Asm, d: Reg, n: Reg, m: Reg) { raw(a, 0x2a20_0000 | m << 16 | n << 5 | d); }
     fn eon(a: &mut Asm, d: Reg, n: Reg, m: Reg) { raw(a, 0x4a20_0000 | m << 16 | n << 5 | d); }
@@ -287,166 +384,217 @@ mod a64 {
     fn rev(a: &mut Asm, d: Reg, n: Reg) { raw(a, 0x5ac0_0800 | n << 5 | d); }
     fn rorv(a: &mut Asm, d: Reg, n: Reg, m: Reg) { raw(a, 0x1ac0_2c00 | m << 16 | n << 5 | d); }
     fn ror_imm(a: &mut Asm, d: Reg, n: Reg, sh: u32) { raw(a, 0x1380_0000 | n << 16 | (sh & 31) << 10 | n << 5 | d); }
+    /// `cbz xt, label`
+    fn cbz_x(a: &mut Asm, rt: Reg, l: Label) { let at = a.here(); a.cbz(rt, l); a.code[at] |= 1 << 31; }
+    fn set_pc(a: &mut Asm, v: u32) { a.mov32(10, v); a.str(10, CPU, offset_of!(Cpu, pc) as u32); }
+    fn set_last(a: &mut Asm, v: u32) { a.mov32(10, v); a.str(10, CTX, offset_of!(Ctx, last_pc) as u32); }
 
-    /// Add `d` to the 64-bit counter at `off` in the Cpu.
     fn add_counter(a: &mut Asm, off: u32, d: u32) {
         if d == 0 { return; }
         a.ldr_x(9, CPU, off); a.add_imm_x(9, 9, d); a.str_x(9, CPU, off);
     }
-
-    /// Counts not yet added to the Cpu: instructions (`insn_count`, `cycle_count`) and those
-    /// retired by host code (helpers count their own).
-    #[derive(Clone, Copy, Default)]
-    struct Pending { insns: u32, retired: u32 }
-
     fn flush(a: &mut Asm, p: &mut Pending) {
         add_counter(a, offset_of!(Cpu, insn_count) as u32, p.insns);
         add_counter(a, offset_of!(Cpu, cycle_count) as u32, p.insns);
         add_counter(a, offset_of!(Cpu, retired_count) as u32, p.retired);
         *p = Pending::default();
     }
-
-    /// An exit after the helper of instruction `k` returned a non-zero status (in w9).
-    struct Exit { at: Label, k: u32, pc: u32, pend: Pending, set_pc: Option<u32> }
-
     fn call_helper(a: &mut Asm, off: u32) { a.ldr_x(9, HLP, off); a.blr(9); }
 
-    fn emit(pc0: u32, insns: &[Insn]) -> Option<Vec<u32>> {
-        // the encodings used reach these offsets
+    /// An early exit after instruction `k` of a block: the status is in STATUS, or `status`.
+    struct Exit { at: Label, k: u32, pc: u32, pend: Pending, set_pc: Option<u32>, status: Option<u32> }
+
+    /// Leave the region with END: the pc, the last instruction's pc, DONE.
+    fn leave(a: &mut Asm, pc: u32, last: u32, epilogue: Label) {
+        set_pc(a, pc); set_last(a, last); a.mov(0, DONE); a.b(epilogue);
+    }
+
+    /// Branch to `fail` unless block `b`'s code versions still hold.
+    fn check_versions(a: &mut Asm, b: &RBlock, fail: Label) {
+        let n = if b.vidx[0] == b.vidx[1] { 1 } else { 2 };
+        for v in 0..n {
+            a.mov32(10, b.vidx[v] * 4); a.ldr_u(9, PV, 10);
+            a.mov32(10, b.ver[v]); a.cmp(9, 10); a.b_cond(Cond::Ne, fail);
+        }
+    }
+
+    /// The region's code and, per block, the word offset of its entry.
+    fn emit(r: &Region, tables: &[Box<[Insn]>]) -> Option<(Vec<u32>, Vec<usize>)> {
         if xo(31) >= 16384 || offset_of!(Cpu, insn_count).max(offset_of!(Cpu, cycle_count)).max(offset_of!(Cpu, retired_count)) >= 32768
             || offset_of!(Cpu, pc) >= 16384 { return None; }
         let mut a = Asm::new();
         let epilogue = a.label();
-        // prologue
-        a.stp_pre(29, 30, SP, -48);
-        a.stp(CPU, BUS, SP, 16);
-        a.stp(HLP, CTX, SP, 32);
-        a.mov_x(CPU, 0); a.mov_x(BUS, 1); a.mov_x(HLP, 2); a.mov_x(CTX, 3);
-
-        let pc_off = offset_of!(Cpu, pc) as u32;
-        let last_off = offset_of!(Ctx, last_pc) as u32;
-        let mut p = Pending::default();
-        let mut exits: Vec<Exit> = Vec::new();
-        let mut pc = pc0;
-        let n = insns.len();
-        let mut pc_set = false;
-        for (k, i) in insns.iter().enumerate() {
-            let next = pc.wrapping_add(i.len as u32);
-            let k32 = k as u32;
-            match kind(i.op) {
-                Kind::Native => {
-                    p.insns += 1; p.retired += 1;
-                    if native(&mut a, i, pc, next, pc_off) { pc_set = true; }
-                }
-                Kind::Load(w) => {
-                    p.insns += 1;
-                    ld(&mut a, 3, i.rs1); a.mov32(9, i.imm as u32); a.add(3, 3, 9);
-                    a.mov_x(0, CPU); a.mov_x(1, BUS); a.mov_x(2, CTX);
-                    a.mov32(4, pc); a.mov32(5, w);
-                    call_helper(&mut a, H_LOAD);
-                    a.lsr_imm_x(STATUS, 0, 32);
-                    let trap = a.label();
-                    a.cmp_imm(STATUS, TRAP); a.b_cond(Cond::Eq, trap);
-                    exits.push(Exit { at: trap, k: k32, pc, pend: p, set_pc: None });
-                    st(&mut a, 0, i.rd);
-                    let out = a.label();
-                    a.cbnz(STATUS, out);
-                    exits.push(Exit { at: out, k: k32, pc, pend: p, set_pc: Some(next) });
-                }
-                Kind::Store(w) => {
-                    p.insns += 1;
-                    ld(&mut a, 3, i.rs1); a.mov32(9, i.imm as u32); a.add(3, 3, 9);
-                    ld(&mut a, 4, i.rs2);
-                    a.mov_x(0, CPU); a.mov_x(1, BUS); a.mov_x(2, CTX);
-                    a.mov32(5, pc); a.mov32(6, w);
-                    call_helper(&mut a, H_STORE);
-                    a.mov(STATUS, 0);
-                    let trap = a.label();
-                    a.cmp_imm(STATUS, TRAP); a.b_cond(Cond::Eq, trap);
-                    exits.push(Exit { at: trap, k: k32, pc, pend: p, set_pc: None });
-                    let out = a.label();
-                    a.cbnz(STATUS, out);
-                    exits.push(Exit { at: out, k: k32, pc, pend: p, set_pc: Some(next) });
-                }
-                Kind::Exec => {
-                    // the interpreter may read the counters (CSRs) and the pc
-                    p.insns += 1;
-                    flush(&mut a, &mut p);
-                    a.mov32(9, pc); a.str(9, CPU, pc_off);
-                    a.mov_x(0, CPU); a.mov_x(1, BUS); a.mov_x(2, CTX);
-                    a.mov64(3, insns.as_ptr().wrapping_add(k) as u64);
-                    a.mov32(4, pc);
-                    call_helper(&mut a, H_EXEC);
-                    a.mov(STATUS, 0);
-                    let out = a.label();
-                    a.cbnz(STATUS, out);
-                    // exec set the pc: a terminator leaves it where execution goes
-                    exits.push(Exit { at: out, k: k32, pc, pend: p, set_pc: None });
-                    pc_set = k + 1 == n;
-                }
-            }
-            pc = next;
+        let labels: Vec<Label> = r.blocks.iter().map(|_| a.label()).collect();
+        // one entry per block: the prologue, then on to the block
+        let mut entries = Vec::with_capacity(r.blocks.len());
+        for &l in &labels {
+            entries.push(a.here());
+            a.stp_pre(29, 30, SP, -80);
+            a.stp(CPU, BUS, SP, 16);
+            a.stp(HLP, CTX, SP, 32);
+            a.stp(DONE, REM, SP, 48);
+            a.stp(PV, TLB, SP, 64);
+            a.mov_x(CPU, 0); a.mov_x(BUS, 1); a.mov_x(HLP, 2); a.mov_x(CTX, 3); a.mov(REM, 4); a.mov(DONE, ZR);
+            a.ldr_x(PV, CTX, offset_of!(Ctx, pv) as u32);
+            a.ldr_x(TLB, CTX, offset_of!(Ctx, tlb) as u32);
+            a.b(l);
         }
-        // the block ran to its end
-        flush(&mut a, &mut p);
-        if !pc_set { a.mov32(9, pc); a.str(9, CPU, pc_off); }
-        let last = last_pc(pc0, insns, n as u32 - 1);
-        a.mov32(9, last); a.str(9, CTX, last_off);
-        a.mov32(0, n as u32);
-        a.b(epilogue);
-        // the early exits: status in w11 (the counters use x9, the pc w10)
+        let mut exits: Vec<Exit> = Vec::new();
+        for (bi, b) in r.blocks.iter().enumerate() {
+            a.bind(labels[bi]);
+            block(&mut a, r, b, &tables[bi], &labels, &mut exits, epilogue);
+        }
         for e in exits {
             a.bind(e.at);
             let mut pend = e.pend;
             flush(&mut a, &mut pend);
-            if let Some(next) = e.set_pc { a.mov32(10, next); a.str(10, CPU, pc_off); }
-            a.mov32(10, e.pc); a.str(10, CTX, last_off);
+            if let Some(n) = e.set_pc { set_pc(&mut a, n); }
+            set_last(&mut a, e.pc);
+            if let Some(s) = e.status { a.mov32(STATUS, s); }
             a.lsl_imm_x(0, STATUS, 32);
-            a.mov32(10, e.k + 1);
+            a.add_imm(10, DONE, e.k + 1);
             a.orr_x(0, 0, 10);
             a.b(epilogue);
         }
         a.bind(epilogue);
+        a.ldp(PV, TLB, SP, 64);
+        a.ldp(DONE, REM, SP, 48);
         a.ldp(HLP, CTX, SP, 32);
         a.ldp(CPU, BUS, SP, 16);
-        a.ldp_post(29, 30, SP, 48);
+        a.ldp_post(29, 30, SP, 80);
         a.ret();
-        Some(a.finish())
+        Some((a.finish(), entries))
     }
 
-    fn last_pc(pc0: u32, insns: &[Insn], k: u32) -> u32 {
-        insns[..k as usize].iter().fold(pc0, |pc, i| pc.wrapping_add(i.len as u32))
+    fn block(a: &mut Asm, r: &Region, b: &RBlock, table: &[Insn], labels: &[Label], exits: &mut Vec<Exit>, epilogue: Label) {
+        let pc_off = offset_of!(Cpu, pc) as u32;
+        let mut p = Pending::default();
+        let mut pc = b.pc;
+        let n = b.insns.len();
+        for (k, i) in b.insns.iter().enumerate() {
+            let next = pc.wrapping_add(i.len as u32);
+            let k32 = k as u32;
+            let more = k + 1 < n;
+            match kind(i.op) {
+                Kind::Native => { p.insns += 1; p.retired += 1; native(a, i, pc, next, pc_off); }
+                Kind::Load(w) => {
+                    p.insns += 1;
+                    ld(a, 3, i.rs1); a.mov32(9, i.imm as u32); a.add(3, 3, 9);
+                    a.mov_x(0, CPU); a.mov_x(1, BUS); a.mov_x(2, CTX);
+                    a.mov32(4, pc); a.mov32(5, w);
+                    call_helper(a, H_LOAD);
+                    a.lsr_imm_x(STATUS, 0, 32);
+                    let trap = a.label();
+                    a.cmp_imm(STATUS, TRAP); a.b_cond(Cond::Eq, trap);
+                    exits.push(Exit { at: trap, k: k32, pc, pend: p, set_pc: None, status: None });
+                    st(a, 0, i.rd);
+                    let out = a.label();
+                    a.cbnz(STATUS, out);
+                    exits.push(Exit { at: out, k: k32, pc, pend: p, set_pc: Some(next), status: None });
+                }
+                Kind::Store(w) => {
+                    p.insns += 1;
+                    ld(a, 3, i.rs1); a.mov32(9, i.imm as u32); a.add(3, 3, 9);
+                    ld(a, 4, i.rs2);
+                    a.mov_x(0, CPU); a.mov_x(1, BUS); a.mov_x(2, CTX);
+                    a.mov32(5, pc); a.mov32(6, w);
+                    call_helper(a, H_STORE);
+                    a.mov(STATUS, 0);
+                    let trap = a.label();
+                    a.cmp_imm(STATUS, TRAP); a.b_cond(Cond::Eq, trap);
+                    exits.push(Exit { at: trap, k: k32, pc, pend: p, set_pc: None, status: None });
+                    let out = a.label();
+                    a.cbnz(STATUS, out);
+                    exits.push(Exit { at: out, k: k32, pc, pend: p, set_pc: Some(next), status: None });
+                    if more {
+                        // the rest of this block may be stale
+                        let stale = a.label();
+                        check_versions(a, b, stale);
+                        exits.push(Exit { at: stale, k: k32, pc, pend: p, set_pc: Some(next), status: Some(LEAVE) });
+                    }
+                }
+                Kind::Exec => {
+                    p.insns += 1;
+                    flush(a, &mut p);
+                    set_pc(a, pc);
+                    a.mov_x(0, CPU); a.mov_x(1, BUS); a.mov_x(2, CTX);
+                    a.mov64(3, table.as_ptr().wrapping_add(k) as u64);
+                    a.mov32(4, pc);
+                    call_helper(a, H_EXEC);
+                    a.mov(STATUS, 0);
+                    let out = a.label();
+                    a.cbnz(STATUS, out);
+                    // exec set the pc
+                    exits.push(Exit { at: out, k: k32, pc, pend: p, set_pc: None, status: None });
+                    if more && may_write(i.op) {
+                        let stale = a.label();
+                        check_versions(a, b, stale);
+                        exits.push(Exit { at: stale, k: k32, pc, pend: p, set_pc: None, status: Some(LEAVE) });
+                    }
+                }
+            }
+            pc = next;
+        }
+        // the block ran whole
+        flush(a, &mut p);
+        a.add_imm(DONE, DONE, n as u32);
+        a.sub_imm(REM, REM, n as u32);
+        let last = b.last_pc();
+        match b.succ {
+            Succ::Gone => { set_last(a, last); a.mov(0, DONE); a.b(epilogue); }
+            Succ::To(t) => transition(a, r, t, last, labels, epilogue),
+            Succ::Branch { op, rs1, rs2, taken, not } => {
+                ld(a, 0, rs1); ld(a, 1, rs2); a.cmp(0, 1);
+                let c = match op { Op::Beq => Cond::Eq, Op::Bne => Cond::Ne, Op::Blt => Cond::Lt, Op::Bge => Cond::Ge, Op::Bltu => Cond::Lo, _ => Cond::Hs };
+                let t_label = a.label();
+                a.b_cond(c, t_label);
+                transition(a, r, not, last, labels, epilogue);
+                a.bind(t_label);
+                transition(a, r, taken, last, labels, epilogue);
+            }
+        }
     }
 
-    /// Host code for a native instruction at `pc`; true when it set the pc (a control transfer).
-    fn native(a: &mut Asm, i: &Insn, pc: u32, next: u32, pc_off: u32) -> bool {
+    /// Go on to the block at `t`: inside the region when the dispatch loop would run it whole
+    /// from the same lookup, else leave with the pc at `t`.
+    fn transition(a: &mut Asm, r: &Region, t: u32, last: u32, labels: &[Label], epilogue: Label) {
+        if let Some(m) = r.target(t) {
+            let b = &r.blocks[m];
+            let out = a.label();
+            a.cmp_imm(REM, b.insns.len() as u32); a.b_cond(Cond::Lo, out);
+            check_versions(a, b, out);
+            // translated: the TLB slot must still map the page, executable in this mode
+            let ok = a.label();
+            cbz_x(a, TLB, ok);
+            a.ldr(9, TLB, 0); a.mov32(10, r.vpn + 1); a.cmp(9, 10); a.b_cond(Cond::Ne, out);
+            a.ldr(9, TLB, 4); a.mov32(10, r.phys_page); a.cmp(9, 10); a.b_cond(Cond::Ne, out);
+            a.ldr(9, TLB, 8); a.mov32(10, crate::mmu::pte::X | crate::mmu::pte::U); a.and(9, 9, 10);
+            a.ldr(10, CTX, offset_of!(Ctx, need) as u32); a.cmp(9, 10); a.b_cond(Cond::Ne, out);
+            a.bind(ok);
+            a.b(labels[m]);
+            a.bind(out);
+        }
+        leave(a, t, last, epilogue);
+    }
+
+    /// Host code for a native instruction at `pc` (a conditional branch is the block's end, see
+    /// `block`; `jal` writes its link here, `jalr` its link and the pc).
+    fn native(a: &mut Asm, i: &Insn, pc: u32, next: u32, pc_off: u32) {
         use Op::*;
         let imm = i.imm as u32;
-        // operands: w0 = rs1, w1 = rs2 or the immediate; result in w2
         let rr = |a: &mut Asm| { ld(a, 0, i.rs1); ld(a, 1, i.rs2); };
         let ri = |a: &mut Asm| { ld(a, 0, i.rs1); a.mov32(1, imm); };
         match i.op {
-            Fence => return false,
+            Fence | Beq | Bne | Blt | Bge | Bltu | Bgeu => return,
             Lui => { a.mov32(2, imm); }
             Auipc => { a.mov32(2, pc.wrapping_add(imm)); }
-            Jal => {
-                if i.rd != 0 { a.mov32(2, next); st(a, 2, i.rd); }
-                a.mov32(9, imm); a.str(9, CPU, pc_off);
-                return true;
-            }
+            Jal => { if i.rd != 0 { a.mov32(2, next); st(a, 2, i.rd); } return; }
             Jalr => {
                 ld(a, 0, i.rs1); a.mov32(1, imm); a.add(3, 0, 1);
                 a.mov32(4, !1); a.and(3, 3, 4);
                 if i.rd != 0 { a.mov32(2, next); st(a, 2, i.rd); }
                 a.str(3, CPU, pc_off);
-                return true;
-            }
-            Beq | Bne | Blt | Bge | Bltu | Bgeu => {
-                rr(a); a.cmp(0, 1);
-                let c = match i.op { Beq => Cond::Eq, Bne => Cond::Ne, Blt => Cond::Lt, Bge => Cond::Ge, Bltu => Cond::Lo, _ => Cond::Hs };
-                a.mov32(2, imm); a.mov32(3, next); a.csel(2, 2, 3, c);
-                a.str(2, CPU, pc_off);
-                return true;
+                return;
             }
             Addi => { ri(a); a.add(2, 0, 1); }
             Slti => { ri(a); a.cmp(0, 1); a.cset(2, Cond::Lt); }
@@ -519,6 +667,395 @@ mod a64 {
             _ => unreachable!("not a native instruction: {:?}", i.op),
         }
         st(a, 2, i.rd);
-        false
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-jit"))]
+mod wasm {
+    //! Each region is a module with one function `(cpu, bus, ctx, budget: i32) -> i64` that
+    //! imports the emulator's memory and function table; the page compiles it and installs it in
+    //! the table (`sbc_jit_compile`, as for the other cores), and Rust calls it through a function
+    //! pointer, which in wasm is its table index. Helpers are called the same way. The blocks sit
+    //! in a `loop` around a `br_table` on the next block's index.
+    use super::*;
+    use std::mem::offset_of;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub const AVAILABLE: bool = true;
+
+    #[link(wasm_import_module = "env")]
+    extern "C" {
+        fn sbc_jit_compile(ptr: *const u8, len: usize) -> i32;
+        fn sbc_jit_reset();
+    }
+
+    /// Bumped whenever the page discards every compiled module: a core whose JIT saw an older
+    /// value must forget its blocks' code (another core's reset discarded it).
+    static EPOCH: AtomicU32 = AtomicU32::new(0);
+    /// Modules per epoch before everything is discarded (the page's table only grows).
+    const MAX_MODULES: u32 = 16384;
+    static MODULES: AtomicU32 = AtomicU32::new(0);
+
+    pub struct Jit { epoch: u32, tables: Vec<Box<[Insn]>> }
+
+    impl Jit {
+        pub fn new() -> Option<Box<Jit>> { Some(Box::new(Jit { epoch: EPOCH.load(Ordering::Relaxed), tables: Vec::new() })) }
+        /// Discard all compiled code (every core's: the page frees all its slots).
+        pub fn reset(&mut self) {
+            // SAFETY: the import takes no arguments
+            unsafe { sbc_jit_reset() };
+            MODULES.store(0, Ordering::Relaxed);
+            self.epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+            self.tables.clear();
+        }
+        /// False once any core has discarded the compiled code: forget it (`Blocks::code`).
+        pub fn valid(&self) -> bool { self.epoch == EPOCH.load(Ordering::Relaxed) }
+        pub fn adopt_epoch(&mut self) { self.epoch = EPOCH.load(Ordering::Relaxed); self.tables.clear(); }
+
+        /// # Safety
+        /// `code` must come from `compile` in the current epoch (the module's table index
+        /// times 32 plus the block), for a block that is still the one in memory.
+        pub unsafe fn call<B: Bus>(&self, code: u32, cpu: &mut Cpu, bus: &mut B, ctx: &mut Ctx, budget: u32) -> u64 {
+            type F<B> = unsafe extern "C" fn(*mut Cpu, *mut B, *mut Ctx, u32, u32) -> u64;
+            let f: F<B> = std::mem::transmute::<usize, F<B>>((code >> 5) as usize);
+            f(cpu, bus, ctx, budget, code & 31)
+        }
+
+        /// Compile a region: the code of each of its blocks as an entry (`Region::members`).
+        pub fn compile<B: Bus>(&mut self, r: &Region) -> Option<Vec<u32>> {
+            if MODULES.load(Ordering::Relaxed) >= MAX_MODULES || r.blocks.len() > 32 { return None; }
+            let tables: Vec<Box<[Insn]>> = r.blocks.iter().map(|b| b.insns.clone().into_boxed_slice()).collect();
+            let module = emit::<B>(r, &tables);
+            // SAFETY: the import reads `len` bytes of the module
+            let idx = unsafe { sbc_jit_compile(module.as_ptr(), module.len()) };
+            if idx < 0 { return None; }
+            MODULES.fetch_add(1, Ordering::Relaxed);
+            self.tables.extend(tables);
+            Some((0..r.blocks.len() as u32).map(|k| (idx as u32) << 5 | k).collect())
+        }
+    }
+
+    fn uleb(out: &mut Vec<u8>, mut v: u64) {
+        loop { let b = (v & 0x7f) as u8; v >>= 7; if v == 0 { out.push(b); break; } out.push(b | 0x80); }
+    }
+    fn sleb(out: &mut Vec<u8>, mut v: i64) {
+        loop {
+            let b = (v & 0x7f) as u8; v >>= 7;
+            let done = (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0);
+            out.push(if done { b } else { b | 0x80 });
+            if done { break; }
+        }
+    }
+
+    // params cpu, bus, ctx, budget left (REM), the block to start with (IDX); locals: status,
+    // DONE, the code versions, the TLB slot, a load's result
+    const CPU: u32 = 0;
+    const BUS: u32 = 1;
+    const CTX: u32 = 2;
+    const REM: u32 = 3;
+    const IDX: u32 = 4;
+    const ST: u32 = 5;
+    const DONE: u32 = 6;
+    const PV: u32 = 7;
+    const TLB: u32 = 8;
+    const V64: u32 = 9;
+    // types: 0 the region, 1 h_exec, 2 h_load, 3 h_store
+    const T_EXEC: u32 = 1;
+    const T_LOAD: u32 = 2;
+    const T_STORE: u32 = 3;
+
+    struct W { c: Vec<u8>, h_exec: usize, h_load: usize, h_store: usize, nest: u32 }
+    impl W {
+        fn op(&mut self, b: u8) { self.c.push(b); }
+        fn i32c(&mut self, v: u32) { self.op(0x41); sleb(&mut self.c, v as i32 as i64); }
+        fn i64c(&mut self, v: u64) { self.op(0x42); sleb(&mut self.c, v as i64); }
+        fn lget(&mut self, l: u32) { self.op(0x20); uleb(&mut self.c, l as u64); }
+        fn lset(&mut self, l: u32) { self.op(0x21); uleb(&mut self.c, l as u64); }
+        fn mem(&mut self, op: u8, align: u32, off: u32) { self.op(op); uleb(&mut self.c, align as u64); uleb(&mut self.c, off as u64); }
+        fn get(&mut self, r: u8) { if r == 0 { self.i32c(0) } else { self.lget(CPU); self.mem(0x28, 2, xo(r)); } }
+        fn set(&mut self, r: u8, f: impl FnOnce(&mut W)) { if r == 0 { return; } self.lget(CPU); f(self); self.mem(0x36, 2, xo(r)); }
+        fn set_pc(&mut self, v: u32) { self.lget(CPU); self.i32c(v); self.mem(0x36, 2, offset_of!(Cpu, pc) as u32); }
+        fn counter(&mut self, off: u32, d: u32) {
+            if d == 0 { return; }
+            self.lget(CPU); self.lget(CPU); self.mem(0x29, 3, off); self.i64c(d as u64); self.op(0x7c); self.mem(0x37, 3, off);
+        }
+        fn flush(&mut self, p: &mut Pending) {
+            self.counter(offset_of!(Cpu, insn_count) as u32, p.insns);
+            self.counter(offset_of!(Cpu, cycle_count) as u32, p.insns);
+            self.counter(offset_of!(Cpu, retired_count) as u32, p.retired);
+            *p = Pending::default();
+        }
+        fn last_pc(&mut self, v: u32) { self.lget(CTX); self.i32c(v); self.mem(0x36, 2, offset_of!(Ctx, last_pc) as u32); }
+        fn call(&mut self, f: usize, ty: u32) { self.i32c(f as u32); self.op(0x11); uleb(&mut self.c, ty as u64); self.op(0x00); }
+        fn if_(&mut self) { self.op(0x04); self.op(0x40); self.nest += 1; }
+        fn end(&mut self) { self.op(0x0b); self.nest -= 1; }
+        /// return (status << 32) | (DONE + done), the status in ST
+        fn ret_status(&mut self, done: u32) {
+            self.lget(ST); self.op(0xad); self.i64c(32); self.op(0x86);
+            self.lget(DONE); self.i32c(done); self.op(0x6a); self.op(0xad); self.op(0x84); self.op(0x0f);
+        }
+        /// an early exit after instruction `k`: counters, pc, last pc, status
+        fn exit(&mut self, mut p: Pending, k: u32, pc: u32, set_pc: Option<u32>, status: Option<u32>) {
+            self.flush(&mut p);
+            if let Some(n) = set_pc { self.set_pc(n); }
+            self.last_pc(pc);
+            if let Some(s) = status { self.i32c(s); self.lset(ST); }
+            self.ret_status(k + 1);
+        }
+        /// push whether block `b`'s code versions still hold
+        fn versions_ok(&mut self, b: &RBlock) {
+            let n = if b.vidx[0] == b.vidx[1] { 1 } else { 2 };
+            for v in 0..n {
+                self.lget(PV); self.i32c(b.vidx[v] * 4); self.op(0x6a); self.mem(0x28, 2, 0);
+                self.i32c(b.ver[v]); self.op(0x46);
+                if v == 1 { self.op(0x71); }
+            }
+        }
+    }
+
+    fn xo(r: u8) -> u32 { offset_of!(Cpu, x) as u32 + 4 * r as u32 }
+
+    fn emit<B: Bus>(r: &Region, tables: &[Box<[Insn]>]) -> Vec<u8> {
+        let mut w = W { c: Vec::with_capacity(4096), h_exec: h_exec::<B> as *const () as usize, h_load: h_load::<B> as *const () as usize, h_store: h_store::<B> as *const () as usize, nest: 0 };
+        w.i32c(0); w.lset(DONE);
+        w.lget(CTX); w.mem(0x28, 2, offset_of!(Ctx, pv) as u32); w.lset(PV);
+        w.lget(CTX); w.mem(0x28, 2, offset_of!(Ctx, tlb) as u32); w.lset(TLB);
+        let nb = r.blocks.len() as u32;
+        // loop $top; block $b(nb-1) .. block $b0; br_table on IDX
+        w.op(0x03); w.op(0x40);
+        for _ in 0..nb { w.op(0x02); w.op(0x40); }
+        w.lget(IDX); w.op(0x0e); uleb(&mut w.c, nb as u64 - 1);
+        for k in 0..nb - 1 { uleb(&mut w.c, k as u64); }
+        uleb(&mut w.c, nb as u64 - 1);
+        for (bi, b) in r.blocks.iter().enumerate() {
+            w.op(0x0b); // end of $b(bi): its code follows, inside $b(bi+1).. and the loop
+            // the loop is at depth (blocks still open) = nb - 1 - bi
+            block(&mut w, r, b, &tables[bi], nb - 1 - bi as u32);
+        }
+        w.op(0x0b); // end of the loop
+        w.op(0x00); // unreachable: every block ends in a return or a branch to the loop
+        w.op(0x0b);
+        assemble(&w.c)
+    }
+
+    fn block(w: &mut W, r: &Region, b: &RBlock, table: &[Insn], depth: u32) {
+        let mut p = Pending::default();
+        let mut pc = b.pc;
+        let n = b.insns.len();
+        for (k, i) in b.insns.iter().enumerate() {
+            let next = pc.wrapping_add(i.len as u32);
+            let k32 = k as u32;
+            let more = k + 1 < n;
+            match kind(i.op) {
+                Kind::Native => { p.insns += 1; p.retired += 1; native(w, i, pc, next); }
+                Kind::Load(kd) => {
+                    p.insns += 1;
+                    w.lget(CPU); w.lget(BUS); w.lget(CTX);
+                    w.get(i.rs1); w.i32c(i.imm as u32); w.op(0x6a);
+                    w.i32c(pc); w.i32c(kd);
+                    w.call(w.h_load, T_LOAD);
+                    w.lset(V64);
+                    w.lget(V64); w.i64c(32); w.op(0x88); w.op(0xa7); w.lset(ST);
+                    w.lget(ST); w.i32c(TRAP); w.op(0x46); w.if_(); w.exit(p, k32, pc, None, None); w.end();
+                    if i.rd != 0 { w.lget(CPU); w.lget(V64); w.op(0xa7); w.mem(0x36, 2, xo(i.rd)); }
+                    w.lget(ST); w.if_(); w.exit(p, k32, pc, Some(next), None); w.end();
+                }
+                Kind::Store(kd) => {
+                    p.insns += 1;
+                    w.lget(CPU); w.lget(BUS); w.lget(CTX);
+                    w.get(i.rs1); w.i32c(i.imm as u32); w.op(0x6a);
+                    w.get(i.rs2); w.i32c(pc); w.i32c(kd);
+                    w.call(w.h_store, T_STORE);
+                    w.lset(ST);
+                    w.lget(ST); w.i32c(TRAP); w.op(0x46); w.if_(); w.exit(p, k32, pc, None, None); w.end();
+                    w.lget(ST); w.if_(); w.exit(p, k32, pc, Some(next), None); w.end();
+                    if more { w.versions_ok(b); w.op(0x45); w.if_(); w.exit(p, k32, pc, Some(next), Some(LEAVE)); w.end(); }
+                }
+                Kind::Exec => {
+                    p.insns += 1;
+                    w.flush(&mut p);
+                    w.set_pc(pc);
+                    w.lget(CPU); w.lget(BUS); w.lget(CTX);
+                    w.i32c(table.as_ptr().wrapping_add(k) as usize as u32); w.i32c(pc);
+                    w.call(w.h_exec, T_EXEC);
+                    w.lset(ST);
+                    w.lget(ST); w.if_(); w.exit(p, k32, pc, None, None); w.end();
+                    if more && may_write(i.op) { w.versions_ok(b); w.op(0x45); w.if_(); w.exit(p, k32, pc, None, Some(LEAVE)); w.end(); }
+                }
+            }
+            pc = next;
+        }
+        w.flush(&mut p);
+        w.lget(DONE); w.i32c(n as u32); w.op(0x6a); w.lset(DONE);
+        w.lget(REM); w.i32c(n as u32); w.op(0x6b); w.lset(REM);
+        let last = b.last_pc();
+        match b.succ {
+            Succ::Gone => { w.last_pc(last); w.lget(DONE); w.op(0xad); w.op(0x0f); }
+            Succ::To(t) => transition(w, r, t, last, depth),
+            Succ::Branch { op, rs1, rs2, taken, not } => {
+                let cmp = match op { Op::Beq => 0x46, Op::Bne => 0x47, Op::Blt => 0x48, Op::Bge => 0x4e, Op::Bltu => 0x49, _ => 0x4f };
+                w.get(rs1); w.get(rs2); w.op(cmp);
+                w.if_(); transition(w, r, taken, last, depth); w.end();
+                transition(w, r, not, last, depth);
+            }
+        }
+    }
+
+    /// Go on to the block at `t` inside the region when the dispatch loop would run it whole from
+    /// the same lookup, else leave with the pc at `t`. `depth`: the loop's label depth here,
+    /// before any `if` this emits (`W::nest` counts those around it).
+    fn transition(w: &mut W, r: &Region, t: u32, last: u32, depth: u32) {
+        if let Some(m) = r.target(t) {
+            let b = &r.blocks[m];
+            // REM >= n && versions && (no TLB || (tag, page, fetch permission))
+            w.lget(REM); w.i32c(b.insns.len() as u32); w.op(0x4f);
+            w.versions_ok(b); w.op(0x71);
+            w.lget(TLB); w.op(0x45);
+            w.lget(TLB); w.mem(0x28, 2, 0); w.i32c(r.vpn + 1); w.op(0x46);
+            w.lget(TLB); w.mem(0x28, 2, 4); w.i32c(r.phys_page); w.op(0x46); w.op(0x71);
+            w.lget(TLB); w.mem(0x28, 2, 8); w.i32c(crate::mmu::pte::X | crate::mmu::pte::U); w.op(0x71);
+            w.lget(CTX); w.mem(0x28, 2, offset_of!(Ctx, need) as u32); w.op(0x46); w.op(0x71);
+            w.op(0x72); w.op(0x71);
+            w.if_();
+            w.i32c(m as u32); w.lset(IDX);
+            w.op(0x0c); uleb(&mut w.c, (depth + w.nest - 1 + 1) as u64);
+            w.end();
+        }
+        w.set_pc(t); w.last_pc(last); w.lget(DONE); w.op(0xad); w.op(0x0f);
+    }
+
+    /// Wasm for a native instruction (a conditional branch is the block's end; `jal` writes its
+    /// link here, `jalr` its link and the pc).
+    fn native(w: &mut W, i: &Insn, pc: u32, next: u32) {
+        use Op::*;
+        let imm = i.imm as u32;
+        let (rs1, rs2) = (i.rs1, i.rs2);
+        let rr = |w: &mut W, ops: &[u8]| { let ops = ops.to_vec(); w.set(i.rd, move |w| { w.get(rs1); w.get(rs2); for o in ops { w.op(o); } }); };
+        let ri = |w: &mut W, v: u32, ops: &[u8]| { let ops = ops.to_vec(); w.set(i.rd, move |w| { w.get(rs1); w.i32c(v); for o in ops { w.op(o); } }); };
+        match i.op {
+            Fence | Beq | Bne | Blt | Bge | Bltu | Bgeu => {}
+            Lui => w.set(i.rd, |w| w.i32c(imm)),
+            Auipc => w.set(i.rd, |w| w.i32c(pc.wrapping_add(imm))),
+            Jal => w.set(i.rd, |w| w.i32c(next)),
+            Jalr => {
+                // the target first: rd may be rs1
+                w.get(rs1); w.i32c(imm); w.op(0x6a); w.i32c(!1); w.op(0x71); w.lset(ST);
+                w.set(i.rd, |w| w.i32c(next));
+                w.lget(CPU); w.lget(ST); w.mem(0x36, 2, offset_of!(Cpu, pc) as u32);
+            }
+            Addi => ri(w, imm, &[0x6a]),
+            Slti => ri(w, imm, &[0x48]),
+            Sltiu => ri(w, imm, &[0x49]),
+            Xori => ri(w, imm, &[0x73]),
+            Ori => ri(w, imm, &[0x72]),
+            Andi => ri(w, imm, &[0x71]),
+            Slli => ri(w, imm & 31, &[0x74]),
+            Srli => ri(w, imm & 31, &[0x76]),
+            Srai => ri(w, imm & 31, &[0x75]),
+            Add => rr(w, &[0x6a]),
+            Sub => rr(w, &[0x6b]),
+            Sll => rr(w, &[0x74]),
+            Srl => rr(w, &[0x76]),
+            Sra => rr(w, &[0x75]),
+            Slt => rr(w, &[0x48]),
+            Sltu => rr(w, &[0x49]),
+            Xor => rr(w, &[0x73]),
+            Or => rr(w, &[0x72]),
+            And => rr(w, &[0x71]),
+            Mul => rr(w, &[0x6c]),
+            Mulh | Mulhu => {
+                let ext = if i.op == Mulh { 0xac } else { 0xad };
+                w.set(i.rd, |w| { w.get(rs1); w.op(ext); w.get(rs2); w.op(ext); w.op(0x7e); w.i64c(32); w.op(0x88); w.op(0xa7); });
+            }
+            // wasm traps where RISC-V defines a result: divisor 0, and INT_MIN / -1 (signed)
+            Div | Divu | Rem | Remu => {
+                let signed = matches!(i.op, Div | Rem);
+                let div = matches!(i.op, Div | Divu);
+                w.set(i.rd, |w| {
+                    w.get(rs2); w.op(0x45);
+                    w.op(0x04); w.op(0x7f);
+                    if div { w.i32c(u32::MAX) } else { w.get(rs1) }
+                    w.op(0x05);
+                    if signed {
+                        w.get(rs1); w.i32c(0x8000_0000); w.op(0x46); w.get(rs2); w.i32c(u32::MAX); w.op(0x46); w.op(0x71);
+                        w.op(0x04); w.op(0x7f);
+                        if div { w.get(rs1) } else { w.i32c(0) }
+                        w.op(0x05);
+                        w.get(rs1); w.get(rs2); w.op(if div { 0x6d } else { 0x6f });
+                        w.op(0x0b);
+                    } else {
+                        w.get(rs1); w.get(rs2); w.op(if div { 0x6e } else { 0x70 });
+                    }
+                    w.op(0x0b);
+                });
+            }
+            Sh1add | Sh2add | Sh3add => {
+                let sh = match i.op { Sh1add => 1, Sh2add => 2, _ => 3 };
+                w.set(i.rd, |w| { w.get(rs1); w.i32c(sh); w.op(0x74); w.get(rs2); w.op(0x6a); });
+            }
+            Andn => w.set(i.rd, |w| { w.get(rs1); w.get(rs2); w.i32c(u32::MAX); w.op(0x73); w.op(0x71); }),
+            Orn => w.set(i.rd, |w| { w.get(rs1); w.get(rs2); w.i32c(u32::MAX); w.op(0x73); w.op(0x72); }),
+            Xnor => w.set(i.rd, |w| { w.get(rs1); w.get(rs2); w.op(0x73); w.i32c(u32::MAX); w.op(0x73); }),
+            Clz => w.set(i.rd, |w| { w.get(rs1); w.op(0x67); }),
+            Ctz => w.set(i.rd, |w| { w.get(rs1); w.op(0x68); }),
+            Max | Maxu | Min | Minu => {
+                let c = match i.op { Max => 0x4a, Maxu => 0x4b, Min => 0x48, _ => 0x49 };
+                w.set(i.rd, |w| { w.get(rs1); w.get(rs2); w.get(rs1); w.get(rs2); w.op(c); w.op(0x1b); });
+            }
+            SextB => w.set(i.rd, |w| { w.get(rs1); w.i32c(24); w.op(0x74); w.i32c(24); w.op(0x75); }),
+            SextH => w.set(i.rd, |w| { w.get(rs1); w.i32c(16); w.op(0x74); w.i32c(16); w.op(0x75); }),
+            ZextH => w.set(i.rd, |w| { w.get(rs1); w.i32c(0xffff); w.op(0x71); }),
+            Rol => rr(w, &[0x77]),
+            Ror => rr(w, &[0x78]),
+            Rori => ri(w, imm & 31, &[0x78]),
+            Rev8 => w.set(i.rd, |w| {
+                w.get(rs1); w.i32c(24); w.op(0x74);
+                w.get(rs1); w.i32c(8); w.op(0x74); w.i32c(0x00ff_0000); w.op(0x71); w.op(0x72);
+                w.get(rs1); w.i32c(8); w.op(0x76); w.i32c(0xff00); w.op(0x71); w.op(0x72);
+                w.get(rs1); w.i32c(24); w.op(0x76); w.op(0x72);
+            }),
+            Bclr | Binv | Bset => {
+                let o = match i.op { Bclr => 0x71, Binv => 0x73, _ => 0x72 };
+                w.set(i.rd, |w| {
+                    w.get(rs1); w.i32c(1); w.get(rs2); w.op(0x74);
+                    if o == 0x71 { w.i32c(u32::MAX); w.op(0x73); }
+                    w.op(o);
+                });
+            }
+            Bext => w.set(i.rd, |w| { w.get(rs1); w.get(rs2); w.op(0x76); w.i32c(1); w.op(0x71); }),
+            Bclri => ri(w, !(1u32 << (imm & 31)), &[0x71]),
+            Binvi => ri(w, 1 << (imm & 31), &[0x73]),
+            Bseti => ri(w, 1 << (imm & 31), &[0x72]),
+            Bexti => w.set(i.rd, |w| { w.get(rs1); w.i32c(imm & 31); w.op(0x76); w.i32c(1); w.op(0x71); }),
+            _ => unreachable!("not a native instruction: {:?}", i.op),
+        }
+    }
+
+    /// The module: types, imports (env.memory, env.table), one function exported as "f".
+    fn assemble(body: &[u8]) -> Vec<u8> {
+        let mut m = b"\0asm\x01\0\0\0".to_vec();
+        let section = |m: &mut Vec<u8>, id: u8, payload: &[u8]| { m.push(id); uleb(m, payload.len() as u64); m.extend_from_slice(payload); };
+        const I: u8 = 0x7f; const L: u8 = 0x7e;
+        section(&mut m, 1, &[4,
+            0x60, 5, I, I, I, I, I, 1, L,          // the region (cpu, bus, ctx, budget, start) -> i64
+            0x60, 5, I, I, I, I, I, 1, I,          // h_exec (cpu, bus, ctx, insn, pc) -> i32
+            0x60, 6, I, I, I, I, I, I, 1, L,       // h_load (cpu, bus, ctx, va, pc, kind) -> i64
+            0x60, 7, I, I, I, I, I, I, I, 1, I,    // h_store (cpu, bus, ctx, va, v, pc, kind) -> i32
+        ]);
+        let mut imp = vec![2];
+        for (name, desc) in [("memory", &[0x02u8, 0x00, 0x00][..]), ("table", &[0x01u8, 0x70, 0x00, 0x00][..])] {
+            imp.push(3); imp.extend_from_slice(b"env"); imp.push(name.len() as u8); imp.extend_from_slice(name.as_bytes()); imp.extend_from_slice(desc);
+        }
+        section(&mut m, 2, &imp);
+        section(&mut m, 3, &[1, 0]);
+        section(&mut m, 7, &[1, 1, b'f', 0x00, 0]);
+        // locals after the 5 params: ST, DONE, PV, TLB (i32), V64 (i64)
+        let mut f = vec![2, 4, I, 1, L];
+        f.extend_from_slice(body);
+        let mut code = vec![1];
+        uleb(&mut code, f.len() as u64);
+        code.extend_from_slice(&f);
+        section(&mut m, 10, &code);
+        m
     }
 }

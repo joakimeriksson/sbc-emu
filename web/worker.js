@@ -154,6 +154,7 @@ async function start(os, ramMb, jit) {
     const [rom, flash] = await Promise.all([['esp32s31_rev0_rom.elf', false], ['s31_full_flash.bin.gz', true]]
       .map(([f, gz]) => fetchBytes(`assets/esp32s31/${f}`, gz)));
     if (ex.sbc_boot_s31(copyIn(rom), rom.length, copyIn(flash), flash.length) !== 0) throw new Error('boot setup failed');
+    ex.sbc_jit(jit ? 1 : 0);
     frameEvery = 100;
     postMessage({ type: 'status', text: 'booting…' });
     loop();
