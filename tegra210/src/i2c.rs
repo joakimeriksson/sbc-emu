@@ -76,12 +76,12 @@ impl TegraI2c {
         }
     }
 
-    /// Received bytes wait in the FIFO.
     /// Not so much unread data that a DMA channel should stop asking for more.
     pub fn has_room(&self) -> bool {
         self.rx.len() < 1 << 16
     }
 
+    /// Received bytes wait in the FIFO.
     pub fn has_data(&self) -> bool {
         !self.rx.is_empty()
     }

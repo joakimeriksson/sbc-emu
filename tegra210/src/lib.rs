@@ -211,13 +211,14 @@ impl Soc {
             self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
             let usb_reset = self.car.in_reset(xusb::RESET);
+            let dc_reset = dc::RESETS.map(|id| self.car.in_reset(id));
             self.car.write(word - CAR, value);
             if !usb_reset && self.car.in_reset(xusb::RESET) {
                 self.xusb.reset(&mut self.usb);
             }
             self.pcie.set_reset(self.car.in_reset(PCIE_X_RESET));
-            for (d, id) in self.dc.iter_mut().zip(dc::RESETS) {
-                if self.car.in_reset(id) {
+            for ((d, id), was) in self.dc.iter_mut().zip(dc::RESETS).zip(dc_reset) {
+                if !was && self.car.in_reset(id) {
                     d.reset();
                 }
             }
