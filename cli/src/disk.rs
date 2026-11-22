@@ -9,21 +9,21 @@ use std::os::unix::fs::FileExt;
 
 /// `sectors` is what the guest sees; the file holds the first `stored` of them (a partial last
 /// sector counts, the rest of it zeros).
-pub struct CowFile { file: File, stored: u64, sectors: u64, overlay: Overlay, persist: bool, write_failed: bool }
+pub struct CowFile { file: File, path: String, stored: u64, sectors: u64, overlay: Overlay, persist: bool, reported: bool }
 
 impl CowFile {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = File::open(path)?;
         file.try_lock_shared().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len().div_ceil(512);
-        Ok(CowFile { file, stored: sectors, sectors, overlay: Overlay::default(), persist: false, write_failed: false })
+        Ok(CowFile { file, path: path.into(), stored: sectors, sectors, overlay: Overlay::default(), persist: false, reported: false })
     }
     /// Writes go straight to the image file (`--sd-persist`): what the guest installs survives.
     pub fn open_persistent(path: &str) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         file.try_lock().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len().div_ceil(512);
-        Ok(CowFile { file, stored: sectors, sectors, overlay: Overlay::default(), persist: true, write_failed: false })
+        Ok(CowFile { file, path: path.into(), stored: sectors, sectors, overlay: Overlay::default(), persist: true, reported: false })
     }
     /// The image as an SD card: as large as a card's 512 KiB units need it to be, so that a card
     /// never ends inside an image's last partition. The added sectors read as zeros until they
@@ -34,8 +34,21 @@ impl CowFile {
         self.sectors = self.stored.next_multiple_of(emu_core::sdcard::UNIT);
         Ok(self)
     }
+    /// The disk interface has no errors to give the guest; say it once.
+    fn report(&mut self, what: &str, e: std::io::Error) {
+        if !std::mem::replace(&mut self.reported, true) {
+            eprintln!("[sd] {}: {what}: {e}", self.path);
+        }
+    }
+    /// The file grows to the whole disk at the first write past its end, so that a partition the
+    /// guest grew is all there (the added part is sparse).
+    fn grow(&mut self) -> std::io::Result<()> {
+        self.file.set_len(self.sectors * 512)?;
+        self.stored = self.sectors;
+        Ok(())
+    }
     fn check_card_size(&self) -> std::io::Result<()> {
-        if (emu_core::sdcard::UNIT..=1u64 << 32).contains(&self.stored) {
+        if (emu_core::sdcard::UNIT * 512..=2u64 << 40).contains(&self.file.metadata()?.len()) {
             return Ok(());
         }
         Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "an SD (SDHC) or eMMC image must be between 512 KiB and 2 TiB"))
@@ -53,9 +66,13 @@ impl SharedDisk {
         Self::shared(Self::file(path, persist)?.as_card()?)
     }
 
-    /// An eMMC image, at its exact size: a large eMMC reports its sector count, not units.
+    /// An eMMC image, at its exact size: an eMMC above 2 GiB reports its sector count. A smaller
+    /// one counts in units like a card.
     pub fn open_emmc(path: &str, persist: bool) -> std::io::Result<Self> {
         let disk = Self::file(path, persist)?;
+        if disk.stored <= 2 << 21 {
+            return Self::shared(disk.as_card()?);
+        }
         disk.check_card_size()?;
         Self::shared(disk)
     }
@@ -97,8 +114,8 @@ impl Disk for CowFile {
                 Ok(0) => break,
                 Ok(n) => done += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    done = 0;
+                Err(e) => {
+                    self.report("reading the image failed, the guest gets zeros", e);
                     break;
                 }
             }
@@ -122,14 +139,10 @@ impl Disk for CowFile {
         if self.persist {
             let valid = (self.sectors.saturating_sub(lba).saturating_mul(512)).min(data.len() as u64) as usize;
             if valid > 0 {
-                match self.file.write_all_at(&data[..valid], lba * 512) {
-                    Ok(()) => self.stored = self.stored.max(lba + valid as u64 / 512),
-                    // the guest is not told: the disk interface has no errors
-                    Err(e) if !self.write_failed => {
-                        self.write_failed = true;
-                        eprintln!("[sd] writing the image failed, the guest's data is lost: {e}");
-                    }
-                    Err(_) => {}
+                let past = lba * 512 + valid as u64 > self.stored * 512;
+                let done = if past { self.grow() } else { Ok(()) };
+                if let Err(e) = done.and_then(|()| self.file.write_all_at(&data[..valid], lba * 512)) {
+                    self.report("writing the image failed, the guest's data is lost", e);
                 }
             }
             return;
@@ -201,14 +214,20 @@ mod tests {
     fn small_files_are_refused_and_a_partial_last_sector_is_stored() {
         let path = std::env::temp_dir().join(format!("sbc-emu-small-{}.img", std::process::id()));
         let p = path.to_str().unwrap();
-        for n in [0, 2048, 1023 * 512] {
+        for n in [0, 2048, 1023 * 512, 1023 * 512 + 1, 1024 * 512 - 1] {
             std::fs::write(&path, vec![1u8; n]).unwrap();
             assert!(SharedDisk::open(p, true).is_err() && SharedDisk::open_emmc(p, true).is_err(), "{n} bytes");
             assert_eq!(std::fs::metadata(&path).unwrap().len(), n as u64);
         }
         // 1500 sectors and 100 bytes
         std::fs::write(&path, vec![7u8; 1500 * 512 + 100]).unwrap();
-        assert_eq!(SharedDisk::open_emmc(p, false).unwrap().sectors(), 1501);
+        assert_eq!(SharedDisk::open_emmc(p, false).unwrap().sectors(), 2048);
+        // above 2 GiB: exact (sparse)
+        let f = std::fs::File::create(format!("{p}.big")).unwrap();
+        f.set_len((2 << 30) + 300 * 512).unwrap();
+        drop(f);
+        assert_eq!(SharedDisk::open_emmc(&format!("{p}.big"), false).unwrap().sectors(), (4 << 20) + 300);
+        std::fs::remove_file(format!("{p}.big")).unwrap();
         for persist in [false, true] {
             let mut d = SharedDisk::open(p, persist).unwrap();
             assert_eq!(d.sectors(), 2048);

@@ -73,8 +73,9 @@ impl SdCard {
         SdCard { disk, state: CardState::Idle, rca: 0, app: false, erase: (0, 0), trace: false }
     }
 
+    /// (A disk below one unit is no card.)
     pub fn present(&self) -> bool {
-        self.disk.is_some()
+        self.sectors() > 0
     }
 
     pub fn state(&self) -> CardState {
@@ -143,7 +144,7 @@ impl SdCard {
         if self.trace {
             eprintln!("[sd card] {}CMD{index} arg={arg:#010x} state={:?}", if app { "A" } else { "" }, self.state);
         }
-        if self.disk.is_none() {
+        if !self.present() {
             return Reply::timeout();
         }
         let r1 = self.status();
