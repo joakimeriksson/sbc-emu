@@ -75,13 +75,14 @@ impl Copy {
             (1, 1, 1)
         };
         let (src_bytes, dst_bytes) = (length * size * from, length * size * to);
-        let block = |base: u32| {
+        // (with remapping, widths count elements)
+        let block = |base: u32, element: u64| {
             let b = self.r(base);
-            Block { width: self.r(base + 4) as u64, height: self.r(base + 8) as u64, gobs_w: b & 15, gobs_h: b >> 4 & 15, gobs_d: b >> 8 & 15 }
+            Block { width: self.r(base + 4) as u64 * element, height: self.r(base + 8) as u64, gobs_w: b & 15, gobs_h: b >> 4 & 15, gobs_d: b >> 8 & 15 }
         };
         let origin = |base: u32| ((self.r(base + 0x14) & 0xffff) as u64, (self.r(base + 0x14) >> 16) as u64, self.r(base + 0x10) as u64);
-        let src_block = (v >> 7 & 1 == 0).then(|| (block(0x728), origin(0x728)));
-        let dst_block = (v >> 8 & 1 == 0).then(|| (block(0x70c), origin(0x70c)));
+        let src_block = (v >> 7 & 1 == 0).then(|| (block(0x728, size * from), origin(0x728)));
+        let dst_block = (v >> 8 & 1 == 0).then(|| (block(0x70c, size * to), origin(0x70c)));
         // (a block-linear origin counts elements)
         let (sx, dx) = (size * from, size * to);
         let mut line = vec![0u8; src_bytes as usize];

@@ -1414,7 +1414,7 @@ static void s_sh_scratch_vs(void) {
     GLuint p = prog(
         "#version 300 es\nprecision highp float; in vec2 c; in float id; out vec4 v; uniform vec4 k[8]; uniform int n;\nvoid main() { int q = int(id);\n"
         "  vec2 t = vec2(float(q % 8), float(q / 8)) / 8.0;\n" SCRATCH_BODY
-        "  gl_Position = vec4(vec2(float(q %% 8), float(q / 8)) * 0.25 - 1.0 + c * 0.22, 0.0, 1.0); v = vec4(0.5 + 0.5 * sin(r.rgb * 3.0), 1.0); }\n", FS_V);
+        "  gl_Position = vec4(vec2(float(q % 8), float(q / 8)) * 0.25 - 1.0 + c * 0.22, 0.0, 1.0); v = vec4(0.5 + 0.5 * sin(r.rgb * 3.0), 1.0); }\n", FS_V);
     spill_uniforms(p);
     glUniform1i(glGetUniformLocation(p, "n"), 5);
     vs_loop_grid(p);
