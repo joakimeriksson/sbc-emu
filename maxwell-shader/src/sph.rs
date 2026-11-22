@@ -93,7 +93,8 @@ impl Sph {
         Some(Sph {
             words,
             ty,
-            color0_broadcast: w[0] >> 14 & 1 != 0,
+            // the bit says that targets have their own outputs
+            color0_broadcast: w[0] >> 14 & 1 == 0,
             kills_pixels: w[0] >> 15 & 1 != 0,
             global_store: w[0] >> 16 & 1 != 0,
             load_or_store: w[0] >> 26 & 1 != 0,
@@ -232,6 +233,7 @@ mod tests {
         set(&mut w, 0x310, 2);
         w[18] = 0xf0f;
         w[19] = 2;
+        w[0] |= 1 << 14; // separate outputs
         let s = Sph::parse(&bytes(w)).unwrap();
         assert_eq!(s.ty, ShaderType::Fragment);
         assert!(s.kills_pixels && !s.global_store && !s.color0_broadcast);

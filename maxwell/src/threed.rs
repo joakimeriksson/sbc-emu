@@ -338,7 +338,6 @@ impl Threed {
                     let m = self.color_mask(rt);
                     (0..4).for_each(|k| mask[k] &= m >> (4 * k) & 1 != 0);
                 }
-                let format = if self.r(0x19c8 - 4) == 0 && false { format.linear() } else { format };
                 crate::rop::clear_color(&surface, &format, c, mask, rect, layer, mem);
             }
         }

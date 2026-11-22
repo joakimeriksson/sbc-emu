@@ -868,7 +868,6 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
         return;
     }
     let ds = DepthStencil::new(t);
-    let srgb = t.r(0x15b8) & 1 != 0;
     let mut outputs = Vec::new();
     let (mut need, mut write) = (0, 0);
     for (k, c) in targets.color.iter().enumerate() {
@@ -877,8 +876,7 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
         if blend.mask & 0x1111 == 0 {
             continue;
         }
-        let format = if srgb { *format } else { format.linear() };
-        outputs.push((k, Output { format, blend, srgb_write: srgb }));
+        outputs.push((k, Output { format: *format, blend }));
         need |= 1 << k;
         write |= 1 << k;
     }

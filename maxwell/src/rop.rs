@@ -446,7 +446,6 @@ pub fn logic(op: u32, s: u8, d: u8) -> u8 {
 pub struct Output {
     pub format: RtFormat,
     pub blend: Blend,
-    pub srgb_write: bool,
 }
 
 impl Output {
