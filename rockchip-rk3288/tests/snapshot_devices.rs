@@ -86,3 +86,22 @@ fn devices_in_the_middle_of_things() {
         assert!(m.state() == fresh.state(), "seed {seed}: state after the same accesses");
     }
 }
+
+/// A snapshot whose clock is years ahead of its devices does not hang the emulator.
+#[test]
+fn a_clock_far_ahead() {
+    for bit in [40, 50, 60] {
+        let mut m = machine();
+        // audio playing and recording, a loop on core 0
+        for (o, v) in [(0x08, 0x0001_0101u32), (0x10, 0x100 | 1 << 24), (0x1c, 3)] { m.soc.write32(0xff89_0000 + o, v).unwrap(); }
+        m.soc.write32(0, 0xeaff_fffe).unwrap();
+        m.cpus[0].r[15] = 0;
+        m.run(100_000);
+        for c in &mut m.cpus { c.cntpct |= 1 << bit; }
+        let mut far = machine();
+        far.restore(&m.save().unwrap()).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10 { far.run(10_000); let _ = far.soc.read32(0xff89_000c); }
+        assert!(start.elapsed().as_secs() < 5, "bit {bit}: {:?}", start.elapsed());
+    }
+}
