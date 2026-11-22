@@ -795,7 +795,10 @@ impl Host<L> for FragmentHost<'_, '_> {
             0x64 => return [p.layer; L],
             0x2e0 | 0x2e4 => {
                 let pl = if op.addr == 0x2e0 { &p.point[0] } else { &p.point[1] };
-                return std::array::from_fn(|l| { let (x, y) = at(l, self); pl.at(x, y).to_bits() });
+                return std::array::from_fn(|l| {
+                    let (x, y) = at(l, self);
+                    (pl.at(x, y) * if op.mode == IpaMode::MulW { p.w.at(x, y) } else { 1.0 }).to_bits()
+                });
             }
             _ => {}
         }
