@@ -465,6 +465,33 @@ impl Cpu {
     }
 }
 
+/// Every field of the core, so that a new one does not compile until someone has decided here
+/// whether `save_state` and `load_state` need it.
+#[allow(dead_code)]
+fn snapshot_fields(c: &Cpu) {
+    let Cpu {
+        // saved
+        x: _, sp: _, pc: _, nzcv: _, daif: _, el: _, spsel: _, elr: _, spsr: _, esr: _, far: _, vbar: _,
+        sctlr: _, v: _, fpcr: _, fpsr: _, fpsr_nzcv: _, sys: _, irq: _, fiq: _, instret: _, excl_addr: _,
+        excl_armed: _, brk_to_host: _, firmware_calls_to_host: _, aarch32: _, a32: _,
+        // rebuilt (TLBs, compiled code), the machine's (RAM, profile, threads, debugger), or within a
+        // step; `aarch32` and `a32` are entered again from the saved CPSR
+        cur_insn: _, tlb: _, ram: _, ram_len: _, ram_base: _, utlb: _, utlb_asid: _, utlb_unpriv: _,
+        tlb_blocks: _, jit: _, code_pages: _, jit_bus: _, jit_trap: _, store_log: _, chain_until: _,
+        chain_stop: _, jit_disp: _, jit_exit: _, jit_interp: _, jit_refill: _, last_wfe: _, mt: _,
+        wall_clock: _, excl_val: _, ic_bcast: _, crypto: _, jit_off: _, interp_run: _, watch: _,
+        watch_hit: _, tlbi_bcast: _, profile: _,
+    } = c;
+    let crate::sysreg::SysRegs {
+        // saved
+        mpidr: _, cpacr_el1: _, hcr_el2: _, scr_el3: _, ttbr0: _, ttbr1_el1: _, tcr: _, par_el1: _,
+        cntfrq: _, cnt: _, time_base_ns: _, time_base_instret: _, cntvoff: _, ptimer: _, vtimer: _, tpidr: _,
+        other: _,
+        // set by the load; diagnostics
+        timers_changed: _, unknown: _,
+    } = &c.sys;
+}
+
 impl Cpu {
     /// Turn on the block JIT where the host supports it; returns whether it is active.
     pub fn enable_jit(&mut self) -> bool {

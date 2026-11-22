@@ -54,6 +54,17 @@ impl Disk for MemDisk {
         let n = data.len().min(self.0.len() - start);
         self.0[start..start + n].copy_from_slice(&data[..n]);
     }
+    /// There is no image behind it: all it holds.
+    fn overlay(&self) -> Vec<(u64, Vec<u8>)> {
+        let sectors = self.0.chunks(512).enumerate();
+        sectors.filter(|(_, s)| s.iter().any(|&b| b != 0)).map(|(k, s)| (k as u64, s.to_vec())).collect()
+    }
+    fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) {
+        self.0.fill(0);
+        for (lba, data) in sectors {
+            self.write(lba, &data);
+        }
+    }
 }
 
 /// A copy-on-write overlay of written sectors, for disks whose image stays unchanged.

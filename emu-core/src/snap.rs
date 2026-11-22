@@ -306,6 +306,8 @@ pub fn load_disk(r: &mut R, disk: Option<&mut dyn crate::disk::Disk>, what: &str
     let Some(d) = disk else {
         return if r.bool()? { Err(SnapError(format!("the snapshot's machine has {what}: attach the same image"))) } else { Ok(()) };
     };
+    // the guest would go on with caches of sectors this image does not have, and write them into it
+    if !d.snapshots_disk() { return Err(SnapError(format!("{what}: --sd-persist writes into the image: nothing is restored onto it"))); }
     if !r.bool()? { return Err(SnapError(format!("the snapshot's machine has no {what}"))); }
     let sectors = r.u64()?;
     if sectors != d.sectors() {
@@ -320,20 +322,22 @@ pub fn load_disk(r: &mut R, disk: Option<&mut dyn crate::disk::Disk>, what: &str
 // ---------------------------------------------------------------------- files
 
 const MAGIC: &[u8; 8] = b"SBCSNAP2";
-/// No machine has more state than this, RAM included.
-const LIMIT: usize = 12 << 30;
 
-/// A snapshot file: which board, in which version of its layout, and the state (deflated).
+/// A snapshot file: which board, in which version of its layout, the sizes, and the state (zlib: its
+/// checksum tells a damaged file).
 pub fn pack(board: &str, version: u32, body: &[u8]) -> Vec<u8> {
     let mut w = W(MAGIC.to_vec());
     w.tag(board);
     w.u32(version);
-    w.0.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(body, 1));
+    let packed = miniz_oxide::deflate::compress_to_vec_zlib(body, 1);
+    w.u64(body.len() as u64);
+    w.bytes(&packed);
     w.0
 }
 
-/// The state in `file`, if it is `board`'s in this `version`.
-pub fn unpack(board: &str, version: u32, file: &[u8]) -> Result<Vec<u8>, SnapError> {
+/// The state in `file`, if it is `board`'s in this `version` and no more than `limit` bytes (see
+/// `limit`).
+pub fn unpack(board: &str, version: u32, limit: u64, file: &[u8]) -> Result<Vec<u8>, SnapError> {
     if file.starts_with(b"SBCSNAP1") { return Err(SnapError("this is a Raspberry Pi 4 snapshot".into())); }
     let Some(rest) = file.strip_prefix(MAGIC) else { return Err(SnapError("not an sbc-emu snapshot".into())) };
     let mut r = R::new(rest);
@@ -341,8 +345,18 @@ pub fn unpack(board: &str, version: u32, file: &[u8]) -> Result<Vec<u8>, SnapErr
     if from != board { return Err(SnapError(format!("this is a snapshot of the board '{from}', not '{board}'"))); }
     let v = r.u32()?;
     if v != version { return Err(SnapError(format!("the snapshot has layout version {v}, this build has {version}"))); }
-    miniz_oxide::inflate::decompress_to_vec_with_limit(&rest[r.p..], LIMIT).map_err(|e| SnapError(format!("the snapshot is damaged ({:?})", e.status)))
+    let damaged = |what: String| SnapError(format!("the snapshot is damaged ({what})"));
+    let len = r.u64()?;
+    let packed = r.bytes()?;
+    if r.p != rest.len() { return Err(damaged(format!("{} bytes too many", rest.len() - r.p))); }
+    if len > limit { return Err(SnapError(format!("the snapshot's state is {} MiB, this machine's at most {}", len >> 20, limit >> 20))); }
+    let body = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(packed, len as usize).map_err(|e| damaged(format!("{:?}", e.status)))?;
+    if body.len() as u64 != len { return Err(damaged(format!("{} bytes of {len}", body.len()))); }
+    Ok(body)
 }
+
+/// The most state a machine can have: its RAM, every sector of its disks written, and the rest.
+pub fn limit(ram: usize, sectors: u64) -> u64 { ram as u64 * 2 + sectors * 1024 + (256 << 20) }
 
 #[cfg(test)]
 mod tests {
@@ -414,12 +428,26 @@ mod tests {
     #[test]
     fn files_say_what_they_are() {
         let f = pack("board-a", 3, b"state");
-        assert_eq!(unpack("board-a", 3, &f).unwrap(), b"state");
-        assert!(unpack("board-b", 3, &f).unwrap_err().0.contains("board-a"));
-        assert!(unpack("board-a", 4, &f).unwrap_err().0.contains("version 3"));
-        assert!(unpack("board-a", 3, b"SBCSNAP1xxxx").unwrap_err().0.contains("Pi 4"));
-        assert!(unpack("board-a", 3, b"hello").is_err());
-        assert!(unpack("board-a", 3, &f[..f.len() - 3]).is_err());
+        assert_eq!(unpack("board-a", 3, 100, &f).unwrap(), b"state");
+        assert!(unpack("board-b", 3, 100, &f).unwrap_err().0.contains("board-a"));
+        assert!(unpack("board-a", 4, 100, &f).unwrap_err().0.contains("version 3"));
+        assert!(unpack("board-a", 3, 100, b"SBCSNAP1xxxx").unwrap_err().0.contains("Pi 4"));
+        assert!(unpack("board-a", 3, 100, b"hello").is_err());
+        assert!(unpack("board-a", 3, 4, &f).unwrap_err().0.contains("at most"));
+    }
+
+    #[test]
+    fn a_damaged_file_is_refused() {
+        let body: Vec<u8> = (0..600u32).flat_map(|k| (k / 7).to_le_bytes()).collect();
+        let f = pack("b", 1, &body);
+        for n in 0..f.len() { assert!(unpack("b", 1, 1 << 20, &f[..n]).is_err(), "cut at {n}"); }
+        assert!(unpack("b", 1, 1 << 20, &[&f[..], b"x"].concat()).is_err());
+        for bit in 0..f.len() * 8 {
+            let mut g = f.clone();
+            g[bit / 8] ^= 1 << (bit % 8);
+            // (some bits of the zlib header mean nothing: then the state is the right one)
+            if let Ok(b) = unpack("b", 1, 1 << 20, &g) { assert!(b == body, "bit {bit}"); }
+        }
     }
 
     #[test]

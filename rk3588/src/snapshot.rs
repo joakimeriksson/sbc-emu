@@ -9,7 +9,7 @@ use emu_core::snap::{self, Snap, SnapError, R, W};
 
 const BOARD: &str = "orangepi5";
 /// Of the layout: raise it when what is saved changes.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 emu_core::snap_enum!(CoreState { Off, Run, Wfi, Wfe });
 
@@ -105,7 +105,13 @@ impl Machine {
 
     /// Continue from a snapshot made by `save`. After an error the machine is in pieces.
     pub fn restore(&mut self, file: &[u8]) -> Result<(), String> {
-        self.load_state(&snap::unpack(BOARD, VERSION, file).map_err(|e| e.0)?).map_err(|e| e.0)
+        let disks = [
+            self.soc.mmc.card.disk.as_ref().map_or(0, |d| d.sectors()),
+            self.soc.pcie.nvme.as_ref().and_then(|n| n.disk.as_ref()).map_or(0, |d| d.sectors()),
+            self.soc.usb.storage.as_ref().map_or(0, |s| s.disk.sectors()),
+        ];
+        let limit = snap::limit(self.soc.ram.len(), disks.iter().sum());
+        self.load_state(&snap::unpack(BOARD, VERSION, limit, file).map_err(|e| e.0)?).map_err(|e| e.0)
     }
 
     fn load_state(&mut self, state: &[u8]) -> Result<(), SnapError> {

@@ -575,7 +575,13 @@ impl Sdhci {
         // Exactly the snapshot's sectors: writes made after it was taken are dropped.
         if let Some(d) = self.disk.as_mut() {
             if !d.snapshots_disk() {
-                eprintln!("[sd] restored snapshot without the SD card's state: --sd-persist writes go to the image");
+                // sectors that cannot go onto the image: the guest would go on with caches of them
+                // and write what does not fit the rest into it
+                if !sectors.is_empty() {
+                    return Err(emu_core::snap::SnapError(format!("the snapshot has {} written SD sectors, which --sd-persist would not bring back: restore without it", sectors.len())));
+                }
+                // saved with --sd-persist: right if nothing has written to the image since
+                eprintln!("[sd] restored onto --sd-persist: the image must be as it was when the snapshot was taken");
             }
             d.restore_overlay(sectors);
         }
