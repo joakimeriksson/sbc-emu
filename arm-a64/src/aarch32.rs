@@ -54,7 +54,7 @@ impl El1Host for El1<'_> {
     }
 
     fn compiled(&mut self, pa: u32) {
-        // the 32-bit core's physical addresses are RAM offsets, as code_pages' are
+        // the 32-bit JIT's keys are RAM offsets (`ram_key`), as code_pages' are
         self.0.mark_code_page(pa as u64 >> 12);
     }
 

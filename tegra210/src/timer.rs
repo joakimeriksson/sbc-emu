@@ -47,6 +47,8 @@ struct Tmr {
     /// period of a periodic timer (ns)
     period: u64,
     irq: bool,
+    /// a count written but not started yet (ns): `service` starts it
+    start: Option<u64>,
 }
 
 pub struct Timers {
@@ -89,7 +91,10 @@ impl Timers {
         }
     }
 
-    pub fn write(&mut self, offset: u64, value: u32, now: u64) {
+    /// A write does not know the time (the machine's is as old as the running core's block):
+    /// a timer it starts begins to count at the next `service`, which the machine runs right
+    /// after the access.
+    pub fn write(&mut self, offset: u64, value: u32) {
         let o = offset & !3;
         match o {
             USEC_CNTR => {}
@@ -101,7 +106,8 @@ impl Timers {
                     let t = &mut self.tmr[i];
                     t.ptv = value;
                     t.period = if value & PTV_PER != 0 { ns } else { 0 };
-                    t.deadline = (value & PTV_EN != 0).then_some(now + ns);
+                    t.deadline = None;
+                    t.start = (value & PTV_EN != 0).then_some(ns);
                 }
                 Some(i) => {
                     if value & PCR_INTR_CLR != 0 {
@@ -118,6 +124,9 @@ impl Timers {
     /// Expire the timers due by `now`.
     pub fn service(&mut self, now: u64) {
         for t in self.tmr.iter_mut() {
+            if let Some(ns) = t.start.take() {
+                t.deadline = Some(now + ns);
+            }
             while let Some(d) = t.deadline.filter(|&d| d <= now) {
                 t.irq = true;
                 if t.period > 0 {
@@ -148,20 +157,26 @@ mod tests {
     #[test]
     fn oneshot_and_periodic_at_the_configured_rate() {
         let mut t = Timers::default();
-        t.write(USEC_CFG, 0x045f, 0); // 19.2 MHz
-        // TMR10 (0x90): 1920 counts = 100 us
-        t.write(0x90, PTV_EN | (1920 - 1), 0);
-        t.service(99_999);
+        t.write(USEC_CFG, 0x045f); // 19.2 MHz
+        // TMR10 (0x90): 1920 counts = 100 us, from the service after the write
+        t.write(0x90, PTV_EN | (1920 - 1));
+        t.service(50_000);
+        t.service(149_999);
         assert!(!t.irq(10));
-        t.service(100_000);
+        t.service(150_000);
         assert!(t.irq(10));
         assert_eq!(t.next_event(), None);
-        t.write(0x94, PCR_INTR_CLR, 100_000);
+        t.write(0x94, PCR_INTR_CLR);
         assert!(!t.irq(10));
-        t.write(0x90, PTV_EN | PTV_PER | (192 - 1), 200_000); // every 10 us
+        t.write(0x90, PTV_EN | PTV_PER | (192 - 1)); // every 10 us
+        t.service(200_000);
         t.service(210_000);
         assert!(t.irq(10));
         assert_eq!(t.next_event(), Some(220_000));
+        t.write(0x90, 0); // stopped before it counts again
+        t.write(0x94, PCR_INTR_CLR);
+        t.service(230_000);
+        assert!(!t.irq(10));
         assert_eq!(t.read(USEC_CNTR, 5_000_000), 5000);
         assert_eq!(irq_of(10), Some(32 + 176));
     }

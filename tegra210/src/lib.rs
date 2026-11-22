@@ -15,7 +15,7 @@ use peripherals::{Gic, Uart};
 
 pub const RAM_BASE: u64 = 0x8000_0000;
 /// The Nano's DRAM is 4 GiB; a smaller emulated amount is reported in /memory.
-pub const MAX_RAM: usize = 4 << 30;
+pub const MAX_RAM: u64 = 4 << 30;
 /// The arch timer's frequency (clock M, the 38.4 MHz oscillator / 2).
 pub const CNTFRQ: u64 = 19_200_000;
 pub const GICD: u64 = 0x5004_1000;
@@ -134,7 +134,7 @@ impl Soc {
         } else if at(UARTA, 0x40) {
             self.uart.write(word - UARTA, value);
         } else if at(TMR, timer::SIZE) {
-            self.timers.write(word - TMR, value, self.now);
+            self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
             self.car.write(word - CAR, value);
         } else if at(PMC, 0xc00) {
@@ -174,8 +174,8 @@ impl Soc {
         }
         self.dirty = true;
         let word = addr & !3;
-        let v = if size == 4 || addr & 3 == 0 && !(GICD..GICD + 0x1000).contains(&word) {
-            // narrow writes at a register's address (8250 byte registers) go as they are
+        let v = if size == 4 || (UARTA..UARTA + 0x40).contains(&word) && addr & 3 == 0 {
+            // the 8250 driver writes its byte registers as bytes at the word's address
             value as u32
         } else {
             let shift = (addr & 3) * 8;
@@ -259,7 +259,7 @@ pub struct Machine {
 impl Machine {
     /// A Jetson Nano with `ram_bytes` of DRAM (up to 4 GiB) and `ncpu` cores (1-4).
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self, String> {
-        if !(64 << 20..=MAX_RAM).contains(&ram_bytes) {
+        if !(64 << 20..=MAX_RAM).contains(&(ram_bytes as u64)) {
             return Err("the Jetson Nano takes 64..4096 MiB of RAM".into());
         }
         if !(1..=NCPU).contains(&ncpu) {
@@ -377,6 +377,8 @@ impl Machine {
             .filter(|(k, _)| self.state[*k] != CoreState::Off)
             .flat_map(|(_, c)| Self::timer_deadlines(c))
             .chain(self.soc.next_event())
+            // an expired timer whose interrupt is off wakes nobody: it must not stop time
+            .filter(|&t| t > self.now)
             .min()
     }
 
@@ -495,6 +497,8 @@ impl Machine {
                 return Some(Stop::Breakpoint(k));
             }
             *steps -= 1;
+            // what a device read sees as the time (a block that has run a while sees its start)
+            self.soc.now = self.soc.now.max(t);
             if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret >= self.next_check {
                 self.update();
             }
@@ -654,9 +658,7 @@ impl Machine {
             done += n;
         }
         for c in self.cpus.iter_mut() {
-            if let Some(j) = c.jit.as_deref_mut() {
-                j.flush();
-            }
+            c.jit_invalidate(u64::MAX); // the 32-bit core's code too
         }
         true
     }
@@ -768,5 +770,96 @@ mod tests {
         let stop = m.run(100);
         assert!(matches!(stop, Stop::Idle(_)), "{stop:?}");
         assert_eq!(u64::from_le_bytes(m.soc.ram[0x1000..0x1008].try_into().unwrap()), 0x2a);
+    }
+
+    fn load(m: &mut Machine, code: &[u32]) {
+        for (i, w) in code.iter().enumerate() {
+            m.soc.ram[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        m.cpus[0].pc = RAM_BASE;
+        m.cpus[0].el = 1;
+    }
+
+    #[test]
+    fn narrow_writes_keep_the_other_bytes() {
+        let mut m = Machine::with_cpus(64 << 20, 1).unwrap();
+        for (addr, size, value, want) in [(0, 1, 0x55, 0x1122_3355u64), (0, 2, 0xabcd, 0x1122_abcd), (1, 1, 0x55, 0x1122_5544), (2, 2, 0xabcd, 0xabcd_3344)] {
+            m.soc.write(0x6000_c000, 4, 0x1122_3344).unwrap();
+            m.soc.write(0x6000_c000 + addr, size, value).unwrap();
+            assert_eq!(m.soc.read(0x6000_c000, 4).unwrap(), want, "{size} bytes at {addr}");
+        }
+    }
+
+    /// A timer started after a long stretch without a device access counts from the write.
+    #[test]
+    fn a_timer_counts_from_when_it_was_started() {
+        for jit in [false, true] {
+            let mut m = Machine::with_cpus(64 << 20, 1).unwrap();
+            if jit {
+                m.enable_jit();
+            }
+            m.soc.timers.write(0x14, 0x045f); // 19.2 MHz
+            load(&mut m, &[
+                0xd2ac_0000, // mov x0, #0x60000000
+                0xf28a_1200, // movk x0, #0x5090 (TMR10)
+                0x5280_efe1, // mov w1, #0x77f (100 us)
+                0x72b0_0001, // movk w1, #0x8000, lsl #16 (enable)
+                0xd29b_bd02, // mov x2, #0xdde8
+                0xf2a0_00c2, // movk x2, #6, lsl #16 (450,024 loops, about 0.9 ms)
+                0xf100_0442, // subs x2, x2, #1
+                0x54ff_ffe1, // b.ne
+                0xb900_0001, // str w1, [x0]
+                0xd503_207f, // wfi
+            ]);
+            let stop = m.run(10_000_000);
+            assert!(matches!(stop, Stop::Idle(_)), "{stop:?}");
+            assert!(!m.soc.timers.irq(10), "not yet (jit {jit})");
+            let due = m.soc.timers.next_event().unwrap();
+            let left = due - m.now();
+            assert!((99_000..=100_000).contains(&left), "{left} ns left (jit {jit})");
+            m.idle_until(due);
+            assert!(m.soc.timers.irq(10));
+        }
+    }
+
+    /// An expired arch timer whose interrupt is off does not keep time from moving on.
+    #[test]
+    fn an_expired_masked_timer_does_not_stop_time() {
+        let mut m = Machine::with_cpus(64 << 20, 1).unwrap();
+        load(&mut m, &[0xd503_207f, 0xd503_207f]); // wfi; wfi
+        m.cpus[0].sys.vtimer.ctl = 1;
+        m.cpus[0].sys.vtimer.cval = 0;
+        m.soc.timers.write(0x14, 0x045f);
+        m.soc.timers.write(0x90, 1 << 31 | 95_999); // 5 ms
+        for _ in 0..4 {
+            if let Stop::Idle(t) = m.run(1000) {
+                m.idle_until(t);
+            }
+        }
+        assert!(m.soc.timers.irq(10), "time stopped at {} ns", m.now());
+    }
+
+    /// A debugger's write into a 32-bit program's compiled code takes effect.
+    #[test]
+    fn debug_write_reaches_compiled_32_bit_code() {
+        let mut m = Machine::with_cpus(64 << 20, 1).unwrap();
+        m.enable_jit();
+        load(&mut m, &[
+            0xd280_0200, // mov x0, #0x10 (AArch32 user mode)
+            0xd518_4000, // msr spsr_el1, x0
+            0xd2b0_0201, // mov x1, #0x80100000
+            0xd518_4021, // msr elr_el1, x1
+            0xd2b0_0402, // mov x2, #0x80200000
+            0xd69f_03e0, // eret
+        ]);
+        // 1: mov r0, #1; str r0, [r2]; b 1b
+        for (i, w) in [0xe3a0_0001u32, 0xe582_0000, 0xeaff_fffc].iter().enumerate() {
+            m.soc.ram[0x10_0000 + i * 4..0x10_0004 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        m.run(1_000_000);
+        assert_eq!(m.soc.ram[0x20_0000], 1);
+        assert!(m.debug_write(0, RAM_BASE + 0x10_0000, &0xe3a0_0002u32.to_le_bytes()));
+        m.run(1_000_000);
+        assert_eq!(m.soc.ram[0x20_0000], 2);
     }
 }

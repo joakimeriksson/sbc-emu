@@ -94,14 +94,16 @@ impl Car {
         let o = offset as usize & (SIZE as usize - 4);
         let v = self.regs[o / 4];
         let enabled = |base: usize| self.regs[base / 4] & PLL_ENABLE != 0;
+        // the lock bit follows the enable, whatever a driver wrote back
+        let locked = |on: bool, bit: u32| if on { v | bit } else { v & !bit };
         match o {
             _ if BASE_LOCKS.iter().any(|&(b, _)| b == o) => {
                 let lock = BASE_LOCKS.iter().find(|&&(b, _)| b == o).unwrap().1;
-                if v & PLL_ENABLE != 0 { v | lock } else { v & !lock }
+                locked(v & PLL_ENABLE != 0, lock)
             }
-            PLLMB_BASE => if v & PLL_ENABLE != 0 { v | PLL_BASE_LOCK } else { v },
-            PLLE_MISC0 => if self.regs[PLLE_BASE / 4] & 1 << 31 != 0 { v | 1 << 11 } else { v },
-            PLLRE_MISC0 => if enabled(PLLRE_BASE) { v | 1 << 27 } else { v },
+            PLLMB_BASE => locked(v & PLL_ENABLE != 0, PLL_BASE_LOCK),
+            PLLE_MISC0 => locked(self.regs[PLLE_BASE / 4] & 1 << 31 != 0, 1 << 11),
+            PLLRE_MISC0 => locked(enabled(PLLRE_BASE), 1 << 27),
             UTMIPLL_HW_PWRDN_CFG0 => v | 1 << 31,
             _ => v,
         }
@@ -133,5 +135,14 @@ mod tests {
         c.write(0x80, 0);
         assert_eq!(c.read(0x80) & PLL_BASE_LOCK, 0);
         assert_eq!(c.read(0x50) >> 28, 5);
+        // PLLE, PLLRE, PLLMB: a lock bit written back does not outlive the PLL
+        for (base, on, reg, bit) in [(0xe8, 1 << 31, 0xec, 11), (0x4c4, PLL_ENABLE, 0x4c8, 27), (0x5e8, PLL_ENABLE, 0x5e8, 27)] {
+            c.write(base, on);
+            let v = c.read(reg);
+            assert_ne!(v & 1 << bit, 0, "{base:#x}");
+            c.write(reg, v);
+            c.write(base, if reg == base { v & !on } else { 0 });
+            assert_eq!(c.read(reg) & 1 << bit, 0, "{base:#x}");
+        }
     }
 }

@@ -11,6 +11,7 @@ use emu_core::fdt::Node;
 pub const KERNEL_OFFSET: u64 = 0x0020_0000;
 pub const DTB_OFFSET: u64 = 0x0800_0000;
 pub const INITRD_OFFSET: u64 = 0x0820_0000;
+const MAX_DTB: u64 = INITRD_OFFSET - DTB_OFFSET;
 pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,mmio32,0x70006000 console=ttyS0,115200 rdinit=/init";
 
 /// An arm64 Image: as given, or unpacked from an EFI zboot image ("zimg" at offset 4, the
@@ -44,20 +45,26 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, String> {
         return Err("not gzip".into());
     }
     let flags = data[3];
+    let bad = || "gzip: truncated or bad header".to_string();
     let mut p = 10;
     if flags & 4 != 0 {
-        let xlen = u16::from_le_bytes([data[p], data[p + 1]]) as usize;
-        p += 2 + xlen;
+        let xlen = data.get(p..p + 2).ok_or_else(bad)?;
+        p += 2 + u16::from_le_bytes([xlen[0], xlen[1]]) as usize;
     }
     for bit in [8, 16] {
         if flags & bit != 0 {
-            p += data[p..].iter().position(|&b| b == 0).ok_or("gzip: bad header")? + 1;
+            p += data.get(p..).ok_or_else(bad)?.iter().position(|&b| b == 0).ok_or_else(bad)? + 1;
         }
     }
     if flags & 2 != 0 {
         p += 2;
     }
-    miniz_oxide::inflate::decompress_to_vec(&data[p..data.len() - 8]).map_err(|e| format!("gunzip: {e:?}"))
+    let (body, trailer) = data.split_at(data.len() - 8);
+    let out = miniz_oxide::inflate::decompress_to_vec(body.get(p..).ok_or_else(bad)?).map_err(|e| format!("gunzip: {e:?}"))?;
+    if u32::from_le_bytes(trailer[4..].try_into().unwrap()) != out.len() as u32 {
+        return Err("gzip: the unpacked size does not match (truncated file?)".into());
+    }
+    Ok(out)
 }
 
 /// Patch the stock DTB for direct boot.
@@ -91,6 +98,9 @@ pub fn boot_linux(m: &mut Machine, kernel: &[u8], dtb: &[u8], initrd: Option<&[u
         return Err(format!("the kernel ({} MiB with its bss) does not fit below the device tree", image_size >> 20));
     }
     let ram_len = m.soc.ram.len() as u64;
+    if DTB_OFFSET + MAX_DTB > ram_len {
+        return Err(format!("{} MiB of RAM is too little for the boot layout; give --ram-mb 256 or more", ram_len >> 20));
+    }
     m.soc.ram[entry as usize..entry as usize + image.len()].copy_from_slice(&image);
     let range = match initrd {
         Some(data) => {
@@ -117,4 +127,39 @@ pub fn boot_linux(m: &mut Machine, kernel: &[u8], dtb: &[u8], initrd: Option<&[u
     c.x[0] = RAM_BASE + DTB_OFFSET;
     c.sys.cpacr_el1 = 3 << 20;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_gzip_is_an_error() {
+        let mut d = vec![0u8; 18];
+        d[..4].copy_from_slice(&[0x1f, 0x8b, 8, 4]);
+        d[10..12].copy_from_slice(&[0xff, 0xff]); // an extra field longer than the file
+        assert!(kernel_image(&d).is_err());
+        d[3] = 8; // a name that never ends
+        d[10..].fill(b'x');
+        assert!(kernel_image(&d).is_err());
+        assert!(kernel_image(&d[..12]).is_err());
+        // a whole stream whose length trailer is wrong
+        let mut z = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0];
+        z.extend(miniz_oxide::deflate::compress_to_vec(&[7; 100], 6));
+        z.extend([0, 0, 0, 0, 99, 0, 0, 0]);
+        assert!(gunzip(&z).unwrap_err().contains("size"));
+        let n = z.len();
+        z[n - 4] = 100;
+        assert_eq!(gunzip(&z).unwrap(), vec![7; 100]);
+    }
+
+    #[test]
+    fn too_little_ram_is_an_error() {
+        let mut image = vec![0u8; 4096];
+        image[56..60].copy_from_slice(b"ARMd");
+        for mb in [64, 128, 129] {
+            let mut m = Machine::with_cpus(mb << 20, 1).unwrap();
+            assert!(boot_linux(&mut m, &image, &[], None, "").unwrap_err().contains("RAM"), "{mb} MiB");
+        }
+    }
 }
