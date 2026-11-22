@@ -47,7 +47,8 @@ cargo build --release
 ```
 
 `Ctrl-A x` quits. `--board NAME` picks another board; the board pages have the recipes,
-including the downloads each one needs. sbc-emu ships no operating system images: you bring
+including the downloads each one needs. `--gdb PORT` lets gdb or lldb debug the guest, on every
+board ([debugging](docs/debugging.md)). sbc-emu ships no operating system images: you bring
 your own.
 
 To build the browser site locally:

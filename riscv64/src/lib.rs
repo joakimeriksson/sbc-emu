@@ -209,6 +209,8 @@ pub struct Hart {
     pub jit_fence_seen: u64,
     /// the last illegal instruction (pc, encoding), for reports
     pub last_illegal: Option<(u64, u32)>,
+    /// a debugger's watch ranges (`run_debug` checks them; nothing else does)
+    pub watch: emu_core::debug::Watch,
 }
 
 impl Hart {
@@ -263,6 +265,7 @@ impl Hart {
             jit_tmp: 0,
             jit_fence_seen: 0,
             last_illegal: None,
+            watch: Default::default(),
         }
     }
 
@@ -310,8 +313,65 @@ impl Hart {
         n
     }
 
+    /// `run` for a debugger, one instruction at a time: stops in front of a breakpoint, after an
+    /// access in a watch range, and with the instructions executed.
+    #[cold]
+    #[inline(never)]
+    pub fn run_debug<B: Bus>(&mut self, bus: &mut B, budget: u64, k: usize, breakpoints: &mut emu_core::debug::Breakpoints) -> (u64, Option<emu_core::Stop>) {
+        let mut n = 0;
+        while n < budget {
+            if let Some(lines) = bus.irq_update() {
+                self.irq_lines = lines;
+            }
+            if self.mip() & self.mie != 0 {
+                self.wfi = false;
+                self.take_interrupt();
+            }
+            if self.wfi {
+                break;
+            }
+            if breakpoints.hit(k, self.pc) {
+                return (n, Some(emu_core::Stop::Breakpoint(k)));
+            }
+            if self.watch.is_empty() {
+                self.step(bus);
+            } else {
+                self.step_watched(bus);
+            }
+            n += 1;
+            if let Some((address, access)) = self.watch.hit.take() {
+                return (n, Some(emu_core::Stop::Watchpoint(k, address, access)));
+            }
+        }
+        (n, None)
+    }
+
+    /// `step`, checking the access the instruction makes (if it does not trap) against `watch`.
+    /// Here rather than in `load` and `store`, which the interpreter runs all the time.
+    #[cold]
+    #[inline(never)]
+    fn step_watched<B: Bus>(&mut self, bus: &mut B) {
+        use emu_core::debug::{WATCH_READ, WATCH_WRITE};
+        let (pc, traps) = (self.pc, self.traps);
+        let insn = self.fetch(bus, pc).map_or(0, |i| if i & 3 == 3 { i } else { rvc::expand(i as u16) });
+        let access = jit::mem_access(insn).map(|(rs1, imm, size, store)| (self.x[rs1].wrapping_add(imm), size as u64, store));
+        self.step(bus);
+        let Some((va, size, store)) = access.filter(|_| self.traps == traps) else { return };
+        let (amo, rd) = (insn & 0x7f == 0x2f, (insn >> 7) as usize & 31);
+        match (amo, insn >> 27) {
+            // a store-conditional that failed (rd = 1) stored nothing
+            (true, 0x03) if rd != 0 && self.x[rd] != 0 => {}
+            (true, f) if f != 0x02 && f != 0x03 => {
+                self.watch.check(va, size, WATCH_WRITE);
+                self.watch.check(va, size, WATCH_READ);
+            }
+            _ => self.watch.check(va, size, if store { WATCH_WRITE } else { WATCH_READ }),
+        }
+    }
+
     /// Fetch, decode and execute one instruction (taking any exception it raises).
-    #[inline]
+    // always: with a debugger's loops calling it too, `run` would otherwise call it out of line
+    #[inline(always)]
     pub fn step<B: Bus>(&mut self, bus: &mut B) {
         let pc = self.pc;
         let r = match self.fetch(bus, pc) {

@@ -102,6 +102,14 @@ pub trait Core {
     /// Halted by `waiti`/`wfi` until an interrupt arrives.
     fn waiting(&self) -> bool;
     fn insn_count(&self) -> u64;
+    /// Leave `waiti`/`wfi` (a debugger steps a sleeping core).
+    fn wake(&mut self) {}
+    /// A debugger's watch range on [addr, addr + len): `kind` 1 write, 2 read, 3 either. The
+    /// core checks them in its interpreter only, and runs interpreted while any is set.
+    fn watch(&mut self, _addr: u32, _len: u32, _kind: u8, _insert: bool) {}
+    /// The watch range hit since the last call: its address and the access (1 write, 2 read).
+    #[inline(always)]
+    fn take_watch_hit(&mut self) -> Option<(u32, u8)> { None }
     /// Present the SoC's interrupt state. Called after the machine re-derives it; must be cheap.
     fn set_irq(&mut self, irq: Self::Irq);
     /// An interrupt could be taken now (the idle skip is only allowed when this is false).

@@ -235,6 +235,10 @@ pub struct Cpu {
     pub hwlp_state: u32,
     /// decoded blocks (`block`, EX265); kept across a reset, but emptied by it
     pub blocks: crate::block::Blocks,
+    /// a debugger's watch ranges (address, length, 1 write | 2 read; interpreter only) and the
+    /// first access that hit one
+    pub watch: Vec<(u32, u32, u8)>,
+    pub watch_hit: Option<(u32, u8)>,
 }
 
 impl Default for Cpu {
@@ -253,7 +257,7 @@ impl Cpu {
             insn_count: 0, retired_count: 0, cycle_count: 0, cycle_base: 0, instret_base: 0, waiting: false, irq: None, misa: MISA_RV32IMC, isa_ext: 0,
             has_ext_ill: false, f: [0; 32], fcsr: 0, ext_ill: 0, ext_ill_all_fp: false, user_counters: false, clic: false, clic_std: false, mintthresh: 0, mtvt: 0, hartid: 0, mil: 0, clint_levels: Vec::new(), reservation: None, boundary_bloom: 0, csr_other: HashMap::new(),
             q: [0; 8], pie_sar: 0, pie_sar_byte: 0, pie_cfg: 0, pie_state: 0,
-            hwlp_start: [0; 2], hwlp_end: [0; 2], hwlp_count: [0; 2], hwlp_state: 0, blocks: crate::block::Blocks::default(),
+            hwlp_start: [0; 2], hwlp_end: [0; 2], hwlp_count: [0; 2], hwlp_state: 0, blocks: crate::block::Blocks::default(), watch: Vec::new(), watch_hit: None,
         }
     }
     pub fn new_rv32imac() -> Self { let mut c = Cpu::new(); c.misa = MISA_RV32IMAC; c }
@@ -290,8 +294,11 @@ impl Cpu {
         let (all_fp, isa_ext, privileged) = (self.ext_ill_all_fp, self.isa_ext, self.privileged);
         let mut blocks = std::mem::take(&mut self.blocks);
         blocks.flush();
+        // a debugger's watch ranges are not the chip's state either
+        let watch = std::mem::take(&mut self.watch);
         *self = Cpu::new();
         self.blocks = blocks;
+        self.watch = watch;
         self.insn_count = insns; self.retired_count = retired; self.cycle_count = cycles;
         self.cycle_base = cycles; self.instret_base = retired;
         self.misa = misa; self.has_ext_ill = ext_ill; self.user_counters = counters; self.clic = clic; self.clic_std = clic_std; self.hartid = hart; self.boundary_bloom = bloom; self.ext_ill_all_fp = all_fp; self.isa_ext = isa_ext; self.privileged = privileged;
@@ -338,6 +345,14 @@ impl Cpu {
     #[inline(always)]
     pub fn set(&mut self, r: u8, v: u32) { if r != 0 { self.x[r as usize] = v; } }
 
+    /// An access of `size` bytes at `va` (1 write, 2 read) against the watch ranges.
+    #[cold]
+    pub(crate) fn watch_check(&mut self, va: u32, size: u32, access: u8) {
+        if self.watch_hit.is_some() { return; }
+        if let Some(&(a, _, _)) = self.watch.iter().find(|&&(a, n, k)| k & access != 0 && (va.wrapping_sub(a) < n || a.wrapping_sub(va) < size)) {
+            self.watch_hit = Some((a, access));
+        }
+    }
     #[inline(always)]
     pub fn mie_enabled(&self) -> bool { self.mstatus & mstatus::MIE != 0 }
 

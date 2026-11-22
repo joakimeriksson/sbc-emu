@@ -267,6 +267,8 @@ pub struct Machine {
     mt: Option<mt::Mt>,
     pub irqs: u64,
     pub exceptions: u64,
+    /// a debugger's breakpoints (set through `debug_breakpoint`)
+    pub breakpoints: emu_core::debug::Breakpoints,
 }
 impl Machine {
     pub fn new(ram_bytes: usize) -> Result<Self,String> { Self::with_cpus(ram_bytes, 1) }
@@ -275,7 +277,7 @@ impl Machine {
         if !(128<<20..=2usize<<30).contains(&ram_bytes) {return Err("Orange Pi bring-up supports 128..2048 MiB RAM".into());}
         if !(1..=MAX_CPUS).contains(&ncpu) {return Err(format!("the RK3588S has 1..{MAX_CPUS} cores"));}
         let soc=Soc {ram:vec![0;ram_bytes], uart:Default::default(), mmc:Default::default(), gpu:Default::default(), gmac:Default::default(), net:None, gic:gic::Gic::with_cpus(ncpu),display:Default::default(),xhci:{let mut x=xhci::Xhci::new();x.attach(&[emu_core::usb::DevId::Keyboard,emu_core::usb::DevId::Tablet]);x},usb:Default::default(),pcie:Default::default(),audio:Default::default(),grf:grf::BLOCKS.map(|(_,s)|grf::Grf::new(s)),vop2:Default::default(),scmi:Default::default(),now:0,hdptx:vec![0;(grf::HDPTXPHY_SIZE/4) as usize],hdmi:hdmi_qp::HdmiQp::new(display::edid(&display::Mode::MODES[0])),next_net_poll:0,dirty:true,unknown:Vec::new()};
-        let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,multi:false,#[cfg(not(target_arch = "wasm32"))] mt:None,irqs:0,exceptions:0};
+        let mut m=Self{cpus:Vec::new(),state:vec![CoreState::Off;ncpu],soc,gpu_probe:false,dtb:Vec::new(),now:0,cur:0,next_check:0,round_end:u64::MAX,multi:false,#[cfg(not(target_arch = "wasm32"))] mt:None,irqs:0,exceptions:0,breakpoints:Default::default()};
         for k in 0..ncpu { let c=m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0]=CoreState::Run;
         Ok(m)
@@ -408,7 +410,7 @@ impl Machine {
     /// the same time; a core that is alone runs without rounds until something wakes another.
     pub fn run(&mut self,budget:u64)->Stop {
         #[cfg(not(target_arch = "wasm32"))]
-        if self.multi { return self.run_threaded(std::time::Duration::from_millis(10)); }
+        if self.multi && !self.debugging() { return self.run_threaded(std::time::Duration::from_millis(10)); }
         if self.cpus[0].mt { for c in self.cpus.iter_mut() { c.mt=false; } }
         let end=self.instret().saturating_add(budget);
         let mut total=self.instret();
@@ -441,9 +443,12 @@ impl Machine {
     fn slice(&mut self, k: usize, round_start: u64, total: &mut u64, end: u64, steps: &mut u64, storm: &mut u32) -> Option<Stop> {
         self.switch_to(k);
         self.catch_up(k,round_start);
+        // what a debugger has set only changes between runs
+        let (breaks,watches)=(!self.breakpoints.at.is_empty(),!self.cpus[k].watch.is_empty());
         loop {
             let t=self.cpus[k].now_ns();
             if t>=self.round_end || *total>=end || *steps==0 {return None;}
+            if breaks && self.breakpoints.hit(k,self.cpus[k].pc) {return Some(Stop::Breakpoint(k));}
             *steps-=1;
             if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret>=self.next_check {self.update();}
             let cpu=&mut self.cpus[k];
@@ -451,6 +456,7 @@ impl Machine {
             cpu.chain_until=i0.saturating_add(self.round_end-t).min(self.next_check).min(i0+(end-*total));
             let r=cpu.step(&mut self.soc);
             *total+=self.cpus[k].instret-i0;
+            if watches { if let Some((a,kind))=self.cpus[k].watch_hit.take() { if r.is_ok() {return Some(Stop::Watchpoint(k,a,kind));} } }
             if let Some(op)=self.cpus[k].tlbi_bcast.take() {
                 for (j,o) in self.cpus.iter_mut().enumerate() { if j!=k {o.tlb_invalidate(op);} }
             }
@@ -485,6 +491,60 @@ impl Machine {
                 Err(Trap::Hlt(n))=>return Some(Stop::Hlt(n)),
             }
         }
+    }
+    /// Whether a debugger has breakpoints or watchpoints set (the cores then take turns,
+    /// interpreted).
+    pub fn debugging(&self) -> bool { !self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty() || self.cpus.iter().any(|c|c.jit_off) }
+    fn set_debugging(&mut self) {
+        let on=!self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty();
+        for c in self.cpus.iter_mut() {c.jit_off=on;}
+    }
+    pub fn debug_breakpoint(&mut self, addr: u64, insert: bool) { self.breakpoints.set(addr,insert); self.set_debugging(); }
+    /// Watch [addr, addr + len) for accesses of `kind` (1 write, 2 read, 3 either) on every core.
+    pub fn debug_watch(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        for c in self.cpus.iter_mut() { c.watch.retain(|&w|w!=(addr,len,kind)); if insert {c.watch.push((addr,len,kind));} }
+        self.set_debugging();
+    }
+    /// Execute one instruction on core `k` (interpreter; a sleeping core is woken); a stop it
+    /// causes, if any. `run` does it, with the other cores off meanwhile.
+    #[cold]
+    pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
+        if self.state[k]==CoreState::Off {return None;}
+        let states=std::mem::replace(&mut self.state,vec![CoreState::Off;self.cpus.len()]);
+        self.state[k]=CoreState::Run;
+        let jit_off=std::mem::replace(&mut self.cpus[k].jit_off,true);
+        self.breakpoints.resume=Some((k,self.cpus[k].pc));
+        let stop=self.run(1);
+        self.breakpoints.resume=None;
+        self.cpus[k].jit_off=jit_off;
+        // a core the instruction started (PSCI) stays on
+        for (j,s) in states.into_iter().enumerate() { if j!=k && self.state[j]==CoreState::Off {self.state[j]=s;} }
+        (!matches!(stop,Stop::Budget|Stop::Idle(_))).then_some(stop)
+    }
+    /// Guest RAM at virtual address `va` as core `k` sees it.
+    pub fn debug_read(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<u8>> {
+        let mut out=Vec::with_capacity(len);
+        while out.len()<len {
+            let a=va.wrapping_add(out.len() as u64);
+            let pa=self.cpus[k].debug_translate(&mut self.soc,a)? as usize;
+            let n=(len-out.len()).min(0x1000-(a & 0xfff) as usize);
+            out.extend_from_slice(self.soc.ram.get(pa..pa.checked_add(n)?)?);
+        }
+        Some(out)
+    }
+    /// Write guest RAM at virtual address `va`; compiled code is dropped.
+    pub fn debug_write(&mut self, k: usize, va: u64, data: &[u8]) -> bool {
+        let mut done=0;
+        while done<data.len() {
+            let a=va.wrapping_add(done as u64);
+            let Some(pa)=self.cpus[k].debug_translate(&mut self.soc,a) else {return false};
+            let n=(data.len()-done).min(0x1000-(a & 0xfff) as usize);
+            let Some(dst)=(pa as usize).checked_add(n).and_then(|e|self.soc.ram.get_mut(pa as usize..e)) else {return false};
+            dst.copy_from_slice(&data[done..done+n]);
+            done+=n;
+        }
+        for c in self.cpus.iter_mut() { if let Some(j)=c.jit.as_deref_mut() {j.flush();} }
+        true
     }
     /// The core with MPIDR affinity `mpidr` (Aff1 = core, Aff0 = 0).
     fn target(&self, mpidr: u64) -> Option<usize> {
@@ -542,7 +602,7 @@ impl Machine {
         f.sys.time_base_ns=now; f.sys.time_base_instret=c.instret;
         f.el=el; f.spsel=true; f.daif=0xf<<6; f.pc=entry; f.x[0]=context;
         f.sys.cpacr_el1=3<<20;
-        f.jit_off=c.jit_off; f.crypto=c.crypto; f.mt=c.mt; f.wall_clock=c.wall_clock;
+        f.jit_off=c.jit_off; f.watch=c.watch.clone(); f.crypto=c.crypto; f.mt=c.mt; f.wall_clock=c.wall_clock;
         let mut old=std::mem::replace(c,f);
         old.hand_jit_to(c);
     }

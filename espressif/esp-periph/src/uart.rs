@@ -48,6 +48,8 @@ pub struct Uart { pub tx_out: Vec<u8>, pub int_raw: u32, pub int_ena: u32, layou
 impl Uart {
     pub fn new(layout: UartLayout) -> Self { Uart { tx_out: Vec::new(), int_raw: INT_ALWAYS, int_ena: 0, layout, rx: VecDeque::new(), ram: RegRam::new(), edges: 0, queue: VecDeque::new(), credit: 0 } }
     /// Bytes from the host into the receive FIFO; what does not fit is dropped and flagged RXFIFO_OVF.
+    /// Room in the RX FIFO.
+    pub fn rx_room(&self) -> usize { RX_FIFO_SIZE - self.rx.len().min(RX_FIFO_SIZE) }
     pub fn host_input(&mut self, data: &[u8]) {
         if self.autobaud_on() { self.edges = self.edges.saturating_add(9 * data.len() as u32).min(0x3ff); }
         for &b in data {

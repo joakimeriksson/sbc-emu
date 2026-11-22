@@ -10,4 +10,6 @@ rk3588 = { path = "../rk3588" }
 allwinner-h3 = { path = "../allwinner-h3" }
 rockchip-rk3288 = { path = "../rockchip-rk3288" }
 starfive-jh7110 = { path = "../starfive-jh7110" }
+esp32s31 = { path = "../espressif/esp32s31" }
+esp-soc = { path = "../espressif/esp-soc" }
 emu-core = { path = "../emu-core" }

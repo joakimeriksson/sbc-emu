@@ -874,6 +874,7 @@ impl Machine {
         f.x[0] = context;
         f.sys.cpacr_el1 = 3 << 20;
         f.jit_off = c.jit_off;
+        f.watch = c.watch.clone();
         f.crypto = c.crypto;
         f.mt = c.mt;
         f.wall_clock = c.wall_clock;

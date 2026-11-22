@@ -27,6 +27,8 @@ GitHub Actions runs the suite on every pull request and push to `main` ([.github
   interpreted and compiled (a plain store instead of the compare-and-swap loses ~70% of them).
 - `arm-a64/tests/system.rs`: exceptions, EL changes, MMU faults, timer interrupts.
 - `bcm2711/tests/watch.rs`: debugger watchpoints stop after the access, on the right core.
+- `cli/src/gdb.rs`: each board's machine under the gdb stub (memory, registers, steps, breakpoints,
+  watchpoints), a debugger that vanishes, a reset; `tools/gdb-check.py` does it on booted guests.
 - `tools/wasm-smoke.mjs`, `tools/wasm-smoke-sd.mjs`: headless boots of the WebAssembly build.
 - `tests/gpu/` + `scripts/gpu-gltest.txt`: OpenGL ES and Vulkan scenes rendered in the guest on the
   emulated V3D and on Mesa's software renderers, compared per pixel ([docs/gpu.md](gpu.md)).

@@ -3,6 +3,7 @@
 //! step stopped). No dependencies, no chip knowledge.
 
 pub mod snap;
+pub mod debug;
 pub mod disk;
 pub mod gpt;
 pub mod sdcard;

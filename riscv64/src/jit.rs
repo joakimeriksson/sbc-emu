@@ -338,7 +338,7 @@ fn interpret_bb<B: Bus>(h: &mut Hart, bus: &mut B, end: u64) {
 }
 
 /// The memory access an instruction makes: (base register, offset, size, store).
-fn mem_access(i: u32) -> Option<(usize, u64, u8, bool)> {
+pub(crate) fn mem_access(i: u32) -> Option<(usize, u64, u8, bool)> {
     let rs1 = ((i >> 15) & 31) as usize;
     let f3 = (i >> 12) & 7;
     let imm_i = ((i as i32) >> 20) as i64 as u64;

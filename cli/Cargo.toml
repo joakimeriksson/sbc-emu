@@ -16,3 +16,6 @@ arm-a32 = { path = "../arm-a32" }
 rockchip-rk3288 = { path = "../rockchip-rk3288" }
 starfive-jh7110 = { path = "../starfive-jh7110" }
 riscv64 = { path = "../riscv64" }
+riscv-rv32 = { path = "../riscv-rv32" }
+esp32s31 = { path = "../espressif/esp32s31" }
+esp-soc = { path = "../espressif/esp-soc" }

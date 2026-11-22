@@ -2,7 +2,7 @@
 //! Orange Pi One): option validation, `--script` automation, host stdin with the
 //! Ctrl-A x escape, wall-clock pacing of idle time and guest reset/power-off, and for
 //! boards with a display `--screenshot`, `--vnc` and the `screenshot FILE` script command.
-use crate::{arg, vnc::{Screen, Vnc}};
+use crate::{arg, gdb::{self, Gdb}, vnc::{Screen, Vnc}};
 use sbc_machine::{Machine as HostMachine, Stop};
 use std::{
     collections::VecDeque,
@@ -12,7 +12,7 @@ use std::{
 };
 
 /// A board machine as the serial loop needs it.
-pub(crate) trait SerialBoard {
+pub(crate) trait SerialBoard: gdb::Target {
     fn host(&mut self) -> HostMachine<'_>;
     /// Virtual time in nanoseconds.
     fn now(&self) -> u64;
@@ -84,14 +84,14 @@ fn screenshot<B: SerialBoard>(m: &mut B, tag: &str, path: &str) {
 /// Options every serial board accepts; `extra` lists board-specific valued options. A board
 /// that lists `--smp` there checks its core count itself; the others run one core.
 pub(crate) fn validate_options(args: &[String], extra: &[&str]) -> Result<(), String> {
-    const COMMON: [&str; 9] = [
+    const COMMON: [&str; 10] = [
         "--board", "--kernel", "--initrd", "--append", "--script", "--timeout", "--max-insns",
-        "--ram-mb", "--smp",
+        "--ram-mb", "--smp", "--gdb",
     ];
     let mut index = 1;
     while index < args.len() {
         let a = args[index].as_str();
-        if a.starts_with("--board=") || matches!(a, "--no-jit" | "--no-display" | "--sd-persist") {
+        if a.starts_with("--board=") || matches!(a, "--no-jit" | "--no-display" | "--sd-persist" | "--gdb-wait") {
             index += 1;
             continue;
         }
@@ -124,6 +124,9 @@ pub(crate) struct RunConfig {
     pub audio_out: Option<String>,
     /// What the board plays on HDMI, for boards where that is a separate output.
     pub hdmi_audio_out: Option<String>,
+    /// The gdb stub's port (`--gdb PORT`), and whether to wait for a debugger before starting.
+    pub gdb: Option<u16>,
+    pub gdb_wait: bool,
 }
 
 impl RunConfig {
@@ -147,7 +150,12 @@ impl RunConfig {
         let (screenshot, vnc) = (arg(args, "--screenshot").map(str::to_owned), arg(args, "--vnc").map(str::to_owned));
         let audio_out = arg(args, "--audio-out").map(str::to_owned);
         let hdmi_audio_out = arg(args, "--hdmi-audio-out").map(str::to_owned);
-        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out, hdmi_audio_out })
+        let gdb = arg(args, "--gdb").map(|p| p.trim_start_matches("tcp::").parse::<u16>()).transpose().map_err(|_| "--gdb needs a port number")?;
+        let gdb_wait = args.iter().any(|a| a == "--gdb-wait");
+        if gdb_wait && gdb.is_none() {
+            return Err("--gdb-wait needs --gdb PORT".into());
+        }
+        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out, hdmi_audio_out, gdb, gdb_wait })
     }
 }
 
@@ -183,6 +191,10 @@ pub(crate) fn run<B: SerialBoard>(
         Some(_) => return Err("--hdmi-audio-out: this board has no separate HDMI audio output".into()),
         None => None,
     };
+    let mut gdb = match config.gdb {
+        Some(port) => Some(Gdb::listen(port).map_err(|e| format!("--gdb {port}: {e}"))?),
+        None => None,
+    };
     let _terminal = crate::terminal::RawTty::enable();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -202,11 +214,20 @@ pub(crate) fn run<B: SerialBoard>(
     // how much of `serial` the current wait-serial has searched without a match (searching
     // all of it again on every pass made long boots quadratic)
     let mut searched = 0usize;
-    let start = Instant::now();
+    let mut start = Instant::now();
     let mut anchor = Instant::now();
     let mut escape = false;
     // `sleep SECS`: the script waits until this virtual time (ns)
     let mut sleep_until: Option<u64> = None;
+    if let Some(g) = gdb.as_mut().filter(|_| config.gdb_wait) {
+        g.wait_for_client();
+        let core = m.stopped_core();
+        if let gdb::Resume::Kill = g.halted(&mut m, core, 5, false) {
+            return Ok(());
+        }
+        start = Instant::now();
+        anchor = Instant::now();
+    }
     let result = 'run: loop {
         let mut input = std::mem::take(&mut idle_input);
         while let Ok(b) = rx.try_recv() {
@@ -258,6 +279,9 @@ pub(crate) fn run<B: SerialBoard>(
                 }
                 "reset" => {
                     m = make_machine()?;
+                    if let Some(g) = gdb.as_ref() {
+                        g.rearm(&mut m);
+                    }
                     anchor = Instant::now();
                     serial.clear();
                     searched = 0;
@@ -330,8 +354,21 @@ pub(crate) fn run<B: SerialBoard>(
         if let (Some(v), Some(screen)) = (vnc.as_mut(), m.screen()) {
             v.poll(screen);
         }
-        let budget = (config.max_insns - m.instret()).min(1_000_000);
-        let stop = m.host().run(budget);
+        if let Some(g) = gdb.as_mut() {
+            let p = g.poll(&mut m);
+            if !matches!(p, gdb::Poll::Running) {
+                let halted = Instant::now();
+                let core = m.stopped_core();
+                if let gdb::Resume::Kill = g.halted(&mut m, core, 2, matches!(p, gdb::Poll::Interrupt)) {
+                    break Ok(());
+                }
+                // halted time is neither guest idle time nor part of --timeout
+                start += halted.elapsed();
+                anchor += halted.elapsed();
+            }
+        }
+        let budget = (config.max_insns.saturating_sub(m.instret())).min(1_000_000);
+        let mut stop = m.host().run(budget);
         if let Some(a) = audio.as_mut() {
             let (rate, samples) = m.take_audio();
             a.push(rate, &samples);
@@ -346,6 +383,22 @@ pub(crate) fn run<B: SerialBoard>(
             output.flush().map_err(|e| e.to_string())?;
             crate::script::append_serial(&mut serial, &bytes);
         }
+        // a debugger looks at its own stops and at those that would end the run
+        if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
+            if let Some((core, sig)) = g.stop_signal(&stop, m.stopped_core()) {
+                let halted = Instant::now();
+                if let gdb::Resume::Kill = g.halted(&mut m, core, sig, true) {
+                    break Ok(());
+                }
+                start += halted.elapsed();
+                anchor += halted.elapsed();
+                stop = Stop::Budget;
+            }
+        }
+        if let Stop::Breakpoint(_) | Stop::Watchpoint(..) = stop {
+            // the debugger went away while the guest ran
+            stop = Stop::Budget;
+        }
         match stop {
             Stop::Budget => {}
             Stop::Idle(deadline) => {
@@ -353,8 +406,11 @@ pub(crate) fn run<B: SerialBoard>(
                 let wall = anchor.elapsed().as_nanos() as u64;
                 if wall <= m.now() {
                     let wait = Duration::from_nanos(deadline.saturating_sub(wall).min(20_000_000).max(1));
-                    if let Ok(b) = rx.recv_timeout(wait) {
-                        idle_input.push(b);
+                    match rx.recv_timeout(wait) {
+                        Ok(b) => idle_input.push(b),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        // standard input ended: there is nothing to wait on but time
+                        Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(wait),
                     }
                 }
                 let target = deadline.min((anchor.elapsed().as_nanos() as u64).max(m.now()));
@@ -362,6 +418,9 @@ pub(crate) fn run<B: SerialBoard>(
             }
             Stop::Reset => {
                 m = make_machine()?;
+                if let Some(g) = gdb.as_ref() {
+                    g.rearm(&mut m);
+                }
                 if audio.is_some() {
                     m.capture_audio();
                 }

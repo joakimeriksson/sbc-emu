@@ -89,6 +89,11 @@ pub struct Machine<S: Soc> {
     pub script: Script,
     pub max_cycles: u64,
     pub console: Console,
+    /// a debugger's breakpoints (`debug_breakpoint`): pcs, their bloom, the (core, pc) reported
+    /// last (running on from there does not stop there again)
+    pub breakpoints: Vec<u32>,
+    bp_bloom: u64,
+    bp_resume: Option<(usize, u32)>,
     /// live web UI
     pub web: Option<WebServer>,
     pub camera_input: Option<std::sync::Arc<std::sync::Mutex<Option<crate::picture::Picture>>>>,
@@ -149,7 +154,7 @@ const BB_DEFAULT: u64 = match option_env!("ESP32SIM_BB_BUILD") {
 impl<S: Soc> Machine<S> {
     pub fn new(mac: [u8; 6], bus: S::Bus) -> Self {
         Machine {
-            web_restart: false, button_reset: false, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
+            web_restart: false, button_reset: false, breakpoints: Vec::new(), bp_bloom: 0, bp_resume: None, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
             cores: (0..S::CORES).map(|i| S::new_core_with_bus(i, &bus)).collect(), core_held: (0..S::CORES).map(|i| i > 0).collect(), quantum: QUANTUM, run_steps: 0, vq_stats: [0; 4], vq_skip: 0, vq_penalty: 0, vq_max: std::env::var("ESP32SIM_VQ").ok().and_then(|v| v.parse().ok()).unwrap_or(VQ_DEFAULT),
             bb_max: std::env::var("ESP32SIM_BB").ok().and_then(|v| v.parse().ok()).unwrap_or(BB_DEFAULT).min(4096), bb_stats: [0; 8],
             bus, symbols: BTreeMap::new(),
@@ -405,6 +410,7 @@ impl<S: Soc> Machine<S> {
         // the entry PC exact while retaining callbacks for combined BLOCK/TRAP observers.
         let budget = if self.probes.contains(Wants::TRAP_PC) { budget.min(1) } else { budget };
         S::select_core(&mut self.bus, core);
+        if self.bp_bloom != 0 { if let Some(stop) = self.breakpoint_hit(core) { return (0, Some(stop)); } }
         let cpu = &mut self.cores[core];
         let pc = cpu.pc();
         // stubs and probes are block boundaries, so testing them at block start is exact
@@ -417,7 +423,47 @@ impl<S: Soc> Machine<S> {
             if let Some(&ret) = self.stubs.get(&pc) { cpu.return_from_stub(&mut self.bus, ret); self.stub_hits += 1; return (1, None); }
         }
         let (used, trap) = cpu.run(&mut self.bus, budget);
-        self.finish_step(core, pc, used, trap)
+        let (used, stop) = self.finish_step(core, pc, used, trap);
+        if stop.is_none() { if let Some((a, kind)) = self.cores[core].take_watch_hit() { return (used, Some(Stop::Watchpoint(core, a, kind))); } }
+        (used, stop)
+    }
+
+    #[cold]
+    fn breakpoint_hit(&mut self, core: usize) -> Option<Stop> {
+        let cpu = &self.cores[core];
+        let pc = cpu.pc();
+        if cpu.waiting() || !self.breakpoints.contains(&pc) { return None; }
+        if self.bp_resume == Some((core, pc)) { self.bp_resume = None; return None; }
+        self.bp_resume = Some((core, pc));
+        Some(Stop::Breakpoint(pc))
+    }
+
+    /// A debugger's breakpoint at `addr`. Blocks and compiled code end in front of it.
+    pub fn debug_breakpoint(&mut self, addr: u32, insert: bool) {
+        self.breakpoints.retain(|&a| a != addr);
+        if insert { self.breakpoints.push(addr); }
+        self.bp_bloom = self.breakpoints.iter().fold(0, |m, &pc| m | pc_bit(pc));
+    }
+
+    /// The core that reported `Stop::Breakpoint` last.
+    pub fn debug_core(&self) -> usize { self.bp_resume.map_or(0, |(k, _)| k) }
+
+    /// Watch [addr, addr + len) for accesses of `kind` (1 write, 2 read, 3 either) on every core.
+    pub fn debug_watch(&mut self, addr: u32, len: u32, kind: u8, insert: bool) {
+        for c in &mut self.cores { c.watch(addr, len, kind, insert); }
+    }
+
+    /// Execute one instruction on `core` (a sleeping one is woken); a stop it causes, if any.
+    pub fn debug_step(&mut self, core: usize) -> Option<Stop> {
+        if core > 0 && S::core_state(&self.bus, core) != CoreState::Running { return None; }
+        self.refresh_irq();
+        self.cores[core].wake();
+        self.bp_resume = None;
+        let stop = self.step_core(core);
+        let watch = self.cores[core].take_watch_hit();
+        self.after_round(1);
+        self.drain_console();
+        stop.or(watch.map(|(a, kind)| Stop::Watchpoint(core, a, kind)))
     }
 
     /// The completion of a dispatch at `pc` that retired `used` iterations: observers, trap counts,
@@ -568,7 +614,7 @@ impl<S: Soc> Machine<S> {
         self.stub_bloom = self.stubs.keys().chain(S::function_hooks(&self.bus)).fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for c in &mut self.cores {
-            c.set_boundaries(self.stub_bloom | self.probe_bloom);
+            c.set_boundaries(self.stub_bloom | self.probe_bloom | self.bp_bloom);
             c.set_block_observation(self.probes.contains(Wants::BLOCK | Wants::TRAP_PC));
         }
         // Per-instruction observers need the slow hooks; only exact-PC trap observers use bounded fragments.
@@ -672,7 +718,7 @@ impl<S: Soc> Machine<S> {
             // decided: each core runs one whole quantum in index order. Run K of those rounds in
             // one batch and close them in one fold, with the same per-core budgets and order.
             if can_batch && busy == usize::MAX {
-                let (mut enabled, mut all_busy) = (0u32, true);
+                let (mut enabled, mut all_busy) = (0u32, self.bp_bloom == 0);
                 for i in 0..S::CORES { if on[i] { enabled += 1; all_busy &= !idle[i]; } }
                 if all_busy && enabled > 1 {
                     let k = self.bb_quanta(max_insns - n, n);
@@ -944,7 +990,7 @@ impl<S: Soc> Machine<S> {
         self.stub_bloom = self.stubs.keys().chain(S::function_hooks(&self.bus)).fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for c in &mut self.cores {
-            c.set_boundaries(self.stub_bloom | self.probe_bloom);
+            c.set_boundaries(self.stub_bloom | self.probe_bloom | self.bp_bloom);
             c.set_block_observation(self.probes.contains(Wants::BLOCK | Wants::TRAP_PC));
         }
         let blocks = !self.probes.contains(Wants::INSN);
