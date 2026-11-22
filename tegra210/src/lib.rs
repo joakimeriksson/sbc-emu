@@ -1,13 +1,16 @@
 //! NVIDIA Tegra X1 (T210) and the Jetson Nano: four Cortex-A57 cores, a GIC-400, the
 //! Tegra timers, clock/reset controller and PMC, UART A, the fuses and chip ID, I²C with the
 //! MAX77620 PMIC, GPIO, the SDMMC controllers, PCIe with the RTL8111H Ethernet controller, USB
-//! 3.0 (XUSB), and RAM at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host (the
+//! 3.0 (XUSB), the display controllers with HDMI, the SMMU, host1x, and RAM at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host (the
 //! role of the secure monitor on a real Nano). Device addresses no model claims behave
 //! as read-back registers, and their pages are logged, so drivers probe without faults.
 //! Plan: docs/jetson-nano-plan.md.
+pub mod apbdma;
 pub mod boot;
 pub mod car;
+pub mod dc;
 pub mod gpio;
+pub mod host1x;
 pub mod i2c;
 pub mod max77620;
 pub mod padctl;
@@ -15,11 +18,14 @@ pub mod pcie;
 pub mod pmc;
 pub mod rtl8168;
 pub mod sdhci;
+pub mod smmu;
+pub mod sor;
 pub mod timer;
 pub mod xusb;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
+pub use peripherals::dw_hdmi::Mode;
 use peripherals::{Gic, Uart};
 
 pub const RAM_BASE: u64 = 0x8000_0000;
@@ -41,6 +47,9 @@ pub const I2C: [(u64, usize); 6] =
 /// their numbers in the clock and reset controller
 const I2C_RESETS: [usize; 6] = [12, 54, 67, 103, 47, 166];
 pub const I2C5: usize = 4;
+/// The VI's I2C controller.
+const I2C_VI_RESET: usize = 208;
+const I2C_VI_IRQ: usize = 32 + 17;
 /// The SDMMC controllers, 0x200 apart, and their interrupts; the microSD slot is on SDMMC1.
 pub const SDMMC: u64 = 0x700b_0000;
 pub const SDMMC_IRQS: [usize; 4] = [32 + 0x0e, 32 + 0x0f, 32 + 0x13, 32 + 0x1f];
@@ -52,13 +61,13 @@ pub const PADCTL: u64 = 0x7009_f000;
 const PCIE_X_RESET: usize = 74;
 /// The Ethernet controller's address: sbc-emu's locally administered one.
 const MAC: [u8; 6] = [0x02, 0x53, 0x42, 0x4e, 0x4e, 0x01];
+/// The HDMI connector's hot-plug pin: low with a monitor. Its DDC is on I²C4.
+pub const HDMI_HPD: usize = 0xe1;
+const DDC: usize = 3;
+/// Its registers are four times as far apart as the other I²C controllers'.
+const I2C_VI: u64 = 0x546c_0c00;
 pub const PMC: u64 = 0x7000_e400;
 pub const FUSE: u64 = 0x7000_f800;
-/// The memory controller: its DMA-flush handshake is modelled, the rest reads back.
-pub const MC: u64 = 0x7001_9000;
-/// (control, status) register pairs of the memory controller's client hot resets: a
-/// client whose DMA is blocked (control bit set) is idle at once (status bit set).
-const MC_HOTRESET: [(u64, u64); 2] = [(0x200, 0x204), (0x970, 0x974)];
 /// Every device of the SoC (and PCIe) lies here; RAM starts where it ends.
 const DEVICE_WINDOW: (u64, u64) = (0x0100_0000, RAM_BASE);
 
@@ -98,6 +107,15 @@ pub struct Soc {
     pub xusb: xusb::Xusb,
     /// the emulated USB devices: a keyboard and a tablet, and a stick on request
     pub usb: emu_core::usb::Devices,
+    pub apbdma: apbdma::ApbDma,
+    /// the camera's I²C controller, inside the display's address range
+    pub i2c_vi: i2c::TegraI2c,
+    /// the monitor's own mode
+    pub monitor: Option<(u32, u32)>,
+    pub smmu: smmu::Smmu,
+    pub host1x: host1x::Host1x,
+    pub dc: [dc::Dc; 2],
+    pub sor: [sor::Sor; 2],
     /// the network behind the Ethernet port, and when to poll it next (ns)
     pub net: Option<sbc_net::net::VirtualNet>,
     net_next: u64,
@@ -153,6 +171,18 @@ impl Soc {
             self.padctl.read(word - PADCTL)
         } else if at(xusb::BASE, xusb::SIZE) {
             self.xusb.read(word - xusb::BASE)
+        } else if at(apbdma::BASE, apbdma::SIZE) {
+            self.apbdma.read(word - apbdma::BASE)
+        } else if let Some(o) = word.checked_sub(I2C_VI).filter(|&o| o < 0x400) {
+            self.i2c_vi.read(o >> 2)
+        } else if at(smmu::BASE, smmu::SIZE) {
+            self.smmu.read(word - smmu::BASE)
+        } else if at(host1x::BASE, host1x::SIZE) {
+            self.host1x.read(word - host1x::BASE)
+        } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
+            self.dc[k].read(word - dc::BASE[k])
+        } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {
+            self.sor[k].read(word - sor::BASE[k])
         } else if at(GPIO, gpio::SIZE) {
             self.gpio.read(word - GPIO)
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
@@ -162,8 +192,6 @@ impl Soc {
             self.fuse.get(&o).copied().unwrap_or_else(|| fuse_preset(o))
         } else if word == APBMISC + 4 {
             HIDREV
-        } else if let Some(&(control, _)) = MC_HOTRESET.iter().find(|&&(_, s)| word == MC + s) {
-            self.stub_read(MC + control)
         } else if (DEVICE_WINDOW.0..DEVICE_WINDOW.1).contains(&word) {
             self.stub_read(word)
         } else {
@@ -183,11 +211,25 @@ impl Soc {
             self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
             let usb_reset = self.car.in_reset(xusb::RESET);
+            let dc_reset = dc::RESETS.map(|id| self.car.in_reset(id));
             self.car.write(word - CAR, value);
             if !usb_reset && self.car.in_reset(xusb::RESET) {
                 self.xusb.reset(&mut self.usb);
             }
             self.pcie.set_reset(self.car.in_reset(PCIE_X_RESET));
+            for ((d, id), was) in self.dc.iter_mut().zip(dc::RESETS).zip(dc_reset) {
+                if !was && self.car.in_reset(id) {
+                    d.reset();
+                }
+            }
+            for (s, id) in self.sor.iter_mut().zip(sor::RESETS) {
+                if self.car.in_reset(id) {
+                    *s = Default::default();
+                }
+            }
+            if self.car.in_reset(I2C_VI_RESET) {
+                self.i2c_vi.reset();
+            }
             for (c, &id) in self.i2c.iter_mut().zip(&I2C_RESETS) {
                 if self.car.in_reset(id) {
                     c.reset();
@@ -200,6 +242,19 @@ impl Soc {
         } else if at(xusb::BASE, xusb::SIZE) {
             let mut dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
             self.xusb.write(word - xusb::BASE, value, &mut dma, &mut self.usb);
+        } else if at(apbdma::BASE, apbdma::SIZE) {
+            self.apbdma.write(word - apbdma::BASE, value);
+        } else if let Some(o) = word.checked_sub(I2C_VI).filter(|&o| o < 0x400) {
+            self.i2c_vi.write(o >> 2, value, self.now);
+        } else if at(smmu::BASE, smmu::SIZE) {
+            self.smmu.write(word - smmu::BASE, value);
+        } else if at(host1x::BASE, host1x::SIZE) {
+            let dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
+            self.host1x.write(word - host1x::BASE, value, &self.smmu, &dma);
+        } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
+            self.dc[k].write(word - dc::BASE[k], value, self.now);
+        } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {
+            self.sor[k].write(word - sor::BASE[k], value);
         } else if at(GPIO, gpio::SIZE) {
             self.gpio.write(word - GPIO, value);
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
@@ -278,14 +333,26 @@ impl Soc {
         self.now = self.now.max(now);
         self.timers.service(self.now);
         self.gic.set_level(UARTA_IRQ, self.uart.irq());
+        self.apbdma.run(&mut sdhci::Dma { ram: &mut self.ram, base: RAM_BASE }, &mut I2cFifos { i2c: &mut self.i2c, now: self.now });
+        for k in 0..32 {
+            self.gic.set_level(apbdma::irq_of(k), self.apbdma.irq(k));
+        }
         for (c, &(_, irq)) in self.i2c.iter().zip(&I2C) {
             self.gic.set_level(irq, c.irq());
         }
+        self.gic.set_level(I2C_VI_IRQ, self.i2c_vi.irq());
         for (c, &irq) in self.sd.iter().zip(&SDMMC_IRQS) {
             self.gic.set_level(irq, c.irq());
         }
         self.xusb.xhci.tick(self.now, &mut sdhci::Dma { ram: &mut self.ram, base: RAM_BASE }, &mut self.usb);
         self.gic.set_level(xusb::IRQ, self.xusb.irq());
+        for (d, &irq) in self.dc.iter_mut().zip(&dc::IRQS) {
+            if let Some((point, n)) = d.tick(self.now) {
+                (0..n).for_each(|_| self.host1x.increment(point));
+            }
+            self.gic.set_level(irq, d.irq());
+        }
+        self.gic.set_level(host1x::IRQ, self.host1x.irq());
         self.pump_network();
         self.pcie.update();
         self.gic.set_level(pcie::IRQ, self.pcie.irq());
@@ -325,7 +392,35 @@ impl Soc {
 
     fn next_event(&self) -> Option<u64> {
         let net = (self.net.is_some() && self.pcie.nic.receiving()).then_some(self.net_next);
-        self.timers.next_event().into_iter().chain(net).chain(self.xusb.xhci.next_event(&self.usb)).min()
+        self.timers.next_event().into_iter().chain(net).chain(self.xusb.xhci.next_event(&self.usb)).chain(self.dc.iter().filter_map(|d| d.next_event())).min()
+    }
+}
+
+/// The I²C controllers' FIFOs, as the APB DMA reaches them.
+struct I2cFifos<'a> {
+    i2c: &'a mut [i2c::TegraI2c; 6],
+    now: u64,
+}
+
+impl I2cFifos<'_> {
+    fn at(&mut self, apb: u64) -> Option<(&mut i2c::TegraI2c, u64)> {
+        let k = I2C.iter().position(|&(b, _)| (b..b + i2c::SIZE).contains(&apb))?;
+        Some((&mut self.i2c[k], apb - I2C[k].0))
+    }
+}
+
+impl apbdma::Fifo for I2cFifos<'_> {
+    fn ready(&mut self, apb: u64, to_peripheral: bool) -> bool {
+        self.at(apb).is_some_and(|(c, _)| if to_peripheral { c.has_room() } else { c.has_data() })
+    }
+    fn take(&mut self, apb: u64) -> u32 {
+        self.at(apb).map_or(0, |(c, o)| c.read(o))
+    }
+    fn put(&mut self, apb: u64, v: u32) {
+        let now = self.now;
+        if let Some((c, o)) = self.at(apb) {
+            c.write(o, v, now);
+        }
     }
 }
 
@@ -413,6 +508,13 @@ impl Machine {
             padctl: Default::default(),
             xusb: Default::default(),
             usb: Default::default(),
+            apbdma: Default::default(),
+            i2c_vi: Default::default(),
+            monitor: None,
+            smmu: Default::default(),
+            host1x: Default::default(),
+            dc: Default::default(),
+            sor: Default::default(),
             net: None,
             net_next: 0,
             fuse: Default::default(),
@@ -422,6 +524,8 @@ impl Machine {
             stub_pages: Vec::new(),
             log_stub_pages: false,
         };
+        let mut soc = soc;
+        soc.gpio.set_input(HDMI_HPD, true);
         let mut m = Self { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, cur: 0, next_check: 0, round_end: u64::MAX, irqs: 0, exceptions: 0, breakpoints: Default::default(), debugging: false, jit_off_before: vec![false; ncpu] };
         for k in 0..ncpu {
             let c = m.fresh_cpu(k);
@@ -471,6 +575,28 @@ impl Machine {
         self.soc.net = Some(net);
         self.soc.pcie.nic.set_link(true);
         self.soc.dirty = true;
+    }
+
+    /// Connect a monitor to HDMI.
+    pub fn connect_monitor(&mut self, mode: &Mode) {
+        self.soc.i2c[DDC].attach(0x50, Box::new(peripherals::dw_hdmi::EdidEeprom::new(mode)));
+        let totals = (mode.width + mode.hfp + mode.hsync + mode.hbp, mode.height + mode.vfp + mode.vsync + mode.vbp, mode.clock_khz);
+        self.soc.dc.iter_mut().for_each(|d| d.mode = Some(totals));
+        self.soc.monitor = Some((mode.width, mode.height));
+        self.soc.gpio.set_input(HDMI_HPD, false);
+        self.soc.dirty = true;
+    }
+
+    /// The picture on HDMI as RGBA.
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let s = &self.soc;
+        let dma = peripherals::dma::Ram { ram: &s.ram, base: RAM_BASE };
+        [smmu::Group::Dc, smmu::Group::DcB].into_iter().zip(&s.dc).find_map(|(g, d)| d.render(g, &s.smmu, &dma, out))
+    }
+
+    /// The size of the picture on HDMI.
+    pub fn screen_size(&self) -> Option<(u32, u32)> {
+        self.soc.dc.iter().find(|d| d.running())?.size()
     }
 
     /// Plug a USB stick in.

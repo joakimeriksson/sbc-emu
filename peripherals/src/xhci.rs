@@ -135,6 +135,9 @@ const MIN_HOLD_NS: u64 = 1000;
 /// Addresses have 52 bits here, so that sums of them do not overflow.
 const ADDRESS: u64 = (1 << 52) - 1;
 
+/// Segments looked at (HCSPARAMS2 allows two).
+const MAX_SEGMENTS: u32 = 16;
+
 /// Events kept while the driver's ring is full.
 const MAX_PENDING: usize = 4096;
 
@@ -362,7 +365,9 @@ impl Xhci {
                 let w = if off == 0x638 { lo(self.erdp) } else { hi(self.erdp) };
                 // EHB is write-1-to-clear
                 self.erdp = (w & !0xf) | (w & 7) | if off == 0x638 && v & 8 != 0 { 0 } else { ehb };
-                while let (Some(&(param, status, control)), false) = (self.pending.front(), self.ring_full(ram)) {
+                // (a low half that points nowhere waits for the high one)
+                let valid = self.in_ring(ram, self.erdp & !0xf);
+                while let (Some(&(param, status, control)), true) = (self.pending.front(), valid && !self.ring_full(ram)) {
                     self.pending.pop_front();
                     self.put(ram, param, status, control);
                 }
@@ -378,7 +383,7 @@ impl Xhci {
             o if (DB..DB + 4 * (MAX_SLOTS as u64 + 1)).contains(&o) => {
                 if self.usbcmd & CMD_RS == 0 { return; }
                 let slot = ((o - DB) / 4) as usize;
-                if slot == 0 { self.crr = true; self.run_commands(ram, devs); return; }
+                if slot == 0 { self.crr = true; self.stopping = false; self.run_commands(ram, devs); return; }
                 // ringing a stopped endpoint restarts it (a halted one waits for Reset Endpoint)
                 let dci = (v & 0xff) as usize;
                 if slot <= MAX_SLOTS && (1..32).contains(&dci) && self.slots[slot].eps[dci].state == EP_STOPPED {
@@ -428,6 +433,14 @@ impl Xhci {
     }
 
     fn enqueue_addr(&self, ram: &Dma) -> u64 { self.segment(ram, self.ev_seg).0.wrapping_add(16 * self.ev_idx as u64) }
+
+    /// Whether an address is in a segment of the event ring.
+    fn in_ring(&self, ram: &Dma, a: u64) -> bool {
+        (0..self.erstsz.min(MAX_SEGMENTS)).any(|s| {
+            let (base, size) = self.segment(ram, s);
+            a.checked_sub(base).is_some_and(|o| o < 16 * size as u64)
+        })
+    }
 
     /// The slot after the next one is the driver's dequeue pointer.
     fn ring_full(&self, ram: &Dma) -> bool {

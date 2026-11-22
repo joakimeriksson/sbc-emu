@@ -1,0 +1,13 @@
+# Jetson Nano: HDMI in the Debian-kernel guest (scripts/jetson-nano-debian-fixture.sh): tegra-drm reads
+# the monitor's EDID and shows the console (--hdmi-mode 1280x720, the default)
+wait-serial jetson-nano#
+sleep 4
+serial grep -q 'disconnected' /sys/class/drm/card0-DP-1/status && grep -q '^connected' /sys/class/drm/card0-HDMI-A-1/status && printf 'HPD_%s' OK; echo\r
+wait-serial HPD_OK
+serial head -n1 /sys/class/drm/card0-HDMI-A-1/modes | grep -q 1280x720 && printf 'EDID_%s' OK; echo\r
+wait-serial EDID_OK
+serial cat /sys/class/graphics/fb0/virtual_size | grep -q 1280,720 && printf 'FB_%s' OK; echo\r
+wait-serial FB_OK
+serial echo 0 > /sys/class/graphics/fbcon/cursor_blink; head -c 3686400 /dev/urandom > /tmp/a; cat /tmp/a > /dev/fb0; sleep 1; head -c 3686400 /dev/fb0 | cmp - /tmp/a && printf 'RW_%s' OK; echo\r
+wait-serial RW_OK
+quit

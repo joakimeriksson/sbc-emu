@@ -52,7 +52,7 @@ cp "$src/modules.builtin" "$src/modules.builtin.modinfo" "$src/modules.order" "$
 # drivers of the board, and what each of them needs (modules.dep is made in the guest)
 find "$src/kernel" -name '*.ko.xz' > "$work/modules"
 todo="i2c-tegra fixed gpio-regulator max77620-regulator pwm-tegra pwm-regulator sdhci-tegra ext4 crc32c_generic
-    phy-tegra-xusb r8169 realtek af_packet xhci-tegra usbhid hid-generic evdev usb-storage sd_mod"
+    phy-tegra-xusb r8169 realtek af_packet xhci-tegra usbhid hid-generic evdev usb-storage sd_mod tegra-drm"
 done=" "
 while [ -n "$todo" ]; do
     set -- $todo
@@ -87,7 +87,7 @@ mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 depmod -a
 for m in pwm-tegra fixed gpio-regulator i2c-tegra max77620-regulator pwm-regulator sdhci-tegra crc32c_generic ext4 phy-tegra-xusb realtek r8169 af_packet \
-    usbhid hid-generic evdev sd_mod usb-storage xhci-tegra; do
+    usbhid hid-generic evdev sd_mod usb-storage xhci-tegra tegra-drm; do
     modprobe $m || echo "modprobe $m failed"
 done
 # root=/dev/..., LABEL= or UUID= (BusyBox finds no PARTUUID=); "card" is the first ext4 partition of the microSD
