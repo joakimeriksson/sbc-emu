@@ -8,4 +8,10 @@ serial md5sum /dev/sda | grep -q 96995b58d4cbf6aaa9041b4f00c7f6ae && printf 'STI
 wait-serial STICK_OK
 serial grep -q xhci-hcd /proc/interrupts && printf 'IRQ_%s' OK; echo\r
 wait-serial IRQ_OK
+# the controller is powered down when its root hubs are idle, and comes back
+serial P=/sys/bus/platform/devices/70090000.usb/power/runtime_status; D="/sys/block/sda/device/power /sys/bus/usb/devices/*/power"; for d in $D; do echo 500 > $d/autosuspend_delay_ms; echo auto > $d/control; done 2>/dev/null\r
+serial n=0; until grep -q suspended $P || [ $n = 30 ]; do sleep 1; n=$((n+1)); done; grep -q suspended $P && printf 'IDLE_%s' OK; echo\r
+wait-serial IDLE_OK
+serial for d in $D; do echo on > $d/control; done; sleep 3; md5sum /dev/sda | grep -q 96995b58d4cbf6aaa9041b4f00c7f6ae && grep -q active $P && printf 'RESUME_%s' OK; echo\r
+wait-serial RESUME_OK
 quit

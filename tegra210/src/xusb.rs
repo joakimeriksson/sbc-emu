@@ -60,7 +60,8 @@ impl Default for Xusb {
 impl Xusb {
     /// A keyboard and a tablet, and a USB stick on request.
     pub fn attach(&mut self, stick: bool) {
-        self.xhci.attach(&[stick.then_some(DevId::Storage), Some(DevId::Keyboard), Some(DevId::Tablet)]);
+        // (the first USB 2 port is the micro-B connector: a device, not a host)
+        self.xhci.attach(&[None, stick.then_some(DevId::Storage), Some(DevId::Keyboard), Some(DevId::Tablet)]);
     }
 
     /// The controller was held in reset, or its power was off: the firmware is gone.
@@ -169,8 +170,8 @@ mod tests {
         assert_eq!(x.read(0x24) & 1 << 11, 0);
         assert_eq!(x.read(4) >> 24, 8, "eight root ports");
         assert_eq!((x.read(0x508), x.read(0x518)), (4 << 8 | 5, 4 << 8 | 1));
-        // the keyboard is on port 6
-        assert_eq!((x.read(0x420 + 0x10 * 4) & 1, x.read(0x420 + 0x10 * 5) & 1), (0, 1));
+        // the keyboard is on the third USB 2 port, the stick (none here) on the second
+        assert_eq!([4, 5, 6, 7].map(|k| x.read(0x420 + 0x10 * k) & 1), [0, 0, 1, 1]);
         let mut d = Dma { ram: &mut [], base: 0x8000_0000 };
         x.write(FPCI + MBOX_OWNER, 2, &mut d, &mut devs);
         assert_eq!(x.read(FPCI + MBOX_OWNER), 2);
@@ -180,6 +181,6 @@ mod tests {
         assert_eq!((x.read(FPCI + MBOX_OWNER), x.messages), (0, 1));
         x.reset(&mut devs);
         assert_ne!(x.read(0x24) & 1 << 11, 0);
-        assert_eq!(x.read(0x420 + 0x10 * 5) & 1, 1, "the keyboard is still plugged in");
+        assert_eq!(x.read(0x420 + 0x10 * 6) & 1, 1, "the keyboard is still plugged in");
     }
 }

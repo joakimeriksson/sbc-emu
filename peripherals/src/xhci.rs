@@ -31,9 +31,11 @@ const DB: u64 = 0x800;
 const CMD_RS: u32 = 1 << 0;
 const CMD_HCRST: u32 = 1 << 1;
 const CMD_INTE: u32 = 1 << 2;
+const CMD_CRS: u32 = 1 << 9;
 const STS_HCH: u32 = 1 << 0;
 const STS_EINT: u32 = 1 << 3;
 const STS_PCD: u32 = 1 << 4;
+const STS_SRE: u32 = 1 << 10;
 const STS_CNR: u32 = 1 << 11;
 
 // PORTSC
@@ -107,6 +109,10 @@ pub struct Xhci {
     erstsz: u32,
     erstba: u64,
     erdp: u64,
+    /// the command ring was just stopped by a write to CRCR's low half
+    stopping: bool,
+    /// events that wait for room in the ring
+    pending: std::collections::VecDeque<(u64, u32, u32)>,
     /// event ring producer: segment, index, cycle state
     ev_seg: u32,
     ev_idx: u32,
@@ -119,14 +125,23 @@ pub struct Xhci {
 }
 
 fn rd32(ram: &Dma, a: u64) -> u32 { ram.get(a, 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())) }
-fn rd64(ram: &Dma, a: u64) -> u64 { rd32(ram, a) as u64 | (rd32(ram, a + 4) as u64) << 32 }
+fn rd64(ram: &Dma, a: u64) -> u64 { rd32(ram, a) as u64 | (rd32(ram, a.wrapping_add(4)) as u64) << 32 }
 fn wr32(ram: &mut Dma, a: u64, v: u32) { if let Some(b) = ram.slice(a, 4) { b.copy_from_slice(&v.to_le_bytes()); } }
-fn wr64(ram: &mut Dma, a: u64, v: u64) { wr32(ram, a, v as u32); wr32(ram, a + 4, (v >> 32) as u32); }
+fn wr64(ram: &mut Dma, a: u64, v: u64) { wr32(ram, a, v as u32); wr32(ram, a.wrapping_add(4), (v >> 32) as u32); }
+
+/// The shortest time between an interrupt's acknowledgement and the next one.
+const MIN_HOLD_NS: u64 = 1000;
+
+/// Addresses have 52 bits here, so that sums of them do not overflow.
+const ADDRESS: u64 = (1 << 52) - 1;
+
+/// Events kept while the driver's ring is full.
+const MAX_PENDING: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct Trb { addr: u64, param: u64, status: u32, control: u32 }
 impl Trb {
-    fn read(ram: &Dma, a: u64) -> Trb { Trb { addr: a, param: rd64(ram, a), status: rd32(ram, a + 8), control: rd32(ram, a + 12) } }
+    fn read(ram: &Dma, a: u64) -> Trb { Trb { addr: a, param: rd64(ram, a), status: rd32(ram, a.wrapping_add(8)), control: rd32(ram, a.wrapping_add(12)) } }
     fn ty(&self) -> u32 { (self.control >> 10) & 0x3f }
     fn cycle(&self) -> bool { self.control & 1 != 0 }
     fn chain(&self) -> bool { self.control & (1 << 4) != 0 }
@@ -141,7 +156,7 @@ impl Xhci {
     pub fn new(layout: Layout) -> Self {
         let mut x = Xhci {
             ports: vec![Port::default(); layout.usb2.len() + layout.usb3.len()], layout, ready: true,
-            usbcmd: 0, usbsts: STS_HCH, dnctrl: 0, config: 0, crcr: 0, cmd_deq: 0, cmd_ccs: true, crr: false, dcbaap: 0,
+            usbcmd: 0, usbsts: STS_HCH, dnctrl: 0, config: 0, crcr: 0, cmd_deq: 0, cmd_ccs: true, crr: false, stopping: false, pending: Default::default(), dcbaap: 0,
             iman: 0, imod: 4000, irq_hold: 0, erstsz: 0, erstba: 0, erdp: 0, ev_seg: 0, ev_idx: 0, ev_pcs: true,
             slots: [Slot::default(); MAX_SLOTS + 1], now: 0, next_poll: 0, transfers: 0, trace: std::env::var_os("SBC_TRACE_XHCI").is_some(),
         };
@@ -213,7 +228,8 @@ impl Xhci {
     /// while its controller state still says halted) would fire again at once, and the CPU
     /// that is about to change that state would never get to run.
     fn moderate(&mut self) {
-        self.irq_hold = self.now + (self.imod & 0xffff) as u64 * 250;
+        // (Tegra's driver sets IMODI to 0; the hold still has to let the CPU run)
+        self.irq_hold = self.now + ((self.imod & 0xffff) as u64 * 250).max(MIN_HOLD_NS);
     }
 
     pub fn irq(&self) -> bool { self.usbcmd & CMD_INTE != 0 && self.iman & 3 == 3 && self.now >= self.irq_hold }
@@ -272,7 +288,12 @@ impl Xhci {
             0x20 => {
                 if v & CMD_HCRST != 0 { self.reset(devs); return; }
                 let was = self.usbcmd & CMD_RS != 0;
-                self.usbcmd = v & 0x3f0d;
+                // CSS and CRS read as 0. Nothing is kept for a restore (the board resets the whole
+                // controller when its power goes), which the driver has to hear of: it starts over.
+                self.usbcmd = v & 0x3c0d;
+                if v & CMD_CRS != 0 {
+                    self.usbsts |= STS_SRE;
+                }
                 if v & CMD_RS != 0 {
                     self.usbsts &= !STS_HCH;
                     if !was {
@@ -295,9 +316,14 @@ impl Xhci {
                     if off == 0x38 && v & 6 != 0 {
                         // command stop/abort: nothing is in flight, the ring just stops
                         self.crr = false;
+                        self.stopping = true;
                         let deq = self.cmd_deq;
                         self.post(ram, deq, 24 << 24, T_CMD_DONE_EV << 10);
                     }
+                    return;
+                }
+                // the other half of the write that stopped the ring
+                if std::mem::take(&mut self.stopping) && off == 0x3c {
                     return;
                 }
                 self.crcr = if off == 0x38 { lo(self.crcr) } else { hi(self.crcr) };
@@ -329,13 +355,17 @@ impl Xhci {
                 self.ev_seg = 0;
                 self.ev_idx = 0;
                 self.ev_pcs = true;
+                self.pending.clear();
             }
             0x638 | 0x63c => {
                 let ehb = self.erdp & 8;
                 let w = if off == 0x638 { lo(self.erdp) } else { hi(self.erdp) };
                 // EHB is write-1-to-clear
                 self.erdp = (w & !0xf) | (w & 7) | if off == 0x638 && v & 8 != 0 { 0 } else { ehb };
-                // events the driver has not consumed yet interrupt again
+                while let (Some(&(param, status, control)), false) = (self.pending.front(), self.ring_full(ram)) {
+                    self.pending.pop_front();
+                    self.put(ram, param, status, control);
+                }
                 // events still pending: interrupt again, but only while running (a halted
                 // controller does not interrupt; Linux 5.15 ignores an interrupt without EINT
                 // and would then never clear Event Handler Busy)
@@ -393,17 +423,37 @@ impl Xhci {
     // ------------------------------------------------------------------ the event ring
 
     fn segment(&self, ram: &Dma, seg: u32) -> (u64, u32) {
-        let e = self.erstba + 16 * seg as u64;
-        (rd64(ram, e) & !0x3f, rd32(ram, e + 8) & 0xffff)
+        let e = self.erstba.wrapping_add(16 * seg as u64);
+        (rd64(ram, e) & !0x3f, rd32(ram, e.wrapping_add(8)) & 0xffff)
     }
 
-    fn enqueue_addr(&self, ram: &Dma) -> u64 { self.segment(ram, self.ev_seg).0 + 16 * self.ev_idx as u64 }
+    fn enqueue_addr(&self, ram: &Dma) -> u64 { self.segment(ram, self.ev_seg).0.wrapping_add(16 * self.ev_idx as u64) }
+
+    /// The slot after the next one is the driver's dequeue pointer.
+    fn ring_full(&self, ram: &Dma) -> bool {
+        if self.erstsz == 0 { return false; }
+        let (base, size) = self.segment(ram, self.ev_seg);
+        let next = if self.ev_idx + 1 < size {
+            base.wrapping_add(16 * (self.ev_idx as u64 + 1))
+        } else {
+            self.segment(ram, if self.ev_seg + 1 < self.erstsz { self.ev_seg + 1 } else { 0 }).0
+        };
+        next == self.erdp & !0xf
+    }
 
     fn post(&mut self, ram: &mut Dma, param: u64, status: u32, control: u32) {
+        if self.pending.is_empty() && !self.ring_full(ram) {
+            self.put(ram, param, status, control);
+        } else if self.pending.len() < MAX_PENDING {
+            self.pending.push_back((param, status, control));
+        }
+    }
+
+    fn put(&mut self, ram: &mut Dma, param: u64, status: u32, control: u32) {
         if self.erstsz == 0 { return; }
         let (base, size) = self.segment(ram, self.ev_seg);
         if size == 0 { return; }
-        let a = base + 16 * self.ev_idx as u64;
+        let a = base.wrapping_add(16 * self.ev_idx as u64);
         wr64(ram, a, param);
         wr32(ram, a + 8, status);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -420,10 +470,10 @@ impl Xhci {
 
     // ------------------------------------------------------------------ commands
 
-    fn ctx(&self, ram: &Dma, slot: usize) -> u64 { rd64(ram, self.dcbaap + 8 * slot as u64) & !0x3f }
+    fn ctx(&self, ram: &Dma, slot: usize) -> u64 { rd64(ram, self.dcbaap.wrapping_add(8 * slot as u64)) & ADDRESS & !0x3f }
 
     fn set_ep_ctx(&self, ram: &mut Dma, slot: usize, dci: usize) {
-        let out = self.ctx(ram, slot) + 32 * dci as u64;
+        let out = self.ctx(ram, slot).wrapping_add(32 * dci as u64);
         let ep = self.slots[slot].eps[dci];
         wr32(ram, out, (rd32(ram, out) & !7) | ep.state as u32);
         wr64(ram, out + 8, ep.deq | ep.ccs as u64);
@@ -439,11 +489,11 @@ impl Xhci {
             let t = Trb::read(ram, self.cmd_deq);
             if t.cycle() != self.cmd_ccs { return; }
             if t.ty() == T_LINK {
-                self.cmd_deq = t.param & !0xf;
+                self.cmd_deq = t.param & ADDRESS & !0xf;
                 if t.control & 2 != 0 { self.cmd_ccs = !self.cmd_ccs; }
                 continue;
             }
-            self.cmd_deq += 16;
+            self.cmd_deq = self.cmd_deq.wrapping_add(16);
             let (cc, slot) = self.command(t, ram, devs);
             if self.trace { eprintln!("[xhci] command {} slot {} -> {cc}", t.ty(), slot); }
             self.post(ram, t.addr, cc << 24, T_CMD_DONE_EV << 10 | (slot as u32) << 24);
@@ -466,7 +516,7 @@ impl Xhci {
             }
             10 => { self.slots[slot] = Slot::default(); CC_SUCCESS } // Disable Slot
             11 => { // Address Device
-                let input = t.param & !0xf;
+                let input = t.param & ADDRESS & !0xf;
                 let out = self.ctx(ram, slot);
                 let port = ((rd32(ram, input + 32 + 4) >> 16) & 0xff) as usize;
                 let Some(p) = port.checked_sub(1).and_then(|k| self.ports.get(k)).copied() else { return (CC_TRB_ERROR, slot) };
@@ -495,7 +545,7 @@ impl Xhci {
                     self.set_slot_state(ram, slot, 2, addr);
                     return (CC_SUCCESS, slot);
                 }
-                let input = t.param & !0xf;
+                let input = t.param & ADDRESS & !0xf;
                 let (drop, add) = (rd32(ram, input), rd32(ram, input + 4));
                 for d in 2..32 {
                     if drop >> d & 1 != 0 { self.slots[slot].eps[d] = Ep::default(); self.set_ep_ctx(ram, slot, d); }
@@ -513,7 +563,7 @@ impl Xhci {
                 CC_SUCCESS
             }
             13 => { // Evaluate Context
-                let input = t.param & !0xf;
+                let input = t.param & ADDRESS & !0xf;
                 let out = self.ctx(ram, slot);
                 let add = rd32(ram, input + 4);
                 if add & 1 != 0 { for k in (0..12).step_by(4) { let w = rd32(ram, input + 32 + k); wr32(ram, out + k, w); } }
@@ -533,7 +583,7 @@ impl Xhci {
             16 => { // Set TR Dequeue Pointer
                 if dci == 0 || dci > 31 { return (CC_TRB_ERROR, slot); }
                 let ep = &mut self.slots[slot].eps[dci];
-                ep.deq = t.param & !0xf;
+                ep.deq = t.param & ADDRESS & !0xf;
                 ep.ccs = t.param & 1 != 0;
                 if ep.state == EP_DISABLED { ep.state = EP_STOPPED; }
                 self.set_ep_ctx(ram, slot, dci);
@@ -559,7 +609,7 @@ impl Xhci {
         let port = self.slots[slot].port as usize;
         let Some(id) = port.checked_sub(1).and_then(|k| self.ports.get(k)).and_then(|p| p.dev) else { return };
         let mut ran_out = false;
-        for _ in 0..256 {
+        for _ in 0..4096 {
             if self.slots[slot].eps[dci].state != EP_RUNNING { break; }
             let Some(dev) = devs.get(id) else { return };
             match self.run_td(slot, dci, ram, dev) {
@@ -585,12 +635,12 @@ impl Xhci {
             let t = Trb::read(ram, a);
             if t.cycle() != ccs { return None; }
             if t.ty() == T_LINK {
-                a = t.param & !0xf;
+                a = t.param & ADDRESS & !0xf;
                 if t.control & 2 != 0 { ccs = !ccs; }
                 continue;
             }
             td.push(t);
-            a += 16;
+            a = a.wrapping_add(16);
             // a control transfer runs from its Setup to its Status stage (no chain bits between)
             let control = dci == 1 && td[0].ty() == T_SETUP;
             if if control { t.ty() == T_STATUS } else { !t.chain() } { break; }
@@ -723,33 +773,87 @@ impl Xhci {
             (a, b) => a.or(b),
         }
     }
-
-    // ------------------------------------------------------------------ snapshots
-
-    pub fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("xhci-v1");
-        for v in [self.usbcmd, self.usbsts, self.dnctrl, self.config, self.iman, self.imod, self.erstsz, self.ev_seg, self.ev_idx] { w.u32(v); }
-        for v in [self.crcr, self.cmd_deq, self.dcbaap, self.erstba, self.erdp, self.next_poll] { w.u64(v); }
-        for b in [self.cmd_ccs, self.crr, self.ev_pcs] { w.bool(b); }
-        for p in &self.ports { w.u32(p.sc); w.u32(p.pmsc); w.u8(dev_code(p.dev)); }
-        for s in &self.slots {
-            w.bool(s.enabled); w.u8(s.port);
-            for e in &s.eps { w.u8(e.state); w.u64(e.deq); w.bool(e.ccs); }
-        }
-    }
-    pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        r.tag("xhci-v1")?;
-        for v in [&mut self.usbcmd, &mut self.usbsts, &mut self.dnctrl, &mut self.config, &mut self.iman, &mut self.imod, &mut self.erstsz, &mut self.ev_seg, &mut self.ev_idx] { *v = r.u32()?; }
-        for v in [&mut self.crcr, &mut self.cmd_deq, &mut self.dcbaap, &mut self.erstba, &mut self.erdp, &mut self.next_poll] { *v = r.u64()?; }
-        for b in [&mut self.cmd_ccs, &mut self.crr, &mut self.ev_pcs] { *b = r.bool()?; }
-        for p in self.ports.iter_mut() { p.sc = r.u32()?; p.pmsc = r.u32()?; p.dev = dev_of(r.u8()?); }
-        for s in self.slots.iter_mut() {
-            s.enabled = r.bool()?; s.port = r.u8()?;
-            for e in s.eps.iter_mut() { e.state = r.u8()?; e.deq = r.u64()?; e.ccs = r.bool()?; }
-        }
-        Ok(())
-    }
 }
 
-fn dev_code(d: Option<DevId>) -> u8 { match d { None => 0, Some(DevId::Keyboard) => 1, Some(DevId::Tablet) => 2, Some(DevId::Storage) => 3, Some(DevId::Camera) => 4 } }
-fn dev_of(c: u8) -> Option<DevId> { match c { 1 => Some(DevId::Keyboard), 2 => Some(DevId::Tablet), 3 => Some(DevId::Storage), 4 => Some(DevId::Camera), _ => None } }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RING: u64 = 0x1000;
+    const EVENTS: u64 = 0x2000;
+    const ERST: u64 = 0x3000;
+
+    fn running(ram: &mut [u8], devs: &mut Devices) -> Xhci {
+        let mut x = Xhci::new(Layout { usb3: 0..1, usb2: 1..2 });
+        x.trace = false;
+        let mut d = Dma { ram, base: 0 };
+        wr64(&mut d, ERST, EVENTS);
+        wr32(&mut d, ERST + 8, 16);
+        for (o, v) in [(0x58, 8), (0x38, RING as u32 | 1), (0x3c, 0), (0x628, 1), (0x638, EVENTS as u32), (0x630, ERST as u32), (0x634, 0), (0x620, 2), (0x20, 5)] {
+            x.write(o, v, &mut d, devs);
+        }
+        x
+    }
+
+    /// Queue Enable Slot commands from index `from`.
+    fn commands(ram: &mut [u8], from: u64, n: u64) {
+        for k in from..from + n {
+            wr32(&mut Dma { ram, base: 0 }, RING + 16 * k + 12, 9 << 10 | 1);
+        }
+    }
+
+    #[test]
+    fn a_restore_is_refused() {
+        let (mut ram, mut devs) = (vec![0; 0x4000], Devices::default());
+        let mut x = running(&mut ram, &mut devs);
+        let mut d = Dma { ram: &mut ram, base: 0 };
+        x.write(0x20, 0x204, &mut d, &mut devs);
+        assert_eq!((x.read(0x20) & 0x300, x.read(0x24) & STS_SRE), (0, STS_SRE));
+        x.write(0x24, STS_SRE, &mut d, &mut devs);
+        assert_eq!(x.read(0x24) & STS_SRE, 0);
+    }
+
+    #[test]
+    fn a_stopped_command_ring_goes_on_where_it_was() {
+        let (mut ram, mut devs) = (vec![0; 0x4000], Devices::default());
+        let mut x = running(&mut ram, &mut devs);
+        commands(&mut ram, 0, 2);
+        let mut d = Dma { ram: &mut ram, base: 0 };
+        x.write(DB, 0, &mut d, &mut devs);
+        x.write(0x38, 4, &mut d, &mut devs); // abort
+        x.write(0x3c, 0, &mut d, &mut devs);
+        x.write(DB, 0, &mut d, &mut devs);
+        assert_eq!(x.slots.iter().filter(|s| s.enabled).count(), 2);
+    }
+
+    #[test]
+    fn events_wait_for_room_in_the_ring() {
+        let (mut ram, mut devs) = (vec![0; 0x4000], Devices::default());
+        let mut x = running(&mut ram, &mut devs);
+        commands(&mut ram, 0, 20);
+        let mut d = Dma { ram: &mut ram, base: 0 };
+        x.write(DB, 0, &mut d, &mut devs);
+        let event = |d: &Dma, k: u64| (rd64(d, EVENTS + 16 * k), rd32(d, EVENTS + 16 * k + 12) & 1);
+        assert_eq!(event(&d, 14), (RING + 16 * 14, 1));
+        assert_eq!(event(&d, 15), (0, 0));
+        x.write(0x638, EVENTS as u32 + 16 * 15 | 8, &mut d, &mut devs);
+        x.write(0x63c, 0, &mut d, &mut devs);
+        assert_eq!((event(&d, 15), event(&d, 0), event(&d, 3)), ((RING + 16 * 15, 1), (RING + 16 * 16, 0), (RING + 16 * 19, 0)));
+    }
+
+    #[test]
+    fn an_unserviced_interrupt_leaves_the_cpu_time() {
+        let (mut ram, mut devs) = (vec![0; 0x4000], Devices::default());
+        let mut x = running(&mut ram, &mut devs);
+        commands(&mut ram, 0, 1);
+        let mut d = Dma { ram: &mut ram, base: 0 };
+        x.write(0x624, 0, &mut d, &mut devs);
+        x.write(DB, 0, &mut d, &mut devs);
+        assert!(x.irq());
+        x.write(0x620, 3, &mut d, &mut devs);
+        x.write(0x638, EVENTS as u32 | 8, &mut d, &mut devs); // nothing consumed
+        assert!(!x.irq() && x.next_event(&devs) == Some(MIN_HOLD_NS));
+        x.tick(MIN_HOLD_NS, &mut d, &mut devs);
+        assert!(x.irq());
+    }
+}
