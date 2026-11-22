@@ -158,6 +158,28 @@ impl Disk for CowFile {
 mod tests {
     use super::*;
 
+    /// What the Pi 4's `loadvm` goes by.
+    #[test]
+    fn a_persistent_image_knows_it_was_written() {
+        let path = std::env::temp_dir().join(format!("sbc-through-{}.img", std::process::id()));
+        std::fs::write(&path, vec![0; 2 << 20]).unwrap();
+        let p = path.to_str().unwrap();
+        {
+            let mut cow = CowFile::open(p).unwrap();
+            cow.write(1, &[1; 512]);
+            assert!(!cow.written_through());
+        }
+        let mut disk = SharedDisk::open(p, true).unwrap();
+        assert!(!disk.written_through());
+        let mut sector = [0; 512];
+        disk.read(1, &mut sector);
+        assert!(!disk.written_through());
+        let other = disk.clone();
+        disk.write(1, &[1; 512]);
+        assert!(disk.written_through() && other.written_through());
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn restoring_a_snapshot_drops_sectors_written_after_it() {
         let path = std::env::temp_dir().join(format!("sbc-cow-{}.img", std::process::id()));

@@ -60,3 +60,19 @@ fn a_refused_restore_changes_nothing() {
     m.restore(&early).unwrap();
     assert!(!m.in_pieces);
 }
+
+/// A restore that fails half way leaves the disks as they were: they outlive the machine.
+#[test]
+fn the_card_survives_a_failed_restore() {
+    let mut other = machine(false);
+    other.soc.sd.disk.as_mut().unwrap().write(7, &[1; 512]);
+    other.soc.ram[65000] = 1;
+    let mut raw = miniz_oxide::inflate::decompress_to_vec(&other.save()[8..]).unwrap();
+    raw.truncate(raw.len() - 10);
+    let mut m = machine(false);
+    m.soc.sd.disk.as_mut().unwrap().write(9, &[2; 512]);
+    assert!(m.restore_raw(&raw).is_err() && m.in_pieces);
+    let mut s = [0; 1024 * 2];
+    m.soc.sd.disk.as_mut().unwrap().read(7, &mut s);
+    assert!(s[..512].iter().all(|&b| b == 0) && s[1024..1536].iter().all(|&b| b == 2));
+}

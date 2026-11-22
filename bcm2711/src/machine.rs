@@ -1022,13 +1022,25 @@ impl Machine {
     /// of the single-core machine (v4) restore into any machine; their extra cores stay off.
     pub fn restore(&mut self, snap: &[u8]) -> Result<(), String> {
         if snap.len() < 8 || &snap[..8] != SNAP_MAGIC { return Err("not an sbc-emu snapshot".into()); }
-        let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("snapshot inflate: {e:?}"))?;
+        let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("the snapshot is damaged ({:?})", e.status))?;
         self.restore_raw(&raw)
     }
 
     /// Restore from a snapshot's body after the magic, already inflated: the browser build takes
     /// snapshots recompressed with zstd (`tools/snap-zstd.sh`), a third smaller than deflate.
     pub fn restore_raw(&mut self, raw: &[u8]) -> Result<(), String> {
+        let sd = self.soc.sd.disk.as_ref().map(|d| d.overlay());
+        let stick = self.soc.devs.storage.as_ref().map(|s| s.disk.overlay());
+        let result = self.load_raw(raw);
+        if result.is_err() && self.in_pieces {
+            // the disks outlive the machine: they keep what this session has written
+            if let (Some(d), Some(o)) = (self.soc.sd.disk.as_mut(), sd) { d.restore_overlay(o); }
+            if let (Some(s), Some(o)) = (self.soc.devs.storage.as_mut(), stick) { s.disk.restore_overlay(o); }
+        }
+        result
+    }
+
+    fn load_raw(&mut self, raw: &[u8]) -> Result<(), String> {
         let mut r = emu_core::snap::R::new(raw);
         let e = |e: emu_core::snap::SnapError| e.0;
         let v10 = r.tag("machine-v10").is_ok();
@@ -1049,18 +1061,21 @@ impl Machine {
         if self.soc.sd.disk.as_ref().is_some_and(|d| d.written_through()) {
             return Err("the guest has written to the image since it was opened (--sd-persist): going back would corrupt it".into());
         }
+        let (now, exceptions, irqs) = (r.u64().map_err(e)?, r.u64().map_err(e)?, r.u64().map_err(e)?);
+        let cores = if v5 { Some(r.u32().map_err(e)? as usize) } else { None };
+        if let Some(n) = cores.filter(|&n| n != self.cpus.len()) {
+            return Err(format!("snapshot has {n} cores, machine has {} (use --smp {n})", self.cpus.len()));
+        }
         // from here on an error leaves the machine in pieces
         self.in_pieces = true;
-        self.now = r.u64().map_err(e)?; self.exceptions = r.u64().map_err(e)?; self.irqs = r.u64().map_err(e)?;
+        (self.now, self.exceptions, self.irqs) = (now, exceptions, irqs);
         // the JIT's code is stale after a restore; keep one (empty) cache with core 0
         let mut jit = self.cpus[self.cur].jit.take();
         if let Some(j) = jit.as_mut() { j.flush(); }
         self.cur = 0;
         self.soc.cur = 0;
         for k in 0..self.cpus.len() { self.cpus[k] = self.fresh_cpu(k); self.state[k] = CoreState::Off; }
-        if v5 {
-            let n = r.u32().map_err(e)? as usize;
-            if n != self.cpus.len() { return Err(format!("snapshot has {n} cores, machine has {} (use --smp {n})", self.cpus.len())); }
+        if let Some(n) = cores {
             for k in 0..n {
                 self.state[k] = match r.u8().map_err(e)? { 0 => CoreState::Off, 2 => CoreState::Wfi, 3 => CoreState::Wfe, _ => CoreState::Run };
                 self.cpus[k].load_state(&mut r).map_err(e)?;

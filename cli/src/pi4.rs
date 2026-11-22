@@ -222,6 +222,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                             monitor::Effect::Quit => { quit = true; break; }
                             monitor::Effect::Pause(p) => paused = p,
                             monitor::Effect::Reset => reset_req = true,
+                            monitor::Effect::Restored => { reset_req = false; owed = None; }
                             monitor::Effect::Gdb(port) => match gdb::Gdb::listen(port) { Ok(g) => gdb = Some(g), Err(e) => eprint!("gdbserver: {e}\r\n") },
                             monitor::Effect::None => {}
                         }
@@ -293,6 +294,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                             monitor::Effect::Quit => { script.pop_front(); break Stop::Budget; }
                             monitor::Effect::Pause(p) => paused = p,
                             monitor::Effect::Reset => reset_req = true,
+                            monitor::Effect::Restored => { reset_req = false; owed = None; }
                             monitor::Effect::Gdb(port) => if let Ok(g) = gdb::Gdb::listen(port) { gdb = Some(g) },
                             monitor::Effect::None => {}
                         }
