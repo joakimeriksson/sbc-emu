@@ -1,0 +1,8 @@
+[package]
+name = "maxwell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA Maxwell (GM20B) graphics engine: the 3D, 2D, inline-to-memory and compute classes"
+
+[dependencies]
