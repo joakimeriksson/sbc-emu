@@ -290,7 +290,7 @@ async function start(os, ramMb, jit, file) {
       .map(([f, gz]) => fetchBytes(`assets/jetson-nano/${f}`, gz)));
     ex.sbc_kms(1280, 720);
     const cmd = new TextEncoder().encode('console=tty0 console=ttyS0,115200 rdinit=/init');
-    if (ex.sbc_boot_nano(ramMb, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, copyIn(cmd), cmd.length) !== 0) throw new Error('boot setup failed');
+    if (ex.sbc_boot_nano(ramMb, Date.now() / 1000, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, copyIn(cmd), cmd.length) !== 0) throw new Error('boot setup failed');
     if (jit) ex.sbc_jit(1);
     frameEvery = 66;
     postMessage({ type: 'status', text: 'booting…' });

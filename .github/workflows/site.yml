@@ -33,7 +33,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: cache/site
-          key: site-guest-${{ hashFiles('tools/site-build.sh') }}
+          key: site-guest-${{ hashFiles('tools/site-build.sh', 'scripts/jetson-nano-debian-fixture.sh') }}
       - name: Build (guest downloads, snapshot, browser build)
         run: tools/site-build.sh
       - uses: actions/upload-pages-artifact@v3

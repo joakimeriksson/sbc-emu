@@ -28,7 +28,7 @@ const [kp, kl] = load(`${dir}/vmlinuz`), [dp, dl] = load(`${dir}/tegra210-p3450-
 const cmd = Buffer.from('console=tty0 console=ttyS0,115200 rdinit=/init'), cp = ex.sbc_alloc(cmd.length) >>> 0;
 mem().set(cmd, cp);
 ex.sbc_kms(1280, 720);
-if (ex.sbc_boot_nano(Number(process.env.SBC_RAM_MB ?? 1024), kp, kl, dp, dl, ip, il, cp, cmd.length) !== 0) throw new Error('boot setup failed');
+if (ex.sbc_boot_nano(Number(process.env.SBC_RAM_MB ?? 1024), Date.now() / 1000, kp, kl, dp, dl, ip, il, cp, cmd.length) !== 0) throw new Error('boot setup failed');
 console.log('jit', process.env.SBC_JIT === '0' ? (ex.sbc_jit(0), 'off') : (ex.sbc_jit(1) ? 'on' : 'unavailable'));
 if (process.env.SBC_JIT_HOT) ex.sbc_jit_hot(Number(process.env.SBC_JIT_HOT));
 
@@ -38,7 +38,7 @@ const steps = [
   ['jetson-nano#', 'uname -m; grep -c ^processor /proc/cpuinfo\r'],
   ['jetson-nano#', "awk 'BEGIN { x = atan2(1,1)*4; print \"fp\", x, sqrt(2) }'\r"],
   ['fp 3.14159 1.41421', 'for i in 1 2 3 4; do (n=0; while [ $n -lt 20000 ]; do n=$((n+1)); done; echo done$i) & done; wait; echo PAR_$((40+2))\r'],
-  ['PAR_42', 'ls /dev/dri/renderD128 && cat /sys/class/graphics/fb0/virtual_size && printf "DRM_%s\\n" OK\r'],
+  ['PAR_42', 'ls -l /sys/class/drm/renderD*/device/driver | grep nouveau && cat /sys/class/graphics/fb0/virtual_size && printf "DRM_%s\\n" OK\r'],
   ['DRM_OK', 'reboot -f\r'],
   ['TEGRA210_BOOT_OK', null],
   ['jetson-nano#', 'printf "REBOOT_%s\\n" OK\r'],
@@ -68,7 +68,8 @@ while (performance.now() - t0 < secs * 1000 && step < steps.length) {
 }
 const p = ex.sbc_fb_render() >>> 0;
 console.log(`\nscreen ${p ? `${ex.sbc_fb_w()} x ${ex.sbc_fb_h()}` : 'off'}`);
+const ok = step === steps.length && p !== 0 && ex.sbc_fb_w() === 1280;
 const el = (performance.now() - t0) / 1000;
-console.log(`\n--- ${step === steps.length ? 'PASS' : 'INCOMPLETE'}: wall ${el.toFixed(1)} s, ${(ex.sbc_insns() / 1e9).toFixed(2)} G insns (${(ex.sbc_insns() / el / 1e6).toFixed(0)} MIPS), ${ex.sbc_jit_blocks()} blocks compiled`);
+console.log(`\n--- ${ok ? 'PASS' : 'INCOMPLETE'}: wall ${el.toFixed(1)} s, ${(ex.sbc_insns() / 1e9).toFixed(2)} G insns (${(ex.sbc_insns() / el / 1e6).toFixed(0)} MIPS), ${ex.sbc_jit_blocks()} blocks compiled`);
 for (const m of marks) console.log('  ' + m);
-process.exit(step === steps.length ? 0 : 1);
+process.exit(ok ? 0 : 1);

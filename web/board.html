@@ -51,8 +51,8 @@
   </div>
   <p id="status" aria-live="polite"></p>
   <div class="try" id="try"></div>
-  <div class="screen" id="screen" tabindex="0" aria-label="The HDMI monitor: click it to type on the USB keyboard" hidden><canvas id="canvas" width="1280" height="720"></canvas></div>
-  <footer>The terminal is the board's serial console: click it and type.<span id="hdminote" hidden> The picture is its HDMI monitor, with a USB keyboard of its own.</span><br>
+  <div class="screen" id="screen" tabindex="0" role="application" aria-label="The HDMI monitor; type here on its USB keyboard, Shift and Tab to leave" hidden><canvas id="canvas" width="1280" height="720" role="img" aria-label="The picture on the HDMI monitor"></canvas></div>
+  <footer>The terminal is the board's serial console: click it and type.<span id="hdminote" hidden> The picture is its HDMI monitor: with a keyboard, click it and type (Shift+Tab leaves it).</span><br>
     <a href="./">All boards</a> · <a href="https://github.com/joakimeriksson/sbc-emu">Source on GitHub</a> · <a href="sources.html">What runs here, and its licences</a> · <span id="tm"></span></footer>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
@@ -91,8 +91,8 @@ const BOARDS = {
   'jetson-nano': {
     name: 'Jetson Nano', os: 'jetson-nano', ramMb: 1024, screen: true,
     lede: 'Debian’s kernel with the board’s own device tree and a BusyBox shell, booting from scratch on an emulated Tegra X1: four 64-bit Cortex-A57 cores, translated to WebAssembly as they run, with HDMI, USB, Ethernet and the Maxwell GPU found by Linux’s own drivers. Nothing runs on a server.',
-    note: 'Downloads 27 MB (the emulator, Debian’s kernel and a small initramfs) and boots Linux, in about 15 seconds on a fast computer.',
-    tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA, and nothing of NVIDIA’s is downloaded.',
+    note: 'Downloads 23 MB (the emulator, Debian’s kernel and a small initramfs) and boots Linux, in about 15 seconds on a fast computer.',
+    tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA, and none of its firmware is downloaded.',
     try: ['uname -a', 'cat /proc/device-tree/model; echo', 'grep -c processor /proc/cpuinfo', 'dmesg | grep -i nouveau', 'ls /dev/dri', 'ip link set eth0 up; sleep 3; udhcpc -i eth0 -n -q', 'cat /proc/interrupts | head -30', 'free -m', 'cat /dev/urandom > /dev/fb0'],
   },
   'esp32s31': {
@@ -150,17 +150,20 @@ $('powerbtn').onclick = () => {
 };
 // the monitor takes the keyboard (USB HID usages)
 const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
-  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, ArrowRight: 0x4f, ArrowLeft: 0x50,
-  ArrowDown: 0x51, ArrowUp: 0x52, Home: 0x4a, End: 0x4d, Delete: 0x4c, PageUp: 0x4b, PageDown: 0x4e,
-  ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6 };
+  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39, PrintScreen: 0x46,
+  ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f,
+  ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53, IntlBackslash: 0x64, ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2,
+  MetaLeft: 0xe3, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6, MetaRight: 0xe7 };
 for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
 for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
 HID.Digit0 = 0x27;
+for (let i = 1; i <= 12; i++) HID['F' + i] = 0x39 + i;
 const held = new Set();
 const key = (usage, down) => worker?.postMessage({ type: 'key', usage, down });
 $('screen').addEventListener('keydown', (e) => {
   const u = HID[e.code];
-  if (!worker || u === undefined || e.metaKey) return;
+  // (Shift+Tab is for leaving the monitor)
+  if (!worker || u === undefined || (e.metaKey && e.code !== 'MetaLeft' && e.code !== 'MetaRight') || (e.code === 'Tab' && e.shiftKey)) return;
   e.preventDefault();
   if (!held.has(u)) { held.add(u); key(u, true); }
 });
