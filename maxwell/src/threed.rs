@@ -150,6 +150,10 @@ impl Threed {
         if Inline::owns(m) {
             self.rop.flush(mem);
             self.inline.method(m, v, mem);
+            if m == 0x1b4 {
+                self.pipe.invalidate_textures();
+                self.pipe.cbufs_changed = true;
+            }
             return;
         }
         match m {

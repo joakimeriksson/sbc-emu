@@ -106,6 +106,9 @@ impl Copy {
                 }
                 done += n;
                 budget -= ((n * sx.max(dx)) as i64).max(256);
+                if budget < 0 {
+                    break;
+                }
             }
             // (a line costs something even if it is empty)
             budget -= 64;

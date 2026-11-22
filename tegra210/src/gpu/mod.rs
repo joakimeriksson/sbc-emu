@@ -306,15 +306,17 @@ impl Gpu {
         #[cfg(not(target_arch = "wasm32"))]
         let start = std::time::Instant::now();
         // a channel may release the semaphore another waits for
+        let mut moved = false;
         for _ in 0..64 {
             let (waiting, progress) = self.run_once(smmu, ram);
             self.waiting = waiting;
+            moved |= progress;
             if !waiting || !progress {
                 break;
             }
         }
         // a semaphore that stays away is looked at less and less often
-        self.pause = if self.waiting { (2 * self.pause).clamp(RETRY_NS, MAX_RETRY_NS) } else { 0 };
+        self.pause = if self.waiting && !moved { (2 * self.pause).clamp(RETRY_NS, MAX_RETRY_NS) } else { 0 };
         self.retry = self.now + self.pause.max(RETRY_NS);
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -352,28 +354,45 @@ impl Gpu {
     }
 
     pub fn tick(&mut self, now: u64) {
-        self.now = now;
-        if self.r(0x9140) & 1 != 0 && !self.timer_intr && self.alarm().is_some_and(|t| now >= t) {
+        let before = std::mem::replace(&mut self.now, now);
+        if self.r(0x9140) & 1 != 0 && !self.timer_intr && self.alarm(before).is_some_and(|t| now >= t) {
             self.timer_intr = true;
         }
     }
 
-    /// When the timer's alarm goes off (it compares the time's low word).
-    fn alarm(&self) -> Option<u64> {
+    /// The first time after `after` that the timer's alarm goes off: it compares the low word.
+    fn alarm(&self, after: u64) -> Option<u64> {
         let a = self.regs.get(&0x9420).copied()? as u64;
-        let t = self.now & !0xffff_ffff | a;
-        // the nearest time with that low word
-        Some(if t + (1 << 31) < self.now {
-            t + (1 << 32)
-        } else if t > self.now + (1 << 31) {
-            t.saturating_sub(1 << 32)
-        } else {
-            t
-        })
+        let t = after & !0xffff_ffff | a;
+        Some(if t <= after { t + (1 << 32) } else { t })
     }
 
     pub fn next_event(&self) -> Option<u64> {
-        let alarm = (self.r(0x9140) & 1 != 0 && !self.timer_intr).then(|| self.alarm()).flatten().filter(|&t| t > self.now);
+        let alarm = (self.r(0x9140) & 1 != 0 && !self.timer_intr).then(|| self.alarm(self.now)).flatten();
         alarm.into_iter().chain(self.waiting.then_some(self.retry)).min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alarms_compare_the_low_word() {
+        let mut g = Gpu::default();
+        let at = |g: &mut Gpu, now: u64| {
+            g.tick(now);
+            std::mem::take(&mut g.timer_intr)
+        };
+        g.regs.insert(0x9140, 1);
+        g.tick(0x1_ffff_0000);
+        // just below the wrap of the low word, stepped over
+        g.regs.insert(0x9420, 0xffff_ff00);
+        assert_eq!(g.next_event(), Some(0x1_ffff_ff00));
+        assert!(!at(&mut g, 0x1_ffff_8000) && at(&mut g, 0x2_0000_0040) && !at(&mut g, 0x2_0000_1000));
+        // three seconds ahead
+        g.regs.insert(0x9420, 3_000_000_000);
+        assert_eq!(g.next_event(), Some(0x2_0000_0000 + 3_000_000_000));
+        assert!(!at(&mut g, 0x2_0000_0000 + 2_999_999_999) && at(&mut g, 0x2_0000_0000 + 3_000_000_000));
     }
 }
