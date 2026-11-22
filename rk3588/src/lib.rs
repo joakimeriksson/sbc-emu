@@ -421,7 +421,7 @@ impl Machine {
             if total>=end || steps==0 {break Stop::Budget;}
             self.update();
             if self.state.contains(&CoreState::Run) { for s in self.state.iter_mut() { if *s==CoreState::Wfe {*s=CoreState::Run;} } }
-            let runnable=self.state.iter().filter(|s|**s==CoreState::Run).count();
+            let runnable=(0..self.cpus.len()).filter(|&k|self.state[k]==CoreState::Run && self.breakpoints.may_run(k)).count();
             if runnable==0 {
                 let poll=self.soc.net.as_ref().is_some_and(|n|n.nat.is_some()) || !self.soc.gmac.rx_queue.is_empty();
                 let mut until=self.next_deadline().unwrap_or(self.now+10_000_000);
@@ -431,7 +431,7 @@ impl Machine {
             let round_start=self.now;
             self.round_end=if runnable==1 {u64::MAX} else {round_start+quantum()};
             for k in 0..self.cpus.len() {
-                if self.state[k]!=CoreState::Run {continue;}
+                if self.state[k]!=CoreState::Run || !self.breakpoints.may_run(k) {continue;}
                 if let Some(stop)=self.slice(k,round_start,&mut total,end,&mut steps,&mut storm) {break 'run stop;}
                 if total>=end || steps==0 {break;}
             }
@@ -507,19 +507,18 @@ impl Machine {
         self.set_debugging();
     }
     /// Execute one instruction on core `k` (interpreter; a sleeping core is woken); a stop it
-    /// causes, if any. `run` does it, with the other cores off meanwhile.
+    /// causes, if any. `run` does it, giving the other cores no turn meanwhile.
     #[cold]
     pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
         if self.state[k]==CoreState::Off {return None;}
-        let states=std::mem::replace(&mut self.state,vec![CoreState::Off;self.cpus.len()]);
         self.state[k]=CoreState::Run;
         let jit_off=std::mem::replace(&mut self.cpus[k].jit_off,true);
         self.breakpoints.resume=Some((k,self.cpus[k].pc));
+        self.breakpoints.only=Some(k);
         let stop=self.run(1);
+        self.breakpoints.only=None;
         self.breakpoints.resume=None;
         self.cpus[k].jit_off=jit_off;
-        // a core the instruction started (PSCI) stays on
-        for (j,s) in states.into_iter().enumerate() { if j!=k && self.state[j]==CoreState::Off {self.state[j]=s;} }
         (!matches!(stop,Stop::Budget|Stop::Idle(_))).then_some(stop)
     }
     /// Guest RAM at virtual address `va` as core `k` sees it.

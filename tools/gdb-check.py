@@ -189,12 +189,12 @@ def check(board, port):
         ok('register and memory writes')
         # single steps: every one moves the pc or is a branch to itself
         pcs = []
-        for _ in range(200):
+        for _ in range(2000):
             sig, t, _ = stop(r.cmd(f'vCont;s:{me:x}'))
             assert (sig, t) == (5, me), (sig, t)
             pcs.append(d.reg('pc'))
         assert len(set(pcs)) > 5, [hex(x) for x in pcs[:10]]
-        ok(f'200 steps ({len(set(pcs))} pcs)')
+        ok(f'{len(pcs)} steps ({len(set(pcs))} pcs)')
         # a breakpoint: typing at the shell makes the guest run; stop where it has been
         target = max(set(pcs), key=pcs.count)
         hits = []
@@ -236,12 +236,37 @@ def check(board, port):
         sig, _, _ = stop(r.recv())
         assert sig == 2, sig
         ok('continue and Ctrl-C')
+        # with every core busy, stepping one leaves the others' registers alone; whichever is stepped
+        # (the one that comes first in a round would get a step anyway)
+        g.type('\rP=; ' + '(while :; do :; done) & P="$P $!"; ' * g.cores + '\r')
+        r.send('vCont;c')
+        time.sleep(3)
+        r.s.sendall(b'\x03')
+        stop(r.recv())
+        def look(but):
+            seen = {}
+            for t in threads:
+                if t != but:
+                    d.thread(t)
+                    info = bytes.fromhex(r.cmd(f'qThreadExtraInfo,{t:x}')).decode()
+                    # waking up is allowed: it runs nothing
+                    seen[t] = (r.cmd('g'), re.sub(r'\b(Wfi|Wfe|Wait|Run)\b| wfi', '', info))
+            d.thread(but)
+            return seen
+        on = [t for t in threads if 'Off' not in bytes.fromhex(r.cmd(f'qThreadExtraInfo,{t:x}')).decode()]
+        for me in on:
+            before = look(me)
+            for _ in range(400): stop(r.cmd(f'vCont;s:{me:x}'))
+            after = look(me)
+            changed = [(t, before[t][1], after[t][1]) for t in before if before[t] != after[t]]
+            assert not changed, f'stepping thread {me} changed {changed}'
+        ok(f'stepping threads {on} leaves the others alone')
         # leave with a breakpoint set: the guest must not stop on it
         assert r.cmd(f'Z0,{target:x},4') == 'OK'
         assert r.cmd('D') == 'OK'
         r.s.close()
         g.seen = len(g.out)
-        g.type('\recho DE""TACHED $((6*7))\r')
+        g.type('\rkill $P; echo DE""TACHED $((6*7))\r')
         g.wait('DETACHED 42', 60)
         ok('detach, shell works')
         # a debugger that vanishes while the guest runs leaves nothing set either

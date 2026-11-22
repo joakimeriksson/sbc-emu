@@ -629,11 +629,19 @@ impl Machine {
         }
     }
 
+    /// Cores that run at the same time (one while a debugger steps it).
+    fn running_cores(&self) -> u64 {
+        if self.breakpoints.only.is_some() {
+            return 1;
+        }
+        self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64
+    }
+
     /// One instruction of one core: 1 ns divided among the running cores. Cores asleep in
     /// WFI/WFE (or in the boot ROM) do not count, so a lone busy core runs at 1 ns per
     /// instruction.
     fn tick(&mut self, n: u64) {
-        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        let running = self.running_cores();
         self.advance_subtick(n * (12 / running));
     }
 
@@ -651,7 +659,7 @@ impl Machine {
     /// Instructions a core may run before the next device deadline (compiled blocks chain
     /// until then).
     fn instructions_to_deadline(&self) -> u64 {
-        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        let running = self.running_cores();
         let now = self.cpus[0].cntpct;
         if self.next_event <= now {
             return 1;
@@ -909,7 +917,7 @@ impl Machine {
     }
 
     /// Execute one instruction on core `k` (interpreted; a sleeping core is woken); a stop it
-    /// causes, if any. `run` does it, with the other cores off meanwhile.
+    /// causes, if any. `run` does it, giving the other cores no turn meanwhile.
     #[cold]
     pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
         if !matches!(self.state[k], CoreState::Run | CoreState::Wait) {
@@ -919,17 +927,12 @@ impl Machine {
         if jit {
             self.set_jit(false);
         }
-        let states = std::mem::replace(&mut self.state, vec![CoreState::Off; NCPU]);
         self.state[k] = CoreState::Run;
         self.breakpoints.resume = Some((k, self.cpus[k].r[15] as u64));
+        self.breakpoints.only = Some(k);
         let stop = self.run(1);
+        self.breakpoints.only = None;
         self.breakpoints.resume = None;
-        // a core the instruction started stays on
-        for (j, state) in states.into_iter().enumerate() {
-            if j != k && self.state[j] == CoreState::Off {
-                self.state[j] = state;
-            }
-        }
         if jit {
             self.set_jit(true);
         }
@@ -993,7 +996,7 @@ impl Machine {
             }
             let Some(k) = (1..=NCPU)
                 .map(|offset| (self.cur + offset) % NCPU)
-                .find(|&k| self.state[k] == CoreState::Run)
+                .find(|&k| self.state[k] == CoreState::Run && self.breakpoints.may_run(k))
             else {
                 return Stop::Idle(match self.next_event {
                     u64::MAX => u64::MAX,
