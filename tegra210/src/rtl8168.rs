@@ -498,13 +498,17 @@ fn offload(mut f: Vec<u8>, opts1: u32, opts2: u32) -> Vec<Vec<u8>> {
     if header < ip + 20 || header > f.len() {
         return vec![f];
     }
+    // the datagram ends where its header says (Ethernet padding may follow; a frame to be cut is
+    // whole, whatever its length field says)
+    let length = u16::from_be_bytes(if v4 { [f[ip + 2], f[ip + 3]] } else { [f[ip + 4], f[ip + 5]] }) as usize;
+    let datagram = if gso { f.len() } else { ip + length + if v4 { 0 } else { 40 } };
     if !gso && opts2 & (3 << 30) == 0 {
         if v4 {
             fill_ipv4(&mut f, ip, header); // the IPv4 header's checksum alone
         }
         return vec![f];
     }
-    if transport < header || f.len() < transport + if tcp { 20 } else { 8 } {
+    if transport < header || datagram > f.len() || datagram < transport + if tcp { 20 } else { 8 } {
         return vec![f];
     }
     let end = ip + if v4 { 20 } else { 40 };
@@ -514,7 +518,7 @@ fn offload(mut f: Vec<u8>, opts1: u32, opts2: u32) -> Vec<Vec<u8>> {
         }
         let (proto, at) = if tcp { (6, transport + 16) } else { (17, transport + 6) };
         f[at..at + 2].fill(0);
-        let mut c = transport_checksum(&f[ip..end], v4, proto, &f[transport..]);
+        let mut c = transport_checksum(&f[ip..end], v4, proto, &f[transport..datagram]);
         if proto == 17 && c == 0 {
             c = 0xffff;
         }
@@ -680,6 +684,11 @@ mod tests {
         let out = offload(f.clone(), 0, 1 << 29 | 1 << 30 | 38 << 18).remove(0);
         assert_eq!(sum(0, &out[18..38]), 0xffff);
         assert_eq!(transport_checksum(&out[18..38], true, 6, &out[38..]), 0);
+        // padding after the datagram is not part of it
+        let mut p = tcp_frame(3);
+        p.resize(60, 0x55);
+        let out = offload(p, 0, 1 << 29 | 1 << 30 | 34 << 18).remove(0);
+        assert_eq!(transport_checksum(&out[14..34], true, 6, &out[34..57]), 0);
         // any descriptor, any frame: no panic
         let mut x = 1u32;
         let mut next = || { x ^= x << 13; x ^= x >> 17; x ^= x << 5; x };
