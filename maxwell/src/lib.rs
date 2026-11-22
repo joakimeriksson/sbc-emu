@@ -7,6 +7,7 @@ pub mod pipe;
 pub mod raster;
 pub mod rop;
 pub mod threed;
+pub mod twod;
 pub mod vertex;
 
 pub use maxwell_tex::Memory;
@@ -29,6 +30,7 @@ impl<M: Memory + ?Sized> MemoryExt for M {}
 pub struct Engine {
     pub threed: threed::Threed,
     inline: inline::Inline,
+    twod: twod::Twod,
     /// (class, method) pairs without an effect, for reports
     pub unknown: std::collections::BTreeSet<(u32, u32)>,
 }
@@ -54,6 +56,12 @@ impl Engine {
                     }
                     self.inline.method(m, v, mem);
                 }
+            }
+            0x902d => {
+                if matches!(m, 0x8dc | 0x860) {
+                    self.threed.rop.flush(mem);
+                }
+                self.twod.method(m, v, mem);
             }
             _ => {
                 self.unknown.insert((class, m));
