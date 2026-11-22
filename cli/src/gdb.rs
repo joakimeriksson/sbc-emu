@@ -811,20 +811,68 @@ mod tests {
         }
     }
 
-    /// Stepping one core leaves the others where and as they are, and they go on afterwards.
+    /// Stepping one core leaves the others where and as they are, and they go on afterwards. Both
+    /// ways: the core that comes first in a round would get the step anyway.
     #[track_caller]
-    fn others_stay<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, counter: usize) {
-        for _ in 0..4 { assert_eq!(run(m, 200_000), Stop::Budget); }
-        let (before, pc1) = (reg(m, 1, counter), pc(m, 1));
-        assert!(before > 10, "core 1 runs");
-        let state = m.describe(1);
-        for _ in 0..50 { assert_eq!(m.step(0), None); }
-        assert_eq!((m.describe(1), reg(m, 1, counter), pc(m, 1)), (state, before, pc1));
-        // the stepped core did run, and the other goes on from where it was
-        for _ in 0..4 { assert_eq!(run(m, 200_000), Stop::Budget); }
-        let after = reg(m, 1, counter);
-        assert!(after > before + 10, "core 1: {before} before the steps, {after} after them and more");
-        assert!(pc(m, 1) & !0xf == pc1 & !0xf);
+    fn others_stay<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, counter: usize, now: fn(&M) -> u64) {
+        for (me, other) in [(0, 1), (1, 0)] {
+            for _ in 0..4 { assert_eq!(run(m, 200_000), Stop::Budget); }
+            let (mine, before, at) = (reg(m, me, counter), reg(m, other, counter), pc(m, other));
+            assert!(mine > 10 && before > 10, "both cores run");
+            let (state, t) = (m.describe(other), now(m));
+            for _ in 0..4000 { assert_eq!(m.step(me), None); }
+            assert_eq!((m.describe(other), reg(m, other, counter), pc(m, other)), (state, before, at), "stepping core {me}");
+            // the stepped core did run (four instructions a round), one nanosecond each
+            assert_eq!(reg(m, me, counter), mine + 1000, "core {me}");
+            let dt = now(m) - t;
+            assert!((3800..=4200).contains(&dt), "4000 steps took {dt} ns");
+            // and the other goes on from where it was
+            for _ in 0..4 { assert_eq!(run(m, 200_000), Stop::Budget); }
+            assert!(reg(m, other, counter) > before + 10);
+            assert!(pc(m, other) & !0xf == at & !0xf);
+        }
+    }
+
+    /// A stepped PSCI call sees the other cores as they are.
+    #[test]
+    fn a_stepped_psci_call_sees_the_others_on() {
+        let mut m = rk3588::Machine::with_cpus(128 << 20, 2).unwrap();
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        m.soc.ram[0x21_0000..0x21_0004].copy_from_slice(&0xd400_0003u32.to_le_bytes()); // smc
+        for k in 0..2 {
+            m.state[k] = rk3588::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+        }
+        for _ in 0..4 { let _ = m.run(200_000); }
+        let count = m.cpus[1].x[1];
+        // AFFINITY_INFO: on; CPU_ON: already on, and nothing restarted
+        for (call, want) in [(0x8400_0004u64, 0u64), (0xc400_0003, -4i64 as u64)] {
+            (m.cpus[0].pc, m.cpus[0].x[0], m.cpus[0].x[1]) = (0x21_0000, call, 0x100);
+            assert_eq!(m.debug_step(0), None);
+            assert_eq!((m.cpus[0].x[0], m.cpus[1].x[1]), (want, count), "{call:x}");
+        }
+    }
+
+    /// A stepped SEV wakes a core waiting for it.
+    #[test]
+    fn a_stepped_sev_is_heard() {
+        let mut m = allwinner_h3::Machine::with_ram_size(128 << 20);
+        let base = m.soc.ram.base as u32;
+        place(&mut m.soc.ram.mem, 0x20_0000, [0xe320_f004, 0xe320_f000, 0xe320_f000, 0xeaff_fffb]); // sev; nop; nop; b
+        place(&mut m.soc.ram.mem, 0x21_0000, [0xe320_f002, 0xe281_1001, 0xe320_f000, 0xeaff_fffe]); // wfe; add r1, r1, #1; nop; b .
+        m.state[0] = allwinner_h3::CoreState::Off;
+        m.cpus[0].r[15] = base + 0x20_0000;
+        // the first WFE may use up an event that is already there: until one waits
+        for _ in 0..2 {
+            m.state[1] = allwinner_h3::CoreState::Run;
+            (m.cpus[1].r[15], m.cpus[1].r[1]) = (base + 0x21_0000, 0);
+            let _ = m.run(10_000);
+        }
+        assert_eq!((m.state[1], m.cpus[1].r[1]), (allwinner_h3::CoreState::Wait, 0));
+        m.state[0] = allwinner_h3::CoreState::Run;
+        assert_eq!(m.debug_step(0), None);
+        for _ in 0..4 { let _ = m.run(10_000); }
+        assert_eq!(m.cpus[1].r[1], 1, "the waiting core went on");
     }
 
     #[test]
@@ -835,7 +883,7 @@ mod tests {
             m.state[k] = rk3588::CoreState::Run;
             (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
         }
-        others_stay(&mut m, |m, n| Host::OrangePi5(m).run(n), 1);
+        others_stay(&mut m, |m, n| Host::OrangePi5(m).run(n), 1, |m| m.now());
     }
 
     #[test]
@@ -846,7 +894,7 @@ mod tests {
             m.state[k] = tegra210::CoreState::Run;
             (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, tegra210::RAM_BASE + 0x20_0000, tegra210::RAM_BASE + 0x30_0000 + 64 * k as u64);
         }
-        others_stay(&mut m, |m, n| Host::JetsonNano(m).run(n), 1);
+        others_stay(&mut m, |m, n| Host::JetsonNano(m).run(n), 1, |m| m.now());
     }
 
     #[test]
@@ -858,7 +906,7 @@ mod tests {
             m.state[k] = allwinner_h3::CoreState::Run;
             (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000 + 64 * k as u32);
         }
-        others_stay(&mut m, |m, n| Host::OrangePiOne(m).run(n), 1);
+        others_stay(&mut m, |m, n| Host::OrangePiOne(m).run(n), 1, |m| m.now());
     }
 
     #[test]
@@ -877,7 +925,7 @@ mod tests {
         run_some(&mut m);
         assert_eq!(m.state[1], rockchip_rk3288::CoreState::Run);
         m.cpus[1].r[2] = 0x30_0040;
-        others_stay(&mut m, |m, n| Host::TinkerBoard(m).run(n), 1);
+        others_stay(&mut m, |m, n| Host::TinkerBoard(m).run(n), 1, |m| m.now());
     }
 
     fn run_some(m: &mut rockchip_rk3288::Machine) { let _ = Host::TinkerBoard(m).run(3_000); }

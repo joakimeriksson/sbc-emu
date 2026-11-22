@@ -629,11 +629,19 @@ impl Machine {
         }
     }
 
+    /// Cores that run at the same time (one while a debugger steps it).
+    fn running_cores(&self) -> u64 {
+        if self.breakpoints.only.is_some() {
+            return 1;
+        }
+        self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64
+    }
+
     /// One instruction of one core: 1 ns divided among the running cores. Cores asleep in
     /// WFI/WFE (or in the boot ROM) do not count, so a lone busy core runs at 1 ns per
     /// instruction.
     fn tick(&mut self, n: u64) {
-        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        let running = self.running_cores();
         self.advance_subtick(n * (12 / running));
     }
 
@@ -651,7 +659,7 @@ impl Machine {
     /// Instructions a core may run before the next device deadline (compiled blocks chain
     /// until then).
     fn instructions_to_deadline(&self) -> u64 {
-        let running = self.state.iter().filter(|&&s| s == CoreState::Run).count().max(1) as u64;
+        let running = self.running_cores();
         let now = self.cpus[0].cntpct;
         if self.next_event <= now {
             return 1;

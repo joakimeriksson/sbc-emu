@@ -12,8 +12,8 @@ pub struct Breakpoints {
     pub at: Vec<u64>,
     /// the (core, pc) reported last: running on from there must not stop there again
     pub resume: Option<(usize, u64)>,
-    /// While a single step runs: the core it is for. The others stay as they are, powered and in
-    /// whatever state, and get no turn.
+    /// While a single step runs: the core it is for. The others stay powered and get no turn (they
+    /// may wake up: from WFI by an interrupt, from WFE).
     pub only: Option<usize>,
 }
 
