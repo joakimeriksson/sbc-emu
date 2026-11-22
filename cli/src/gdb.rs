@@ -133,9 +133,8 @@ impl Target for bcm2711::Machine {
     fn read(&mut self, c: usize, va: u64, len: usize) -> Option<Vec<u8>> { self.debug_read(c, va, len) }
     fn write(&mut self, c: usize, va: u64, data: &[u8]) -> bool { self.debug_write(c, va, data) }
     fn breakpoint(&mut self, addr: u64, insert: bool) {
-        self.breakpoints.retain(|&x| x != addr);
-        if insert { self.breakpoints.push(addr); }
-        let on = !self.breakpoints.is_empty() || !self.cpus[0].watch.is_empty();
+        self.breakpoints.set(addr, insert);
+        let on = !self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty();
         self.set_debugging(on);
     }
     fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) { bcm2711::Machine::watchpoint(self, addr, len, kind, insert) }
@@ -300,7 +299,7 @@ impl Target for ::esp32s31::Machine {
         match n {
             0 => {}
             1..=31 => h.x[n] = v,
-            32 => h.pc = v,
+            32 => { h.pc = v; self.debug_moved(c); }
             33..=64 => h.f[n - 33] = v,
             65 => h.fcsr = h.fcsr & !0x1f | v & 0x1f,
             66 => h.fcsr = h.fcsr & !0xe0 | (v & 7) << 5,
@@ -1004,6 +1003,60 @@ mod tests {
             (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
         }
         stopped_elsewhere(&mut m, |m, n| Host::Pi4(m).run(n), (0, 1), 0x20_0000, 1);
+    }
+
+    /// A core that was stopped at a breakpoint, and then taken elsewhere (the breakpoint removed, or
+    /// its pc set), stops there the next time it comes by, even if another was stepped meanwhile.
+    #[track_caller]
+    fn comes_by_again<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, cores: (usize, usize), code: u64, counter: usize, pc_reg: usize) {
+        for moved in [false, true] {
+            for _ in 0..4 { let _ = run(m, 200_000); }
+            m.breakpoint(code + 8, true);
+            let k = match run(m, 400_000) { Stop::Breakpoint(k) => k, other => panic!("{other:?}") };
+            let other = if k == cores.0 { cores.1 } else { cores.0 };
+            if moved {
+                let word = m.reg(k, pc_reg).unwrap().len();
+                assert!(m.set_reg(k, pc_reg, &(code + 12).to_le_bytes()[..word]));
+            } else {
+                m.breakpoint(code + 8, false);
+                // past it
+                for _ in 0..2 { assert_eq!(m.step(k), None); }
+            }
+            for _ in 0..3 { m.step(other); }
+            if !moved { m.breakpoint(code + 8, true); }
+            let before = reg(m, k, counter);
+            for _ in 0..100 { if run(m, 200_000) == Stop::Breakpoint(k) { break; } }
+            assert_eq!((pc(m, k), reg(m, k, counter)), (code + 8, before + 1), "moved {moved}, core {k}");
+            m.breakpoint(code + 8, false);
+        }
+    }
+
+    #[test]
+    fn a_breakpoint_come_by_again() {
+        let mut m = bcm2711::Machine::with_cpus(65 << 20, 2);
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        for k in 0..2 {
+            m.state[k] = bcm2711::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+        }
+        comes_by_again(&mut m, |m, n| Host::Pi4(m).run(n), (0, 1), 0x20_0000, 1, 32);
+
+        let mut m = allwinner_h3::Machine::with_ram_size(128 << 20);
+        let base = m.soc.ram.base as u32;
+        place(&mut m.soc.ram.mem, 0x20_0000, A32);
+        for k in 0..2 {
+            m.state[k] = allwinner_h3::CoreState::Run;
+            (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000 + 64 * k as u32);
+        }
+        comes_by_again(&mut m, |m, n| Host::OrangePiOne(m).run(n), (0, 1), base as u64 + 0x20_0000, 1, 15);
+
+        // one running core: the step of the other (off) does nothing, as on the chip
+        let mut m = ::esp32s31::machine([2, 0, 0, 0, 0, 1], 16 << 20);
+        let sram = ::esp32s31::bus::SRAM_BASE as u64;
+        for (k, w) in RV.iter().enumerate() { assert!(Target::write(&mut m, 0, sram + 0x1000 + 4 * k as u64, &w.to_le_bytes())); }
+        m.cores[0].pc = sram as u32 + 0x1000;
+        m.cores[0].x[12] = sram as u32 + 0x2000;
+        comes_by_again(&mut m, |m, n| Host::Esp32S31(m).run(n), (0, 1), sram + 0x1000, 11, 32);
     }
 
     /// Stepping through a load-reserved/store-conditional loop gets through it; a step of another

@@ -323,6 +323,7 @@ pub(crate) fn run<B: SerialBoard>(
                 }
                 "reset" => {
                     m = make_machine()?;
+                    owed = None; // it was the old machine's
                     if let Some(g) = gdb.as_ref() {
                         g.rearm(&mut m);
                     }

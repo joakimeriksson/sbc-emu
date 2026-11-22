@@ -94,6 +94,7 @@ pub struct Machine<S: Soc> {
     pub breakpoints: Vec<u32>,
     bp_bloom: u64,
     bp_resume: Option<(usize, u32)>,
+    bp_core: usize,
     /// live web UI
     pub web: Option<WebServer>,
     pub camera_input: Option<std::sync::Arc<std::sync::Mutex<Option<crate::picture::Picture>>>>,
@@ -154,7 +155,7 @@ const BB_DEFAULT: u64 = match option_env!("ESP32SIM_BB_BUILD") {
 impl<S: Soc> Machine<S> {
     pub fn new(mac: [u8; 6], bus: S::Bus) -> Self {
         Machine {
-            web_restart: false, button_reset: false, breakpoints: Vec::new(), bp_bloom: 0, bp_resume: None, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
+            web_restart: false, button_reset: false, breakpoints: Vec::new(), bp_bloom: 0, bp_resume: None, bp_core: 0, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
             cores: (0..S::CORES).map(|i| S::new_core_with_bus(i, &bus)).collect(), core_held: (0..S::CORES).map(|i| i > 0).collect(), quantum: QUANTUM, run_steps: 0, vq_stats: [0; 4], vq_skip: 0, vq_penalty: 0, vq_max: std::env::var("ESP32SIM_VQ").ok().and_then(|v| v.parse().ok()).unwrap_or(VQ_DEFAULT),
             bb_max: std::env::var("ESP32SIM_BB").ok().and_then(|v| v.parse().ok()).unwrap_or(BB_DEFAULT).min(4096), bb_stats: [0; 8],
             bus, symbols: BTreeMap::new(),
@@ -435,6 +436,7 @@ impl<S: Soc> Machine<S> {
         if cpu.waiting() || !self.breakpoints.contains(&pc) { return None; }
         if self.bp_resume == Some((core, pc)) { self.bp_resume = None; return None; }
         self.bp_resume = Some((core, pc));
+        self.bp_core = core;
         Some(Stop::Breakpoint(pc))
     }
 
@@ -442,11 +444,18 @@ impl<S: Soc> Machine<S> {
     pub fn debug_breakpoint(&mut self, addr: u32, insert: bool) {
         self.breakpoints.retain(|&a| a != addr);
         if insert { self.breakpoints.push(addr); }
+        // set again, it stops a core that comes by again
+        if self.bp_resume.is_some_and(|(_, pc)| pc == addr) { self.bp_resume = None; }
         self.bp_bloom = self.breakpoints.iter().fold(0, |m, &pc| m | pc_bit(pc));
     }
 
+    /// A debugger has set the pc of `core`: it no longer stands where it was reported.
+    pub fn debug_moved(&mut self, core: usize) {
+        if self.bp_resume.is_some_and(|(k, _)| k == core) { self.bp_resume = None; }
+    }
+
     /// The core that reported `Stop::Breakpoint` last.
-    pub fn debug_core(&self) -> usize { self.bp_resume.map_or(0, |(k, _)| k) }
+    pub fn debug_core(&self) -> usize { self.bp_core }
 
     /// Watch [addr, addr + len) for accesses of `kind` (1 write, 2 read, 3 either) on every core.
     pub fn debug_watch(&mut self, addr: u32, len: u32, kind: u8, insert: bool) {

@@ -993,13 +993,8 @@ impl Machine {
                     break;
                 }
             }
-            if std::mem::take(&mut self.soc.gpio_reset) {
-                return Stop::Reset;
-            }
-            match self.soc.i2c[5].device::<Axp15060>(PMIC_ADDR).map(|p| std::mem::replace(&mut p.request, PowerRequest::None)) {
-                Some(PowerRequest::Reset) => return Stop::Reset,
-                Some(PowerRequest::Off) => return Stop::PowerOff,
-                _ => {}
+            if let Some(stop) = self.power_request() {
+                return stop;
             }
             if self.soc.net.is_some() {
                 self.soc.pump_network();
@@ -1035,6 +1030,18 @@ impl Machine {
         }
     }
 
+    /// A reset or power-off the guest has asked the GPIO or the PMIC for.
+    fn power_request(&mut self) -> Option<Stop> {
+        if std::mem::take(&mut self.soc.gpio_reset) {
+            return Some(Stop::Reset);
+        }
+        match self.soc.i2c[5].device::<Axp15060>(PMIC_ADDR).map(|p| std::mem::replace(&mut p.request, PowerRequest::None)) {
+            Some(PowerRequest::Reset) => Some(Stop::Reset),
+            Some(PowerRequest::Off) => Some(Stop::PowerOff),
+            _ => None,
+        }
+    }
+
     /// Execute one instruction on hart `k` (interpreted; a hart in WFI is woken, as the ISA
     /// allows); a stop it causes, if any.
     pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
@@ -1057,7 +1064,7 @@ impl Machine {
         self.breakpoints.end_step(k);
         self.soc.now += n;
         self.soc.dev_touched = true;
-        stop
+        stop.or_else(|| self.power_request())
     }
 
     /// The RAM behind [va, va + len) as hart `k` maps it, a page at a time.

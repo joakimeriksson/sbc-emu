@@ -349,7 +349,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         }
         let budget = 2_000_000u64.min(max.saturating_sub(m.instret()));
         if budget == 0 { break Stop::Budget; }
-        if paused && !reset_req {
+        // (what the guest asked for in a step happens though the monitor has paused it)
+        if paused && !reset_req && owed.is_none() {
             // paused from the monitor: only keys move; the pause does not count as guest time
             let t0 = Instant::now();
             if let Ok(b) = rx.recv_timeout(Duration::from_millis(20)) { idle_keys.push(b); }
@@ -411,6 +412,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 if let Some(n) = m.soc.net.as_mut() { n.nat = None; } // free forwarded host ports
                 m = match power_on(d, u) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
                 if let Some(g) = gdb.as_ref() { g.rearm(&mut m); }
+                owed = None; // it was the old machine's
             }
             other => break other,
         }

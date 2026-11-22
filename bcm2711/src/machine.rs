@@ -494,10 +494,8 @@ pub struct Machine {
     next_check: u64,
     /// virtual time at which the current round ends (u64::MAX: one core runs alone)
     round_end: u64,
-    /// debugger breakpoints (virtual pcs, any core); see `set_debugging`
-    pub breakpoints: Vec<u64>,
-    /// the breakpoint just reported (core, pc): resuming executes it once
-    bp_resume: Option<(usize, u64)>,
+    /// a debugger's breakpoints (interpreter only, see `set_debugging`)
+    pub breakpoints: emu_core::debug::Breakpoints,
     /// the deadline of the last idle stop (`idle_until` wakes sleeping cores there, not before)
     idle_target: u64,
     /// run the cores on their own host threads (faster with several busy cores, not repeatable);
@@ -515,7 +513,7 @@ impl Machine {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = (ram as u64).saturating_sub(GPU_MEM); // tiny test machines have less RAM than that
         let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, vc4: None, v3d: None, net: None, unknown: Vec::new(), dirty: true };
-        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Vec::new(), bp_resume: None, idle_target: 0, multi: false,
+        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Default::default(), idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
@@ -671,7 +669,7 @@ impl Machine {
     /// or asleep) runs without rounds until something wakes another one.
     pub fn run(&mut self, budget: u64) -> Stop {
         #[cfg(not(target_arch = "wasm32"))]
-        if self.multi && self.breakpoints.is_empty() && !self.cpus.iter().any(|c| c.jit_off || !c.watch.is_empty()) {
+        if self.multi && self.breakpoints.at.is_empty() && !self.cpus.iter().any(|c| c.jit_off || !c.watch.is_empty()) {
             return self.run_threaded(std::time::Duration::from_millis(10));
         }
         if self.cpus[0].mt {
@@ -712,15 +710,12 @@ impl Machine {
     fn slice(&mut self, k: usize, round_start: u64, total: &mut u64, end: u64, steps: &mut u64, storm: &mut u32) -> Option<Stop> {
         self.switch_to(k);
         self.catch_up(k, round_start);
+        // what a debugger has set only changes between runs
+        let breaks = !self.breakpoints.at.is_empty();
         loop {
             let t = self.cpus[k].now_ns();
             if t >= self.round_end || *total >= end || *steps == 0 { return None; }
-            if !self.breakpoints.is_empty() {
-                let pc = self.cpus[k].pc;
-                if self.breakpoints.contains(&pc) {
-                    if self.bp_resume == Some((k, pc)) { self.bp_resume = None; } else { self.bp_resume = Some((k, pc)); return Some(Stop::Breakpoint(k)); }
-                }
-            }
+            if breaks && self.breakpoints.hit(k, self.cpus[k].pc) { return Some(Stop::Breakpoint(k)); }
             *steps -= 1;
             if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret >= self.next_check {
                 self.update_irqs();
@@ -895,7 +890,7 @@ impl Machine {
             c.watch.retain(|&w| w != (addr, len, kind));
             if insert { c.watch.push((addr, len, kind)); }
         }
-        let on = !self.breakpoints.is_empty() || !self.cpus[0].watch.is_empty();
+        let on = !self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty();
         self.set_debugging(on);
     }
 
@@ -905,15 +900,13 @@ impl Machine {
         self.state[k] = CoreState::Run;
         let jit_off = self.cpus[k].jit_off;
         self.cpus[k].jit_off = true;
-        // another core's stays: it goes on from there later
-        let other = self.bp_resume.filter(|r| r.0 != k);
-        self.bp_resume = Some((k, self.cpus[k].pc));
+        self.breakpoints.begin_step(k, self.cpus[k].pc);
         self.round_end = u64::MAX;
         let (mut total, mut steps, mut storm) = (self.instret(), 1, 0);
         // not behind what another core has seen
         let t = self.cpus[k].now_ns().max(self.now);
         let r = self.slice(k, t, &mut total, u64::MAX, &mut steps, &mut storm);
-        self.bp_resume = other;
+        self.breakpoints.end_step(k);
         self.cpus[k].jit_off = jit_off;
         let t = self.cpus[k].now_ns();
         if t > self.now { self.now = t; }
