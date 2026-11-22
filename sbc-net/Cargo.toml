@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Virtual network for emulated boards: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, virtual 802.11 AP (from esp32sim)"
+
+[dependencies]
+emu-core = { path = "../emu-core" }

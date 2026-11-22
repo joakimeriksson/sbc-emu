@@ -1,6 +1,7 @@
 //! Host model of the CSF global management interface (not MCU instruction execution).
 //! Queues retain their registers and setup across doorbells and ring wraps.
 use crate::gpu_mmu::{AddressSpace, Fault};
+#[derive(Default)]
 struct Queue {
     binding: [u64; 4], // Ring base/size and VM page-table configuration.
     stream: crate::gpu_cs::Stream,
@@ -227,6 +228,9 @@ impl Firmware {
         Ok((irq, req & 1 != 0))
     }
 }
+
+emu_core::snap_struct!(Queue { binding, stream });
+emu_core::snap_struct!(Firmware { running, input, output, groups, stride, failed_queues, queues, tiler });
 
 #[cfg(test)]
 mod tests {

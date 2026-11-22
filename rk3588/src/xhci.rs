@@ -692,33 +692,9 @@ impl Xhci {
         let waiting = self.usbcmd & CMD_RS != 0 && self.ports.iter().any(|p| p.dev.is_some_and(|d| devs.has_input(d)));
         waiting.then_some(self.next_poll)
     }
-
-    // ------------------------------------------------------------------ snapshots
-
-    pub fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("xhci-v1");
-        for v in [self.usbcmd, self.usbsts, self.dnctrl, self.config, self.iman, self.imod, self.erstsz, self.ev_seg, self.ev_idx] { w.u32(v); }
-        for v in [self.crcr, self.cmd_deq, self.dcbaap, self.erstba, self.erdp, self.next_poll] { w.u64(v); }
-        for b in [self.cmd_ccs, self.crr, self.ev_pcs] { w.bool(b); }
-        for p in &self.ports { w.u32(p.sc); w.u32(p.pmsc); w.u8(dev_code(p.dev)); }
-        for s in &self.slots {
-            w.bool(s.enabled); w.u8(s.port);
-            for e in &s.eps { w.u8(e.state); w.u64(e.deq); w.bool(e.ccs); }
-        }
-    }
-    pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        r.tag("xhci-v1")?;
-        for v in [&mut self.usbcmd, &mut self.usbsts, &mut self.dnctrl, &mut self.config, &mut self.iman, &mut self.imod, &mut self.erstsz, &mut self.ev_seg, &mut self.ev_idx] { *v = r.u32()?; }
-        for v in [&mut self.crcr, &mut self.cmd_deq, &mut self.dcbaap, &mut self.erstba, &mut self.erdp, &mut self.next_poll] { *v = r.u64()?; }
-        for b in [&mut self.cmd_ccs, &mut self.crr, &mut self.ev_pcs] { *b = r.bool()?; }
-        for p in self.ports.iter_mut() { p.sc = r.u32()?; p.pmsc = r.u32()?; p.dev = dev_of(r.u8()?); }
-        for s in self.slots.iter_mut() {
-            s.enabled = r.bool()?; s.port = r.u8()?;
-            for e in s.eps.iter_mut() { e.state = r.u8()?; e.deq = r.u64()?; e.ccs = r.bool()?; }
-        }
-        Ok(())
-    }
 }
 
-pub(crate) fn dev_code(d: Option<DevId>) -> u8 { match d { None => 0, Some(DevId::Keyboard) => 1, Some(DevId::Tablet) => 2, Some(DevId::Storage) => 3, Some(DevId::Camera) => 4 } }
-pub(crate) fn dev_of(c: u8) -> Option<DevId> { match c { 1 => Some(DevId::Keyboard), 2 => Some(DevId::Tablet), 3 => Some(DevId::Storage), 4 => Some(DevId::Camera), _ => None } }
+emu_core::snap_struct!(Ep { state, deq, ccs });
+emu_core::snap_struct!(Slot { enabled, port, eps });
+emu_core::snap_struct!(Port { sc, pmsc, dev });
+emu_core::snap_struct!(Xhci { usbcmd, usbsts, dnctrl, config, crcr, cmd_deq, cmd_ccs, crr, dcbaap, ports, iman, imod, erstsz, erstba, erdp, ev_seg, ev_idx, ev_pcs, slots, now, next_poll, transfers } skip { trace });

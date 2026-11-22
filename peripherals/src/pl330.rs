@@ -414,6 +414,32 @@ impl Pl330 {
     }
 }
 
+emu_core::snap_struct!(Channel { state, pc, sar, dar, ccr, lc, burst, fifo, fault });
+emu_core::snap_struct!(Pl330 { channels, inten, es, dbginst, manager_fault } skip { log });
+
+impl emu_core::snap::Snap for State {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let (kind, peripheral) = match *self {
+            State::Stopped => (0, 0),
+            State::Executing => (1, 0),
+            State::Wfp(p) => (2, p),
+            State::Fault => (3, 0),
+        };
+        w.u8(kind);
+        w.u8(peripheral);
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        *self = match (r.u8()?, r.u8()?) {
+            (0, _) => State::Stopped,
+            (1, _) => State::Executing,
+            (2, p) => State::Wfp(p),
+            (3, _) => State::Fault,
+            (k, _) => return Err(emu_core::snap::SnapError(format!("PL330 channel state {k}"))),
+        };
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

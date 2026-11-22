@@ -114,6 +114,9 @@ impl Mmc {
     }
 }
 
+emu_core::snap_enum!(Transfer { None, Read, Write });
+emu_core::snap_struct!(Mmc { card, regs, transfer, buffer, position, lba, remaining, raw });
+
 #[cfg(test)]
 mod tests {
     use super::*;

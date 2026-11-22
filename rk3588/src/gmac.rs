@@ -135,6 +135,8 @@ impl Gmac {
     }
 }
 
+emu_core::snap_struct!(Gmac { regs, phy, tx_index, rx_index, tx_partial, tx_dropping, tx_active, tx_out, rx_queue });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -200,6 +200,23 @@ impl Scmi {
     }
 }
 
+emu_core::snap_struct!(Clock { rate, enabled } skip { name });
+
+impl emu_core::snap::Snap for Scmi {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { clocks, resets, calls } = self;
+        emu_core::snap::save_each(w, clocks);
+        emu_core::snap::save_each(w, resets);
+        calls.save(w);
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { clocks, resets, calls } = self;
+        emu_core::snap::load_each(r, clocks, "SCMI clocks")?;
+        emu_core::snap::load_each(r, resets, "SCMI resets")?;
+        calls.load(r)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

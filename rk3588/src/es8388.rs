@@ -110,6 +110,8 @@ impl I2cDevice for Es8388 {
     }
 }
 
+emu_core::snap_struct!(Es8388 { regs, pointer });
+
 #[cfg(test)]
 mod tests {
     use super::*;

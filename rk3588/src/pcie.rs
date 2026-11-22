@@ -83,6 +83,19 @@ impl Pcie {
     pub fn irq(&self) -> bool { self.cfg[1] & 0x400 == 0 && self.intx() }
 }
 
+impl emu_core::snap::Snap for Pcie {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { nvme, cfg } = self;
+        cfg.save(w);
+        emu_core::snap::save_fitted(w, nvme);
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { nvme, cfg } = self;
+        cfg.load(r)?;
+        emu_core::snap::load_fitted(r, nvme, "an NVMe SSD (--nvme)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

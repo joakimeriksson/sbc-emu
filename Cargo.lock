@@ -133,6 +133,7 @@ dependencies = [
 name = "peripherals"
 version = "0.0.1"
 dependencies = [
+ "emu-core",
  "sbc-net",
 ]
 
@@ -245,6 +246,9 @@ dependencies = [
 [[package]]
 name = "sbc-net"
 version = "0.0.1"
+dependencies = [
+ "emu-core",
+]
 
 [[package]]
 name = "starfive-jh7110"

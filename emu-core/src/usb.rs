@@ -438,8 +438,8 @@ impl UsbDevice for Storage {
 // ---------------------------------------------------------------------- where devices sit
 
 /// The devices that exist, and which controller port each one is plugged into.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DevId { Keyboard, Tablet, Storage, Camera }
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DevId { #[default] Keyboard, Tablet, Storage, Camera }
 
 #[derive(Default)]
 pub struct Devices {
@@ -472,6 +472,42 @@ impl Devices {
 }
 
 // ---------------------------------------------------------------------- snapshots
+
+crate::snap_enum!(DevId { Keyboard, Tablet, Storage, Camera });
+crate::snap_struct!(Std { address, pending_address, configured, pending_in });
+crate::snap_struct!(Keyboard { st, held, modifiers, events, last, leds });
+crate::snap_struct!(Tablet { st, events, last, state });
+
+impl crate::snap::Snap for Storage {
+    fn save(&self, w: &mut crate::snap::W) {
+        let Self { st, disk, data, csw, write, sense } = self;
+        st.save(w); data.save(w); csw.save(w); write.save(w); sense.save(w);
+        crate::snap::save_disk(w, Some(disk.as_ref()));
+    }
+    fn load(&mut self, r: &mut crate::snap::R) -> Result<(), crate::snap::SnapError> {
+        let Self { st, disk, data, csw, write, sense } = self;
+        st.load(r)?; data.load(r)?; csw.load(r)?; write.load(r)?; sense.load(r)?;
+        crate::snap::load_disk(r, Some(disk.as_mut()), "a USB stick (--usb-drive)")
+    }
+}
+
+/// All of it, pending input included (`save_state` is the Pi 4's older format).
+impl crate::snap::Snap for Devices {
+    fn save(&self, w: &mut crate::snap::W) {
+        let Self { kbd, tablet, storage, camera } = self;
+        kbd.save(w); tablet.save(w);
+        crate::snap::save_fitted(w, storage);
+        w.bool(camera.is_some());
+    }
+    fn load(&mut self, r: &mut crate::snap::R) -> Result<(), crate::snap::SnapError> {
+        let Self { kbd, tablet, storage, camera } = self;
+        kbd.load(r)?; tablet.load(r)?;
+        crate::snap::load_fitted(r, storage, "a USB stick (--usb-drive)")?;
+        if r.bool()? || camera.is_some() { return Err(crate::snap::SnapError("the USB camera is not in this snapshot format".into())); }
+        Ok(())
+    }
+}
+
 
 fn save_std(w: &mut crate::snap::W, s: &Std) {
     w.u8(s.address); w.bool(s.pending_address.is_some()); w.u8(s.pending_address.unwrap_or(0));

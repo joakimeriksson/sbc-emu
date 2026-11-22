@@ -269,6 +269,10 @@ impl VirtualNet {
     }
 }
 
+// The host side of NAT (its sockets) is not part of a snapshot: a guest's connections through it
+// end, as if the cable had been out.
+emu_core::snap_struct!(VirtualNet { gw_mac, gw_ip, dns_ip, sta_ip, mask, dhcp_acks, dns_answers, ntp_answers, tcp_rejects, arp_replies, pings, unhandled, now_us, guest_mac, last_arp_us } skip { log, nat });
+
 #[cfg(test)]
 mod tests {
     use super::*;

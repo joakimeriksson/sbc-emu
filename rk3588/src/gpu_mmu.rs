@@ -189,6 +189,8 @@ impl AddressSpace {
     }
 }
 
+emu_core::snap_struct!(AddressSpace { transtab, transcfg });
+
 #[cfg(test)]
 mod tests {
     use super::*;
