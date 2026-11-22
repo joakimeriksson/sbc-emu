@@ -77,7 +77,18 @@ impl Default for Car {
         regs[SPARE_REG0 / 4] = 1 << 2;
         // PLLP runs (408 MHz) and so does PLLX for the CPU, as the bootloader leaves them
         regs[0xa0 / 4] = PLL_ENABLE;
-        regs[0xe0 / 4] = PLL_ENABLE;
+        // PLLX at 998.4 MHz for the CPU, PLLM at 1593.6 MHz for the memory; PLLC, C2, C3 and
+        // A1 (499.2 MHz) and PLLD (595.2 MHz) are off, with dividers: Linux takes a clock whose
+        // rate is zero for a broken one
+        regs[0xe0 / 4] = PLL_ENABLE | 52 << 8 | 2;
+        regs[0x90 / 4] = PLL_ENABLE | 83 << 8 | 2;
+        for base in [0x80, 0x4e8, 0x4fc, 0x6a4] {
+            regs[base / 4] = 26 << 10 | 2;
+        }
+        regs[0xd0 / 4] = 62 << 11 | 4;
+        // VIC03 and VI from clock M (their mux values 0 are no source)
+        regs[0x678 / 4] = 6 << 29;
+        regs[0x148 / 4] = 5 << 29;
         // the super-clock muxes in the RUN state (bit 29), source in bits 7:4: the CPU
         // clusters on PLLX (8), the system clock on PLLP (3)
         regs[CCLKG_BURST_POLICY / 4] = 1 << 29 | 8 << 4;

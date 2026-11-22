@@ -50,6 +50,9 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 **USB works**: XUSB through Debian's `xhci-tegra`, with a keyboard, a tablet and a stick
 (`--usb-drive`). Check: `scripts/jetson-nano-usb.txt`.
 
+**HDMI works**: `tegra-drm` reads the monitor's EDID and shows the console (`--hdmi-mode`, `--vnc`,
+`--screenshot`). Check: `scripts/jetson-nano-display.txt`.
+
 ### What is modelled (`tegra210/`)
 
 | Block | Model |
@@ -61,7 +64,11 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 | Clock and reset controller | 38.4 MHz oscillator, clock M 19.2 MHz, PLL lock bits, enable/reset set-clear registers, super clocks in RUN |
 | PMC | power-gate toggles, I/O pad deep power-down |
 | Fuses, chip ID | HIDREV = T210 A02; speedo, SKU and IDDQ fuses |
-| Memory controller | the client DMA-flush handshake |
+| Memory controller | the SMMU (per-group address spaces, two-level page tables walked on every use), the client DMA-flush handshake |
+| host1x | 192 sync points with threshold interrupts; command channels, of which only sync point increments have an effect |
+| Display controllers ×2 | timing, three windows (scaling, blending, linear and block-linear), cursor, vertical blank; RGB formats |
+| SOR ×2 | register files whose sequencers finish at once; DisplayPort reports no monitor |
+| APB DMA | 32 channels, serving the I²C FIFOs |
 | UART A | `peripherals::uart` (16550) |
 | I²C ×6 | packet mode, PIO |
 | MAX77620 PMIC | a register file (regulators, GPIO) and its real-time clock |
@@ -85,8 +92,8 @@ PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
 3. **USB and network** (done): PCIe and the RTL8111H, XUSB. (Alpine's kernel has neither PCIe, the
    PMIC nor the SMMU, Debian's has all.) Not yet: USB 3.0 devices, the on-board hub, the device-mode
    port.
-4. **Display**: host1x (the command engine the display and the GPU sit behind), the display
-   controllers, SOR/HDMI; `tegra-drm`.
+4. **Display** (done): the SMMU, host1x, the display controllers, SOR/HDMI; `tegra-drm`. Not yet:
+   YUV overlays, HDMI audio, DisplayPort, VIC.
 5. **GPU** (GM20B through nouveau and Mesa): the falcons (PMU, FECS, GPCCS) at a high level,
    accepting NVIDIA's signed firmware from `linux-firmware` and reporting it running; the GR
    engine's command processing; Maxwell's shader instruction set (documented by nouveau,

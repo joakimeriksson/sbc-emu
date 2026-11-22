@@ -76,6 +76,11 @@ impl TegraI2c {
         }
     }
 
+    /// Received bytes wait in the FIFO.
+    pub fn has_data(&self) -> bool {
+        !self.rx.is_empty()
+    }
+
     /// The interrupt status: the FIFO requests are levels.
     fn status(&self) -> u32 {
         let mut s = self.regs[INT_STATUS / 4];
