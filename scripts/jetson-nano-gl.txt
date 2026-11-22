@@ -1,0 +1,14 @@
+# GL test scenes on the Jetson Nano's GPU, against Mesa's software renderers (tests/gpu/run-nano.sh).
+# Start tools/gpu_server.py on the host first. A Debian 13 card with gcc, libegl-dev, libgles-dev and
+# Mesa; the root password given on the command line (systemd.set_credential, see jetson-nano-debian.txt)
+# is "nano".
+wait-serial login:
+sleep 1
+serial root\r
+wait-serial Password:
+serial nano\r
+wait-serial ~#
+sleep 1
+serial python3 -c "import urllib.request as u; open('/tmp/run.sh','wb').write(u.urlopen('http://10.0.2.2:8800/run-nano.sh').read())"; sh /tmp/run.sh; echo NANO-GL-""END\r
+wait-serial NANO-GL-END
+quit

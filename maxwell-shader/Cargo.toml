@@ -1,0 +1,8 @@
+[package]
+name = "maxwell-shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decoder and interpreter of NVIDIA Maxwell (GM20B, shader model 5) shader code as Mesa's nouveau driver emits it"
+
+[dependencies]

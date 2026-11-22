@@ -10,6 +10,7 @@ pub mod boot;
 pub mod car;
 pub mod dc;
 pub mod gpio;
+pub mod gpu;
 pub mod host1x;
 pub mod i2c;
 pub mod max77620;
@@ -114,6 +115,7 @@ pub struct Soc {
     pub monitor: Option<(u32, u32)>,
     pub smmu: smmu::Smmu,
     pub host1x: host1x::Host1x,
+    pub gpu: gpu::Gpu,
     pub dc: [dc::Dc; 2],
     pub sor: [sor::Sor; 2],
     /// the network behind the Ethernet port, and when to poll it next (ns)
@@ -179,6 +181,11 @@ impl Soc {
             self.smmu.read(word - smmu::BASE)
         } else if at(host1x::BASE, host1x::SIZE) {
             self.host1x.read(word - host1x::BASE)
+        } else if at(gpu::BAR0, gpu::SIZE) {
+            self.gpu.tick(self.now);
+            self.gpu.read(word - gpu::BAR0)
+        } else if at(gpu::BAR1, gpu::SIZE) {
+            self.gpu.bar1_read(word - gpu::BAR1, &self.smmu, &self.ram)
         } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
             self.dc[k].read(word - dc::BASE[k])
         } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {
@@ -248,9 +255,16 @@ impl Soc {
             self.i2c_vi.write(o >> 2, value, self.now);
         } else if at(smmu::BASE, smmu::SIZE) {
             self.smmu.write(word - smmu::BASE, value);
+            self.gpu.mmu.invalidate();
         } else if at(host1x::BASE, host1x::SIZE) {
             let dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
             self.host1x.write(word - host1x::BASE, value, &self.smmu, &dma);
+        } else if at(gpu::BAR0, gpu::SIZE) {
+            self.gpu.tick(self.now);
+            self.gpu.write(word - gpu::BAR0, value, &self.smmu, &mut self.ram);
+        } else if at(gpu::BAR1, gpu::SIZE) {
+            self.gpu.tick(self.now);
+            self.gpu.bar1_write(word - gpu::BAR1, value, &self.smmu, &mut self.ram);
         } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
             self.dc[k].write(word - dc::BASE[k], value, self.now);
         } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {
@@ -353,6 +367,9 @@ impl Soc {
             self.gic.set_level(irq, d.irq());
         }
         self.gic.set_level(host1x::IRQ, self.host1x.irq());
+        self.gpu.tick(self.now);
+        self.gpu.poll(&self.smmu, &mut self.ram);
+        self.gic.set_level(gpu::IRQ, self.gpu.irq());
         self.pump_network();
         self.pcie.update();
         self.gic.set_level(pcie::IRQ, self.pcie.irq());
@@ -392,7 +409,7 @@ impl Soc {
 
     fn next_event(&self) -> Option<u64> {
         let net = (self.net.is_some() && self.pcie.nic.receiving()).then_some(self.net_next);
-        self.timers.next_event().into_iter().chain(net).chain(self.xusb.xhci.next_event(&self.usb)).chain(self.dc.iter().filter_map(|d| d.next_event())).min()
+        self.timers.next_event().into_iter().chain(net).chain(self.xusb.xhci.next_event(&self.usb)).chain(self.dc.iter().filter_map(|d| d.next_event())).chain(self.gpu.next_event()).min()
     }
 }
 
@@ -513,6 +530,7 @@ impl Machine {
             monitor: None,
             smmu: Default::default(),
             host1x: Default::default(),
+            gpu: Default::default(),
             dc: Default::default(),
             sor: Default::default(),
             net: None,

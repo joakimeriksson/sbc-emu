@@ -53,6 +53,10 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 **HDMI works**: `tegra-drm` reads the monitor's EDID and shows the console (`--hdmi-mode`, `--vnc`,
 `--screenshot`). Check: `scripts/jetson-nano-display.txt`.
 
+**The GPU works**: nouveau drives the GM20B, and Debian's Mesa (25.0.7, unmodified) renders OpenGL ES
+3.2 with it: kmscube and every glmark2 scene on HDMI, and the GL test scenes match llvmpipe. See
+[jetson-nano-gpu.md](jetson-nano-gpu.md).
+
 ### What is modelled (`tegra210/`)
 
 | Block | Model |
@@ -78,6 +82,7 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 | RTL8111H | the register window and its indirect spaces, the PHY, the transmit and receive rings, offloads; MSI (not MSI-X), no wake-on-LAN, VLAN tags or jumbo frames |
 | XUSB | the shared xHCI core (`peripherals::xhci`) behind the falcon's firmware load, which accepts any firmware and runs none; the mailbox; the devices sit on the USB 2.0 root ports (a real Nano has a hub) |
 | XUSB pad controller | its UPHY PLLs calibrate and lock; the rest is a register file |
+| GM20B | the memory management unit, PMU and FECS at their message level, channels and runlists, the copy engine; the 3D, 2D, compute and inline-to-memory classes in `maxwell/` |
 | Everything else in 0x0100_0000-0x8000_0000 | read-back registers; first-touched pages are listed at exit (`SBC_STUB_LOG=1` prints them as they happen) |
 
 PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
@@ -94,10 +99,7 @@ PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
    port.
 4. **Display** (done): the SMMU, host1x, the display controllers, SOR/HDMI; `tegra-drm`. Not yet:
    YUV overlays, HDMI audio, DisplayPort, VIC.
-5. **GPU** (GM20B through nouveau and Mesa): the falcons (PMU, FECS, GPCCS) at a high level,
-   accepting NVIDIA's signed firmware from `linux-firmware` and reporting it running; the GR
-   engine's command processing; Maxwell's shader instruction set (documented by nouveau,
-   Mesa's compiler and envytools). On the scale of the Mali-G610 and V3D work.
+5. **GPU** (done): GM20B through nouveau and Mesa; see [jetson-nano-gpu.md](jetson-nano-gpu.md).
 6. **Browser**: the board page, like the Orange Pi One's (the WebAssembly build already has the
    A64 JIT).
 

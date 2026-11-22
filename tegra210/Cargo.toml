@@ -10,4 +10,5 @@ arm-a64 = { path = "../arm-a64" }
 emu-core = { path = "../emu-core" }
 peripherals = { path = "../peripherals" }
 sbc-net = { path = "../sbc-net" }
+maxwell = { path = "../maxwell" }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
