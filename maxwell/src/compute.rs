@@ -2,7 +2,7 @@
 //! for every workgroup.
 use crate::common_host;
 use crate::inline::Inline;
-use crate::pipe::{Common, Pipe, Work, L};
+use crate::pipe::{self, Common, Pipe, Work, L};
 use crate::threed::Cbuf;
 use crate::Memory;
 use maxwell_shader::{Exit, Host, Lanes, Program, SurfOp, TexOp};
@@ -62,9 +62,12 @@ impl Launch {
     }
 }
 
-/// The largest workgroup (threads), and instructions per launch and sixteen threads.
+/// The largest workgroup (threads), the most local memory of one, and the most instructions (of
+/// sixteen threads each) in a workgroup and in a launch: programs that do not end are stopped.
 const MAX_THREADS: u64 = 4096;
+const MAX_LOCAL: usize = 1 << 28;
 const FUEL: u64 = 400_000_000;
+const LAUNCH_FUEL: u64 = 20_000_000_000;
 
 struct Group<'a, 'm> {
     common: &'a mut Common<'m>,
@@ -160,6 +163,10 @@ impl Compute {
             return;
         }
         let batches = (threads as usize).div_ceil(L);
+        if launch.local > pipe::MAX_LOCAL || launch.local * batches * L > MAX_LOCAL {
+            pipe.fail(format!("compute shader with {} bytes of local memory", launch.local));
+            return;
+        }
         // the descriptor invalidates the caches
         pipe.invalidate_textures();
         pipe.cbufs_changed = true;
@@ -180,11 +187,14 @@ impl Compute {
         let locals: Vec<[[u32; L]; 3]> = (0..batches).map(|b| std::array::from_fn(|k| std::array::from_fn(|l| thread(b, l)[k]))).collect();
         let (_, mut common) = pipe.workers[0].parts(&work, mem);
         let mut failed = None;
+        let mut left_fuel = LAUNCH_FUEL;
         'groups: for z in 0..launch.groups[2] {
             for y in 0..launch.groups[1] {
                 for x in 0..launch.groups[0] {
                     self.shared.fill(0);
                     let mut left: Vec<bool> = vec![true; batches];
+                    let start = FUEL.min(left_fuel);
+                    let mut fuel = start;
                     for (b, l) in self.lanes[..batches].iter_mut().enumerate() {
                         let n = (threads as usize - b * L).min(L);
                         l.start(program, (1u64 << n).wrapping_sub(1) as u32, 0);
@@ -196,7 +206,6 @@ impl Compute {
                                 continue;
                             }
                             let mut host = Group { common: &mut common, shared: &mut self.shared, group: [x, y, z], local: locals[b] };
-                            let mut fuel = FUEL;
                             match maxwell_shader::run(program, &mut self.lanes[b], &mut host, &mut fuel) {
                                 Exit::Done => left[b] = false,
                                 Exit::Barrier => {}
@@ -207,6 +216,7 @@ impl Compute {
                             }
                         }
                     }
+                    left_fuel -= start - fuel;
                 }
             }
         }

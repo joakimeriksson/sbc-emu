@@ -41,10 +41,14 @@ pub struct Shader {
     pub sph: Sph,
 }
 
+/// The most local memory a lane gets, in bytes.
+pub const MAX_LOCAL: usize = 1 << 19;
+
 impl Shader {
     /// Bytes of local memory of each lane.
     pub fn local_size(&self) -> usize {
-        (self.sph.local_low + self.sph.local_high + self.sph.local_crs) as usize
+        // (the hardware has no more, and neither do we)
+        ((self.sph.local_low + self.sph.local_high + self.sph.local_crs) as usize).min(MAX_LOCAL)
     }
 }
 
@@ -404,7 +408,7 @@ impl Common<'_> {
                         return [0; 4];
                     }
                     let level = if op.lod_mode == LodMode::Level { lod[k] } else { 0 };
-                    let pos = std::array::from_fn(|c| p[c][k] as i32 + offset[c][k] as i32);
+                    let pos = std::array::from_fn(|c| (p[c][k] as i32).wrapping_add(offset[c][k] as i32));
                     maxwell_tex::sample::fetch(&tex, cache, mem, pos, if op.array { layer[k] } else { 0 }, level, op.ms.then_some(sample[k]))
                 });
                 put(r);

@@ -584,7 +584,7 @@ fn lambdas(tex: &Texture, a: &Args, normalized: bool, aniso: u32) -> ([f32; LANE
         let (dx, dy) = derivatives(tex, a, normalized, lane);
         let (x2, y2) = (dot(dx), dot(dy));
         let (long, short, axis) = if x2 >= y2 { (x2, y2, dx) } else { (y2, x2, dy) };
-        if aniso > 1 && long > 0.0 {
+        if aniso > 1 && long > 1.0 {
             let n = ((long / short.max(1e-12)).sqrt().ceil()).clamp(1.0, aniso as f32);
             probes[lane] = (n as u32, axis);
             // The probes cover the long axis, unless that takes too many.
@@ -657,7 +657,7 @@ pub fn sample<M: Memory + ?Sized>(
             continue;
         }
         let (n, axis) = probes[l];
-        *o = if n > 1 && lambda[l] > 0.0 {
+        *o = if n > 1 {
             let mip = &tex.levels[tex.first as usize];
             let size = if normalized { [mip.width as f32, mip.height as f32, 1.0] } else { [1.0; 3] };
             let mut sum = [0.0; 4];
@@ -727,8 +727,8 @@ pub fn gather<M: Memory + ?Sized>(
     out
 }
 
-/// TMML: the level of detail (signed 8.8 fixed point, biased, not clamped) and the level that
-/// would be used (unsigned 8.8, from the view's first), in 16 bits each.
+/// TMML: the level of detail (biased, not clamped) and the level that would be used (from the view's
+/// first), as floats.
 pub fn query_lod(tex: &Texture, smp: &Sampler, a: &Args) -> [[u32; 4]; LANES] {
     if tex.null || tex.is_buffer {
         return [[0; 4]; LANES];
@@ -744,8 +744,7 @@ pub fn query_lod(tex: &Texture, smp: &Sampler, a: &Args) -> [[u32; 4]; LANES] {
             MipFilter::Nearest => (level + 0.5).floor().min(top),
             MipFilter::Linear => level,
         };
-        let fixed = |v: f32| (v * 256.0).round() as i32 as u32 & 0xffff;
-        [fixed(raw.clamp(-128.0, 127.99)), fixed(level), 0, 0]
+        [raw.to_bits(), level.to_bits(), 0, 0]
     })
 }
 
