@@ -42,6 +42,14 @@ pub fn gob_offset(x: u32, y: u32) -> u32 {
     (X_SWIZZLE[(x & 63) as usize] | Y_SWIZZLE[(y & 7) as usize]) as u32
 }
 
+/// Where the `piece`th 16 bytes of a GOB are in rows of bytes.
+#[inline(always)]
+fn piece_offset(piece: usize, stride: usize) -> usize {
+    let x = (piece >> 1 & 1) * 16 + (piece >> 4) * 32;
+    let y = (piece & 1) + (piece >> 2 & 3) * 2;
+    y * stride + x
+}
+
 /// Block size in GOBs, as log2. `width` is always 0 on these surfaces as the drivers make
 /// them (a block is one GOB wide).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -236,6 +244,14 @@ impl Plane {
             for gx in (x / 64)..=((x + w - 1) / 64) {
                 let (c0, c1) = (x.max(gx * 64), (x + w).min(gx * 64 + 64));
                 mem.read(base + self.gob(gx * 64, gy * 8, z), &mut gob);
+                if r1 - r0 == 8 && c1 - c0 == 64 {
+                    let at = (gy * 8 - y) as usize * stride + (gx * 64 - x) as usize;
+                    for (piece, p) in gob.as_chunks::<16>().0.iter().enumerate() {
+                        let o = at + piece_offset(piece, stride);
+                        out[o..o + 16].copy_from_slice(p);
+                    }
+                    continue;
+                }
                 for r in r0..r1 {
                     let row = (r - y) as usize * stride;
                     let mut c = c0;
@@ -278,8 +294,17 @@ impl Plane {
         for gy in (y / 8)..=((y + h - 1) / 8) {
             for gx in (x / 64)..=((x + w - 1) / 64) {
                 let addr = base + self.gob(gx * 64, gy * 8, z);
+                if gy * 8 >= y && gy * 8 + 8 <= y + h && gx * 64 >= x && gx * 64 + 64 <= x + w {
+                    let at = (gy * 8 - y) as usize * stride + (gx * 64 - x) as usize;
+                    for (piece, p) in gob.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                        let o = at + piece_offset(piece, stride);
+                        p.copy_from_slice(&data[o..o + 16]);
+                    }
+                    mem.write(addr, &gob);
+                    continue;
+                }
                 // In memory order, the 16-byte pieces of the GOB; runs of them are written
-                // together (the whole GOB when it is inside the rectangle).
+                // together.
                 let (mut start, mut end) = (0usize, 0usize);
                 for piece in 0..32u32 {
                     let px = gx * 64 + ((piece >> 1) & 1) * 16 + (piece >> 4) * 32;

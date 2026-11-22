@@ -4,7 +4,7 @@
 use crate::bc::{self, Texels};
 use crate::desc::{BadHeader, Compare, CubeEdges, Dim, Layout, MipFilter, Reduction, Source, Tic, Tsc, Wrap};
 use crate::layout::{BlockDims, Chain, Mip, MsMode, Plane, Shape, GOB_BYTES};
-use crate::num::{bits, rgb9e5_to_f32, srgb8_table, Chan, Num, Packed};
+use crate::num::{bits, half_to_f32, rgb9e5_to_f32, srgb8_table, Chan, Num, Packed};
 use crate::{bptc, etc, Memory};
 
 /// Why a header gives no texture.
@@ -57,6 +57,8 @@ pub enum Kind {
     Packed,
     /// Four 8-bit UNORM channels (perhaps sRGB).
     Rgba8,
+    /// Four half floats.
+    Rgba16f,
     Rgb9e5,
     /// Two texels in 32 bits. Byte of each texel's luma, of red and of blue.
     Yuv { y: [u8; 2], r: u8, b: u8 },
@@ -159,7 +161,7 @@ impl TexFormat {
 
     /// Integer or unpacked texels: anything but 4x4 blocks and the like.
     pub fn is_plain(&self) -> bool {
-        matches!(self.kind, Kind::Packed | Kind::Rgba8)
+        matches!(self.kind, Kind::Packed | Kind::Rgba8 | Kind::Rgba16f)
     }
 }
 
@@ -209,6 +211,9 @@ impl Texture {
         let packed = format.packed(t.types, t.srgb);
         if t.format == 8 && packed.ch.iter().all(|c| c.num == Num::Unorm) {
             format.kind = Kind::Rgba8;
+        }
+        if t.format == 3 && packed.ch.iter().all(|c| c.num == Num::Float) {
+            format.kind = Kind::Rgba16f;
         }
         let swizzle = t.swizzle.map(|s| s as u8);
         let integer = format.kind == Kind::Packed
@@ -356,10 +361,17 @@ impl Texture {
             }
             Kind::Packed => {
                 let addr = base + plane.offset(x * f.bytes, y, z);
-                let w = cache.words(mem, addr, f.bytes);
-                let mut p = self.packed;
-                p.srgb &= srgb;
-                p.decode(&w)
+                let w = if f.bytes == 4 { [cache.word(mem, addr), 0, 0, 0] } else { cache.words(mem, addr, f.bytes) };
+                if self.packed.srgb && !srgb {
+                    Packed { srgb: false, ..self.packed }.decode(&w)
+                } else {
+                    self.packed.decode(&w)
+                }
+            }
+            Kind::Rgba16f => {
+                let w = cache.words(mem, base + plane.offset(x * 8, y, z), 8);
+                let h = |v: u32| half_to_f32(v as u16);
+                bits([h(w[0]), h(w[0] >> 16), h(w[1]), h(w[1] >> 16)])
             }
             Kind::Rgb9e5 => {
                 let v = rgb9e5_to_f32(cache.word(mem, base + plane.offset(x * 4, y, z)));
@@ -433,7 +445,7 @@ impl Sampler {
 }
 
 const LINES: usize = 256;
-const BLOCKS: usize = 256;
+const BLOCKS: usize = 512;
 const LINE: u64 = GOB_BYTES as u64;
 
 /// Texels read lately: 512-byte lines of memory (a GOB of a block-linear texture) and decoded
@@ -528,6 +540,17 @@ impl TexCache {
     pub(crate) fn words<M: Memory + ?Sized>(&mut self, mem: &M, addr: u64, n: u32) -> [u32; 4] {
         let n = n.min(16) as usize;
         let o = (addr & (LINE - 1)) as usize;
+        if n == 8 && o & 7 == 0 {
+            let l = self.line(mem, addr);
+            let o = o & (LINE as usize - 8);
+            let w = |i: usize| u32::from_le_bytes([l[o + i], l[o + i + 1], l[o + i + 2], l[o + i + 3]]);
+            return [w(0), w(4), 0, 0];
+        }
+        if n <= 2 && o + n <= LINE as usize {
+            let l = self.line(mem, addr);
+            let lo = l[o & (LINE as usize - 1)] as u32;
+            return [if n == 2 { lo | (l[(o + 1) & (LINE as usize - 1)] as u32) << 8 } else { lo }, 0, 0, 0];
+        }
         let mut b = [0u8; 16];
         if o + n <= LINE as usize {
             b[..n].copy_from_slice(&self.line(mem, addr)[o..o + n]);

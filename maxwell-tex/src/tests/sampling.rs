@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use super::*;
 use crate::num::{bits, f32s};
 use crate::sample::*;

@@ -34,6 +34,8 @@ impl Surface {
         ms: MsMode,
     ) -> Self {
         let pitch = tile_mode >> 12 & 1 != 0;
+        // The registers hold more than the hardware has.
+        let (width, height) = (width.min(1 << 20), height.min(1 << 16));
         let plane = if pitch {
             Plane::pitch(width)
         } else {

@@ -184,8 +184,8 @@ impl RtFormat {
 
     #[inline(always)]
     fn encode_rgba8(&self, v: [f32; 4]) -> [u8; 4] {
-        // `max` first so that NaN gives 0.
-        let c = v.map(|v| (v.max(0.0).min(1.0) * 255.0 + 0.5) as u8);
+        // NaN gives 0.
+        let c = v.map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
         if self.fast == Fast::Bgra8 {
             [c[2], c[1], c[0], c[3]]
         } else {

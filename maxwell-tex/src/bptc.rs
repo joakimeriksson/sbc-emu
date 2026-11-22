@@ -115,6 +115,7 @@ struct Bc7Mode {
 
 #[rustfmt::skip]
 const BC7: [Bc7Mode; 8] = {
+    #[allow(clippy::too_many_arguments)]
     const fn m(
         subsets: u32, part: u32, rotation: u32, selector: u32, color: u32, alpha: u32,
         p_end: bool, p_subset: bool, index: u32, index2: u32,

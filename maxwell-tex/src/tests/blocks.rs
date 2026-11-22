@@ -82,7 +82,7 @@ fn bc6h_by_hand() {
 #[test]
 fn etc_by_hand() {
     // Individual mode: both halves grey 0x88, table 0 (2, 8), all indices 0.
-    let v = 0x88_88_88_00_0000_0000u64;
+    let v = 0x8888_8800_0000_0000u64;
     assert_eq!(texel(be(v), BlockCode::Etc2Rgb, 0), [138, 138, 138, 255]);
     // Texel (column 1, row 0), number 4: index 3, -8.
     assert_eq!(texel(be(v | 1 << 4 | 1 << 20), BlockCode::Etc2Rgb, 1), [128, 128, 128, 255]);
@@ -121,7 +121,7 @@ fn random_blocks() {
         let mut rng = Rng(0x9E3779B97F4A7C15u64.wrapping_add(seed));
         let mut data: Vec<u8> = (0..2048 * n).map(|_| (rng.next() >> 24) as u8).collect();
         if code == Bc7 {
-            for (i, b) in data.chunks_exact_mut(16).enumerate() {
+            for (i, b) in data.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                 let m = (i % 8) as u32;
                 b[0] = (b[0] & !((1u8 << m).wrapping_sub(1))) | 1 << m;
                 if m == 7 {

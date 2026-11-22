@@ -424,21 +424,25 @@ impl<M: Memory + ?Sized> Ctx<'_, M> {
             [at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1)]
         };
         let w = [(256 - fx) * (256 - fy), fx * (256 - fy), (256 - fx) * fy, fx * fy];
-        let mut out = [0.0; 4];
         if self.srgb {
             let table = srgb8_table();
-            for (c, o) in out.iter_mut().enumerate().take(3) {
-                *o = (0..4).map(|k| table[t[k][c] as usize] * w[k] as f32).sum::<f32>() * (1.0 / 65536.0);
+            let mut out = [0.0; 4];
+            for (t, w) in t.iter().zip(w) {
+                let w = w as f32 * (1.0 / 65536.0);
+                let c = [table[t[0] as usize], table[t[1] as usize], table[t[2] as usize], t[3] as f32 * (1.0 / 255.0)];
+                for (o, c) in out.iter_mut().zip(c) {
+                    *o += c * w;
+                }
             }
-            let a: u32 = (0..4).map(|k| t[k][3] as u32 * w[k]).sum();
-            out[3] = a as f32 / (255.0 * 65536.0);
-        } else {
-            for (c, o) in out.iter_mut().enumerate() {
-                let v = t[0][c] as u32 * w[0] + t[1][c] as u32 * w[1] + t[2][c] as u32 * w[2] + t[3][c] as u32 * w[3];
-                *o = v as f32 / (255.0 * 65536.0);
+            return out;
+        }
+        let mut sum = [0u32; 4];
+        for (t, w) in t.iter().zip(w) {
+            for (s, t) in sum.iter_mut().zip(t) {
+                *s += *t as u32 * w;
             }
         }
-        out
+        sum.map(|s| s as f32 * (1.0 / (255.0 * 65536.0)))
     }
 
     /// Filtered value of one level of a non-integer texture.
