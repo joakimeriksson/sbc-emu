@@ -402,9 +402,11 @@ pub(crate) fn run<B: SerialBoard>(
         match stop {
             Stop::Budget => {}
             Stop::Idle(deadline) => {
-                // Virtual time never runs ahead of the wall clock while idle.
+                // Virtual time never runs ahead of the wall clock while idle: sleep until the
+                // deadline's wall time. (Not only while the guest is ahead: after each turn its
+                // time is the wall clock a moment ago, and the loop would spin.)
                 let wall = anchor.elapsed().as_nanos() as u64;
-                if wall <= m.now() {
+                if wall < deadline {
                     let wait = Duration::from_nanos(deadline.saturating_sub(wall).min(20_000_000).max(1));
                     match rx.recv_timeout(wait) {
                         Ok(b) => idle_input.push(b),
