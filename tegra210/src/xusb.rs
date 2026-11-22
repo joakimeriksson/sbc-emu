@@ -60,7 +60,8 @@ impl Default for Xusb {
 impl Xusb {
     /// A keyboard and a tablet, and a USB stick on request.
     pub fn attach(&mut self, stick: bool) {
-        self.xhci.attach(&[stick.then_some(DevId::Storage), Some(DevId::Keyboard), Some(DevId::Tablet)]);
+        // (the first USB 2 port is the micro-B connector: a device, not a host)
+        self.xhci.attach(&[None, stick.then_some(DevId::Storage), Some(DevId::Keyboard), Some(DevId::Tablet)]);
     }
 
     /// The controller was held in reset, or its power was off: the firmware is gone.
