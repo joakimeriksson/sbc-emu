@@ -59,6 +59,16 @@ impl TegraI2c {
         self.devices.push((address & 0x7f, device));
     }
 
+    /// The clock and reset controller holds the controller in reset.
+    pub fn reset(&mut self) {
+        self.release();
+        self.header.clear();
+        self.payload.clear();
+        self.rx.clear();
+        self.completing = false;
+        self.regs.fill(0);
+    }
+
     /// STOP for a device that a CONTINUE left addressed.
     fn release(&mut self) {
         if let Some((i, _)) = self.current.take() {
@@ -334,13 +344,15 @@ mod tests {
 
     #[test]
     fn a_bus_clear_ends_an_abandoned_transfer_to_the_same_device() {
-        let mut c = TegraI2c::default();
-        c.attach(0x3c, Box::new(Mem { data: vec![0; 256], ..Default::default() }));
-        packet(&mut c, 0x3c, HEADER_CONTINUE, 2, &[0xaa10]);
-        c.write(BUS_CLEAR_CNFG as u64, 1, 0);
-        packet(&mut c, 0x3c, 0, 2, &[0x0120]); // register 0x20 = 1
-        packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x20]);
-        packet(&mut c, 0x3c, HEADER_READ, 1, &[]);
-        assert_eq!(c.read(RX_FIFO as u64), 1);
+        for by_reset in [false, true] {
+            let mut c = TegraI2c::default();
+            c.attach(0x3c, Box::new(Mem { data: vec![0; 256], ..Default::default() }));
+            packet(&mut c, 0x3c, HEADER_CONTINUE, 2, &[0xaa10]);
+            if by_reset { c.reset() } else { c.write(BUS_CLEAR_CNFG as u64, 1, 0) }
+            packet(&mut c, 0x3c, 0, 2, &[0x0120]); // register 0x20 = 1
+            packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x20]);
+            packet(&mut c, 0x3c, HEADER_READ, 1, &[]);
+            assert_eq!(c.read(RX_FIFO as u64), 1, "reset {by_reset}");
+        }
     }
 }

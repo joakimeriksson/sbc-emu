@@ -33,6 +33,8 @@ pub const GPIO: u64 = 0x6000_d000;
 /// The I²C controllers and their interrupts; the PMIC is on I²C5.
 pub const I2C: [(u64, usize); 6] =
     [(0x7000_c000, 32 + 0x26), (0x7000_c400, 32 + 0x54), (0x7000_c500, 32 + 0x5c), (0x7000_c700, 32 + 0x78), (0x7000_d000, 32 + 0x35), (0x7000_d100, 32 + 0x3f)];
+/// their numbers in the clock and reset controller
+const I2C_RESETS: [usize; 6] = [12, 54, 67, 103, 47, 166];
 pub const I2C5: usize = 4;
 /// The SDMMC controllers, 0x200 apart, and their interrupts; the microSD slot is on SDMMC1.
 pub const SDMMC: u64 = 0x700b_0000;
@@ -158,6 +160,11 @@ impl Soc {
             self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
             self.car.write(word - CAR, value);
+            for (c, &id) in self.i2c.iter_mut().zip(&I2C_RESETS) {
+                if self.car.in_reset(id) {
+                    c.reset();
+                }
+            }
         } else if at(PMC, 0xc00) {
             self.pmc.write(word - PMC, value);
         } else if at(GPIO, gpio::SIZE) {

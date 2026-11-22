@@ -19,18 +19,24 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 DL=${DOWNLOADS:-$OUT/downloads}
 mkdir -p "$DL"
-fetch() { # file url sha256 [other-url]
-    if [ ! -f "$DL/$1" ]; then
-        echo "fetching $2" >&2
-        curl -fL --retry 3 -o "$DL/$1.part" "$2" ||
-            { [ -n "${4:-}" ] && curl -fL --retry 3 -o "$DL/$1.part" "$4"; } || exit 1
-        mv "$DL/$1.part" "$DL/$1"
+sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+fetch() { # file sha256 url...
+    f=$1 want=$2
+    shift 2
+    if [ ! -f "$DL/$f" ]; then
+        for url; do
+            echo "fetching $url" >&2
+            curl -fL --retry 3 -o "$DL/$f.part" "$url" || continue
+            [ "$(sha "$DL/$f.part")" = "$want" ] && mv "$DL/$f.part" "$DL/$f" && return
+            echo "$url: not the file with sha256 $want" >&2
+        done
+        rm -f "$DL/$f.part"
+        exit 1
     fi
-    actual=$(shasum -a 256 "$DL/$1" | cut -d' ' -f1)
-    [ "$actual" = "$3" ] || { echo "$1: sha256 $actual, expected $3" >&2; exit 1; }
+    [ "$(sha "$DL/$f")" = "$want" ] || { echo "$DL/$f: sha256 is not $want" >&2; exit 1; }
 }
-fetch "$DEB" "$DEB_URL" "$DEB_SHA" "$DEB_SNAPSHOT"
-fetch "$ROOTFS" "$ROOTFS_URL" "$ROOTFS_SHA"
+fetch "$DEB" "$DEB_SHA" "$DEB_URL" "$DEB_SNAPSHOT"
+fetch "$ROOTFS" "$ROOTFS_SHA" "$ROOTFS_URL"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/deb" "$work/root"
@@ -69,6 +75,8 @@ root=$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline)
 if [ -n "$root" ]; then
     dev=
     case $root in card | /dev/* | LABEL=* | UUID=*) ;; *) echo "root=$root: use /dev/..., LABEL=, UUID= or card"; root= ;; esac
+fi
+if [ -n "$root" ]; then
     for i in $(seq 100); do
         case $root in
             card) dev=$(blkid | grep 'TYPE="ext4"' | sed -n 's/^\(\/dev\/mmcblk[0-9]*p[0-9]*\):.*/\1/p' | head -n1) ;;
@@ -76,7 +84,6 @@ if [ -n "$root" ]; then
             *) dev=$root ;;
         esac
         [ -b "$dev" ] && break
-        [ -n "$root" ] || break
         usleep 100000
     done
     mkdir -p /new
