@@ -131,6 +131,8 @@ impl I2cDevice for Hym8563 {
     }
 }
 
+emu_core::snap_struct!(Hym8563 { regs, pointer, seconds, epoch_ns, now_ns, time_written });
+
 #[cfg(test)]
 mod tests {
     use super::*;

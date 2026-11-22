@@ -190,3 +190,20 @@ fn word(addr: u64, width: u64) -> Result<(), Fault> {
         Err(Fault::Prohibited)
     }
 }
+
+impl emu_core::snap::Snap for Peripherals {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { mmc, i2c, gpio, dma_written } = self;
+        emu_core::snap::save_each(w, mmc);
+        for (_, _, bus) in i2c { bus.save(w); }
+        emu_core::snap::save_each(w, gpio);
+        dma_written.save(w);
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { mmc, i2c, gpio, dma_written } = self;
+        emu_core::snap::load_each(r, mmc, "MMC controllers")?;
+        for (_, _, bus) in i2c { bus.load(r)?; }
+        emu_core::snap::load_each(r, gpio, "GPIO banks")?;
+        dma_written.load(r)
+    }
+}

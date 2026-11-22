@@ -135,6 +135,8 @@ impl Dsi {
     }
 }
 
+emu_core::snap_struct!(Dsi { payload, reply, max_return, packets } fixed { regs } skip { log });
+
 #[cfg(test)]
 mod tests {
     use super::*;

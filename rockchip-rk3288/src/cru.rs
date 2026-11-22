@@ -228,6 +228,10 @@ impl Pmu {
     }
 }
 
+emu_core::snap_struct!(Cru { reset_requested } fixed { regs });
+emu_core::snap_struct!(Grf {} fixed { regs });
+emu_core::snap_struct!(Pmu {} fixed { regs });
+
 #[cfg(test)]
 mod tests {
     use super::*;

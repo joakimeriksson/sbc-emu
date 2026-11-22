@@ -18,6 +18,12 @@ impl SerialBoard for Machine {
     fn instret(&self) -> u64 {
         Machine::instret(self)
     }
+    fn save(&self) -> Result<Vec<u8>, String> {
+        Machine::save(self)
+    }
+    fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        Machine::restore(self, file)
+    }
     fn report(&self, tag: &str) {
         eprintln!(
             "[{tag}] core {} pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
@@ -133,7 +139,7 @@ pub(crate) fn run_board(args: &[String], profile: &Profile) -> ExitCode {
 
 fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let tag = profile.tag;
-    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc", "--audio-out"];
+    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc", "--audio-out", "--restore", "--snapshot"];
     if profile.network.is_some() {
         options.push("--net");
     }
@@ -160,7 +166,9 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
             }
         }
     }
-    let (kernel, dtb) = if card_boot {
+    // a snapshot has the kernel in its RAM
+    let only_restored = arg(args, "--restore").is_some() && arg(args, "--kernel").is_none() && !card_boot;
+    let (kernel, dtb) = if card_boot || only_restored {
         (Vec::new(), Vec::new())
     } else {
         (
@@ -191,6 +199,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let no_jit = args.iter().any(|a| a == "--no-jit");
+    let booted = std::cell::Cell::new(false);
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::with_ram_size(ram);
         if no_jit {
@@ -207,7 +216,11 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         let disk = |d: &Option<crate::disk::SharedDisk>| d.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         m.soc.periph.insert_sd(disk(&sd));
         m.soc.periph.mmc[devices::EMMC].insert(disk(&emmc));
-        if card_boot {
+        if only_restored {
+            if booted.replace(true) {
+                return Err("the guest rebooted: give --kernel, --sd or --emmc with --restore to boot it again".into());
+            }
+        } else if card_boot {
             let boot = boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
             eprintln!(
                 "[{tag}] boot from {}: {}, kernel {} bytes, initrd {} bytes, cmdline \"{}\"",

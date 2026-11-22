@@ -680,3 +680,68 @@ pub fn tiler_job(vm: &mut Vm, job: u64, list: &mut Vec<Prim>) -> u64 {
     }
     20 + prims * 4 + count as u64
 }
+
+emu_core::snap_struct!(Dcd { flags, offset_start, position, ubos, textures, samplers, push, state, attr_bufs, attrs, vary_bufs, varyings, viewport, occlusion, fbd });
+emu_core::snap_struct!(DrawState { dcd, rsd_va, first_provoking, point_size, line_width });
+
+/// A polygon list. Triangles of one draw follow each other and share its state: it is written
+/// once, with the first.
+pub(crate) fn save_list(w: &mut emu_core::snap::W, list: &[Prim]) {
+    use emu_core::snap::Snap as _;
+    w.u64(list.len() as u64);
+    let mut last: Option<&Rc<DrawState>> = None;
+    for Prim { kind, v, pos, corner, draw } in list {
+        let new = !last.is_some_and(|l| Rc::ptr_eq(l, draw));
+        w.bool(new);
+        if new { draw.as_ref().save(w); }
+        last = Some(draw);
+        kind.save(w);
+        v.save(w);
+        pos.save(w);
+        corner.save(w);
+    }
+}
+
+pub(crate) fn load_list(r: &mut emu_core::snap::R) -> Result<Vec<Prim>, emu_core::snap::SnapError> {
+    use emu_core::snap::Snap as _;
+    let mut list: Vec<Prim> = Vec::new();
+    for _ in 0..r.u64()? {
+        let draw = if r.bool()? {
+            let mut d = DrawState { dcd: Dcd::default(), rsd_va: 0, first_provoking: false, point_size: 0.0, line_width: 0.0 };
+            d.load(r)?;
+            Rc::new(d)
+        } else {
+            list.last().ok_or_else(|| emu_core::snap::SnapError("a polygon list without a draw".into()))?.draw.clone()
+        };
+        let mut p = Prim { kind: 0, v: [0; 3], pos: [[0.0; 4]; 3], corner: [[0.0; 3]; 3], draw };
+        p.kind.load(r)?;
+        p.v.load(r)?;
+        p.pos.load(r)?;
+        p.corner.load(r)?;
+        list.push(p);
+    }
+    Ok(list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_comes_back_with_its_draws_shared() {
+        let draw = |k: u64| Rc::new(DrawState { dcd: Dcd { position: k, ..Default::default() }, rsd_va: k + 1, first_provoking: true, point_size: 2.0, line_width: 1.0 });
+        let (a, b) = (draw(5), draw(9));
+        let prim = |k: u8, draw: &Rc<DrawState>| Prim { kind: k, v: [1, 2, k as u32], pos: [[0.5; 4]; 3], corner: [[k as f32; 3]; 3], draw: draw.clone() };
+        let list = [prim(1, &a), prim(2, &a), prim(3, &b)];
+        let mut w = emu_core::snap::W::default();
+        save_list(&mut w, &list);
+        let back = load_list(&mut emu_core::snap::R::new(&w.0)).unwrap();
+        assert_eq!(format!("{back:?}"), format!("{list:?}"));
+        assert!(Rc::ptr_eq(&back[0].draw, &back[1].draw) && !Rc::ptr_eq(&back[1].draw, &back[2].draw));
+        let mut again = emu_core::snap::W::default();
+        save_list(&mut again, &back);
+        assert_eq!(w.0, again.0);
+        // the first triangle must bring its draw
+        assert!(load_list(&mut emu_core::snap::R::new(&[1, 0, 0, 0, 0, 0, 0, 0, 0])).is_err());
+    }
+}

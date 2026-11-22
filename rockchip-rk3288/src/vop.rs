@@ -265,6 +265,8 @@ impl Memory for RamView<'_> {
     }
 }
 
+emu_core::snap_struct!(Vop { regs, mmu, status, next_frame, frames } fixed { lut } skip { log });
+
 #[cfg(test)]
 mod tests {
     use super::*;

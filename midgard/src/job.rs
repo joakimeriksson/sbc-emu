@@ -19,7 +19,7 @@ use crate::draw::{self, Prim};
 use crate::frag;
 use crate::status;
 use crate::vm::Vm;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub const JOB_NULL: u32 = 1;
 pub const JOB_WRITE_VALUE: u32 = 2;
@@ -48,7 +48,7 @@ pub struct JobState {
     /// Polygon lists by address space (its page-table base) and framebuffer descriptor:
     /// tiler jobs append, the fragment job of the same framebuffer consumes. Processes
     /// share virtual addresses, so the descriptor alone does not name a framebuffer.
-    pub lists: HashMap<(u64, u64), Vec<Prim>>,
+    pub lists: BTreeMap<(u64, u64), Vec<Prim>>,
 }
 
 /// Polygon lists kept at once; a list whose fragment job never came (a failed chain) is
@@ -96,6 +96,7 @@ impl JobState {
                 JOB_TILER => {
                     let fbd = vm.r64(va + 64 + 28 * 4) & !63;
                     if self.lists.len() >= MAX_LISTS && !self.lists.contains_key(&(transtab, fbd)) {
+                        // the lowest key: any would do, but the same one in every run
                         let stale = *self.lists.keys().next().unwrap();
                         self.lists.remove(&stale);
                     }
@@ -132,5 +133,28 @@ impl JobState {
             va = next;
         }
         ChainResult { status: status::JOB_CONFIG_FAULT, tail, cycles }
+    }
+}
+
+impl emu_core::snap::Snap for JobState {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { counts, lists } = self;
+        counts.save(w);
+        w.u64(lists.len() as u64);
+        for (key, list) in lists {
+            key.save(w);
+            draw::save_list(w, list);
+        }
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { counts, lists } = self;
+        counts.load(r)?;
+        lists.clear();
+        for _ in 0..r.u64()? {
+            let mut key = (0u64, 0u64);
+            key.load(r)?;
+            lists.insert(key, draw::load_list(r)?);
+        }
+        Ok(())
     }
 }

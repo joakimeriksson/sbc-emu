@@ -74,6 +74,8 @@ fn read_u64(ram: &[u8], base: u64, pa: u64) -> Option<u64> {
     Some(u64::from_le_bytes(ram.get(i..i.checked_add(8)?)?.try_into().unwrap()))
 }
 
+emu_core::snap_struct!(AddressSpace { transtab, memattr, lockaddr, transcfg, faultstatus, faultaddress, active_transtab });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -252,6 +252,25 @@ impl EmmcCard {
     }
 }
 
+impl emu_core::snap::Snap for EmmcCard {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { disk, state, rca, ext_csd, erase, trace: _ } = self;
+        state.save(w);
+        rca.save(w);
+        ext_csd.save(w);
+        erase.save(w);
+        emu_core::snap::save_disk(w, disk.as_deref());
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { disk, state, rca, ext_csd, erase, trace: _ } = self;
+        state.load(r)?;
+        rca.load(r)?;
+        ext_csd.load(r)?;
+        erase.load(r)?;
+        emu_core::snap::load_disk(r, disk.as_mut().map(|d| d.as_mut() as &mut dyn Disk), "an eMMC (--emmc)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

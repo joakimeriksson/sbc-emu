@@ -541,6 +541,13 @@ impl Default for MaliT760 {
     }
 }
 
+emu_core::snap_struct!(Slot { head, tail, affinity, config, xaffinity, status, head_next, affinity_next, config_next, command_next, flush_id_next, running, held });
+emu_core::snap_struct!(MaliT760 {
+    gpu_rawstat, gpu_mask, fault_status, fault_address, shader_ready, tiler_ready, l2_ready, config, perfcnt, pwr_override,
+    cycle_count_running, cycle_base, flush_id, job_rawstat, job_mask, slots, mmu_rawstat, mmu_mask, aspaces, jobs, now, chains,
+    written_pages,
+} skip { trace });
+
 #[cfg(test)]
 mod tests {
     use super::*;

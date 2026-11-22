@@ -6,3 +6,4 @@ license.workspace = true
 description = "ARM Mali-T760 (Midgard) GPU as driven by Linux's panfrost driver and Mesa's panfrost driver"
 
 [dependencies]
+emu-core = { path = "../emu-core" }

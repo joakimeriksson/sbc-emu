@@ -69,6 +69,8 @@ impl I2cDevice for Syr82x {
     }
 }
 
+emu_core::snap_struct!(Syr82x { regs, pointer });
+
 #[cfg(test)]
 mod tests {
     use super::*;

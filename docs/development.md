@@ -27,7 +27,8 @@ GitHub Actions runs the suite on every pull request and push to `main` ([.github
   interpreted and compiled (a plain store instead of the compare-and-swap loses ~70% of them).
 - `arm-a64/tests/system.rs`: exceptions, EL changes, MMU faults, timer interrupts.
 - `bcm2711/tests/watch.rs`: debugger watchpoints stop after the access, on the right core.
-- `rk3588/tests/snapshot.rs`, `allwinner-h3/tests/snapshot.rs`: a restored machine goes on exactly as the saved one (bare metal, and
+- `rk3588/tests/snapshot.rs`, `allwinner-h3/tests/snapshot.rs`,
+  `rockchip-rk3288/tests/snapshot.rs`: a restored machine goes on exactly as the saved one (bare metal, and
   about 30 points of a Linux boot when the guest is in `cache/`).
 - `cli/src/gdb.rs`: each board's machine under the gdb stub (memory, registers, steps, breakpoints,
   watchpoints), a debugger that vanishes, a reset; `tools/gdb-check.py` does it on booted guests.

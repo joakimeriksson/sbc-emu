@@ -270,6 +270,8 @@ fn rockchip_seconds_for_unix(unix: i64) -> i64 {
     seconds_of(y, m, d, hms, 31)
 }
 
+emu_core::snap_struct!(Rk808 { regs, pointer, expect_pointer, rtc_seconds, rtc_epoch_ns, now_ns, power_off });
+
 #[cfg(test)]
 mod tests {
     use super::*;

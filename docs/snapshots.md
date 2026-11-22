@@ -6,7 +6,7 @@ not zero and what the guest has written to its disks. Restored, the guest goes o
 | Board | |
 |---|---|
 | Raspberry Pi 4 | yes (script `save`, monitor `savevm`/`loadvm`, `--restore`) |
-| Orange Pi 5, Orange Pi One | yes (below) |
+| Orange Pi 5, Orange Pi One, Tinker Board | yes (below) |
 | The other boards | not yet |
 
 ```sh
@@ -17,7 +17,7 @@ sbc-emu run --board orangepi5 ... --restore here.snap        # go on from it
 
 Restore with the options the snapshot was made with: the same `--smp`, `--ram-mb` (its default
 depends on `--kernel`), `--net`, `--gpu`
-and disk **images** (`--sd`, `--nvme`, `--usb-drive`; a snapshot holds only what was written over
+and disk **images** (`--sd`, `--emmc`, `--nvme`, `--usb-drive`; a snapshot holds only what was written over
 them). Cores, RAM, devices, and the images' sizes are checked, their contents are not. The kernel is
 in the snapshot's RAM; `--kernel` is only needed if the guest is to reboot. `--no-jit` and
 `--threads` may differ.

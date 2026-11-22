@@ -240,6 +240,8 @@ impl I2s {
     }
 }
 
+emu_core::snap_struct!(I2s { txcr, rxcr, ckr, dmacr, intcr, xfer, tx, rx_level, tx_to, rx_to, rate, frames, underruns } skip { capture, out });
+
 #[cfg(test)]
 mod tests {
     use super::*;
