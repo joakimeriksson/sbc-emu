@@ -21,6 +21,14 @@ impl Breakpoints {
     /// Whether core `k` may have a turn (see `only`).
     pub fn may_run(&self, k: usize) -> bool { self.only.is_none_or(|o| o == k) }
 
+    /// The core whose turn is the `i`th of a round of `n`: core `i`, but while breakpoints are set
+    /// counted from the one after `last`. Each stop ends a round, and a core that reaches a
+    /// breakpoint in every round would keep the others from theirs.
+    #[inline(always)]
+    pub fn turn(&self, i: usize, last: usize, n: usize) -> usize {
+        if self.at.is_empty() { i } else { (last + 1 + i) % n }
+    }
+
     pub fn set(&mut self, addr: u64, insert: bool) {
         self.at.retain(|&a| a != addr);
         if insert { self.at.push(addr); }
