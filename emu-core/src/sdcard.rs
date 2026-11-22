@@ -78,8 +78,11 @@ impl SdCard {
         self.state
     }
 
+    /// The card's capacity: the image's sectors, rounded up to the 512 KiB units of the CSD.
+    /// (Rounded down, a card ends inside an odd-sized image's last partition, which Linux
+    /// truncates or drops.) What the image lacks of the last unit reads as zeros.
     pub fn sectors(&self) -> u64 {
-        self.disk.as_ref().map_or(0, |d| d.sectors())
+        self.disk.as_ref().map_or(0, |d| d.sectors().next_multiple_of(1024))
     }
 
     /// R1 card status: current state and READY_FOR_DATA.
@@ -118,7 +121,7 @@ impl SdCard {
     }
 
     pub fn csd(&self) -> u128 {
-        // CSD version 2.0 (SDHC): C_SIZE in 512 KiB units, rounded down.
+        // CSD version 2.0 (SDHC): C_SIZE in 512 KiB units.
         let c_size = (self.sectors() / 1024).saturating_sub(1) as u128 & 0x3f_ffff;
         1 << 126
             | 0x0e << 112 // TAAC
@@ -248,6 +251,19 @@ mod tests {
         let card = ready_card();
         assert_eq!(card.state(), CardState::Transfer);
         assert_eq!(card.csd() >> 48 & 0x3f_ffff, 1, "2048 sectors = 2 x 512 KiB");
+    }
+
+    #[test]
+    fn an_odd_sized_image_fits_the_card() {
+        for (sectors, capacity) in [(2048, 2048), (2049, 3072), (3071, 3072), (1, 1024)] {
+            let mut card = SdCard::new(Some(Box::new(MemDisk::new(sectors))));
+            assert_eq!(((card.csd() >> 48 & 0x3f_ffff) + 1) * 1024, capacity);
+            assert!(card.in_range(sectors - 1, 1) && card.in_range(capacity as u64 - 1, 1) && !card.in_range(capacity as u64, 1));
+            let mut out = [0xff; 512];
+            card.write_blocks(capacity as u64 - 1, &[1; 512]);
+            card.read_blocks(capacity as u64 - 1, &mut out);
+            assert_eq!(out[0], (capacity as u64 - 1 < sectors) as u8, "past the image: zeros, and writes go nowhere");
+        }
     }
 
     #[test]
