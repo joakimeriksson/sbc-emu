@@ -22,6 +22,7 @@ pub struct Draw {
     pub triangles: Vec<[[f32; 4]; 3]>,
     pub varyings: Option<(usize, Arc<[u8]>)>,
 }
+#[derive(Default)]
 pub struct Frame {
     pub owner: Owner,
     pub width: u32,
@@ -435,6 +436,14 @@ fn draw_vertices(
     }
     Ok(ids)
 }
+
+impl Default for Draw {
+    fn default() -> Self { Self { regs: [0; 256], instruction: 0, triangles: Vec::new(), varyings: None } }
+}
+emu_core::snap_struct!(Heap { owner, started, completed, fragments });
+emu_core::snap_struct!(Draw { regs, instruction, triangles, varyings });
+emu_core::snap_struct!(Frame { owner, width, height, draws, vertices });
+emu_core::snap_struct!(Tiler { frames, vertices, heaps });
 
 #[cfg(test)]
 mod tests {

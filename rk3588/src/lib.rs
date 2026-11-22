@@ -31,6 +31,7 @@ pub mod audio;
 pub mod grf;
 pub mod hdmi_qp;
 pub mod scmi;
+mod snapshot;
 pub mod vop2;
 
 use arm_a64::{Cpu, CpuProfile};

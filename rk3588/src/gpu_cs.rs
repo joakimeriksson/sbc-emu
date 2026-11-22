@@ -367,6 +367,13 @@ impl Stream {
     }
 }
 
+impl Default for Stream {
+    fn default() -> Self {
+        Self { regs: [0; 256], start: 0, pc: 0, end: 0, stack: Vec::new(), heap: None, oom_handler: None, standalone_tiler: Default::default() }
+    }
+}
+emu_core::snap_struct!(Stream { regs, start, pc, end, stack, heap, oom_handler, standalone_tiler });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -226,3 +226,5 @@ fn play(dmac: &mut Pl330, bus: &mut DmaBus, now: u64, codec: Option<u32>) {
         }
     }
 }
+
+emu_core::snap_struct!(Audio { dmac, i2s1, i2s5, i2c6, now });

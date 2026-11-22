@@ -57,3 +57,5 @@ impl RegisterPointer {
         reg
     }
 }
+
+emu_core::snap_struct!(RegisterPointer { pointer, expect_pointer });

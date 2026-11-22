@@ -294,6 +294,8 @@ impl I2sTdm {
     }
 }
 
+emu_core::snap_struct!(I2sTdm { txcr, rxcr, ckr, dmacr, intcr, xfer, tdm_txcr, tdm_rxcr, clkdiv, tx, rx_level, tx_to, rx_to, rate, gain, frames, underruns } skip { capture, out });
+
 #[cfg(test)]
 mod tests {
     use super::*;

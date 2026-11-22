@@ -104,6 +104,8 @@ impl HdmiQp {
     }
 }
 
+emu_core::snap_struct!(HdmiQp { rddata, int1, ddc_reads, edid } fixed { regs });
+
 #[cfg(test)]
 mod tests {
     use super::*;

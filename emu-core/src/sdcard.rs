@@ -229,6 +229,27 @@ impl SdCard {
     }
 }
 
+crate::snap_enum!(CardState { Idle, Ready, Ident, Standby, Transfer });
+
+impl crate::snap::Snap for SdCard {
+    fn save(&self, w: &mut crate::snap::W) {
+        let Self { disk, state, rca, app, erase, trace: _ } = self;
+        state.save(w);
+        rca.save(w);
+        app.save(w);
+        erase.save(w);
+        crate::snap::save_disk(w, disk.as_deref());
+    }
+    fn load(&mut self, r: &mut crate::snap::R) -> Result<(), crate::snap::SnapError> {
+        let Self { disk, state, rca, app, erase, trace: _ } = self;
+        state.load(r)?;
+        rca.load(r)?;
+        app.load(r)?;
+        erase.load(r)?;
+        crate::snap::load_disk(r, disk.as_mut().map(|d| d.as_mut() as &mut dyn Disk), "an SD card (--sd)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

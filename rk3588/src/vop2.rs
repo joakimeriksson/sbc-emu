@@ -286,6 +286,8 @@ impl Vop2 {
     }
 }
 
+emu_core::snap_struct!(Vop2 { raw, next_frame, frames, shown, taken_over } fixed { regs });
+
 #[cfg(test)]
 mod tests {
     use super::*;

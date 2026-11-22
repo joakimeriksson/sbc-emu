@@ -267,3 +267,11 @@ impl Gic {
             o if o >= 0x10000 && Self::private_offset(o - 0x10000) => self.bank_write(pe, o-0x10000,v), _=>{} }
     }
 }
+
+emu_core::snap_struct!(Line { group, enabled, pending, level, active, edge, priority });
+emu_core::snap_struct!(Pe { private, pmr, cpu_ctlr, group1, waker, sre, running } skip { cached });
+emu_core::snap_struct!(Gic { ctlr, route, cur, acknowledges } fixed { shared, pes } skip { ready } after |s| {
+    s.changed();
+    if s.cur >= s.pes.len() { return Err(emu_core::snap::SnapError(format!("GIC: PE {} of {}", s.cur, s.pes.len()))); }
+    Ok(())
+});

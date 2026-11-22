@@ -142,6 +142,8 @@ impl Gpu {
         }
     }
 }
+emu_core::snap_struct!(Gpu { raw, firmware, mask, ready, regs, spaces });
+
 #[cfg(test)]
 mod tests {
     use super::*;

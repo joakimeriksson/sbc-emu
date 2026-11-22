@@ -11,6 +11,8 @@ impl SerialBoard for rk3588::Machine {
     fn now(&self) -> u64 { rk3588::Machine::now(self) }
     fn screen(&mut self) -> Option<&mut dyn Screen> { Some(self) }
     fn instret(&self) -> u64 { rk3588::Machine::instret(self) }
+    fn save(&self) -> Result<Vec<u8>, String> { rk3588::Machine::save(self) }
+    fn restore(&mut self, file: &[u8]) -> Result<(), String> { rk3588::Machine::restore(self, file) }
     // --audio-out: the headphone jack (ES8388); --hdmi-audio-out: HDMI0
     fn capture_audio(&mut self) -> bool { self.soc.audio.capture(true, false); true }
     fn take_audio(&mut self) -> (u32, Vec<i16>) { let i = &mut self.soc.audio.i2s1; (i.rate, std::mem::take(&mut i.out)) }
@@ -50,7 +52,7 @@ pub(crate) fn run(args:&[String])->ExitCode {
     match execute(args) {Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("[orangepi5] {e}");ExitCode::FAILURE}}
 }
 fn execute(args:&[String])->Result<(),String> {
-    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme", "--audio-out", "--hdmi-audio-out"])?;
+    serial_board::validate_options(args, &["--threads", "--dump-dtb", "--sd", "--gpu", "--net", "--smp", "--hdmi-mode", "--vnc", "--screenshot", "--usb-drive", "--nvme", "--audio-out", "--hdmi-audio-out", "--restore", "--snapshot"])?;
     // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
     let multi=match arg(args,"--threads") { None|Some("single")=>false, Some("multi")=>true, Some(_)=>return Err("--threads single|multi".into()) };
     let smp=arg(args,"--smp").map_or(Ok(rk3588::MAX_CPUS),|s|s.parse::<usize>().ok().filter(|n|(1..=rk3588::MAX_CPUS).contains(n)).ok_or(format!("--smp takes 1..{}",rk3588::MAX_CPUS)))?;
@@ -69,7 +71,9 @@ fn execute(args:&[String])->Result<(),String> {
     let net=arg(args,"--net").unwrap_or("nat");
     if !["none","local","nat"].contains(&net) {return Err("--net must be none, local or nat".into());}
     let kernel=arg(args,"--kernel").map(std::fs::read).transpose().map_err(|e|e.to_string())?;
-    if kernel.is_none() && arg(args,"--sd").is_none() { return Err("provide --kernel Image or --sd IMAGE".into()); }
+    // a snapshot has the kernel in its RAM
+    let restore=arg(args,"--restore").is_some();
+    if kernel.is_none() && arg(args,"--sd").is_none() && !restore { return Err("provide --kernel Image or --sd IMAGE".into()); }
     if kernel.is_none() && arg(args,"--initrd").is_some() { return Err("--initrd requires --kernel".into()); }
     let initrd=arg(args,"--initrd").map(std::fs::read).transpose().map_err(|e|e.to_string())?;
     let cmdline=arg(args,"--append").unwrap_or(rk3588::boot::DEFAULT_CMDLINE);
@@ -77,6 +81,7 @@ fn execute(args:&[String])->Result<(),String> {
     let config=RunConfig::from_args("orangepi5", args)?;
     let persist=args.iter().any(|a|a=="--sd-persist");
     let disk=arg(args,"--sd").map(|p|SharedDisk::open(p,persist).map_err(|e|format!("{p}: {e}"))).transpose()?;
+    let booted=std::cell::Cell::new(false);
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::with_cpus(ram,smp)?;
         m.gpu_probe=gpu=="probe";
@@ -94,6 +99,9 @@ fn execute(args:&[String])->Result<(),String> {
         m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
         if let Some(kernel)=kernel.as_ref() {
             rk3588::boot::boot_linux(&mut m,kernel,initrd.as_deref(),cmdline)?;
+        } else if arg(args,"--sd").is_none() {
+            // only to be restored into
+            if booted.replace(true) {return Err("the guest rebooted: give --kernel or --sd with --restore to boot it again".into());}
         } else {
             let card=rk3588::boot::read_card(m.soc.mmc.card.disk.as_mut().ok_or("no SD image")?.as_mut())?;
             for note in &card.notes {eprintln!("[orangepi5 firmware] {note}");}

@@ -4,7 +4,7 @@
 //! and EDID.
 
 /// A monitor mode (`--hdmi-mode WxH`): a CEA-861 timing at 60 Hz with positive syncs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mode {
     pub width: u32,
     pub height: u32,
@@ -130,6 +130,9 @@ impl Display {
         Some((mode.width, mode.height))
     }
 }
+
+emu_core::snap_struct!(Mode { width, height, clock_khz, hfp, hsync, hbp, vfp, vsync, vbp, vic });
+emu_core::snap_struct!(Display { scanout, frames });
 
 #[cfg(test)]
 mod tests {

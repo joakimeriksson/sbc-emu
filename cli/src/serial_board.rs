@@ -19,6 +19,13 @@ pub(crate) trait SerialBoard: gdb::Target {
     fn instret(&self) -> u64;
     /// One-line execution summary plus any unmodelled-hardware notes.
     fn report(&self, tag: &str);
+    /// The machine as a snapshot file, and back (into a machine made with the same options).
+    fn save(&self) -> Result<Vec<u8>, String> {
+        Err("snapshots are not implemented for this board".into())
+    }
+    fn restore(&mut self, _file: &[u8]) -> Result<(), String> {
+        Err("snapshots are not implemented for this board".into())
+    }
     /// The board's display, if it has one.
     fn screen(&mut self) -> Option<&mut dyn Screen> {
         None
@@ -81,6 +88,22 @@ fn screenshot<B: SerialBoard>(m: &mut B, tag: &str, path: &str) {
     }
 }
 
+/// Write a snapshot.
+fn save<B: SerialBoard>(m: &B, tag: &str, path: &str) -> Result<(), String> {
+    let file = m.save()?;
+    // never half a snapshot under the name
+    let part = format!("{path}.part");
+    std::fs::write(&part, &file).and_then(|()| std::fs::rename(&part, path)).map_err(|e| format!("{path}: {e}"))?;
+    eprintln!("\r[{tag}] snapshot at {:.3} s, {:.1} MiB -> {path}\r", m.now() as f64 / 1e9, file.len() as f64 / (1 << 20) as f64);
+    Ok(())
+}
+
+/// The moment a guest at virtual time `now` would have started for its clock to be the wall's.
+fn anchored(now: u64) -> Instant {
+    let t = Instant::now();
+    t.checked_sub(Duration::from_nanos(now)).unwrap_or(t)
+}
+
 /// Options every serial board accepts; `extra` lists board-specific valued options. A board
 /// that lists `--smp` there checks its core count itself; the others run one core.
 pub(crate) fn validate_options(args: &[String], extra: &[&str]) -> Result<(), String> {
@@ -127,6 +150,10 @@ pub(crate) struct RunConfig {
     /// The gdb stub's port (`--gdb PORT`), and whether to wait for a debugger before starting.
     pub gdb: Option<u16>,
     pub gdb_wait: bool,
+    /// Continue from this snapshot (`--restore`).
+    pub restore: Option<String>,
+    /// Where Ctrl-A s writes one (`--snapshot`, else BOARD.snap).
+    pub snapshot: String,
 }
 
 impl RunConfig {
@@ -143,7 +170,7 @@ impl RunConfig {
             .map_err(|_| "invalid --timeout")?;
         let script = crate::script::load(arg(args, "--script")).map_err(|e| e.to_string())?;
         for line in &script {
-            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep" | "pointer")) {
+            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep" | "pointer" | "save")) {
                 return Err(format!("unsupported script command: {line}"));
             }
         }
@@ -155,7 +182,9 @@ impl RunConfig {
         if gdb_wait && gdb.is_none() {
             return Err("--gdb-wait needs --gdb PORT".into());
         }
-        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out, hdmi_audio_out, gdb, gdb_wait })
+        let restore = arg(args, "--restore").map(str::to_owned);
+        let snapshot = arg(args, "--snapshot").map_or_else(|| format!("{tag}.snap"), str::to_owned);
+        Ok(Self { tag, script, timeout, max_insns, screenshot, vnc, audio_out, hdmi_audio_out, gdb, gdb_wait, restore, snapshot })
     }
 }
 
@@ -214,8 +243,13 @@ pub(crate) fn run<B: SerialBoard>(
     // how much of `serial` the current wait-serial has searched without a match (searching
     // all of it again on every pass made long boots quadratic)
     let mut searched = 0usize;
+    if let Some(path) = config.restore.as_deref() {
+        let file = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        m.restore(&file).map_err(|e| format!("--restore {path}: {e}"))?;
+        eprintln!("[{tag}] restored {path}: {:.3} s, {} instructions", m.now() as f64 / 1e9, m.instret());
+    }
     let mut start = Instant::now();
-    let mut anchor = Instant::now();
+    let mut anchor = anchored(m.now());
     let mut escape = false;
     // `sleep SECS`: the script waits until this virtual time (ns)
     let mut sleep_until: Option<u64> = None;
@@ -226,7 +260,7 @@ pub(crate) fn run<B: SerialBoard>(
             return Ok(());
         }
         start = Instant::now();
-        anchor = Instant::now();
+        anchor = anchored(m.now());
     }
     let result = 'run: loop {
         let mut input = std::mem::take(&mut idle_input);
@@ -238,6 +272,12 @@ pub(crate) fn run<B: SerialBoard>(
                 escape = false;
                 if b == b'x' {
                     break 'run Ok(());
+                }
+                if b == b's' {
+                    if let Err(e) = save(&m, tag, &config.snapshot) {
+                        eprintln!("\r[{tag}] no snapshot: {e}\r");
+                    }
+                    continue;
                 }
                 pending.push_back(1);
             } else if b == 1 {
@@ -286,6 +326,10 @@ pub(crate) fn run<B: SerialBoard>(
                     serial.clear();
                     searched = 0;
                     pending.clear();
+                    true
+                }
+                "save" => {
+                    save(&m, tag, rest)?;
                     true
                 }
                 "screenshot" => {

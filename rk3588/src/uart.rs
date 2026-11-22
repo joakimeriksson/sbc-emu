@@ -70,3 +70,5 @@ impl Uart {
         }
     }
 }
+
+emu_core::snap_struct!(Uart { out, rx, ier, lcr, mcr, fcr, dll, dlm, scratch, tx_pending });

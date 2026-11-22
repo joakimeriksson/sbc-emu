@@ -45,6 +45,8 @@ impl Grf {
     }
 }
 
+emu_core::snap_struct!(Grf {} fixed { regs });
+
 #[cfg(test)]
 mod tests {
     use super::*;

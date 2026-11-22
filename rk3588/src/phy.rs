@@ -89,6 +89,8 @@ impl Yt8531 {
     }
 }
 
+emu_core::snap_struct!(Yt8531 { regs, extended, page, cable, link_latched_low });
+
 #[cfg(test)]
 mod tests {
     use super::*;
