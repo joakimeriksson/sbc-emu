@@ -270,6 +270,14 @@ fn rockchip_seconds_for_unix(unix: i64) -> i64 {
     seconds_of(y, m, d, hms, 31)
 }
 
+/// Seconds a restored clock may show: `date_of` goes through the years one by one.
+const LIMIT: i64 = 1 << 40;
+
+emu_core::snap_struct!(Rk808 { regs, pointer, expect_pointer, rtc_seconds, rtc_epoch_ns, now_ns, power_off } after |c| {
+    if !(-LIMIT..LIMIT).contains(&c.rtc_seconds) { return Err(emu_core::snap::SnapError("a clock tens of thousands of years off".into())); }
+    Ok(())
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;

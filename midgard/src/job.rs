@@ -19,7 +19,7 @@ use crate::draw::{self, Prim};
 use crate::frag;
 use crate::status;
 use crate::vm::Vm;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub const JOB_NULL: u32 = 1;
 pub const JOB_WRITE_VALUE: u32 = 2;
@@ -41,6 +41,13 @@ pub struct ChainResult {
 }
 
 /// State shared between jobs (and chains).
+/// A polygon list, and when it was begun (a count).
+#[derive(Default)]
+pub struct List {
+    pub prims: Vec<Prim>,
+    begun: u64,
+}
+
 #[derive(Default)]
 pub struct JobState {
     /// Jobs run, by type (index = job type).
@@ -48,7 +55,9 @@ pub struct JobState {
     /// Polygon lists by address space (its page-table base) and framebuffer descriptor:
     /// tiler jobs append, the fragment job of the same framebuffer consumes. Processes
     /// share virtual addresses, so the descriptor alone does not name a framebuffer.
-    pub lists: HashMap<(u64, u64), Vec<Prim>>,
+    pub lists: BTreeMap<(u64, u64), List>,
+    /// Lists begun so far.
+    begun: u64,
 }
 
 /// Polygon lists kept at once; a list whose fragment job never came (a failed chain) is
@@ -56,6 +65,20 @@ pub struct JobState {
 const MAX_LISTS: usize = 64;
 
 impl JobState {
+    /// The polygon list of `key`, a new one if need be. When too many are kept the oldest goes: its
+    /// fragment job is the least likely still to come.
+    fn list(&mut self, key: (u64, u64)) -> &mut Vec<Prim> {
+        if !self.lists.contains_key(&key) {
+            if self.lists.len() >= MAX_LISTS {
+                let oldest = *self.lists.iter().min_by_key(|(_, l)| l.begun).unwrap().0;
+                self.lists.remove(&oldest);
+            }
+            self.begun += 1;
+        }
+        let begun = self.begun;
+        &mut self.lists.entry(key).or_insert_with(|| List { prims: Vec::new(), begun }).prims
+    }
+
     /// Drop the polygon lists of the address space with page tables at `transtab`.
     pub fn drop_lists(&mut self, transtab: u64) {
         self.lists.retain(|&(t, _), _| t != transtab);
@@ -95,17 +118,12 @@ impl JobState {
                 }
                 JOB_TILER => {
                     let fbd = vm.r64(va + 64 + 28 * 4) & !63;
-                    if self.lists.len() >= MAX_LISTS && !self.lists.contains_key(&(transtab, fbd)) {
-                        let stale = *self.lists.keys().next().unwrap();
-                        self.lists.remove(&stale);
-                    }
-                    let list = self.lists.entry((transtab, fbd)).or_default();
-                    cycles += draw::tiler_job(vm, va, list);
+                    cycles += draw::tiler_job(vm, va, self.list((transtab, fbd)));
                     status::DONE
                 }
                 JOB_FRAGMENT => {
                     let fbd = vm.r64(va + 32 + 8) & !63;
-                    let list = self.lists.remove(&(transtab, fbd)).unwrap_or_default();
+                    let list = self.lists.remove(&(transtab, fbd)).unwrap_or_default().prims;
                     cycles += frag::fragment_job(vm, va, &list, trace);
                     status::DONE
                 }
@@ -132,5 +150,53 @@ impl JobState {
             va = next;
         }
         ChainResult { status: status::JOB_CONFIG_FAULT, tail, cycles }
+    }
+}
+
+impl emu_core::snap::Snap for JobState {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { counts, lists, begun } = self;
+        counts.save(w);
+        begun.save(w);
+        w.u64(lists.len() as u64);
+        for (key, List { prims, begun }) in lists {
+            key.save(w);
+            begun.save(w);
+            draw::save_list(w, prims);
+        }
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { counts, lists, begun } = self;
+        counts.load(r)?;
+        begun.load(r)?;
+        lists.clear();
+        for _ in 0..r.u64()? {
+            let mut key = (0u64, 0u64);
+            key.load(r)?;
+            let mut begun = 0u64;
+            begun.load(r)?;
+            lists.insert(key, List { prims: draw::load_list(r)?, begun });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lists whose fragment job never came do not push out the ones in use, whatever their keys.
+    #[test]
+    fn the_oldest_list_goes() {
+        for stale in [1u64, 1 << 40] {
+            let mut j = JobState::default();
+            for k in 0..MAX_LISTS as u64 { j.list((stale, k)); }
+            for frame in 0..200u64 {
+                j.list((1 << 20, 0x1000));
+                j.list((1 << 20, 0x2000));
+                assert!(j.lists.len() <= MAX_LISTS);
+                for fbd in [0x1000, 0x2000] { assert!(j.lists.remove(&(1 << 20, fbd)).is_some(), "stale {stale:#x}, frame {frame}, {fbd:#x}"); }
+            }
+        }
     }
 }

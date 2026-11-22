@@ -38,6 +38,10 @@ const INT_START: u32 = 1 << 4;
 const INT_STOP: u32 = 1 << 5;
 const INT_NAKRCV: u32 = 1 << 6;
 
+/// A device of this machine: one a snapshot can hold.
+pub trait BusDevice: I2cDevice + emu_core::snap::Snap {}
+impl<T: I2cDevice + emu_core::snap::Snap> BusDevice for T {}
+
 /// One rk3x controller and the devices on its bus.
 pub struct Rk3xI2c {
     con: u32,
@@ -55,7 +59,7 @@ pub struct Rk3xI2c {
     current: Option<usize>,
     /// The address byte of the current message has been sent.
     addressed: bool,
-    devices: Vec<(u8, Box<dyn I2cDevice>)>,
+    devices: Vec<(u8, Box<dyn BusDevice>)>,
     /// Virtual time in nanoseconds, set by the machine before each access.
     pub now_ns: u64,
 }
@@ -84,7 +88,7 @@ impl Default for Rk3xI2c {
 
 impl Rk3xI2c {
     /// Attach a device at 7-bit address `address`.
-    pub fn attach(&mut self, address: u8, device: Box<dyn I2cDevice>) {
+    pub fn attach(&mut self, address: u8, device: Box<dyn BusDevice>) {
         self.devices.push((address & 0x7f, device));
     }
 
@@ -261,6 +265,38 @@ impl Rk3xI2c {
     }
 }
 
+impl emu_core::snap::Snap for Rk3xI2c {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { con, clkdiv, mrxaddr, mrxraddr, mtxcnt, mrxcnt, ien, ipd, fcnt, tx, rx, current, addressed, devices, now_ns } = self;
+        for v in [con, clkdiv, mrxaddr, mrxraddr, mtxcnt, mrxcnt, ien, ipd, fcnt] { v.save(w); }
+        tx.save(w);
+        rx.save(w);
+        current.save(w);
+        addressed.save(w);
+        now_ns.save(w);
+        w.u64(devices.len() as u64);
+        for (address, device) in devices { address.save(w); device.save(w); }
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { con, clkdiv, mrxaddr, mrxraddr, mtxcnt, mrxcnt, ien, ipd, fcnt, tx, rx, current, addressed, devices, now_ns } = self;
+        for v in [con, clkdiv, mrxaddr, mrxraddr, mtxcnt, mrxcnt, ien, ipd, fcnt] { v.load(r)?; }
+        tx.load(r)?;
+        rx.load(r)?;
+        current.load(r)?;
+        addressed.load(r)?;
+        now_ns.load(r)?;
+        let n = r.u64()?;
+        if n != devices.len() as u64 || current.is_some_and(|c| c >= devices.len()) {
+            return Err(emu_core::snap::SnapError(format!("the snapshot has {n} I2C devices, this machine {}", devices.len())));
+        }
+        for (address, device) in devices {
+            if r.u8()? != *address { return Err(emu_core::snap::SnapError("other I2C devices in the snapshot".into())); }
+            device.load(r)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +310,7 @@ mod tests {
         selected: bool,
     }
 
+    emu_core::snap_struct!(Regs { regs, pointer, selected });
     impl I2cDevice for Regs {
         fn start(&mut self, _read: bool) -> bool {
             self.selected = false;

@@ -138,6 +138,9 @@ version = "0.0.1"
 [[package]]
 name = "midgard"
 version = "0.0.1"
+dependencies = [
+ "emu-core",
+]
 
 [[package]]
 name = "miniz_oxide"

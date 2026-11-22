@@ -110,6 +110,8 @@ impl I2cDevice for Act8846 {
     }
 }
 
+emu_core::snap_struct!(Act8846 { regs, pointer, power_off });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,6 +11,15 @@ const APPROVED: &[(&str, &str, &str)] = &[
     ("emu-core", "SdCard", "trace"),                        // debugging output
     ("mali400", "Mali400", "logged trace"),                 // debugging output
     ("peripherals", "Pl330", "log"),                        // debugging output
+    ("midgard", "MaliT760", "trace"),                       // debugging output
+    ("rockchip-rk3288", "Dsi", "log"),                      // debugging output
+    ("rockchip-rk3288", "DwMmc", "base irq"),               // constants of the board
+    ("rockchip-rk3288", "EmmcCard", "trace"),               // debugging output
+    ("rockchip-rk3288", "I2s", "capture out"),              // --audio-out, what was recorded
+    ("rockchip-rk3288", "Machine", "breakpoints debug_jit jit"), // the debugger's; the JIT
+    ("rockchip-rk3288", "Rga", "log"),                      // debugging output
+    ("rockchip-rk3288", "Soc", "code_watch display_name display_rotation log_stub_pages"), // of compiled code; the board's set-up; debugging output
+    ("rockchip-rk3288", "Vop", "log"),                      // debugging output
     ("rk3588", "Clock", "name"),                            // a constant of the board
     ("rk3588", "Gic", "ready"),                             // a cache, dropped by `after`
     ("rk3588", "I2sTdm", "capture out"),                    // --audio-out, what was recorded

@@ -285,6 +285,8 @@ impl Rga {
     }
 }
 
+emu_core::snap_struct!(Rga { jobs, written } fixed { regs } skip { log });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,6 +18,12 @@ impl SerialBoard for Machine {
     fn instret(&self) -> u64 {
         Machine::instret(self)
     }
+    fn save(&self) -> Result<Vec<u8>, String> {
+        Machine::save(self)
+    }
+    fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        Machine::restore(self, file)
+    }
     fn report(&self, tag: &str) {
         eprintln!(
             "[{tag}] core {} pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
@@ -133,7 +139,7 @@ pub(crate) fn run_board(args: &[String], profile: &Profile) -> ExitCode {
 
 fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let tag = profile.tag;
-    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc", "--audio-out"];
+    let mut options = vec!["--dtb", "--dump-dtb", "--sd", "--emmc", "--screenshot", "--vnc", "--audio-out", "--restore", "--snapshot"];
     if profile.network.is_some() {
         options.push("--net");
     }
@@ -160,7 +166,10 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
             }
         }
     }
-    let (kernel, dtb) = if card_boot {
+    // a snapshot has the kernel in its RAM
+    let restore = arg(args, "--restore").is_some();
+    let no_kernel = arg(args, "--kernel").is_none();
+    let (kernel, dtb) = if no_kernel && (card_boot || restore) {
         (Vec::new(), Vec::new())
     } else {
         (
@@ -168,7 +177,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
             (profile.fixup_dtb)(read(arg(args, "--dtb").ok_or(profile.dtb_hint)?)?)?,
         )
     };
-    let initrd = arg(args, "--initrd").map(read).transpose()?;
+    let initrd = arg(args, "--initrd").filter(|_| !(no_kernel && restore)).map(read).transpose()?;
     let cmdline = arg(args, "--append").unwrap_or(profile.cmdline);
     let ram = serial_board::ram_bytes(args, profile.default_ram_mb)?;
     if ram == 0 || ram > 0xfe00_0000 {
@@ -191,6 +200,8 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let no_jit = args.iter().any(|a| a == "--no-jit");
+    // the machine restored into is not booted first; when the guest reboots, a new one is
+    let restored = std::cell::Cell::new(false);
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::with_ram_size(ram);
         if no_jit {
@@ -207,7 +218,11 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         let disk = |d: &Option<crate::disk::SharedDisk>| d.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
         m.soc.periph.insert_sd(disk(&sd));
         m.soc.periph.mmc[devices::EMMC].insert(disk(&emmc));
-        if card_boot {
+        if restore && !restored.replace(true) {
+            // nothing: the snapshot has it all
+        } else if no_kernel && !card_boot {
+            return Err("the guest rebooted: give --kernel, --sd or --emmc with --restore to boot it again".into());
+        } else if card_boot {
             let boot = boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
             eprintln!(
                 "[{tag}] boot from {}: {}, kernel {} bytes, initrd {} bytes, cmdline \"{}\"",
@@ -226,6 +241,9 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         Ok(m)
     };
     if let Some(path) = arg(args, "--dump-dtb").filter(|_| !card_boot) {
+        if restore {
+            return Err("--dump-dtb: a restored machine is not booted from a device tree".into());
+        }
         let range = initrd
             .as_ref()
             .map(|d| (boot::INITRD_ADDR, boot::INITRD_ADDR + d.len() as u32));

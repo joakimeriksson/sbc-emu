@@ -212,20 +212,26 @@ impl I2sTdm {
         self.rate = self.frame_rate(mclk, codec);
     }
 
+    /// Nanoseconds per frame (a guest can program a rate of gigahertz: never 0).
+    fn period(&self) -> u64 {
+        (1_000_000_000 / u64::from(self.rate.max(1))).max(1)
+    }
+
     /// Play and record frames up to virtual time `now` (ns), with MCLK `mclk` Hz or the
     /// codec's frame rate `codec`.
     pub fn update(&mut self, now: u64, mclk: u64, codec: Option<u32>) {
         self.clocks(mclk, codec);
-        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        let period = self.period();
         if self.xfer & XFER_TXS != 0 {
             let words = self.tx_words();
-            while self.tx_to + period <= now {
-                self.tx_to += period;
+            while let due @ 1.. = now.saturating_sub(self.tx_to) / period {
                 if self.tx.len() < words {
-                    // an underrun: the frame goes out as silence, and is not recorded
-                    self.underruns += 1;
-                    continue;
+                    // underruns: the frames go out as silence, and are not recorded
+                    self.underruns += due;
+                    self.tx_to += due * period;
+                    break;
                 }
+                self.tx_to += period;
                 let frame: Vec<u32> = self.tx.drain(..words).collect();
                 self.frames += 1;
                 if self.capture {
@@ -237,10 +243,10 @@ impl I2sTdm {
         }
         if self.xfer & XFER_RXS != 0 {
             let words = self.rx_words();
-            while self.rx_to + period <= now {
-                self.rx_to += period;
-                self.rx_level = (self.rx_level + words).min(FIFO_WORDS);
-            }
+            let due = now.saturating_sub(self.rx_to) / period;
+            self.rx_to += due * period;
+            // (no more frames than fill it)
+            self.rx_level = (self.rx_level + words * due.min(FIFO_WORDS as u64) as usize).min(FIFO_WORDS);
         }
     }
 
@@ -271,13 +277,13 @@ impl I2sTdm {
         if self.xfer & XFER_TXS == 0 || self.dmacr & DMACR_TDE == 0 {
             return None;
         }
-        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        let period = self.period();
         Some(self.tx_to + (self.tx.len() / self.tx_words()) as u64 * period)
     }
 
     /// When the next DMA request rises (virtual ns), while a direction runs.
     pub fn next_deadline(&self) -> Option<u64> {
-        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        let period = self.period();
         let mut next = None::<u64>;
         if self.xfer & XFER_TXS != 0 && self.dmacr & DMACR_TDE != 0 {
             let tdl = (self.dmacr & 0x1f) as usize;

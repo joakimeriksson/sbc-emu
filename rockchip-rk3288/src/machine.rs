@@ -1,3 +1,5 @@
+use crate::dwmmc::Card;
+use emu_core::snap::{self, Snap};
 use crate::cru::{Cru, Grf, Pmu, CRU_SIZE, GRF_SIZE, PMU_SIZE};
 use crate::devices::Peripherals;
 use crate::dsi::{Dsi, DSI_SIZE};
@@ -1186,5 +1188,81 @@ impl Bus for Soc {
             self.mmio_write(addr, 4, value as u32)?;
             self.mmio_write(addr + 4, 4, (value >> 32) as u32)
         }
+    }
+}
+
+emu_core::snap_struct!(Soc {
+    ram, sram, uart, gic, cru, grf, pmu, periph, vop, dsi, hdmi, rga, gpu, now, dirty, stub_regs, stub_pages, i2s, dmac,
+} fitted { wifi_net: "a network (--net)" } skip { code_watch, display_rotation, display_name, log_stub_pages });
+emu_core::snap_enum!(CoreState { Off, BootRom, Run, Wait });
+
+/// Snapshots: cores, devices, virtual time, what was written to the cards, and RAM. See
+/// `docs/snapshots.md`.
+impl Machine {
+    const BOARD: &'static str = "tinkerboard";
+    /// Of the layout: raise it when what is saved changes.
+    const VERSION: u32 = 1;
+
+    /// The machine as a snapshot file; an error when it has state that cannot be saved.
+    pub fn save(&self) -> Result<Vec<u8>, String> {
+        for mmc in &self.soc.periph.mmc {
+            match &mmc.card {
+                Card::Sd(c) => snap::check_disk(c.disk.as_deref())?,
+                Card::Emmc(c) => snap::check_disk(c.disk.as_deref())?,
+                Card::Sdio(_) => return Err("the Wi-Fi's SDIO device is not in snapshots".into()),
+            }
+        }
+        Ok(snap::pack(Self::BOARD, Self::VERSION, &self.state()))
+    }
+
+    /// Continue from a snapshot made by `save`. After an error the machine is in pieces.
+    pub fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        let sectors = self.soc.periph.mmc.iter().map(|m| match &m.card {
+            Card::Sd(c) => c.disk.as_ref().map_or(0, |d| d.sectors()),
+            Card::Emmc(c) => c.disk.as_ref().map_or(0, |d| d.sectors()),
+            Card::Sdio(_) => 0,
+        });
+        let limit = snap::limit(self.soc.ram.mem.len(), sectors.sum());
+        let state = snap::unpack(Self::BOARD, Self::VERSION, limit, file).map_err(|e| e.0)?;
+        self.load_state(&state).map_err(|e| e.0)
+    }
+
+    /// The state in a snapshot, unpacked.
+    pub fn state(&self) -> Vec<u8> {
+        let Self {
+            cpus, state, soc, cur, next_event, timer_state, irqs, exceptions, subtick, last_stop_core,
+            breakpoints: _, debug_jit: _, jit: _,
+        } = self;
+        let mut w = snap::W::default();
+        snap::save_each(&mut w, cpus);
+        snap::save_each(&mut w, state);
+        soc.save(&mut w);
+        cur.save(&mut w);
+        next_event.save(&mut w);
+        snap::save_each(&mut w, timer_state);
+        irqs.save(&mut w);
+        exceptions.save(&mut w);
+        subtick.save(&mut w);
+        last_stop_core.save(&mut w);
+        w.0
+    }
+
+    fn load_state(&mut self, state: &[u8]) -> Result<(), snap::SnapError> {
+        let r = &mut snap::R::new(state);
+        snap::load_each(r, &mut self.cpus, "cores")?;
+        snap::load_each(r, &mut self.state, "cores")?;
+        self.soc.load(r)?;
+        self.cur.load(r)?;
+        self.next_event.load(r)?;
+        snap::load_each(r, &mut self.timer_state, "cores")?;
+        self.irqs.load(r)?;
+        self.exceptions.load(r)?;
+        self.subtick.load(r)?;
+        self.last_stop_core.load(r)?;
+        for k in [self.cur, self.last_stop_core] {
+            if k >= NCPU { return Err(snap::SnapError(format!("core {k} of {NCPU}"))); }
+        }
+        if r.p != state.len() { return Err(snap::SnapError(format!("{} bytes too many", state.len() - r.p))); }
+        Ok(())
     }
 }

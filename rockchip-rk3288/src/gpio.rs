@@ -101,6 +101,8 @@ impl GpioBank {
     }
 }
 
+emu_core::snap_struct!(GpioBank { regs, inputs, edges });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -173,16 +173,18 @@ impl I2s {
     /// Play and record frames up to virtual time `now` (ns) with MCLK `mclk` Hz.
     pub fn update(&mut self, now: u64, mclk: u64) {
         self.rate = self.frame_rate(mclk);
-        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        // (a guest can program a rate of gigahertz)
+        let period = (1_000_000_000 / u64::from(self.rate.max(1))).max(1);
         if self.xfer & XFER_TXS != 0 {
             let words = self.tx_words();
-            while self.tx_to + period <= now {
-                self.tx_to += period;
+            while let due @ 1.. = now.saturating_sub(self.tx_to) / period {
                 if self.tx.len() < words {
-                    // an underrun: the frame goes out as silence, and is not recorded
-                    self.underruns += 1;
-                    continue;
+                    // underruns: the frames go out as silence, and are not recorded
+                    self.underruns += due;
+                    self.tx_to += due * period;
+                    break;
                 }
+                self.tx_to += period;
                 let frame: Vec<u32> = self.tx.drain(..words).collect();
                 self.frames += 1;
                 if self.capture {
@@ -193,10 +195,10 @@ impl I2s {
         }
         if self.xfer & XFER_RXS != 0 {
             let words = self.rx_words();
-            while self.rx_to + period <= now {
-                self.rx_to += period;
-                self.rx_level = (self.rx_level + words).min(FIFO_WORDS);
-            }
+            let due = now.saturating_sub(self.rx_to) / period;
+            self.rx_to += due * period;
+            // (no more frames than fill it)
+            self.rx_level = (self.rx_level + words * due.min(FIFO_WORDS as u64) as usize).min(FIFO_WORDS);
         }
     }
 
@@ -223,7 +225,7 @@ impl I2s {
 
     /// When the next DMA request rises (virtual ns), while a direction runs.
     pub fn next_deadline(&self) -> Option<u64> {
-        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        let period = (1_000_000_000 / u64::from(self.rate.max(1))).max(1);
         let mut next = None::<u64>;
         if self.xfer & XFER_TXS != 0 && self.dmacr & DMACR_TDE != 0 {
             let tdl = (self.dmacr & 0x1f) as usize;
@@ -239,6 +241,8 @@ impl I2s {
         next
     }
 }
+
+emu_core::snap_struct!(I2s { txcr, rxcr, ckr, dmacr, intcr, xfer, tx, rx_level, tx_to, rx_to, rate, frames, underruns } skip { capture, out });
 
 #[cfg(test)]
 mod tests {

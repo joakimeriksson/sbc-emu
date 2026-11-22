@@ -198,6 +198,7 @@ impl Card {
 
 /// A PIO write in progress: the FIFO collects `bytes` before they go to the card (to
 /// block `lba`, or the SDIO card's CMD53 when `sdio`).
+#[derive(Default)]
 struct PioWrite {
     lba: Option<u64>,
     sdio: bool,
@@ -578,6 +579,27 @@ impl DwMmc {
             };
         }
         false
+    }
+}
+
+emu_core::snap_struct!(PioWrite { lba, sdio, bytes, data });
+emu_core::snap_struct!(DwMmc { card, regs, rintsts, idsts, fifo, pio_write, dma_written } skip { base, irq });
+
+/// An SDIO device is not in a snapshot: a machine that has one does not save (`Machine::save`).
+impl emu_core::snap::Snap for Card {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        match self {
+            Card::Sd(c) => { w.u8(0); c.save(w) }
+            Card::Emmc(c) => { w.u8(1); c.save(w) }
+            Card::Sdio(_) => w.u8(2),
+        }
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        match (r.u8()?, self) {
+            (0, Card::Sd(c)) => c.load(r),
+            (1, Card::Emmc(c)) => c.load(r),
+            (kind, _) => Err(emu_core::snap::SnapError(format!("another kind of card ({kind}) in an MMC slot"))),
+        }
     }
 }
 
