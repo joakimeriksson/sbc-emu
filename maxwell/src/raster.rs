@@ -317,21 +317,25 @@ fn depth_bias(w: &[Win], factor: f32, units: f32, clamp: f32, s: &Setup) -> f32 
 /// The planes that only keep coordinates small.
 const GUARDS: u32 = 0xf << 3;
 const GUARD: f32 = 32.0;
+/// The same in pixels, for vertices that are in window coordinates already.
+const GUARD_PIXELS: f32 = 65536.0;
 
 /// The distance to a clip plane (inside: not negative).
 #[inline]
 fn distance(v: &View, vs: &Verts, p: u32, plane: u32) -> f32 {
     let [x, y, z, w] = vs.position(p);
+    let g = if v.transform { GUARD * w } else { GUARD_PIXELS };
     match plane {
+        0..=2 if !v.transform => 1.0,
         0 => w - 1e-12,
         1 if v.clamp_near => 1.0,
         1 => if v.zero_to_one { z } else { z + w },
         2 if v.clamp_far => 1.0,
         2 => w - z,
-        3 => GUARD * w - x,
-        4 => GUARD * w + x,
-        5 => GUARD * w - y,
-        6 => GUARD * w + y,
+        3 => g - x,
+        4 => g + x,
+        5 => g - y,
+        6 => g + y,
         _ if v.planes >> (plane - 7) & 1 != 0 => vs.f(p, CLIP + plane as usize - 7),
         _ => 1.0,
     }
@@ -341,7 +345,8 @@ fn distance(v: &View, vs: &Verts, p: u32, plane: u32) -> f32 {
 #[inline]
 fn outside(v: &View, vs: &Verts, p: u32) -> u32 {
     let [x, y, z, w] = vs.position(p);
-    let g = GUARD * w;
+    let (g, w) = if v.transform { (GUARD * w, w) } else { (GUARD_PIXELS, 1.0) };
+    let z = if v.transform { z } else { 0.5 };
     let near = if v.clamp_near { 1.0 } else if v.zero_to_one { z } else { z + w };
     let far = if v.clamp_far { 1.0 } else { w - z };
     // (not "less than": NaNs are outside)
