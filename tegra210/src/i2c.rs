@@ -2,8 +2,8 @@
 //!
 //! The host writes a packet into the TX FIFO: three header words (protocol, payload size - 1,
 //! then address and flags), and for a write the payload. Each packet runs at once when it is
-//! complete; a read's bytes wait in the RX FIFO. PIO only: the driver uses DMA for transfers
-//! longer than the PMIC's.
+//! complete; a read's bytes wait in the RX FIFO. The driver uses PIO, or the
+//! APB DMA controller for longer transfers.
 pub use peripherals::i2c::{I2cDevice, RegisterPointer};
 use std::collections::VecDeque;
 
@@ -77,6 +77,11 @@ impl TegraI2c {
     }
 
     /// Received bytes wait in the FIFO.
+    /// Not so much unread data that a DMA channel should stop asking for more.
+    pub fn has_room(&self) -> bool {
+        self.rx.len() < 1 << 16
+    }
+
     pub fn has_data(&self) -> bool {
         !self.rx.is_empty()
     }

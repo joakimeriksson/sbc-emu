@@ -61,7 +61,7 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 | GIC-400 | `peripherals::gic` (GICv2) |
 | Legacy interrupt controller (`ictlr`) | read-back registers: interrupts go straight to the GIC |
 | Timers (TMR, TIMERUS) | per-core countdown timers with interrupts, the microsecond counter; the count rate comes from `TIMERUS_USEC_CFG` |
-| Clock and reset controller | 38.4 MHz oscillator, clock M 19.2 MHz, PLL lock bits, enable/reset set-clear registers, super clocks in RUN |
+| Clock and reset controller | 38.4 MHz oscillator, clock M 19.2 MHz, PLL lock bits, enable/reset set-clear registers, super clocks in RUN, default PLL dividers and clock sources |
 | PMC | power-gate toggles, I/O pad deep power-down |
 | Fuses, chip ID | HIDREV = T210 A02; speedo, SKU and IDDQ fuses |
 | Memory controller | the SMMU (per-group address spaces, two-level page tables walked on every use), the client DMA-flush handshake |
@@ -70,7 +70,7 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 | SOR ×2 | register files whose sequencers finish at once; DisplayPort reports no monitor |
 | APB DMA | 32 channels, serving the I²C FIFOs |
 | UART A | `peripherals::uart` (16550) |
-| I²C ×6 | packet mode, PIO |
+| I²C ×6, the VI's | packet mode, PIO and APB DMA |
 | MAX77620 PMIC | a register file (regulators, GPIO) and its real-time clock |
 | GPIO | eight banks, masked writes, edge and level interrupts; the card-detect switch |
 | SDMMC ×4 | SDHCI 3.0, ADMA2 with 32- and 64-bit descriptors, PIO; an unanswered command completes with its timeout error (Linux masks the timeout's signal on Tegra) |
