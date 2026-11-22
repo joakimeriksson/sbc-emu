@@ -52,7 +52,7 @@ cp "$src/modules.builtin" "$src/modules.builtin.modinfo" "$src/modules.order" "$
 # drivers of the board, and what each of them needs (modules.dep is made in the guest)
 find "$src/kernel" -name '*.ko.xz' > "$work/modules"
 todo="i2c-tegra fixed gpio-regulator max77620-regulator pwm-tegra pwm-regulator sdhci-tegra ext4 crc32c_generic
-    phy-tegra-xusb r8169 realtek af_packet"
+    phy-tegra-xusb r8169 realtek af_packet xhci-tegra usbhid hid-generic evdev usb-storage sd_mod"
 done=" "
 while [ -n "$todo" ]; do
     set -- $todo
@@ -72,6 +72,11 @@ while [ -n "$todo" ]; do
         todo="$todo $(LC_ALL=C tr "\0" "\n" < "$dst/${o%.xz}" | LC_ALL=C sed -n 's/^depends=//p' | tr ',' ' ')"
     done
 done
+# The USB controller's driver wants NVIDIA's firmware, which Debian has in firmware-misc-nonfree. The
+# emulator does not run it, so a file with nothing but a length (fwimg_len, at byte 100) does.
+fw=$work/root/lib/firmware/nvidia/tegra210
+mkdir -p "$fw"
+{ head -c 100 /dev/zero; printf '\000\020\000\000'; head -c 3992 /dev/zero; } > "$fw/xusb.bin"
 cat > "$work/root/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev
@@ -81,7 +86,8 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 depmod -a
-for m in pwm-tegra fixed gpio-regulator i2c-tegra max77620-regulator pwm-regulator sdhci-tegra crc32c_generic ext4 phy-tegra-xusb realtek r8169 af_packet; do
+for m in pwm-tegra fixed gpio-regulator i2c-tegra max77620-regulator pwm-regulator sdhci-tegra crc32c_generic ext4 phy-tegra-xusb realtek r8169 af_packet \
+    usbhid hid-generic evdev sd_mod usb-storage xhci-tegra; do
     modprobe $m || echo "modprobe $m failed"
 done
 # root=/dev/..., LABEL= or UUID= (BusyBox finds no PARTUUID=); "card" is the first ext4 partition of the microSD

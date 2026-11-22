@@ -52,7 +52,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net", "--usb-drive"])?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel Image|vmlinuz is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb tegra210-p3450-0000.dtb is required")?)?;
@@ -91,6 +91,10 @@ fn execute(args: &[String]) -> Result<(), String> {
         if let Some(d) = disk.clone() {
             m.insert_sd(Box::new(d));
         }
+        // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
+        if let Some(path) = arg(args, "--usb-drive") {
+            m.attach_usb_drive(Box::new(crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?));
+        }
         if net != "none" {
             m.connect_network(net == "nat", std::env::var_os("SBC_NET_LOG").is_some());
         }
@@ -99,7 +103,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     };
     eprintln!(
         "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
-         fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller; PSCI by the host; other devices are read-back stubs",
+         fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive); PSCI by the host; other devices are read-back stubs",
         if no_jit { "interpreter" } else { "JIT" }
     );
     serial_board::run(config, make_machine)

@@ -13,6 +13,8 @@
 //! | `dw_hdmi` | Synopsys DesignWare HDMI TX with a connected monitor: IDs, hot plug, DDC and PHY I²C masters, interrupts; the EDID (`Mode`, `edid`, `EdidEeprom`) | Allwinner H3, Rockchip RK3288 |
 //! | `pl330` | Arm DMA-330 DMA controller: the channel threads run the driver's microcode | Rockchip RK3288 (audio) |
 //! | `sdio` | an SDIO card: CMD5/52/53, CCCR, FBR, CIS; the functions behind a trait | any SD host controller |
+//! | `xhci` | xHCI 1.0 host controller core with configurable root ports | Jetson Nano |
+//! | `dma` | guest RAM as a bus-mastering device reaches it | `xhci`, Jetson Nano |
 //! | `timebase` | 24 MHz architectural timer ticks against nanoseconds | Allwinner H3, Rockchip RK3288 |
 //!
 //! A board attaches an I²C chip to its controller's bus at the chip's address; the
@@ -20,6 +22,7 @@
 
 pub mod act8846;
 pub mod bcm43455;
+pub mod dma;
 pub mod dw_hdmi;
 pub mod gic;
 pub mod hym8563;
@@ -30,6 +33,7 @@ pub mod sdio;
 pub mod syr82x;
 pub mod timebase;
 pub mod uart;
+pub mod xhci;
 
 pub use gic::{Gic, NCPU, SPURIOUS};
 pub use uart::Uart;
