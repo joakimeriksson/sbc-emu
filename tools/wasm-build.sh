@@ -40,6 +40,12 @@ if [ -f cache/orangepi5/Image.gz ]; then
   mkdir -p web/assets/orangepi5
   cp cache/orangepi5/Image.gz cache/orangepi5/initramfs.cpio.gz web/assets/orangepi5/
 fi
+# the Jetson Nano's demo (scripts/jetson-nano-debian-fixture.sh) for web/board.html?b=jetson-nano
+if [ -f cache/jetson-nano/debian/initramfs.cpio.gz ]; then
+  mkdir -p web/assets/jetson-nano
+  cp cache/jetson-nano/debian/tegra210-p3450-0000.dtb cache/jetson-nano/debian/initramfs.cpio.gz web/assets/jetson-nano/
+  gzip -9n -c cache/jetson-nano/debian/vmlinuz > web/assets/jetson-nano/Image.gz
+fi
 # the ESP32-S31's demo (scripts/esp32s31-fixture.sh) for web/board.html?b=esp32s31
 if [ -f cache/esp32s31/images/s31_full_flash.bin ]; then
   mkdir -p web/assets/esp32s31

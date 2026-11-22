@@ -235,12 +235,14 @@ dependencies = [
  "esp-soc",
  "esp32s31",
  "lzma-rs",
+ "peripherals",
  "riscv-rv32",
  "riscv64",
  "rk3588",
  "rockchip-rk3288",
  "ruzstd",
  "starfive-jh7110",
+ "tegra210",
  "v3d",
 ]
 

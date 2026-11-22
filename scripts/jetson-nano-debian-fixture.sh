@@ -115,7 +115,11 @@ if [ -n "$root" ]; then
     fi
     [ -b "$dev" ] && echo "cannot mount $dev" || echo "no block device for root=$root"
 fi
+# a shell on the monitor too (openvt: it has its own session, and Ctrl-C works)
+openvt -c 1 -- sh -c 'while :; do sh; done'
 echo "TEGRA210_BOOT_OK: arm64 Linux BusyBox shell"
+# (late drivers' messages would bury the prompt; dmesg has them)
+dmesg -n 1
 exec setsid -c /bin/sh
 INIT
 chmod 755 "$work/root/init"

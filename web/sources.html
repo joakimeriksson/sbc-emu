@@ -112,6 +112,19 @@
     <li><strong>Alpine Linux 3.24.4 minirootfs</strong> for aarch64, unmodified, with a short <code>/init</code> written for sbc-emu (<code>scripts/orangepi5-fixture.sh</code>). Licences and source as for the Orange Pi One's initramfs above.</li>
   </ul>
 
+  <h2>Jetson Nano: Linux kernel and device tree</h2>
+  <ul>
+    <li><strong>Linux 6.12.117</strong>, Debian 13's <code>linux-image-6.12.117+deb13-arm64</code> package (version 6.12.117-1) for arm64: its <code>vmlinuz</code> (the kernel <code>Image</code>, served gzip'd) and its <code>tegra210-p3450-0000.dtb</code>, unmodified (SHA-256 of the package <code>73805585…f1ae287a</code>).</li>
+    <li>Licence: GNU GPL version 2.</li>
+    <li>Source: Debian's <code>linux</code> source package, version 6.12.117-1, from <a href="https://snapshot.debian.org/package/linux/6.12.117-1/">snapshot.debian.org</a> (the kernel.org release with Debian's configuration and patches).</li>
+  </ul>
+
+  <h2>Jetson Nano: initramfs</h2>
+  <ul>
+    <li><strong>Alpine Linux 3.24.4 minirootfs</strong> for aarch64, unmodified, with the board's drivers from the kernel package above (unpacked modules) and a short <code>/init</code> written for sbc-emu (<code>scripts/jetson-nano-debian-fixture.sh</code>). Licences and source as for the Orange Pi One's initramfs and the kernel above.</li>
+    <li>The USB and GPU drivers look for NVIDIA's firmware. None is here: the files with those names are placeholders written by <code>scripts/jetson-nano-debian-fixture.sh</code> and <code>tools/nano_gpu_firmware.py</code>, with headers and no code, because the emulator answers for the microcontrollers itself.</li>
+  </ul>
+
   <h2>ESP32-S31: mask ROM</h2>
   <ul>
     <li><strong>The ESP32-S31 mask ROM</strong>, Espressif's <code>esp32s31_rev0_rom.elf</code> from <a href="https://github.com/espressif/esp-rom-elfs/releases/tag/20260528">esp-rom-elfs 20260528</a>, unmodified (SHA-256 <code>a52ad751…93d5ab87</code>).</li>

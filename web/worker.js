@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'esp32s31', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'jetson-nano'|'esp32s31', ramMb},
 //      {type:'start', os:'sd-file', file, ramMb} (a Raspberry Pi SD image the visitor chose: .img, .img.xz, .img.gz),
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
@@ -276,6 +276,23 @@ async function start(os, ramMb, jit, file) {
     if (ex.sbc_boot_opi5(ramMb, copyIn(kernel), kernel.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
     if (jit) ex.sbc_jit(1);
     frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
+  if (os === 'jetson-nano') {
+    // NVIDIA Jetson Nano (Tegra X1, four Cortex-A57s): Debian's arm64 kernel (gzip'd) with the board's
+    // own device tree and an Alpine/BusyBox initramfs with the board's drivers
+    // (scripts/jetson-nano-debian-fixture.sh); shells on the serial console and on HDMI, a 1280 x 720
+    // monitor, with the USB keyboard
+    postMessage({ type: 'status', text: 'loading the Debian kernel, device tree and initramfs…' });
+    const [kernel, dtb, initrd] = await Promise.all([['Image.gz', true], ['tegra210-p3450-0000.dtb', false], ['initramfs.cpio.gz', false]]
+      .map(([f, gz]) => fetchBytes(`assets/jetson-nano/${f}`, gz)));
+    ex.sbc_kms(1280, 720);
+    const cmd = new TextEncoder().encode('console=tty0 console=ttyS0,115200 rdinit=/init');
+    if (ex.sbc_boot_nano(ramMb, Date.now() / 1000, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, copyIn(cmd), cmd.length) !== 0) throw new Error('boot setup failed');
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 66;
     postMessage({ type: 'status', text: 'booting…' });
     loop();
     return;
