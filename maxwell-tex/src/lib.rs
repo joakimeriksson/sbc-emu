@@ -40,4 +40,9 @@ pub use texture::{Sampler, TexCache, TexError, Texture};
 pub trait Memory {
     fn read(&self, addr: u64, out: &mut [u8]);
     fn write(&mut self, addr: u64, data: &[u8]);
+
+    /// The same memory for another thread, to read only (writes may be dropped). None: one thread.
+    fn share(&self) -> Option<Box<dyn Memory + Send + '_>> {
+        None
+    }
 }

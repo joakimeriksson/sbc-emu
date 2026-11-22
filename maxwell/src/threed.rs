@@ -33,6 +33,16 @@ pub struct Counters {
     pub fragments: u64,
 }
 
+impl Counters {
+    pub fn add(&mut self, o: &Self) {
+        self.samples += o.samples;
+        self.vertices += o.vertices;
+        self.primitives += o.primitives;
+        self.draws += o.draws;
+        self.fragments += o.fragments;
+    }
+}
+
 pub struct Threed {
     pub regs: Box<[u32; REGS]>,
     pub mme: Mme,

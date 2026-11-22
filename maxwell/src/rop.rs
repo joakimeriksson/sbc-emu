@@ -189,16 +189,24 @@ impl Rop {
         }
     }
 
-    /// The tile at tile coordinates (x, y) of `layer`, with the targets in `need` loaded and those
-    /// in `write` marked as changed.
-    pub fn tile(&mut self, x: u32, y: u32, layer: u32, need: u32, write: u32, mem: &dyn Memory) -> &mut TileSet {
-        let t = self.targets.as_ref().unwrap();
-        let spare = &mut self.spare;
-        let set = self.tiles.entry((x, y, layer)).or_insert_with(|| {
-            let mut s = spare.pop().unwrap_or_else(|| Box::new(TileSet { color: Default::default(), zeta: Tile::default(), loaded: 0, dirty: 0 }));
+    /// Take the tile at tile coordinates (x, y) of `layer` out, to draw into it.
+    pub fn take(&mut self, x: u32, y: u32, layer: u32) -> Box<TileSet> {
+        self.tiles.remove(&(x, y, layer)).unwrap_or_else(|| {
+            let mut s = self.spare.pop().unwrap_or_else(|| Box::new(TileSet { color: Default::default(), zeta: Tile::default(), loaded: 0, dirty: 0 }));
             (s.loaded, s.dirty) = (0, 0);
             s
-        });
+        })
+    }
+
+    pub fn put(&mut self, x: u32, y: u32, layer: u32, set: Box<TileSet>) {
+        self.tiles.insert((x, y, layer), set);
+    }
+
+    /// Load the targets in `need` that a tile does not have yet, and mark those in `write` as
+    /// changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(&self, set: &mut TileSet, x: u32, y: u32, layer: u32, need: u32, write: u32, mem: &dyn Memory) {
+        let t = self.targets.as_ref().unwrap();
         let missing = need & !set.loaded;
         if missing != 0 {
             for (k, c) in t.color.iter().enumerate() {
@@ -214,7 +222,6 @@ impl Rop {
             set.loaded |= missing;
         }
         set.dirty |= write;
-        set
     }
 }
 

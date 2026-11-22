@@ -134,6 +134,36 @@ impl maxwell::Memory for View<'_> {
     fn write(&mut self, va: u64, data: &[u8]) {
         View::write(self, va, data);
     }
+    fn share(&self) -> Option<Box<dyn maxwell::Memory + Send + '_>> {
+        Some(Box::new(Reader { ram: self.ram, smmu: self.smmu, mmu: Mmu::default(), space: self.space }))
+    }
+}
+
+/// Memory as a channel sees it, for reading on another thread.
+struct Reader<'a> {
+    ram: &'a [u8],
+    smmu: &'a Smmu,
+    mmu: Mmu,
+    space: Space,
+}
+
+impl maxwell::Memory for Reader<'_> {
+    fn read(&self, mut va: u64, mut out: &mut [u8]) {
+        while !out.is_empty() {
+            let n = (0x1000 - (va & 0xfff) as usize).min(out.len());
+            let (part, rest) = out.split_at_mut(n);
+            match self.mmu.translate(self.space, va, self.smmu, self.ram) {
+                Some(p) => {
+                    let o = p.offset + (va & 0xfff) as usize;
+                    part.copy_from_slice(&self.ram[o..o + n]);
+                }
+                None => part.fill(0),
+            }
+            out = rest;
+            va += n as u64;
+        }
+    }
+    fn write(&mut self, _va: u64, _data: &[u8]) {}
 }
 
 impl View<'_> {

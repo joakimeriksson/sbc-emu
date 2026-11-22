@@ -1,17 +1,17 @@
 //! The graphics pipeline of a draw: vertices are fetched and shaded, primitives assembled, clipped
 //! and rasterized, fragments shaded and written.
-use crate::raster;
+use crate::raster::{self, Geometry, Prim, Scene, Verts};
 use crate::rop::{Blend, DepthStencil, Output, Rect, Targets};
 use crate::threed::{Cbuf, Threed};
 use crate::vertex::{self, Attribute};
 use crate::Memory;
 use maxwell_shader::isa::{Attr, IpaLoc, IpaMode, LodMode, Pixld, SurfDim, TexKind};
-use maxwell_shader::sph::Interp;
+use maxwell_shader::sph::{FragOutputs, Interp};
 use maxwell_shader::{Exit, Handle, Host, IpaOp, Lanes, Program, Sph, SurfOp, TexOp};
 use maxwell_tex::{Args, Lod, Sampler, TexCache, Texture};
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Invocations that run together.
 pub const L: usize = 16;
@@ -27,8 +27,8 @@ pub fn word(addr: u32) -> Option<usize> {
     (w < WORDS).then_some(w)
 }
 pub const POSITION: usize = (0x70 - 0x40) / 4;
-const POINT_SIZE: usize = (0x6c - 0x40) / 4;
-const LAYER: usize = (0x64 - 0x40) / 4;
+pub const POINT_SIZE: usize = (0x6c - 0x40) / 4;
+pub const LAYER: usize = (0x64 - 0x40) / 4;
 pub const CLIP: usize = (0x2c0 - 0x40) / 4;
 
 pub enum Indices<'a> {
@@ -43,59 +43,135 @@ pub struct Shader {
 
 /// A constant buffer's words, read when they are first used.
 pub struct Words {
-    buffer: Cell<Cbuf>,
-    words: Vec<Cell<u32>>,
-    valid: [Cell<u64>; 16],
+    buffer: Cbuf,
+    /// what they were read in
+    generation: u64,
+    words: Box<[Cell<u32>]>,
+    valid: [Cell<u64>; 4],
 }
 
 impl Default for Words {
     fn default() -> Self {
-        Self { buffer: Default::default(), words: vec![Cell::new(0); 0x4000], valid: Default::default() }
+        Self { buffer: Default::default(), generation: 0, words: Box::default(), valid: Default::default() }
     }
 }
 
 impl Words {
-    fn bind(&self, b: Cbuf) {
-        if self.buffer.get() != b {
-            self.buffer.set(b);
-            self.forget();
+    fn bind(&mut self, b: Cbuf, generation: u64) {
+        if self.buffer != b || self.generation != generation {
+            (self.buffer, self.generation) = (b, generation);
+            let n = (b.size.min(0x1_0000) as usize).div_ceil(256) * 64;
+            if self.words.len() < n {
+                self.words = vec![Cell::new(0); n].into_boxed_slice();
+            }
+            self.valid.iter().for_each(|v| v.set(0));
         }
-    }
-
-    fn forget(&self) {
-        self.valid.iter().for_each(|v| v.set(0));
     }
 
     #[inline]
     fn get(&self, offset: u32, mem: &dyn Memory) -> u32 {
-        let b = self.buffer.get();
+        let b = self.buffer;
         if offset >= b.size || offset >= 0x1_0000 {
             return 0;
         }
+        // (256 bytes at a time)
         let w = offset as usize / 4;
-        let (block, bit) = (w / 16, 1u64 << (w / 16 % 64));
-        if self.valid[block / 64].get() & bit == 0 {
-            let mut raw = [0u8; 64];
-            mem.read(b.address + 64 * block as u64, &mut raw);
+        let (block, bit) = (w / 64, 1u64 << (w / 64 % 64));
+        let valid = &self.valid[block / 64];
+        if valid.get() & bit == 0 {
+            let mut raw = [0u8; 256];
+            mem.read(b.address + 256 * block as u64, &mut raw);
             for (k, c) in raw.chunks_exact(4).enumerate() {
-                self.words[16 * block + k].set(u32::from_le_bytes(c.try_into().unwrap()));
+                self.words[64 * block + k].set(u32::from_le_bytes(c.try_into().unwrap()));
             }
-            self.valid[block / 64].set(self.valid[block / 64].get() | bit);
+            valid.set(valid.get() | bit);
         }
         self.words[w].get()
     }
 }
 
+/// Host threads for shading (`SBC_MAXWELL_THREADS`; by default the host's cores minus two, for the
+/// CPU cores). The browser build has no threads.
+pub fn threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| match std::env::var("SBC_MAXWELL_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(n) => n.clamp(1, 64),
+            None => std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(2).clamp(1, 16),
+        })
+    }
+}
+
+/// What one thread keeps: shader registers and its own caches of memory.
+pub struct Worker {
+    pub lanes: Lanes<L>,
+    words: Box<[[Words; 18]; 6]>,
+    textures: HashMap<u32, Arc<Texture>>,
+    samplers: HashMap<u32, Arc<Sampler>>,
+    cache: TexCache,
+    generation: u64,
+    /// a shader wrote memory
+    pub stored: bool,
+}
+
+impl Worker {
+    fn new() -> Self {
+        Self {
+            lanes: Lanes::new(),
+            words: Box::new(std::array::from_fn(|_| std::array::from_fn(|_| Words::default()))),
+            textures: HashMap::new(),
+            samplers: HashMap::new(),
+            cache: TexCache::new(),
+            generation: 0,
+            stored: false,
+        }
+    }
+
+    /// The registers and a shader's surroundings.
+    pub fn parts<'a>(&'a mut self, work: &Work, mem: &'a mut dyn Memory) -> (&'a mut Lanes<L>, Common<'a>) {
+        if self.generation != work.textures {
+            self.generation = work.textures;
+            self.textures.clear();
+            self.samplers.clear();
+            self.cache.invalidate();
+        }
+        let words = &mut self.words[work.stage];
+        for (w, b) in words.iter_mut().zip(&work.cbufs) {
+            w.bind(*b, work.constants);
+        }
+        let common = Common { mem, words, textures: &mut self.textures, samplers: &mut self.samplers, cache: &mut self.cache, tic: work.tic, tsc: work.tsc, tex_cb: work.tex_cb, stored: false };
+        (&mut self.lanes, common)
+    }
+}
+
+/// A stage's resources in a draw.
+#[derive(Clone)]
+pub struct Work {
+    stage: usize,
+    cbufs: [Cbuf; 18],
+    /// generations of the textures' and the constants' contents
+    textures: u64,
+    constants: u64,
+    tic: u64,
+    tsc: u64,
+    tex_cb: u32,
+}
+
 pub struct Pipe {
-    shaders: HashMap<u64, Option<Rc<Shader>>>,
-    textures: HashMap<u32, Rc<Texture>>,
-    samplers: HashMap<u32, Rc<Sampler>>,
-    tex_cache: TexCache,
+    shaders: HashMap<u64, Option<Arc<Shader>>>,
     /// constant values of attributes without a stream
     pub constants: [[u32; 4]; 32],
     pub cbufs_changed: bool,
-    words: Vec<Rc<[Words; 18]>>,
-    lanes: Lanes<L>,
+    constant_generation: u64,
+    texture_generation: u64,
+    pub workers: Vec<Worker>,
+    /// primitives by tile, empty between draws
+    pub bins: Vec<Vec<u32>>,
     pub errors: std::collections::BTreeSet<String>,
 }
 
@@ -103,13 +179,12 @@ impl Default for Pipe {
     fn default() -> Self {
         Self {
             shaders: HashMap::new(),
-            textures: HashMap::new(),
-            samplers: HashMap::new(),
-            tex_cache: TexCache::new(),
             constants: [[0, 0, 0, 1f32.to_bits()]; 32],
             cbufs_changed: true,
-            words: (0..6).map(|_| Rc::new(std::array::from_fn(|_| Words::default()))).collect(),
-            lanes: Lanes::new(),
+            constant_generation: 1,
+            texture_generation: 1,
+            workers: Vec::new(),
+            bins: Vec::new(),
             errors: Default::default(),
         }
     }
@@ -117,9 +192,13 @@ impl Default for Pipe {
 
 impl Pipe {
     pub fn invalidate_textures(&mut self) {
-        self.textures.clear();
-        self.samplers.clear();
-        self.tex_cache.invalidate();
+        self.texture_generation += 1;
+    }
+
+    pub fn need_workers(&mut self, n: usize) {
+        while self.workers.len() < n {
+            self.workers.push(Worker::new());
+        }
     }
 
     pub fn invalidate_shaders(&mut self) {
@@ -144,7 +223,7 @@ impl Pipe {
     }
 
     /// The shader at `at` (its header first) of the code segment at `base`.
-    fn shader(&mut self, base: u64, start: u32, mem: &dyn Memory) -> Option<Rc<Shader>> {
+    fn shader(&mut self, base: u64, start: u32, mem: &dyn Memory) -> Option<Arc<Shader>> {
         if let Some(s) = self.shaders.get(&(base + start as u64)) {
             return s.clone();
         }
@@ -164,7 +243,7 @@ impl Pipe {
             }
         };
         let s = match made {
-            Ok(s) => Some(Rc::new(s)),
+            Ok(s) => Some(Arc::new(s)),
             Err(e) => {
                 self.error(e);
                 None
@@ -178,9 +257,9 @@ impl Pipe {
 /// What every stage's host needs.
 pub struct Common<'a> {
     pub mem: &'a mut dyn Memory,
-    pub words: Rc<[Words; 18]>,
-    pub textures: &'a mut HashMap<u32, Rc<Texture>>,
-    pub samplers: &'a mut HashMap<u32, Rc<Sampler>>,
+    pub words: &'a [Words; 18],
+    pub textures: &'a mut HashMap<u32, Arc<Texture>>,
+    pub samplers: &'a mut HashMap<u32, Arc<Sampler>>,
     pub cache: &'a mut TexCache,
     pub tic: u64,
     pub tsc: u64,
@@ -194,26 +273,26 @@ impl Common<'_> {
         self.words.get(index as usize).map_or(0, |w| w.get(offset, &*self.mem))
     }
 
-    fn texture_at(&mut self, id: u32) -> Rc<Texture> {
+    fn texture_at(&mut self, id: u32) -> Arc<Texture> {
         if let Some(t) = self.textures.get(&id) {
             return t.clone();
         }
         let mut raw = [0u8; 32];
         self.mem.read(self.tic + 32 * id as u64, &mut raw);
         let w: [u32; 8] = std::array::from_fn(|k| u32::from_le_bytes(raw[4 * k..4 * k + 4].try_into().unwrap()));
-        let t = Rc::new(Texture::from_words(&w).unwrap_or_else(|_| Texture::empty()));
+        let t = Arc::new(Texture::from_words(&w).unwrap_or_else(|_| Texture::empty()));
         self.textures.insert(id, t.clone());
         t
     }
 
-    fn sampler_at(&mut self, id: u32) -> Rc<Sampler> {
+    fn sampler_at(&mut self, id: u32) -> Arc<Sampler> {
         if let Some(s) = self.samplers.get(&id) {
             return s.clone();
         }
         let mut raw = [0u8; 32];
         self.mem.read(self.tsc + 32 * id as u64, &mut raw);
         let w: [u32; 8] = std::array::from_fn(|k| u32::from_le_bytes(raw[4 * k..4 * k + 4].try_into().unwrap()));
-        let s = Rc::new(Sampler::from_words(&w));
+        let s = Arc::new(Sampler::from_words(&w));
         self.samplers.insert(id, s.clone());
         s
     }
@@ -315,7 +394,7 @@ impl Common<'_> {
         }
     }
 
-    fn surface(&mut self, op: &SurfOp<L>, l: usize) -> (Rc<Texture>, [i32; 3], u32) {
+    fn surface(&mut self, op: &SurfOp<L>, l: usize) -> (Arc<Texture>, [i32; 3], u32) {
         let h = match op.handle {
             Handle::Bindless(h) => h[l],
             Handle::Bound(w) => self.cbuf(self.tex_cb, 4 * w),
@@ -422,7 +501,8 @@ struct VertexHost<'a, 'm> {
     inputs: &'a [[[u32; 4]; 32]; L],
     vertex: [u32; L],
     instance: u32,
-    out: &'a mut [[u32; WORDS]],
+    layout: &'a Verts,
+    out: &'a mut [u32],
 }
 
 impl Host<L> for VertexHost<'_, '_> {
@@ -438,8 +518,10 @@ impl Host<L> for VertexHost<'_, '_> {
     }
 
     fn attr_store(&mut self, lane: usize, a: Attr, v: u32) {
-        if let (Some(w), Some(o)) = (word(a.addr), self.out.get_mut(lane)) {
-            o[w] = v;
+        if let Some(s) = word(a.addr).and_then(|w| self.layout.slot(w)) {
+            if let Some(o) = self.out.get_mut(lane * self.layout.stride + s) {
+                *o = v;
+            }
         }
     }
 }
@@ -457,18 +539,22 @@ struct Stream {
 
 const FUEL: u64 = 4_000_000;
 
-/// The constant buffers of stage `s`, ready.
-fn stage_words(t: &mut Threed, s: usize) -> Rc<[Words; 18]> {
-    let w = t.pipe.words[s].clone();
-    for (k, b) in t.cbufs[s].iter().enumerate() {
-        w[k].bind(*b);
+/// Stage `s`'s resources.
+pub fn work(t: &Threed, s: usize) -> Work {
+    Work {
+        stage: s,
+        cbufs: t.cbufs[s],
+        textures: t.pipe.texture_generation,
+        constants: t.pipe.constant_generation,
+        tic: t.address(0x1574),
+        tsc: t.address(0x155c),
+        tex_cb: t.r(0x2608),
     }
-    w
 }
 
 pub fn draw(t: &mut Threed, indices: Indices, mem: &mut dyn Memory) {
     if std::mem::take(&mut t.pipe.cbufs_changed) {
-        t.pipe.words.iter().for_each(|s| s.iter().for_each(|w| w.forget()));
+        t.pipe.constant_generation += 1;
     }
     // split at the restart index
     let restart = (t.r(0x1644) & 1 != 0).then(|| t.r(0x1648));
@@ -490,10 +576,10 @@ fn strip(t: &mut Threed, list: &[u32], arrays: bool, mem: &mut dyn Memory) {
     let stage = |t: &Threed, k: u32| (t.r(0x2000 + 0x40 * k) & 1 != 0).then(|| t.r(0x2004 + 0x40 * k));
     let Some(vs) = stage(t, 1).and_then(|s| t.pipe.shader(base, s, mem)) else { return };
     let fs = stage(t, 5).and_then(|s| t.pipe.shader(base, s, mem));
-    let (verts, remap) = shade_vertices(t, &vs, list, arrays, mem);
+    let (vertices, remap) = shade_vertices(t, &vs, list, arrays, mem);
     t.counters.vertices += list.len() as u64;
     // (tessellation and geometry shaders change what is rasterized)
-    let mut out = raster::Geometry { vertices: verts, primitives: Vec::new(), size: 0 };
+    let mut out = Geometry { vertices, primitives: Vec::new(), size: 0, ids: None };
     let first = t.r(0x1684) & 1 == 0;
     let op = t.batch.op;
     vertex::assemble(op, list.len(), first, |p| {
@@ -516,26 +602,93 @@ fn strip(t: &mut Threed, list: &[u32], arrays: bool, mem: &mut dyn Memory) {
     if t.r(0x37c) & 1 == 0 {
         return;
     }
-    // quads, strips of them and polygons are triangles here
     rasterize(t, &mut out, fs, mem);
 }
 
+/// A vertex shader's inputs in a draw.
+struct VertexInputs {
+    streams: [Stream; 32],
+    attributes: Vec<(usize, Attribute)>,
+    constants: [[u32; 4]; 32],
+    element_base: u32,
+    instance_base: u32,
+    instance: u32,
+}
+
+impl VertexInputs {
+    /// Shade vertices: their outputs go to `out`, `layout.stride` words each.
+    fn run(&self, vs: &Shader, work: &Work, w: &mut Worker, mem: &mut dyn Memory, layout: &Verts, vertices: &[u32], out: &mut [u32]) -> Option<String> {
+        let mut inputs = [[[0u32; 4]; 32]; L];
+        let (lanes, mut common) = w.parts(work, mem);
+        lanes.set_local_size((vs.sph.local_low + vs.sph.local_high + vs.sph.local_crs) as usize);
+        let mut failed = None;
+        for (chunk, outs) in vertices.chunks(L).zip(out.chunks_mut(L * layout.stride)) {
+            for (lane, &i) in chunk.iter().enumerate() {
+                for &(k, a) in &self.attributes {
+                    let s = &self.streams[a.stream];
+                    inputs[lane][k] = if a.constant || !s.on {
+                        self.constants[k]
+                    } else {
+                        let e = match s.divisor {
+                            Some(0) => self.instance_base as u64,
+                            Some(d) => self.instance_base as u64 + (self.instance / d) as u64,
+                            None => i.wrapping_add(self.element_base) as u64,
+                        };
+                        let at = s.at + e * s.stride + a.offset as u64;
+                        if at > s.limit { [0; 4] } else { a.fetch(at, &*common.mem) }
+                    };
+                }
+            }
+            let vertex = std::array::from_fn(|l| chunk.get(l).copied().unwrap_or(0).wrapping_add(self.element_base));
+            lanes.start(&vs.program, (1u32 << chunk.len()).wrapping_sub(1), 0);
+            let mut host = VertexHost { common: &mut common, inputs: &inputs, vertex, instance: self.instance, layout, out: outs };
+            let mut fuel = FUEL;
+            let e = maxwell_shader::run(&vs.program, lanes, &mut host, &mut fuel);
+            if !matches!(e, Exit::Done) {
+                failed = Some(format!("vertex shader stopped: {e:?}"));
+            }
+        }
+        let stored = common.stored;
+        w.stored |= stored;
+        failed
+    }
+}
+
+/// Vertices a thread shades at a time.
+const CHUNK: usize = 16 * L;
+
 /// Shade every vertex of the list once; returns them and where each list entry is.
-fn shade_vertices(t: &mut Threed, vs: &Rc<Shader>, list: &[u32], arrays: bool, mem: &mut dyn Memory) -> (Vec<[u32; WORDS]>, Vec<u32>) {
+fn shade_vertices(t: &mut Threed, vs: &Arc<Shader>, list: &[u32], arrays: bool, mem: &mut dyn Memory) -> (Verts, Vec<u32>) {
     let mut unique: Vec<u32> = Vec::new();
     let remap: Vec<u32> = if arrays {
         unique.extend_from_slice(list);
         (0..list.len() as u32).collect()
     } else {
-        let mut seen: HashMap<u32, u32> = HashMap::with_capacity(list.len());
-        list.iter()
-            .map(|&i| {
-                *seen.entry(i).or_insert_with(|| {
-                    unique.push(i);
-                    unique.len() as u32 - 1
+        let (low, high) = list.iter().fold((u32::MAX, 0), |(a, b), &i| (a.min(i), b.max(i)));
+        if (high - low) as usize <= 4 * list.len() + 1024 {
+            // a table serves
+            let mut seen = vec![u32::MAX; (high - low) as usize + 1];
+            list.iter()
+                .map(|&i| {
+                    let s = &mut seen[(i - low) as usize];
+                    if *s == u32::MAX {
+                        *s = unique.len() as u32;
+                        unique.push(i);
+                    }
+                    *s
                 })
-            })
-            .collect()
+                .collect()
+        } else {
+            let mut seen: HashMap<u32, u32> = HashMap::with_capacity(list.len());
+            list.iter()
+                .map(|&i| {
+                    *seen.entry(i).or_insert_with(|| {
+                        unique.push(i);
+                        unique.len() as u32 - 1
+                    })
+                })
+                .collect()
+        }
     };
     let streams: [Stream; 32] = std::array::from_fn(|j| {
         let j = j as u32;
@@ -548,52 +701,67 @@ fn shade_vertices(t: &mut Threed, vs: &Rc<Shader>, list: &[u32], arrays: bool, m
             divisor: (t.r(0x1880 + 4 * j) & 1 != 0).then(|| t.r(0x1c0c + 16 * j)),
         }
     });
-    let attributes: Vec<(usize, Attribute)> = (0..32).filter(|&k| (0..4).any(|c| vs.sph.reads(0x80 + 16 * k as u32 + 4 * c))).map(|k| (k, Attribute::new(t.r(0x1160 + 4 * k as u32)))).collect();
-    let (element_base, id_base) = (if arrays { 0 } else { t.r(0x1434) }, if arrays { 0 } else { t.r(0x1434) });
-    let instance_base = t.r(0x1438);
-    let instance = t.batch.instance;
-    let words = stage_words(t, 0);
-    let mut out = vec![[0u32; WORDS]; unique.len()];
-    for v in out.iter_mut() {
-        v[POSITION + 3] = 1f32.to_bits();
-    }
-    let (tic, tsc, tex_cb) = (t.address(0x1574), t.address(0x155c), t.r(0x2608));
-    let p = &mut t.pipe;
-    let constants = p.constants;
-    p.lanes.set_local_size((vs.sph.local_low + vs.sph.local_high + vs.sph.local_crs) as usize);
-    let mut common = Common { mem, words, textures: &mut p.textures, samplers: &mut p.samplers, cache: &mut p.tex_cache, tic, tsc, tex_cb, stored: false };
-    let mut inputs = [[[0u32; 4]; 32]; L];
+    let attributes = (0..32).filter(|&k| (0..4).any(|c| vs.sph.reads(0x80 + 16 * k as u32 + 4 * c))).map(|k| (k, Attribute::new(t.r(0x1160 + 4 * k as u32)))).collect();
+    let inputs = VertexInputs {
+        streams,
+        attributes,
+        constants: t.pipe.constants,
+        element_base: if arrays { 0 } else { t.r(0x1434) },
+        instance_base: t.r(0x1438),
+        instance: t.batch.instance,
+    };
+    let work = work(t, 0);
+    let mut out = Verts::new(vs.sph.outputs().filter_map(word));
+    out.grow(unique.len());
+    let stride = out.stride;
+    let mut data = std::mem::take(&mut out.data);
+    let workers = if vs.program.writes_memory() { 1 } else { threads().min(unique.len() / (2 * CHUNK)).max(1) };
+    t.pipe.need_workers(workers);
     let mut failed = None;
-    for (chunk, outs) in unique.chunks(L).zip(out.chunks_mut(L)) {
-        for (lane, &i) in chunk.iter().enumerate() {
-            for &(k, a) in &attributes {
-                let s = &streams[a.stream];
-                inputs[lane][k] = if a.constant || !s.on {
-                    constants[k]
-                } else {
-                    let e = match s.divisor {
-                        Some(0) => instance_base as u64,
-                        Some(d) => instance_base as u64 + (instance / d) as u64,
-                        None => i.wrapping_add(element_base) as u64,
-                    };
-                    let at = s.at + e * s.stride + a.offset as u64;
-                    if at > s.limit { [0; 4] } else { a.fetch(at, &*common.mem) }
-                };
-            }
+    #[cfg(not(target_arch = "wasm32"))]
+    if workers > 1 && mem.share().is_some() {
+        use std::sync::Mutex;
+        let jobs = Mutex::new(unique.chunks(CHUNK).zip(data.chunks_mut(CHUNK * stride)));
+        let memory = &*mem;
+        failed = std::thread::scope(|scope| {
+            let handles: Vec<_> = t.pipe.workers[..workers]
+                .iter_mut()
+                .map(|w| {
+                    let (jobs, work, inputs, layout) = (&jobs, &work, &inputs, &out);
+                    let mut mine = memory.share().unwrap();
+                    scope.spawn(move || {
+                        let mut failed = None;
+                        loop {
+                            let Some((v, o)) = jobs.lock().unwrap().next() else { break };
+                            failed = inputs.run(vs, work, w, &mut *mine, layout, v, o).or(failed);
+                        }
+                        failed
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).last()
+        });
+        out.data = data;
+        if let Some(e) = failed {
+            t.pipe.error(e);
         }
-        let vertex = std::array::from_fn(|l| chunk.get(l).copied().unwrap_or(0).wrapping_add(id_base));
-        p.lanes.start(&vs.program, (1u32 << chunk.len()).wrapping_sub(1), 0);
-        let mut host = VertexHost { common: &mut common, inputs: &inputs, vertex, instance, out: outs };
-        let mut fuel = FUEL;
-        let e = maxwell_shader::run(&vs.program, &mut p.lanes, &mut host, &mut fuel);
-        if !matches!(e, Exit::Done) {
-            failed = Some(format!("vertex shader stopped: {e:?}"));
-        }
+        return (out, remap);
     }
+    failed = inputs.run(vs, &work, &mut t.pipe.workers[0], mem, &out, &unique, &mut data).or(failed);
+    out.data = data;
     if let Some(e) = failed {
         t.pipe.error(e);
     }
+    written(t);
     (out, remap)
+}
+
+/// A shader may have written memory: what was read from it is stale.
+fn written(t: &mut Threed) {
+    if t.pipe.workers.iter_mut().fold(false, |s, w| s | std::mem::take(&mut w.stored)) {
+        t.pipe.invalidate_textures();
+        t.pipe.cbufs_changed = true;
+    }
 }
 
 /// What the rasterizer needs to know about a fragment shader's surroundings.
@@ -604,7 +772,7 @@ pub struct Setup {
     pub outputs: Vec<(usize, Output)>,
     pub constant: [f32; 4],
     pub logic: Option<u32>,
-    pub fs: Option<Rc<Shader>>,
+    pub fs: Option<Arc<Shader>>,
     /// depth and stencil are tested before shading
     pub early: bool,
     pub alpha_test: Option<(u32, f32)>,
@@ -623,9 +791,15 @@ pub struct Setup {
     pub write: u32,
     pub sprite: u32,
     pub flat: bool,
+    /// the shader's results
+    pub frag: FragOutputs,
+    /// the index in `inputs` of each attribute word
+    pub slots: [u8; WORDS],
+    /// the shader writes memory: no threads
+    pub serial: bool,
 }
 
-fn rasterize(t: &mut Threed, g: &mut raster::Geometry, fs: Option<Rc<Shader>>, mem: &mut dyn Memory) {
+fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mut dyn Memory) {
     let targets = Targets::new(t);
     let mut rect = targets.rect();
     if t.r(0xe00) & 1 != 0 {
@@ -677,14 +851,20 @@ fn rasterize(t: &mut Threed, g: &mut raster::Geometry, fs: Option<Rc<Shader>>, m
     if samples == 1 || t.r(0x1534) & 1 == 0 {
         sample_mask = u32::MAX;
     }
-    let inputs = match &fs {
-        None => Vec::new(),
-        Some(f) => (0..WORDS).filter_map(|w| {
-            let addr = FIRST + 4 * w as u32;
-            let i = f.sph.interp(addr);
-            (f.sph.reads(addr) && addr >= 0x80).then_some((w, i))
-        }).collect(),
-    };
+    let two_sided = t.r(0x1688) & 1 != 0;
+    let mut inputs: Vec<(usize, Interp)> = Vec::new();
+    if let Some(f) = &fs {
+        for a in (0x80..0x3c0).step_by(4).filter(|&a| f.sph.reads(a)) {
+            let Some(w) = word(a) else { continue };
+            inputs.push((w, f.sph.interp(a)));
+            // back faces' colours
+            if two_sided && (0x280..0x2a0).contains(&a) {
+                inputs.push((w + 8, f.sph.interp(a)));
+            }
+        }
+    }
+    let mut slots = [u8::MAX; WORDS];
+    inputs.iter().enumerate().for_each(|(k, i)| slots[i.0] = k as u8);
     let dual = outputs.iter().any(|(_, o)| o.blend.on && o.blend.rgb[1..].iter().chain(&o.blend.alpha[1..]).any(|f| matches!(f & 0xfff, 0x900..=0x903)));
     let s = Setup {
         rect,
@@ -700,7 +880,7 @@ fn rasterize(t: &mut Threed, g: &mut raster::Geometry, fs: Option<Rc<Shader>>, m
         per_sample: t.r(0x754) & 0x10 != 0 && samples > 1,
         alpha_to_coverage,
         dual,
-        two_sided: t.r(0x1688) & 1 != 0,
+        two_sided,
         clamp_z: t.r(0x193c) & 0x18 != 0,
         zrange: { let (a, b) = (t.f(0xc08), t.f(0xc0c)); (a.min(b), a.max(b)) },
         inputs,
@@ -708,6 +888,9 @@ fn rasterize(t: &mut Threed, g: &mut raster::Geometry, fs: Option<Rc<Shader>>, m
         write,
         sprite: if t.r(0x1520) & 1 != 0 { t.r(0x1604) } else { 0 },
         flat: t.r(0x12d4) == 0x1d00,
+        frag: out.unwrap_or_default(),
+        slots,
+        serial: fs.as_ref().is_some_and(|f| f.program.writes_memory()),
         targets,
         fs,
     };
@@ -715,46 +898,61 @@ fn rasterize(t: &mut Threed, g: &mut raster::Geometry, fs: Option<Rc<Shader>>, m
         return;
     }
     t.rop.begin(&s.targets);
-    let words = stage_words(t, 4);
-    raster::draw(t, g, &s, words, mem);
-    let _ = (LAYER, POINT_SIZE);
-}
-
-impl Threed {
-    /// The pieces a fragment shader's host needs, apart from the render targets.
-    pub(crate) fn fragment_parts<'a>(&'a mut self, words: Rc<[Words; 18]>, mem: &'a mut dyn Memory) -> (Common<'a>, &'a mut Lanes<L>, &'a mut crate::rop::Rop, &'a mut crate::threed::Counters) {
-        let (tic, tsc, tex_cb) = (self.address(0x1574), self.address(0x155c), self.r(0x2608));
-        let p = &mut self.pipe;
-        (Common { mem, words, textures: &mut p.textures, samplers: &mut p.samplers, cache: &mut p.tex_cache, tic, tsc, tex_cb, stored: false }, &mut p.lanes, &mut self.rop, &mut self.counters)
+    let scene = raster::setup(t, g, &s);
+    if scene.prims.is_empty() {
+        return;
     }
+    let work = work(t, 4);
+    raster::draw(t, &scene, &s, &work, mem);
+    written(t);
 }
 
-/// A fragment shader's surroundings: quads of one primitive.
+/// A fragment shader's surroundings: four quads.
 pub struct FragmentHost<'a, 'm> {
-    pub common: &'a mut Common<'m>,
-    pub setup: &'a Setup,
-    pub prim: &'a raster::Primitive,
-    /// each quad's first pixel
-    pub quads: [(i32, i32); L / 4],
+    common: &'a mut Common<'m>,
+    setup: &'a Setup,
+    scene: &'a Scene,
+    /// each quad's primitive and first pixel
+    prims: [&'a Prim; L / 4],
+    quads: [(i32, i32); L / 4],
     /// each lane's covered samples
-    pub coverage: [u32; L],
+    coverage: [u32; L],
     /// the sample being shaded, with per-sample shading
-    pub sample: Option<u32>,
+    sample: Option<u32>,
+    /// each lane's sample point
+    x: [f32; L],
+    y: [f32; L],
 }
 
-impl FragmentHost<'_, '_> {
-    /// A lane's sample point, in pixels.
-    #[inline(always)]
-    fn at(&self, l: usize, offset: (f32, f32)) -> (f32, f32) {
-        let (qx, qy) = self.quads[l / 4];
-        let (cx, cy) = match self.sample {
+impl<'a, 'm> FragmentHost<'a, 'm> {
+    pub fn new(common: &'a mut Common<'m>, setup: &'a Setup, scene: &'a Scene, prims: [&'a Prim; L / 4], quads: [(i32, i32); L / 4], coverage: [u32; L], sample: Option<u32>) -> Self {
+        let (cx, cy) = match sample {
             Some(s) => {
-                let (x, y) = self.setup.positions[s as usize];
+                let (x, y) = setup.positions[s as usize];
                 (x as f32 / 256.0, y as f32 / 256.0)
             }
             None => (0.5, 0.5),
         };
-        ((qx + (l & 1) as i32) as f32 + cx + offset.0, (qy + (l >> 1 & 1) as i32) as f32 + cy + offset.1)
+        let x = std::array::from_fn(|l| (quads[l / 4].0 + (l & 1) as i32) as f32 + cx);
+        let y = std::array::from_fn(|l| (quads[l / 4].1 + (l >> 1 & 1) as i32) as f32 + cy);
+        Self { common, setup, scene, prims, quads, coverage, sample, x, y }
+    }
+
+    /// Where an instruction interpolates.
+    fn points(&self, op: &IpaOp<L>) -> ([f32; L], [f32; L]) {
+        let pixel = |l: usize| ((self.quads[l / 4].0 + (l & 1) as i32) as f32, (self.quads[l / 4].1 + (l >> 1 & 1) as i32) as f32);
+        let all = (1u32 << self.setup.samples) - 1;
+        let at = |l: usize| match op.loc {
+            IpaLoc::Offset => (pixel(l).0 + 0.5 + op.offset[0][l], pixel(l).1 + 0.5 + op.offset[1][l]),
+            // a partly covered pixel: at a sample that is
+            IpaLoc::Centroid if self.sample.is_none() && self.coverage[l] & all != all && self.coverage[l] & all != 0 => {
+                let (x, y) = self.setup.positions[self.coverage[l].trailing_zeros() as usize];
+                (pixel(l).0 + x as f32 / 256.0, pixel(l).1 + y as f32 / 256.0)
+            }
+            _ => (self.x[l], self.y[l]),
+        };
+        let p: [(f32, f32); L] = std::array::from_fn(at);
+        (p.map(|p| p.0), p.map(|p| p.1))
     }
 }
 
@@ -769,76 +967,71 @@ impl Host<L> for FragmentHost<'_, '_> {
     }
 
     fn interpolate(&mut self, op: &IpaOp<L>) -> [u32; L] {
-        let p = self.prim;
-        let centroid = op.loc == IpaLoc::Centroid && self.sample.is_none() && self.setup.samples > 1;
-        let at = |l: usize, h: &Self| -> (f32, f32) {
-            if op.loc == IpaLoc::Offset {
-                let (qx, qy) = h.quads[l / 4];
-                return ((qx + (l & 1) as i32) as f32 + 0.5 + op.offset[0][l], (qy + (l >> 1 & 1) as i32) as f32 + 0.5 + op.offset[1][l]);
-            }
-            let all = (1u32 << h.setup.samples) - 1;
-            if centroid && h.coverage[l] & all != all && h.coverage[l] & all != 0 {
-                let s = h.coverage[l].trailing_zeros() as usize;
-                let (x, y) = h.setup.positions[s];
-                let (qx, qy) = h.quads[l / 4];
-                return ((qx + (l & 1) as i32) as f32 + x as f32 / 256.0, (qy + (l >> 1 & 1) as i32) as f32 + y as f32 / 256.0);
-            }
-            h.at(l, (0.0, 0.0))
+        let moved;
+        let (x, y) = if op.loc == IpaLoc::Default {
+            (&self.x, &self.y)
+        } else {
+            moved = self.points(op);
+            (&moved.0, &moved.1)
         };
+        let mul_w = op.mode == IpaMode::MulW;
+        let mut out = [0u32; L];
+        let of = |f: &dyn Fn(&Prim, usize) -> f32| std::array::from_fn(|l| f(self.prims[l / 4], l).to_bits());
         match op.addr {
-            0x70 => return std::array::from_fn(|l| at(l, self).0.to_bits()),
-            0x74 => return std::array::from_fn(|l| at(l, self).1.to_bits()),
-            0x78 => return std::array::from_fn(|l| { let (x, y) = at(l, self); p.z.at(x, y).to_bits() }),
-            0x7c => return std::array::from_fn(|l| { let (x, y) = at(l, self); p.w.at(x, y).to_bits() }),
-            0x3fc => return [if p.front { u32::MAX } else { 0 }; L],
-            0x60 => return [p.id; L],
-            0x64 => return [p.layer; L],
+            0x70 => return x.map(f32::to_bits),
+            0x74 => return y.map(f32::to_bits),
+            0x78 => return of(&|p, l| p.z.at(x[l], y[l])),
+            0x7c => return of(&|p, l| p.w.at(x[l], y[l])),
+            0x3fc => return std::array::from_fn(|l| if self.prims[l / 4].front { u32::MAX } else { 0 }),
+            0x60 => return std::array::from_fn(|l| self.prims[l / 4].id),
+            0x64 => return std::array::from_fn(|l| self.prims[l / 4].layer),
+            0x68 => return [0; L],
             0x2e0 | 0x2e4 => {
-                let pl = if op.addr == 0x2e0 { &p.point[0] } else { &p.point[1] };
-                return std::array::from_fn(|l| {
-                    let (x, y) = at(l, self);
-                    (pl.at(x, y) * if op.mode == IpaMode::MulW { p.w.at(x, y) } else { 1.0 }).to_bits()
+                return of(&|p, l| {
+                    let v = p.point.map_or(0.0, |k| self.scene.points[k as usize][(op.addr >> 2 & 1) as usize].at(x[l], y[l]));
+                    if mul_w { v * p.w.at(x[l], y[l]) } else { v }
                 });
             }
             _ => {}
         }
-        // two-sided colours
-        let mut addr = op.addr;
-        if self.setup.two_sided && !p.front && (0x280..0x2a0).contains(&addr) {
-            addr += 0x20;
-        }
-        let Some(w) = word(addr) else { return [0; L] };
-        // a point sprite's coordinate takes a generic's place
-        if p.is_point && (0x80..0x100).contains(&addr) {
-            let g = (addr - 0x80) / 16;
-            if self.setup.sprite >> (3 + g) & 1 != 0 {
-                return match addr >> 2 & 3 {
-                    c @ (0 | 1) => std::array::from_fn(|l| {
-                        let (x, y) = at(l, self);
-                        (p.point[c as usize].at(x, y) * if op.mode == IpaMode::MulW { p.w.at(x, y) } else { 1.0 }).to_bits()
-                    }),
-                    3 => std::array::from_fn(|l| { let (x, y) = at(l, self); (if op.mode == IpaMode::MulW { p.w.at(x, y) } else { 1.0 }).to_bits() }),
-                    _ => [0; L],
-                };
-            }
-        }
-        match &p.planes[w] {
-            raster::Plane::None => [0; L],
-            raster::Plane::Flat(v) => {
-                // a shader that multiplies with w gets the value over w
-                if op.mode == IpaMode::MulW {
-                    let v = f32::from_bits(*v);
-                    return std::array::from_fn(|l| { let (x, y) = at(l, self); (v * p.w.at(x, y)).to_bits() });
+        let Some(w) = word(op.addr) else { return out };
+        for (q, o) in out.chunks_exact_mut(4).enumerate() {
+            let p = self.prims[q];
+            let at = 4 * q..4 * q + 4;
+            let (x, y) = (&x[at.clone()], &y[at]);
+            // a point sprite's coordinate takes a generic's place
+            if let (Some(k), 0x80..=0xfc) = (p.point, op.addr) {
+                if self.setup.sprite >> (3 + (op.addr - 0x80) / 16) & 1 != 0 {
+                    let c = (op.addr >> 2 & 3) as usize;
+                    for l in 0..4 {
+                        let v = match c {
+                            0 | 1 => self.scene.points[k as usize][c].at(x[l], y[l]),
+                            2 => 0.0,
+                            _ => 1.0,
+                        };
+                        o[l] = if mul_w { v * p.w.at(x[l], y[l]) } else { v }.to_bits();
+                    }
+                    continue;
                 }
-                [*v; L]
             }
-            raster::Plane::Linear(pl) => {
-                if op.mode == IpaMode::Constant {
-                    return [p.flat[w]; L];
+            // two-sided colours
+            let w = if self.setup.two_sided && !p.front && (0x280..0x2a0).contains(&op.addr) { w + 8 } else { w };
+            let k = self.setup.slots[w];
+            if k == u8::MAX {
+                continue;
+            }
+            let slot = &self.scene.slots[p.slots as usize + k as usize];
+            match (&slot.linear, op.mode) {
+                (None, IpaMode::MulW) => {
+                    // the shader will multiply by w
+                    let v = f32::from_bits(slot.flat);
+                    (0..4).for_each(|l| o[l] = (v * p.w.at(x[l], y[l])).to_bits());
                 }
-                std::array::from_fn(|l| { let (x, y) = at(l, self); pl.at(x, y).to_bits() })
+                (None, _) | (_, IpaMode::Constant) => o.fill(slot.flat),
+                (Some(v), _) => (0..4).for_each(|l| o[l] = v.at(x[l], y[l]).to_bits()),
             }
         }
+        out
     }
 
     fn pixld(&mut self, what: Pixld, arg: &[u32; L]) -> [u32; L] {
