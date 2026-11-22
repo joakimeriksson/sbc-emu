@@ -42,7 +42,7 @@ impl Pmu {
             0x100 => (self.halted as u32) << 4,
             0x108 => (DMEM as u32 >> 8) << 9 | 0xc0, // 48 KiB of code, 40 of data
             0x12c => 4 << 12 | 1 << 8 | 2 << 4 | 5,
-            0x0dc => if self.bound { 5 << 12 } else { 0 },
+            0x0dc | 0x20c => if self.bound { 5 << 12 } else { 0 },
             0x10c => self.r(o) & !6, // memories scrubbed
             0x1c4..=0x1ff if o & 7 == 4 => {
                 let p = (o as usize - 0x1c4) / 8;
@@ -62,7 +62,7 @@ impl Pmu {
                 let s = self.r(0x008) & !v;
                 self.regs.insert(0x008, s);
             }
-            0x054 => {
+            0x054 | 0x480 => {
                 self.bound = true;
                 let s = self.r(0x008) | 8;
                 self.regs.insert(0x008, s);

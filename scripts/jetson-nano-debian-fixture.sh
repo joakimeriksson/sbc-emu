@@ -52,7 +52,7 @@ cp "$src/modules.builtin" "$src/modules.builtin.modinfo" "$src/modules.order" "$
 # drivers of the board, and what each of them needs (modules.dep is made in the guest)
 find "$src/kernel" -name '*.ko.xz' > "$work/modules"
 todo="i2c-tegra fixed gpio-regulator max77620-regulator pwm-tegra pwm-regulator sdhci-tegra ext4 crc32c_generic
-    phy-tegra-xusb r8169 realtek af_packet xhci-tegra usbhid hid-generic evdev usb-storage sd_mod tegra-drm"
+    phy-tegra-xusb r8169 realtek af_packet xhci-tegra usbhid hid-generic evdev usb-storage sd_mod tegra-drm nouveau"
 done=" "
 while [ -n "$todo" ]; do
     set -- $todo
@@ -77,6 +77,7 @@ done
 fw=$work/root/lib/firmware/nvidia/tegra210
 mkdir -p "$fw"
 { head -c 100 /dev/zero; printf '\000\020\000\000'; head -c 3992 /dev/zero; } > "$fw/xusb.bin"
+python3 "$(dirname "$0")/../tools/nano_gpu_firmware.py" "$work/root/lib/firmware"
 cat > "$work/root/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev

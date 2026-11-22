@@ -56,6 +56,8 @@ pub struct Gpu {
     runlist_intr: u32,
     timer_intr: bool,
     now: u64,
+    /// the last time read (the timer never stands still, whatever the CPU's blocks do)
+    last_time: u64,
     pub trace: bool,
     /// registers touched that have no model, for reports
     pub submissions: u64,
@@ -88,6 +90,7 @@ impl Default for Gpu {
             runlist_intr: 0,
             timer_intr: false,
             now: 0,
+            last_time: 0,
             trace: std::env::var_os("SBC_TRACE_GPU").is_some(),
             submissions: 0,
         }
@@ -99,8 +102,9 @@ impl Gpu {
         self.regs.get(&o).copied().unwrap_or(0)
     }
 
-    fn time(&self) -> u64 {
-        self.now & !31
+    fn time(&mut self) -> u64 {
+        self.last_time = (self.now & !31).max(self.last_time + 32);
+        self.last_time
     }
 
     /// The PMC's pending interrupts.
@@ -137,7 +141,7 @@ impl Gpu {
             0x2a00 => self.runlist_intr,
             0x9100 => self.timer_intr as u32,
             0x9400 => self.time() as u32,
-            0x9410 => (self.time() >> 32) as u32,
+            0x9410 => (self.last_time.max(self.now) >> 32) as u32,
             0x022700..=0x0227fc => TOP.get((o as usize - 0x022700) / 4).copied().unwrap_or(0),
             0x070000..=0x070010 => 0, // flushes are done
             0x100c80 => self.r(o) | 0xff_8000,
@@ -149,6 +153,9 @@ impl Gpu {
             },
             0x10_a000..=0x10_afff => self.pmu.read(o - pmu::BASE),
             0x12_004c => 0,
+            // the graphics clock's PLL locks and ramps at once
+            0x13_7000 => self.r(o) & !(1 << 17) | (self.r(o) & 1) << 17,
+            0x13_28a0 => self.r(o) | 1 << 24,
             0x40_4170 => self.r(o) & !0x10,
             0x40_9108 | 0x41_a108 => 0x4_0040, // 16 KiB of code, 8 of data
             0x40_912c | 0x41_a12c => 4 << 12 | 1 << 8 | 2 << 4 | 5,
