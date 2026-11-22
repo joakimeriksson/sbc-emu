@@ -12,8 +12,6 @@ pub struct Verts {
     map: [u8; WORDS],
     pub stride: usize,
     pub data: Vec<u32>,
-    /// the words that clipping interpolates
-    lerp: Vec<bool>,
 }
 
 const NONE: u8 = 255;
@@ -29,7 +27,7 @@ impl Verts {
                 stride += 1;
             }
         }
-        Self { map, stride: stride as usize, data: Vec::new(), lerp: Vec::new() }
+        Self { map, stride: stride as usize, data: Vec::new() }
     }
 
     /// Append `n` vertices (zeros, with w = 1).
@@ -60,27 +58,6 @@ impl Verts {
         self.slot(w).map_or(0, |s| self.data[v as usize * self.stride + s])
     }
 
-    #[inline(always)]
-    fn f(&self, v: u32, w: usize) -> f32 {
-        f32::from_bits(self.get(v, w))
-    }
-
-    #[inline(always)]
-    fn position(&self, v: u32) -> [f32; 4] {
-        // (the position's words come first)
-        let p = &self.data[v as usize * self.stride..][..4];
-        std::array::from_fn(|k| f32::from_bits(p[k]))
-    }
-
-    /// A vertex between two.
-    fn mix(&mut self, a: u32, b: u32, t: f32) -> u32 {
-        let n = self.len() as u32;
-        for s in 0..self.stride {
-            let (x, y) = (self.data[a as usize * self.stride + s], self.data[b as usize * self.stride + s]);
-            self.data.push(if self.lerp[s] { (f32::from_bits(x) + (f32::from_bits(y) - f32::from_bits(x)) * t).to_bits() } else { x });
-        }
-        n
-    }
 }
 
 /// The primitives of a draw: `size` indices each.
@@ -133,6 +110,7 @@ pub struct Slot {
 type Edge = (i64, i64, i64);
 
 /// A triangle (or half a point or a line) set up for rasterizing.
+#[derive(Clone)]
 pub struct Prim {
     edges: [Edge; 3],
     /// pixels [x0, x1) × [y0, y1)
@@ -140,8 +118,10 @@ pub struct Prim {
     pub z: Linear,
     /// 1/w
     pub w: Linear,
-    /// its first attribute in `Scene::slots`
-    pub slots: u32,
+    /// the vertices its attributes come from, and where they are (x, y, 1/w)
+    v: [u32; 3],
+    provoking: u32,
+    at: [[f32; 3]; 3],
     /// of a point: its coordinates in `Scene::points`
     pub point: Option<u32>,
     pub front: bool,
@@ -153,10 +133,59 @@ pub struct Prim {
 #[derive(Default)]
 pub struct Scene {
     pub prims: Vec<Prim>,
-    pub slots: Vec<Slot>,
     pub points: Vec<[Linear; 2]>,
     /// a guess at the pixels
     pub area: u64,
+    /// vertices made by clipping, until they join the others
+    extra: Vec<u32>,
+}
+
+/// The vertices: the draw's, and those clipping makes.
+struct Source<'a> {
+    verts: &'a Verts,
+    count: u32,
+    extra: Vec<u32>,
+    lerp: &'a [bool],
+}
+
+impl Source<'_> {
+    #[inline(always)]
+    fn words(&self, v: u32) -> &[u32] {
+        let n = self.verts.stride;
+        if v < self.count {
+            &self.verts.data[v as usize * n..][..n]
+        } else {
+            &self.extra[(v - self.count) as usize * n..][..n]
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, v: u32, w: usize) -> u32 {
+        self.verts.slot(w).map_or(0, |s| self.words(v)[s])
+    }
+
+    #[inline(always)]
+    fn f(&self, v: u32, w: usize) -> f32 {
+        f32::from_bits(self.get(v, w))
+    }
+
+    #[inline(always)]
+    fn position(&self, v: u32) -> [f32; 4] {
+        // (the position's words come first)
+        let p = self.words(v);
+        std::array::from_fn(|k| f32::from_bits(p[k]))
+    }
+
+    /// A vertex between two.
+    fn mix(&mut self, a: u32, b: u32, t: f32) -> u32 {
+        let n = self.count + (self.extra.len() / self.verts.stride) as u32;
+        for s in 0..self.verts.stride {
+            let (x, y) = (self.words(a)[s], self.words(b)[s]);
+            let v = if self.lerp[s] { (f32::from_bits(x) + (f32::from_bits(y) - f32::from_bits(x)) * t).to_bits() } else { x };
+            self.extra.push(v);
+        }
+        n
+    }
 }
 
 /// A vertex in window coordinates.
@@ -179,52 +208,120 @@ struct View {
     transform: bool,
 }
 
+/// What setup needs of the registers.
+struct State {
+    view: View,
+    cull: Option<u32>,
+    /// clockwise (in window coordinates with y down) is the front
+    front_negative: bool,
+    mode_front: u32,
+    mode_back: u32,
+    offset_on: [bool; 3],
+    factor: f32,
+    units: f32,
+    clamp: f32,
+    width: f32,
+    point_size: f32,
+    attribute_size: bool,
+    first_provokes: bool,
+}
+
+/// Primitives a thread sets up at a time.
+const CHUNK: usize = 4096;
+
 /// Set up every primitive of `g`.
 pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
-    let v = View {
-        scale: [t.f(0xa00), t.f(0xa04), t.f(0xa08)],
-        offset: [t.f(0xa0c), t.f(0xa10), t.f(0xa14)],
-        zero_to_one: t.r(0xd7c) & 1 != 0,
-        clamp_near: t.r(0x193c) & 8 != 0,
-        clamp_far: t.r(0x193c) & 0x10 != 0,
-        planes: t.r(0x1510) & 0xff,
-        transform: t.r(0x192c) & 1 != 0,
+    let state = State {
+        view: View {
+            scale: [t.f(0xa00), t.f(0xa04), t.f(0xa08)],
+            offset: [t.f(0xa0c), t.f(0xa10), t.f(0xa14)],
+            zero_to_one: t.r(0xd7c) & 1 != 0,
+            clamp_near: t.r(0x193c) & 8 != 0,
+            clamp_far: t.r(0x193c) & 0x10 != 0,
+            planes: t.r(0x1510) & 0xff,
+            transform: t.r(0x192c) & 1 != 0,
+        },
+        cull: (t.r(0x1918) & 1 != 0).then(|| t.r(0x1920)),
+        front_negative: t.r(0x191c) == 0x900,
+        mode_front: t.r(0xdac),
+        mode_back: t.r(0xdb0),
+        // glPolygonOffset, for point, line and filled polygons
+        offset_on: [t.r(0xdc0) & 1 != 0, t.r(0xdc4) & 1 != 0, t.r(0xdc8) & 1 != 0],
+        factor: t.f(0x156c),
+        units: t.f(0x15bc),
+        clamp: t.f(0x187c),
+        width: if t.r(0x1570) & 1 != 0 { t.f(0x13b0) } else { t.f(0x13b4) }.max(1.0),
+        point_size: t.f(0x1518),
+        attribute_size: t.r(0x1910) & 1 != 0,
+        first_provokes: t.r(0x1684) & 1 == 0,
     };
-    let cull = (t.r(0x1918) & 1 != 0).then(|| t.r(0x1920));
-    // clockwise (in window coordinates with y down) is the front
-    let front_negative = t.r(0x191c) == 0x900;
-    let (mode_front, mode_back) = (t.r(0xdac), t.r(0xdb0));
-    // glPolygonOffset, for point, line and filled polygons
-    let offset_on = [t.r(0xdc0) & 1 != 0, t.r(0xdc4) & 1 != 0, t.r(0xdc8) & 1 != 0];
-    let (factor, units, clamp) = (t.f(0x156c), t.f(0x15bc), t.f(0x187c));
-    let width = if t.r(0x1570) & 1 != 0 { t.f(0x13b0) } else { t.f(0x13b4) }.max(1.0);
-    let (point_size, attribute_size) = (t.f(0x1518), t.r(0x1910) & 1 != 0);
-    let first_provokes = t.r(0x1684) & 1 == 0;
-
-    let vs = &mut g.vertices;
-    vs.lerp = vec![false; vs.stride];
+    let mut lerp = vec![false; g.vertices.stride];
     let smooth = s.inputs.iter().filter(|i| i.1 != Interp::Constant).map(|i| i.0);
     for w in (POSITION..POSITION + 4).chain(CLIP..CLIP + 8).chain(smooth) {
-        if let Some(k) = vs.slot(w) {
-            vs.lerp[k] = true;
+        if let Some(k) = g.vertices.slot(w) {
+            lerp[k] = true;
         }
     }
-    let vertices = vs.len();
+    let total = g.primitives.len() / g.size;
+    let count = g.vertices.len() as u32;
+    let one = |from: usize, to: usize| {
+        let source = Source { verts: &g.vertices, count, extra: Vec::new(), lerp: &lerp };
+        part(&state, g, s, source, from, to)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if total > 2 * CHUNK && crate::pipe::threads() > 1 {
+        let parts: Vec<std::sync::Mutex<Option<Scene>>> = (0..total.div_ceil(CHUNK)).map(|_| Default::default()).collect();
+        crate::pool::run(parts.len(), &|k| {
+            *parts[k].lock().unwrap() = Some(one(k * CHUNK, ((k + 1) * CHUNK).min(total)));
+        });
+        let mut scene = Scene::default();
+        let stride = g.vertices.stride;
+        for p in parts {
+            let mut p = p.into_inner().unwrap().unwrap();
+            // where its own vertices and points go
+            let moved = g.vertices.len() as u32 - count;
+            let points = scene.points.len() as u32;
+            for q in &mut p.prims {
+                for v in q.v.iter_mut().chain([&mut q.provoking]) {
+                    if *v >= count {
+                        *v += moved;
+                    }
+                }
+                if let Some(k) = &mut q.point {
+                    *k += points;
+                }
+            }
+            debug_assert!(p.extra.len().is_multiple_of(stride));
+            g.vertices.data.append(&mut p.extra);
+            scene.prims.append(&mut p.prims);
+            scene.points.append(&mut p.points);
+            scene.area += p.area;
+        }
+        return scene;
+    }
+    let mut scene = one(0, total);
+    g.vertices.data.append(&mut scene.extra);
+    scene
+}
+
+/// Set up the primitives from `from` to `to`.
+fn part(st: &State, g: &Geometry, s: &Setup, mut vs: Source, from: usize, to: usize) -> Scene {
+    let v = &st.view;
     let mut b = Build { s, scene: Scene::default(), id: 0, layer: 0 };
     let mut poly: Vec<u32> = Vec::new();
     let mut spare: Vec<u32> = Vec::new();
     let mut wins: Vec<Win> = Vec::new();
-    for (id, p) in g.primitives.chunks_exact(g.size).enumerate() {
+    for (id, p) in g.primitives.chunks_exact(g.size).enumerate().take(to).skip(from) {
         b.id = g.ids.as_ref().map_or(id as u32, |i| i[id]);
         b.layer = vs.get(p[0], crate::pipe::LAYER);
         if g.size == 1 {
-            let size = if attribute_size { vs.f(p[0], crate::pipe::POINT_SIZE) } else { point_size };
-            if outside(&v, vs, p[0]) & !GUARDS == 0 {
-                b.point(vs, p[0], window(&v, vs, p[0]), size.max(1.0));
+            let size = if st.attribute_size { vs.f(p[0], crate::pipe::POINT_SIZE) } else { st.point_size };
+            if outside(v, &vs, p[0]) & !GUARDS == 0 {
+                b.point(p[0], window(v, &vs, p[0]), size.max(1.0));
             }
             continue;
         }
-        let codes: [u32; 3] = std::array::from_fn(|k| p.get(k).map_or(0, |&i| outside(&v, vs, i)));
+        let codes: [u32; 3] = std::array::from_fn(|k| p.get(k).map_or(0, |&i| outside(v, &vs, i)));
         poly.clear();
         poly.extend_from_slice(p);
         if codes[0] | codes[1] | codes[2] != 0 {
@@ -232,53 +329,51 @@ pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
             if codes[0] & codes[1] & last != 0 {
                 continue;
             }
-            clip(&v, vs, &mut poly, &mut spare, codes[0] | codes[1] | codes[2]);
+            clip(v, &mut vs, &mut poly, &mut spare, codes[0] | codes[1] | codes[2]);
         }
         if poly.len() < g.size {
             continue;
         }
-        let provoking = if first_provokes { p[0] } else { p[g.size - 1] };
+        let provoking = if st.first_provokes { p[0] } else { p[g.size - 1] };
         wins.clear();
-        wins.extend(poly.iter().map(|&i| window(&v, vs, i)));
+        wins.extend(poly.iter().map(|&i| window(v, &vs, i)));
         if g.size == 2 {
-            b.line(vs, [poly[0], poly[1]], [wins[0], wins[1]], provoking, width);
-        } else {
-            let area = area_of(&wins);
-            if area == 0.0 || !area.is_finite() {
-                vs.data.truncate(vertices * vs.stride);
-                continue;
-            }
-            // y goes down in window coordinates: a positive area is clockwise
-            let front = (area > 0.0) == front_negative;
-            let culled = cull.is_some_and(|c| c == 0x408 || c == 0x404 && front || c == 0x405 && !front);
-            if !culled {
-                let mode = if front { mode_front } else { mode_back };
-                let bias = |on: bool| if on { depth_bias(&wins, factor, units, clamp, s) } else { 0.0 };
-                match mode {
-                    0x1b00 | 0x1b01 => {
-                        let z = bias(offset_on[(mode & 1) as usize]);
-                        wins.iter_mut().for_each(|w| w.z += z);
-                        for k in 0..poly.len() {
-                            if mode == 0x1b00 {
-                                b.point(vs, poly[k], wins[k], point_size.max(1.0));
-                            } else {
-                                let n = (k + 1) % poly.len();
-                                b.line(vs, [poly[k], poly[n]], [wins[k], wins[n]], provoking, width);
-                            }
-                        }
-                    }
-                    _ => {
-                        let z = bias(offset_on[2]);
-                        for k in 1..poly.len() - 1 {
-                            b.triangle(vs, [poly[0], poly[k], poly[k + 1]], [wins[0], wins[k], wins[k + 1]], provoking, front, z);
-                        }
+            b.line([poly[0], poly[1]], [wins[0], wins[1]], provoking, st.width);
+            continue;
+        }
+        let area = area_of(&wins);
+        if area == 0.0 || !area.is_finite() {
+            continue;
+        }
+        // y goes down in window coordinates: a positive area is clockwise
+        let front = (area > 0.0) == st.front_negative;
+        if st.cull.is_some_and(|c| c == 0x408 || c == 0x404 && front || c == 0x405 && !front) {
+            continue;
+        }
+        let mode = if front { st.mode_front } else { st.mode_back };
+        let bias = |on: bool| if on { depth_bias(&wins, st.factor, st.units, st.clamp, s) } else { 0.0 };
+        match mode {
+            0x1b00 | 0x1b01 => {
+                let z = bias(st.offset_on[(mode & 1) as usize]);
+                wins.iter_mut().for_each(|w| w.z += z);
+                for k in 0..poly.len() {
+                    if mode == 0x1b00 {
+                        b.point(poly[k], wins[k], st.point_size.max(1.0));
+                    } else {
+                        let n = (k + 1) % poly.len();
+                        b.line([poly[k], poly[n]], [wins[k], wins[n]], provoking, st.width);
                     }
                 }
             }
+            _ => {
+                let z = bias(st.offset_on[2]);
+                for k in 1..poly.len() - 1 {
+                    b.triangle([poly[0], poly[k], poly[k + 1]], [wins[0], wins[k], wins[k + 1]], provoking, front, z);
+                }
+            }
         }
-        // (the vertices clipping made)
-        vs.data.truncate(vertices * vs.stride);
     }
+    b.scene.extra = vs.extra;
     b.scene
 }
 
@@ -322,7 +417,7 @@ const GUARD_PIXELS: f32 = 65536.0;
 
 /// The distance to a clip plane (inside: not negative).
 #[inline]
-fn distance(v: &View, vs: &Verts, p: u32, plane: u32) -> f32 {
+fn distance(v: &View, vs: &Source, p: u32, plane: u32) -> f32 {
     let [x, y, z, w] = vs.position(p);
     let g = if v.transform { GUARD * w } else { GUARD_PIXELS };
     match plane {
@@ -343,7 +438,7 @@ fn distance(v: &View, vs: &Verts, p: u32, plane: u32) -> f32 {
 
 /// The planes a vertex is outside of.
 #[inline]
-fn outside(v: &View, vs: &Verts, p: u32) -> u32 {
+fn outside(v: &View, vs: &Source, p: u32) -> u32 {
     let [x, y, z, w] = vs.position(p);
     let (g, w) = if v.transform { (GUARD * w, w) } else { (GUARD_PIXELS, 1.0) };
     let z = if v.transform { z } else { 0.5 };
@@ -365,7 +460,7 @@ fn outside(v: &View, vs: &Verts, p: u32) -> u32 {
 }
 
 /// Clip a polygon or a line to the planes in `codes`.
-fn clip(v: &View, vs: &mut Verts, poly: &mut Vec<u32>, out: &mut Vec<u32>, codes: u32) {
+fn clip(v: &View, vs: &mut Source, poly: &mut Vec<u32>, out: &mut Vec<u32>, codes: u32) {
     let line = poly.len() == 2;
     for plane in (0..15).filter(|k| codes >> k & 1 != 0) {
         out.clear();
@@ -393,7 +488,7 @@ fn clip(v: &View, vs: &mut Verts, poly: &mut Vec<u32>, out: &mut Vec<u32>, codes
 }
 
 #[inline]
-fn window(v: &View, vs: &Verts, p: u32) -> Win {
+fn window(v: &View, vs: &Source, p: u32) -> Win {
     let [x, y, z, w] = vs.position(p);
     if !v.transform {
         return Win { x, y, z, w };
@@ -414,10 +509,11 @@ struct Plane3 {
 }
 
 impl Plane3 {
-    fn new(w: &[Win; 3]) -> Self {
-        let (ax, ay) = ((w[1].x - w[0].x) as f64, (w[1].y - w[0].y) as f64);
-        let (bx, by) = ((w[2].x - w[0].x) as f64, (w[2].y - w[0].y) as f64);
-        Self { ax, ay, bx, by, inv: 1.0 / (ax * by - bx * ay), x0: w[0].x, y0: w[0].y }
+    /// Through three places (x, y).
+    fn of(w: &[[f32; 3]; 3]) -> Self {
+        let (ax, ay) = ((w[1][0] - w[0][0]) as f64, (w[1][1] - w[0][1]) as f64);
+        let (bx, by) = ((w[2][0] - w[0][0]) as f64, (w[2][1] - w[0][1]) as f64);
+        Self { ax, ay, bx, by, inv: 1.0 / (ax * by - bx * ay), x0: w[0][0], y0: w[0][1] }
     }
 
     fn through(&self, v: [f32; 3]) -> Linear {
@@ -435,37 +531,49 @@ struct Build<'s> {
     layer: u32,
 }
 
-impl Build<'_> {
-    /// The attributes of a triangle; returns where they start.
-    fn slots(&mut self, vs: &Verts, w: &[Win; 3], plane: &Plane3, v: [u32; 3], provoking: u32) -> u32 {
-        let at = self.scene.slots.len() as u32;
-        for &(k, i) in &self.s.inputs {
-            let Some(slot) = vs.slot(k) else {
-                self.scene.slots.push(Slot { flat: 0, linear: None });
-                continue;
-            };
-            let value = |n: u32| vs.data[n as usize * vs.stride + slot];
-            let flat = value(provoking);
-            let is_flat = i == Interp::Constant || self.s.flat && (0x280 - 0x40..0x2c0 - 0x40).contains(&(4 * k));
-            let linear = (!is_flat).then(|| {
-                let over = |n: usize| f32::from_bits(value(v[n])) * if i == Interp::Perspective { w[n].w } else { 1.0 };
-                plane.through([over(0), over(1), over(2)])
-            });
-            self.scene.slots.push(Slot { flat, linear });
-        }
-        at
+/// The attributes of a primitive.
+fn attributes(verts: &Verts, p: &Prim, s: &Setup, out: &mut Vec<Slot>) {
+    out.clear();
+    let plane = Plane3::of(&p.at);
+    let value = |n: u32, slot: usize| verts.data[n as usize * verts.stride + slot];
+    for &(k, i) in &s.inputs {
+        let Some(slot) = verts.slot(k) else {
+            out.push(Slot { flat: 0, linear: None });
+            continue;
+        };
+        let flat = value(p.provoking, slot);
+        let linear = if i == Interp::Constant {
+            None
+        } else if p.point.is_some() {
+            // nothing varies over a point
+            Some(Linear::constant(f32::from_bits(flat) * if i == Interp::Perspective { p.at[0][2] } else { 1.0 }))
+        } else if s.flat && (0x280 - 0x40..0x2c0 - 0x40).contains(&(4 * k)) {
+            None
+        } else {
+            let over = |n: usize| f32::from_bits(value(p.v[n], slot)) * if i == Interp::Perspective { p.at[n][2] } else { 1.0 };
+            Some(plane.through([over(0), over(1), over(2)]))
+        };
+        out.push(Slot { flat, linear });
     }
+}
 
-    fn triangle(&mut self, vs: &Verts, v: [u32; 3], w: [Win; 3], provoking: u32, front: bool, bias: f32) {
+fn places(w: &[Win; 3]) -> [[f32; 3]; 3] {
+    w.map(|w| [w.x, w.y, w.w])
+}
+
+impl Build<'_> {
+    fn triangle(&mut self, v: [u32; 3], w: [Win; 3], provoking: u32, front: bool, bias: f32) {
         let Some((edges, bounds)) = self.edges(&w) else { return };
-        let plane = Plane3::new(&w);
-        let slots = self.slots(vs, &w, &plane, v, provoking);
+        let at = places(&w);
+        let plane = Plane3::of(&at);
         let prim = Prim {
             edges,
             bounds,
             z: plane.through([w[0].z + bias, w[1].z + bias, w[2].z + bias]),
             w: plane.through([w[0].w, w[1].w, w[2].w]),
-            slots,
+            v,
+            provoking,
+            at,
             point: None,
             front,
             id: self.id,
@@ -475,21 +583,10 @@ impl Build<'_> {
     }
 
     /// A point: a square (or a sprite) of `size` pixels.
-    fn point(&mut self, vs: &Verts, v: u32, w: Win, size: f32) {
+    fn point(&mut self, v: u32, w: Win, size: f32) {
         let h = size * 0.5;
         let corner = |x: f32, y: f32| Win { x: w.x + x, y: w.y + y, ..w };
         let quad = [corner(-h, -h), corner(h, -h), corner(h, h), corner(-h, h)];
-        // nothing varies over a point
-        let slots = self.scene.slots.len() as u32;
-        for &(k, i) in &self.s.inputs {
-            let flat = vs.get(v, k);
-            let linear = match i {
-                Interp::Constant => None,
-                Interp::Perspective => Some(Linear::constant(f32::from_bits(flat) * w.w)),
-                _ => Some(Linear::constant(f32::from_bits(flat))),
-            };
-            self.scene.slots.push(Slot { flat, linear });
-        }
         let upper_left = self.s.sprite >> 2 & 1 != 0;
         let across = Linear { value: 0.0, dx: 1.0 / size, dy: 0.0, x0: w.x - h, y0: 0.0 };
         let (value, dy) = if upper_left { (0.0, 1.0 / size) } else { (1.0, -1.0 / size) };
@@ -497,14 +594,14 @@ impl Build<'_> {
         let point = Some(self.scene.points.len() as u32 - 1);
         for t in [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]] {
             if let Some((edges, bounds)) = self.edges(&t) {
-                let prim = Prim { edges, bounds, z: Linear::constant(w.z), w: Linear::constant(w.w), slots, point, front: true, id: self.id, layer: self.layer };
-                self.push(prim);
+                let (z, w) = (Linear::constant(w.z), Linear::constant(w.w));
+                self.push(Prim { edges, bounds, z, w, v: [v; 3], provoking: v, at: places(&t), point, front: true, id: self.id, layer: self.layer });
             }
         }
     }
 
     /// A line as a parallelogram, `width` pixels wide across its minor axis.
-    fn line(&mut self, vs: &Verts, v: [u32; 2], [a, b]: [Win; 2], provoking: u32, width: f32) {
+    fn line(&mut self, v: [u32; 2], [a, b]: [Win; 2], provoking: u32, width: f32) {
         let (dx, dy) = (b.x - a.x, b.y - a.y);
         if dx == 0.0 && dy == 0.0 {
             return;
@@ -514,13 +611,12 @@ impl Build<'_> {
         let shift = |w: Win, s: f32| Win { x: w.x + ox * s, y: w.y + oy * s, ..w };
         let q = [shift(a, -1.0), shift(b, -1.0), shift(b, 1.0), shift(a, 1.0)];
         let first = [q[0], q[1], q[2]];
-        let plane = Plane3::new(&first);
-        let slots = self.slots(vs, &first, &plane, [v[0], v[1], v[1]], provoking);
+        let at = places(&first);
+        let plane = Plane3::of(&at);
         let (z, w) = (plane.through([a.z, b.z, b.z]), plane.through([a.w, b.w, b.w]));
         for t in [first, [q[0], q[2], q[3]]] {
             if let Some((edges, bounds)) = self.edges(&t) {
-                let prim = Prim { edges, bounds, z, w, slots, point: None, front: true, id: self.id, layer: self.layer };
-                self.push(prim);
+                self.push(Prim { edges, bounds, z, w, v: [v[0], v[1], v[1]], provoking, at, point: None, front: true, id: self.id, layer: self.layer });
             }
         }
     }
@@ -549,10 +645,12 @@ impl Build<'_> {
         let r = self.s.rect;
         let min = |f: fn(&(i64, i64)) -> i64| p.iter().map(f).min().unwrap();
         let max = |f: fn(&(i64, i64)) -> i64| p.iter().map(f).max().unwrap();
-        let x0 = (min(|p| p.0) >> 8).max(r.x0 as i64) as i32;
-        let y0 = (min(|p| p.1) >> 8).max(r.y0 as i64) as i32;
-        let x1 = ((max(|p| p.0) + 255) >> 8).min(r.x1 as i64) as i32;
-        let y1 = ((max(|p| p.1) + 255) >> 8).min(r.y1 as i64) as i32;
+        // pixels whose samples may be inside: with one sample, those with their centre in the box
+        let (low, high) = if self.s.samples == 1 { (127, 128) } else { (0, 255) };
+        let x0 = ((min(|p| p.0) + low) >> 8).max(r.x0 as i64) as i32;
+        let y0 = ((min(|p| p.1) + low) >> 8).max(r.y0 as i64) as i32;
+        let x1 = ((max(|p| p.0) + high) >> 8).min(r.x1 as i64) as i32;
+        let y1 = ((max(|p| p.1) + high) >> 8).min(r.y1 as i64) as i32;
         (x0 < x1 && y0 < y1).then_some((edges, (x0, y0, x1, y1)))
     }
 
@@ -582,7 +680,7 @@ fn square(edges: &[Edge; 3], x: i64, y: i64, n: i64) -> Option<bool> {
 const T: i32 = TILE as i32;
 
 /// Rasterize a scene.
-pub fn draw(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memory) {
+pub fn draw(t: &mut Threed, verts: &Verts, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memory) {
     let mut layers: Vec<u32> = Vec::new();
     for p in &scene.prims {
         if layers.last() != Some(&p.layer) && !layers.contains(&p.layer) {
@@ -615,7 +713,7 @@ pub fn draw(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn
             }
         }
         let tiles: Vec<(u32, u32, u32)> = used.iter().map(|&at| (at, (tx0 + at as i32 % w) as u32, (ty0 + at as i32 / w) as u32)).collect();
-        run(t, scene, s, work, mem, layer, &tiles, &bins, threads);
+        run(t, verts, scene, s, work, mem, layer, &tiles, &bins, threads);
         for at in used {
             bins[at as usize].clear();
         }
@@ -625,7 +723,7 @@ pub fn draw(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn
 
 /// Run the tiles of a layer.
 #[allow(clippy::too_many_arguments)]
-fn run(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memory, layer: u32, tiles: &[(u32, u32, u32)], bins: &[Vec<u32>], threads: usize) {
+fn run(t: &mut Threed, verts: &Verts, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memory, layer: u32, tiles: &[(u32, u32, u32)], bins: &[Vec<u32>], threads: usize) {
     let threads = threads.min(tiles.len());
     t.pipe.need_workers(threads.max(1));
     #[cfg(not(target_arch = "wasm32"))]
@@ -646,7 +744,7 @@ fn run(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memo
                 let Some(&(at, x, y)) = tiles.get(k) else { break };
                 let mut set = sets[k].lock().unwrap().take().unwrap();
                 rop.load(&mut set, x, y, layer, s.need, s.write, &**mine);
-                tile(w, work, scene, s, &mut **mine, &mut set, (x as i32 * T, y as i32 * T), &bins[at as usize], out);
+                tile(w, work, verts, scene, s, &mut **mine, &mut set, (x as i32 * T, y as i32 * T), &bins[at as usize], out);
                 *sets[k].lock().unwrap() = Some(set);
             }
         });
@@ -666,7 +764,7 @@ fn run(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memo
     for &(at, x, y) in tiles {
         let mut set = t.rop.take(x, y, layer);
         t.rop.load(&mut set, x, y, layer, s.need, s.write, mem);
-        tile(&mut t.pipe.workers[0], work, scene, s, mem, &mut set, (x as i32 * T, y as i32 * T), &bins[at as usize], &mut out);
+        tile(&mut t.pipe.workers[0], work, verts, scene, s, mem, &mut set, (x as i32 * T, y as i32 * T), &bins[at as usize], &mut out);
         t.rop.put(x, y, layer, set);
     }
     t.counters.add(&out.0);
@@ -677,8 +775,8 @@ fn run(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memo
 
 /// Draw a bin's primitives into a tile.
 #[allow(clippy::too_many_arguments)]
-fn tile(w: &mut Worker, work: &Work, scene: &Scene, s: &Setup, mem: &mut dyn Memory, set: &mut TileSet, (tx, ty): (i32, i32), bin: &[u32], out: &mut (Counters, Option<String>)) {
-    let mut sh = Shade { w, work, scene, s, mem, set, out, batch: Batch::default() };
+fn tile(w: &mut Worker, work: &Work, verts: &Verts, scene: &Scene, s: &Setup, mem: &mut dyn Memory, set: &mut TileSet, (tx, ty): (i32, i32), bin: &[u32], out: &mut (Counters, Option<String>)) {
+    let mut sh = Shade { w, work, verts, scene, s, mem, set, out, batch: Batch::default(), keys: [u32::MAX; KEPT], slots: std::array::from_fn(|_| Vec::new()) };
     let all = (1u32 << s.samples) - 1;
     let mask = all & s.sample_mask;
     for &k in bin {
@@ -737,15 +835,22 @@ struct Batch {
     coverage: [u32; L],
 }
 
+/// Primitives whose attributes are kept.
+const KEPT: usize = 8;
+
 struct Shade<'a, 'm> {
     w: &'a mut Worker,
     work: &'a Work,
+    verts: &'a Verts,
     scene: &'a Scene,
     s: &'a Setup,
     mem: &'m mut dyn Memory,
     set: &'a mut TileSet,
     out: &'a mut (Counters, Option<String>),
     batch: Batch,
+    /// attributes of some primitives
+    keys: [u32; KEPT],
+    slots: [Vec<Slot>; KEPT],
 }
 
 impl Shade<'_, '_> {
@@ -769,7 +874,8 @@ impl Shade<'_, '_> {
         }
         cov[4 * n..].fill(0);
         let (s, scene) = (self.s, self.scene);
-        let prims: [&Prim; L / 4] = std::array::from_fn(|q| &scene.prims[prims[if q < n { q } else { 0 }] as usize]);
+        let keys: [u32; L / 4] = std::array::from_fn(|q| prims[if q < n { q } else { 0 }]);
+        let prims: [&Prim; L / 4] = keys.map(|k| &scene.prims[k as usize]);
         let z_at = |l: usize, sample: usize| {
             let (qx, qy) = quads[l / 4];
             let (sx, sy) = if s.samples == 1 { (128, 128) } else { s.positions[sample] };
@@ -791,6 +897,34 @@ impl Shade<'_, '_> {
             return;
         };
         let out = &s.frag;
+        // the primitives' attributes
+        let mut place = [0; L / 4];
+        let mut used = 0u32;
+        for q in 0..n {
+            if let Some(e) = self.keys.iter().position(|&k| k == keys[q]) {
+                place[q] = e;
+                used |= 1 << e;
+            }
+        }
+        for q in 0..n {
+            if self.keys[place[q]] != keys[q] {
+                // (another quad of this batch may have put it in)
+                place[q] = match self.keys.iter().position(|&k| k == keys[q]) {
+                    Some(e) => e,
+                    None => {
+                        let e = (!used).trailing_zeros() as usize;
+                        attributes(self.verts, prims[q], s, &mut self.slots[e]);
+                        self.keys[e] = keys[q];
+                        e
+                    }
+                };
+                used |= 1 << place[q];
+            }
+        }
+        for q in n..L / 4 {
+            place[q] = place[0];
+        }
+        let slots: [&[Slot]; L / 4] = place.map(|e| &self.slots[e][..]);
         for pass in 0..if s.per_sample { s.samples } else { 1 } {
             let sample = s.per_sample.then_some(pass);
             let mut live = cov;
@@ -812,7 +946,7 @@ impl Shade<'_, '_> {
             let (lanes, mut common) = self.w.parts(self.work, self.mem);
             lanes.set_local_size(fs.local_size());
             lanes.start(&fs.program, run, helper);
-            let mut host = FragmentHost::new(&mut common, s, scene, prims, quads, live, sample);
+            let mut host = FragmentHost::new(&mut common, s, scene, prims, slots, quads, live, sample);
             let mut fuel = 4_000_000;
             let e = maxwell_shader::run(&fs.program, lanes, &mut host, &mut fuel);
             let stored = common.stored;

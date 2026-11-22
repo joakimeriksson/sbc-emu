@@ -1,6 +1,6 @@
 //! The graphics pipeline of a draw: vertices are fetched and shaded, primitives assembled, clipped
 //! and rasterized, fragments shaded and written.
-use crate::raster::{self, Geometry, Prim, Scene, Verts};
+use crate::raster::{self, Geometry, Prim, Scene, Slot, Verts};
 use crate::rop::{Blend, DepthStencil, Output, Rect, Targets};
 use crate::threed::{Cbuf, Threed};
 use crate::vertex::{self, Attribute};
@@ -978,7 +978,7 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
         return;
     }
     let work = work(t, 4);
-    raster::draw(t, &scene, &s, &work, mem);
+    raster::draw(t, &g.vertices, &scene, &s, &work, mem);
     written(t);
 }
 
@@ -989,6 +989,7 @@ pub struct FragmentHost<'a, 'm> {
     scene: &'a Scene,
     /// each quad's primitive and first pixel
     prims: [&'a Prim; L / 4],
+    slots: [&'a [Slot]; L / 4],
     quads: [(i32, i32); L / 4],
     /// each lane's covered samples
     coverage: [u32; L],
@@ -1000,7 +1001,8 @@ pub struct FragmentHost<'a, 'm> {
 }
 
 impl<'a, 'm> FragmentHost<'a, 'm> {
-    pub fn new(common: &'a mut Common<'m>, setup: &'a Setup, scene: &'a Scene, prims: [&'a Prim; L / 4], quads: [(i32, i32); L / 4], coverage: [u32; L], sample: Option<u32>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(common: &'a mut Common<'m>, setup: &'a Setup, scene: &'a Scene, prims: [&'a Prim; L / 4], slots: [&'a [Slot]; L / 4], quads: [(i32, i32); L / 4], coverage: [u32; L], sample: Option<u32>) -> Self {
         let (cx, cy) = match sample {
             Some(s) => {
                 let (x, y) = setup.positions[s as usize];
@@ -1010,7 +1012,7 @@ impl<'a, 'm> FragmentHost<'a, 'm> {
         };
         let x = std::array::from_fn(|l| (quads[l / 4].0 + (l & 1) as i32) as f32 + cx);
         let y = std::array::from_fn(|l| (quads[l / 4].1 + (l >> 1 & 1) as i32) as f32 + cy);
-        Self { common, setup, scene, prims, quads, coverage, sample, x, y }
+        Self { common, setup, scene, prims, slots, quads, coverage, sample, x, y }
     }
 
     /// Where an instruction interpolates.
@@ -1095,7 +1097,7 @@ impl Host<L> for FragmentHost<'_, '_> {
             if k == u8::MAX {
                 continue;
             }
-            let slot = &self.scene.slots[p.slots as usize + k as usize];
+            let slot = &self.slots[q][k as usize];
             match (&slot.linear, op.mode) {
                 (None, IpaMode::MulW) => {
                     // the shader will multiply by w
