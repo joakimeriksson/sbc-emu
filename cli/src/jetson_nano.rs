@@ -40,6 +40,9 @@ impl SerialBoard for Machine {
         for (k, d) in self.soc.dc.iter().enumerate().filter(|(_, d)| d.frames > 0) {
             eprintln!("[{tag}] display controller {k}: {} frames, {:?}", d.frames, d.size());
         }
+        if self.soc.gpu.submissions > 0 {
+            eprintln!("[{tag}] GPU: {} submissions, {:.1} s of host time", self.soc.gpu.submissions, self.soc.gpu.busy.as_secs_f64());
+        }
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));

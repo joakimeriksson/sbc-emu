@@ -8,6 +8,10 @@ use std::collections::HashMap;
 pub struct Done {
     pub entries: u64,
     pub nonstall: bool,
+    /// stopped at a semaphore
+    pub waiting: bool,
+    /// a semaphore it waited for came
+    pub resumed: bool,
 }
 
 #[derive(Default)]
@@ -45,12 +49,25 @@ impl Host {
                 let v = view.read32(at);
                 if if ge { v.wrapping_sub(value) as i32 >= 0 } else { v == value } {
                     s.waiting = None;
+                    done.resumed = true;
                 } else {
+                    done.waiting = true;
+                    s.engine.end(view);
+                    if trace {
+                        eprintln!("[gpfifo] channel {id}: waits at {at:#x} for {value:#x} (is {v:#x}, at least: {ge})");
+                    }
                     return done;
                 }
             }
             if let Some((at, words)) = s.rest.take() {
                 s.execute(at, words, view, now, &mut done, trace);
+                // how far the channel has read, which the kernel polls when its ring wraps
+                let end = match s.rest {
+                    Some((at, _)) => at,
+                    None => at + 4 * words as u64,
+                };
+                mmu::write32(userd + 0x44, end as u32, view.smmu, view.ram);
+                mmu::write32(userd + 0x60, (end >> 32) as u32, view.smmu, view.ram);
                 continue;
             }
             let get = mmu::read32(userd + 0x88, view.smmu, view.ram).unwrap_or(0);

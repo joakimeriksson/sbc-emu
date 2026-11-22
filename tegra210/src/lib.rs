@@ -347,6 +347,7 @@ impl Soc {
         }
         self.gic.set_level(host1x::IRQ, self.host1x.irq());
         self.gpu.tick(self.now);
+        self.gpu.poll(&self.smmu, &mut self.ram);
         self.gic.set_level(gpu::IRQ, self.gpu.irq());
         self.pump_network();
         self.pcie.update();

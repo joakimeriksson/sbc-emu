@@ -18,6 +18,8 @@ pub const IRQ: usize = 32 + 0x9d;
 /// GM20B revision A1.
 const BOOT0: u32 = 0x12b0_00a1;
 const CHANNELS: u32 = 512;
+/// How often a semaphore the CPU may write is looked at (nanoseconds).
+const RETRY_NS: u64 = 100_000;
 
 // PMC interrupt bits
 const INTR_FIFO: u32 = 1 << 8;
@@ -61,6 +63,11 @@ pub struct Gpu {
     pub trace: bool,
     /// registers touched that have no model, for reports
     pub submissions: u64,
+    /// host time spent executing them
+    pub busy: std::time::Duration,
+    /// a channel waits for a semaphore; when to look again
+    waiting: bool,
+    retry: u64,
 }
 
 pub mod host;
@@ -93,6 +100,9 @@ impl Default for Gpu {
             last_time: 0,
             trace: std::env::var_os("SBC_TRACE_GPU").is_some(),
             submissions: 0,
+            busy: Default::default(),
+            waiting: false,
+            retry: 0,
         }
     }
 }
@@ -287,6 +297,25 @@ impl Gpu {
 
     /// Run every channel that has work.
     fn run(&mut self, smmu: &Smmu, ram: &mut [u8]) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = std::time::Instant::now();
+        // a channel may release the semaphore another waits for
+        for _ in 0..64 {
+            let (waiting, progress) = self.run_once(smmu, ram);
+            self.waiting = waiting;
+            if !waiting || !progress {
+                break;
+            }
+        }
+        self.retry = self.now + RETRY_NS;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.busy += start.elapsed();
+        }
+    }
+
+    fn run_once(&mut self, smmu: &Smmu, ram: &mut [u8]) -> (bool, bool) {
+        let (mut waiting, mut progress) = (false, false);
         for k in 0..self.runlist.len() {
             let id = self.runlist[k];
             let Some(c) = self.channels.get(id as usize).copied() else { continue };
@@ -296,10 +325,20 @@ impl Gpu {
                 let mut view = mmu::View { ram, smmu, mmu: &self.mmu, space, fault: Default::default() };
                 let done = self.host.run_channel(id, inst, &mut view, self.now);
                 self.submissions += done.entries;
+                waiting |= done.waiting;
+                progress |= done.resumed || done.entries != 0;
                 if done.nonstall {
                     self.fifo_intr |= FIFO_NONSTALL;
                 }
             }
+        }
+        (waiting, progress)
+    }
+
+    /// Channels that wait for a semaphore the CPU may write.
+    pub fn poll(&mut self, smmu: &Smmu, ram: &mut [u8]) {
+        if self.waiting && self.now >= self.retry {
+            self.run(smmu, ram);
         }
     }
 
@@ -318,6 +357,7 @@ impl Gpu {
     }
 
     pub fn next_event(&self) -> Option<u64> {
-        (self.r(0x9140) & 1 != 0 && !self.timer_intr).then(|| self.alarm()).flatten().filter(|&t| t > self.now)
+        let alarm = (self.r(0x9140) & 1 != 0 && !self.timer_intr).then(|| self.alarm()).flatten().filter(|&t| t > self.now);
+        alarm.into_iter().chain(self.waiting.then_some(self.retry)).min()
     }
 }
