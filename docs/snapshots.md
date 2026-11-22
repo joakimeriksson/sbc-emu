@@ -24,8 +24,13 @@ in the snapshot's RAM; `--kernel` is only needed if the guest is to reboot. `--n
 On one thread and interpreted (`--no-jit`), a restored run is the uninterrupted one, to the
 instruction and byte; with the JIT or `--threads multi` it is as repeatable as those are.
 
-Not in a snapshot: connections through NAT (they end; new ones work), compiled code, audio recorded
-so far (`--audio-out`). Refused: `--sd-persist`, which writes into the image. A snapshot fits the
+Input typed but not yet taken by the guest is handed over first. `--hdmi-mode` is the snapshot's until
+the guest reboots.
+
+Not in a snapshot: connections through NAT (the guest's end hears nothing more, as if the cable had
+been cut; new ones work), compiled code, audio recorded
+so far (`--audio-out`). Refused: `--sd-persist`, which writes into the image, both to save and to restore with; a file that is
+damaged. A snapshot fits the
 build that made it: when the layout changes, its version does, and another is refused (the Pi 4's
 older format keeps its own compatibility).
 

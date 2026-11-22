@@ -81,7 +81,8 @@ fn execute(args:&[String])->Result<(),String> {
     let config=RunConfig::from_args("orangepi5", args)?;
     let persist=args.iter().any(|a|a=="--sd-persist");
     let disk=arg(args,"--sd").map(|p|SharedDisk::open(p,persist).map_err(|e|format!("{p}: {e}"))).transpose()?;
-    let booted=std::cell::Cell::new(false);
+    // the machine restored into is not booted first; when the guest reboots, a new one is
+    let restored=std::cell::Cell::new(false);
     let make_machine=||->Result<rk3588::Machine,String>{
         let mut m=rk3588::Machine::with_cpus(ram,smp)?;
         m.gpu_probe=gpu=="probe";
@@ -97,11 +98,12 @@ fn execute(args:&[String])->Result<(),String> {
         }
         if net != "none" { m.connect_network(net == "nat", false); }
         m.soc.mmc.card.disk=disk.clone().map(|d|Box::new(d) as Box<dyn emu_core::disk::Disk>);
-        if let Some(kernel)=kernel.as_ref() {
+        if restore && !restored.replace(true) {
+            // nothing: the snapshot has it all
+        } else if let Some(kernel)=kernel.as_ref() {
             rk3588::boot::boot_linux(&mut m,kernel,initrd.as_deref(),cmdline)?;
         } else if arg(args,"--sd").is_none() {
-            // only to be restored into
-            if booted.replace(true) {return Err("the guest rebooted: give --kernel or --sd with --restore to boot it again".into());}
+            return Err("the guest rebooted: give --kernel or --sd with --restore to boot it again".into());
         } else {
             let card=rk3588::boot::read_card(m.soc.mmc.card.disk.as_mut().ok_or("no SD image")?.as_mut())?;
             for note in &card.notes {eprintln!("[orangepi5 firmware] {note}");}
@@ -112,6 +114,7 @@ fn execute(args:&[String])->Result<(),String> {
         Ok(m)
     };
     if let Some(path)=arg(args,"--dump-dtb") {
+        if restore {return Err("--dump-dtb: a restored machine is not booted from a device tree".into());}
         std::fs::write(path,&make_machine()?.dtb).map_err(|e|format!("{path}: {e}"))?;
     }
     eprintln!("[orangepi5] experimental RK3588S: {} core(s) ({} Cortex-A55, {} Cortex-A76), GICv3, UART2, microSD, Ethernet, USB (keyboard, tablet{}), HDMI ({}), audio (headphones, HDMI); emulated firmware, reduced DT",smp,smp.min(4),smp.saturating_sub(4),if arg(args,"--usb-drive").is_some() {", stick"} else {""},hdmi.map_or("off".to_string(),|m|format!("{}x{} framebuffer",m.width,m.height)));

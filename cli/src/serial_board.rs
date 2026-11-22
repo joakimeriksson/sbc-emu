@@ -93,7 +93,10 @@ fn save<B: SerialBoard>(m: &B, tag: &str, path: &str) -> Result<(), String> {
     let file = m.save()?;
     // never half a snapshot under the name
     let part = format!("{path}.part");
-    std::fs::write(&part, &file).and_then(|()| std::fs::rename(&part, path)).map_err(|e| format!("{path}: {e}"))?;
+    if let Err(e) = std::fs::write(&part, &file).and_then(|()| std::fs::rename(&part, path)) {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("{path}: {e}"));
+    }
     eprintln!("\r[{tag}] snapshot at {:.3} s, {:.1} MiB -> {path}\r", m.now() as f64 / 1e9, file.len() as f64 / (1 << 20) as f64);
     Ok(())
 }
@@ -251,6 +254,8 @@ pub(crate) fn run<B: SerialBoard>(
     let mut start = Instant::now();
     let mut anchor = anchored(m.now());
     let mut escape = false;
+    // Ctrl-A s: a snapshot, once the guest has taken what was typed before it
+    let mut save_asked = false;
     // `sleep SECS`: the script waits until this virtual time (ns)
     let mut sleep_until: Option<u64> = None;
     if let Some(g) = gdb.as_mut().filter(|_| config.gdb_wait) {
@@ -274,9 +279,7 @@ pub(crate) fn run<B: SerialBoard>(
                     break 'run Ok(());
                 }
                 if b == b's' {
-                    if let Err(e) = save(&m, tag, &config.snapshot) {
-                        eprintln!("\r[{tag}] no snapshot: {e}\r");
-                    }
+                    save_asked = true;
                     continue;
                 }
                 pending.push_back(1);
@@ -328,8 +331,12 @@ pub(crate) fn run<B: SerialBoard>(
                     pending.clear();
                     true
                 }
+                // once the guest has what was typed: the rest of it is not the machine's
+                "save" if !pending.is_empty() => false,
                 "save" => {
-                    save(&m, tag, rest)?;
+                    if let Err(e) = save(&m, tag, rest) {
+                        break Err(e);
+                    }
                     true
                 }
                 "screenshot" => {
@@ -384,6 +391,12 @@ pub(crate) fn run<B: SerialBoard>(
                 break;
             }
             pending.pop_front();
+        }
+        if save_asked && pending.is_empty() {
+            save_asked = false;
+            if let Err(e) = save(&m, tag, &config.snapshot) {
+                eprintln!("\r[{tag}] no snapshot: {e}\r");
+            }
         }
         if config.timeout.is_some_and(|t| start.elapsed() >= t) {
             break Err("host timeout before completion".into());
@@ -463,7 +476,10 @@ pub(crate) fn run<B: SerialBoard>(
                 m.host().idle_until(target);
             }
             Stop::Reset => {
-                m = make_machine()?;
+                m = match make_machine() {
+                    Ok(m) => m,
+                    Err(e) => break Err(e),
+                };
                 if let Some(g) = gdb.as_ref() {
                     g.rearm(&mut m);
                 }
