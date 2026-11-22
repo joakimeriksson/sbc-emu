@@ -27,6 +27,9 @@ impl SerialBoard for Machine {
             self.exceptions,
             self.state
         );
+        if self.soc.sd[0].blocks_read + self.soc.sd[0].blocks_written > 0 {
+            eprintln!("[{tag}] SD card: {} blocks read, {} written", self.soc.sd[0].blocks_read, self.soc.sd[0].blocks_written);
+        }
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));
@@ -45,7 +48,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--smp"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--smp"])?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel Image|vmlinuz is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb tegra210-p3450-0000.dtb is required")?)?;
@@ -61,15 +64,24 @@ fn execute(args: &[String]) -> Result<(), String> {
         });
         std::fs::write(path, boot::prepare_device_tree(&dtb, ram as u64, &cmdline, range)?).map_err(|e| format!("{path}: {e}"))?;
     }
+    // the card survives guest reboots (one disk shared by the successive machines)
+    let persist = args.iter().any(|a| a == "--sd-persist");
+    let disk = arg(args, "--sd")
+        .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
+        .transpose()?;
     let no_jit = args.iter().any(|a| a == "--no-jit") || std::env::var("SBC_JIT").is_ok_and(|v| v == "0");
     let log_stubs = std::env::var("SBC_STUB_LOG").is_ok_and(|v| v == "1");
     let make_machine = || -> Result<Machine, String> {
-        let mut m = Machine::with_cpus(ram, smp)?;
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let mut m = Machine::with_clock(ram, smp, unix)?;
         m.soc.log_stub_pages = log_stubs;
         if no_jit {
             m.set_jit(false);
         } else {
             m.enable_jit();
+        }
+        if let Some(d) = disk.clone() {
+            m.insert_sd(Box::new(d));
         }
         boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), &cmdline)?;
         Ok(m)

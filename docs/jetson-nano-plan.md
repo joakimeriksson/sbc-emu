@@ -31,6 +31,17 @@ sh scripts/jetson-nano-fixture.sh cache/jetson-nano      # pinned Alpine aarch64
 - Shell after 3.2 s of virtual time and 3.3 s of wall time on an M-series Mac (JIT).
 - Linux's remaining complaints: no PSCI `CPU_SUSPEND` (CPU idle states), no PMU.
 
+**Milestone 2 is done: Debian 13 boots from the microSD card** (its arm64 cloud image, unmodified)
+with Debian's own kernel, device tree and Tegra drivers, to a login; 20 s of virtual time to boot,
+check and power off. Alpine's kernel cannot: it lacks the MAX77620 PMIC, whose regulators the SD
+card needs, PCIe and the SMMU.
+
+```sh
+sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian   # Debian's kernel + an initramfs
+# the card: debian-13-nocloud-arm64-20261116-2664.tar.xz from cloud.debian.org/images/cloud/trixie/
+# (SHA-512 9e2f3958...), unpacked to disk.raw; the command line is in scripts/jetson-nano-debian.txt
+```
+
 ### What is modelled (`tegra210/`)
 
 | Block | Model |
@@ -44,6 +55,10 @@ sh scripts/jetson-nano-fixture.sh cache/jetson-nano      # pinned Alpine aarch64
 | Fuses, chip ID | HIDREV = T210 A02; speedo, SKU and IDDQ fuses |
 | Memory controller | the client DMA-flush handshake |
 | UART A | `peripherals::uart` (16550) |
+| I²C ×6 | packet mode, PIO |
+| MAX77620 PMIC | a register file (regulators, GPIO) and its real-time clock |
+| GPIO | eight banks, masked writes, edge and level interrupts; the card-detect switch |
+| SDMMC ×4 | SDHCI 3.0, ADMA2 with 32- and 64-bit descriptors, PIO; an unanswered command completes with its timeout error (Linux masks the timeout's signal on Tegra) |
 | Everything else in 0x0100_0000-0x8000_0000 | read-back registers; first-touched pages are listed at exit (`SBC_STUB_LOG=1` prints them as they happen) |
 
 PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
@@ -51,14 +66,14 @@ PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
 ## Milestones
 
 1. **Serial shell** (done): CPU, GIC, UART, timers, CAR, PMC, fuses.
-2. **Storage and a full OS**: SD card (`sdhci-tegra`: SDHCI plus Tegra's pad calibration and
-   tap tuning registers; the existing SD card model), the MAX77620 PMIC on I²C5 (regulators
-   for the card's I/O voltage), GPIO, pin mux; boot a full arm64 distribution's root file
-   system from the card. PSCI `CPU_SUSPEND`.
+2. **Storage and a full OS** (done): I²C, the MAX77620 PMIC with its clock, GPIO, the SDMMC
+   controllers (ADMA2 with 64-bit addresses); Debian 13 from a microSD card. Still to do: PSCI
+   `CPU_SUSPEND`; UHS modes (the card offers 3.3 V high speed); UEFI-style or extlinux boot (the
+   kernel and initramfs come from the command line); interrupts from the PMIC; APB DMA.
 3. **USB and network**: XUSB (the driver uploads NVIDIA's firmware, `nvidia/tegra210/xusb.bin`,
    to a falcon microcontroller: accept it and present the xHCI behind it, reusing the Pi 4's
    xHCI model) and the pad controller; then the PCIe controller and an RTL8111 (r8169), or
-   USB networking first. Alpine's kernel has no Tegra PCIe driver; Debian's does.
+   USB networking first. Debian's kernel has the drivers (Alpine's has neither the PMIC, PCIe nor the SMMU).
 4. **Display**: host1x (the command engine the display and the GPU sit behind), the display
    controllers, SOR/HDMI; `tegra-drm`.
 5. **GPU** (GM20B through nouveau and Mesa): the falcons (PMU, FECS, GPCCS) at a high level,
