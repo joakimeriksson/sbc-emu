@@ -348,7 +348,7 @@ impl Soc {
     }
 
     /// Exchange frames between the Ethernet controller and the network: what the guest sends goes
-    /// out at once, the network is polled every millisecond.
+    /// out at once, the network is polled.
     fn pump_network(&mut self) {
         let nic = &mut self.pcie.nic;
         if nic.tx_out.is_empty() && self.now < self.net_next {
@@ -362,10 +362,12 @@ impl Soc {
             }
             if self.now >= self.net_next {
                 nic.deliver(net.poll(now_us));
-                self.net_next = self.now + 1_000_000;
+                // soon while frames wait or the NAT relays connections
+                let busy = net.nat.is_some() || !nic.rx_queue.is_empty();
+                self.net_next = self.now + if busy { 1_000_000 } else { 10_000_000 };
             }
         }
-        nic.service(&mut sdhci::Dma { ram: &mut self.ram, base: RAM_BASE });
+        self.pcie.service(&mut sdhci::Dma { ram: &mut self.ram, base: RAM_BASE });
     }
 
     fn next_event(&self) -> Option<u64> {

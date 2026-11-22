@@ -141,6 +141,24 @@ impl Rtl8168 {
         self.status() & u16::from_le_bytes([self.regs[INTR_MASK], self.regs[INTR_MASK + 1]]) != 0
     }
 
+    /// The negotiated (or forced) speed in Mbit/s and whether it is full duplex; the partner offers
+    /// everything.
+    fn speed(&self) -> (u32, bool) {
+        let c = self.phy[0];
+        if c & 1 << 12 == 0 {
+            let speed = match (c >> 6 & 1, c >> 13 & 1) { (1, 0) => 1000, (_, 1) => 100, _ => 10 };
+            return (speed, c & 1 << 8 != 0);
+        }
+        let (a, g) = (self.phy[4], self.phy[9]);
+        match () {
+            _ if g & 1 << 9 != 0 => (1000, true),
+            _ if g & 1 << 8 != 0 => (1000, false),
+            _ if a & 1 << 8 != 0 => (100, true),
+            _ if a & 1 << 7 != 0 => (100, false),
+            _ => (10, a & 1 << 6 != 0),
+        }
+    }
+
     fn phy_read(&self, reg: usize) -> u16 {
         let link = self.link();
         match reg {
@@ -173,7 +191,12 @@ impl Rtl8168 {
 
     fn ocp_read(&self, reg: u32) -> u16 {
         match reg {
-            0xa434 => if self.link() { 0x002c } else { 0 }, // page 0xa43: 1000 Mbit/s, full duplex
+            // page 0xa43: the speed and duplex
+            0xa434 if self.link() => {
+                let (speed, full) = self.speed();
+                (match speed { 1000 => 0x20, 100 => 0x10, _ => 0 }) | 4 | (full as u16) << 3
+            }
+            0xa434 => 0,
             r if (PHY_BASE..PHY_BASE + 0x40).contains(&r) => self.phy_read((r - PHY_BASE) as usize / 2),
             r => self.indirect.get(&(b'o', r)).copied().unwrap_or(0) as u16,
         }
@@ -205,7 +228,11 @@ impl Rtl8168 {
             *b = match o + k {
                 // always ready, both FIFOs empty, link list ready
                 MCU => self.regs[MCU] & !(1 << 7) | 1 << 5 | 1 << 4 | 1 << 1,
-                PHY_STATUS => if self.link() { 0x60 | 0x10 | 0x02 | 0x01 } else { 0 },
+                PHY_STATUS if self.link() => {
+                    let (speed, full) = self.speed();
+                    0x62 | (match speed { 1000 => 0x10, 100 => 0x08, _ => 0x04 }) | full as u8
+                }
+                PHY_STATUS => 0,
                 // commands are done at once; the receive buffer is empty
                 CHIP_CMD => self.regs[CHIP_CMD] | 1,
                 r => self.regs[r],
@@ -376,8 +403,10 @@ impl Rtl8168 {
             }
             if opts1 & LAST != 0 {
                 let frame = std::mem::take(&mut self.partial);
-                self.tx_out.extend(offload(frame, opts1, opts2));
-                self.tx_frames += 1;
+                if self.link() {
+                    self.tx_out.extend(offload(frame, opts1, opts2));
+                    self.tx_frames += 1;
+                }
                 self.raise(TX_OK);
             }
         }
@@ -434,40 +463,62 @@ fn sum(mut s: u32, data: &[u8]) -> u32 {
 }
 
 /// The Internet checksum of a transport segment with its pseudo header; `ip` is the IP header.
-fn transport_checksum(ip: &[u8], proto: u8, seg: &[u8]) -> u16 {
-    let s = if ip[0] >> 4 == 4 { sum(0, &ip[12..20]) } else { sum(0, &ip[8..40]) };
+fn transport_checksum(ip: &[u8], v4: bool, proto: u8, seg: &[u8]) -> u16 {
+    let s = if v4 { sum(0, &ip[12..20]) } else { sum(0, &ip[8..40]) };
     !(sum(s + proto as u32 + seg.len() as u32, seg) as u16)
 }
 
-/// What the transmit descriptor asks for: checksums filled in, or the frame cut into segments.
+/// Where the IP header starts and whether it is IPv4 (None: not IP, or cut short); an 802.1Q tag
+/// may be in front of it.
+fn ip_header(f: &[u8]) -> Option<(usize, bool)> {
+    let tagged = f.get(12..14)? == [0x81, 0];
+    let at = if tagged { 18 } else { 14 };
+    let v4 = match f.get(at - 2..at)? {
+        [8, 0] => true,
+        [0x86, 0xdd] => false,
+        _ => return None,
+    };
+    let header = f.get(at..at + if v4 { 20 } else { 40 })?;
+    (header[0] >> 4 == if v4 { 4 } else { 6 }).then_some((at, v4))
+}
+
+/// What the transmit descriptor asks for: checksums filled in, or the frame cut into segments. A
+/// frame that is not what the descriptor says goes out as it is.
 fn offload(mut f: Vec<u8>, opts1: u32, opts2: u32) -> Vec<Vec<u8>> {
     let gso = opts1 & (1 << 25 | 1 << 26) != 0;
+    let tcp = gso || opts2 & 1 << 30 != 0;
+    let want_v4 = if gso { opts1 & 1 << 26 != 0 } else { opts2 & 1 << 29 != 0 };
+    if !gso && opts2 & (0xf << 28) == 0 {
+        return vec![f];
+    }
+    let Some((ip, v4)) = ip_header(&f).filter(|&(_, v4)| v4 == want_v4) else { return vec![f] };
     let transport = if gso { opts1 >> 18 & 0x7f } else { opts2 >> 18 & 0x3ff } as usize;
-    let v4 = if gso { opts1 & 1 << 26 != 0 } else { opts2 & 1 << 29 != 0 };
-    let ip = 14;
-    let headers = ip + if v4 { 20 } else { 40 };
+    // the IPv4 header with its options
+    let header = if v4 { ip + 4 * (f[ip] & 15) as usize } else { ip + 40 };
+    if header < ip + 20 || header > f.len() {
+        return vec![f];
+    }
     if !gso && opts2 & (3 << 30) == 0 {
-        // (the IPv4 header checksum alone)
-        if v4 && f.len() >= headers {
-            fill_ipv4(&mut f, ip, transport.max(headers));
+        if v4 {
+            fill_ipv4(&mut f, ip, header); // the IPv4 header's checksum alone
         }
         return vec![f];
     }
-    if transport < headers || f.len() < transport + 8 || (gso || opts2 & 1 << 30 != 0) && f.len() < transport + 20 {
+    if transport < header || f.len() < transport + if tcp { 20 } else { 8 } {
         return vec![f];
     }
-    let end = if v4 { headers } else { ip + 40 };
+    let end = ip + if v4 { 20 } else { 40 };
     if !gso {
-        let (proto, at) = if opts2 & 1 << 30 != 0 { (6, transport + 16) } else { (17, transport + 6) };
+        if v4 {
+            fill_ipv4(&mut f, ip, header);
+        }
+        let (proto, at) = if tcp { (6, transport + 16) } else { (17, transport + 6) };
         f[at..at + 2].fill(0);
-        let mut c = transport_checksum(&f[ip..end], proto, &f[transport..]);
+        let mut c = transport_checksum(&f[ip..end], v4, proto, &f[transport..]);
         if proto == 17 && c == 0 {
             c = 0xffff;
         }
         f[at..at + 2].copy_from_slice(&c.to_be_bytes());
-        if v4 {
-            fill_ipv4(&mut f, ip, transport);
-        }
         return vec![f];
     }
     let mss = (opts2 >> 18 & 0x7ff) as usize;
@@ -490,12 +541,12 @@ fn offload(mut f: Vec<u8>, opts1: u32, opts2: u32) -> Vec<Vec<u8>> {
             if v4 {
                 s[ip + 2..ip + 4].copy_from_slice(&((n - ip) as u16).to_be_bytes());
                 s[ip + 4..ip + 6].copy_from_slice(&id.wrapping_add(k as u16).to_be_bytes());
-                fill_ipv4(&mut s, ip, transport);
+                fill_ipv4(&mut s, ip, header);
             } else {
                 s[ip + 4..ip + 6].copy_from_slice(&((n - ip - 40) as u16).to_be_bytes());
             }
             s[transport + 16..transport + 18].fill(0);
-            let c = transport_checksum(&s[ip..end], 6, &s[transport..]);
+            let c = transport_checksum(&s[ip..end], v4, 6, &s[transport..]);
             s[transport + 16..transport + 18].copy_from_slice(&c.to_be_bytes());
             s
         })
@@ -605,7 +656,7 @@ mod tests {
     }
 
     fn valid(f: &[u8]) -> bool {
-        sum(0, &f[14..34]) == 0xffff && transport_checksum(&f[14..34], 6, &f[34..]) == 0
+        sum(0, &f[14..34]) == 0xffff && transport_checksum(&f[14..34], true, 6, &f[34..]) == 0
     }
 
     #[test]
@@ -623,5 +674,23 @@ mod tests {
         // nonsense offsets leave the frame alone
         assert_eq!(offload(tcp_frame(10), 1 << 26 | 2 << 18, 1000 << 18), [tcp_frame(10)]);
         assert_eq!(offload(vec![1, 2, 3], 0, 1 << 29 | 1 << 30 | 34 << 18), [vec![1, 2, 3]]);
+        // a frame with an inline VLAN tag
+        let mut f = tcp_frame(40);
+        f.splice(12..12, [0x81, 0, 0, 100]);
+        let out = offload(f.clone(), 0, 1 << 29 | 1 << 30 | 38 << 18).remove(0);
+        assert_eq!(sum(0, &out[18..38]), 0xffff);
+        assert_eq!(transport_checksum(&out[18..38], true, 6, &out[38..]), 0);
+        // any descriptor, any frame: no panic
+        let mut x = 1u32;
+        let mut next = || { x ^= x << 13; x ^= x >> 17; x ^= x << 5; x };
+        for k in 0..20_000 {
+            let mut g = if k % 3 == 0 { f.clone() } else { tcp_frame(k % 90) };
+            for _ in 0..k % 5 {
+                let at = next() as usize % g.len();
+                g[at] = next() as u8;
+            }
+            g.truncate(next() as usize % (g.len() + 1));
+            let _ = offload(g, next(), next());
+        }
     }
 }
