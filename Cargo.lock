@@ -119,6 +119,18 @@ version = "0.0.1"
 [[package]]
 name = "maxwell"
 version = "0.0.1"
+dependencies = [
+ "maxwell-shader",
+ "maxwell-tex",
+]
+
+[[package]]
+name = "maxwell-shader"
+version = "0.0.1"
+
+[[package]]
+name = "maxwell-tex"
+version = "0.0.1"
 
 [[package]]
 name = "midgard"
@@ -271,6 +283,7 @@ version = "0.0.1"
 dependencies = [
  "arm-a64",
  "emu-core",
+ "maxwell",
  "miniz_oxide",
  "peripherals",
  "sbc-net",

@@ -1,0 +1,8 @@
+[package]
+name = "maxwell-tex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA Maxwell (GM20B) surfaces: block-linear layouts, texture and sampler descriptors, sampling, render target formats"
+
+[dependencies]
