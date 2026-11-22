@@ -24,6 +24,7 @@ const AFI_MSI_FPCI_BAR_ST: usize = 0x64;
 const AFI_MSI_VEC: usize = 0x6c;
 const AFI_MSI_EN_VEC: usize = 0x8c;
 const AFI_INTR_MASK: usize = 0xb4;
+const AFI_INTR_CODE: usize = 0xb8;
 const AFI_SM_INTR_ENABLE: usize = 0xc4;
 const AFI_PCIE_PME: usize = 0xf0;
 const AFI_PCIE_CONFIG: usize = 0xf8;
@@ -125,6 +126,9 @@ impl Pcie {
         match o {
             0x00 | 0x08 | 0x10 | 0x14 | 0x34 | 0x48 | 0x80 | 0x84 | 0x8c | 0x94 => {}
             0x04 => *r = *r & 0xffff_0000 | v & 0x0547,
+            // status halves: no bit is ever set, and none is set by writing it back to clear it
+            0x1c | 0x88 | 0x98 => *r = v & 0xffff,
+            0xa0 => {}
             0x0c => *r = 0x0001_0000 | v & 0xff,
             0x3c => *r = 0x0100 | v & 0xffff_00ff,
             _ => *r = v,
@@ -155,6 +159,8 @@ impl Pcie {
         if let Some(o) = addr.checked_sub(AFI).filter(|&o| o < 0x800) {
             let o = o as usize & !3;
             let v = match o {
+                // why the controller interrupts: the device's line
+                AFI_INTR_CODE => if self.irq() { 6 } else { 0 },
                 // the power-off message is acknowledged at once
                 AFI_PCIE_PME => {
                     let v = self.afi[o / 4];
@@ -179,7 +185,7 @@ impl Pcie {
             return pick(w);
         }
         match self.bar() {
-            Some(b) if (b..b + rtl8168::SIZE).contains(&addr) => self.nic.read(addr - b, size),
+            Some(b) if addr.checked_sub(b).is_some_and(|o| o < rtl8168::SIZE) => self.nic.read(addr - b, size),
             _ => pick(u32::MAX),
         }
     }
@@ -213,7 +219,10 @@ impl Pcie {
                 self.nic_config_write(t.3 & !3, v, mask);
             }
         } else if let Some(b) = self.bar() {
-            if (b..b + rtl8168::SIZE).contains(&addr) {
+            if addr.checked_sub(b).is_some_and(|o| o < rtl8168::SIZE) {
+                // without bus mastering the device reaches no memory
+                let mut none = Dma { ram: &mut [], base: 0 };
+                let dma = if self.ep[1] & 4 != 0 { dma } else { &mut none };
                 self.nic.write(addr - b, value, size, dma);
             }
         }
@@ -252,6 +261,13 @@ impl Pcie {
     fn reset_device(&mut self) {
         self.ep = Self::endpoint();
         self.nic.bus_reset();
+    }
+
+    /// Run the device's rings, if it may master the bus.
+    pub fn service(&mut self, dma: &mut Dma) {
+        if self.ep[1] & 4 != 0 {
+            self.nic.service(dma);
+        }
     }
 
     /// Send a message when the device's interrupt rises.
@@ -325,6 +341,8 @@ mod tests {
         assert_eq!(p.read(a + 0x18, 4), 0xffff_f004);
         p.write(a + 0x18, 0x1300_0000, 4, &mut d);
         p.write(a + 4, 6, 2, &mut d);
+        p.write(PORTS + 0x10a0, 1 << 16, 4, &mut d);
+        assert_eq!(p.read(PORTS + 0x10a0, 4), 0, "PME status: nothing to clear");
         assert_eq!(p.read(0x1300_0040, 4) >> 20 & 0xfcf, 0x541);
         // MSI vector 5 to the AFI's page
         p.write(a + 0x54, 0x9000_0000, 4, &mut d);

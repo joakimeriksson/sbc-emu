@@ -61,7 +61,11 @@ while [ -n "$todo" ]; do
         case $done in *" $m "*) continue ;; esac
         done="$done$m "
         f=$(grep "/$(echo "$m" | sed 's/[-_]/[-_]/g')\.ko\.xz$" "$work/modules" | head -n1)
-        [ -n "$f" ] || continue # built in
+        if [ -z "$f" ]; then
+            grep -q "/$(echo "$m" | sed 's/[-_]/[-_]/g')\.ko$" "$src/modules.builtin" && continue
+            echo "$m: no such module, and not built in" >&2
+            exit 1
+        fi
         o=${f#"$src"/}
         mkdir -p "$dst/$(dirname "$o")"
         xz -dc "$f" > "$dst/${o%.xz}"
