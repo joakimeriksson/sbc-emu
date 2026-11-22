@@ -185,6 +185,7 @@ impl Cpu {
         // other threads may ask this core to stop: they write this core's `chain_until`)
         let budget = self.chain_until.saturating_sub(self.instret);
         a.chain_until = before.saturating_add(if self.mt { budget.min(20_000) } else { budget });
+        a.jit_off = self.jit_off;
         let r = a.step_el0(bus, &mut El1(self));
         self.instret += a.instret.wrapping_sub(before);
         self.pc = a.r[15] as u64;

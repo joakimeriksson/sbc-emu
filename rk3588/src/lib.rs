@@ -543,7 +543,7 @@ impl Machine {
             dst.copy_from_slice(&data[done..done+n]);
             done+=n;
         }
-        for c in self.cpus.iter_mut() { if let Some(j)=c.jit.as_deref_mut() {j.flush();} }
+        for c in self.cpus.iter_mut() { c.jit_invalidate(u64::MAX); } // the 32-bit core's code too
         true
     }
     /// The core with MPIDR affinity `mpidr` (Aff1 = core, Aff0 = 0).

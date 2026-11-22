@@ -116,7 +116,7 @@ impl Cpu {
         let host: *mut (dyn El1Host + '_) = host;
         self.el1 = Some(unsafe { std::mem::transmute::<*mut (dyn El1Host + '_), *mut (dyn El1Host + 'static)>(host) });
         self.el0_exit = None;
-        let result = if self.jit.is_some() {
+        let result = if self.jit.is_some() && !self.jit_off {
             self.jit_poll();
             match if self.interp_run { None } else { self.jit_step(bus) } {
                 Some(r) => r,
