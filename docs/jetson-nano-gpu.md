@@ -40,7 +40,7 @@ programs' `cmp`), results on Debian 13:
 |---|---|
 | `tests/gpu/gles2test.c` (GLES 2) | 24 of 25 against softpipe; `tex_etc1` has random blocks that are not valid ETC1, which ETC2 hardware decodes in ETC2's way |
 | `tests/gpu/gltest.c` (GLES 3) | 48 of 49 against llvmpipe; in `atlas_pbo` llvmpipe filters at texel centres and is off itself |
-| `tests/gpu/gles32test.c` (GLES 3.2) | 48 of 48 against llvmpipe |
+| `tests/gpu/gles32test.c` (GLES 3.2) | 49 of 49 against llvmpipe |
 
 `tests/gpu/run-nano.sh` is the guest's side (`scripts/jetson-nano-gl.txt`; start `tools/gpu_server.py`
 first). `cargo test -p maxwell -p maxwell-shader -p maxwell-tex` has the unit tests: shaders compiled by
@@ -48,8 +48,38 @@ Mesa with their reference results, block formats against Apple's texture units, 
 drivers' formulas.
 
 Host time per 1280 x 720 frame on an M-series Mac (sixteen threads): glmark2 build 3 ms, phong shading
-5 ms, effect2d 8 ms, jellyfish 12 ms, refract 32 ms. The GPU takes no virtual time, so the guest's own
-frame rates mean little.
+5 ms, effect2d 8 ms, jellyfish 12 ms, refract 32 ms. A submission is drawn when it
+starts; the next one starts no sooner than the host time later (`SBC_GPU_TIME` scales it, 0: at once),
+so the guest's frame rates are those of the emulation.
+
+## Demos in the browser
+
+`web/board.html?b=jetson-nano-gpu` boots the Debian kernel with Mesa and six demos
+(`demos/nano-gl`, Rust, OpenGL ES 3.2 and KMS without a window system) in the initramfs:
+
+| Demo | What it uses |
+|---|---|
+| `gpu-demo cubes` | instancing |
+| `gpu-demo planet` | tessellation |
+| `gpu-demo swarm` | transform feedback, points |
+| `gpu-demo fur` | a geometry shader |
+| `gpu-demo tunnel` | a long fragment shader, a stretching blit |
+| `gpu-demo shadow` | a depth texture compared while sampling |
+
+`gpu-demo` runs all of them in turn, at 640 x 480 (`--mode 1280x720`); `--shot FILE --time T` writes a
+picture instead, on whatever Mesa chooses, which is how they are compared with llvmpipe (`cubes`,
+`swarm`, `tunnel` and `shadow` are equal to 8 of 255; in `planet` and `fur` under 0.5 % of the pixels
+differ by more than 40). `scripts/jetson-nano-gpu-demo-fixture.sh` makes the archive from pinned Debian packages
+(13 MB) without LLVM, which Mesa's library names and nouveau does not use: a library of functions that
+return 0 is in its place (`tools/stub_library.py`). With it the 48 scenes `gles32test.c` then had came out the same.
+
+nouveau draws into tiled buffers that tegra-drm shows as they are (PRIME). Mesa's own driver for this
+pair (opening the display's card, as kmscube does) hands on neither shader storage buffers nor the size
+of patches in 25.0: the first crashes it and the second draws nothing.
+
+In the browser the GPU has one thread, and nothing but the interpreter for shaders: expect some 5 to 30
+frames per second. `SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs`
+runs them in Node.
 
 ## Not done
 
@@ -60,6 +90,6 @@ frame rates mean little.
   target.
 - Multiple vertex streams in transform feedback; subgroups wider than 16 lanes in compute.
 - Vulkan (NVK) and NVIDIA's own driver have not been tried.
-- The GPU runs on the CPU's thread (a core waits while it draws) and is not in the browser build's pages.
+- The GPU runs on the CPU's thread (a core waits while it draws); no JIT for shaders.
 
 `SBC_TRACE_GPU=1` prints register accesses, `SBC_TRACE_GPFIFO=1` every method.

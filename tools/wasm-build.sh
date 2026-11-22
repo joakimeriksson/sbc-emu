@@ -45,6 +45,8 @@ if [ -f cache/jetson-nano/debian/initramfs.cpio.gz ]; then
   mkdir -p web/assets/jetson-nano
   cp cache/jetson-nano/debian/tegra210-p3450-0000.dtb cache/jetson-nano/debian/initramfs.cpio.gz web/assets/jetson-nano/
   gzip -9n -c cache/jetson-nano/debian/vmlinuz > web/assets/jetson-nano/Image.gz
+  # and its GPU demos (scripts/jetson-nano-gpu-demo-fixture.sh) for web/board.html?b=jetson-nano-gpu
+  if [ -f cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz ]; then cp cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz web/assets/jetson-nano/; fi
 fi
 # the ESP32-S31's demo (scripts/esp32s31-fixture.sh) for web/board.html?b=esp32s31
 if [ -f cache/esp32s31/images/s31_full_flash.bin ]; then

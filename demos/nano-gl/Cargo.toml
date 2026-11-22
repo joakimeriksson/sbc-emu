@@ -1,0 +1,15 @@
+# GL demos that run in the guest: built for aarch64 Linux by build.sh, so not in the workspace.
+[package]
+name = "nano-gl"
+version = "0.0.1"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "OpenGL ES 3.2 demos on KMS for the emulated Jetson Nano"
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

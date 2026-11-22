@@ -32,6 +32,7 @@
   .screen[hidden] { display: none; }
   .screen canvas { display: block; width: 100%; height: auto; }
   .try { display: flex; flex-wrap: wrap; gap: 8px; }
+  .try + .term { margin-top: 14px; }
   .try button { font: 14px ui-monospace, Menlo, monospace; padding: 9px 14px; border-radius: 6px; border: 1px solid var(--silk-2); background: transparent; color: var(--silk); cursor: pointer; }
   .try button:not(:disabled):hover { border-color: var(--gold); color: var(--gold); }
   .try button:disabled { opacity: .45; cursor: default; }
@@ -95,6 +96,15 @@ const BOARDS = {
     tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA, and none of its firmware is downloaded.',
     try: ['uname -a', 'cat /proc/device-tree/model; echo', 'grep -c processor /proc/cpuinfo', 'dmesg | grep -i nouveau', 'ls /dev/dri', 'ip link set eth0 up; sleep 3; udhcpc -i eth0 -n -q', 'cat /proc/interrupts | head -30', 'free -m', 'cat /dev/urandom > /dev/fb0'],
   },
+  'jetson-nano-gpu': {
+    name: 'Jetson Nano', os: 'jetson-nano-gpu', ramMb: 1024, screen: true, screenFirst: true,
+    lede: 'OpenGL ES 3.2 on the emulated Jetson Nano’s Maxwell GPU: Debian’s kernel and its nouveau driver, Mesa, and six small demos written for this page, on the HDMI monitor. Mesa compiles their shaders for the GPU, and the emulator runs the GPU’s own instructions. Nothing runs on a server.',
+    note: 'Downloads 33 MB (the emulator, Debian’s kernel, Mesa and the demos), boots Linux and starts the demos, one after the other.',
+    tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA, and none of its firmware or drivers are downloaded.',
+    start: ['jetson-nano#', 'gpu-demo'],
+    stop: true, about: 'CPU: JIT to WebAssembly · GPU: shaders interpreted',
+    try: ['gpu-demo cubes', 'gpu-demo planet', 'gpu-demo swarm', 'gpu-demo fur', 'gpu-demo tunnel', 'gpu-demo shadow', 'gpu-demo', 'dmesg | grep -i nouveau'],
+  },
   'esp32s31': {
     name: 'ESP32-S31 Function CoreBoard', os: 'esp32s31', ramMb: 0,
     lede: 'A microcontroller running Linux: Espressif’s official flash image boots through the chip’s own mask ROM, U-Boot, OpenSBI and U-Boot again to Linux, on an emulated ESP32-S31 with two 32-bit RISC-V cores and 16 MB of RAM. Nothing runs on a server.',
@@ -122,28 +132,35 @@ fit.fit();
 addEventListener('resize', () => fit.fit());
 let worker = null;
 const ctx = $('canvas').getContext('2d');
-$('screen').hidden = $('hdminote').hidden = !board.screen;
+$('screen').hidden = !board.screen || !!board.screenFirst; // (that one appears when it boots)
+$('hdminote').hidden = !board.screen;
+if (board.screenFirst) document.querySelector('.term').before($('screen'), $('status'), $('try'));
 const serial = (text) => worker?.postMessage({ type: 'serial', bytes: [...new TextEncoder().encode(text)] });
 term.onData(serial);
-$('try').onclick = (e) => { if (e.target.tagName === 'BUTTON') { serial(e.target.textContent + '\r'); term.focus(); } };
+// (Ctrl-C first, where what runs does not end by itself)
+$('try').onclick = (e) => { if (e.target.tagName === 'BUTTON') { serial((board.stop ? '\x03' : '') + e.target.textContent + '\r'); term.focus(); } };
 
 $('powerbtn').onclick = () => {
   $('powerbtn').disabled = true;
   worker = new Worker('worker.js');
-  let state = '';
+  let state = '', heard = '', started = !board.start;
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.type === 'status') {
       state = m.text; $('status').textContent = state;
-      if (state === 'booting…') { $('power').hidden = true; document.querySelectorAll('#try button').forEach((b) => b.disabled = false); term.focus(); }
+      if (state === 'booting…') { $('power').hidden = true; $('screen').hidden = !board.screen; document.querySelectorAll('#try button').forEach((b) => b.disabled = false); term.focus(); }
       if (m.phase === 'error') $('powerbtn').disabled = false;
     } else if (m.type === 'uart') {
       term.write(m.text);
+      if (!started) {
+        heard = (heard + m.text).slice(-200);
+        if (heard.includes(board.start[0])) { started = true; serial(board.start[1] + '\r'); }
+      }
     } else if (m.type === 'frame' && board.screen) {
       if ($('canvas').width !== m.w || $('canvas').height !== m.h) { $('canvas').width = m.w; $('canvas').height = m.h; }
       ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
     } else if (m.type === 'stats') {
-      $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s` + (m.jit ? ` · ${m.jit} blocks compiled to WebAssembly` : '');
+      $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s` + (m.jit ? ` · ${m.jit} blocks compiled to WebAssembly` : '') + (board.about ? ` · ${board.about}` : '');
     }
   };
   worker.postMessage({ type: 'start', os: board.os, ramMb: board.ramMb, jit: new URLSearchParams(location.search).get('jit') !== '0' });

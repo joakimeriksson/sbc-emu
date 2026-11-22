@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'jetson-nano'|'esp32s31', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'jetson-nano'|'jetson-nano-gpu'|'esp32s31', ramMb},
 //      {type:'start', os:'sd-file', file, ramMb} (a Raspberry Pi SD image the visitor chose: .img, .img.xz, .img.gz),
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
@@ -280,14 +280,25 @@ async function start(os, ramMb, jit, file) {
     loop();
     return;
   }
-  if (os === 'jetson-nano') {
+  if (os === 'jetson-nano' || os === 'jetson-nano-gpu') {
     // NVIDIA Jetson Nano (Tegra X1, four Cortex-A57s): Debian's arm64 kernel (gzip'd) with the board's
     // own device tree and an Alpine/BusyBox initramfs with the board's drivers
     // (scripts/jetson-nano-debian-fixture.sh); shells on the serial console and on HDMI, a 1280 x 720
-    // monitor, with the USB keyboard
-    postMessage({ type: 'status', text: 'loading the Debian kernel, device tree and initramfs…' });
-    const [kernel, dtb, initrd] = await Promise.all([['Image.gz', true], ['tegra210-p3450-0000.dtb', false], ['initramfs.cpio.gz', false]]
+    // monitor, with the USB keyboard. The GPU demos (scripts/jetson-nano-gpu-demo-fixture.sh: Mesa and
+    // demos/nano-gl) are a second archive behind the initramfs, at a multiple of 4 bytes, unpacked here:
+    // the guest would take ten times as long
+    const gpu = os === 'jetson-nano-gpu';
+    postMessage({ type: 'status', text: `loading the Debian kernel, device tree and initramfs${gpu ? ', Mesa and the demos' : ''}…` });
+    const [kernel, dtb, base, demos] = await Promise.all([['Image.gz', true], ['tegra210-p3450-0000.dtb', false], ['initramfs.cpio.gz', false], ...(gpu ? [['gpu-demo.cpio.xz', false]] : [])]
       .map(([f, gz]) => fetchBytes(`assets/jetson-nano/${f}`, gz)));
+    let initrd = base;
+    if (gpu) {
+      postMessage({ type: 'status', text: 'unpacking Mesa and the demos…' });
+      const file = new Blob([demos]), xz = xzBlocks(file), at = (base.length + 3) & ~3;
+      initrd = new Uint8Array(at + xz.size);
+      initrd.set(base);
+      for (const b of xz.blocks) initrd.set(xzDecode(file, b), at + b.uoff);
+    }
     ex.sbc_kms(1280, 720);
     const cmd = new TextEncoder().encode('console=tty0 console=ttyS0,115200 rdinit=/init');
     if (ex.sbc_boot_nano(ramMb, Date.now() / 1000, copyIn(kernel), kernel.length, copyIn(dtb), dtb.length, copyIn(initrd), initrd.length, copyIn(cmd), cmd.length) !== 0) throw new Error('boot setup failed');

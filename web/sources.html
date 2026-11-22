@@ -125,6 +125,14 @@
     <li>The USB and GPU drivers look for NVIDIA's firmware. None is here: the files with those names are placeholders written by <code>scripts/jetson-nano-debian-fixture.sh</code> and <code>tools/nano_gpu_firmware.py</code>, with headers and no code, because the emulator answers for the microcontrollers itself.</li>
   </ul>
 
+  <h2>Jetson Nano: GPU demos</h2>
+  <ul>
+    <li><strong>Mesa 25.0.7</strong> and the libraries it needs, unmodified, from Debian 13's arm64 packages, which <a href="https://github.com/joakimeriksson/sbc-emu/blob/main/scripts/jetson-nano-gpu-demo.packages"><code>scripts/jetson-nano-gpu-demo.packages</code></a> lists with their SHA-256: Mesa, libglvnd, libdrm, the X.Org and Wayland client libraries, libffi and Expat (MIT-style licences); glibc, libelf and libsensors (GNU LGPL); libgcc and libstdc++ (GNU GPL version 3 with the GCC runtime library exception); zstd and libbsd/libmd (BSD); zlib. Each package's copyright file is in the guest under <code>/opt/gpu/licenses</code>.</li>
+    <li>Source: Debian's source packages of the same versions, from <a href="https://snapshot.debian.org/archive/debian/20261121T000000Z/">snapshot.debian.org</a>.</li>
+    <li>Mesa's library also names LLVM, which the Nano's driver does not use: in its place is a library of functions that do nothing, written by <code>tools/stub_library.py</code>.</li>
+    <li><strong>The demos</strong> (<code>demos/nano-gl</code>) were written for sbc-emu, with its BSD licence. <code>scripts/jetson-nano-gpu-demo-fixture.sh</code> builds the archive.</li>
+  </ul>
+
   <h2>ESP32-S31: mask ROM</h2>
   <ul>
     <li><strong>The ESP32-S31 mask ROM</strong>, Espressif's <code>esp32s31_rev0_rom.elf</code> from <a href="https://github.com/espressif/esp-rom-elfs/releases/tag/20260528">esp-rom-elfs 20260528</a>, unmodified (SHA-256 <code>a52ad751…93d5ab87</code>).</li>

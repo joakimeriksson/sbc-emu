@@ -70,6 +70,41 @@ pub struct Gpu {
     waiting: bool,
     retry: u64,
     pause: u64,
+    /// what ran last takes until then: the next submission starts no earlier
+    busy_until: u64,
+    /// guest time for host time (`SBC_GPU_TIME`; 0: the GPU takes none)
+    time_scale: f64,
+}
+
+/// The longest that one submission keeps the GPU, in guest time: drivers give up at some point.
+const MAX_BUSY_NS: u64 = 1_000_000_000;
+
+/// Host time: `Instant` natively, the page's `performance.now()` in the browser.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn sbc_host_now_ms() -> f64;
+}
+struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant, #[cfg(target_arch = "wasm32")] f64);
+impl Clock {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn now() -> Clock {
+        Clock(std::time::Instant::now())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn now() -> Clock {
+        // SAFETY: a clock read that the page provides
+        Clock(unsafe { sbc_host_now_ms() })
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn elapsed(&self) -> std::time::Duration {
+        // SAFETY: as above
+        std::time::Duration::from_secs_f64((unsafe { sbc_host_now_ms() } - self.0).max(0.0) / 1000.0)
+    }
 }
 
 pub mod host;
@@ -106,6 +141,8 @@ impl Default for Gpu {
             waiting: false,
             retry: 0,
             pause: 0,
+            busy_until: 0,
+            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0),
         }
     }
 }
@@ -301,10 +338,14 @@ impl Gpu {
         }
     }
 
-    /// Run every channel that has work.
+    /// Run every channel that has work. All of it is done at once, and keeps the GPU for as long as the
+    /// host needed: what comes next waits, so that the guest sees the speed it gets.
     fn run(&mut self, smmu: &Smmu, ram: &mut [u8]) {
-        #[cfg(not(target_arch = "wasm32"))]
-        let start = std::time::Instant::now();
+        if self.now < self.busy_until {
+            (self.waiting, self.retry) = (true, self.busy_until);
+            return;
+        }
+        let start = Clock::now();
         // a channel may release the semaphore another waits for
         let mut moved = false;
         for _ in 0..64 {
@@ -318,10 +359,9 @@ impl Gpu {
         // a semaphore that stays away is looked at less and less often
         self.pause = if self.waiting && !moved { (2 * self.pause).clamp(RETRY_NS, MAX_RETRY_NS) } else { 0 };
         self.retry = self.now + self.pause.max(RETRY_NS);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.busy += start.elapsed();
-        }
+        let took = start.elapsed();
+        self.busy += took;
+        self.busy_until = self.now + ((took.as_nanos() as f64 * self.time_scale) as u64).min(MAX_BUSY_NS);
     }
 
     fn run_once(&mut self, smmu: &Smmu, ram: &mut [u8]) -> (bool, bool) {
