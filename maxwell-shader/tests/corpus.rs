@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Runs real nouveau code (compiled by Mesa's nv50_ir for GM20B) and compares with the results
 //! of Mesa's softpipe. The corpus is made outside the repository: MAXWELL_CORPUS names a
 //! directory with one directory per shader, each with the code segment (`NNN-FS.bin`,
@@ -21,6 +22,8 @@ struct Gpu {
     /// Outputs of the vertex shader by vertex.
     vtx: Vec<Vec<u32>>,
     sph: Option<Sph>,
+    unit: u32,
+    img: common::Images,
 }
 
 const SSBO: u64 = 0x1_0000_0000;
@@ -29,7 +32,7 @@ impl<const N: usize> Host<N> for Gpu {
     fn cbuf(&self, index: u32, offset: u32) -> u32 {
         let o = offset as usize / 4;
         match index {
-            // the state variable for gl_FragCoord: the shader flips, so does softpipe
+            // the state variable for gl_FragCoord: y * 1 + 0
             0 => [1f32, 0.0, -1.0, 8.0].get(o).map_or(0, |x| x.to_bits()),
             1 => self.ubo.get(o).copied().unwrap_or(0),
             // compute: buffer 0 in the auxiliary buffer
@@ -38,6 +41,7 @@ impl<const N: usize> Host<N> for Gpu {
                 0x2a4 => (SSBO >> 32) as u32,
                 0x2a8 => 4096,
                 0x100 => 1,
+                0x4a0..=0x4df => self.img.info(offset - 0x4a0),
                 _ => self.tex_cb.get(o).copied().unwrap_or(0),
             },
             _ => 0,
@@ -83,7 +87,7 @@ impl<const N: usize> Host<N> for Gpu {
             let y = (self.y + i / 2) as f32 + 0.5 + op.offset[1][i];
             match op.addr {
                 0x70 => x.to_bits(),
-                0x74 => (W as f32 - y).to_bits(),
+                0x74 => y.to_bits(),
                 0x78 => 0.5f32.to_bits(),
                 0x7c => 1f32.to_bits(),
                 0x3fc => !0,
@@ -101,14 +105,30 @@ impl<const N: usize> Host<N> for Gpu {
         })
     }
     fn texture(&mut self, t: &TexOp<N>) -> [[u32; N]; 4] {
-        common::texture(t)
+        common::texture(self.unit, t)
+    }
+    fn surface_load(&mut self, s: &SurfOp<N>) -> [[u32; N]; 4] {
+        self.img.load(s)
+    }
+    fn surface_store(&mut self, s: &SurfOp<N>, d: &[[u32; N]; 4]) {
+        self.img.store(s, d)
+    }
+    fn surface_atomic(
+        &mut self,
+        s: &SurfOp<N>,
+        op: AtomOp,
+        ty: AtomTy,
+        a: &[u64; N],
+        b: &[u64; N],
+    ) -> [u64; N] {
+        self.img.atomic(s, op, ty, a, b)
     }
 }
 
 mod common;
 
 fn words(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.as_chunks().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
 }
 
 fn fetch(code: &[u8]) -> impl FnMut(u32) -> Option<u64> + '_ {
@@ -126,7 +146,9 @@ fn close(a: u32, b: u32) -> bool {
     if x.is_nan() && y.is_nan() {
         return true;
     }
-    (x - y).abs() <= (x.abs().max(y.abs()) * 2e-5).max(1e-6)
+    // Small integers look like denormals: those have to be equal.
+    let number = |v: f32| v == 0.0 || (v.abs() > 1e-12 && v.abs() < 1e12);
+    number(x) && number(y) && (x - y).abs() <= (x.abs().max(y.abs()) * 2e-5).max(1e-6)
 }
 
 #[test]
@@ -135,6 +157,7 @@ fn corpus() {
     let dir = std::env::var("MAXWELL_CORPUS").unwrap();
     let ubo = words(&std::fs::read(std::env::var("MAXWELL_UBO").unwrap()).unwrap());
     let only = std::env::var("MAXWELL_ONLY").ok();
+    let mut kinds = std::collections::BTreeMap::new();
     let (mut ran, mut bad, mut decoded) = (0, 0, 0);
     let mut dirs: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
     dirs.sort();
@@ -143,6 +166,8 @@ fn corpus() {
         if only.as_ref().is_some_and(|o| *o != name) {
             continue;
         }
+        // Tests of textures and images are named after the unit.
+        let unit = name.trim_start_matches(['t', 'i']).split('_').next().unwrap().parse().unwrap_or(0);
         let mut reference = std::fs::read(d.join("ref")).ok().map(|b| words(&b));
         // Code compiled with the other compiler options has its reference elsewhere.
         if reference.is_none() {
@@ -166,6 +191,11 @@ fn corpus() {
                 }
             };
             decoded += 1;
+            for i in p.insts() {
+                let t = format!("{:?}", i.op);
+                let t = t.split([' ', '(']).next().unwrap().to_string();
+                *kinds.entry(t).or_insert(0u32) += 1;
+            }
             if p.any(|o| matches!(o, Op::Invalid(_))) {
                 println!("{name}/{n}: unknown instruction\n{p}");
                 bad += 1;
@@ -185,6 +215,8 @@ fn corpus() {
                 tid: vec![],
                 vtx: vec![vec![0; 0x100]; 4],
                 sph: None,
+                unit,
+                img: common::Images::new(unit.min(5)),
             };
             let Some(reference) = &reference else { continue };
             let mut got = vec![0xdead_beefu32; reference.len()];
@@ -272,6 +304,9 @@ fn corpus() {
                 }
             }
         }
+    }
+    if std::env::var("MAXWELL_KINDS").is_ok() {
+        println!("{kinds:?}");
     }
     println!("{decoded} decoded, {ran} run, {bad} bad");
     assert_eq!(bad, 0);

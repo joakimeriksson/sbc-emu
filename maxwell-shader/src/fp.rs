@@ -94,16 +94,22 @@ pub fn fma(a: f32, b: f32, c: f32) -> f32 {
     }
     #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
     {
-        // The product is exact in double. Rounding the sum twice goes wrong only when the
-        // double lies halfway between two singles (or is a denormal single).
-        let p = a as f64 * b as f64;
-        let s = p + c as f64;
-        let halfway = s.to_bits() & 0x1fff_ffff == 0x1000_0000;
-        if halfway || s.abs() < 2e-38 {
-            add_odd(p, c as f64) as f32
-        } else {
-            s as f32
-        }
+        fma_double(a, b, c)
+    }
+}
+
+/// The same without a fused instruction. The product is exact in double. Rounding the sum twice
+/// goes wrong only when the double lies halfway between two singles (or is a denormal single).
+#[allow(dead_code)]
+#[inline(always)]
+fn fma_double(a: f32, b: f32, c: f32) -> f32 {
+    let p = a as f64 * b as f64;
+    let s = p + c as f64;
+    let halfway = s.to_bits() & 0x1fff_ffff == 0x1000_0000;
+    if halfway || s.abs() < 2e-38 {
+        add_odd(p, c as f64) as f32
+    } else {
+        s as f32
     }
 }
 
@@ -136,11 +142,7 @@ pub fn round_int32(x: f32, rnd: Rnd) -> f32 {
 /// minNum/maxNum: a NaN loses, -0 is less than +0.
 #[inline(always)]
 pub fn min(a: f32, b: f32) -> f32 {
-    if a.is_nan() {
-        b
-    } else if b.is_nan() {
-        a
-    } else if a < b || (a == b && a.is_sign_negative()) {
+    if a < b || b.is_nan() || (a == b && a.is_sign_negative()) {
         a
     } else {
         b
@@ -149,11 +151,7 @@ pub fn min(a: f32, b: f32) -> f32 {
 
 #[inline(always)]
 pub fn max(a: f32, b: f32) -> f32 {
-    if a.is_nan() {
-        b
-    } else if b.is_nan() {
-        a
-    } else if a > b || (a == b && b.is_sign_negative()) {
+    if a > b || b.is_nan() || (a == b && b.is_sign_negative()) {
         a
     } else {
         b
@@ -161,11 +159,7 @@ pub fn max(a: f32, b: f32) -> f32 {
 }
 
 pub fn min64(a: f64, b: f64) -> f64 {
-    if a.is_nan() {
-        b
-    } else if b.is_nan() {
-        a
-    } else if a < b || (a == b && a.is_sign_negative()) {
+    if a < b || b.is_nan() || (a == b && a.is_sign_negative()) {
         a
     } else {
         b
@@ -275,8 +269,14 @@ mod tests {
                 f32::from_bits(s)
             };
             let (a, b, c) = (r(), r(), r());
-            let (x, y) = (fma(a, b, c), a.mul_add(b, c));
-            assert!(x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()), "{a} {b} {c}");
+            let y = a.mul_add(b, c);
+            for x in [fma(a, b, c), fma_double(a, b, c)] {
+                assert!(x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()), "{a} {b} {c}");
+            }
+            // and close to halfway: 24-bit mantissas of moderate size
+            let (a, b) = (f32::from_bits(0x3f80_0000 | s >> 9), f32::from_bits(0x3f80_0000 | s & 0xfff));
+            let c = f32::from_bits((s & 0x8000_0000) | 0x3300_0000 + (s >> 20 & 0x7f) * 0x80_000);
+            assert_eq!(fma_double(a, b, c).to_bits(), a.mul_add(b, c).to_bits());
         }
     }
 }

@@ -55,9 +55,6 @@ impl W {
     fn m(self, abs: u32, neg: u32) -> Mod {
         Mod { abs: self.b(abs), neg: self.b(neg) }
     }
-    fn neg(self, neg: u32) -> Mod {
-        Mod { abs: false, neg: self.b(neg) }
-    }
     fn rnd(self, pos: u32) -> Rnd {
         [Rnd::N, Rnd::M, Rnd::P, Rnd::Z][self.f(pos, 2) as usize]
     }
@@ -511,11 +508,13 @@ fn two_source(w: W, form: Form, sel: u32) -> Option<Op> {
             if form == Form::Cb {
                 return None;
             }
+            // The type field sits on top of the immediate.
+            let b = if form == Form::Imm { Src::Imm(w.f(20, 17)) } else { ib };
             Op::Shf {
                 d,
                 lo: a,
                 hi: w.rc(),
-                b: ib,
+                b,
                 right: sel & 0xf00 == 0xc00,
                 high: w.b(48),
                 wrap: w.b(50),

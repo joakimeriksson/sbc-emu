@@ -89,8 +89,12 @@ pub trait Host<const N: usize> {
     /// c[index][offset]; 0 outside the buffer.
     fn cbuf(&self, index: u32, offset: u32) -> u32;
 
-    /// System register `sys` (S2R, CS2R). Lane numbers (0x00), lane masks (0x38-0x3c) and
-    /// "killed" (0x13) are answered by the interpreter.
+    /// System register `sys` (S2R, CS2R): 0x10 vertices per patch in bits 8-15, 0x11 invocation
+    /// id, 0x1d invocation info (byte 0: the primitive's number in the group, byte 2: vertices
+    /// per primitive; ISBERD's operand is their product plus the vertex), 0x20 local id packed
+    /// (x in bits 0-15, y 16-25, z 26-31), 0x21-0x23 local id x, y, z, 0x25-0x27 group id,
+    /// 0x50/0x51 clock. Lane numbers (0x00), lane masks (0x38-0x3c) and "helper or killed"
+    /// (0x13) are answered by the interpreter.
     fn sysval(&mut self, sys: u8) -> [u32; N] {
         [0; N]
     }
@@ -116,11 +120,18 @@ pub trait Host<const N: usize> {
         &mut []
     }
 
-    /// ALD: one 32-bit component.
+    /// ALD: one 32-bit component. The vertex operand of a per-vertex input is what `isberd`
+    /// returned (0 in a vertex shader); of an output (`a.output`, tessellation control) it is
+    /// the lane that runs the invocation to read; of the tessellation coordinates (output
+    /// 0x2f0) it is the lane itself.
+    ///
+    /// nouveau drops barrier() in tessellation control shaders because all invocations of a
+    /// patch run in one 32-lane group: the caller has to do the same (`Lanes<32>`).
     fn attr_load(&mut self, lane: usize, a: Attr) -> u32 {
         0
     }
-    /// AST: one 32-bit component.
+    /// AST: one 32-bit component of an output. In a geometry shader `a.vertex` is the handle
+    /// `emit` returned last (0 before the first vertex).
     fn attr_store(&mut self, lane: usize, a: Attr, v: u32) {}
     /// ISBERD: the handle ALD's vertex operand takes for input vertex `v`.
     fn isberd(&mut self, lane: usize, v: u32) -> u32 {
@@ -132,10 +143,13 @@ pub trait Host<const N: usize> {
         handle
     }
 
-    /// The attribute interpolated linearly in screen space, as the rasterizer set it up: an
-    /// attribute the program header calls perspective was divided by w, and `IpaMode::MulW`
-    /// means that the interpreter multiplies the result with w (from a register). Flat
-    /// attributes (`Constant`) are returned as bits, unchanged.
+    /// The attribute, interpolated linearly in screen space. For an attribute the program header
+    /// calls perspective (or, for point coordinates and other attributes without a mode there,
+    /// if `op.mode` is `MulW`) that is attribute / w: the interpreter then multiplies with w,
+    /// which the program computed as the reciprocal of a[0x7c] (1/w). Window position (0x70 x,
+    /// y, z, 1/w) and the other values below 0x80 are never divided nor multiplied. Flat
+    /// attributes (`Constant`) are returned as bits, unchanged. a[0x3fc] is all ones for a
+    /// front face, zero for a back face.
     fn interpolate(&mut self, op: &IpaOp<N>) -> [u32; N] {
         [0; N]
     }

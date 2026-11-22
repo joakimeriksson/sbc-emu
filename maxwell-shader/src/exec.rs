@@ -86,7 +86,7 @@ impl<const N: usize> Default for Lanes<N> {
 
 impl<const N: usize> Lanes<N> {
     pub fn new() -> Self {
-        assert!(N >= 4 && N <= 32 && N % 4 == 0, "lanes come in quads, at most 32");
+        assert!((4..=32).contains(&N) && N.is_multiple_of(4), "lanes come in quads, at most 32");
         let gpr: Box<[[u32; N]]> = vec![[0; N]; 256].into_boxed_slice();
         Lanes {
             gpr: gpr.try_into().unwrap(),
@@ -559,7 +559,7 @@ pub fn run<const N: usize, H: Host<N>>(
     fuel: &mut u64,
 ) -> Exit {
     let code = &p.code[..];
-    let fault = |pc: u32| Exit::Fault(p.words.get(pc as usize).map_or(0, |w| w.0));
+    let fault = |pc: u32| Exit::Fault(p.words.get(pc as usize).or(p.words.last()).map_or(0, |w| w.0));
     loop {
         if *fuel == 0 {
             return Exit::Timeout;
@@ -1240,7 +1240,9 @@ pub fn run<const N: usize, H: Host<N>>(
                         v
                     }
                 };
-                if mul != RZ && matches!(mode, IpaMode::MulW | IpaMode::State) {
+                // Mesa asks for gl_FragCoord with .MulW too; window coordinates stay as they are.
+                let window = idx.is_none() && (0x60..0x80).contains(&addr);
+                if mul != RZ && !window && matches!(mode, IpaMode::MulW | IpaMode::State) {
                     let w = l.gpr[mul as usize];
                     v = std::array::from_fn(|i| {
                         (f32::from_bits(v[i]) * f32::from_bits(w[i])).to_bits()

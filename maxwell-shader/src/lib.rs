@@ -7,6 +7,11 @@
 //! * everything outside the shader core is behind the `Host` trait: constant buffers, memory,
 //!   attributes, interpolation, textures, images;
 //! * `Sph` reads the 80-byte program header.
+//!
+//! Range reduction (RRO) passes its operand on and MUFU takes the sine, cosine or power of that,
+//! so the pair gives the right result. Physical attribute addresses (AL2P) are the logical
+//! ones. A lane that executes KIL goes on as a helper (`discard` is `demote` in nouveau).
+//! Scheduling words, memory barriers and cache control do nothing.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::needless_range_loop, clippy::precedence, clippy::large_enum_variant)]

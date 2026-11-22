@@ -69,8 +69,8 @@ impl Sph {
     /// None if this is not a program header.
     pub fn parse(bytes: &[u8]) -> Option<Sph> {
         let mut words = [0; 20];
-        for (w, b) in words.iter_mut().zip(bytes.get(..SIZE as usize)?.chunks_exact(4)) {
-            *w = u32::from_le_bytes(b.try_into().unwrap());
+        for (n, w) in words.iter_mut().enumerate() {
+            *w = u32::from_le_bytes(bytes.get(4 * n..4 * n + 4)?.try_into().unwrap());
         }
         let w = &words;
         let ty = match (w[0] >> 10 & 15, w[0] & 31) {
@@ -261,7 +261,7 @@ mod tests {
         w[4] = 0xff000;
         w[5 + 0x20 / 32] |= 0xf;
         w[10] |= 1 << 31;
-        w[13 + (0x1c - 0x10) / 32] |= 0xf << (0x1c - 0x10);
+        w[13] |= 0xf << (0x1c - 0x10);
         let s = Sph::parse(&bytes(w)).unwrap();
         assert_eq!(s.ty, ShaderType::Vertex);
         assert_eq!(s.inputs().collect::<Vec<_>>(), [0x80, 0x84, 0x88, 0x8c, 0x2fc]);
