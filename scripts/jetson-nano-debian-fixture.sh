@@ -4,11 +4,13 @@
 #   OUT/vmlinuz, OUT/tegra210-p3450-0000.dtb   Debian's, unmodified
 #   OUT/initramfs.cpio.gz                      Alpine aarch64 BusyBox, the kernel modules, /init
 # /init loads the board's drivers and, with root=DEV on the command line, switches to it.
+# The kernel is pinned; Debian's mirrors drop superseded versions, snapshot.debian.org keeps them.
 # Usage: scripts/jetson-nano-debian-fixture.sh [OUT]   (default cache/jetson-nano/debian)
 set -eu
 OUT=${1:-cache/jetson-nano/debian}
 DEB=linux-image-6.12.117+deb13-arm64_6.12.117-1_arm64.deb
 DEB_URL=${DEBIAN_MIRROR:-https://deb.debian.org/debian}/pool/main/l/linux-signed-arm64/$DEB
+DEB_SNAPSHOT=https://snapshot.debian.org/archive/debian/20261121T000000Z/pool/main/l/linux-signed-arm64/$DEB
 DEB_SHA=73805585385c78e048e63fdfba66da36bab724c2cdebd96a3055a8a4f1ae287a
 ROOTFS=alpine-minirootfs-3.24.4-aarch64.tar.gz
 ROOTFS_URL=${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}/v3.24/releases/aarch64/$ROOTFS
@@ -17,16 +19,16 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 DL=${DOWNLOADS:-$OUT/downloads}
 mkdir -p "$DL"
-fetch() { # file url sha256
+fetch() { # file url sha256 [other-url]
     if [ ! -f "$DL/$1" ]; then
         echo "fetching $2" >&2
-        curl -fL --retry 3 -o "$DL/$1.part" "$2"
+        curl -fL --retry 3 -o "$DL/$1.part" "$2" || { [ -n "${4:-}" ] && curl -fL --retry 3 -o "$DL/$1.part" "$4"; }
         mv "$DL/$1.part" "$DL/$1"
     fi
     actual=$(shasum -a 256 "$DL/$1" | cut -d' ' -f1)
     [ "$actual" = "$3" ] || { echo "$1: sha256 $actual, expected $3" >&2; exit 1; }
 }
-fetch "$DEB" "$DEB_URL" "$DEB_SHA"
+fetch "$DEB" "$DEB_URL" "$DEB_SHA" "$DEB_SNAPSHOT"
 fetch "$ROOTFS" "$ROOTFS_URL" "$ROOTFS_SHA"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -60,7 +62,7 @@ depmod -a
 for m in pwm-tegra fixed gpio-regulator i2c-tegra max77620-regulator pwm-regulator sdhci-tegra crc32c_generic ext4; do
     modprobe $m || echo "modprobe $m failed"
 done
-# root=/dev/..., LABEL=, UUID= or PARTUUID=; "card" is the first ext4 partition of the microSD
+# root=/dev/..., LABEL= or UUID= (BusyBox finds no PARTUUID=); "card" is the first ext4 partition of the microSD
 # card (the kernel names the two SD hosts in the order they probe)
 root=$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline)
 if [ -n "$root" ]; then
@@ -79,7 +81,7 @@ if [ -n "$root" ]; then
         for d in dev proc sys; do mount -o move /$d /new/$d; done
         exec switch_root /new /sbin/init
     fi
-    echo "cannot mount $root ($dev)"
+    echo "cannot mount root=$root (found: ${dev:-nothing}; use /dev/..., LABEL=, UUID= or card)"
 fi
 echo "TEGRA210_BOOT_OK: arm64 Linux BusyBox shell"
 exec setsid -c /bin/sh

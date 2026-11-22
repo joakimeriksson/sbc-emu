@@ -1,6 +1,6 @@
 //! NVIDIA Tegra X1 (T210) and the Jetson Nano: four Cortex-A57 cores, a GIC-400, the
-//! Tegra timers, clock/reset controller and PMC, UART A, the fuses and chip ID, and RAM at
-//! 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host
+//! Tegra timers, clock/reset controller and PMC, UART A, the fuses and chip ID, I²C with the
+//! MAX77620 PMIC, GPIO, the SDMMC controllers, and RAM at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host
 //! (the role of the secure monitor on a real Nano). Device addresses no model claims behave
 //! as read-back registers, and their pages are logged, so drivers probe without faults.
 //! Plan: docs/jetson-nano-plan.md.
@@ -187,6 +187,10 @@ impl Soc {
             return Ok(self.read(addr, 4)? | self.read(addr + 4, 4)? << 32);
         }
         self.dirty = true;
+        if (SDMMC..SDMMC + 4 * sdhci::SIZE).contains(&addr) {
+            let k = (addr - SDMMC) / sdhci::SIZE;
+            return Ok(self.sd[k as usize].read_sized(addr - SDMMC - k * sdhci::SIZE, size) as u64);
+        }
         let word = self.reg_read(addr & !3).ok_or(Fault::Unmapped)?;
         Ok((word >> ((addr & 3) * 8)) as u64 & ((1u64 << (size * 8)) - 1))
     }
@@ -926,5 +930,29 @@ mod tests {
         assert!(m.debug_write(0, RAM_BASE + 0x10_0000, &0xe3a0_0002u32.to_le_bytes()));
         m.run(1_000_000);
         assert_eq!(m.soc.ram[0x20_0000], 2);
+    }
+
+    #[test]
+    fn narrow_reads_of_the_sd_buffer_take_what_they_read() {
+        let mut m = Machine::with_cpus(64 << 20, 1).unwrap();
+        let mut disk = emu_core::disk::MemDisk::new(2048);
+        emu_core::disk::Disk::write(&mut disk, 3, &(0..512u32).map(|i| i as u8).collect::<Vec<_>>());
+        m.insert_sd(Box::new(disk));
+        let mut cmd = |index: u64, arg: u64, flags: u64| {
+            m.soc.write(SDMMC + 8, 4, arg).unwrap();
+            m.soc.write(SDMMC + 0xe, 2, index << 8 | flags).unwrap();
+        };
+        for (i, a, f) in [(0, 0, 0), (8, 0x1aa, 2), (55, 0, 2), (41, 0x40ff_8000, 2), (2, 0, 1), (3, 0, 2), (7, 0x5bc0 << 16, 3)] {
+            cmd(i, a, f);
+        }
+        m.soc.write(SDMMC + 4, 4, 1 << 16 | 512).unwrap();
+        m.soc.write(SDMMC + 8, 4, 3).unwrap();
+        m.soc.write(SDMMC + 0xc, 4, 17 << 24 | 0x3a << 16 | 1 << 4).unwrap();
+        let mut got = Vec::new();
+        for size in [1usize, 1, 2, 4, 2, 1, 1] {
+            got.extend_from_slice(&m.soc.read(SDMMC + 0x20, size).unwrap().to_le_bytes()[..size]);
+        }
+        assert_eq!(got, (0..12).collect::<Vec<u8>>());
+        assert_eq!(m.soc.read(SDMMC + 0xfe, 2).unwrap(), 2, "a register's upper half");
     }
 }

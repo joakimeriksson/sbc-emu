@@ -42,8 +42,9 @@ pub struct TegraI2c {
     /// a read whose last bytes have not reached the FIFO yet
     completing: bool,
     devices: Vec<(u8, Box<dyn I2cDevice>)>,
-    /// the device a CONTINUE left addressed
-    current: Option<usize>,
+    /// the device a CONTINUE left addressed, until a packet to it goes on or the host gives up
+    /// (and its direction; Linux flushes the FIFOs before every packet, so that does not end it)
+    current: Option<(usize, bool)>,
 }
 
 impl Default for TegraI2c {
@@ -56,6 +57,13 @@ impl TegraI2c {
     /// Attach a device at 7-bit address `address`.
     pub fn attach(&mut self, address: u8, device: Box<dyn I2cDevice>) {
         self.devices.push((address & 0x7f, device));
+    }
+
+    /// STOP for a device that a CONTINUE left addressed.
+    fn release(&mut self) {
+        if let Some((i, _)) = self.current.take() {
+            self.devices[i].1.stop();
+        }
     }
 
     /// The interrupt status: the FIFO requests are levels.
@@ -115,6 +123,7 @@ impl TegraI2c {
             CNFG => {
                 // leaving packet mode drops a half-written packet
                 if value & 1 << 10 == 0 {
+                    self.release();
                     self.header.clear();
                     self.payload.clear();
                 }
@@ -144,8 +153,14 @@ impl TegraI2c {
 
     fn packet(&mut self, len: usize, flags: u32, payload: &[u8], now: u64) {
         let (read, address) = (flags & HEADER_READ != 0, (flags >> 1 & 0x7f) as u8);
-        let ack = match self.current.take() {
-            Some(i) => Some(i), // continues the last packet: no START
+        // a packet the same way to the device the last one left addressed goes on without a START
+        let going_on = self.current.filter(|&(i, r)| self.devices[i].0 == address && r == read);
+        if going_on.is_none() {
+            self.release();
+        }
+        self.current = None;
+        let ack = match going_on {
+            Some((i, _)) => Some(i),
             None => self.devices.iter().position(|(a, _)| *a == address).filter(|&i| {
                 let d = &mut self.devices[i].1;
                 d.clock(now);
@@ -157,8 +172,11 @@ impl TegraI2c {
                 self.regs[INT_STATUS / 4] |= INT_NO_ACK;
                 return;
             }
-            self.regs[INT_STATUS / 4] |= INT_XFER_COMPLETE;
-            return;
+            if read {
+                self.rx.extend(std::iter::repeat_n(0xff, len)); // nobody drives the bus
+            }
+            self.completing = true;
+            return self.check_complete();
         };
         let d = &mut self.devices[i].1;
         let mut ok = true;
@@ -171,7 +189,7 @@ impl TegraI2c {
             ok = payload[..len].iter().all(|&b| d.write(b)) || flags & HEADER_CONT_ON_NAK != 0;
         }
         if flags & HEADER_CONTINUE != 0 && ok {
-            self.current = Some(i);
+            self.current = Some((i, read));
         } else if flags & HEADER_REPEAT_START == 0 || !ok {
             d.stop();
         }
@@ -262,5 +280,48 @@ mod tests {
         c.read(RX_FIFO as u64);
         c.read(RX_FIFO as u64);
         assert_ne!(c.read(INT_STATUS as u64) & INT_XFER_COMPLETE, 0);
+    }
+
+    #[test]
+    fn an_abandoned_continue_does_not_reach_the_next_transfer() {
+        for end in [(FIFO_CONTROL, 3), (CNFG, 0), (INT_STATUS, u32::MAX)] {
+            let mut c = TegraI2c::default();
+            c.attach(0x3c, Box::new(Mem { data: vec![0; 256], ..Default::default() }));
+            c.attach(0x68, Box::new(Mem { data: vec![0x77; 256], ..Default::default() }));
+            packet(&mut c, 0x3c, HEADER_READ | HEADER_CONTINUE, 1, &[]);
+            c.read(RX_FIFO as u64);
+            c.write(end.0 as u64, end.1, 0); // the host gives up (the last: it just goes on)
+            c.write(INT_STATUS as u64, u32::MAX, 0);
+            packet(&mut c, 0x68, 0, 2, &[0x1004]); // register 4 = 0x10 of the other device
+            packet(&mut c, 0x68, HEADER_REPEAT_START, 1, &[4]);
+            packet(&mut c, 0x68, HEADER_READ, 1, &[]);
+            assert_eq!(c.read(RX_FIFO as u64), 0x10, "{end:x?}");
+        }
+    }
+
+    #[test]
+    fn a_read_that_ignores_the_missing_ack_gets_ones() {
+        let mut c = TegraI2c::default();
+        packet(&mut c, 0x50, HEADER_READ | HEADER_CONT_ON_NAK, 3, &[]);
+        assert_eq!(c.read(INT_STATUS as u64) & (INT_XFER_COMPLETE | INT_RX_REQ | INT_NO_ACK), INT_XFER_COMPLETE | INT_RX_REQ);
+        assert_eq!(c.read(RX_FIFO as u64), 0x00ff_ffff);
+    }
+
+    #[test]
+    fn a_continued_read_goes_on_and_a_write_starts_anew() {
+        let mut c = TegraI2c::default();
+        c.attach(0x3c, Box::new(Mem { data: (0..=255).collect(), ..Default::default() }));
+        packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x20]);
+        packet(&mut c, 0x3c, HEADER_READ | HEADER_CONTINUE, 1, &[]);
+        assert_eq!(c.read(RX_FIFO as u64), 0x20);
+        c.write(FIFO_CONTROL as u64, 3, 0); // as Linux does before the rest
+        packet(&mut c, 0x3c, HEADER_READ, 2, &[]);
+        assert_eq!(c.read(RX_FIFO as u64), 0x2221);
+        // given up after the first byte; then register 0x30 of the same device is read
+        packet(&mut c, 0x3c, HEADER_READ | HEADER_CONTINUE, 1, &[]);
+        c.read(RX_FIFO as u64);
+        packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x30]);
+        packet(&mut c, 0x3c, HEADER_READ, 1, &[]);
+        assert_eq!(c.read(RX_FIFO as u64), 0x30);
     }
 }
