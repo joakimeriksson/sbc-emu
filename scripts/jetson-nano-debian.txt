@@ -1,0 +1,25 @@
+# Jetson Nano: Debian 13's arm64 cloud image from the microSD card, with Debian's kernel and its
+# Tegra drivers (docs/jetson-nano-plan.md). First-boot answers come from the command line:
+#   sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian
+#   sbc-emu run --board jetson-nano --kernel .../vmlinuz --dtb .../tegra210-p3450-0000.dtb \
+#     --initrd .../initramfs.cpio.gz --sd disk.raw --append "console=ttyS0,115200 root=card rw \
+#     quiet audit=0 systemd.set_credential=passwd.plaintext-password.root:nano \
+#     systemd.set_credential=firstboot.locale:C.UTF-8 systemd.set_credential=firstboot.timezone:UTC \
+#     systemd.set_credential=firstboot.keymap:us" --script scripts/jetson-nano-debian.txt
+wait-serial login:
+sleep 2
+serial root\r
+wait-serial Password:
+serial nano\r
+wait-serial ~#
+serial printf 'DEB_%s' $(cut -c1-2 /etc/debian_version); echo\r
+wait-serial DEB_13
+serial printf 'CPUS_%s' $(nproc); echo\r
+wait-serial CPUS_4
+serial findmnt -n -o SOURCE / | grep -q '^/dev/mmcblk' && printf 'ROOT_%s' CARD; echo\r
+wait-serial ROOT_CARD
+serial python3 -c "import hashlib; print('PY_' + hashlib.sha256(b'a' * 10**7).hexdigest()[:8])"\r
+wait-serial PY_01f4a87c
+serial dd if=/dev/urandom of=/root/r bs=1M count=32 2>/dev/null; a=$(md5sum < /root/r); sync; echo 3 > /proc/sys/vm/drop_caches; [ "$a" = "$(md5sum < /root/r)" ] && printf 'CARD_%s' SAME; echo\r
+wait-serial CARD_SAME
+serial poweroff\r

@@ -6,7 +6,11 @@
 //! Plan: docs/jetson-nano-plan.md.
 pub mod boot;
 pub mod car;
+pub mod gpio;
+pub mod i2c;
+pub mod max77620;
 pub mod pmc;
+pub mod sdhci;
 pub mod timer;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -25,6 +29,16 @@ pub const CAR: u64 = 0x6000_6000;
 pub const APBMISC: u64 = 0x7000_0800;
 pub const UARTA: u64 = 0x7000_6000;
 pub const UARTA_IRQ: usize = 32 + 36;
+pub const GPIO: u64 = 0x6000_d000;
+/// The I²C controllers and their interrupts; the PMIC is on I²C5.
+pub const I2C: [(u64, usize); 6] =
+    [(0x7000_c000, 32 + 0x26), (0x7000_c400, 32 + 0x54), (0x7000_c500, 32 + 0x5c), (0x7000_c700, 32 + 0x78), (0x7000_d000, 32 + 0x35), (0x7000_d100, 32 + 0x3f)];
+pub const I2C5: usize = 4;
+/// The SDMMC controllers, 0x200 apart, and their interrupts; the microSD slot is on SDMMC1.
+pub const SDMMC: u64 = 0x700b_0000;
+pub const SDMMC_IRQS: [usize; 4] = [32 + 0x0e, 32 + 0x0f, 32 + 0x13, 32 + 0x1f];
+/// The slot's card-detect switch: low with a card in.
+pub const CARD_DETECT: usize = 0xc9;
 pub const PMC: u64 = 0x7000_e400;
 pub const FUSE: u64 = 0x7000_f800;
 /// The memory controller: its DMA-flush handshake is modelled, the rest reads back.
@@ -63,6 +77,9 @@ pub struct Soc {
     pub car: car::Car,
     pub pmc: pmc::Pmc,
     pub timers: timer::Timers,
+    pub gpio: gpio::Gpio,
+    pub i2c: [i2c::TegraI2c; 6],
+    pub sd: [sdhci::Sdhci; 4],
     fuse: std::collections::HashMap<u64, u32>,
     /// virtual time (ns) at the last device update
     pub now: u64,
@@ -111,6 +128,13 @@ impl Soc {
             self.car.read(word - CAR)
         } else if at(PMC, 0xc00) {
             self.pmc.read(word - PMC)
+        } else if at(GPIO, gpio::SIZE) {
+            self.gpio.read(word - GPIO)
+        } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
+            self.i2c[k].read(word - I2C[k].0)
+        } else if at(SDMMC, 4 * sdhci::SIZE) {
+            let k = (word - SDMMC) / sdhci::SIZE;
+            self.sd[k as usize].read(word - SDMMC - k * sdhci::SIZE)
         } else if at(FUSE, 0x400) {
             let o = word - FUSE;
             self.fuse.get(&o).copied().unwrap_or_else(|| fuse_preset(o))
@@ -139,6 +163,10 @@ impl Soc {
             self.car.write(word - CAR, value);
         } else if at(PMC, 0xc00) {
             self.pmc.write(word - PMC, value);
+        } else if at(GPIO, gpio::SIZE) {
+            self.gpio.write(word - GPIO, value);
+        } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
+            self.i2c[k].write(word - I2C[k].0, value, self.now);
         } else if at(FUSE, 0x400) {
             self.fuse.insert(word - FUSE, value);
         } else if word == APBMISC + 4 {
@@ -174,6 +202,13 @@ impl Soc {
         }
         self.dirty = true;
         let word = addr & !3;
+        if (SDMMC..SDMMC + 4 * sdhci::SIZE).contains(&word) {
+            let k = (word - SDMMC) / sdhci::SIZE;
+            // SDHCI registers are 8, 16 and 32 bits wide, and commands start from part of a word
+            let mut dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
+            self.sd[k as usize].write(addr - SDMMC - k * sdhci::SIZE, value as u32, size, &mut dma);
+            return Ok(());
+        }
         let v = if size == 4 || (UARTA..UARTA + 0x40).contains(&word) && addr & 3 == 0 {
             // the 8250 driver writes its byte registers as bytes at the word's address
             value as u32
@@ -194,6 +229,15 @@ impl Soc {
         self.now = self.now.max(now);
         self.timers.service(self.now);
         self.gic.set_level(UARTA_IRQ, self.uart.irq());
+        for (c, &(_, irq)) in self.i2c.iter().zip(&I2C) {
+            self.gic.set_level(irq, c.irq());
+        }
+        for (c, &irq) in self.sd.iter().zip(&SDMMC_IRQS) {
+            self.gic.set_level(irq, c.irq());
+        }
+        for (b, &irq) in gpio::IRQS.iter().enumerate() {
+            self.gic.set_level(irq, self.gpio.irq(b));
+        }
         for i in 0..timer::TIMERS {
             if let Some(irq) = timer::irq_of(i) {
                 self.gic.set_level(irq, self.timers.irq(i));
@@ -257,8 +301,14 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// A Jetson Nano with `ram_bytes` of DRAM (up to 4 GiB) and `ncpu` cores (1-4).
+    /// A Jetson Nano with `ram_bytes` of DRAM (up to 4 GiB) and `ncpu` cores (1-4), its clock at
+    /// the start of 2026.
     pub fn with_cpus(ram_bytes: usize, ncpu: usize) -> Result<Self, String> {
+        Self::with_clock(ram_bytes, ncpu, 1_767_225_600)
+    }
+
+    /// As `with_cpus`, with the real-time clock at `unix_seconds`.
+    pub fn with_clock(ram_bytes: usize, ncpu: usize, unix_seconds: i64) -> Result<Self, String> {
         if !(64 << 20..=MAX_RAM).contains(&(ram_bytes as u64)) {
             return Err("the Jetson Nano takes 64..4096 MiB of RAM".into());
         }
@@ -272,6 +322,14 @@ impl Machine {
             car: car::Car::default(),
             pmc: pmc::Pmc::default(),
             timers: timer::Timers::default(),
+            gpio: gpio::Gpio::default(),
+            i2c: {
+                let mut buses: [i2c::TegraI2c; 6] = Default::default();
+                buses[I2C5].attach(max77620::ADDRESS, Box::new(max77620::Max77620::default()));
+                buses[I2C5].attach(max77620::RTC_ADDRESS, Box::new(max77620::Rtc::new(unix_seconds)));
+                buses
+            },
+            sd: Default::default(),
             fuse: Default::default(),
             now: 0,
             dirty: true,
@@ -314,6 +372,13 @@ impl Machine {
         }
     }
     pub fn enable_jit(&mut self) -> bool { self.cpus[self.cur].enable_jit() }
+
+    /// Put a card in the microSD slot.
+    pub fn insert_sd(&mut self, disk: Box<dyn emu_core::disk::Disk>) {
+        self.soc.sd[0].card.disk = Some(disk);
+        self.soc.gpio.set_input(CARD_DETECT, false);
+        self.soc.dirty = true;
+    }
 
     pub fn serial_input(&mut self, b: u8) -> bool {
         self.soc.dirty = true;
