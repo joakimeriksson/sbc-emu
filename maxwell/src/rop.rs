@@ -85,6 +85,9 @@ pub fn clear_color(s: &Surface, format: &RtFormat, c: [u32; 4], mask: [bool; 4],
     let n = format.bytes as usize;
     let keep = format.write_mask(mask);
     let whole = keep[..n].iter().all(|&b| b == 0xff);
+    if whole && s.fill(mem, layer, rect.x0, rect.y0, rect.x1, rect.y1, &value[..n]) {
+        return;
+    }
     each_tile(s, rect, |x, y, w, h| {
         let mut t = Tile::new(s, x, y, w, h);
         if whole {
@@ -105,11 +108,14 @@ pub fn clear_color(s: &Surface, format: &RtFormat, c: [u32; 4], mask: [bool; 4],
 pub fn clear_zeta(s: &Surface, format: &ZetaFormat, depth: Option<f32>, stencil: Option<u8>, mask: u8, rect: Rect, layer: u32, mem: &mut dyn Memory) {
     let n = format.bytes as usize;
     let whole = depth.is_some() == format.has_depth() && stencil.is_some() == format.has_stencil() && mask == 0xff;
+    let mut b = [0; 8];
+    format.store(format.encode(depth.unwrap_or(0.0), stencil.unwrap_or(0)), &mut b);
+    if whole && s.fill(mem, layer, rect.x0, rect.y0, rect.x1, rect.y1, &b[..n]) {
+        return;
+    }
     each_tile(s, rect, |x, y, w, h| {
         let mut t = Tile::new(s, x, y, w, h);
         if whole {
-            let mut b = [0; 8];
-            format.store(format.encode(depth.unwrap_or(0.0), stencil.unwrap_or(0)), &mut b);
             t.fill(&b[..n]);
         } else {
             t.load(s, mem, layer);

@@ -6,6 +6,8 @@ pub mod geom;
 pub mod inline;
 pub mod mme;
 pub mod pipe;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pool;
 pub mod raster;
 pub mod rop;
 pub mod threed;

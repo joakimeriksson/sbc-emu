@@ -636,28 +636,21 @@ fn run(t: &mut Threed, scene: &Scene, s: &Setup, work: &Work, mem: &mut dyn Memo
         let next = AtomicUsize::new(0);
         let (rop, pipe) = (&t.rop, &mut t.pipe);
         let memory = &*mem;
-        let results: Vec<(Counters, Option<String>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = pipe.workers[..threads]
-                .iter_mut()
-                .map(|w| {
-                    let (sets, next) = (&sets, &next);
-                    let mut mine = memory.share().unwrap();
-                    scope.spawn(move || {
-                        let mut out = (Counters::default(), None);
-                        loop {
-                            let k = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(at, x, y)) = tiles.get(k) else { break };
-                            let mut set = sets[k].lock().unwrap().take().unwrap();
-                            rop.load(&mut set, x, y, layer, s.need, s.write, &*mine);
-                            tile(w, work, scene, s, &mut *mine, &mut set, (x as i32 * T, y as i32 * T), &bins[at as usize], &mut out);
-                            *sets[k].lock().unwrap() = Some(set);
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+        // (a Box<dyn Memory + Send> goes to each thread)
+        type Slot<'a> = Mutex<(&'a mut Worker, Box<dyn Memory + Send + 'a>, (Counters, Option<String>))>;
+        let slots: Vec<Slot> = pipe.workers[..threads].iter_mut().map(|w| Mutex::new((w, memory.share().unwrap(), (Counters::default(), None)))).collect();
+        crate::pool::run(threads, &|k| {
+            let (w, mine, out) = &mut *slots[k].lock().unwrap();
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(at, x, y)) = tiles.get(k) else { break };
+                let mut set = sets[k].lock().unwrap().take().unwrap();
+                rop.load(&mut set, x, y, layer, s.need, s.write, &**mine);
+                tile(w, work, scene, s, &mut **mine, &mut set, (x as i32 * T, y as i32 * T), &bins[at as usize], out);
+                *sets[k].lock().unwrap() = Some(set);
+            }
         });
+        let results: Vec<(Counters, Option<String>)> = slots.into_iter().map(|s| s.into_inner().unwrap().2).collect();
         for (set, &(_, x, y)) in sets.into_iter().zip(tiles) {
             t.rop.put(x, y, layer, set.into_inner().unwrap().unwrap());
         }

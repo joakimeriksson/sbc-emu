@@ -68,6 +68,35 @@ impl Surface {
         }
     }
 
+    /// Fill the pixels [x0, x1) × [y0, y1) of a layer with one sample value, if the rectangle is
+    /// made of whole GOBs (at the surface's edges it may end anywhere). False: not done.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill<M: Memory + ?Sized>(&self, mem: &mut M, layer: u32, x0: u32, y0: u32, x1: u32, y1: u32, value: &[u8]) -> bool {
+        let Some(block) = self.plane.block else { return false };
+        let n = value.len();
+        if n != self.bytes as usize || !n.is_power_of_two() || n > 16 {
+            return false;
+        }
+        let (mx, my) = self.ms.shift();
+        let edge = |v: u32, end: u32, unit: u32| if v >= end { Some(end.div_ceil(unit)) } else { v.is_multiple_of(unit).then_some(v / unit) };
+        let (w, h) = (self.width * self.bytes, self.height);
+        let (Some(gx0), Some(gy0)) = (edge((x0 << mx) * self.bytes, w, 64), edge(y0 << my, h, 8)) else { return false };
+        let (Some(gx1), Some(gy1)) = (edge((x1 << mx) * self.bytes, w, 64), edge(y1 << my, h, 8)) else { return false };
+        let gobs = 1u32 << block.height;
+        let pattern: Vec<u8> = value.iter().copied().cycle().take(512 * gobs as usize).collect();
+        let (base, z) = self.layer(layer);
+        for gx in gx0..gx1 {
+            let mut gy = gy0;
+            while gy < gy1 {
+                // a block's GOBs follow each other downwards
+                let run = (gobs - gy % gobs).min(gy1 - gy);
+                mem.write(base + self.plane.offset(gx * 64, gy * 8, z), &pattern[..512 * run as usize]);
+                gy += run;
+            }
+        }
+        true
+    }
+
     /// Address of a sample.
     pub fn sample_address(&self, x: u32, y: u32, layer: u32, sample: u32) -> u64 {
         let (mx, my) = self.ms.shift();
@@ -208,6 +237,48 @@ impl Tile {
         let v = &value[..self.bytes as usize];
         for s in self.data.chunks_exact_mut(v.len().max(1)) {
             s.copy_from_slice(v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    struct Ram(Vec<u8>);
+    impl Memory for Ram {
+        fn read(&self, a: u64, out: &mut [u8]) {
+            out.copy_from_slice(&self.0[a as usize..a as usize + out.len()]);
+        }
+        fn write(&mut self, a: u64, d: &[u8]) {
+            self.0[a as usize..a as usize + d.len()].copy_from_slice(d);
+        }
+    }
+
+    #[test]
+    fn filling_gobs_is_filling_pixels() {
+        for (bytes, ms) in [(4u32, MsMode::X1), (2, MsMode::X1), (8, MsMode::from_samples(4))] {
+            let s = Surface::new(0, 200, 90, 0x20, 0, bytes, ms);
+            let (w, h) = s.pixels();
+            let value: Vec<u8> = (1..=bytes as u8).collect();
+            let gob = 64 / bytes;
+            let cases = [(0, 0, w, h, true), (gob, 8, 2 * gob, 32, true), (1, 0, w, h, false), (0, 3, w, h, false), (0, 0, w, 16, true)];
+            for (x0, y0, x1, y1, fast) in cases {
+                let mut a = Ram(vec![0; 1 << 19]);
+                assert_eq!(s.fill(&mut a, 0, x0, y0, x1, y1, &value), fast, "{bytes} {x0} {y0} {x1} {y1}");
+                if !fast {
+                    continue;
+                }
+                for y in 0..h {
+                    for x in 0..w {
+                        for k in 0..ms.samples() {
+                            let at = s.sample_address(x, y, 0, k) as usize;
+                            let inside = (x0..x1).contains(&x) && (y0..y1).contains(&y);
+                            assert_eq!(&a.0[at..at + bytes as usize] == &value[..], inside, "{bytes} {x} {y}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

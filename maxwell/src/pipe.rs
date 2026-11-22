@@ -114,12 +114,36 @@ pub fn threads() -> usize {
     }
 }
 
+/// Decoded descriptors, by number.
+struct Cache<T>(Box<[Option<(u32, Arc<T>)>; 64]>);
+
+impl<T> Default for Cache<T> {
+    fn default() -> Self {
+        Self(Box::new(std::array::from_fn(|_| None)))
+    }
+}
+
+impl<T> Cache<T> {
+    #[inline]
+    fn get(&self, id: u32) -> Option<Arc<T>> {
+        self.0[id as usize % 64].as_ref().filter(|e| e.0 == id).map(|e| e.1.clone())
+    }
+
+    fn insert(&mut self, id: u32, t: Arc<T>) {
+        self.0[id as usize % 64] = Some((id, t));
+    }
+
+    fn clear(&mut self) {
+        self.0.fill_with(|| None);
+    }
+}
+
 /// What one thread keeps: shader registers and its own caches of memory.
 pub struct Worker {
     pub lanes: Lanes<L>,
     words: Box<[[Words; 18]; 6]>,
-    textures: HashMap<u32, Arc<Texture>>,
-    samplers: HashMap<u32, Arc<Sampler>>,
+    textures: Cache<Texture>,
+    samplers: Cache<Sampler>,
     cache: TexCache,
     generation: u64,
     /// a shader wrote memory
@@ -131,8 +155,8 @@ impl Worker {
         Self {
             lanes: Lanes::new(),
             words: Box::new(std::array::from_fn(|_| std::array::from_fn(|_| Words::default()))),
-            textures: HashMap::new(),
-            samplers: HashMap::new(),
+            textures: Cache::default(),
+            samplers: Cache::default(),
             cache: TexCache::new(),
             generation: 0,
             stored: false,
@@ -289,8 +313,8 @@ impl Pipe {
 pub struct Common<'a> {
     pub mem: &'a mut dyn Memory,
     pub words: &'a [Words; 18],
-    pub textures: &'a mut HashMap<u32, Arc<Texture>>,
-    pub samplers: &'a mut HashMap<u32, Arc<Sampler>>,
+    textures: &'a mut Cache<Texture>,
+    samplers: &'a mut Cache<Sampler>,
     pub cache: &'a mut TexCache,
     pub tic: u64,
     pub tsc: u64,
@@ -305,8 +329,8 @@ impl Common<'_> {
     }
 
     fn texture_at(&mut self, id: u32) -> Arc<Texture> {
-        if let Some(t) = self.textures.get(&id) {
-            return t.clone();
+        if let Some(t) = self.textures.get(id) {
+            return t;
         }
         let mut raw = [0u8; 32];
         self.mem.read(self.tic + 32 * id as u64, &mut raw);
@@ -317,8 +341,8 @@ impl Common<'_> {
     }
 
     fn sampler_at(&mut self, id: u32) -> Arc<Sampler> {
-        if let Some(s) = self.samplers.get(&id) {
-            return s.clone();
+        if let Some(s) = self.samplers.get(id) {
+            return s;
         }
         let mut raw = [0u8; 32];
         self.mem.read(self.tsc + 32 * id as u64, &mut raw);
@@ -782,24 +806,18 @@ fn shade_vertices(t: &mut Threed, vs: &Arc<Shader>, list: &[u32], arrays: bool, 
         use std::sync::Mutex;
         let jobs = Mutex::new(unique.chunks(CHUNK).zip(data.chunks_mut(CHUNK * stride)));
         let memory = &*mem;
-        failed = std::thread::scope(|scope| {
-            let handles: Vec<_> = t.pipe.workers[..workers]
-                .iter_mut()
-                .map(|w| {
-                    let (jobs, work, inputs, layout) = (&jobs, &work, &inputs, &out);
-                    let mut mine = memory.share().unwrap();
-                    scope.spawn(move || {
-                        let mut failed = None;
-                        loop {
-                            let Some((v, o)) = jobs.lock().unwrap().next() else { break };
-                            failed = inputs.run(vs, work, w, &mut *mine, layout, v, o).or(failed);
-                        }
-                        failed
-                    })
-                })
-                .collect();
-            handles.into_iter().filter_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).last()
+        type Slot<'a> = Mutex<(&'a mut Worker, Box<dyn Memory + Send + 'a>, Option<String>)>;
+        let slots: Vec<Slot> = t.pipe.workers[..workers].iter_mut().map(|w| Mutex::new((w, memory.share().unwrap(), None))).collect();
+        crate::pool::run(workers, &|k| {
+            let (w, mine, failed) = &mut *slots[k].lock().unwrap();
+            loop {
+                let Some((v, o)) = jobs.lock().unwrap().next() else { break };
+                if let Some(e) = inputs.run(vs, &work, w, &mut **mine, &out, v, o) {
+                    *failed = Some(e);
+                }
+            }
         });
+        failed = slots.into_iter().filter_map(|s| s.into_inner().unwrap().2).last();
         out.data = data;
         if let Some(e) = failed {
             t.pipe.error(e);
