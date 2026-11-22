@@ -249,6 +249,11 @@ pub struct Machine {
     round_end: u64,
     pub irqs: u64,
     pub exceptions: u64,
+    /// A debugger's breakpoints (interpreter only, as its watchpoints: see `set_debugging`).
+    pub breakpoints: emu_core::debug::Breakpoints,
+    debugging: bool,
+    /// each core's `jit_off` before a debugger set something
+    jit_off_before: Vec<bool>,
 }
 
 impl Machine {
@@ -274,7 +279,7 @@ impl Machine {
             stub_pages: Vec::new(),
             log_stub_pages: false,
         };
-        let mut m = Self { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, cur: 0, next_check: 0, round_end: u64::MAX, irqs: 0, exceptions: 0 };
+        let mut m = Self { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, cur: 0, next_check: 0, round_end: u64::MAX, irqs: 0, exceptions: 0, breakpoints: Default::default(), debugging: false, jit_off_before: vec![false; ncpu] };
         for k in 0..ncpu {
             let c = m.fresh_cpu(k);
             m.cpus.push(c);
@@ -479,10 +484,15 @@ impl Machine {
     fn slice(&mut self, k: usize, round_start: u64, total: &mut u64, end: u64, steps: &mut u64, storm: &mut u32) -> Option<Stop> {
         self.switch_to(k);
         self.catch_up(k, round_start);
+        // what a debugger has set only changes between runs
+        let (breaks, watches) = (!self.breakpoints.at.is_empty(), !self.cpus[k].watch.is_empty());
         loop {
             let t = self.cpus[k].now_ns();
             if t >= self.round_end || *total >= end || *steps == 0 {
                 return None;
+            }
+            if breaks && self.breakpoints.hit(k, self.cpus[k].pc) {
+                return Some(Stop::Breakpoint(k));
             }
             *steps -= 1;
             if self.soc.dirty || self.cpus[k].sys.timers_changed || self.cpus[k].instret >= self.next_check {
@@ -504,6 +514,13 @@ impl Machine {
                 for (j, o) in self.cpus.iter_mut().enumerate() {
                     if j != k {
                         o.jit_invalidate(op);
+                    }
+                }
+            }
+            if watches {
+                if let Some((a, kind)) = self.cpus[k].watch_hit.take() {
+                    if r.is_ok() {
+                        return Some(Stop::Watchpoint(k, a, kind));
                     }
                 }
             }
@@ -551,6 +568,97 @@ impl Machine {
                 Err(Trap::Hlt(n)) => return Some(Stop::Hlt(n)),
             }
         }
+    }
+
+    /// Cores run interpreted while a debugger has something set; `--no-jit` stays as it was.
+    fn set_debugging(&mut self) {
+        let on = !self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty();
+        if on != self.debugging {
+            self.debugging = on;
+            for (c, off) in self.cpus.iter_mut().zip(self.jit_off_before.iter_mut()) {
+                if on {
+                    *off = std::mem::replace(&mut c.jit_off, true);
+                } else {
+                    c.jit_off = *off;
+                }
+            }
+        }
+    }
+
+    pub fn debug_breakpoint(&mut self, addr: u64, insert: bool) {
+        self.breakpoints.set(addr, insert);
+        self.set_debugging();
+    }
+
+    /// Watch [addr, addr + len) for accesses of `kind` (1 write, 2 read, 3 either) on every core.
+    pub fn debug_watch(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        for c in self.cpus.iter_mut() {
+            c.watch.retain(|&w| w != (addr, len, kind));
+            if insert {
+                c.watch.push((addr, len, kind));
+            }
+        }
+        self.set_debugging();
+    }
+
+    /// Execute one instruction on core `k` (interpreter; a sleeping core is woken); a stop it
+    /// causes, if any. `run` does it, with the other cores off meanwhile.
+    #[cold]
+    pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
+        if self.state[k] == CoreState::Off {
+            return None;
+        }
+        let states = std::mem::replace(&mut self.state, vec![CoreState::Off; self.cpus.len()]);
+        self.state[k] = CoreState::Run;
+        let jit_off = std::mem::replace(&mut self.cpus[k].jit_off, true);
+        self.breakpoints.resume = Some((k, self.cpus[k].pc));
+        let stop = self.run(1);
+        self.breakpoints.resume = None;
+        self.cpus[k].jit_off = jit_off;
+        // a core the instruction started (PSCI) stays on
+        for (j, s) in states.into_iter().enumerate() {
+            if j != k && self.state[j] == CoreState::Off {
+                self.state[j] = s;
+            }
+        }
+        (!matches!(stop, Stop::Budget | Stop::Idle(_))).then_some(stop)
+    }
+
+    /// The pieces of guest RAM behind [va, va + len) as core `k` sees them: (offset, length)
+    /// each. None where it is not RAM: device registers are never read.
+    fn debug_pages(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        let mut done = 0;
+        while done < len {
+            let a = va.wrapping_add(done as u64);
+            let pa = self.cpus[k].debug_translate(&mut self.soc, a)?;
+            let n = (len - done).min(0x1000 - (a & 0xfff) as usize);
+            out.push((self.soc.ram_offset(pa, n)?, n));
+            done += n;
+        }
+        Some(out)
+    }
+
+    /// Guest RAM at virtual address `va` as core `k` sees it.
+    pub fn debug_read(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<u8>> {
+        let pages = self.debug_pages(k, va, len)?;
+        Some(pages.into_iter().flat_map(|(o, n)| self.soc.ram[o..o + n].iter().copied()).collect())
+    }
+
+    /// Write guest RAM at virtual address `va` (all of it or nothing); compiled code is dropped.
+    pub fn debug_write(&mut self, k: usize, va: u64, data: &[u8]) -> bool {
+        let Some(pages) = self.debug_pages(k, va, data.len()) else { return false };
+        let mut done = 0;
+        for (o, n) in pages {
+            self.soc.ram[o..o + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        for c in self.cpus.iter_mut() {
+            if let Some(j) = c.jit.as_deref_mut() {
+                j.flush();
+            }
+        }
+        true
     }
 
     fn target(&self, mpidr: u64) -> Option<usize> {
@@ -616,6 +724,7 @@ impl Machine {
         f.x[0] = context;
         f.sys.cpacr_el1 = 3 << 20;
         f.jit_off = c.jit_off;
+        f.watch = c.watch.clone();
         let mut old = std::mem::replace(c, f);
         old.hand_jit_to(c);
         self.soc.gic.reset_cpu_interface(t);
