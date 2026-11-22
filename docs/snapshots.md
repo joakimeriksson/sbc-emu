@@ -33,7 +33,8 @@ been cut; new ones work), compiled code, audio recorded
 so far (`--audio-out`). Refused: `--sd-persist`, which writes into the image, both to save and to restore with; a file that is
 damaged. (On the Pi 4, whose format is older and has no checksum, a snapshot made with `--sd-persist`
 is accepted, as long as the image is as it was then; one with written sectors is not restored onto
-it.) A snapshot fits the
+it, and `loadvm` is refused once the guest has written to the image. A `loadvm` that fails half way
+resets the machine.) A snapshot fits the
 build that made it: when the layout changes, its version does, and another is refused (the Pi 4's
 older format keeps its own compatibility).
 
