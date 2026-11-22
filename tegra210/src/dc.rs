@@ -7,6 +7,8 @@ use crate::smmu::{Group, Smmu};
 use peripherals::dma::Memory;
 
 pub const BASE: [u64; 2] = [0x5420_0000, 0x5424_0000];
+/// Reset numbers of the two controllers.
+pub const RESETS: [usize; 2] = [27, 26];
 pub const IRQS: [usize; 2] = [32 + 0x49, 32 + 0x4a];
 const REGS: usize = 0x1000;
 pub const SIZE: u64 = 4 * REGS as u64;
@@ -58,13 +60,19 @@ pub struct Dc {
     /// when the next vertical blank starts (ns)
     next_vblank: u64,
     pub frames: u64,
-    /// pixel clock (kHz) of the monitor's mode, for its frame time
-    pub clock_khz: u32,
+    /// the monitor's own mode: its totals (pixels, lines) and pixel clock (kHz)
+    pub mode: Option<(u32, u32, u32)>,
 }
+
+/// The largest picture a controller scans out.
+const MAX_SIZE: u32 = 4096;
+
+/// Surfaces' addresses have 40 bits.
+const ADDRESS: u64 = (1 << 40) - 1;
 
 impl Default for Dc {
     fn default() -> Self {
-        Self { asm: vec![0; REGS], arm: vec![0; REGS], active: vec![0; REGS], pending: 0, int_status: 0, next_vblank: 0, frames: 0, clock_khz: 0 }
+        Self { asm: vec![0; REGS], arm: vec![0; REGS], active: vec![0; REGS], pending: 0, int_status: 0, next_vblank: 0, frames: 0, mode: None }
     }
 }
 
@@ -87,16 +95,22 @@ impl Dc {
     /// The visible size.
     pub fn size(&self) -> Option<(u32, u32)> {
         let (w, h) = (self.active[ACTIVE] & 0x7fff, self.active[ACTIVE] >> 16 & 0x7fff);
-        (w != 0 && h != 0).then_some((w, h))
+        (w != 0 && h != 0 && w <= MAX_SIZE && h <= MAX_SIZE).then_some((w, h))
     }
 
-    /// The frame time (ns): the totals at the mode's pixel clock, 60 Hz without one.
+    /// The frame time (ns): the monitor's own mode at its pixel clock; its other modes all have
+    /// 60 Hz.
     fn frame_time(&self) -> u64 {
-        let sum = |shift: u32| (REF_TO_SYNC + 1..REF_TO_SYNC + 5).map(|r| (self.active[r] >> shift & 0x7fff) as u64).sum::<u64>();
-        match self.clock_khz {
-            0 => 16_666_667,
-            khz => (sum(0) * sum(16) * 1_000_000 / khz as u64).clamp(1_000_000, 200_000_000),
+        let sum = |shift: u32| (REF_TO_SYNC + 1..REF_TO_SYNC + 5).map(|r| self.active[r] >> shift & 0x7fff).sum::<u32>();
+        match self.mode {
+            Some((w, h, khz)) if (w, h) == (sum(0), sum(16)) => w as u64 * h as u64 * 1_000_000 / khz as u64,
+            _ => 16_666_667,
         }
+    }
+
+    /// The controller was held in reset.
+    pub fn reset(&mut self) {
+        *self = Self { mode: self.mode, frames: self.frames, ..Self::default() };
     }
 
     pub fn irq(&self) -> bool {
@@ -198,7 +212,7 @@ impl Dc {
         if src_w == 0 || src_h == 0 || dw == 0 || dh == 0 {
             return;
         }
-        let (stride, start) = ((r(STRIDE) & 0xffff) as u64, (r(START_HI) as u64) << 32 | r(START) as u64);
+        let (stride, start) = ((r(STRIDE) & 0xffff) as u64, ((r(START_HI) as u64) << 32 | r(START) as u64) & ADDRESS);
         // the origin within the surface: bytes and lines (the far corner when mirrored)
         let (ox, oy) = (r(H_OFFSET) as u64, r(V_OFFSET) as u64);
         let (flip_x, flip_y) = (r(OPTIONS) & 1 != 0, r(OPTIONS) & 4 != 0);
@@ -234,7 +248,7 @@ impl Dc {
     fn draw_cursor(&self, group: Group, smmu: &Smmu, dma: &dyn Memory, out: &mut [u8], (w, h): (u32, u32)) {
         let v = self.active[CURSOR_START];
         let n = 32i32 << (v >> 24 & 3);
-        let start = (self.active[CURSOR_START_HI] as u64) << 32 | ((v & 0x3f_ffff) as u64) << 10;
+        let start = ((self.active[CURSOR_START_HI] as u64) << 32 | ((v & 0x3f_ffff) as u64) << 10) & ADDRESS;
         // 14-bit positions; the driver masks them to its 4096 or 8192 limit
         let p = self.active[CURSOR_POSITION];
         let signed = |v: u32, size: u32| { let v = (v & 0x3fff) as i32; if v >= size as i32 && v >= 4096 - n { v - if v >= 8192 - n { 8192 } else { 4096 } } else { v } };
@@ -246,8 +260,9 @@ impl Dc {
                 let (px, py) = (x + cx, y + cy);
                 if (0..w as i32).contains(&px) && (0..h as i32).contains(&py) {
                     let s = &image[((cy * n + cx) * 4) as usize..][..4];
-                    let o = ((py * w as i32 + px) * 4) as usize;
-                    put(&mut out[o..o + 4], [s[2], s[1], s[0], s[3]], true);
+                    let o = (py as usize * w as usize + px as usize) * 4;
+                    // RGBA8888: the alpha is in the low byte
+                    put(&mut out[o..o + 4], [s[3], s[2], s[1], s[0]], true);
                 }
             }
         }
@@ -359,7 +374,7 @@ mod tests {
             p.copy_from_slice(&[k as u8, 0x10, 0x20, 0]);
         }
         // the cursor: one half-transparent green pixel
-        ram[0x2000..0x2004].copy_from_slice(&[0, 255, 0, 128]);
+        ram[0x2000..0x2004].copy_from_slice(&[128, 0, 255, 0]);
         let mut d = Dc::default();
         on(&mut d);
         let a = window(0);
@@ -379,6 +394,24 @@ mod tests {
         let px = |x: usize, y: usize| out[(y * 8 + x) * 4..][..3].to_vec();
         assert_eq!((px(0, 0), px(1, 1), px(7, 3)), (vec![0x20, 0x10, 0], vec![0x20, 0x10, 0], vec![0x20, 0x10, 7]));
         assert_eq!(px(2, 1), [16, 136, 0], "the cursor's pixel, blended");
+    }
+
+    #[test]
+    fn rates_limits_and_reset() {
+        let mut d = Dc { mode: Some((378, 34, 12_852)), ..Dc::default() };
+        on(&mut d);
+        assert_eq!(d.frame_time(), 1_000_000, "the mode's own totals");
+        d.mode = Some((1650, 750, 74_250));
+        assert_eq!(d.frame_time(), 16_666_667, "another mode");
+        w(&mut d, ACTIVE, 0x7fff << 16 | 0x7fff);
+        w(&mut d, STATE_CONTROL, 1 << 8);
+        w(&mut d, STATE_CONTROL, 1);
+        d.tick(20_000_000);
+        assert_eq!((d.size(), d.running()), (None, false));
+        on(&mut d);
+        assert!(d.running());
+        d.reset();
+        assert!(!d.running() && d.mode.is_some() && d.int_status == 0);
     }
 
     #[test]

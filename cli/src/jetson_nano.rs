@@ -55,7 +55,7 @@ impl Screen for Machine {
         self.screen_size()
     }
     fn display_size(&self) -> (u32, u32) {
-        self.screen_size().unwrap_or((1280, 720))
+        self.screen_size().or(self.soc.monitor).unwrap_or((1280, 720))
     }
     fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         Machine::render(self, out)

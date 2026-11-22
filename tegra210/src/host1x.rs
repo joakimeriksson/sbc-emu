@@ -36,6 +36,9 @@ impl Default for Host1x {
     }
 }
 
+/// The most words one run of a channel takes.
+const MAX_WORDS: usize = 1 << 18;
+
 impl Host1x {
     pub fn increment(&mut self, point: usize) {
         if let Some(p) = self.points.get_mut(point) {
@@ -113,6 +116,7 @@ impl Host1x {
         }
     }
 
+    /// Run a channel's push buffer.
     fn run(&mut self, c: usize, smmu: &Smmu, dma: &dyn Memory) {
         if self.channels[c][DMACTRL] & 1 != 0 {
             return; // stopped
@@ -134,7 +138,8 @@ impl Host1x {
                     // gather: the words are elsewhere
                     let a = word(start + get as u64) as u64;
                     get = get.wrapping_add(4);
-                    fifo.extend((0..w as u64 & 0x3fff).map(|k| word(a + 4 * k)));
+                    let n = (w as usize & 0x3fff).min(MAX_WORDS - fifo.len().min(MAX_WORDS));
+                    fifo.extend((0..n as u64).map(|k| word(a + 4 * k)));
                 }
                 _ => fifo.push(w),
             }

@@ -3,6 +3,7 @@
 //! follow the super state. Audio and infoframe registers read back.
 pub const BASE: [u64; 2] = [0x5454_0000, 0x5458_0000];
 pub const SIZE: u64 = 0x1000;
+pub const RESETS: [usize; 2] = [182, 183];
 
 const SUPER_STATE1: usize = 0x02;
 const PWR: usize = 0x15;

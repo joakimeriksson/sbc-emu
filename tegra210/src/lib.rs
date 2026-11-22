@@ -48,6 +48,9 @@ pub const I2C: [(u64, usize); 6] =
 /// their numbers in the clock and reset controller
 const I2C_RESETS: [usize; 6] = [12, 54, 67, 103, 47, 166];
 pub const I2C5: usize = 4;
+/// The VI's I2C controller.
+const I2C_VI_RESET: usize = 208;
+const I2C_VI_IRQ: usize = 32 + 17;
 /// The SDMMC controllers, 0x200 apart, and their interrupts; the microSD slot is on SDMMC1.
 pub const SDMMC: u64 = 0x700b_0000;
 pub const SDMMC_IRQS: [usize; 4] = [32 + 0x0e, 32 + 0x0f, 32 + 0x13, 32 + 0x1f];
@@ -108,6 +111,8 @@ pub struct Soc {
     pub apbdma: apbdma::ApbDma,
     /// the camera's I²C controller, inside the display's address range
     pub i2c_vi: i2c::TegraI2c,
+    /// the monitor's own mode
+    pub monitor: Option<(u32, u32)>,
     pub smmu: smmu::Smmu,
     pub host1x: host1x::Host1x,
     pub gpu: gpu::Gpu,
@@ -213,11 +218,25 @@ impl Soc {
             self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
             let usb_reset = self.car.in_reset(xusb::RESET);
+            let dc_reset = dc::RESETS.map(|id| self.car.in_reset(id));
             self.car.write(word - CAR, value);
             if !usb_reset && self.car.in_reset(xusb::RESET) {
                 self.xusb.reset(&mut self.usb);
             }
             self.pcie.set_reset(self.car.in_reset(PCIE_X_RESET));
+            for ((d, id), was) in self.dc.iter_mut().zip(dc::RESETS).zip(dc_reset) {
+                if !was && self.car.in_reset(id) {
+                    d.reset();
+                }
+            }
+            for (s, id) in self.sor.iter_mut().zip(sor::RESETS) {
+                if self.car.in_reset(id) {
+                    *s = Default::default();
+                }
+            }
+            if self.car.in_reset(I2C_VI_RESET) {
+                self.i2c_vi.reset();
+            }
             for (c, &id) in self.i2c.iter_mut().zip(&I2C_RESETS) {
                 if self.car.in_reset(id) {
                     c.reset();
@@ -334,6 +353,7 @@ impl Soc {
         for (c, &(_, irq)) in self.i2c.iter().zip(&I2C) {
             self.gic.set_level(irq, c.irq());
         }
+        self.gic.set_level(I2C_VI_IRQ, self.i2c_vi.irq());
         for (c, &irq) in self.sd.iter().zip(&SDMMC_IRQS) {
             self.gic.set_level(irq, c.irq());
         }
@@ -407,7 +427,7 @@ impl I2cFifos<'_> {
 
 impl apbdma::Fifo for I2cFifos<'_> {
     fn ready(&mut self, apb: u64, to_peripheral: bool) -> bool {
-        self.at(apb).is_some_and(|(c, _)| to_peripheral || c.has_data())
+        self.at(apb).is_some_and(|(c, _)| if to_peripheral { c.has_room() } else { c.has_data() })
     }
     fn take(&mut self, apb: u64) -> u32 {
         self.at(apb).map_or(0, |(c, o)| c.read(o))
@@ -506,6 +526,7 @@ impl Machine {
             usb: Default::default(),
             apbdma: Default::default(),
             i2c_vi: Default::default(),
+            monitor: None,
             smmu: Default::default(),
             host1x: Default::default(),
             gpu: Default::default(),
@@ -576,7 +597,9 @@ impl Machine {
     /// Connect a monitor to HDMI.
     pub fn connect_monitor(&mut self, mode: &Mode) {
         self.soc.i2c[DDC].attach(0x50, Box::new(peripherals::dw_hdmi::EdidEeprom::new(mode)));
-        self.soc.dc.iter_mut().for_each(|d| d.clock_khz = mode.clock_khz);
+        let totals = (mode.width + mode.hfp + mode.hsync + mode.hbp, mode.height + mode.vfp + mode.vsync + mode.vbp, mode.clock_khz);
+        self.soc.dc.iter_mut().for_each(|d| d.mode = Some(totals));
+        self.soc.monitor = Some((mode.width, mode.height));
         self.soc.gpio.set_input(HDMI_HPD, false);
         self.soc.dirty = true;
     }
