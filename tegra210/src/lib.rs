@@ -929,11 +929,9 @@ impl Machine {
         }
         self.state[k] = CoreState::Run;
         let jit_off = std::mem::replace(&mut self.cpus[k].jit_off, true);
-        self.breakpoints.resume = Some((k, self.cpus[k].pc));
-        self.breakpoints.only = Some(k);
+        self.breakpoints.begin_step(k, self.cpus[k].pc);
         let stop = self.run(1);
-        self.breakpoints.only = None;
-        self.breakpoints.resume = None;
+        self.breakpoints.end_step(k);
         self.cpus[k].jit_off = jit_off;
         (!matches!(stop, Stop::Budget | Stop::Idle(_))).then_some(stop)
     }

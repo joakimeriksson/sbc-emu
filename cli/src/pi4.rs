@@ -171,10 +171,16 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     let mut out = std::io::stdout();
     // the wall clock is anchored so a restored guest's time continues where it was saved
     let mut start = Instant::now() - clock_offset;
+    // what the guest asked for while a debugger stepped it
+    let mut owed: Option<Stop> = None;
     if let Some(g) = gdb.as_mut() {
         if gdb_wait {
             g.wait_for_client();
-            if let gdb::Resume::Kill = g.halted(&mut m, 0, 5, false) { return ExitCode::SUCCESS; }
+            match g.halted(&mut m, 0, 5, false) {
+                gdb::Resume::Kill => return ExitCode::SUCCESS,
+                gdb::Resume::Stopped(stop) => owed = Some(stop),
+                _ => {}
+            }
             start = Instant::now() - Duration::from_nanos(m.now);
         }
     }
@@ -333,28 +339,37 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             let p = g.poll(&mut m);
             if !matches!(p, gdb::Poll::Running) {
                 let t0 = Instant::now();
-                if let gdb::Resume::Kill = g.halted(&mut m, 0, 2, matches!(p, gdb::Poll::Interrupt)) { break Stop::Budget; }
+                match g.halted(&mut m, 0, 2, matches!(p, gdb::Poll::Interrupt)) {
+                    gdb::Resume::Kill => break Stop::Budget,
+                    gdb::Resume::Stopped(stop) => owed = Some(stop),
+                    _ => {}
+                }
                 start += t0.elapsed(); // halted time does not count as guest idle time
             }
         }
         let budget = 2_000_000u64.min(max.saturating_sub(m.instret()));
         if budget == 0 { break Stop::Budget; }
-        if paused && !reset_req {
+        // (what the guest asked for in a step happens though the monitor has paused it)
+        if paused && !reset_req && owed.is_none() {
             // paused from the monitor: only keys move; the pause does not count as guest time
             let t0 = Instant::now();
             if let Ok(b) = rx.recv_timeout(Duration::from_millis(20)) { idle_keys.push(b); }
             start += t0.elapsed();
             continue;
         }
-        let mut stop = if std::mem::take(&mut reset_req) { Stop::Reset } else { HostMachine::Pi4(&mut m).run(budget) };
+        let mut stop = if std::mem::take(&mut reset_req) { Stop::Reset } else if let Some(stop) = owed.take() { stop } else { HostMachine::Pi4(&mut m).run(budget) };
         // a debugger looks at breakpoints and at stops that would end the run
         if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
             let hit = g.stop_signal(&stop, 0);
             if let Some((k, sig)) = hit {
                 let t0 = Instant::now();
-                if let gdb::Resume::Kill = g.halted(&mut m, k, sig, true) { break Stop::Budget; }
+                let resume = g.halted(&mut m, k, sig, true);
                 start += t0.elapsed();
-                stop = Stop::Budget;
+                stop = match resume {
+                    gdb::Resume::Kill => break Stop::Budget,
+                    gdb::Resume::Stopped(stop) => stop,
+                    _ => Stop::Budget,
+                };
             }
         }
         if let Stop::Breakpoint(_) | Stop::Watchpoint(..) = stop { stop = Stop::Budget; }
@@ -397,6 +412,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 if let Some(n) = m.soc.net.as_mut() { n.nat = None; } // free forwarded host ports
                 m = match power_on(d, u) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
                 if let Some(g) = gdb.as_ref() { g.rearm(&mut m); }
+                owed = None; // it was the old machine's
             }
             other => break other,
         }

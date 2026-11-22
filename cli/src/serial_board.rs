@@ -253,11 +253,15 @@ pub(crate) fn run<B: SerialBoard>(
     let mut escape = false;
     // `sleep SECS`: the script waits until this virtual time (ns)
     let mut sleep_until: Option<u64> = None;
+    // what the guest asked for while a debugger stepped it
+    let mut owed: Option<Stop> = None;
     if let Some(g) = gdb.as_mut().filter(|_| config.gdb_wait) {
         g.wait_for_client();
         let core = m.stopped_core();
-        if let gdb::Resume::Kill = g.halted(&mut m, core, 5, false) {
-            return Ok(());
+        match g.halted(&mut m, core, 5, false) {
+            gdb::Resume::Kill => return Ok(()),
+            gdb::Resume::Stopped(stop) => owed = Some(stop),
+            _ => {}
         }
         start = Instant::now();
         anchor = anchored(m.now());
@@ -319,6 +323,7 @@ pub(crate) fn run<B: SerialBoard>(
                 }
                 "reset" => {
                     m = make_machine()?;
+                    owed = None; // it was the old machine's
                     if let Some(g) = gdb.as_ref() {
                         g.rearm(&mut m);
                     }
@@ -403,8 +408,10 @@ pub(crate) fn run<B: SerialBoard>(
             if !matches!(p, gdb::Poll::Running) {
                 let halted = Instant::now();
                 let core = m.stopped_core();
-                if let gdb::Resume::Kill = g.halted(&mut m, core, 2, matches!(p, gdb::Poll::Interrupt)) {
-                    break Ok(());
+                match g.halted(&mut m, core, 2, matches!(p, gdb::Poll::Interrupt)) {
+                    gdb::Resume::Kill => break Ok(()),
+                    gdb::Resume::Stopped(stop) => owed = Some(stop),
+                    _ => {}
                 }
                 // halted time is neither guest idle time nor part of --timeout
                 start += halted.elapsed();
@@ -412,7 +419,10 @@ pub(crate) fn run<B: SerialBoard>(
             }
         }
         let budget = (config.max_insns.saturating_sub(m.instret())).min(1_000_000);
-        let mut stop = m.host().run(budget);
+        let mut stop = match owed.take() {
+            Some(stop) => stop,
+            None => m.host().run(budget),
+        };
         if let Some(a) = audio.as_mut() {
             let (rate, samples) = m.take_audio();
             a.push(rate, &samples);
@@ -431,12 +441,14 @@ pub(crate) fn run<B: SerialBoard>(
         if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
             if let Some((core, sig)) = g.stop_signal(&stop, m.stopped_core()) {
                 let halted = Instant::now();
-                if let gdb::Resume::Kill = g.halted(&mut m, core, sig, true) {
-                    break Ok(());
-                }
+                let resume = g.halted(&mut m, core, sig, true);
                 start += halted.elapsed();
                 anchor += halted.elapsed();
-                stop = Stop::Budget;
+                stop = match resume {
+                    gdb::Resume::Kill => break Ok(()),
+                    gdb::Resume::Stopped(stop) => stop,
+                    _ => Stop::Budget,
+                };
             }
         }
         if let Stop::Breakpoint(_) | Stop::Watchpoint(..) = stop {

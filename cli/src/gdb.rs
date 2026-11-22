@@ -7,7 +7,13 @@ use sbc_machine::Stop;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-pub enum Resume { Continue, Detach, Kill }
+pub enum Resume {
+    Continue,
+    Detach,
+    Kill,
+    /// as Continue, but the guest has asked for this while it was stepped: it happens now
+    Stopped(Stop),
+}
 
 pub enum Poll { Running, Attached, Interrupt }
 
@@ -23,6 +29,8 @@ pub struct Gdb {
     pub reason: String,
     /// what the debugger has set: (0 a breakpoint or a watch kind, address, length)
     points: Vec<(u8, u64, u64)>,
+    /// a reset or power-off the guest asked for in a stepped instruction
+    asked: Option<Stop>,
 }
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
@@ -125,9 +133,8 @@ impl Target for bcm2711::Machine {
     fn read(&mut self, c: usize, va: u64, len: usize) -> Option<Vec<u8>> { self.debug_read(c, va, len) }
     fn write(&mut self, c: usize, va: u64, data: &[u8]) -> bool { self.debug_write(c, va, data) }
     fn breakpoint(&mut self, addr: u64, insert: bool) {
-        self.breakpoints.retain(|&x| x != addr);
-        if insert { self.breakpoints.push(addr); }
-        let on = !self.breakpoints.is_empty() || !self.cpus[0].watch.is_empty();
+        self.breakpoints.set(addr, insert);
+        let on = !self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty();
         self.set_debugging(on);
     }
     fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) { bcm2711::Machine::watchpoint(self, addr, len, kind, insert) }
@@ -292,7 +299,7 @@ impl Target for ::esp32s31::Machine {
         match n {
             0 => {}
             1..=31 => h.x[n] = v,
-            32 => h.pc = v,
+            32 => { h.pc = v; self.debug_moved(c); }
             33..=64 => h.f[n - 33] = v,
             65 => h.fcsr = h.fcsr & !0x1f | v & 0x1f,
             66 => h.fcsr = h.fcsr & !0xe0 | (v & 7) << 5,
@@ -309,6 +316,8 @@ impl Target for ::esp32s31::Machine {
         match self.debug_step(c)? {
             esp_soc::Stop::Watchpoint(k, a, kind) => Some(Stop::Watchpoint(k, a as u64, kind)),
             esp_soc::Stop::Unimplemented(pc, i) => Some(Stop::Unimplemented(pc as u64, i)),
+            // done in place, as when it runs
+            esp_soc::Stop::SwReset => { self.reboot(); None }
             _ => None,
         }
     }
@@ -320,7 +329,7 @@ impl Gdb {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         eprintln!("[sbc-emu] gdb stub on 127.0.0.1:{port} (gdb: target remote :{port}; lldb: gdb-remote {port})");
-        Ok(Gdb { listener, conn: None, rx: Vec::new(), thread: 0, no_ack: false, reason: String::new(), points: Vec::new() })
+        Ok(Gdb { listener, conn: None, rx: Vec::new(), thread: 0, no_ack: false, reason: String::new(), points: Vec::new(), asked: None })
     }
 
     pub fn connected(&self) -> bool { self.conn.is_some() }
@@ -405,6 +414,13 @@ impl Gdb {
     /// The guest is stopped (by `sig` on core `core`): serve the debugger until it resumes.
     /// `announce`: report the stop now (breakpoint, Ctrl-C); a fresh attach waits for "?".
     pub fn halted(&mut self, m: &mut dyn Target, core: usize, sig: u8, announce: bool) -> Resume {
+        match self.serve(m, core, sig, announce) {
+            Resume::Kill => Resume::Kill,
+            r => self.asked.take().map_or(r, Resume::Stopped),
+        }
+    }
+
+    fn serve(&mut self, m: &mut dyn Target, core: usize, sig: u8, announce: bool) -> Resume {
         if self.conn.is_none() { return Resume::Continue; }
         let mut stopped = (sig, core);
         if announce { self.stop_reply(sig, core); }
@@ -529,7 +545,13 @@ impl Gdb {
 
     /// One instruction on core `c`; the stop to report.
     fn step(&mut self, m: &mut dyn Target, c: usize) -> (u8, usize) {
-        let r = m.step(c);
+        // nothing more is executed once the guest has asked for a reset
+        let r = if self.asked.is_some() { None } else { m.step(c) };
+        if let Some(s @ (Stop::Reset | Stop::PowerOff)) = r {
+            let what = if s == Stop::Reset { "a reset" } else { "power-off" };
+            self.send(&format!("O{}", hex(format!("the guest asks for {what}: it happens on continue\n").as_bytes())));
+            self.asked = Some(s);
+        }
         if let Some(Stop::Watchpoint(_, a, kind)) = r { self.reason = watch_reason(a, kind); }
         let sig = match r { Some(Stop::Unimplemented(..)) => 4, _ => 5 };
         self.stop_reply(sig, c);
@@ -929,6 +951,170 @@ mod tests {
     }
 
     fn run_some(m: &mut rockchip_rk3288::Machine) { let _ = Host::TinkerBoard(m).run(3_000); }
+
+    /// A core stopped at a breakpoint goes on from there though another was stepped meanwhile.
+    #[track_caller]
+    fn stopped_elsewhere<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, cores: (usize, usize), code: u64, counter: usize) {
+        for _ in 0..4 { let _ = run(m, 200_000); }
+        m.breakpoint(code + 8, true);
+        let k = match run(m, 200_000) { Stop::Breakpoint(k) => k, other => panic!("{other:?}") };
+        let other = if k == cores.0 { cores.1 } else { cores.0 };
+        let before = reg(m, k, counter);
+        // the other may stand at the breakpoint too, and step off it
+        for _ in 0..5 { m.step(other); }
+        // no turn of core k may end before it has gone round once
+        for _ in 0..50 {
+            if run(m, 200_000) == Stop::Breakpoint(k) { break; }
+        }
+        assert_eq!((pc(m, k), reg(m, k, counter)), (code + 8, before + 1), "core {k}");
+    }
+
+    #[test]
+    fn a_core_at_a_breakpoint_while_another_is_stepped() {
+        let mut m = rk3588::Machine::with_cpus(128 << 20, 2).unwrap();
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        for k in 0..2 {
+            m.state[k] = rk3588::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+        }
+        stopped_elsewhere(&mut m, |m, n| Host::OrangePi5(m).run(n), (0, 1), 0x20_0000, 1);
+
+        let mut m = allwinner_h3::Machine::with_ram_size(128 << 20);
+        let base = m.soc.ram.base as u32;
+        place(&mut m.soc.ram.mem, 0x20_0000, A32);
+        for k in 0..2 {
+            m.state[k] = allwinner_h3::CoreState::Run;
+            (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000 + 64 * k as u32);
+        }
+        stopped_elsewhere(&mut m, |m, n| Host::OrangePiOne(m).run(n), (0, 1), base as u64 + 0x20_0000, 1);
+
+        let mut m = starfive_jh7110::Machine::new(64 << 20);
+        m.load(0x4020_0000, &RV.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        for k in 1..3 {
+            m.state[k] = starfive_jh7110::HartState::Run;
+            (m.harts[k].pc, m.harts[k].x[12]) = (0x4020_0000, 0x4030_0000 + 64 * k as u64);
+        }
+        stopped_elsewhere(&mut m, |m, n| Host::OrangePiRv(m).run(n), (1, 2), 0x4020_0000, 11);
+
+        let mut m = bcm2711::Machine::with_cpus(65 << 20, 2);
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        for k in 0..2 {
+            m.state[k] = bcm2711::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+        }
+        stopped_elsewhere(&mut m, |m, n| Host::Pi4(m).run(n), (0, 1), 0x20_0000, 1);
+    }
+
+    /// A core that was stopped at a breakpoint, and then taken elsewhere (the breakpoint removed, or
+    /// its pc set), stops there the next time it comes by, even if another was stepped meanwhile.
+    #[track_caller]
+    fn comes_by_again<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, cores: (usize, usize), code: u64, counter: usize, pc_reg: usize) {
+        for moved in [false, true] {
+            for _ in 0..4 { let _ = run(m, 200_000); }
+            m.breakpoint(code + 8, true);
+            let k = match run(m, 400_000) { Stop::Breakpoint(k) => k, other => panic!("{other:?}") };
+            let other = if k == cores.0 { cores.1 } else { cores.0 };
+            if moved {
+                let word = m.reg(k, pc_reg).unwrap().len();
+                assert!(m.set_reg(k, pc_reg, &(code + 12).to_le_bytes()[..word]));
+            } else {
+                m.breakpoint(code + 8, false);
+                // past it
+                for _ in 0..2 { assert_eq!(m.step(k), None); }
+            }
+            for _ in 0..3 { m.step(other); }
+            if !moved { m.breakpoint(code + 8, true); }
+            let before = reg(m, k, counter);
+            for _ in 0..100 { if run(m, 200_000) == Stop::Breakpoint(k) { break; } }
+            assert_eq!((pc(m, k), reg(m, k, counter)), (code + 8, before + 1), "moved {moved}, core {k}");
+            m.breakpoint(code + 8, false);
+        }
+    }
+
+    #[test]
+    fn a_breakpoint_come_by_again() {
+        let mut m = bcm2711::Machine::with_cpus(65 << 20, 2);
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        for k in 0..2 {
+            m.state[k] = bcm2711::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+        }
+        comes_by_again(&mut m, |m, n| Host::Pi4(m).run(n), (0, 1), 0x20_0000, 1, 32);
+
+        let mut m = allwinner_h3::Machine::with_ram_size(128 << 20);
+        let base = m.soc.ram.base as u32;
+        place(&mut m.soc.ram.mem, 0x20_0000, A32);
+        for k in 0..2 {
+            m.state[k] = allwinner_h3::CoreState::Run;
+            (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000 + 64 * k as u32);
+        }
+        comes_by_again(&mut m, |m, n| Host::OrangePiOne(m).run(n), (0, 1), base as u64 + 0x20_0000, 1, 15);
+
+        // one running core: the step of the other (off) does nothing, as on the chip
+        let mut m = ::esp32s31::machine([2, 0, 0, 0, 0, 1], 16 << 20);
+        let sram = ::esp32s31::bus::SRAM_BASE as u64;
+        for (k, w) in RV.iter().enumerate() { assert!(Target::write(&mut m, 0, sram + 0x1000 + 4 * k as u64, &w.to_le_bytes())); }
+        m.cores[0].pc = sram as u32 + 0x1000;
+        m.cores[0].x[12] = sram as u32 + 0x2000;
+        comes_by_again(&mut m, |m, n| Host::Esp32S31(m).run(n), (0, 1), sram + 0x1000, 11, 32);
+    }
+
+    /// Stepping through a load-reserved/store-conditional loop gets through it; a step of another
+    /// hart in between ends the reservation.
+    #[test]
+    fn lr_sc_by_steps() {
+        let mut m = starfive_jh7110::Machine::new(64 << 20);
+        // 0: lr.d a3, (a2); addi a3, a3, 1; sc.d a4, a3, (a2); bnez a4, 0b; addi a1, a1, 1; j 0b
+        let code = [0x1006_36afu32, 0x0016_8693, 0x18d6_372f, 0xfe07_1ae3, 0x0015_8593, 0xfedf_f06f];
+        m.load(0x4020_0000, &code.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        for k in 1..3 {
+            m.state[k] = starfive_jh7110::HartState::Run;
+            (m.harts[k].pc, m.harts[k].x[12]) = (0x4020_0000, 0x4030_0000);
+        }
+        for _ in 0..600 { assert_eq!(m.debug_step(1), None); }
+        assert_eq!(m.harts[1].x[11], 100);
+        // both in turn, one instruction each: no increment is lost
+        for _ in 0..600 { for k in 1..3 { assert_eq!(m.debug_step(k), None); } }
+        let total = u64::from_le_bytes(m.debug_read(1, 0x4030_0000, 8).unwrap().try_into().unwrap());
+        let done = m.harts[1].x[11] + m.harts[2].x[11];
+        assert!((done..=done + 2).contains(&total), "{total} in memory, {done} counted");
+    }
+
+    /// However many steps one core takes, the others are not behind it.
+    #[test]
+    fn one_clock_for_all_cores() {
+        let mut m = bcm2711::Machine::with_cpus(65 << 20, 2);
+        place(&mut m.soc.ram, 0x20_0000, [0xd53b_e023, 0xd503_201f, 0xd503_201f, 0x17ff_fffd]); // mrs x3, cntpct_el0; nop; nop; b
+        for k in 0..2 {
+            m.state[k] = bcm2711::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc) = (1, 0x20_0000);
+        }
+        for _ in 0..100_000 { assert_eq!(m.debug_step(0), None); }
+        for _ in 0..4 { assert_eq!(m.debug_step(1), None); }
+        let (a, b) = (m.cpus[0].x[3], m.cpus[1].x[3]);
+        assert!(a > 5000 && b >= a, "core 0 read {a}, core 1 then {b}");
+    }
+
+    /// A reset or power-off the guest asks for in a stepped instruction is not lost: it happens
+    /// when the debugger lets the machine go on, and nothing more is executed before.
+    #[test]
+    fn a_reset_in_a_step() {
+        for end in ["vCont;c", "D"] {
+            let mut g = Gdb::listen(0).unwrap();
+            let mut c = TcpStream::connect(g.listener.local_addr().unwrap()).unwrap();
+            for body in ["vCont;s:1", "vCont;s:1", end] {
+                let sum = body.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+                write!(c, "${body}#{sum:02x}").unwrap();
+            }
+            // smc #0: SYSTEM_RESET; then add x1, x1, #1
+            let mut m = rk3588::Machine::with_cpus(128 << 20, 1).unwrap();
+            place(&mut m.soc.ram, 0x20_0000, [0xd400_0003, 0x9100_0421, 0x9100_0421, 0x9100_0421]);
+            (m.cpus[0].el, m.cpus[0].pc, m.cpus[0].x[0]) = (1, 0x20_0000, 0x8400_0009);
+            while !g.connected() { g.poll(&mut m); }
+            assert!(matches!(g.halted(&mut m, 0, 2, false), Resume::Stopped(Stop::Reset)), "{end}");
+            assert_eq!(m.cpus[0].x[1], 0, "nothing ran after the reset was asked for");
+        }
+    }
 
     /// Records what is set on it.
     #[derive(Default)]
