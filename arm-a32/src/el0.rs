@@ -504,4 +504,49 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bus.device.mem[0x808..0x80c].try_into().unwrap()), 0x0002_2111);
         assert_eq!(bus.ram.mem, before);
     }
+
+    /// Compiled user code in RAM at 0x8000_0000 that the program rewrites, with a plain store
+    /// and (cores on host threads) a store-exclusive: the block is dropped. The JIT's keys are
+    /// RAM offsets, so `ram_key` must find the page.
+    #[test]
+    fn compiled_code_rewritten_in_ram_above_zero() {
+        // at 0x3000: str r2, [r1]; subs r3, r3, #1; bne 0x1000; svc #0
+        rewrite_compiled_code(false, &[0xe581_2000, 0xe253_3001, 0x1aff_f7fc, 0xef00_0000]);
+        // at 0x3000: ldrex r4, [r1]; strex r4, r2, [r1]; subs; bne; svc
+        rewrite_compiled_code(true, &[0xe191_4f9f, 0xe181_4f92, 0xe253_3001, 0x1aff_f7fb, 0xef00_0000]);
+    }
+
+    fn rewrite_compiled_code(mt: bool, store: &[u32]) {
+        const BASE: u64 = 0x8000_0000;
+        let mut mem = vec![0u8; 0x10000];
+        let mut put = |a: usize, w: u32| mem[a..a + 4].copy_from_slice(&w.to_le_bytes());
+        put(0x1000, 0xe3a0_0001); // mov r0, #1 (rewritten to #2)
+        put(0x1004, 0xea00_07fd); // b 0x3000
+        for (i, &w) in store.iter().enumerate() {
+            put(0x3000 + 4 * i, w);
+        }
+        let mut bus = HighBus { base: BASE, mem, accesses: 0 };
+        let mut cpu = Cpu::new_el0();
+        let len = bus.mem.len() as u32;
+        // SAFETY: `bus.mem` outlives `cpu`
+        unsafe { cpu.el0_setup(bus.mem.as_mut_ptr(), BASE, len as u64, mt) };
+        if !cpu.enable_jit(crate::jit::CodeWatch::new(0, len)) {
+            return; // no JIT on this host
+        }
+        cpu.jit_set_hot(1);
+        // first with the store going elsewhere, so the block is compiled and stays compiled;
+        // then onto the block itself: the second pass must run the new instruction
+        for (target, passes, expect) in [(0x2000, 8, 1), (0x1000, 2, 2)] {
+            cpu.r[15] = 0x1000;
+            cpu.r[1] = target;
+            cpu.r[2] = 0xe3a0_0002; // mov r0, #2
+            cpu.r[3] = passes;
+            let ended = (0..1000).any(|_| cpu.step_el0(&mut bus, &mut Host { base: BASE }).is_err());
+            assert!(ended, "the program reaches its SVC");
+            assert_eq!(cpu.r[3], 0);
+            assert_eq!(cpu.r[0], expect, "mt {mt}");
+            assert!(cpu.jit_stats().unwrap().0 > 0, "the code is compiled");
+        }
+        assert!(cpu.jit_stats().unwrap().2 > 0, "the rewritten block is dropped");
+    }
 }
