@@ -63,7 +63,7 @@ impl Launch {
 }
 
 /// The largest workgroup (threads), the most local memory of one, and the most instructions (of
-/// sixteen threads each) in a workgroup and in a launch: programs that do not end are stopped.
+/// sixteen threads each) for sixteen threads and in a launch: programs that do not end are stopped.
 const MAX_THREADS: u64 = 4096;
 const MAX_LOCAL: usize = 1 << 28;
 const FUEL: u64 = 400_000_000;
@@ -193,7 +193,7 @@ impl Compute {
                 for x in 0..launch.groups[0] {
                     self.shared.fill(0);
                     let mut left: Vec<bool> = vec![true; batches];
-                    let start = FUEL.min(left_fuel);
+                    let start = (FUEL * batches as u64).min(left_fuel);
                     let mut fuel = start;
                     for (b, l) in self.lanes[..batches].iter_mut().enumerate() {
                         let n = (threads as usize - b * L).min(L);

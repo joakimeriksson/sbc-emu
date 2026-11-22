@@ -56,7 +56,7 @@ impl Targets {
                 continue;
             }
             let mut s = Surface::new(t.address(base), width, height, mode, t.r(base + 0x1c) as u64 * 4, format.bytes as u32, if mode >> 12 & 1 != 0 { MsMode::X1 } else { ms });
-            let first = t.r(base + 0x20);
+            let first = t.r(base + 0x20) & 0xffff;
             if s.is_3d {
                 s.first_slice = first;
             } else {
@@ -67,8 +67,8 @@ impl Targets {
         }
         let zeta = (t.r(0x1538) & 1 != 0).then(|| zeta_format(t.r(0xfe8))).flatten().map(|format| {
             let mut s = Surface::new(t.address(0xfe0), t.r(0x1228), t.r(0x122c), t.r(0xfec) & 0xfff, t.r(0xff0) as u64 * 4, format.bytes as u32, ms);
-            s.address += s.layer_stride * t.r(0x179c) as u64;
-            layers = layers.min(count(t.r(0x1230), t.r(0x179c)));
+            s.address += s.layer_stride * (t.r(0x179c) & 0xffff) as u64;
+            layers = layers.min(count(t.r(0x1230), t.r(0x179c) & 0xffff));
             (s, format)
         });
         let (h, v) = (t.r(0xff4), t.r(0xff8));

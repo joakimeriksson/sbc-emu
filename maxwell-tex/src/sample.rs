@@ -341,7 +341,8 @@ impl<M: Memory + ?Sized> Ctx<'_, M> {
     fn cube_quad(&mut self, mip: &Mip, p: &Pos) -> ([[u32; 4]; 4], [u32; 2]) {
         let n = mip.width as i32;
         let fixed = |c: f32| (c.clamp(-2.0, 2.0) * n as f32 * 256.0 - 127.5).floor() as i32;
-        let (fx, fy) = (fixed(p.c[0]), fixed(p.c[1]));
+        // (no more than a texel past an edge, as anisotropic probes may be: one corner at most is missing)
+        let (fx, fy) = (fixed(p.c[0]).clamp(-256, 256 * n - 1), fixed(p.c[1]).clamp(-256, 256 * n - 1));
         let (x0, y0) = (fx >> 8, fy >> 8);
         let mut out = [[0; 4]; 4];
         let mut corner = None;
@@ -584,9 +585,10 @@ fn lambdas(tex: &Texture, a: &Args, normalized: bool, aniso: u32) -> ([f32; LANE
         let (dx, dy) = derivatives(tex, a, normalized, lane);
         let (x2, y2) = (dot(dx), dot(dy));
         let (long, short, axis) = if x2 >= y2 { (x2, y2, dx) } else { (y2, x2, dy) };
-        if aniso > 1 && long > 1.0 {
+        if aniso > 1 && long > 0.0 {
             let n = ((long / short.max(1e-12)).sqrt().ceil()).clamp(1.0, aniso as f32);
-            probes[lane] = (n as u32, axis);
+            // (less than a texel long: nothing to average)
+            probes[lane] = (if long > 1.0 { n as u32 } else { 1 }, axis);
             // The probes cover the long axis, unless that takes too many.
             return 0.5 * (long / (n * n)).max(short).log2();
         }
