@@ -8,6 +8,6 @@ serial head -n1 /sys/class/drm/card0-HDMI-A-1/modes | grep -q 1280x720 && printf
 wait-serial EDID_OK
 serial cat /sys/class/graphics/fb0/virtual_size | grep -q 1280,720 && printf 'FB_%s' OK; echo\r
 wait-serial FB_OK
-serial cat /dev/urandom | head -c 3686400 > /dev/fb0; head -c 3686400 /dev/fb0 | md5sum > /tmp/a; sleep 1; head -c 3686400 /dev/fb0 | md5sum | cmp - /tmp/a && printf 'RW_%s' OK; echo\r
+serial echo 0 > /sys/class/graphics/fbcon/cursor_blink; sleep 1; cat /dev/urandom | head -c 3686400 > /dev/fb0; head -c 3686400 /dev/fb0 | md5sum > /tmp/a; sleep 1; head -c 3686400 /dev/fb0 | md5sum | cmp - /tmp/a && printf 'RW_%s' OK; echo\r
 wait-serial RW_OK
 quit
