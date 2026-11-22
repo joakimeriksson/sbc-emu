@@ -148,6 +148,19 @@ impl Target for rk3588::Machine {
     fn describe(&self, c: usize) -> String { format!("CPU#{c} {} {:?} EL{}", if c < 4 { "Cortex-A55" } else { "Cortex-A76" }, self.state[c], self.cpus[c].el) }
 }
 
+impl Target for tegra210::Machine {
+    fn cores(&self) -> usize { self.cpus.len() }
+    fn layout(&self) -> Layout { a64_layout() }
+    fn reg(&self, c: usize, n: usize) -> Option<Vec<u8>> { a64_reg(&self.cpus[c], n) }
+    fn set_reg(&mut self, c: usize, n: usize, b: &[u8]) -> bool { a64_set_reg(&mut self.cpus[c], n, b).is_some() }
+    fn read(&mut self, c: usize, va: u64, len: usize) -> Option<Vec<u8>> { self.debug_read(c, va, len) }
+    fn write(&mut self, c: usize, va: u64, data: &[u8]) -> bool { self.debug_write(c, va, data) }
+    fn breakpoint(&mut self, addr: u64, insert: bool) { self.debug_breakpoint(addr, insert) }
+    fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) { self.debug_watch(addr, len, kind, insert) }
+    fn step(&mut self, c: usize) -> Option<Stop> { self.debug_step(c) }
+    fn describe(&self, c: usize) -> String { format!("CPU#{c} {:?} EL{}", self.state[c], self.cpus[c].el) }
+}
+
 // ---------------------------------------------------------------- 32-bit Arm
 
 fn a32_layout() -> Layout {
@@ -623,6 +636,41 @@ mod tests {
         m.cpus[0].pc = 0x20_0000;
         m.cpus[0].x[2] = 0x30_0000;
         exercise(&mut m, |m, n| Host::OrangePi5(m).run(n), 0, A64, 0x20_0000, 0x30_0000, 1);
+    }
+
+    /// RAM starts at 2 GiB (an offset in it is not its address) and reaches past 4 GiB.
+    #[test]
+    fn jetson_nano() {
+        for at in [0x8020_0000u64, 0x1_4020_0000] {
+            let mut m = tegra210::Machine::with_cpus(4 << 30, 2).unwrap();
+            m.enable_jit();
+            place(&mut m.soc.ram, (at - tegra210::RAM_BASE) as usize, A64);
+            m.cpus[0].el = 1;
+            m.cpus[0].pc = at;
+            m.cpus[0].x[2] = at + 0x10_0000;
+            exercise(&mut m, |m, n| Host::JetsonNano(m).run(n), 0, A64, at, at + 0x10_0000, 1);
+            // device registers are not read, so looking changes nothing
+            assert!(Target::read(&mut m, 0, tegra210::UARTA, 4).is_none());
+            assert!(m.soc.stub_pages.is_empty());
+            // what a debugger set is not lost, nor is --no-jit, and the JIT comes back
+            assert!(!m.cpus[0].jit_off);
+            m.set_jit(false);
+            m.breakpoint(at, true);
+            m.breakpoint(at, false);
+            assert!(m.cpus.iter().all(|c| c.jit_off));
+            // a secondary core that starts keeps the watch ranges
+            m.watchpoint(at + 0x10_0000, 4, 1, true);
+            m.cpus[0].x[0] = 0xc400_0003; // PSCI CPU_ON
+            m.cpus[0].x[1] = tegra210::core_mpidr(1) & 0xff;
+            m.cpus[0].x[2] = at;
+            m.cpus[0].x[3] = 0;
+            let smc = 0xd400_0003u32.to_le_bytes();
+            assert!(Target::write(&mut m, 0, at + 0x1000, &smc));
+            m.cpus[0].pc = at + 0x1000;
+            assert_eq!(m.step(0), None);
+            assert_eq!(m.state[1], tegra210::CoreState::Run);
+            assert_eq!(m.cpus[1].watch, [(at + 0x10_0000, 4, 1)]);
+        }
     }
 
     #[test]

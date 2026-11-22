@@ -595,8 +595,9 @@ unsafe extern "C" fn h_tlb(cpu: *mut Cpu, va: u64, arg: u64) -> u32 {
     };
     let bus = &mut *cpu.jit_bus.expect("bus");
     let Ok(pa) = cpu.translate(bus, va, acc) else { return 0 };
-    if cpu.ram.is_null() || (pa | 0xfff) >= cpu.ram_len { return 0; }
-    cpu.utlb_fill(k, va, tag, pa & !0xfff);
+    let off = pa.wrapping_sub(cpu.ram_base);
+    if cpu.ram.is_null() || (off | 0xfff) >= cpu.ram_len { return 0; }
+    cpu.utlb_fill(k, va, tag, off & !0xfff);
     1
 }
 
@@ -875,8 +876,9 @@ impl Cpu {
             Some(t) => t,
             None => {
                 let pa = self.translate(bus, self.pc, crate::mmu::Access::Exec).ok()?;
-                if self.ram.is_null() || (pa | 0xfff) >= self.ram_len { return None; }
-                self.utlb_fill(0, self.pc, tag, pa & !0xfff)
+                let off = pa.wrapping_sub(self.ram_base);
+                if self.ram.is_null() || (off | 0xfff) >= self.ram_len { return None; }
+                self.utlb_fill(0, self.pc, tag, off & !0xfff)
             }
         };
         let pa = self.utlb[0][ti].1 | (self.pc & 0xfff);

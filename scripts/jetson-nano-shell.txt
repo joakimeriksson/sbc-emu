@@ -1,0 +1,21 @@
+# Jetson Nano bring-up check (docs/jetson-nano-plan.md): the BusyBox shell on the serial
+# console, all four cores online, each on its own Tegra timer, the board's model, 4 GiB. Each
+# value is waited for: a prompt alone is not enough. (The quotes keep the echoed command line
+# from matching.)
+#   sh scripts/jetson-nano-fixture.sh cache/jetson-nano
+#   sbc-emu run --board jetson-nano --kernel cache/jetson-nano/vmlinuz \
+#     --dtb cache/jetson-nano/tegra210-p3450-0000.dtb --initrd cache/jetson-nano/initramfs.cpio.gz \
+#     --script scripts/jetson-nano-shell.txt --timeout 120
+wait-serial TEGRA210_BOOT_OK
+sleep 2
+serial printf 'ARCH_%s' $(uname -m); echo\r
+wait-serial ARCH_aarch64
+serial printf 'CPUS_%s' $(nproc); echo\r
+wait-serial CPUS_4
+serial awk '/tegra_timer/ { c = $1 - 9; if ($(c + 1) > 0) n++ } END { printf "TICK_%s%d", "ON", n }' /proc/interrupts; echo\r
+wait-serial TICK_ON4
+serial cat /proc/device-tree/model; echo\r
+wait-serial NVIDIA Jetson Nano Developer Kit
+serial awk '/MemTotal/ { printf "MEM_%s%d", "GB", ($2 + 524288) / 1048576 }' /proc/meminfo; echo\r
+wait-serial MEM_GB4
+quit

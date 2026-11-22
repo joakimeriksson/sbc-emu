@@ -128,13 +128,19 @@ impl Cpu {
 
     /// Is `pa` (physical) in the RAM the host pointer covers?
     #[inline(always)]
-    pub(crate) fn in_ram(&self, pa: u32) -> bool {
-        !self.ram.is_null() && pa.wrapping_sub(self.ram_base) < self.ram_len
+    pub(crate) fn in_ram(&self, pa: u64) -> bool {
+        !self.ram.is_null() && pa.wrapping_sub(self.ram_phys) < self.ram_len as u64
+    }
+
+    /// The JIT's 32-bit key of RAM address `pa` (`in_ram`): see `ram_phys`.
+    #[inline(always)]
+    pub(crate) fn ram_key(&self, pa: u64) -> u32 {
+        (pa.wrapping_sub(self.ram_phys) as u32).wrapping_add(self.ram_base)
     }
 
     /// Remember a checked translation of RAM in the micro-TLB. Pages holding compiled
     /// code never enter the write table, so every store to them reaches `code_written`.
-    fn utlb_fill(&mut self, va: u32, pa: u32, kind: usize) {
+    fn utlb_fill(&mut self, va: u32, pa: u64, kind: usize) {
         // while a debugger watches, data accesses take the slow path, which checks them
         if !self.watch.is_empty() && kind != U_EXEC {
             return;
@@ -143,19 +149,23 @@ impl Cpu {
             self.io = true;
             return;
         }
-        if kind == U_WRITE && self.jit.as_ref().is_some_and(|j| j.watch.is_code(pa)) {
+        if kind == U_WRITE && self.jit.as_ref().is_some_and(|j| j.watch.is_code(self.ram_key(pa))) {
             return;
         }
-        let host = self.ram as u64 + (pa & !0xfff).wrapping_sub(self.ram_base) as u64;
+        let host = self.ram as u64 + (pa & !0xfff).wrapping_sub(self.ram_phys);
         self.utlb[utlb_table(self.privileged(), kind) * UT + (va >> 12) as usize % UT] =
             Utlb { tag: (va & !0xfff) as u64, delta: host.wrapping_sub((va & !0xfff) as u64) };
     }
 
     /// A store reached physical `pa` through the slow path: drop compiled code there.
-    fn code_written(&mut self, pa: u32) {
+    fn code_written(&mut self, pa: u64) {
+        if !self.in_ram(pa) {
+            return; // code is only compiled from RAM
+        }
+        let key = self.ram_key(pa);
         if let Some(j) = self.jit.as_ref() {
-            if j.watch.is_code(pa) {
-                j.watch.invalidate(pa);
+            if j.watch.is_code(key) {
+                j.watch.invalidate(key);
             }
         }
     }
@@ -256,7 +266,7 @@ impl Cpu {
         bus: &mut dyn Bus,
         va: u32,
         access: Access,
-    ) -> Result<u32, (u32, u32)> {
+    ) -> Result<u64, (u32, u32)> {
         if self.el1.is_some() {
             let access = match access {
                 Access::Read => crate::el0::El0Access::Read,
@@ -266,7 +276,7 @@ impl Cpu {
             return self.el0_translate(bus, va, access);
         }
         if self.sctlr & 1 == 0 {
-            return Ok(va);
+            return Ok(va as u64);
         }
         let slot = (va >> 12) as usize % TLB_ENTRIES;
         let entry = if self.tlb[slot].tag == va >> 12 {
@@ -277,7 +287,7 @@ impl Cpu {
             entry
         };
         self.check(&entry, access).map_err(|status| (va, status))?;
-        Ok(entry.pa_page | (va & 0xfff))
+        Ok((entry.pa_page | (va & 0xfff)) as u64)
     }
 
     /// Set or clear a debugger's watch range (`emu_core::debug::Watch::set`).
@@ -298,7 +308,7 @@ impl Cpu {
         bus: &mut dyn Bus,
         va: u32,
         access: Access,
-    ) -> Result<u32, (u32, u32)> {
+    ) -> Result<u64, (u32, u32)> {
         let pa = self.translate(bus, va, access)?;
         let kind = match access {
             Access::Read => U_READ,
@@ -322,7 +332,7 @@ impl Cpu {
         }
         if !self.watch.is_empty() && access == Access::Read { self.watch.check(va as u64, 1, emu_core::debug::WATCH_READ); }
         let physical = self.translate_fill(bus, va, access)?;
-        bus.read8(physical as u64).map_err(|_| (va, 0x08))
+        bus.read8(physical).map_err(|_| (va, 0x08))
     }
 
     fn crosses_page(&self, va: u32, size: u32) -> bool {
@@ -341,7 +351,7 @@ impl Cpu {
             return Ok(u16::from_le_bytes([lo, hi]));
         }
         let physical = self.translate_fill(bus, va, Access::Read)?;
-        bus.read16(physical as u64).map_err(|_| (va, 0x08))
+        bus.read16(physical).map_err(|_| (va, 0x08))
     }
 
     pub(crate) fn mem_read32(
@@ -364,7 +374,7 @@ impl Cpu {
             return Ok(u32::from_le_bytes(bytes));
         }
         let physical = self.translate_fill(bus, va, access)?;
-        bus.read32(physical as u64).map_err(|_| (va, 0x08))
+        bus.read32(physical).map_err(|_| (va, 0x08))
     }
 
     fn invalidate_exclusive(&mut self, va: u32) {
@@ -393,7 +403,7 @@ impl Cpu {
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
-        bus.write8(physical as u64, value).map_err(|_| (va, 0x08))
+        bus.write8(physical, value).map_err(|_| (va, 0x08))
     }
 
     pub(crate) fn mem_write16(
@@ -420,7 +430,7 @@ impl Cpu {
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
-        bus.write16(physical as u64, value).map_err(|_| (va, 0x08))
+        bus.write16(physical, value).map_err(|_| (va, 0x08))
     }
 
     pub(crate) fn mem_write32(
@@ -447,6 +457,6 @@ impl Cpu {
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
-        bus.write32(physical as u64, value).map_err(|_| (va, 0x08))
+        bus.write32(physical, value).map_err(|_| (va, 0x08))
     }
 }

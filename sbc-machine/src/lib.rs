@@ -18,6 +18,7 @@ pub enum Machine<'a> {
     TinkerBoard(&'a mut rockchip_rk3288::Machine),
     OrangePiRv(&'a mut starfive_jh7110::Machine),
     Esp32S31(&'a mut esp32s31::Machine),
+    JetsonNano(&'a mut tegra210::Machine),
 }
 
 /// Virtual time of an ESP32-S31 in nanoseconds (320 MHz cycles).
@@ -62,6 +63,7 @@ impl Machine<'_> {
             Self::TinkerBoard(m) => m.run(budget),
             Self::OrangePiRv(m) => m.run(budget),
             Self::Esp32S31(m) => s31_run(m, budget),
+            Self::JetsonNano(m) => m.run(budget),
         }
     }
 
@@ -76,6 +78,7 @@ impl Machine<'_> {
             Self::OrangePiRv(m) => m.idle_until(time_ns),
             // its time only moves as it runs (and skips ahead while both harts wait)
             Self::Esp32S31(_) => {}
+            Self::JetsonNano(m) => m.idle_until(time_ns),
         }
     }
 
@@ -96,6 +99,7 @@ impl Machine<'_> {
                 }
                 ready
             }
+            Self::JetsonNano(m) => m.serial_input(byte),
             Self::Pi4(m) => {
                 if !m.soc.uart.rx_room() {
                     return false;
@@ -116,6 +120,7 @@ impl Machine<'_> {
             Self::TinkerBoard(m) => m.serial_output(),
             Self::OrangePiRv(m) => m.serial_output(),
             Self::Esp32S31(m) => &m.console.uart0,
+            Self::JetsonNano(m) => m.serial_output(),
         }
     }
 
@@ -127,6 +132,7 @@ impl Machine<'_> {
             Self::TinkerBoard(m) => m.take_serial_output(),
             Self::OrangePiRv(m) => m.take_serial_output(),
             Self::Esp32S31(m) => std::mem::take(&mut m.console.uart0),
+            Self::JetsonNano(m) => m.take_serial_output(),
         }
     }
 }

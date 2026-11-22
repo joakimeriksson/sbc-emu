@@ -9,11 +9,12 @@ pub enum Board {
     TinkerBoard,
     OrangePiRv,
     Esp32S31,
+    JetsonNano,
 }
 
 impl Board {
-    pub const ALL: [Self; 7] =
-        [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne, Self::TinkerBoard, Self::OrangePiRv, Self::Esp32S31];
+    pub const ALL: [Self; 8] =
+        [Self::Pi4, Self::Pi3, Self::OrangePi5, Self::OrangePiOne, Self::TinkerBoard, Self::OrangePiRv, Self::Esp32S31, Self::JetsonNano];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -24,6 +25,7 @@ impl Board {
             Self::TinkerBoard => "tinkerboard",
             Self::OrangePiRv => "orangepi-rv",
             Self::Esp32S31 => "esp32s31",
+            Self::JetsonNano => "jetson-nano",
         }
     }
 
@@ -36,11 +38,12 @@ impl Board {
             Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (four Cortex-A12s, GIC-400, UART2, direct Linux boot)",
             Self::OrangePiRv => "experimental: Orange Pi RV / StarFive JH7110 (four RV64GC U74s, CLINT, PLIC, UART0, OpenSBI + direct Linux boot)",
             Self::Esp32S31 => "experimental: ESP32-S31-Function-CoreBoard-1 (two RV32IMAC harts, UART0; mask ROM and Linux flash image)",
+            Self::JetsonNano => "experimental: NVIDIA Jetson Nano / Tegra X1 (four Cortex-A57s, GIC-400, UART A, timers, CAR, PMC, direct Linux boot)",
         }
     }
 
     pub fn require_implemented(self) -> Result<(), String> {
-        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::OrangePiRv | Self::Esp32S31) {
+        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::OrangePiRv | Self::Esp32S31 | Self::JetsonNano) {
             Ok(())
         } else {
             Err(format!(

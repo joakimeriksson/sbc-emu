@@ -7,7 +7,7 @@ Boots the board's direct-boot guest to its shell, then, as a debugger would: rea
 description, threads, registers and memory; writes a register and memory and puts them back;
 single-steps; stops at a breakpoint and at a write watchpoint; detaches; and checks that the
 guest's shell still works. Then a second run waits for the debugger before its first instruction
-(--gdb-wait). CACHE=DIR picks another cache, S31=DIR the ESP32-S31's (rom/, out/).
+(--gdb-wait). CACHE=DIR picks another cache, S31=DIR the ESP32-S31's (rom/, out/), NANO=DIR the Jetson Nano's.
 Exit status 0 only if everything passed on every board run.
 """
 import os, re, select, socket, struct, subprocess, sys, time
@@ -18,6 +18,7 @@ CACHE = os.environ.get('CACHE', os.path.join(ROOT, 'cache'))
 S31 = os.environ.get('S31', os.path.join(CACHE, 'esp32s31'))
 EMU = os.environ.get('SBC_EMU', os.path.join(ROOT, 'target/release/sbc-emu'))
 c = lambda *p: os.path.join(CACHE, *p)
+n = lambda *p: os.path.join(os.environ.get('NANO', c('jetson-nano')), *p)
 
 # the guest, its shell prompt, its cores, its architecture
 BOARDS = {
@@ -26,6 +27,7 @@ BOARDS = {
     'orangepi-one': (['--kernel', c('orangepi-one', 'zImage'), '--dtb', c('orangepi-one', 'sun8i-h3-orangepi-one.dtb'), '--initrd', c('orangepi-one', 'initramfs.cpio.gz')], 'orangepi-one# ', 4, 'arm'),
     'tinkerboard': (['--kernel', c('tinker-board', 'zImage'), '--dtb', c('tinker-board', 'rk3288-tinker-s.dtb'), '--initrd', c('tinker-board', 'initramfs.cpio.gz')], 'tinker-board# ', 4, 'arm'),
     'orangepi-rv': (['--firmware', c('orangepi-rv', 'fw_dynamic.bin'), '--kernel', c('orangepi-rv', 'Image'), '--dtb', c('orangepi-rv', 'jh7110-orangepi-rv.dtb'), '--initrd', c('orangepi-rv', 'initramfs.cpio.gz')], 'orangepi-rv# ', 5, 'riscv:rv64'),
+    'jetson-nano': (['--kernel', n('vmlinuz'), '--dtb', n('tegra210-p3450-0000.dtb'), '--initrd', n('initramfs.cpio.gz')], 'jetson-nano# ', 4, 'aarch64'),
     'esp32s31': (['--rom', os.path.join(S31, os.environ.get('S31_ROM', 'esp32s31_rev0_rom.elf')), '--flash', os.path.join(S31, os.environ.get('S31_FLASH', 'images/s31_full_flash.bin'))], '~ # ', 2, 'riscv:rv32'),
 }
 

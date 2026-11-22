@@ -102,11 +102,14 @@ pub struct Cpu {
     pub firmware_calls_to_host: bool,
     pub(crate) cur_insn: u32,
     pub(crate) tlb: Option<Box<[crate::mmu::TlbEntry]>>,
-    /// Host pointer to guest RAM at physical address 0 (and its length): set by the machine so
-    /// RAM accesses can bypass the bus. The machine guarantees the buffer outlives the core and
-    /// is never moved or resized.
+    /// Host pointer to guest RAM at physical address `ram_base` (and its length): set by the
+    /// machine so RAM accesses can bypass the bus. The machine guarantees the buffer outlives
+    /// the core and is never moved or resized. The micro-TLBs, the JITs and `code_pages` work in
+    /// RAM offsets (physical address - `ram_base`); the bus always sees physical addresses.
     pub ram: *mut u8,
     pub ram_len: u64,
+    /// Physical address of RAM's first byte: 0 on the Pi 4 and RK3588, 0x8000_0000 on Tegra.
+    pub ram_base: u64,
     /// micro-TLBs for the RAM fast path: [fetch, read, write] = (tag, physical page)
     /// micro-TLBs for fetch, read and write: direct-mapped on the VA page, (tag, physical page)
     pub(crate) utlb: [[(u64, u64); UT]; 3],
@@ -220,7 +223,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, utlb: [[UTLB_EMPTY; UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, jit_interp: 0, jit_refill: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, ram_base: 0, utlb: [[UTLB_EMPTY; UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, jit_interp: 0, jit_refill: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
         }
     }
 
@@ -518,6 +521,7 @@ impl Cpu {
     /// Another core invalidated instruction cache: `page` (physical page number) or u64::MAX.
     pub fn jit_invalidate(&mut self, page: u64) {
         if let Some(j) = self.jit.as_mut() { if page == u64::MAX { j.flush() } else { j.invalidate_page(page) } }
+        // both JITs are keyed by RAM offset (`ram_base`; the 32-bit core's `ram_key`)
         if let Some(a) = self.a32.as_mut() { a.code_changed((page != u64::MAX).then_some(page)); }
     }
 

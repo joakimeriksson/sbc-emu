@@ -54,6 +54,7 @@ impl El1Host for El1<'_> {
     }
 
     fn compiled(&mut self, pa: u32) {
+        // the 32-bit JIT's keys are RAM offsets (`ram_key`), as code_pages' are
         self.0.mark_code_page(pa as u64 >> 12);
     }
 
@@ -116,11 +117,11 @@ impl El1Host for El1<'_> {
 impl Cpu {
     /// Exception return from EL1 to AArch32 EL0: `spsr` (M = User, bit 4 set) and `elr`.
     pub(crate) fn enter_aarch32(&mut self, spsr: u64, elr: u64) {
-        let (ram, len, mt) = (self.ram, self.ram_len, self.mt);
+        let (ram, base, len, mt) = (self.ram, self.ram_base, self.ram_len, self.mt);
         let jit = self.jit.is_some() && !self.jit_off;
         let a = self.a32.get_or_insert_with(|| Box::new(arm_a32::Cpu::new_el0()));
         // SAFETY: the machine's guarantee for `ram` (see the field) covers this core too
-        unsafe { a.el0_setup(ram, len, mt) };
+        unsafe { a.el0_setup(ram, base, len, mt) };
         // not in the browser: there both JITs install their blocks in the page's one function
         // table, and this core's flush frees all of it
         if jit && !a.jit_enabled() && !ram.is_null() && arm_a32::jit::available() && !jit32_off() && !cfg!(target_arch = "wasm32") {

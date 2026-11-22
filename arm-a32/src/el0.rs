@@ -41,7 +41,7 @@ pub trait El1Host {
     /// An MRC/MCR (or MRRC/MCRR) to coprocessor 15: `insn` in its A32 encoding (condition
     /// passed); `value` is what a write stores (Rt2:Rt for MCRR).
     fn cp15(&mut self, insn: u32, value: u64) -> Cp15;
-    /// The JIT compiled code from physical `pa` (the kernel's instruction-cache maintenance
+    /// The JIT compiled code from RAM offset `pa` (the kernel's instruction-cache maintenance
     /// of that page must reach `Cpu::code_changed`).
     fn compiled(&mut self, _pa: u32) {}
 }
@@ -90,17 +90,20 @@ impl Cpu {
         cpu
     }
 
-    /// Prepare to run user code from guest RAM at `ram` (physical 0, `len` bytes). `mt`: other
-    /// cores run in parallel on host threads (barriers become host fences, store-exclusive a
+    /// Prepare to run user code from guest RAM at `ram` (`len` bytes at physical `base`).
+    /// The first 4 GiB of it are reached directly (and compiled); anything else the 64-bit MMU
+    /// maps, RAM beyond that or a device, goes through the bus. `mt`: other cores run in
+    /// parallel on host threads (barriers become host fences, store-exclusive a
     /// compare-and-swap).
     ///
     /// # Safety
     /// As `set_ram`: `ram` must point to `len` writable bytes that outlive this `Cpu`.
-    pub unsafe fn el0_setup(&mut self, ram: *mut u8, len: u64, mt: bool) {
+    pub unsafe fn el0_setup(&mut self, ram: *mut u8, base: u64, len: u64, mt: bool) {
         let len = len.min(u32::MAX as u64) as u32;
-        if self.ram != ram || self.ram_len != len {
+        if self.ram != ram || self.ram_len != len || self.ram_base != 0 || self.ram_phys != base {
             // SAFETY: the caller's guarantee
             unsafe { self.set_ram(ram, 0, len) };
+            self.ram_phys = base; // the JIT's keys stay RAM offsets
         }
         self.mt = mt;
     }
@@ -221,12 +224,11 @@ impl Cpu {
     }
 
     /// Translate through the host (user access); the error is (VA, `HOST_FSC` | FSC).
-    pub(crate) fn el0_translate(&mut self, bus: &mut dyn Bus, va: u32, access: El0Access) -> Result<u32, (u32, u32)> {
+    pub(crate) fn el0_translate(&mut self, bus: &mut dyn Bus, va: u32, access: El0Access) -> Result<u64, (u32, u32)> {
         let host = self.el1.expect("el0_translate outside step_el0");
         // SAFETY: set by step_el0 for the duration of the step
         match unsafe { (*host).translate(bus, va, access) } {
-            Ok(pa) if pa >> 32 == 0 => Ok(pa as u32),
-            Ok(_) => Err((va, HOST_FSC | 0x10)), // beyond 4 GiB: not reachable by this core
+            Ok(pa) => Ok(pa),
             Err(fsc) => Err((va, HOST_FSC | fsc)),
         }
     }
@@ -351,5 +353,200 @@ impl Cpu {
         if self.mt {
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Physical memory at 4 GiB and up (nothing below), as a Jetson Nano's upper RAM.
+    struct HighBus {
+        base: u64,
+        mem: Vec<u8>,
+        accesses: usize,
+    }
+
+    impl HighBus {
+        fn at(&mut self, addr: u64, n: usize) -> &mut [u8] {
+            assert!(addr >= self.base, "bus access below RAM: {addr:#x}");
+            self.accesses += 1;
+            let o = (addr - self.base) as usize;
+            &mut self.mem[o..o + n]
+        }
+    }
+
+    macro_rules! bus {
+        ($($r:ident $w:ident $t:ty),*) => { $(
+            fn $r(&mut self, a: u64) -> Result<$t, emu_core::Fault> {
+                Ok(<$t>::from_le_bytes(self.at(a, std::mem::size_of::<$t>()).try_into().unwrap()))
+            }
+            fn $w(&mut self, a: u64, v: $t) -> Result<(), emu_core::Fault> {
+                let n = std::mem::size_of::<$t>();
+                self.at(a, n).copy_from_slice(&v.to_le_bytes());
+                Ok(())
+            }
+        )* };
+    }
+
+    impl Bus for HighBus {
+        bus!(read8 write8 u8, read16 write16 u16, read32 write32 u32, read64 write64 u64);
+    }
+
+    /// Every user address maps to RAM at `base + va`.
+    struct Host {
+        base: u64,
+    }
+
+    impl El1Host for Host {
+        fn translate(&mut self, _bus: &mut dyn Bus, va: u32, _access: El0Access) -> Result<u64, u32> {
+            Ok(self.base + va as u64)
+        }
+        fn cp15(&mut self, _insn: u32, _value: u64) -> Cp15 {
+            Cp15::Undefined
+        }
+    }
+
+    /// 32-bit user code, data and page-crossing accesses in RAM above 4 GiB: the core works
+    /// in RAM offsets and the bus sees the real addresses.
+    #[test]
+    fn user_code_in_ram_above_4_gib() {
+        const BASE: u64 = 0x1_0000_0000;
+        let mut mem = vec![0u8; 0x10000];
+        let code: [u32; 4] = [
+            0xe591_0000, // ldr r0, [r1]
+            0xe280_0001, // add r0, r0, #1
+            0xe581_0004, // str r0, [r1, #4]
+            0xe591_2fff, // ldr r2, [r1, #0xfff] (crosses into the next page)
+        ];
+        for (i, w) in code.iter().enumerate() {
+            mem[0x1000 + 4 * i..0x1004 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+        mem[0x2000..0x2004].copy_from_slice(&41u32.to_le_bytes());
+        mem[0x2fff..0x3003].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut bus = HighBus { base: BASE, mem, accesses: 0 };
+        let (ram, len) = (bus.mem.as_mut_ptr(), bus.mem.len() as u64);
+        let mut cpu = Cpu::new_el0();
+        // SAFETY: `bus.mem` outlives `cpu`
+        unsafe { cpu.el0_setup(ram, BASE, len, false) };
+        cpu.r[15] = 0x1000;
+        cpu.r[1] = 0x2000;
+        let mut host = Host { base: BASE };
+        for _ in 0..4 {
+            cpu.step_el0(&mut bus, &mut host).expect("no exception");
+        }
+        assert_eq!(cpu.r[0], 42);
+        assert_eq!(cpu.r[2], 0x1234_5678);
+        assert_eq!(u32::from_le_bytes(bus.mem[0x2004..0x2008].try_into().unwrap()), 42);
+        assert!(bus.accesses > 0, "the slow path goes to the bus");
+    }
+
+    /// A device page a user process mapped, below RAM: the access reaches the bus at the
+    /// device's own address, and RAM is untouched.
+    #[test]
+    fn user_mapping_of_a_device_below_ram() {
+        const RAM: u64 = 0x8000_0000;
+        const DEVICE: u64 = 0x7000_0000;
+        struct Split {
+            ram: HighBus,
+            device: HighBus,
+        }
+        macro_rules! split {
+            ($($r:ident $w:ident $t:ty),*) => { $(
+                fn $r(&mut self, a: u64) -> Result<$t, emu_core::Fault> {
+                    if a < RAM { self.device.$r(a) } else { self.ram.$r(a) }
+                }
+                fn $w(&mut self, a: u64, v: $t) -> Result<(), emu_core::Fault> {
+                    if a < RAM { self.device.$w(a, v) } else { self.ram.$w(a, v) }
+                }
+            )* };
+        }
+        impl Bus for Split {
+            split!(read8 write8 u8, read16 write16 u16, read32 write32 u32, read64 write64 u64);
+        }
+        /// The page at 0x4000 is the device, the rest RAM.
+        struct Maps;
+        impl El1Host for Maps {
+            fn translate(&mut self, _bus: &mut dyn Bus, va: u32, _access: El0Access) -> Result<u64, u32> {
+                Ok(if va >> 12 == 4 { DEVICE + (va as u64 & 0xfff) } else { RAM + va as u64 })
+            }
+            fn cp15(&mut self, _insn: u32, _value: u64) -> Cp15 {
+                Cp15::Undefined
+            }
+        }
+        let mut ram = vec![0u8; 0x10000];
+        let code: [u32; 3] = [
+            0xe591_0804, // ldr r0, [r1, #0x804]
+            0xe280_0001, // add r0, r0, #1
+            0xe581_0808, // str r0, [r1, #0x808]
+        ];
+        for (i, w) in code.iter().enumerate() {
+            ram[0x1000 + 4 * i..0x1004 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+        let before = ram.clone();
+        let mut device = vec![0u8; 0x1000];
+        device[0x804..0x808].copy_from_slice(&0x0002_2110u32.to_le_bytes());
+        let mut bus = Split {
+            ram: HighBus { base: RAM, mem: ram, accesses: 0 },
+            device: HighBus { base: DEVICE, mem: device, accesses: 0 },
+        };
+        let mut cpu = Cpu::new_el0();
+        // 4 GiB claimed, as on the Nano: a 32-bit offset of the device would alias RAM. Only
+        // the first 64 KiB are touched.
+        // SAFETY: `bus.ram.mem` outlives `cpu`; the test accesses only its first 64 KiB
+        unsafe { cpu.el0_setup(bus.ram.mem.as_mut_ptr(), RAM, 4 << 30, false) };
+        cpu.r[15] = 0x1000;
+        cpu.r[1] = 0x4000;
+        for _ in 0..3 {
+            cpu.step_el0(&mut bus, &mut Maps).expect("no exception");
+        }
+        assert_eq!(cpu.r[0], 0x0002_2111);
+        assert_eq!(u32::from_le_bytes(bus.device.mem[0x808..0x80c].try_into().unwrap()), 0x0002_2111);
+        assert_eq!(bus.ram.mem, before);
+    }
+
+    /// Compiled user code in RAM at 0x8000_0000 that the program rewrites, with a plain store
+    /// and (cores on host threads) a store-exclusive: the block is dropped. The JIT's keys are
+    /// RAM offsets, so `ram_key` must find the page.
+    #[test]
+    fn compiled_code_rewritten_in_ram_above_zero() {
+        // at 0x3000: str r2, [r1]; subs r3, r3, #1; bne 0x1000; svc #0
+        rewrite_compiled_code(false, &[0xe581_2000, 0xe253_3001, 0x1aff_f7fc, 0xef00_0000]);
+        // at 0x3000: ldrex r4, [r1]; strex r4, r2, [r1]; subs; bne; svc
+        rewrite_compiled_code(true, &[0xe191_4f9f, 0xe181_4f92, 0xe253_3001, 0x1aff_f7fb, 0xef00_0000]);
+    }
+
+    fn rewrite_compiled_code(mt: bool, store: &[u32]) {
+        const BASE: u64 = 0x8000_0000;
+        let mut mem = vec![0u8; 0x10000];
+        let mut put = |a: usize, w: u32| mem[a..a + 4].copy_from_slice(&w.to_le_bytes());
+        put(0x1000, 0xe3a0_0001); // mov r0, #1 (rewritten to #2)
+        put(0x1004, 0xea00_07fd); // b 0x3000
+        for (i, &w) in store.iter().enumerate() {
+            put(0x3000 + 4 * i, w);
+        }
+        let mut bus = HighBus { base: BASE, mem, accesses: 0 };
+        let mut cpu = Cpu::new_el0();
+        let len = bus.mem.len() as u32;
+        // SAFETY: `bus.mem` outlives `cpu`
+        unsafe { cpu.el0_setup(bus.mem.as_mut_ptr(), BASE, len as u64, mt) };
+        if !cpu.enable_jit(crate::jit::CodeWatch::new(0, len)) {
+            return; // no JIT on this host
+        }
+        cpu.jit_set_hot(1);
+        // first with the store going elsewhere, so the block is compiled and stays compiled;
+        // then onto the block itself: the second pass must run the new instruction
+        for (target, passes, expect) in [(0x2000, 8, 1), (0x1000, 2, 2)] {
+            cpu.r[15] = 0x1000;
+            cpu.r[1] = target;
+            cpu.r[2] = 0xe3a0_0002; // mov r0, #2
+            cpu.r[3] = passes;
+            let ended = (0..1000).any(|_| cpu.step_el0(&mut bus, &mut Host { base: BASE }).is_err());
+            assert!(ended, "the program reaches its SVC");
+            assert_eq!(cpu.r[3], 0);
+            assert_eq!(cpu.r[0], expect, "mt {mt}");
+            assert!(cpu.jit_stats().unwrap().0 > 0, "the code is compiled");
+        }
+        assert!(cpu.jit_stats().unwrap().2 > 0, "the rewritten block is dropped");
     }
 }

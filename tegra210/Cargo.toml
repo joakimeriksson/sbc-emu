@@ -1,0 +1,12 @@
+[package]
+name = "tegra210"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA Tegra X1 (T210) / Jetson Nano: four Cortex-A57s, GIC-400 and the SoC blocks mainline Linux probes"
+
+[dependencies]
+arm-a64 = { path = "../arm-a64" }
+emu-core = { path = "../emu-core" }
+peripherals = { path = "../peripherals" }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

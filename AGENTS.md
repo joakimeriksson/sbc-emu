@@ -48,6 +48,7 @@ Who is working where right now (update this table when you start or finish somet
 | Orange Pi RV (StarFive JH7110) and the RV64 core (and its JIT to AArch64 and WebAssembly, `riscv64/src/jit*.rs`) | `riscv64/`, `starfive-jh7110/`, `powervr/`, `tests/gpu/pvr/`, `cli/src/orangepi_rv.rs`, `docs/orangepi-rv.md` | Claude Code |
 | Mali-T760 (Midgard) GPU of the RK3288 (`docs/mali-t760.md`) | `midgard/`, its hookup in `rockchip-rk3288/src/machine.rs`, `scripts/mali-t760-*` | Claude Code (the Orange Pi One session) |
 | RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); the RV64 boards are in the Orange Pi RV row | `riscv-rv32/`, `espressif/` | Claude Code (taken over from OpenCode) |
+| NVIDIA Jetson Nano / Tegra X1 (plan: `docs/jetson-nano-plan.md`); the `ram_base` of `arm-a64` (RAM above physical 0) | `tegra210/`, `cli/src/jetson_nano.rs`, `scripts/jetson-nano-fixture.sh` | Claude Code |
 
 ## Never
 

@@ -101,6 +101,11 @@ pub struct Cpu {
     pub(crate) ram: *mut u8,
     pub(crate) ram_base: u32,
     pub(crate) ram_len: u32,
+    /// Physical address of the first byte of `ram`. Physical addresses are 64 bits wide from
+    /// `translate` to the bus: under a 64-bit kernel RAM and devices may lie anywhere.
+    /// `ram_base` is where the JIT's 32-bit code keys (`ram_key`) start: the same address for
+    /// a core running its own MMU, 0 (so the keys are RAM offsets) under a 64-bit kernel.
+    pub(crate) ram_phys: u64,
     /// Micro-TLBs (see `mmu::Utlb`), boxed so compiled code reaches them through one pointer.
     pub(crate) utlb: Box<[Utlb; 6 * UT]>,
     /// Set when a slow-path access reached something other than RAM (a device).
@@ -213,6 +218,7 @@ impl Cpu {
             ram: std::ptr::null_mut(),
             ram_base: 0,
             ram_len: 0,
+            ram_phys: 0,
             utlb: Box::new([Utlb::INVALID; 6 * UT]),
             io: false,
             jit: None,
@@ -233,6 +239,7 @@ impl Cpu {
     pub unsafe fn set_ram(&mut self, ram: *mut u8, base: u32, len: u32) {
         self.ram = ram;
         self.ram_base = base;
+        self.ram_phys = base as u64;
         self.ram_len = len;
         self.utlb_flush();
     }
