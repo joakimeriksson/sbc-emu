@@ -1,5 +1,7 @@
-//! What snapshots leave out, all of it, and why. `snap_struct!` makes every field be saved or
-//! skipped; a field that is skipped (or `name: _` in an implementation by hand) must be here.
+//! What snapshots leave out, and why. `snap_struct!` makes every field be saved or skipped; a field
+//! that is skipped (or `name: _` where an implementation by hand takes `Self` apart) must be here.
+//! It cannot see that an implementation by hand names a field and does not write it, nor into the
+//! Pi 4's older `save_state` functions (arm-a64's `Cpu` has its own list of fields next to them).
 use std::collections::{BTreeMap, BTreeSet};
 
 const APPROVED: &[(&str, &str, &str)] = &[
@@ -26,8 +28,8 @@ fn group(s: &str) -> &str {
     let mut depth = 0;
     for (k, c) in s.char_indices() {
         match c {
-            '(' | '{' => depth += 1,
-            ')' | '}' => { depth -= 1; if depth == 0 { return &s[1..k]; } }
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => { depth -= 1; if depth == 0 { return &s[1..k]; } }
             _ => {}
         }
     }
@@ -52,24 +54,38 @@ fn every_skipped_field_is_approved() {
         for f in files {
             if f.ends_with("emu-core/src/snap.rs") { continue; } // the macros themselves
             let text = std::fs::read_to_string(&f).unwrap();
-            let text: String = text.split("#[cfg(test)]\nmod tests").next().unwrap().lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
-            for (at, _) in text.match_indices("snap_struct!(") {
-                let body = group(&text[at + "snap_struct!".len()..]);
+            // without comments and the tests (which may come anywhere), one space between words
+            let text: String = text.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+            let mut text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            while let Some(at) = text.find("#[cfg(test)] mod tests {") {
+                let body = at + "#[cfg(test)] mod tests ".len();
+                let end = body + group(&text[body..]).len() + 2;
+                text.replace_range(at..end, "");
+            }
+            for (at, _) in text.match_indices("snap_struct!") {
+                let rest = text[at + "snap_struct!".len()..].trim_start();
+                if !rest.starts_with(['(', '{', '[']) { continue; } // named in a text
+                let body = group(rest);
                 let name = body.split(|c: char| !c.is_alphanumeric() && c != '_').find(|w| !w.is_empty()).unwrap().to_string();
-                if let Some(k) = body.find("skip {") {
-                    found.entry((krate.clone(), name)).or_default().extend(fields(group(&body[k + "skip ".len()..])));
+                for (k, _) in body.match_indices("skip") {
+                    let list = body[k + "skip".len()..].trim_start();
+                    // (a field may be called something with skip in it)
+                    if list.starts_with('{') { found.entry((krate.clone(), name.clone())).or_default().extend(fields(group(list))); }
                 }
             }
             // by hand: `let Self { .. field: _ .. } = self`, in the impl block before it
             for (at, _) in text.match_indices("let Self {") {
                 let body = group(&text[at + "let Self ".len()..]);
                 assert!(!body.contains(".."), "{}: `..` hides fields", f.display());
-                let header = text[..at].rfind("\nimpl").map_or("", |k| text[k + 1..].lines().next().unwrap());
-                let name = header.trim_end_matches(" {").rsplit([' ', ':']).next().unwrap().to_string();
+                let header = text[..at].rfind("impl ").map_or("", |k| text[k + 5..].split(" {").next().unwrap());
+                let name = header.rsplit([' ', ':']).next().unwrap().to_string();
                 for part in fields(body) {
                     // (an attribute may come first)
                     let part = part.rsplit(']').next().unwrap().trim().to_string();
-                    if let Some(x) = part.strip_suffix(": _") { found.entry((krate.clone(), name.clone())).or_default().insert(x.to_string()); }
+                    if let Some((x, pattern)) = part.split_once(':') {
+                        // `_` or a name that says it is not used
+                        if pattern.trim().starts_with('_') { found.entry((krate.clone(), name.clone())).or_default().insert(x.trim().to_string()); }
+                    }
                 }
             }
         }

@@ -88,8 +88,11 @@ fn screenshot<B: SerialBoard>(m: &mut B, tag: &str, path: &str) {
     }
 }
 
-/// Write a snapshot.
-fn save<B: SerialBoard>(m: &B, tag: &str, path: &str) -> Result<(), String> {
+/// How long a snapshot waits for a guest that takes none of the input typed before it.
+const PATIENCE: Duration = Duration::from_secs(2);
+
+/// Write a snapshot; `typed` bytes of input have not reached the guest.
+fn save<B: SerialBoard>(m: &B, tag: &str, path: &str, typed: usize) -> Result<(), String> {
     let file = m.save()?;
     // never half a snapshot under the name
     let part = format!("{path}.part");
@@ -98,6 +101,9 @@ fn save<B: SerialBoard>(m: &B, tag: &str, path: &str) -> Result<(), String> {
         return Err(format!("{path}: {e}"));
     }
     eprintln!("\r[{tag}] snapshot at {:.3} s, {:.1} MiB -> {path}\r", m.now() as f64 / 1e9, file.len() as f64 / (1 << 20) as f64);
+    if typed > 0 {
+        eprintln!("\r[{tag}] the guest has not taken {typed} bytes typed before it: they are not in the snapshot\r");
+    }
     Ok(())
 }
 
@@ -256,6 +262,9 @@ pub(crate) fn run<B: SerialBoard>(
     let mut escape = false;
     // Ctrl-A s: a snapshot, once the guest has taken what was typed before it
     let mut save_asked = false;
+    // how much typed input waits, and since when it has not become less: a guest that takes none
+    // (it crashed, say) does not hold up a snapshot for ever
+    let mut waiting = (0, Instant::now());
     // `sleep SECS`: the script waits until this virtual time (ns)
     let mut sleep_until: Option<u64> = None;
     if let Some(g) = gdb.as_mut().filter(|_| config.gdb_wait) {
@@ -332,9 +341,9 @@ pub(crate) fn run<B: SerialBoard>(
                     true
                 }
                 // once the guest has what was typed: the rest of it is not the machine's
-                "save" if !pending.is_empty() => false,
+                "save" if !pending.is_empty() && waiting.1.elapsed() < PATIENCE => false,
                 "save" => {
-                    if let Err(e) = save(&m, tag, rest) {
+                    if let Err(e) = save(&m, tag, rest, pending.len()) {
                         break Err(e);
                     }
                     true
@@ -392,9 +401,12 @@ pub(crate) fn run<B: SerialBoard>(
             }
             pending.pop_front();
         }
-        if save_asked && pending.is_empty() {
+        if pending.len() != waiting.0 {
+            waiting = (pending.len(), Instant::now());
+        }
+        if save_asked && (pending.is_empty() || waiting.1.elapsed() >= PATIENCE) {
             save_asked = false;
-            if let Err(e) = save(&m, tag, &config.snapshot) {
+            if let Err(e) = save(&m, tag, &config.snapshot, pending.len()) {
                 eprintln!("\r[{tag}] no snapshot: {e}\r");
             }
         }
@@ -476,6 +488,9 @@ pub(crate) fn run<B: SerialBoard>(
                 m.host().idle_until(target);
             }
             Stop::Reset => {
+                if std::mem::take(&mut save_asked) {
+                    eprintln!("\r[{tag}] no snapshot: the guest has reset\r");
+                }
                 m = match make_machine() {
                     Ok(m) => m,
                     Err(e) => break Err(e),
@@ -504,6 +519,12 @@ pub(crate) fn run<B: SerialBoard>(
             other => break Err(format!("stopped: {other:x?}")),
         }
     };
+    // asked for just before the end (Ctrl-A s, Ctrl-A x)
+    if save_asked {
+        if let Err(e) = save(&m, tag, &config.snapshot, pending.len()) {
+            eprintln!("[{tag}] no snapshot: {e}");
+        }
+    }
     m.report(tag);
     if let Some(path) = config.screenshot.as_deref() {
         screenshot(&mut m, tag, path);
