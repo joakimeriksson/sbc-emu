@@ -12,4 +12,5 @@ rockchip-rk3288 = { path = "../rockchip-rk3288" }
 starfive-jh7110 = { path = "../starfive-jh7110" }
 esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }
+tegra210 = { path = "../tegra210" }
 emu-core = { path = "../emu-core" }

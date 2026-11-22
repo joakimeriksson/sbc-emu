@@ -1,0 +1,11 @@
+# Jetson Nano bring-up check (docs/jetson-nano-plan.md): the BusyBox shell on the serial
+# console, all four cores online, each on its own Tegra timer, the board's model and memory.
+#   sh scripts/jetson-nano-fixture.sh cache/jetson-nano
+#   sbc-emu run --board jetson-nano --kernel cache/jetson-nano/vmlinuz \
+#     --dtb cache/jetson-nano/tegra210-p3450-0000.dtb --initrd cache/jetson-nano/initramfs.cpio.gz \
+#     --script scripts/jetson-nano-shell.txt --timeout 120
+wait-serial TEGRA210_BOOT_OK
+sleep 2
+serial uname -m; nproc; grep tegra_timer /proc/interrupts; cat /proc/device-tree/model; echo; grep MemTotal /proc/meminfo; echo NANO-""OK\n
+wait-serial NANO-OK
+quit

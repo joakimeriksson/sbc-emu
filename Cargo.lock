@@ -202,6 +202,7 @@ dependencies = [
  "rockchip-rk3288",
  "sbc-machine",
  "starfive-jh7110",
+ "tegra210",
  "v3d",
 ]
 
@@ -238,6 +239,7 @@ dependencies = [
  "rk3588",
  "rockchip-rk3288",
  "starfive-jh7110",
+ "tegra210",
 ]
 
 [[package]]
@@ -253,6 +255,16 @@ dependencies = [
  "powervr",
  "riscv64",
  "sbc-net",
+]
+
+[[package]]
+name = "tegra210"
+version = "0.0.1"
+dependencies = [
+ "arm-a64",
+ "emu-core",
+ "miniz_oxide",
+ "peripherals",
 ]
 
 [[package]]

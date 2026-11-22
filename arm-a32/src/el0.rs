@@ -96,11 +96,12 @@ impl Cpu {
     ///
     /// # Safety
     /// As `set_ram`: `ram` must point to `len` writable bytes that outlive this `Cpu`.
-    pub unsafe fn el0_setup(&mut self, ram: *mut u8, len: u64, mt: bool) {
+    pub unsafe fn el0_setup(&mut self, ram: *mut u8, base: u64, len: u64, mt: bool) {
         let len = len.min(u32::MAX as u64) as u32;
-        if self.ram != ram || self.ram_len != len {
+        let base = base as u32; // AArch32 EL0 reaches only RAM below 4 GiB
+        if self.ram != ram || self.ram_len != len || self.ram_base != base {
             // SAFETY: the caller's guarantee
-            unsafe { self.set_ram(ram, 0, len) };
+            unsafe { self.set_ram(ram, base, len) };
         }
         self.mt = mt;
     }

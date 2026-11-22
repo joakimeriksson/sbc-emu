@@ -200,10 +200,11 @@ impl Cpu {
                 Some(t) => t,
                 None => {
                     let pa = self.pa(bus, va, if unpriv { Access::ReadUnpriv } else { Access::Read })?;
-                    if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
+                    let off = pa.wrapping_sub(self.ram_base);
+                    if self.ram.is_null() || (off | 0xfff) >= self.ram_len {
                         return self.load_slow(bus, va, size, unpriv);
                     }
-                    self.utlb_fill(1, va, tag, pa & !0xfff)
+                    self.utlb_fill(1, va, tag, off & !0xfff)
                 }
             };
             // SAFETY: the page lies inside guest RAM (checked when the entry was filled)
@@ -279,10 +280,11 @@ impl Cpu {
                 Some(t) => t,
                 None => {
                     let pa = self.pa(bus, va, if unpriv { Access::WriteUnpriv } else { Access::Write })?;
-                    if self.ram.is_null() || (pa | 0xfff) >= self.ram_len {
+                    let off = pa.wrapping_sub(self.ram_base);
+                    if self.ram.is_null() || (off | 0xfff) >= self.ram_len {
                         return self.store_slow(bus, va, size, v, unpriv);
                     }
-                    self.utlb_fill(2, va, tag, pa & !0xfff)
+                    self.utlb_fill(2, va, tag, off & !0xfff)
                 }
             };
             if let Some(m) = self.excl() {
@@ -382,8 +384,9 @@ impl Cpu {
             unsafe { (self.ram.add((self.utlb[0][ti].1 | (pc & 0xfff)) as usize) as *const u32).read_unaligned() }
         } else {
             let pa = self.pa(bus, pc, Access::Exec)?;
-            if !self.ram.is_null() && (pa | 0xfff) < self.ram_len {
-                self.utlb_fill(0, pc, tag, pa & !0xfff);
+            let off = pa.wrapping_sub(self.ram_base);
+            if !self.ram.is_null() && (off | 0xfff) < self.ram_len {
+                self.utlb_fill(0, pc, tag, off & !0xfff);
             }
             bus.fetch(pa).map_err(|_| self.abort(pc, false, 0x10, true))?
         };
@@ -820,7 +823,8 @@ impl Cpu {
                     self.ic_bcast = Some(u64::MAX);
                 } else if op1 == 3 && crm == 5 && op2 == 1 {
                     let va = self.xr(rt);
-                    let page = match self.translate(bus, va, Access::Read) { Ok(pa) => pa >> 12, Err(_) => u64::MAX };
+                    // the RAM page (JIT blocks and `code_pages` are keyed by RAM offset)
+                    let page = match self.translate(bus, va, Access::Read) { Ok(pa) => pa.wrapping_sub(self.ram_base) >> 12, Err(_) => u64::MAX };
                     // nothing was ever compiled from this page, on any core: nothing to drop
                     if page != u64::MAX && !self.code_page_used(page) { return Ok(()); }
                     self.jit_invalidate(page);
@@ -1241,12 +1245,13 @@ impl Cpu {
         use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
         static PAIRS: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let pa = self.pa(bus, va, Access::Write)?;
-        if self.ram.is_null() || pa + size as u64 > self.ram_len || pa % size as u64 != 0 {
+        let off = pa.wrapping_sub(self.ram_base);
+        if self.ram.is_null() || off.saturating_add(size as u64) > self.ram_len || pa % size as u64 != 0 {
             self.store(bus, va, size, new, false)?;
             return Ok(true);
         }
         // SAFETY: inside guest RAM and naturally aligned (the buffer is at least 16-byte aligned)
-        let p = unsafe { self.ram.add(pa as usize) };
+        let p = unsafe { self.ram.add(off as usize) };
         let ok = unsafe {
             match size {
                 1 => AtomicU8::from_ptr(p).compare_exchange(old as u8, new as u8, SeqCst, SeqCst).is_ok(),
