@@ -12,9 +12,15 @@ pub struct Breakpoints {
     pub at: Vec<u64>,
     /// the (core, pc) reported last: running on from there must not stop there again
     pub resume: Option<(usize, u64)>,
+    /// While a single step runs: the core it is for. The others stay as they are, powered and in
+    /// whatever state, and get no turn.
+    pub only: Option<usize>,
 }
 
 impl Breakpoints {
+    /// Whether core `k` may have a turn (see `only`).
+    pub fn may_run(&self, k: usize) -> bool { self.only.is_none_or(|o| o == k) }
+
     pub fn set(&mut self, addr: u64, insert: bool) {
         self.at.retain(|&a| a != addr);
         if insert { self.at.push(addr); }

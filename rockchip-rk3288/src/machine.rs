@@ -909,7 +909,7 @@ impl Machine {
     }
 
     /// Execute one instruction on core `k` (interpreted; a sleeping core is woken); a stop it
-    /// causes, if any. `run` does it, with the other cores off meanwhile.
+    /// causes, if any. `run` does it, giving the other cores no turn meanwhile.
     #[cold]
     pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
         if !matches!(self.state[k], CoreState::Run | CoreState::Wait) {
@@ -919,17 +919,12 @@ impl Machine {
         if jit {
             self.set_jit(false);
         }
-        let states = std::mem::replace(&mut self.state, vec![CoreState::Off; NCPU]);
         self.state[k] = CoreState::Run;
         self.breakpoints.resume = Some((k, self.cpus[k].r[15] as u64));
+        self.breakpoints.only = Some(k);
         let stop = self.run(1);
+        self.breakpoints.only = None;
         self.breakpoints.resume = None;
-        // a core the instruction started stays on
-        for (j, state) in states.into_iter().enumerate() {
-            if j != k && self.state[j] == CoreState::Off {
-                self.state[j] = state;
-            }
-        }
         if jit {
             self.set_jit(true);
         }
@@ -993,7 +988,7 @@ impl Machine {
             }
             let Some(k) = (1..=NCPU)
                 .map(|offset| (self.cur + offset) % NCPU)
-                .find(|&k| self.state[k] == CoreState::Run)
+                .find(|&k| self.state[k] == CoreState::Run && self.breakpoints.may_run(k))
             else {
                 return Stop::Idle(match self.next_event {
                     u64::MAX => u64::MAX,

@@ -187,14 +187,28 @@ def check(board, port):
         assert d.poke(a, b'\xa5\x5aDEBUG!') == 'OK' and d.mem(a, 8) == b'\xa5\x5aDEBUG!'
         assert d.poke(a, before) == 'OK' and d.mem(a, 8) == before
         ok('register and memory writes')
-        # single steps: every one moves the pc or is a branch to itself
+        # single steps: every one moves the pc or is a branch to itself; the other cores' registers
+        # stay as they are, whatever is stepped through (an interrupt, timer and device accesses)
+        def others():
+            regs = {}
+            for t in threads:
+                if t != me:
+                    d.thread(t)
+                    regs[t] = (r.cmd('g'), r.cmd(f'qThreadExtraInfo,{t:x}').replace(b' wfi'.hex(), ''))
+            d.thread(me)
+            return regs
+        before = others()
         pcs = []
-        for _ in range(200):
+        g.type('\r')
+        for _ in range(2000):
             sig, t, _ = stop(r.cmd(f'vCont;s:{me:x}'))
             assert (sig, t) == (5, me), (sig, t)
             pcs.append(d.reg('pc'))
         assert len(set(pcs)) > 5, [hex(x) for x in pcs[:10]]
-        ok(f'200 steps ({len(set(pcs))} pcs)')
+        after = others()
+        changed = [t for t in before if before[t][0] != after[t][0]]
+        assert not changed, f'stepping thread {me} changed threads {changed}: ' + '; '.join(bytes.fromhex(after[t][1]).decode() for t in changed)
+        ok(f'{len(pcs)} steps ({len(set(pcs))} pcs), the other cores untouched')
         # a breakpoint: typing at the shell makes the guest run; stop where it has been
         target = max(set(pcs), key=pcs.count)
         hits = []

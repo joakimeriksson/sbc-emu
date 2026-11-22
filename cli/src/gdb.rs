@@ -811,6 +811,77 @@ mod tests {
         }
     }
 
+    /// Stepping one core leaves the others where and as they are, and they go on afterwards.
+    #[track_caller]
+    fn others_stay<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, counter: usize) {
+        for _ in 0..4 { assert_eq!(run(m, 200_000), Stop::Budget); }
+        let (before, pc1) = (reg(m, 1, counter), pc(m, 1));
+        assert!(before > 10, "core 1 runs");
+        let state = m.describe(1);
+        for _ in 0..50 { assert_eq!(m.step(0), None); }
+        assert_eq!((m.describe(1), reg(m, 1, counter), pc(m, 1)), (state, before, pc1));
+        // the stepped core did run, and the other goes on from where it was
+        for _ in 0..4 { assert_eq!(run(m, 200_000), Stop::Budget); }
+        let after = reg(m, 1, counter);
+        assert!(after > before + 10, "core 1: {before} before the steps, {after} after them and more");
+        assert!(pc(m, 1) & !0xf == pc1 & !0xf);
+    }
+
+    #[test]
+    fn stepping_leaves_the_other_cores_alone_orangepi5() {
+        let mut m = rk3588::Machine::with_cpus(128 << 20, 2).unwrap();
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        for k in 0..2 {
+            m.state[k] = rk3588::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+        }
+        others_stay(&mut m, |m, n| Host::OrangePi5(m).run(n), 1);
+    }
+
+    #[test]
+    fn stepping_leaves_the_other_cores_alone_jetson_nano() {
+        let mut m = tegra210::Machine::with_cpus(128 << 20, 2).unwrap();
+        place(&mut m.soc.ram, 0x20_0000, A64);
+        for k in 0..2 {
+            m.state[k] = tegra210::CoreState::Run;
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, tegra210::RAM_BASE + 0x20_0000, tegra210::RAM_BASE + 0x30_0000 + 64 * k as u64);
+        }
+        others_stay(&mut m, |m, n| Host::JetsonNano(m).run(n), 1);
+    }
+
+    #[test]
+    fn stepping_leaves_the_other_cores_alone_orangepi_one() {
+        let mut m = allwinner_h3::Machine::with_ram_size(128 << 20);
+        let base = m.soc.ram.base as u32;
+        place(&mut m.soc.ram.mem, 0x20_0000, A32);
+        for k in 0..2 {
+            m.state[k] = allwinner_h3::CoreState::Run;
+            (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000 + 64 * k as u32);
+        }
+        others_stay(&mut m, |m, n| Host::OrangePiOne(m).run(n), 1);
+    }
+
+    #[test]
+    fn stepping_leaves_the_other_cores_alone_tinkerboard() {
+        use emu_core::Bus as _;
+        // core 1 powered up as Linux does it: the power controller's state decides who is on
+        let mut m = rockchip_rk3288::Machine::with_ram_size(128 << 20);
+        place(&mut m.soc.ram.mem, 0x20_0000, A32);
+        // core 0's loop stores into a device (the UART's scratch register): that re-evaluates the
+        // interrupts, and with them who is powered
+        (m.cpus[0].r[15], m.cpus[0].r[2]) = (0x20_0000, rockchip_rk3288::UART2_BASE as u32 + 0x1c);
+        m.soc.write32(rockchip_rk3288::SMP_MAILBOX + 8, 0x20_0000).unwrap();
+        m.soc.write32(rockchip_rk3288::SMP_MAILBOX + 4, rockchip_rk3288::BOOT_MAGIC).unwrap();
+        m.soc.write32(rockchip_rk3288::PMU_BASE + rockchip_rk3288::cru::PMU_PWRDN_CON, 0b1100).unwrap();
+        m.soc.write32(rockchip_rk3288::CRU_BASE + rockchip_rk3288::cru::SOFTRST_CON0, 0x2_0000).unwrap();
+        run_some(&mut m);
+        assert_eq!(m.state[1], rockchip_rk3288::CoreState::Run);
+        m.cpus[1].r[2] = 0x30_0040;
+        others_stay(&mut m, |m, n| Host::TinkerBoard(m).run(n), 1);
+    }
+
+    fn run_some(m: &mut rockchip_rk3288::Machine) { let _ = Host::TinkerBoard(m).run(3_000); }
+
     /// Records what is set on it.
     #[derive(Default)]
     struct Fake(Vec<(u8, u64, u64)>);
