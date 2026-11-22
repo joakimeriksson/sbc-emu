@@ -809,3 +809,27 @@ fn barriers_fuel_and_faults() {
     assert_eq!(run(&p, &mut l, &mut h, &mut fuel), Exit::Fault(8));
     assert!(Program::decode(&[0; 8]).is_err());
 }
+
+/// The offset of an indexed-segmented load is unsigned, within 64 KiB of the buffer.
+#[test]
+fn segmented_constants() {
+    // LDC.IS r0, c[0x1][r1 + 0xbb80]: the buffer's number and the address in r1's halves
+    let load = |off: u64, r1: u32| {
+        let l = exec(&[word(0xef90, &[(0, 8, 0), (8, 8, 1), (20, 16, off), (36, 5, 1), (44, 2, 2), (48, 3, 4)])], &[(1, [r1; 4])]);
+        l.gpr[0][0]
+    };
+    assert_eq!(load(0xbb80, 2 << 16), 3 << 16 | 0xbb80);
+    assert_eq!(load(0x10, 2 << 16 | 0xfff8), 3 << 16 | 8);
+}
+
+/// A loop that only pushes return points ends in a fault, not in ever more memory.
+#[test]
+fn endless_pushes() {
+    let code = assemble(&[word(0xe290, &[(20, 24, rel(0, 0))]), word(0xe240, &[(20, 24, rel(1, 0)), (0, 5, 0xf)])]);
+    let p = Program::decode(&code).expect("decodes");
+    let mut l = Lanes::<4>::new();
+    l.start(&p, 15, 0);
+    let mut fuel = 1 << 24;
+    let e = run(&p, &mut l, &mut Mem::default(), &mut fuel);
+    assert!(matches!(e, Exit::Fault(_)), "{e:?}");
+}

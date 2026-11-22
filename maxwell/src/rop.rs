@@ -35,6 +35,8 @@ pub struct Targets {
     pub ms: MsMode,
     /// the screen scissor
     pub clip: Rect,
+    /// the layers every target has
+    pub layers: u32,
 }
 
 impl Targets {
@@ -42,30 +44,37 @@ impl Targets {
         let ms = MsMode::from_bits(t.r(0x15d0));
         let control = t.r(0x121c);
         let mut color = [None; 8];
+        // (the register has the layer after the last)
+        let count = |end: u32, first: u32| (end & 0xffff).saturating_sub(first).max(1);
+        let mut layers = u32::MAX;
         for (k, c) in color.iter_mut().enumerate().take((control & 15).min(8) as usize) {
             let rt = control >> (4 + 3 * k) & 7;
             let base = 0x800 + 0x40 * rt;
+            // (also of one that is not there: Mesa's framebuffers without attachments)
+            let first = t.r(base + 0x20) & 0xffff;
+            layers = layers.min(count(t.r(base + 0x18), first));
             let Some(format) = rt_format(t.r(base + 0x10)) else { continue };
             let (width, height, mode) = (t.r(base + 8), t.r(base + 0xc), t.r(base + 0x14));
             if width == 0 || height == 0 {
                 continue;
             }
             let mut s = Surface::new(t.address(base), width, height, mode, t.r(base + 0x1c) as u64 * 4, format.bytes as u32, if mode >> 12 & 1 != 0 { MsMode::X1 } else { ms });
-            // the first layer
-            let layer = t.r(base + 0x20);
-            if !s.is_3d {
-                s.address += s.layer_stride * layer as u64;
+            if s.is_3d {
+                s.first_slice = first;
+            } else {
+                s.address = s.address.wrapping_add(s.layer_stride.wrapping_mul(first as u64));
             }
             *c = Some((s, format));
         }
         let zeta = (t.r(0x1538) & 1 != 0).then(|| zeta_format(t.r(0xfe8))).flatten().map(|format| {
             let mut s = Surface::new(t.address(0xfe0), t.r(0x1228), t.r(0x122c), t.r(0xfec) & 0xfff, t.r(0xff0) as u64 * 4, format.bytes as u32, ms);
-            s.address += s.layer_stride * t.r(0x179c) as u64;
+            s.address += s.layer_stride * (t.r(0x179c) & 0xffff) as u64;
+            layers = layers.min(count(t.r(0x1230), t.r(0x179c) & 0xffff));
             (s, format)
         });
         let (h, v) = (t.r(0xff4), t.r(0xff8));
         let clip = Rect { x0: h & 0xffff, x1: (h & 0xffff) + (h >> 16), y0: v & 0xffff, y1: (v & 0xffff) + (v >> 16) };
-        Self { color, zeta, ms, clip }
+        Self { color, zeta, ms, clip, layers }
     }
 
     /// The pixels every bound target has, inside the screen scissor.
@@ -452,17 +461,28 @@ pub fn logic(op: u32, s: u8, d: u8) -> u8 {
 pub struct Output {
     pub format: RtFormat,
     pub blend: Blend,
+    /// colours are clamped to 0 to 1 whatever the format
+    pub clamp: bool,
 }
 
 impl Output {
     #[inline]
-    pub fn write(&self, p: &mut [u8], color: [u32; 4], src1: [f32; 4], constant: [f32; 4], logic_op: Option<u32>) {
+    pub fn write(&self, p: &mut [u8], color: [u32; 4], mut src1: [f32; 4], mut constant: [f32; 4], logic_op: Option<u32>) {
         let n = self.format.bytes as usize;
+        // logic operations are for integers and linear normalised values
+        let logic_op = logic_op.filter(|_| !self.format.srgb && (self.format.class != Class::Float || self.format.is_normalized()));
         let mut value = color;
         if self.format.class == Class::Float {
             let mut c = color.map(f32::from_bits);
+            if self.clamp {
+                c = c.map(|v| v.max(0.0).min(1.0));
+            }
             if self.format.is_normalized() {
-                c = c.map(|v| if v.is_nan() { 0.0 } else { v });
+                // (max and min drop NaNs)
+                let low = if self.format.is_signed() { -1.0 } else { 0.0 };
+                let limit = |v: f32| if v.is_nan() { 0.0 } else { v.max(low).min(1.0) };
+                c = c.map(limit);
+                (src1, constant) = (src1.map(limit), constant.map(limit));
             }
             if self.blend.on && logic_op.is_none() {
                 let dst = self.format.decode_f32(p);

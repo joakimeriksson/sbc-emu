@@ -17,6 +17,8 @@ pub struct Surface {
     pub layer_stride: u64,
     /// Layers are the slices of a 3D surface.
     pub is_3d: bool,
+    /// of a 3D surface: the slice that is layer 0
+    pub first_slice: u32,
     pub ms: MsMode,
 }
 
@@ -49,6 +51,7 @@ impl Surface {
             plane,
             layer_stride,
             is_3d: tile_mode >> 16 & 1 != 0,
+            first_slice: 0,
             ms,
         }
     }
@@ -62,7 +65,7 @@ impl Surface {
     /// A layer's address, and its slice there.
     pub fn layer(&self, layer: u32) -> (u64, u32) {
         if self.is_3d {
-            (self.address, layer)
+            (self.address, self.first_slice.wrapping_add(layer))
         } else {
             (self.address + self.layer_stride * layer as u64, 0)
         }

@@ -319,7 +319,8 @@ impl Packed {
                 } else {
                     1f32.to_bits()
                 }
-            } else if self.srgb && i < 3 {
+            } else if self.srgb && (i == 0 || i < 3 && self.ch[2].bits != 0) {
+                // (two channels are luminance and alpha)
                 srgb8_table()[(c.raw(words) & 255) as usize].to_bits()
             } else {
                 c.decode(words)

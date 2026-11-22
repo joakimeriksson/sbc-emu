@@ -11,7 +11,9 @@ pub struct Twod {
 
 impl Default for Twod {
     fn default() -> Self {
-        Self { regs: vec![0; 0x400], sifc: Vec::new() }
+        let mut regs = vec![0; 0x400];
+        regs[0x26c / 4] = 1; // always
+        Self { regs, sifc: Vec::new() }
     }
 }
 
@@ -66,7 +68,15 @@ impl Twod {
     }
 
     fn blit(&self, mem: &mut dyn Memory) {
+        if !self.rendering(mem) {
+            return;
+        }
         let (Some((src, sf, sz)), Some((dst, df, dz))) = (self.surface(0x230), self.surface(0x200)) else { return };
+        // a raster operation of source, destination and the pattern's colour (Mesa's pattern is solid)
+        let rop = (self.r(0x2ac) == 4).then(|| {
+            let p = self.r(0x2f4).to_be_bytes().map(|b| b as f32 / 255.0);
+            (self.r(0x2a0) as u8, df.encode_f32([p[1], p[2], p[3], p[0]]))
+        });
         let (dx0, dy0) = (self.r(0x8b0) as i32 as i64, self.r(0x8b4) as i32 as i64);
         let (w, h) = (self.r(0x8b8) as i64, self.r(0x8bc) as i64);
         let (du, dv) = (self.fixed(0x8c0), self.fixed(0x8c8));
@@ -74,7 +84,7 @@ impl Twod {
         let bilinear = self.r(0x88c) >> 4 & 1 != 0;
         // where the first sample is: the pixel's corner, or its centre
         let centre = self.r(0x88c) & 1 == 0;
-        let (half_u, half_v) = if centre { (du / 2, dv / 2) } else { (0, 0) };
+        let (half_u, half_v) = if centre { ((du.unsigned_abs() / 2) as i64, (dv.unsigned_abs() / 2) as i64) } else { (0, 0) };
         let (mut cx0, mut cy0, mut cx1, mut cy1) = (0, 0, dst.width as i64, dst.height as i64);
         if let Some((x0, y0, x1, y1)) = self.clip() {
             (cx0, cy0, cx1, cy1) = (cx0.max(x0), cy0.max(y0), cx1.min(x1), cy1.min(y1));
@@ -103,7 +113,7 @@ impl Twod {
                     load(&mut line, sy, mem);
                 }
                 // a plain copy of a run
-                if same && du == ONE {
+                if same && du == ONE && rop.is_none() {
                     let sx = (u0 + (x0 - dx0) * du + half_u) >> 32;
                     if sx >= 0 && sx + (x1 - x0) <= src.width as i64 {
                         out.copy_from_slice(&line[sx as usize * sb..][..(x1 - x0) as usize * sb]);
@@ -146,17 +156,33 @@ impl Twod {
                     out[(x - x0) as usize * db..][..db].copy_from_slice(&df.encode_f32(mix)[..db]);
                 }
             }
-            dst.plane.write_rect(mem, dst_base, rect(x0 as u32 * db as u32, y as u32, out.len() as u32, 1), dz, &out, out.len());
+            let at = rect(x0 as u32 * db as u32, y as u32, out.len() as u32, 1);
+            if let Some((op, pattern)) = &rop {
+                let mut old = vec![0u8; out.len()];
+                let n = old.len();
+                dst.plane.read_rect(mem, dst_base, at, dz, &mut old, n);
+                for (k, (o, d)) in out.iter_mut().zip(&old).enumerate() {
+                    *o = rop3(*op, pattern[k % db], *o, *d);
+                }
+            }
+            dst.plane.write_rect(mem, dst_base, at, dz, &out, out.len());
         }
+    }
+
+    /// Conditional rendering.
+    fn rendering(&self, mem: &dyn Memory) -> bool {
+        crate::threed::condition(self.r(0x26c), ((self.r(0x264) & 0xff) as u64) << 32 | self.r(0x268) as u64, mem)
     }
 
     /// An image through the push buffer: written line by line as it comes.
     fn image(&mut self, mem: &mut dyn Memory) -> bool {
         let (w, h) = (self.r(0x838) as usize, self.r(0x83c) as usize);
-        if self.r(0x800) & 1 != 0 || w == 0 {
-            return false; // bitmaps: not drivers' business any more
-        }
-        let (Some(sf), Some((dst, df, dz))) = (RtFormat::from_code(self.r(0x804) as u8), self.surface(0x200)) else { return false };
+        // (bitmaps are not drivers' business any more)
+        let target = (self.r(0x800) & 1 == 0 && w != 0 && w <= 1 << 16 && h <= 1 << 16).then(|| RtFormat::from_code(self.r(0x804) as u8).zip(self.surface(0x200))).flatten();
+        let Some((sf, (dst, df, dz))) = target else {
+            self.sifc.clear();
+            return false;
+        };
         let stride = (w * sf.bytes as usize).next_multiple_of(4);
         if self.sifc.len() < stride * h {
             return false;
@@ -167,11 +193,19 @@ impl Twod {
         for y in 0..h {
             let line = &self.sifc[y * stride..][..w * sf.bytes as usize];
             let out: Vec<u8> = if sf == df { line.to_vec() } else { line.chunks_exact(sf.bytes as usize).flat_map(|p| convert(&sf, &df, p)[..db].to_vec()).collect() };
-            dst.plane.write_rect(mem, base, rect(x0 * db as u32, y0 + y as u32, out.len() as u32, 1), z, &out, out.len());
+            dst.plane.write_rect(mem, base, rect(x0.wrapping_mul(db as u32) & 0xff_ffff, y0.wrapping_add(y as u32) & 0xff_ffff, out.len() as u32, 1), z, &out, out.len());
         }
         self.sifc.clear();
         true
     }
+}
+
+/// A raster operation: bit (pattern, source, destination) of its number, for every bit.
+fn rop3(op: u8, p: u8, s: u8, d: u8) -> u8 {
+    (0..8).fold(0, |v, k| {
+        let i = (p >> k & 1) << 2 | (s >> k & 1) << 1 | d >> k & 1;
+        v | (op >> i & 1) << k
+    })
 }
 
 fn rect(x: u32, y: u32, w: u32, h: u32) -> maxwell_tex::layout::Rect {

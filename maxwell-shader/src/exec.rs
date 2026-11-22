@@ -1018,7 +1018,7 @@ pub fn run<const N: usize, H: Host<N>>(
                     let y = if !right {
                         x.checked_shl(n).unwrap_or(0)
                     } else if signed {
-                        (x as i64).checked_shr(n).unwrap_or(0) as u64
+                        ((x as i64) >> n.min(63)) as u64
                     } else {
                         x.checked_shr(n).unwrap_or(0)
                     };
@@ -1213,8 +1213,9 @@ pub fn run<const N: usize, H: Host<N>>(
                 let off = if loc == IpaLoc::Offset {
                     let o = l.gpr[offset as usize];
                     [
-                        o.map(|x| x as i16 as f32 / 4096.0),
-                        o.map(|x| (x >> 16) as i16 as f32 / 4096.0),
+                        // 12 bits each; the bits above may hold something else
+                        o.map(|x| ((x << 20) as i32 >> 20) as f32 / 4096.0),
+                        o.map(|x| ((x << 4) as i32 >> 20) as f32 / 4096.0),
                     ]
                 } else {
                     [[0.0; N]; 2]
@@ -1331,10 +1332,18 @@ pub fn run<const N: usize, H: Host<N>>(
                 l.stack.push(Token { kind: Kind::Ret, pc: l.pc, lanes: 0 });
                 l.pc = t;
             }
-            Op::Pret { t } => l.stack.push(Token { kind: Kind::Ret, pc: t, lanes: 0 }),
-            Op::Ssy { t } => l.stack.push(Token { kind: Kind::Ssy, pc: t, lanes: 0 }),
-            Op::Pbk { t } => l.stack.push(Token { kind: Kind::Pbk, pc: t, lanes: 0 }),
-            Op::Pcnt { t } => l.stack.push(Token { kind: Kind::Pcnt, pc: t, lanes: 0 }),
+            Op::Pret { t } | Op::Ssy { t } | Op::Pbk { t } | Op::Pcnt { t } => {
+                let kind = match inst.op {
+                    Op::Pret { .. } => Kind::Ret,
+                    Op::Ssy { .. } => Kind::Ssy,
+                    Op::Pbk { .. } => Kind::Pbk,
+                    _ => Kind::Pcnt,
+                };
+                if l.stack.len() >= MAX_DEPTH {
+                    return fault(pc);
+                }
+                l.stack.push(Token { kind, pc: t, lanes: 0 });
+            }
             Op::Sync { cond } | Op::Brk { cond } | Op::Cont { cond } | Op::Ret { cond } => {
                 let kind = match inst.op {
                     Op::Sync { .. } => Kind::Ssy,
@@ -1366,6 +1375,9 @@ pub fn run<const N: usize, H: Host<N>>(
                 }
             }
             Op::Sam => {
+                if l.sam.len() >= MAX_DEPTH {
+                    return fault(pc);
+                }
                 l.sam.push(l.active);
                 for q in 0..N / 4 {
                     if l.active >> (4 * q) & 15 != 0 {
@@ -1799,7 +1811,7 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
                     (0, base[i])
                 };
                 let idx = idx as u32 + seg;
-                let o = o.wrapping_add(off as u32);
+                let o = o.wrapping_add(off as u32) & if mode >= 2 { 0xffff } else { u32::MAX };
                 match ty {
                     MemTy::B64 | MemTy::B128 => {
                         for k in 0..ty.bytes() / 4 {

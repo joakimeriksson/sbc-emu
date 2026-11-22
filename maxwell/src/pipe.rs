@@ -41,10 +41,14 @@ pub struct Shader {
     pub sph: Sph,
 }
 
+/// The most local memory a lane gets, in bytes.
+pub const MAX_LOCAL: usize = 1 << 19;
+
 impl Shader {
     /// Bytes of local memory of each lane.
     pub fn local_size(&self) -> usize {
-        (self.sph.local_low + self.sph.local_high + self.sph.local_crs) as usize
+        // (the hardware has no more, and neither do we)
+        ((self.sph.local_low + self.sph.local_high + self.sph.local_crs) as usize).min(MAX_LOCAL)
     }
 }
 
@@ -404,7 +408,7 @@ impl Common<'_> {
                         return [0; 4];
                     }
                     let level = if op.lod_mode == LodMode::Level { lod[k] } else { 0 };
-                    let pos = std::array::from_fn(|c| p[c][k] as i32 + offset[c][k] as i32);
+                    let pos = std::array::from_fn(|c| (p[c][k] as i32).wrapping_add(offset[c][k] as i32));
                     maxwell_tex::sample::fetch(&tex, cache, mem, pos, if op.array { layer[k] } else { 0 }, level, op.ms.then_some(sample[k]))
                 });
                 put(r);
@@ -616,22 +620,36 @@ pub fn draw(t: &mut Threed, indices: Indices, mem: &mut dyn Memory) {
     if std::mem::take(&mut t.pipe.cbufs_changed) {
         t.pipe.constant_generation += 1;
     }
-    // split at the restart index
+    // split at the restart index; the primitives' numbers go on
     let restart = (t.r(0x1644) & 1 != 0).then(|| t.r(0x1648));
+    let mut id = 0;
     match indices {
         Indices::Range(first, n) => {
-            let v: Vec<u32> = (0..n).map(|k| first.wrapping_add(k)).collect();
-            strip(t, &v, true, mem);
+            // points, lines, triangles and quads in parts; other lists have their limit
+            let part = if matches!(t.batch.op, 0 | 1 | 4 | 7) { 3 << 20 } else { 1 << 25 };
+            let mut at = 0;
+            while at < n {
+                let m = part.min(n - at);
+                let v: Vec<u32> = (0..m).map(|k| first.wrapping_add(at + k)).collect();
+                strip(t, &v, true, &mut id, mem);
+                at += m;
+                if part == 1 << 25 {
+                    break;
+                }
+            }
         }
         Indices::List(list) => match restart {
-            Some(r) => list.split(|&i| i == r).filter(|s| !s.is_empty()).for_each(|s| strip(t, s, false, mem)),
-            None => strip(t, list, false, mem),
+            Some(r) => list.split(|&i| i == r).for_each(|s| strip(t, s, false, &mut id, mem)),
+            None => strip(t, list, false, &mut id, mem),
         },
     }
 }
 
 /// Draw one run of vertices.
-fn strip(t: &mut Threed, list: &[u32], arrays: bool, mem: &mut dyn Memory) {
+fn strip(t: &mut Threed, list: &[u32], arrays: bool, id: &mut u32, mem: &mut dyn Memory) {
+    if list.is_empty() {
+        return;
+    }
     let base = t.address(0x1608);
     let stage = |t: &Threed, k: u32| (t.r(0x2000 + 0x40 * k) & 1 != 0).then(|| t.r(0x2004 + 0x40 * k));
     let shader = |t: &mut Threed, k: u32| stage(t, k).and_then(|s| t.pipe.shader(base, s, mem));
@@ -643,9 +661,10 @@ fn strip(t: &mut Threed, list: &[u32], arrays: bool, mem: &mut dyn Memory) {
     let mut out;
     if op == 14 {
         let Some(eval) = eval else { return };
-        out = crate::geom::tessellate(t, &vertices, &remap, t.r(0xdcc).clamp(1, 32) as usize, control.as_ref(), &eval, mem);
+        out = crate::geom::tessellate(t, &vertices, &remap, t.r(0xdcc).clamp(1, 32) as usize, control.as_ref(), &eval, *id, mem);
+        *id = id.wrapping_add(remap.len() as u32 / t.r(0xdcc).clamp(1, 32));
     } else {
-        out = Geometry { vertices, primitives: Vec::new(), size: 0, ids: None };
+        out = Geometry { vertices, primitives: Vec::new(), size: 0, first_id: *id, ids: None };
         let first = t.r(0x1684) & 1 == 0;
         vertex::assemble(op, list.len(), first, |p| {
             out.size = p.len();
@@ -653,7 +672,10 @@ fn strip(t: &mut Threed, list: &[u32], arrays: bool, mem: &mut dyn Memory) {
         });
         // quads are two triangles with one number
         if matches!(op, 7 | 8) {
-            out.ids = Some((0..(out.primitives.len() / 3) as u32).map(|k| k / 2).collect());
+            out.ids = Some((0..(out.primitives.len() / 3) as u32).map(|k| id.wrapping_add(k / 2)).collect());
+            *id = id.wrapping_add(out.primitives.len() as u32 / 6);
+        } else {
+            *id = id.wrapping_add((out.primitives.len() / out.size.max(1)) as u32);
         }
     }
     if out.primitives.is_empty() {
@@ -852,6 +874,9 @@ pub struct Setup {
     pub positions: [(i32, i32); 16],
     pub per_sample: bool,
     pub alpha_to_coverage: bool,
+    pub alpha_to_one: bool,
+    /// the layer of everything, unless vertices choose theirs
+    pub layer: Option<u32>,
     pub dual: bool,
     pub two_sided: bool,
     pub clamp_z: bool,
@@ -888,7 +913,7 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
         if blend.mask & 0x1111 == 0 {
             continue;
         }
-        outputs.push((k, Output { format: *format, blend }));
+        outputs.push((k, Output { format: *format, blend, clamp: t.r(0x13a8) >> (4 * k) & 1 != 0 }));
         need |= 1 << k;
         write |= 1 << k;
     }
@@ -911,7 +936,8 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
     let alpha_test = (t.r(0x12ec) & 1 != 0).then(|| (t.r(0x1314), t.f(0x1310)));
     let alpha_to_coverage = t.r(0x153c) & 1 != 0 && samples > 1;
     let forced = t.r(0x210) & 1 != 0;
-    let changes = sph.is_some_and(|s| s.kills_pixels) || out.as_ref().is_some_and(|o| o.depth.is_some() || o.sample_mask.is_some()) || alpha_test.is_some() || alpha_to_coverage;
+    let stores = fs.as_ref().is_some_and(|f| f.sph.global_store || f.program.writes_memory());
+    let changes = stores || sph.is_some_and(|s| s.kills_pixels) || out.as_ref().is_some_and(|o| o.depth.is_some() || o.sample_mask.is_some()) || alpha_test.is_some() || alpha_to_coverage;
     let mut sample_mask = 0;
     for s in 0..samples {
         // one word per pixel of a 2 × 2 block; the first serves all
@@ -948,10 +974,15 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
         positions,
         per_sample: t.r(0x754) & 0x10 != 0 && samples > 1,
         alpha_to_coverage,
+        alpha_to_one: t.r(0x153c) >> 4 & 1 != 0 && samples > 1,
         dual,
+        layer: (t.r(0x15cc) >> 16 & 1 == 0).then(|| t.r(0x15cc) & 0xffff),
         two_sided,
         clamp_z: t.r(0x193c) & 0x18 != 0,
-        zrange: { let (a, b) = (t.f(0xc08), t.f(0xc0c)); (a.min(b), a.max(b)) },
+        zrange: {
+            let (a, b) = (t.f(0xc08), t.f(0xc0c));
+            if a.is_nan() || b.is_nan() { (0.0, 1.0) } else { (a.min(b), a.max(b)) }
+        },
         inputs,
         need,
         write,
@@ -967,14 +998,25 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
         return;
     }
     t.rop.begin(&s.targets);
-    let scene = raster::setup(t, g, &s);
-    if scene.prims.is_empty() {
-        return;
+    if t.r(0x2600) & 1 != 0 {
+        g.vertices.clamp_colors();
     }
     let work = work(t, 4);
-    raster::draw(t, &g.vertices, &scene, &s, &work, mem);
+    // (a part at a time, for the memory it takes)
+    let total = g.primitives.len() / g.size;
+    let vertices = g.vertices.data.len();
+    for from in (0..total).step_by(PART) {
+        let scene = raster::setup(t, g, &s, from, (from + PART).min(total));
+        if !scene.prims.is_empty() {
+            raster::draw(t, &g.vertices, &scene, &s, &work, mem);
+        }
+        g.vertices.data.truncate(vertices);
+    }
     written(t);
 }
+
+/// Primitives set up before they are drawn.
+const PART: usize = 1 << 18;
 
 /// A fragment shader's surroundings: four quads.
 pub struct FragmentHost<'a, 'm> {

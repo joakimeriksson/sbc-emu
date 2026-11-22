@@ -571,8 +571,7 @@ fn lod_queries() {
     let at = |x: f32| Args { coord: [[0.5, 0.5 + x / 256.0, 0.5, 0.5], [0.5; 4], [0.0; 4]], lod: Lod::Auto, ..Args::default() };
     let q = |s: &Smp, x: f32| {
         let t = query_lod(&tex, &Sampler::from_words(&s.words()), &at(x))[0];
-        // As the driver's shaders convert them.
-        (t[0] as i16 as f32 / 256.0, t[1] as u16 as f32 / 256.0)
+        (f32::from_bits(t[0]), f32::from_bits(t[1]))
     };
     assert_eq!(q(&s, 4.0), (2.5, 2.5));
     assert_eq!(q(&s, 64.0), (6.5, 3.0));
@@ -642,4 +641,47 @@ fn cache_invalidation() {
     assert_eq!((get(&mut c, &ram, 0), get(&mut c, &ram, 16)), (0, one));
     c.invalidate();
     assert_eq!((get(&mut c, &ram, 0), get(&mut c, &ram, 16)), (one, one));
+}
+
+/// A pixel no wider than a texel but many long is still averaged over its length.
+#[test]
+fn anisotropic_magnified_across() {
+    let (v, ram) = build(View::new(0x1d, 1, 64, 64, 1), 1, 1, |_, _, _, y| if y >> 2 & 1 != 0 { 255 } else { 0 });
+    let tex = Texture::from_words(&v.block_linear()).expect("format");
+    let mut s = Smp::new(true, 0);
+    s.aniso = 16;
+    let smp = Sampler::from_words(&s.words());
+    for w in [0.5, 1.0, 1.5] {
+        for c in [10.0, 12.0, 14.0, 16.0] {
+            let a = Args { coord: [[0.1, 0.1 + w / 64.0, 0.1, 0.1 + w / 64.0], [c / 64.0, c / 64.0, (c + 16.0) / 64.0, (c + 16.0) / 64.0], [0.0; 4]], lod: Lod::Auto, ..Args::default() };
+            let got = f32::from_bits(sample(&tex, &smp, &mut TexCache::new(), &ram, &a)[0][0]);
+            assert!((got - 0.5).abs() < 0.04, "{w} wide at {c}: {got}");
+        }
+    }
+}
+
+/// A white cube is white everywhere, also where anisotropic probes go past a corner.
+#[test]
+fn white_cube() {
+    struct White;
+    impl Memory for White {
+        fn read(&self, _: u64, o: &mut [u8]) {
+            o.fill(255)
+        }
+        fn write(&mut self, _: u64, _: &[u8]) {}
+    }
+    let tic = [0x8 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28, 0x1000, 3 << 21, 2 << 3 | 5 << 28, 3 << 23 | 31, 1 << 31 | 31, 0, 5 << 4];
+    let tsc = [7 << 20 | 2 | 2 << 3, 2 | 2 << 4 | 3 << 6 | 0x200, 0xfff << 12, 0, 0, 0, 0, 0];
+    let (t, s) = (Texture::from_words(&tic).expect("format"), Sampler::from_words(&tsc));
+    for i in 0..60 {
+        for j in 0..60 {
+            for (dx, dy) in [((0.02f32, 0.02f32), (0.2f32, 0.2f32)), ((0.03, 0.0), (0.0, 0.3)), ((0.2, -0.2), (0.01, 0.01))] {
+                let (u, v) = (-1.0 + i as f32 / 30.0, -1.0 + j as f32 / 30.0);
+                let c = [(u, v), (u + dx.0, v + dx.1), (u + dy.0, v + dy.1), (u + dx.0 + dy.0, v + dx.1 + dy.1)];
+                let a = Args { coord: [[1.0; 4], c.map(|p| p.0), c.map(|p| p.1)], lod: Lod::Auto, ..Args::default() };
+                let r = f32::from_bits(sample(&t, &s, &mut TexCache::new(), &White, &a)[0][0]);
+                assert!((r - 1.0).abs() < 0.01, "{u} {v}: {r}");
+            }
+        }
+    }
 }

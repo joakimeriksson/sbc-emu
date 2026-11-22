@@ -263,6 +263,7 @@ impl Soc {
             self.gpu.tick(self.now);
             self.gpu.write(word - gpu::BAR0, value, &self.smmu, &mut self.ram);
         } else if at(gpu::BAR1, gpu::SIZE) {
+            self.gpu.tick(self.now);
             self.gpu.bar1_write(word - gpu::BAR1, value, &self.smmu, &mut self.ram);
         } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
             self.dc[k].write(word - dc::BASE[k], value, self.now);
