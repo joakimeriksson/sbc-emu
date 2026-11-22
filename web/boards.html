@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sbc-emu</title>
-<meta name="description" content="Six single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. All of them boot in your browser.">
+<meta name="description" content="Seven single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. All of them boot in your browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -218,6 +218,17 @@
       <rect class="port" x="10" y="55" width="9" height="6.7" rx="2.5"/><rect class="port" x="40" y="55" width="15" height="6.7" rx="1"/><rect class="port" x="62" y="55" width="9" height="6.7" rx="2.5"/>
     </symbol>
 
+    <symbol id="b-nano" viewBox="0 0 100 80">
+      <rect class="pcb" x=".3" y=".3" width="99.4" height="79.4" rx="2"/>
+      <circle class="hole" cx="4" cy="4" r="1.6"/><circle class="hole" cx="96" cy="4" r="1.6"/><circle class="hole" cx="4" cy="76" r="1.6"/><circle class="hole" cx="96" cy="76" r="1.6"/>
+      <rect class="hdr" transform="translate(12 1.5)" width="50.8" height="5.08"/>
+      <path class="trace" d="M58 30h10l5 5h8M58 38h12l4 4h7M30 52v8l-4 4v6M44 52v18M16 34h-6l-4 4v12"/>
+      <rect class="can" x="16" y="12" width="44" height="40" rx="1"/>
+      <rect class="chip" x="28" y="21" width="20" height="20" rx=".7"/><text class="lbl" x="38" y="30.4">Tegra X1</text><text class="lbl s" x="38" y="34">128 GPU cores</text>
+      <rect class="port" x="80" y="8" width="19.7" height="14" rx=".6"/><rect class="port" x="80" y="25" width="19.7" height="14" rx=".6"/><rect class="port" x="78" y="42" width="21.7" height="16" rx=".6"/>
+      <rect class="port" x="10" y="72" width="8" height="7.7" rx="1"/><rect class="port" x="30" y="72" width="15" height="7.7" rx="1"/><rect class="port" x="54" y="70" width="9" height="9.7" rx="3.5"/>
+    </symbol>
+
     <symbol id="b-s31" viewBox="0 0 26 58">
       <rect class="pcb" x=".3" y=".3" width="25.4" height="57.4" rx="1.6"/>
       <rect class="hdr" transform="translate(.5 3)" width="2.54" height="50.8"/><rect class="hdr" transform="translate(22.96 3)" width="2.54" height="50.8"/>
@@ -249,16 +260,16 @@
       <div class="actions">
         <a class="pad-btn" href="hello.html"><span class="via" aria-hidden="true"></span>Power on a Raspberry Pi 4</a>
         <a class="quiet" href="gpu.html">3D on its GPU</a>
-        <a class="quiet" href="#boards">See all six boards</a>
+        <a class="quiet" href="#boards">See all seven boards</a>
       </div>
     </div>
     <div>
-      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. All six boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
+      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. All seven boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
       <dl class="tally">
-        <dt>6</dt><dd>boards</dd>
+        <dt>7</dt><dd>boards</dd>
         <dt>4</dt><dd>instruction sets</dd>
-        <dt>5</dt><dd>GPUs</dd>
-        <dt>6</dt><dd>boot in your browser</dd>
+        <dt>6</dt><dd>GPUs</dd>
+        <dt>7</dt><dd>boot in your browser</dd>
       </dl>
     </div>
   </section>
@@ -271,7 +282,8 @@
       <li><a class="unit on" href="#orangepi-rv" style="--w:89;--i:2"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
       <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:3"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
       <li><a class="unit on" href="#orangepi5" style="--w:100;--i:4"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
-      <li><a class="unit on" href="#esp32s31" style="--w:26;--i:5"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
+      <li><a class="unit on" href="#jetson-nano" style="--w:100;--i:5"><svg viewBox="0 0 100 80" aria-hidden="true"><use href="#b-nano"/><circle class="glow" cx="6" cy="64" r="4"/><circle class="led" cx="6" cy="64" r="1.1"/></svg>Jetson Nano</a></li>
+      <li><a class="unit on" href="#esp32s31" style="--w:26;--i:6"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
     </ul>
     <p class="legend"><span><i aria-hidden="true"></i>Boots in your browser, on this site</span></p>
   </section>
@@ -383,6 +395,25 @@
       </div>
     </article>
 
+    <article class="sheet live" id="jetson-nano">
+      <div class="art"><svg viewBox="0 0 100 80" style="--w:100" aria-hidden="true"><use href="#b-nano"/><circle class="glow" cx="6" cy="64" r="4"/><circle class="led" cx="6" cy="64" r="1.1"/></svg></div>
+      <div>
+        <h3>Jetson Nano</h3>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>NVIDIA Tegra X1</dd></div>
+          <div><dt>CPU</dt><dd>4 × Cortex-A57</dd></div>
+          <div><dt>Instruction set</dt><dd>64-bit Arm</dd></div>
+          <div><dt>GPU</dt><dd>Maxwell: GLES 3.2</dd></div>
+        </dl>
+        <p>Debian 13 from the microSD card, with Debian’s own kernel and open drivers: Ethernet, USB, HDMI, and the Maxwell GPU through nouveau and Mesa, with compute, geometry and tessellation shaders.</p>
+        <div class="run">
+          <a class="pad-btn" href="board.html?b=jetson-nano"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>Debian’s kernel boots from scratch to shells on the serial console and HDMI in about 15 seconds. A 27 MB download.</small>
+        </div>
+      </div>
+    </article>
+
     <article class="sheet live" id="esp32s31">
       <div class="art"><svg viewBox="0 0 26 58" style="--w:26" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg></div>
       <div>
@@ -407,7 +438,7 @@
     <h2 id="cores-h">Four CPU cores, written from scratch</h2>
     <p class="lede">The boards share their cores, the snapshot format, the virtual network and this site. A new board is mostly its SoC: the devices between the CPU and the connectors.</p>
     <div class="cores">
-      <div class="core"><h3>64-bit Arm</h3><code>arm-a64</code><p><strong>Raspberry Pi 4, Orange Pi 5.</strong> ARMv8-A with FP and NEON, exact to Arm’s rounding and NaN rules. A block JIT to AArch64 natively, and to WebAssembly in the browser.</p></div>
+      <div class="core"><h3>64-bit Arm</h3><code>arm-a64</code><p><strong>Raspberry Pi 4, Orange Pi 5, Jetson Nano.</strong> ARMv8-A with FP and NEON, exact to Arm’s rounding and NaN rules. A block JIT to AArch64 natively, and to WebAssembly in the browser.</p></div>
       <div class="core"><h3>32-bit Arm</h3><code>arm-a32</code><p><strong>Orange Pi One, Tinker Board S</strong>, and 32-bit programs on the Pi 4. A32, Thumb-2, VFPv4 and NEON, with JITs to AArch64 and WebAssembly.</p></div>
       <div class="core"><h3>64-bit RISC-V</h3><code>riscv64</code><p><strong>Orange Pi RV.</strong> RV64GC with the U74’s bit-manipulation extensions and Sv39 paging, under real OpenSBI. A block JIT to WebAssembly in the browser.</p></div>
       <div class="core"><h3>32-bit RISC-V</h3><code>riscv-rv32</code><p><strong>ESP32-S31.</strong> RV32IMAC with machine, supervisor and user modes and Sv32 paging, from the esp32sim project.</p></div>
@@ -416,7 +447,7 @@
 
   <footer>
     <p>The demos run on your computer: the emulator is WebAssembly in a Web Worker, and no server runs the boards. sbc-emu is open source under the BSD 3-Clause licence: <a href="https://github.com/joakimeriksson/sbc-emu">source on GitHub</a>. <a href="sources.html">What runs in the demos, and its licences</a>.</p>
-    <p>Raspberry Pi, Orange Pi, ASUS, Tinker Board, Broadcom, Allwinner, Rockchip, StarFive, SiFive, Arm and Espressif are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them. The board drawings are simplified outlines.</p>
+    <p>Raspberry Pi, Orange Pi, ASUS, Tinker Board, Broadcom, Allwinner, Rockchip, StarFive, SiFive, NVIDIA, Jetson, Tegra, Arm and Espressif are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them. The board drawings are simplified outlines.</p>
   </footer>
 </div>
 </body>

@@ -5,7 +5,8 @@
 # (scripts/orangepi-one-fixture.sh), the Tinker Board's Debian kernel and BusyBox initramfs
 # (scripts/tinker-board-fixture.sh), the Orange Pi RV's OpenSBI, Alpine kernel and initramfs
 # (scripts/orangepi-rv-fixture.sh) and the Orange Pi 5's Debian kernel and initramfs
-# (scripts/orangepi5-fixture.sh), and the ESP32-S31's mask ROM (Espressif's esp-rom-elfs) and
+# (scripts/orangepi5-fixture.sh), the Jetson Nano's Debian kernel, device tree and initramfs
+# (scripts/jetson-nano-debian-fixture.sh), and the ESP32-S31's mask ROM (Espressif's esp-rom-elfs) and
 # Linux flash image (scripts/esp32s31-fixture.sh; a release asset, as its build takes an hour), all
 # pinned; and the Pi 4 3D demos' snapshot (gpu.html), from a release asset. boards.html is the
 # front page. Every file is a whole-file fetch, so any static web server can serve the site:
@@ -74,13 +75,15 @@ sh scripts/tinker-board-fixture.sh cache/tinker-board
 sh scripts/orangepi-rv-fixture.sh cache/orangepi-rv
 # the Orange Pi 5 (wasm-build.sh stages it into web/assets/orangepi5)
 sh scripts/orangepi5-fixture.sh cache/orangepi5
+# the Jetson Nano (wasm-build.sh stages it into web/assets/jetson-nano)
+DOWNLOADS="$PWD/$DL" sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian
 
 tools/wasm-build.sh
 # this build must still restore the 3D snapshot and draw with it, without an SD card
 SBC_SNAP="$DL/gpu-demo.snap.zst" SBC_SD=/nonexistent node tools/wasm-gpu-bench.mjs 3 cube
 
 rm -rf "$OUT"
-mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/esp32s31"
+mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/jetson-nano" "$OUT/assets/esp32s31"
 cp web/boards.html "$OUT/index.html"
 cp web/hello.html web/board.html web/gpu.html web/pi4.html web/sources.html web/worker.js "$OUT/"
 cp web/wasm/sbc-emu.wasm "$OUT/wasm/"
@@ -95,6 +98,7 @@ cp web/assets/orangepi-one/zImage web/assets/orangepi-one/sun8i-h3-orangepi-one.
 cp web/assets/tinker/zImage web/assets/tinker/rk3288-tinker-s.dtb web/assets/tinker/initramfs.cpio.gz "$OUT/assets/tinker/"
 cp web/assets/orangepi-rv/fw_dynamic.bin web/assets/orangepi-rv/Image.gz web/assets/orangepi-rv/jh7110-orangepi-rv.dtb web/assets/orangepi-rv/initramfs.cpio.gz "$OUT/assets/orangepi-rv/"
 cp web/assets/orangepi5/Image.gz web/assets/orangepi5/initramfs.cpio.gz "$OUT/assets/orangepi5/"
+cp web/assets/jetson-nano/Image.gz web/assets/jetson-nano/tegra210-p3450-0000.dtb web/assets/jetson-nano/initramfs.cpio.gz "$OUT/assets/jetson-nano/"
 cp "$DL/esp32s31_rev0_rom.elf" "$DL/s31_full_flash.bin.gz" "$OUT/assets/esp32s31/"
 touch "$OUT/.nojekyll"
 find "$OUT" -type f -exec ls -l {} + | awk '{ print $5, $9 }'
