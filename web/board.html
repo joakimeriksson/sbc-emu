@@ -27,6 +27,10 @@
   .power button:disabled { cursor: progress; opacity: .7; }
   .power p { margin: 0; color: var(--silk-2); font-size: 14px; max-width: 28rem; }
   #status { margin: 8px 0 14px; color: var(--silk-2); font-size: 14px; font-variant-numeric: tabular-nums; min-height: 1.5em; }
+  .screen { margin: 14px 0 0; background: #000; border: 2px solid var(--silk-2); border-radius: 6px; overflow: hidden; }
+  .screen:focus { outline: none; border-color: var(--gold); }
+  .screen[hidden] { display: none; }
+  .screen canvas { display: block; width: 100%; height: auto; }
   .try { display: flex; flex-wrap: wrap; gap: 8px; }
   .try button { font: 14px ui-monospace, Menlo, monospace; padding: 9px 14px; border-radius: 6px; border: 1px solid var(--silk-2); background: transparent; color: var(--silk); cursor: pointer; }
   .try button:not(:disabled):hover { border-color: var(--gold); color: var(--gold); }
@@ -47,7 +51,8 @@
   </div>
   <p id="status" aria-live="polite"></p>
   <div class="try" id="try"></div>
-  <footer>The terminal is the board's serial console: click it and type.<br>
+  <div class="screen" id="screen" tabindex="0" aria-label="The HDMI monitor: click it to type on the USB keyboard" hidden><canvas id="canvas" width="1280" height="720"></canvas></div>
+  <footer>The terminal is the board's serial console: click it and type.<span id="hdminote" hidden> The picture is its HDMI monitor, with a USB keyboard of its own.</span><br>
     <a href="./">All boards</a> · <a href="https://github.com/joakimeriksson/sbc-emu">Source on GitHub</a> · <a href="sources.html">What runs here, and its licences</a> · <span id="tm"></span></footer>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
@@ -83,6 +88,13 @@ const BOARDS = {
     tm: 'Orange Pi is a trademark of Shenzhen Xunlong Software Co.; Rockchip is a trademark of Rockchip Electronics Co., Ltd. sbc-emu is not affiliated with either.',
     try: ['uname -a', 'cat /proc/device-tree/model; echo', 'grep -c processor /proc/cpuinfo', 'cat /proc/cpuinfo | head -12', 'cat /proc/interrupts', 'free -m', 'dmesg | tail -15'],
   },
+  'jetson-nano': {
+    name: 'Jetson Nano', os: 'jetson-nano', ramMb: 1024, screen: true,
+    lede: 'Debian’s kernel with the board’s own device tree and a BusyBox shell, booting from scratch on an emulated Tegra X1: four 64-bit Cortex-A57 cores, translated to WebAssembly as they run, with HDMI, USB, Ethernet and the Maxwell GPU found by Linux’s own drivers. Nothing runs on a server.',
+    note: 'Downloads 27 MB (the emulator, Debian’s kernel and a small initramfs) and boots Linux, in about 15 seconds on a fast computer.',
+    tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA, and nothing of NVIDIA’s is downloaded.',
+    try: ['uname -a', 'cat /proc/device-tree/model; echo', 'grep -c processor /proc/cpuinfo', 'dmesg | grep -i nouveau', 'ls /dev/dri', 'ip link set eth0 up; sleep 3; udhcpc -i eth0 -n -q', 'cat /proc/interrupts | head -30', 'free -m', 'cat /dev/urandom > /dev/fb0'],
+  },
   'esp32s31': {
     name: 'ESP32-S31 Function CoreBoard', os: 'esp32s31', ramMb: 0,
     lede: 'A microcontroller running Linux: Espressif’s official flash image boots through the chip’s own mask ROM, U-Boot, OpenSBI and U-Boot again to Linux, on an emulated ESP32-S31 with two 32-bit RISC-V cores and 16 MB of RAM. Nothing runs on a server.',
@@ -109,6 +121,8 @@ term.open($('xterm'));
 fit.fit();
 addEventListener('resize', () => fit.fit());
 let worker = null;
+const ctx = $('canvas').getContext('2d');
+$('screen').hidden = $('hdminote').hidden = !board.screen;
 const serial = (text) => worker?.postMessage({ type: 'serial', bytes: [...new TextEncoder().encode(text)] });
 term.onData(serial);
 $('try').onclick = (e) => { if (e.target.tagName === 'BUTTON') { serial(e.target.textContent + '\r'); term.focus(); } };
@@ -125,12 +139,33 @@ $('powerbtn').onclick = () => {
       if (m.phase === 'error') $('powerbtn').disabled = false;
     } else if (m.type === 'uart') {
       term.write(m.text);
+    } else if (m.type === 'frame' && board.screen) {
+      if ($('canvas').width !== m.w || $('canvas').height !== m.h) { $('canvas').width = m.w; $('canvas').height = m.h; }
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
     } else if (m.type === 'stats') {
       $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s` + (m.jit ? ` · ${m.jit} blocks compiled to WebAssembly` : '');
     }
   };
   worker.postMessage({ type: 'start', os: board.os, ramMb: board.ramMb, jit: new URLSearchParams(location.search).get('jit') !== '0' });
 };
+// the monitor takes the keyboard (USB HID usages)
+const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
+  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, ArrowRight: 0x4f, ArrowLeft: 0x50,
+  ArrowDown: 0x51, ArrowUp: 0x52, Home: 0x4a, End: 0x4d, Delete: 0x4c, PageUp: 0x4b, PageDown: 0x4e,
+  ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6 };
+for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
+for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
+HID.Digit0 = 0x27;
+const held = new Set();
+const key = (usage, down) => worker?.postMessage({ type: 'key', usage, down });
+$('screen').addEventListener('keydown', (e) => {
+  const u = HID[e.code];
+  if (!worker || u === undefined || e.metaKey) return;
+  e.preventDefault();
+  if (!held.has(u)) { held.add(u); key(u, true); }
+});
+$('screen').addEventListener('keyup', (e) => { const u = HID[e.code]; if (u === undefined) return; e.preventDefault(); if (held.delete(u)) key(u, false); });
+$('screen').addEventListener('blur', () => { for (const u of held) key(u, false); held.clear(); });
 if (new URLSearchParams(location.search).has('autostart')) $('powerbtn').click();
 </script>
 </body>

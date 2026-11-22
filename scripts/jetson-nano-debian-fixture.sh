@@ -115,6 +115,8 @@ if [ -n "$root" ]; then
     fi
     [ -b "$dev" ] && echo "cannot mount $dev" || echo "no block device for root=$root"
 fi
+# a shell on the monitor too
+[ -c /dev/tty1 ] && [ -d /sys/class/drm/card0 ] && setsid sh -c 'exec sh </dev/tty1 >/dev/tty1 2>&1' &
 echo "TEGRA210_BOOT_OK: arm64 Linux BusyBox shell"
 exec setsid -c /bin/sh
 INIT
