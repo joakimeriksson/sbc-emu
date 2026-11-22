@@ -41,6 +41,13 @@ pub struct Shader {
     pub sph: Sph,
 }
 
+impl Shader {
+    /// Bytes of local memory of each lane.
+    pub fn local_size(&self) -> usize {
+        (self.sph.local_low + self.sph.local_high + self.sph.local_crs) as usize
+    }
+}
+
 /// A constant buffer's words, read when they are first used.
 pub struct Words {
     buffer: Cbuf,
@@ -164,6 +171,7 @@ pub struct Work {
 
 pub struct Pipe {
     shaders: HashMap<u64, Option<Arc<Shader>>>,
+    programs: HashMap<u64, Option<Arc<Program>>>,
     /// constant values of attributes without a stream
     pub constants: [[u32; 4]; 32],
     pub cbufs_changed: bool,
@@ -179,6 +187,7 @@ impl Default for Pipe {
     fn default() -> Self {
         Self {
             shaders: HashMap::new(),
+            programs: HashMap::new(),
             constants: [[0, 0, 0, 1f32.to_bits()]; 32],
             cbufs_changed: true,
             constant_generation: 1,
@@ -203,6 +212,7 @@ impl Pipe {
 
     pub fn invalidate_shaders(&mut self) {
         self.shaders.clear();
+        self.programs.clear();
     }
 
     /// Memory may have changed behind the engine's back (a new submission).
@@ -220,6 +230,27 @@ impl Pipe {
         if self.errors.len() < 100 && self.errors.insert(e.clone()) {
             eprintln!("[maxwell] {e}");
         }
+    }
+
+    /// The compute shader at `entry` of the code segment at `base`.
+    pub fn program(&mut self, base: u64, entry: u32, mem: &dyn Memory) -> Option<Arc<Program>> {
+        if let Some(p) = self.programs.get(&(base + entry as u64)) {
+            return p.clone();
+        }
+        let made = Program::decode_at(entry, &mut |a| {
+            let mut b = [0; 8];
+            mem.read(base + a as u64, &mut b);
+            Some(u64::from_le_bytes(b))
+        });
+        let p = match made {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                self.error(e);
+                None
+            }
+        };
+        self.programs.insert(base + entry as u64, p.clone());
+        p
     }
 
     /// The shader at `at` (its header first) of the code segment at `base`.
@@ -297,9 +328,9 @@ impl Common<'_> {
         s
     }
 
-    pub fn texture(&mut self, op: &TexOp<L>) -> [[u32; L]; 4] {
-        let mut out = [[0; L]; 4];
-        for q in 0..L / 4 {
+    pub fn texture<const N: usize>(&mut self, op: &TexOp<N>) -> [[u32; N]; 4] {
+        let mut out = [[0; N]; 4];
+        for q in 0..N / 4 {
             let active = (op.lanes >> (4 * q) & 15) as u8;
             if active == 0 {
                 continue;
@@ -323,10 +354,10 @@ impl Common<'_> {
         out
     }
 
-    fn quad(&mut self, op: &TexOp<L>, q: usize, handle: u32, active: u8, out: &mut [[u32; L]; 4]) {
+    fn quad<const N: usize>(&mut self, op: &TexOp<N>, q: usize, handle: u32, active: u8, out: &mut [[u32; N]; 4]) {
         let tex = self.texture_at(handle & 0xf_ffff);
-        let at = |v: &[u32; L]| -> [u32; 4] { std::array::from_fn(|k| v[4 * q + k]) };
-        let fl = |v: &[u32; L]| at(v).map(f32::from_bits);
+        let at = |v: &[u32; N]| -> [u32; 4] { std::array::from_fn(|k| v[4 * q + k]) };
+        let fl = |v: &[u32; N]| at(v).map(f32::from_bits);
         let mut put = |r: [[u32; 4]; 4]| {
             for (k, t) in r.iter().enumerate() {
                 if active >> k & 1 != 0 {
@@ -363,7 +394,7 @@ impl Common<'_> {
                 let smp = self.sampler_at(handle >> 20);
                 let lod = match op.lod_mode {
                     _ if op.kind == TexKind::Grad => {
-                        let g = |v: &[[f32; L]; 2]| -> [[f32; 4]; 3] { std::array::from_fn(|c| std::array::from_fn(|k| v.get(c).map_or(0.0, |v| v[4 * q + k]))) };
+                        let g = |v: &[[f32; N]; 2]| -> [[f32; 4]; 3] { std::array::from_fn(|c| std::array::from_fn(|k| v.get(c).map_or(0.0, |v| v[4 * q + k]))) };
                         Lod::Grad { dx: g(&op.ddx), dy: g(&op.ddy) }
                     }
                     LodMode::Auto => Lod::Auto,
@@ -394,7 +425,7 @@ impl Common<'_> {
         }
     }
 
-    fn surface(&mut self, op: &SurfOp<L>, l: usize) -> (Arc<Texture>, [i32; 3], u32) {
+    fn surface<const N: usize>(&mut self, op: &SurfOp<N>, l: usize) -> (Arc<Texture>, [i32; 3], u32) {
         let h = match op.handle {
             Handle::Bindless(h) => h[l],
             Handle::Bound(w) => self.cbuf(self.tex_cb, 4 * w),
@@ -411,9 +442,9 @@ impl Common<'_> {
         (t, p, layer)
     }
 
-    pub fn surface_load(&mut self, op: &SurfOp<L>) -> [[u32; L]; 4] {
-        let mut out = [[0; L]; 4];
-        for l in (0..L).filter(|l| op.lanes >> l & 1 != 0) {
+    pub fn surface_load<const N: usize>(&mut self, op: &SurfOp<N>) -> [[u32; N]; 4] {
+        let mut out = [[0; N]; 4];
+        for l in (0..N).filter(|l| op.lanes >> l & 1 != 0) {
             let (t, p, layer) = self.surface(op, l);
             let v = if op.raw {
                 let mut b = [0u8; 16];
@@ -429,9 +460,9 @@ impl Common<'_> {
         out
     }
 
-    pub fn surface_store(&mut self, op: &SurfOp<L>, data: &[[u32; L]; 4]) {
+    pub fn surface_store<const N: usize>(&mut self, op: &SurfOp<N>, data: &[[u32; N]; 4]) {
         self.stored = true;
-        for l in (0..L).filter(|l| op.lanes >> l & 1 != 0) {
+        for l in (0..N).filter(|l| op.lanes >> l & 1 != 0) {
             let (t, p, layer) = self.surface(op, l);
             let v: [u32; 4] = std::array::from_fn(|k| data[k][l]);
             if op.raw {
@@ -446,10 +477,10 @@ impl Common<'_> {
         self.cache.invalidate();
     }
 
-    pub fn surface_atomic(&mut self, op: &SurfOp<L>, atom: maxwell_shader::isa::AtomOp, ty: maxwell_shader::isa::AtomTy, a: &[u64; L], b: &[u64; L]) -> [u64; L] {
+    pub fn surface_atomic<const N: usize>(&mut self, op: &SurfOp<N>, atom: maxwell_shader::isa::AtomOp, ty: maxwell_shader::isa::AtomTy, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
         self.stored = true;
-        let mut out = [0; L];
-        for l in (0..L).filter(|l| op.lanes >> l & 1 != 0) {
+        let mut out = [0; N];
+        for l in (0..N).filter(|l| op.lanes >> l & 1 != 0) {
             let (t, p, layer) = self.surface(op, l);
             if let Some(at) = maxwell_tex::sample::image_address(&t, p, layer) {
                 let n = ty.bytes();
@@ -468,7 +499,7 @@ impl Common<'_> {
 /// The parts of `Host` that are the same for every stage.
 #[macro_export]
 macro_rules! common_host {
-    () => {
+    ($n:expr) => {
         #[inline(always)]
         fn cbuf(&self, index: u32, offset: u32) -> u32 {
             self.common.cbuf(index, offset)
@@ -480,16 +511,16 @@ macro_rules! common_host {
             self.common.stored = true;
             self.common.mem.write(addr, data);
         }
-        fn texture(&mut self, op: &TexOp<L>) -> [[u32; L]; 4] {
+        fn texture(&mut self, op: &TexOp<{ $n }>) -> [[u32; $n]; 4] {
             self.common.texture(op)
         }
-        fn surface_load(&mut self, op: &SurfOp<L>) -> [[u32; L]; 4] {
+        fn surface_load(&mut self, op: &SurfOp<{ $n }>) -> [[u32; $n]; 4] {
             self.common.surface_load(op)
         }
-        fn surface_store(&mut self, op: &SurfOp<L>, data: &[[u32; L]; 4]) {
+        fn surface_store(&mut self, op: &SurfOp<{ $n }>, data: &[[u32; $n]; 4]) {
             self.common.surface_store(op, data)
         }
-        fn surface_atomic(&mut self, op: &SurfOp<L>, atom: maxwell_shader::isa::AtomOp, ty: maxwell_shader::isa::AtomTy, a: &[u64; L], b: &[u64; L]) -> [u64; L] {
+        fn surface_atomic(&mut self, op: &SurfOp<{ $n }>, atom: maxwell_shader::isa::AtomOp, ty: maxwell_shader::isa::AtomTy, a: &[u64; $n], b: &[u64; $n]) -> [u64; $n] {
             self.common.surface_atomic(op, atom, ty, a, b)
         }
     };
@@ -506,7 +537,7 @@ struct VertexHost<'a, 'm> {
 }
 
 impl Host<L> for VertexHost<'_, '_> {
-    common_host!();
+    common_host!(L);
 
     fn attr_load(&mut self, lane: usize, a: Attr) -> u32 {
         match a.addr {
@@ -538,6 +569,16 @@ struct Stream {
 }
 
 const FUEL: u64 = 4_000_000;
+
+impl Work {
+    /// Compute's resources.
+    pub fn compute(pipe: &mut Pipe, cbufs: [Cbuf; 18], tic: u64, tsc: u64, tex_cb: u32) -> Self {
+        if std::mem::take(&mut pipe.cbufs_changed) {
+            pipe.constant_generation += 1;
+        }
+        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb }
+    }
+}
 
 /// Stage `s`'s resources.
 pub fn work(t: &Threed, s: usize) -> Work {
@@ -574,35 +615,53 @@ pub fn draw(t: &mut Threed, indices: Indices, mem: &mut dyn Memory) {
 fn strip(t: &mut Threed, list: &[u32], arrays: bool, mem: &mut dyn Memory) {
     let base = t.address(0x1608);
     let stage = |t: &Threed, k: u32| (t.r(0x2000 + 0x40 * k) & 1 != 0).then(|| t.r(0x2004 + 0x40 * k));
-    let Some(vs) = stage(t, 1).and_then(|s| t.pipe.shader(base, s, mem)) else { return };
-    let fs = stage(t, 5).and_then(|s| t.pipe.shader(base, s, mem));
+    let shader = |t: &mut Threed, k: u32| stage(t, k).and_then(|s| t.pipe.shader(base, s, mem));
+    let Some(vs) = shader(t, 1) else { return };
+    let (control, eval, geometry, fs) = (shader(t, 2), shader(t, 3), shader(t, 4), shader(t, 5));
     let (vertices, remap) = shade_vertices(t, &vs, list, arrays, mem);
     t.counters.vertices += list.len() as u64;
-    // (tessellation and geometry shaders change what is rasterized)
-    let mut out = Geometry { vertices, primitives: Vec::new(), size: 0, ids: None };
-    let first = t.r(0x1684) & 1 == 0;
     let op = t.batch.op;
-    vertex::assemble(op, list.len(), first, |p| {
-        out.size = p.len();
-        out.primitives.extend(p.iter().map(|&k| remap[k as usize]));
-    });
-    if out.primitives.is_empty() {
-        return;
-    }
-    // adjacency is for geometry shaders: without one it is dropped
-    let mut out = match op {
-        10 | 11 => out.pick(&[1, 2]),
-        12 | 13 => out.pick(&[0, 2, 4]),
-        _ => out,
-    };
+    let mut out;
     if op == 14 {
-        return; // patches: not yet
+        let Some(eval) = eval else { return };
+        out = crate::geom::tessellate(t, &vertices, &remap, t.r(0xdcc).clamp(1, 32) as usize, control.as_ref(), &eval, mem);
+    } else {
+        out = Geometry { vertices, primitives: Vec::new(), size: 0, ids: None };
+        let first = t.r(0x1684) & 1 == 0;
+        vertex::assemble(op, list.len(), first, |p| {
+            out.size = p.len();
+            out.primitives.extend(p.iter().map(|&k| remap[k as usize]));
+        });
+        // quads are two triangles with one number
+        if matches!(op, 7 | 8) {
+            out.ids = Some((0..(out.primitives.len() / 3) as u32).map(|k| k / 2).collect());
+        }
     }
-    t.counters.primitives += (out.primitives.len() / out.size.max(1)) as u64;
-    if t.r(0x37c) & 1 == 0 {
+    if out.primitives.is_empty() {
+        written(t);
         return;
     }
-    rasterize(t, &mut out, fs, mem);
+    t.counters.assembled += (out.primitives.len() / out.size) as u64;
+    if let Some(g) = geometry {
+        out = crate::geom::geometry(t, &out, &g, mem);
+    } else {
+        // adjacency is for geometry shaders
+        out = match op {
+            10 | 11 => out.pick(&[1, 2]),
+            12 | 13 => out.pick(&[0, 2, 4]),
+            _ => out,
+        };
+    }
+    t.counters.primitives += (out.primitives.len() / out.size) as u64;
+    if t.r(0x744) & 1 != 0 {
+        crate::geom::feedback(t, &out, mem);
+        t.pipe.invalidate_textures();
+        t.pipe.cbufs_changed = true;
+    }
+    if t.r(0x37c) & 1 != 0 && !out.primitives.is_empty() {
+        rasterize(t, &mut out, fs, mem);
+    }
+    written(t);
 }
 
 /// A vertex shader's inputs in a draw.
@@ -620,7 +679,7 @@ impl VertexInputs {
     fn run(&self, vs: &Shader, work: &Work, w: &mut Worker, mem: &mut dyn Memory, layout: &Verts, vertices: &[u32], out: &mut [u32]) -> Option<String> {
         let mut inputs = [[[0u32; 4]; 32]; L];
         let (lanes, mut common) = w.parts(work, mem);
-        lanes.set_local_size((vs.sph.local_low + vs.sph.local_high + vs.sph.local_crs) as usize);
+        lanes.set_local_size(vs.local_size());
         let mut failed = None;
         for (chunk, outs) in vertices.chunks(L).zip(out.chunks_mut(L * layout.stride)) {
             for (lane, &i) in chunk.iter().enumerate() {
@@ -957,7 +1016,7 @@ impl<'a, 'm> FragmentHost<'a, 'm> {
 }
 
 impl Host<L> for FragmentHost<'_, '_> {
-    common_host!();
+    common_host!(L);
 
     fn sysval(&mut self, sys: u8) -> [u32; L] {
         match sys {

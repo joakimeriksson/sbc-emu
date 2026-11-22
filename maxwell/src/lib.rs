@@ -1,6 +1,8 @@
 //! NVIDIA Maxwell's graphics engine (GM20B) as Mesa's nouveau driver programs it: the 3D class
 //! (B197), compute (B1C0), inline-to-memory (A140) and 2D (902D). Methods come in from the host's
 //! push buffers; everything runs at once, in order.
+pub mod compute;
+pub mod geom;
 pub mod inline;
 pub mod mme;
 pub mod pipe;
@@ -31,6 +33,7 @@ pub struct Engine {
     pub threed: threed::Threed,
     inline: inline::Inline,
     twod: twod::Twod,
+    compute: compute::Compute,
     /// (class, method) pairs without an effect, for reports
     pub unknown: std::collections::BTreeSet<(u32, u32)>,
 }
@@ -55,6 +58,15 @@ impl Engine {
                         self.threed.rop.flush(mem);
                     }
                     self.inline.method(m, v, mem);
+                }
+            }
+            0xb1c0 => {
+                if m == 0x2bc {
+                    self.threed.rop.flush(mem);
+                }
+                if self.compute.method(m, v, &mut self.threed.pipe, mem, now) {
+                    self.threed.pipe.invalidate_textures();
+                    self.threed.pipe.cbufs_changed = true;
                 }
             }
             0x902d => {

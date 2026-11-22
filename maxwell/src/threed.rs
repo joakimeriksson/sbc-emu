@@ -31,6 +31,15 @@ pub struct Counters {
     pub primitives: u64,
     pub draws: u64,
     pub fragments: u64,
+    /// before geometry shaders
+    pub assembled: u64,
+    pub control: u64,
+    pub evaluations: u64,
+    pub geometry: u64,
+    pub geometry_out: u64,
+    /// primitives written by transform feedback, and those that should have been
+    pub feedback: u64,
+    pub feedback_needed: u64,
 }
 
 impl Counters {
@@ -249,7 +258,7 @@ impl Threed {
         match self.r(0x1558) & 7 {
             0 => false,
             1 => true,
-            2 => mem.read32(at) != 0 || mem.read32(at + 4) != 0,
+            2 => mem.read32(at + 4) != 0,
             mode => {
                 let same = mem.read32(at) == mem.read32(at + 16) && mem.read32(at + 4) == mem.read32(at + 20);
                 same == (mode == 3)
@@ -261,12 +270,25 @@ impl Threed {
     fn report(&mut self, v: u32, mem: &mut dyn Memory, now: u64) {
         self.rop.flush(mem);
         let at = self.address(0x1b00);
-        let value = match v >> 23 & 31 {
-            2 | 0x15 => Some(self.counters.samples),
-            1 | 5 => Some(self.counters.vertices),
-            3 | 0x0f | 0x11 | 0x12 => Some(self.counters.primitives),
-            0x13 => Some(self.counters.fragments),
+        let select = v >> 23 & 31;
+        let c = &self.counters;
+        let value = match select {
             0 => None,
+            2 | 0x15 => Some(c.samples),
+            1 | 5 => Some(c.vertices),
+            3 => Some(c.assembled),
+            7 => Some(c.geometry),
+            9 => Some(c.geometry_out),
+            0x0b => Some(c.feedback),
+            0x0d => Some(c.feedback_needed),
+            0x0f | 0x11 | 0x12 => Some(c.primitives),
+            0x13 => Some(c.fragments),
+            // the bytes written to a transform feedback buffer
+            0x1a => Some(self.r(0x390 + 0x20 * (v >> 5 & 3)) as u64),
+            0x1b => Some(c.control),
+            0x1d => Some(c.evaluations),
+            // overflow of transform feedback
+            6 | 0x1e => Some(c.feedback_needed - c.feedback),
             _ => Some(0),
         };
         match v & 3 {
@@ -275,6 +297,11 @@ impl Threed {
             0 | 2 => {
                 let mut b = [0u8; 16];
                 match value {
+                    // 32-bit counters come after the payload
+                    Some(n) if v & 3 == 2 && matches!(select, 2 | 0x1a) => {
+                        b[..4].copy_from_slice(&self.r(0x1b08).to_le_bytes());
+                        b[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+                    }
                     Some(n) if v & 3 == 2 => b[..8].copy_from_slice(&n.to_le_bytes()),
                     _ => b[..4].copy_from_slice(&self.r(0x1b08).to_le_bytes()),
                 }

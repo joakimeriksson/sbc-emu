@@ -817,7 +817,7 @@ impl Shade<'_, '_> {
             }
             self.out.0.fragments += (run & !helper).count_ones() as u64;
             let (lanes, mut common) = self.w.parts(self.work, self.mem);
-            lanes.set_local_size((fs.sph.local_low + fs.sph.local_high + fs.sph.local_crs) as usize);
+            lanes.set_local_size(fs.local_size());
             lanes.start(&fs.program, run, helper);
             let mut host = FragmentHost::new(&mut common, s, scene, prims, quads, live, sample);
             let mut fuel = 4_000_000;
