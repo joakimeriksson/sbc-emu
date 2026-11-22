@@ -521,8 +521,8 @@ impl Cpu {
     /// Another core invalidated instruction cache: `page` (physical page number) or u64::MAX.
     pub fn jit_invalidate(&mut self, page: u64) {
         if let Some(j) = self.jit.as_mut() { if page == u64::MAX { j.flush() } else { j.invalidate_page(page) } }
-        let base = self.ram_base >> 12;
-        if let Some(a) = self.a32.as_mut() { a.code_changed((page != u64::MAX).then_some(page + base)); }
+        // both are keyed by RAM offset (the 32-bit core works in offsets: `el0_setup`)
+        if let Some(a) = self.a32.as_mut() { a.code_changed((page != u64::MAX).then_some(page)); }
     }
 
     #[inline]

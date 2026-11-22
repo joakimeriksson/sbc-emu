@@ -62,7 +62,7 @@ impl Cpu {
     }
 
     fn read_code16(&mut self, bus: &mut dyn Bus, va: u32, pa: u32) -> Result<u32, Trap> {
-        bus.read16(pa as u64)
+        bus.read16(self.bus_address(pa))
             .map(u32::from)
             .map_err(|_| self.prefetch_abort(va, 0x08))
     }

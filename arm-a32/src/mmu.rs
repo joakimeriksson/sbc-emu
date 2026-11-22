@@ -126,6 +126,12 @@ impl Cpu {
         self.host(va, size, U_WRITE)
     }
 
+    /// The bus address of this core's physical address `pa` (see `phys_bias`).
+    #[inline(always)]
+    pub(crate) fn bus_address(&self, pa: u32) -> u64 {
+        pa as u64 + self.phys_bias
+    }
+
     /// Is `pa` (physical) in the RAM the host pointer covers?
     #[inline(always)]
     pub(crate) fn in_ram(&self, pa: u32) -> bool {
@@ -322,7 +328,7 @@ impl Cpu {
         }
         if !self.watch.is_empty() && access == Access::Read { self.watch.check(va as u64, 1, emu_core::debug::WATCH_READ); }
         let physical = self.translate_fill(bus, va, access)?;
-        bus.read8(physical as u64).map_err(|_| (va, 0x08))
+        bus.read8(self.bus_address(physical)).map_err(|_| (va, 0x08))
     }
 
     fn crosses_page(&self, va: u32, size: u32) -> bool {
@@ -341,7 +347,7 @@ impl Cpu {
             return Ok(u16::from_le_bytes([lo, hi]));
         }
         let physical = self.translate_fill(bus, va, Access::Read)?;
-        bus.read16(physical as u64).map_err(|_| (va, 0x08))
+        bus.read16(self.bus_address(physical)).map_err(|_| (va, 0x08))
     }
 
     pub(crate) fn mem_read32(
@@ -364,7 +370,7 @@ impl Cpu {
             return Ok(u32::from_le_bytes(bytes));
         }
         let physical = self.translate_fill(bus, va, access)?;
-        bus.read32(physical as u64).map_err(|_| (va, 0x08))
+        bus.read32(self.bus_address(physical)).map_err(|_| (va, 0x08))
     }
 
     fn invalidate_exclusive(&mut self, va: u32) {
@@ -393,7 +399,7 @@ impl Cpu {
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
-        bus.write8(physical as u64, value).map_err(|_| (va, 0x08))
+        bus.write8(self.bus_address(physical), value).map_err(|_| (va, 0x08))
     }
 
     pub(crate) fn mem_write16(
@@ -420,7 +426,7 @@ impl Cpu {
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
-        bus.write16(physical as u64, value).map_err(|_| (va, 0x08))
+        bus.write16(self.bus_address(physical), value).map_err(|_| (va, 0x08))
     }
 
     pub(crate) fn mem_write32(
@@ -447,6 +453,6 @@ impl Cpu {
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
-        bus.write32(physical as u64, value).map_err(|_| (va, 0x08))
+        bus.write32(self.bus_address(physical), value).map_err(|_| (va, 0x08))
     }
 }

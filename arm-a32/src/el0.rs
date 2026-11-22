@@ -90,18 +90,20 @@ impl Cpu {
         cpu
     }
 
-    /// Prepare to run user code from guest RAM at `ram` (physical 0, `len` bytes). `mt`: other
-    /// cores run in parallel on host threads (barriers become host fences, store-exclusive a
-    /// compare-and-swap).
+    /// Prepare to run user code from guest RAM at `ram` (`len` bytes at physical `base`).
+    /// The core then works in RAM offsets (`phys_bias` = `base`): up to 4 GiB of RAM is
+    /// reachable wherever it sits; a page outside it (a device a user process mapped) below
+    /// `base` is not, and faults. `mt`: other cores run in parallel on host threads (barriers
+    /// become host fences, store-exclusive a compare-and-swap).
     ///
     /// # Safety
     /// As `set_ram`: `ram` must point to `len` writable bytes that outlive this `Cpu`.
     pub unsafe fn el0_setup(&mut self, ram: *mut u8, base: u64, len: u64, mt: bool) {
         let len = len.min(u32::MAX as u64) as u32;
-        let base = base as u32; // AArch32 EL0 reaches only RAM below 4 GiB
-        if self.ram != ram || self.ram_len != len || self.ram_base != base {
+        if self.ram != ram || self.ram_len != len || self.ram_base != 0 || self.phys_bias != base {
+            self.phys_bias = base;
             // SAFETY: the caller's guarantee
-            unsafe { self.set_ram(ram, base, len) };
+            unsafe { self.set_ram(ram, 0, len) };
         }
         self.mt = mt;
     }
@@ -226,8 +228,9 @@ impl Cpu {
         let host = self.el1.expect("el0_translate outside step_el0");
         // SAFETY: set by step_el0 for the duration of the step
         match unsafe { (*host).translate(bus, va, access) } {
-            Ok(pa) if pa >> 32 == 0 => Ok(pa as u32),
-            Ok(_) => Err((va, HOST_FSC | 0x10)), // beyond 4 GiB: not reachable by this core
+            // this core's physical address: the offset from `phys_bias`
+            Ok(pa) if pa.wrapping_sub(self.phys_bias) >> 32 == 0 => Ok(pa.wrapping_sub(self.phys_bias) as u32),
+            Ok(_) => Err((va, HOST_FSC | 0x10)), // 4 GiB or more past `phys_bias`: not reachable
             Err(fsc) => Err((va, HOST_FSC | fsc)),
         }
     }
@@ -352,5 +355,91 @@ impl Cpu {
         if self.mt {
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Physical memory at 4 GiB and up (nothing below), as a Jetson Nano's upper RAM.
+    struct HighBus {
+        base: u64,
+        mem: Vec<u8>,
+        accesses: usize,
+    }
+
+    impl HighBus {
+        fn at(&mut self, addr: u64, n: usize) -> &mut [u8] {
+            assert!(addr >= self.base, "bus access below RAM: {addr:#x}");
+            self.accesses += 1;
+            let o = (addr - self.base) as usize;
+            &mut self.mem[o..o + n]
+        }
+    }
+
+    macro_rules! bus {
+        ($($r:ident $w:ident $t:ty),*) => { $(
+            fn $r(&mut self, a: u64) -> Result<$t, emu_core::Fault> {
+                Ok(<$t>::from_le_bytes(self.at(a, std::mem::size_of::<$t>()).try_into().unwrap()))
+            }
+            fn $w(&mut self, a: u64, v: $t) -> Result<(), emu_core::Fault> {
+                let n = std::mem::size_of::<$t>();
+                self.at(a, n).copy_from_slice(&v.to_le_bytes());
+                Ok(())
+            }
+        )* };
+    }
+
+    impl Bus for HighBus {
+        bus!(read8 write8 u8, read16 write16 u16, read32 write32 u32, read64 write64 u64);
+    }
+
+    /// Every user address maps to RAM at `base + va`.
+    struct Host {
+        base: u64,
+    }
+
+    impl El1Host for Host {
+        fn translate(&mut self, _bus: &mut dyn Bus, va: u32, _access: El0Access) -> Result<u64, u32> {
+            Ok(self.base + va as u64)
+        }
+        fn cp15(&mut self, _insn: u32, _value: u64) -> Cp15 {
+            Cp15::Undefined
+        }
+    }
+
+    /// 32-bit user code, data and page-crossing accesses in RAM above 4 GiB: the core works
+    /// in RAM offsets and the bus sees the real addresses.
+    #[test]
+    fn user_code_in_ram_above_4_gib() {
+        const BASE: u64 = 0x1_0000_0000;
+        let mut mem = vec![0u8; 0x10000];
+        let code: [u32; 4] = [
+            0xe591_0000, // ldr r0, [r1]
+            0xe280_0001, // add r0, r0, #1
+            0xe581_0004, // str r0, [r1, #4]
+            0xe591_2fff, // ldr r2, [r1, #0xfff] (crosses into the next page)
+        ];
+        for (i, w) in code.iter().enumerate() {
+            mem[0x1000 + 4 * i..0x1004 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+        mem[0x2000..0x2004].copy_from_slice(&41u32.to_le_bytes());
+        mem[0x2fff..0x3003].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut bus = HighBus { base: BASE, mem, accesses: 0 };
+        let (ram, len) = (bus.mem.as_mut_ptr(), bus.mem.len() as u64);
+        let mut cpu = Cpu::new_el0();
+        // SAFETY: `bus.mem` outlives `cpu`
+        unsafe { cpu.el0_setup(ram, BASE, len, false) };
+        cpu.r[15] = 0x1000;
+        cpu.r[1] = 0x2000;
+        let mut host = Host { base: BASE };
+        for _ in 0..4 {
+            cpu.step_el0(&mut bus, &mut host).expect("no exception");
+        }
+        assert_eq!(cpu.r[0], 42);
+        assert_eq!(cpu.r[2], 0x1234_5678);
+        assert_eq!(u32::from_le_bytes(bus.mem[0x2004..0x2008].try_into().unwrap()), 42);
+        assert!(bus.accesses > 0, "the slow path goes to the bus");
     }
 }
