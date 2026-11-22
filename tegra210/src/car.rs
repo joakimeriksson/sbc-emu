@@ -109,6 +109,12 @@ impl Car {
         }
     }
 
+    /// Whether the peripheral with this clock/reset number (the device tree's) is in reset.
+    pub fn in_reset(&self, id: usize) -> bool {
+        const BANKS: [usize; 7] = [0x4, 0x8, 0xc, 0x358, 0x35c, 0x28c, 0x2a4]; // L H U V W X Y
+        BANKS.get(id / 32).is_some_and(|b| self.regs[b / 4] & 1 << (id % 32) != 0)
+    }
+
     pub fn write(&mut self, offset: u64, value: u32) {
         let o = offset as usize & (SIZE as usize - 4);
         if let Some(&(state, set, _)) = SET_CLEAR.iter().find(|&&(_, s, c)| s == o || c == o) {
