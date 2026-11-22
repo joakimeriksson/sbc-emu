@@ -145,3 +145,5 @@ impl Uart {
         }
     }
 }
+
+emu_core::snap_struct!(Uart { out, rx, divisor, ier, lcr, mcr, scr, fifo_enabled, thre_pending });

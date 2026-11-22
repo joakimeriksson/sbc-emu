@@ -15,6 +15,12 @@ impl SerialBoard for allwinner_h3::Machine {
     fn instret(&self) -> u64 {
         allwinner_h3::Machine::instret(self)
     }
+    fn save(&self) -> Result<Vec<u8>, String> {
+        allwinner_h3::Machine::save(self)
+    }
+    fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        allwinner_h3::Machine::restore(self, file)
+    }
     fn report(&self, tag: &str) {
         eprintln!(
             "[{tag}] pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
@@ -98,7 +104,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode", "--net"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode", "--net", "--restore", "--snapshot"])?;
     let net = arg(args, "--net").unwrap_or("nat");
     if !matches!(net, "nat" | "local" | "none") {
         return Err("--net nat|local|none".into());
@@ -122,7 +128,9 @@ fn execute(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let (kernel, dtb) = if card_boot {
+    // a snapshot has the kernel in its RAM
+    let only_restored = arg(args, "--restore").is_some() && arg(args, "--kernel").is_none() && !card_boot;
+    let (kernel, dtb) = if card_boot || only_restored {
         (Vec::new(), Vec::new())
     } else {
         (
@@ -142,6 +150,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     let disk = arg(args, "--sd")
         .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
         .transpose()?;
+    let booted = std::cell::Cell::new(false);
     let make_machine = || -> Result<allwinner_h3::Machine, String> {
         let mut m = allwinner_h3::Machine::with_ram_size(ram);
         if args.iter().any(|a| a == "--no-jit") {
@@ -152,7 +161,11 @@ fn execute(args: &[String]) -> Result<(), String> {
             m.connect_network(net == "nat", false);
         }
         m.soc.mmc.card.disk = disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
-        if card_boot {
+        if only_restored {
+            if booted.replace(true) {
+                return Err("the guest rebooted: give --kernel or --sd with --restore to boot it again".into());
+            }
+        } else if card_boot {
             let boot = allwinner_h3::boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
             eprintln!(
                 "[orangepi-one] boot from SD card: kernel {} bytes, initrd {} bytes, cmdline \"{}\"",

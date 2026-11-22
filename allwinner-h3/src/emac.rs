@@ -375,6 +375,8 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+emu_core::snap_struct!(Emac { regs, phy, tx_desc, rx_desc, tx_out, rx_queue, tx_frames, rx_frames, rx_dropped });
+
 #[cfg(test)]
 mod tests {
     use super::*;

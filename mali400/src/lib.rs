@@ -56,8 +56,9 @@ pub enum Irq {
 const GPU_HZ: u64 = 432_000_000;
 const TICK_HZ: u64 = 24_000_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Unit {
+    #[default]
     Gp,
     Pp(usize),
 }
@@ -528,3 +529,22 @@ impl Mali400 {
         }
     }
 }
+
+impl emu_core::snap::Snap for Unit {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        w.u8(match *self { Unit::Gp => 0, Unit::Pp(k) => 1 + k as u8 });
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        *self = match r.u8()? as usize {
+            0 => Unit::Gp,
+            k if k <= NUM_PP => Unit::Pp(k - 1),
+            k => return Err(emu_core::snap::SnapError(format!("Mali-400 unit {k}"))),
+        };
+        Ok(())
+    }
+}
+emu_core::snap_struct!(Gp { regs, rawstat, mask, status, jobs, plbu, point_sizes, vs_ran });
+emu_core::snap_struct!(Pp { frame, wb, rawstat, mask, status, jobs } fixed { regs });
+emu_core::snap_struct!(Pmu { off, rawstat, mask, sw_delay });
+emu_core::snap_struct!(L2 { regs });
+emu_core::snap_struct!(Mali400 { gp, pp, mmu, pmu, l2, now, pending } skip { logged, trace });

@@ -586,6 +586,8 @@ impl Cpu {
     }
 }
 
+emu_core::snap_struct!(Vfp { d, fpscr, fpexc, fpinst, fpinst2 });
+
 #[cfg(test)]
 mod tests {
     use super::*;

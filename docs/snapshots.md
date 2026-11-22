@@ -6,7 +6,7 @@ not zero and what the guest has written to its disks. Restored, the guest goes o
 | Board | |
 |---|---|
 | Raspberry Pi 4 | yes (script `save`, monitor `savevm`/`loadvm`, `--restore`) |
-| Orange Pi 5 | yes (below) |
+| Orange Pi 5, Orange Pi One | yes (below) |
 | The other boards | not yet |
 
 ```sh
@@ -40,6 +40,6 @@ older format keeps its own compatibility).
 ## Adding a board
 
 `emu_core::snap::Snap` is implemented with `snap_struct!`, which names every field of a structure as
-saved, `fixed` (a length the hardware gives) or `skip`: new state that is in none of them does not
+saved, `fixed` (a length the hardware gives), `fitted` (there or not, as the machine is built) or `skip`: new state that is in none of them does not
 compile. `rk3588/src/snapshot.rs` puts a machine together, and `rk3588/tests/snapshot.rs` is the test
 to copy: run, save, go on; restore into a new machine, go on as far; the two states are equal.

@@ -72,10 +72,7 @@ impl Machine {
     /// The machine as a snapshot file. An error when it has state that cannot be saved (a disk
     /// that writes through to its image).
     pub fn save(&self) -> Result<Vec<u8>, String> {
-        let persistent = |d: Option<&dyn emu_core::disk::Disk>| d.is_some_and(|d| !d.snapshots_disk());
-        if persistent(self.soc.mmc.card.disk.as_deref()) {
-            return Err("--sd-persist writes into the image: a snapshot could not bring it back".into());
-        }
+        snap::check_disk(self.soc.mmc.card.disk.as_deref())?;
         Ok(snap::pack(BOARD, VERSION, &self.state()))
     }
 

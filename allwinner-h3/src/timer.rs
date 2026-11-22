@@ -163,6 +163,9 @@ impl Timer {
     }
 }
 
+emu_core::snap_struct!(Channel { control, interval, base, start, expired });
+emu_core::snap_struct!(Timer { irq_enable, irq_status, channels, seen });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -344,6 +344,10 @@ impl DwHdmi {
     }
 }
 
+emu_core::snap_struct!(Mode { clock_khz, width, hfp, hsync, hbp, height, vfp, vsync, vbp, positive_sync });
+emu_core::snap_struct!(EdidEeprom { data, pointer, pointer_next });
+emu_core::snap_struct!(DwHdmi { edid, phy } fixed { regs });
+
 #[cfg(test)]
 mod tests {
     use super::*;

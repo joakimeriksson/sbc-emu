@@ -416,6 +416,8 @@ fn blend(src: u32, alpha: u32, dst: u32, premultiplied: bool) -> u32 {
     0xff00_0000 | channel(16) | channel(8) | channel(0)
 }
 
+emu_core::snap_struct!(Display { hdmi, mode, next_vblank, frames } fixed { mixer, tcon, phy });
+
 #[cfg(test)]
 mod tests {
     use super::*;

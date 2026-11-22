@@ -533,6 +533,9 @@ fn transfer(dev: &mut dyn UsbDevice, endpoint: u8, pid: u32, cbp: u32, be: u32, 
     }
 }
 
+emu_core::snap_struct!(Ehci { regs });
+emu_core::snap_struct!(Ohci { regs, next_frame, done_head, attached, device_reset });
+
 #[cfg(test)]
 mod tests {
     use super::*;

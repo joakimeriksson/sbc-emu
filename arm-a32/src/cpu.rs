@@ -1821,3 +1821,21 @@ impl Core for Cpu {
         self.fiq = fiq;
     }
 }
+
+// The TLBs and compiled code are rebuilt; `model` and the RAM are the machine's, `el1` and
+// `el0_exit` live only during a step.
+emu_core::snap_struct!(Cpu {
+    r, cpsr, banked_sp, banked_lr, banked_spsr, irq, fiq, instret, last_wfe, cur_pc, cur_size, tlb_broadcast, pc_written, psr_restored,
+    event, sent_event, firmware_calls_to_host, midr, mpidr, diagnostic, internal_feature, vbar, cntfrq, cntkctl, cntpct, cntp_ctl,
+    cntp_cval, cntv_ctl, cntv_cval, banked_fiq_r8, banked_usr_r8, exclusive_addr, exclusive_size, exclusive_val, sctlr, actlr, cpacr,
+    ttbr0, ttbr1, ttbcr, dacr, dfsr, ifsr, dfar, ifar, fcseidr, contextidr, tpidrurw, tpidrro, tpidrprw, prrr, nmrr, csselr, teecr,
+    teehbr, vfp, undef_to_guest, last_undef,
+} skip {
+    model, tlb, ram, ram_base, ram_len, ram_phys, utlb, io, jit, jit_bus, jit_trap, chain_until, jit_off, interp_run, jit_disp,
+    jit_front, el1, el0_exit, mt, watch,
+} after |c| {
+    c.interp_run = false;
+    c.tlb_flush();
+    c.code_changed(None);
+    Ok(())
+});

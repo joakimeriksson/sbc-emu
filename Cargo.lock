@@ -115,6 +115,9 @@ dependencies = [
 [[package]]
 name = "mali400"
 version = "0.0.1"
+dependencies = [
+ "emu-core",
+]
 
 [[package]]
 name = "maxwell"

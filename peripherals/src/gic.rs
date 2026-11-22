@@ -351,6 +351,12 @@ impl Gic {
     }
 }
 
+emu_core::snap_struct!(Core { enabled, pending, active, level, priority, sgi_source, control, priority_mask, running });
+emu_core::snap_struct!(Gic { dist_enable, enabled, pending, active, level, edge, priority, target, current } fixed { cores } after |g| {
+    if g.current >= g.cores.len() { return Err(emu_core::snap::SnapError(format!("GIC: core {} of {}", g.current, g.cores.len()))); }
+    Ok(())
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
