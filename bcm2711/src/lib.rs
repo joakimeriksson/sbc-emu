@@ -29,4 +29,4 @@ pub mod vc4;
 pub use emu_core::usb as usbdev;
 pub mod xhci;
 
-pub use machine::{Machine, Stop};
+pub use machine::{CoreState, Machine, Stop};

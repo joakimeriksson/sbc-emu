@@ -10,8 +10,8 @@ pub const WATCH_READ: u8 = 2;
 #[derive(Clone, Default, Debug)]
 pub struct Breakpoints {
     pub at: Vec<u64>,
-    /// the (core, pc) reported last: running on from there must not stop there again
-    pub resume: Option<(usize, u64)>,
+    /// Where cores have been reported (core, pc): running on from there must not stop there again.
+    resume: Vec<(usize, u64)>,
     /// While a single step runs: the core it is for. The others stay powered and get no turn (they
     /// may wake up: from WFI by an interrupt, from WFE).
     pub only: Option<usize>,
@@ -25,12 +25,29 @@ impl Breakpoints {
         self.at.retain(|&a| a != addr);
         if insert { self.at.push(addr); }
     }
+    /// Core `k` is stepped from `pc`: no stop there, and no turn for the others.
+    pub fn begin_step(&mut self, k: usize, pc: u64) {
+        self.forget(k);
+        self.resume.push((k, pc));
+        self.only = Some(k);
+    }
+    /// What the other cores have been reported for stays.
+    pub fn end_step(&mut self, k: usize) {
+        self.forget(k);
+        self.only = None;
+    }
+    fn forget(&mut self, k: usize) -> Option<u64> {
+        let i = self.resume.iter().position(|r| r.0 == k)?;
+        Some(self.resume.swap_remove(i).1)
+    }
     /// Core `k` is about to execute the instruction at `pc`: stop in front of it?
     #[inline]
     pub fn hit(&mut self, k: usize, pc: u64) -> bool {
-        if self.at.is_empty() || !self.at.contains(&pc) { return false; }
-        if self.resume.take_if(|r| *r == (k, pc)).is_some() { return false; }
-        self.resume = Some((k, pc));
+        if self.at.is_empty() { return false; }
+        // wherever the core is now, it goes on from here
+        let reported = self.forget(k);
+        if !self.at.contains(&pc) || reported == Some(pc) { return false; }
+        self.resume.push((k, pc));
         true
     }
 }

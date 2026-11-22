@@ -905,12 +905,15 @@ impl Machine {
         self.state[k] = CoreState::Run;
         let jit_off = self.cpus[k].jit_off;
         self.cpus[k].jit_off = true;
+        // another core's stays: it goes on from there later
+        let other = self.bp_resume.filter(|r| r.0 != k);
         self.bp_resume = Some((k, self.cpus[k].pc));
         self.round_end = u64::MAX;
         let (mut total, mut steps, mut storm) = (self.instret(), 1, 0);
-        let t = self.cpus[k].now_ns();
+        // not behind what another core has seen
+        let t = self.cpus[k].now_ns().max(self.now);
         let r = self.slice(k, t, &mut total, u64::MAX, &mut steps, &mut storm);
-        self.bp_resume = None;
+        self.bp_resume = other;
         self.cpus[k].jit_off = jit_off;
         let t = self.cpus[k].now_ns();
         if t > self.now { self.now = t; }

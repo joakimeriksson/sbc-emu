@@ -1041,16 +1041,20 @@ impl Machine {
         if self.state[k] != HartState::Run {
             return None;
         }
-        self.breakpoints.resume = Some((k, self.harts[k].pc));
+        self.breakpoints.begin_step(k, self.harts[k].pc);
         self.soc.update_devices();
+        // a hart's reservation lasts over its own steps; another's turn ends it
+        let changed = self.soc.cur != k;
         self.soc.cur = k;
         let lines = self.soc.lines(k);
         let hart = &mut self.harts[k];
         hart.irq_lines = lines;
         hart.wfi = false;
-        hart.reservation = u64::MAX;
+        if changed {
+            hart.reservation = u64::MAX;
+        }
         let (n, stop) = hart.run_debug(&mut self.soc, 1, k, &mut self.breakpoints);
-        self.breakpoints.resume = None;
+        self.breakpoints.end_step(k);
         self.soc.now += n;
         self.soc.dev_touched = true;
         stop

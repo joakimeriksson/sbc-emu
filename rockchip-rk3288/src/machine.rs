@@ -928,11 +928,9 @@ impl Machine {
             self.set_jit(false);
         }
         self.state[k] = CoreState::Run;
-        self.breakpoints.resume = Some((k, self.cpus[k].r[15] as u64));
-        self.breakpoints.only = Some(k);
+        self.breakpoints.begin_step(k, self.cpus[k].r[15] as u64);
         let stop = self.run(1);
-        self.breakpoints.only = None;
-        self.breakpoints.resume = None;
+        self.breakpoints.end_step(k);
         if jit {
             self.set_jit(true);
         }

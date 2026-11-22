@@ -458,11 +458,13 @@ impl<S: Soc> Machine<S> {
         if core > 0 && S::core_state(&self.bus, core) != CoreState::Running { return None; }
         self.refresh_irq();
         self.cores[core].wake();
-        self.bp_resume = None;
+        // another core's stays: it goes on from there later
+        if self.bp_resume.is_some_and(|(k, _)| k == core) { self.bp_resume = None; }
         let stop = self.step_core(core);
         let watch = self.cores[core].take_watch_hit();
         self.after_round(1);
         self.drain_console();
+        if self.bus.sw_reset() { return Some(Stop::SwReset); }
         stop.or(watch.map(|(a, kind)| Stop::Watchpoint(core, a, kind)))
     }
 
