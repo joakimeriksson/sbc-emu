@@ -56,7 +56,7 @@ struct State {
     low_prim_size: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Draw {
     indexed: bool,
     first: u32,
@@ -415,3 +415,7 @@ fn culled(p: &[[f32; 4]; 3], cull: u32) -> bool {
     let ccw = area < 0.0;
     (ccw && cull & 0x40000 != 0) || (!ccw && cull & 0x20000 != 0)
 }
+
+emu_core::snap_struct!(State { viewport, depth_range, cull, index_field, force_point_size, rsw, gl_pos, indexed_gl_pos, point_size, indices, scissor, low_prim_size });
+emu_core::snap_struct!(Draw { indexed, first, count, mode, next });
+emu_core::snap_struct!(Plbu { st, pc, end, cursor, limit, list_started, emitted_state, draw, prims, point_sizes });

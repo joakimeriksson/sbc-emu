@@ -113,3 +113,5 @@ impl Mmu {
         pa
     }
 }
+
+emu_core::snap_struct!(Mmu { dte, paging, stall, fault, rawstat, mask });

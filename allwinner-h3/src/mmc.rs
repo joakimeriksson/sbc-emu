@@ -242,6 +242,8 @@ impl SunxiMmc {
     }
 }
 
+emu_core::snap_struct!(SunxiMmc { card, regs, raw, idst, dma_written });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,3 +6,4 @@ license.workspace = true
 description = "ARM Mali-400 (Utgard) GPU as driven by Linux's lima driver and Mesa's lima driver"
 
 [dependencies]
+emu-core = { path = "../emu-core" }

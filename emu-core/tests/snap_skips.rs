@@ -5,7 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 const APPROVED: &[(&str, &str, &str)] = &[
+    ("allwinner-h3", "Machine", "breakpoints debug_jit jit trace_exceptions trace_from"), // the debugger's; the JIT; debugging output
+    ("allwinner-h3", "Soc", "code_watch log_stub_pages"),   // of compiled code; debugging output
+    ("arm-a32", "Cpu", "model tlb ram ram_base ram_len ram_phys utlb io jit jit_bus jit_trap chain_until jit_off interp_run jit_disp jit_front el1 el0_exit mt watch"), // the machine's set-up, caches (dropped), what lives during a step, the debugger's
     ("emu-core", "SdCard", "trace"),                        // debugging output
+    ("mali400", "Mali400", "logged trace"),                 // debugging output
     ("peripherals", "Pl330", "log"),                        // debugging output
     ("rk3588", "Clock", "name"),                            // a constant of the board
     ("rk3588", "Gic", "ready"),                             // a cache, dropped by `after`

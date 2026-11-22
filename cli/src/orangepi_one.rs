@@ -15,6 +15,12 @@ impl SerialBoard for allwinner_h3::Machine {
     fn instret(&self) -> u64 {
         allwinner_h3::Machine::instret(self)
     }
+    fn save(&self) -> Result<Vec<u8>, String> {
+        allwinner_h3::Machine::save(self)
+    }
+    fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        allwinner_h3::Machine::restore(self, file)
+    }
     fn report(&self, tag: &str) {
         eprintln!(
             "[{tag}] pc={:#010x} insns={} virtual={:.3}s irqs={} exceptions={} cores={:?}",
@@ -98,7 +104,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode", "--net"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--screenshot", "--vnc", "--hdmi-mode", "--net", "--restore", "--snapshot"])?;
     let net = arg(args, "--net").unwrap_or("nat");
     if !matches!(net, "nat" | "local" | "none") {
         return Err("--net nat|local|none".into());
@@ -122,7 +128,10 @@ fn execute(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let (kernel, dtb) = if card_boot {
+    // a snapshot has the kernel in its RAM
+    let restore = arg(args, "--restore").is_some();
+    let no_kernel = arg(args, "--kernel").is_none();
+    let (kernel, dtb) = if no_kernel && (card_boot || restore) {
         (Vec::new(), Vec::new())
     } else {
         (
@@ -130,7 +139,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             read(arg(args, "--dtb").ok_or("--dtb sun8i-h3-orangepi-one.dtb is required")?)?,
         )
     };
-    let initrd = arg(args, "--initrd").map(read).transpose()?;
+    let initrd = arg(args, "--initrd").filter(|_| !(no_kernel && restore)).map(read).transpose()?;
     let cmdline = arg(args, "--append").unwrap_or(allwinner_h3::boot::DEFAULT_CMDLINE);
     let ram = serial_board::ram_bytes(args, allwinner_h3::RAM_SIZE >> 20)?;
     if ram == 0 || ram > 2 << 30 {
@@ -142,6 +151,8 @@ fn execute(args: &[String]) -> Result<(), String> {
     let disk = arg(args, "--sd")
         .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
         .transpose()?;
+    // the machine restored into is not booted first; when the guest reboots, a new one is
+    let restored = std::cell::Cell::new(false);
     let make_machine = || -> Result<allwinner_h3::Machine, String> {
         let mut m = allwinner_h3::Machine::with_ram_size(ram);
         if args.iter().any(|a| a == "--no-jit") {
@@ -152,7 +163,11 @@ fn execute(args: &[String]) -> Result<(), String> {
             m.connect_network(net == "nat", false);
         }
         m.soc.mmc.card.disk = disk.clone().map(|d| Box::new(d) as Box<dyn emu_core::disk::Disk>);
-        if card_boot {
+        if restore && !restored.replace(true) {
+            // nothing: the snapshot has it all
+        } else if no_kernel && !card_boot {
+            return Err("the guest rebooted: give --kernel or --sd with --restore to boot it again".into());
+        } else if card_boot {
             let boot = allwinner_h3::boot::boot_from_card(&mut m, arg(args, "--append").unwrap_or(""))?;
             eprintln!(
                 "[orangepi-one] boot from SD card: kernel {} bytes, initrd {} bytes, cmdline \"{}\"",
@@ -167,6 +182,9 @@ fn execute(args: &[String]) -> Result<(), String> {
         Ok(m)
     };
     if let Some(path) = arg(args, "--dump-dtb").filter(|_| !card_boot) {
+        if restore {
+            return Err("--dump-dtb: a restored machine is not booted from a device tree".into());
+        }
         use allwinner_h3::boot::{prepare_device_tree, INITRD_ADDR};
         let range = initrd.as_ref().map(|d| (INITRD_ADDR, INITRD_ADDR + d.len() as u32));
         let blob = prepare_device_tree(&dtb, ram as u64, cmdline, range)?;

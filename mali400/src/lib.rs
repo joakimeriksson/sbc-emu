@@ -56,8 +56,9 @@ pub enum Irq {
 const GPU_HZ: u64 = 432_000_000;
 const TICK_HZ: u64 = 24_000_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Unit {
+    #[default]
     Gp,
     Pp(usize),
 }
@@ -192,6 +193,8 @@ pub struct Mali400 {
     pub now: u64,
     /// Jobs whose completion interrupt is still to come: (due tick, unit, raw status bits).
     pending: Vec<(u64, Unit, u32)>,
+    /// Cycles spent on a PLBU list that stopped for memory.
+    owed: u64,
     /// print every job (`SBC_MALI_LOG=1`)
     pub trace: bool,
 }
@@ -265,7 +268,7 @@ impl Mali400 {
 
     /// Finish a job after the time its work takes on the real GPU.
     fn complete(&mut self, unit: Unit, bits: u32) {
-        let cycles = pp::take_cycles();
+        let cycles = std::mem::take(&mut self.owed) + pp::take_cycles();
         let due = self.now + (cycles * TICK_HZ / GPU_HZ).max(1);
         match unit {
             Unit::Gp => self.gp.status |= gp_reg::STATUS_VS_ACTIVE | gp_reg::STATUS_PLBU_ACTIVE,
@@ -389,6 +392,11 @@ impl Mali400 {
             }
             matches!(outcome, plbu::Outcome::Done)
         };
+        if !done {
+            // a stopped list's work so far counts when it completes: in this GPU's state, not the
+            // thread's, which another machine or a snapshot does not share
+            self.owed += pp::take_cycles();
+        }
         if done {
             if self.trace {
                 eprintln!("\r[mali] GP job {}: {} primitives\r", self.gp.jobs, p.prims);
@@ -526,5 +534,49 @@ impl Mali400 {
             0x1c => pmu.sw_delay = value,
             _ => {}
         }
+    }
+}
+
+impl emu_core::snap::Snap for Unit {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        w.u8(match *self { Unit::Gp => 0, Unit::Pp(k) => 1 + k as u8 });
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        *self = match r.u8()? as usize {
+            0 => Unit::Gp,
+            k if k <= NUM_PP => Unit::Pp(k - 1),
+            k => return Err(emu_core::snap::SnapError(format!("Mali-400 unit {k}"))),
+        };
+        Ok(())
+    }
+}
+emu_core::snap_struct!(Gp { regs, rawstat, mask, status, jobs, plbu, point_sizes, vs_ran });
+emu_core::snap_struct!(Pp { frame, wb, rawstat, mask, status, jobs } fixed { regs });
+emu_core::snap_struct!(Pmu { off, rawstat, mask, sw_delay });
+emu_core::snap_struct!(L2 { regs });
+emu_core::snap_struct!(Mali400 { gp, pp, mmu, pmu, l2, now, pending, owed } skip { logged, trace });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Jobs on their way, a PLBU list that stopped for memory and what it has cost so far.
+    #[test]
+    fn unfinished_work_is_in_a_snapshot() {
+        use emu_core::snap::Snap as _;
+        let mut m = Mali400::default();
+        m.pending = vec![(5000, Unit::Pp(1), 3), (4000, Unit::Gp, 1)];
+        m.owed = 77;
+        m.gp.plbu = Some(plbu::Plbu::new(0x1000, 0x2000, (0x3000, 0x4000), vec![(1, 2)]));
+        m.gp.vs_ran = true;
+        let mut w = emu_core::snap::W::default();
+        m.save(&mut w);
+        let mut back = Mali400::default();
+        back.load(&mut emu_core::snap::R::new(&w.0)).unwrap();
+        assert_eq!(back.pending, m.pending);
+        assert_eq!((back.owed, back.next_deadline(), back.gp.vs_ran), (77, Some(4000), true));
+        let mut again = emu_core::snap::W::default();
+        back.save(&mut again);
+        assert!(back.gp.plbu.is_some() && w.0 == again.0);
     }
 }

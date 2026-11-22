@@ -59,20 +59,22 @@ pub trait Snap {
 /// does not compile, so new state cannot be forgotten.
 ///
 /// `{ saved }`, then optionally `fixed { .. }` (containers whose length is the hardware's:
-/// another length in the snapshot is an error), `skip { .. }` (configuration, host resources,
+/// another length in the snapshot is an error), `fitted { part: "what it is" }` (an `Option` the
+/// machine is built with or without: the same in both), `skip { .. }` (configuration, host resources,
 /// caches), and `after |s| ..` (runs after a load: drop caches, check ranges).
 #[macro_export]
 macro_rules! snap_struct {
-    ($ty:ty { $($f:ident),* $(,)? } $(fixed { $($x:ident),* $(,)? })? $(skip { $($s:ident),* $(,)? })? $(after $h:expr)?) => {
+    ($ty:ty { $($f:ident),* $(,)? } $(fixed { $($x:ident),* $(,)? })? $(fitted { $($o:ident : $what:expr),* $(,)? })? $(skip { $($s:ident),* $(,)? })? $(after $h:expr)?) => {
         impl $crate::snap::Snap for $ty {
             fn save(&self, w: &mut $crate::snap::W) {
-                let Self { $($f,)* $($($x,)*)? $($($s: _,)*)? } = self;
+                let Self { $($f,)* $($($x,)*)? $($($o,)*)? $($($s: _,)*)? } = self;
                 $($crate::snap::Snap::save($f, w);)*
                 $($($crate::snap::Snap::save($x, w);)*)?
+                $($($crate::snap::save_fitted(w, $o);)*)?
                 let _ = w;
             }
             fn load(&mut self, r: &mut $crate::snap::R) -> Result<(), $crate::snap::SnapError> {
-                let Self { $($f,)* $($($x,)*)? $($($s: _,)*)? } = self;
+                let Self { $($f,)* $($($x,)*)? $($($o,)*)? $($($s: _,)*)? } = self;
                 $($crate::snap::Snap::load($f, r)?;)*
                 $($(
                     let n = $x.len();
@@ -81,6 +83,7 @@ macro_rules! snap_struct {
                         return Err($crate::snap::SnapError(format!("{}.{}: {} entries in the snapshot, {n} here", stringify!($ty), stringify!($x), $x.len())));
                     }
                 )*)?
+                $($($crate::snap::load_fitted(r, $o, $what)?;)*)?
                 let _ = r;
                 $(
                     let after: fn(&mut Self) -> Result<(), $crate::snap::SnapError> = $h;
@@ -204,6 +207,25 @@ impl<K: Snap + Default + Ord, V: Snap + Default> Snap for std::collections::BTre
     }
 }
 
+/// In the order of the keys: a snapshot does not depend on the host's hashing.
+impl<K: Snap + Default + Ord + std::hash::Hash, V: Snap + Default> Snap for std::collections::HashMap<K, V> {
+    fn save(&self, w: &mut W) {
+        let mut entries: Vec<_> = self.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        w.u64(entries.len() as u64);
+        for (k, v) in entries { k.save(w); v.save(w); }
+    }
+    fn load(&mut self, r: &mut R) -> Result<(), SnapError> {
+        self.clear();
+        load_n::<(K, V)>(r, |(k, v)| { self.insert(k, v); })
+    }
+}
+
+impl Snap for crate::FlatRam {
+    fn save(&self, w: &mut W) { save_ram(w, &self.mem); }
+    fn load(&mut self, r: &mut R) -> Result<(), SnapError> { load_ram(r, &mut self.mem) }
+}
+
 impl<T: Snap + Copy> Snap for std::cell::Cell<T> {
     fn save(&self, w: &mut W) { self.get().save(w); }
     fn load(&mut self, r: &mut R) -> Result<(), SnapError> { self.get_mut().load(r) }
@@ -301,6 +323,14 @@ pub fn save_disk(w: &mut W, disk: Option<&dyn crate::disk::Disk>) {
     }
 }
 
+/// An error for a disk that writes through to its image: a snapshot could not bring it back.
+pub fn check_disk(disk: Option<&dyn crate::disk::Disk>) -> Result<(), String> {
+    if disk.is_some_and(|d| !d.snapshots_disk()) {
+        return Err("--sd-persist writes into the image: a snapshot could not bring it back".into());
+    }
+    Ok(())
+}
+
 /// The disk must be there, with the image it had.
 pub fn load_disk(r: &mut R, disk: Option<&mut dyn crate::disk::Disk>, what: &str) -> Result<(), SnapError> {
     let Some(d) = disk else {
@@ -308,7 +338,7 @@ pub fn load_disk(r: &mut R, disk: Option<&mut dyn crate::disk::Disk>, what: &str
     };
     // the guest would go on with caches of sectors this image does not have, and write them into it
     if !d.snapshots_disk() { return Err(SnapError(format!("{what}: --sd-persist writes into the image: nothing is restored onto it"))); }
-    if !r.bool()? { return Err(SnapError(format!("the snapshot's machine has no {what}"))); }
+    if !r.bool()? { return Err(SnapError(format!("this machine has {what}, the snapshot's does not"))); }
     let sectors = r.u64()?;
     if sectors != d.sectors() {
         return Err(SnapError(format!("{what}: the snapshot's image has {sectors} sectors, this one {}", d.sectors())));
@@ -368,11 +398,11 @@ mod tests {
     snap_enum!(Phase { Idle, Busy, Done });
 
     #[derive(Default, PartialEq, Debug, Clone)]
-    struct Dev { a: u32, phase: Phase, queue: VecDeque<(u8, u64)>, map: BTreeMap<u16, Vec<u8>>, set: BTreeSet<(u32, u32)>, last: Option<[u16; 3]>, f: f32, regs: Vec<u32>, cache: u32, config: bool }
-    snap_struct!(Dev { a, phase, queue, map, set, last, f } fixed { regs } skip { cache, config } after |s| { s.cache = 0; Ok(()) });
+    struct Dev { part: Option<u32>, a: u32, phase: Phase, queue: VecDeque<(u8, u64)>, map: BTreeMap<u16, Vec<u8>>, set: BTreeSet<(u32, u32)>, last: Option<[u16; 3]>, f: f32, regs: Vec<u32>, cache: u32, config: bool }
+    snap_struct!(Dev { a, phase, queue, map, set, last, f } fixed { regs } fitted { part: "a part" } skip { cache, config } after |s| { s.cache = 0; Ok(()) });
 
     fn dev() -> Dev {
-        Dev { a: 7, phase: Phase::Done, queue: [(1, 2), (3, 4)].into(), map: [(5, vec![6, 7])].into(), set: [(8, 9)].into(), last: Some([1, 2, 3]), f: -0.5, regs: vec![1, 2, 3], cache: 99, config: true }
+        Dev { part: Some(3), a: 7, phase: Phase::Done, queue: [(1, 2), (3, 4)].into(), map: [(5, vec![6, 7])].into(), set: [(8, 9)].into(), last: Some([1, 2, 3]), f: -0.5, regs: vec![1, 2, 3], cache: 99, config: true }
     }
 
     #[test]
@@ -380,7 +410,7 @@ mod tests {
         let d = dev();
         let mut w = W::default();
         d.save(&mut w);
-        let mut other = Dev { regs: vec![9; 3], cache: 5, queue: [(9, 9)].into(), map: [(1, vec![])].into(), ..Default::default() };
+        let mut other = Dev { part: Some(0), regs: vec![9; 3], cache: 5, queue: [(9, 9)].into(), map: [(1, vec![])].into(), ..Default::default() };
         other.load(&mut R::new(&w.0)).unwrap();
         // what is skipped stays this machine's; the cache is dropped
         assert_eq!(other, Dev { cache: 0, config: false, ..d });
@@ -397,12 +427,24 @@ mod tests {
         let mut w = W::default();
         dev().save(&mut w);
         for n in 0..w.0.len() { assert!(dev().load(&mut R::new(&w.0[..n])).is_err(), "cut at {n}"); }
+        assert!(Dev { part: None, ..dev() }.load(&mut R::new(&w.0)).unwrap_err().0.contains("a part"));
         let mut d = Dev { regs: vec![0; 4], ..Default::default() };
         assert!(d.load(&mut R::new(&w.0)).unwrap_err().0.contains("regs"));
         assert!(Phase::Idle.load(&mut R::new(&[3])).is_err());
         // a length beyond the data neither allocates for it nor overflows
         assert!(Vec::<u64>::new().load(&mut R::new(&[0xff; 24])).is_err());
         assert!(R::new(&[0xff; 24]).bytes().is_err());
+    }
+
+    #[test]
+    fn hash_maps_are_ordered() {
+        let (mut a, mut b) = (W::default(), W::default());
+        (0..50u32).map(|k| (k, k as u64)).collect::<std::collections::HashMap<_, _>>().save(&mut a);
+        (0..50u32).rev().map(|k| (k, k as u64)).collect::<std::collections::HashMap<_, _>>().save(&mut b);
+        assert_eq!(a.0, b.0);
+        let mut m = std::collections::HashMap::<u32, u64>::from([(99, 1)]);
+        m.load(&mut R::new(&a.0)).unwrap();
+        assert!(m.len() == 50 && m[&7] == 7);
     }
 
     #[test]
