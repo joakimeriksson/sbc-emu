@@ -83,3 +83,27 @@ fn devices_in_the_middle_of_things() {
         assert!(m.state() == fresh.state(), "seed {seed}: state after the same accesses");
     }
 }
+
+/// A snapshot whose clock is years ahead of its devices does not hang the emulator: USB (a frame
+/// each millisecond), the display and the timers all catch up.
+#[test]
+fn a_clock_far_ahead() {
+    for bit in [40, 50, 60] {
+        let mut m = machine();
+        // both OHCIs operational, with their frame interrupt; the timers; a loop on core 0
+        for base in [0x01c1_a400u64, 0x01c1_b400] {
+            m.soc.write32(base + 4, 2 << 6).unwrap();
+            m.soc.write32(base + 0x10, 1 << 31 | 1 << 2).unwrap();
+        }
+        for (o, v) in [(0x00, 3), (0x14, 240_000), (0x10, 7), (0x24, 240_000), (0x20, 7)] { m.soc.write32(0x01c2_0c00 + o, v).unwrap(); }
+        m.soc.write32(allwinner_h3::RAM_BASE, 0xeaff_fffe).unwrap();
+        m.cpus[0].r[15] = allwinner_h3::RAM_BASE as u32;
+        m.run(100_000);
+        for c in &mut m.cpus { c.cntpct |= 1 << bit; }
+        let mut far = machine();
+        far.restore(&m.save().unwrap()).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10 { far.run(10_000); }
+        assert!(start.elapsed().as_secs() < 5, "bit {bit}: {:?}", start.elapsed());
+    }
+}

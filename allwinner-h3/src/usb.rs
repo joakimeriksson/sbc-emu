@@ -8,6 +8,8 @@ use emu_core::usb::{Speed, UsbDevice};
 
 /// 24 MHz ticks per 1 ms USB frame.
 const FRAME_TICKS: u64 = 24_000;
+/// Frames run at once at most (a second of them).
+const MAX_FRAMES: u64 = 1000;
 
 /// Little-endian access to guest RAM (physical addresses), as a bus master sees it.
 pub struct Dma<'a> {
@@ -314,8 +316,18 @@ impl Ohci {
                 d.bus_reset();
             }
         }
+        // time goes from event to event, and every frame is one. Far behind all the same (a damaged
+        // snapshot), the frames nobody could have seen are counted, not run.
+        if let Some(frame) = self.next_frame {
+            let behind = now.saturating_sub(frame) / FRAME_TICKS;
+            if behind > MAX_FRAMES {
+                let skip = behind - MAX_FRAMES;
+                self.next_frame = Some(frame + skip * FRAME_TICKS);
+                self.regs[HC_FM_NUMBER] = (self.regs[HC_FM_NUMBER] + skip as u32) & 0xffff;
+            }
+        }
         while let Some(frame) = self.next_frame.filter(|&f| f <= now) {
-            self.next_frame = Some(frame + FRAME_TICKS);
+            self.next_frame = frame.checked_add(FRAME_TICKS);
             self.frame(dma, device.as_deref_mut());
         }
     }
