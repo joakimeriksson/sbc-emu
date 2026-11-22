@@ -437,6 +437,16 @@ mod tests {
         assert!(g.waiting);
         g.bar1_read(0x288, &smmu, &mut ram);
         assert!(!g.waiting && g.busy_until >= 5_000_000);
+        // what runs keeps the GPU, as long as the host took (which a coarse clock may not see at once)
+        let mut f = Gpu { time_scale: 1e6, ..Default::default() };
+        f.tick(1_000_000);
+        assert!((0..100_000).any(|_| {
+            f.run(&smmu, &mut ram);
+            f.busy_until > f.now
+        }));
+        let mut f = Gpu { time_scale: 0.0, ..Default::default() };
+        f.run(&smmu, &mut ram);
+        assert_eq!(f.busy_until, 0);
         // and later by itself
         g.run(&smmu, &mut ram);
         assert!(g.waiting);

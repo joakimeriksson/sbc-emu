@@ -50,7 +50,8 @@ drivers' formulas.
 Host time per 1280 x 720 frame on an M-series Mac (sixteen threads): glmark2 build 3 ms, phong shading
 5 ms, effect2d 8 ms, jellyfish 12 ms, refract 32 ms. A submission is drawn when it
 starts; the next one starts no sooner than the host time later (`SBC_GPU_TIME` scales it, 0: at once),
-so the guest's frame rates are those of the emulation. (A driver that looks whether a ring has room runs
+so the guest's frame rates are about those of the emulation: one submission counts for a second at
+most, so what is slower than that runs slow. (A driver that looks whether a ring has room runs
 what waits: it would give up before the GPU's time is over.)
 
 ## Demos in the browser
@@ -80,7 +81,7 @@ nouveau draws into tiled buffers that tegra-drm shows as they are (PRIME). Mesa'
 pair (opening the display's card, as kmscube does) hands on neither shader storage buffers nor the size
 of patches in 25.0: the first crashes it and the second draws nothing.
 
-In the browser the GPU has one thread, and nothing but the interpreter for shaders: expect some 3 to 15
+In the browser the GPU has one thread, and nothing but the interpreter for shaders: expect some 1 to 15
 frames per second. `SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs`
 runs them in Node.
 

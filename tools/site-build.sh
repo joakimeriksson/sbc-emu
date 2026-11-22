@@ -83,6 +83,8 @@ DOWNLOADS="$PWD/$DL" sh scripts/jetson-nano-gpu-demo-fixture.sh cache/jetson-nan
 tools/wasm-build.sh
 # this build must still restore the 3D snapshot and draw with it, without an SD card
 SBC_SNAP="$DL/gpu-demo.snap.zst" SBC_SD=/nonexistent node tools/wasm-gpu-bench.mjs 3 cube
+# and its xz decoder must unpack the Jetson Nano's demos
+SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs unpack
 
 rm -rf "$OUT"
 mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/jetson-nano" "$OUT/assets/esp32s31"

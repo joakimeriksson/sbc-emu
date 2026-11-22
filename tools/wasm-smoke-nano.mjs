@@ -3,6 +3,7 @@
 // scripts/jetson-nano-debian-fixture.sh), waits for the shell on the serial console, runs a few
 // commands on all four cores, checks the screen and the GPU's driver, reboots and reports the times.
 //   node tools/wasm-smoke-nano.mjs [seconds] [dir]     (dir: cache/jetson-nano/debian)
+//   SBC_GPU=FILE node tools/wasm-smoke-nano.mjs unpack  (only: does the page's decoder unpack the demos?)
 // SBC_GPU=FILE loads the GPU demos (scripts/jetson-nano-gpu-demo-fixture.sh's gpu-demo.cpio.xz) behind
 // the initramfs, unpacked as the page does, and instead runs the demos, stops one with Ctrl-C, and reports their frames per second
 // (SBC_SHOTS=DIR: and writes a picture of each).
@@ -29,10 +30,32 @@ ex = instance.exports;
 const mem = () => new Uint8Array(ex.memory.buffer);
 const put = (b) => { const p = ex.sbc_alloc(b.length) >>> 0; mem().set(b, p); return [p, b.length]; };
 const load = (f) => put(fs.readFileSync(f));
+// an .xz file of one stream, with the page's decoder
+function unxz(f) {
+  const d = fs.readFileSync(f), isize = (d.readUInt32LE(d.length - 8) + 1) * 4, index = d.length - 12 - isize;
+  let p = index + 1, at = 12;
+  const v = () => { let x = 0, s = 1, c; do { c = d[p++]; x += (c & 0x7f) * s; s *= 128; } while (c & 0x80); return x; };
+  const n = v(), out = [];
+  for (let k = 0; k < n; k++) {
+    const packed = v(), size = v(), q = ex.sbc_xz_in(packed) >>> 0;
+    mem().set(d.subarray(at, at + packed), q);
+    if (ex.sbc_xz_block(size) < 0) throw new Error(`${f}: the page cannot unpack it (only LZMA2, without other filters)`);
+    const o = ex.sbc_xz_out_ptr() >>> 0;
+    out.push(Buffer.from(mem().slice(o, o + size)));
+    at += (packed + 3) & ~3;
+  }
+  if (at !== index) throw new Error(`${f}: not one .xz stream`);
+  return Buffer.concat(out);
+}
+if (process.argv[2] === 'unpack') {
+  const f = process.env.SBC_GPU, same = unxz(f).equals(execFileSync('xz', ['-dc', f], { maxBuffer: 2 ** 28 }));
+  console.log(`${f}: ${same ? 'the page unpacks it' : 'NOT what xz says'}`);
+  process.exit(same ? 0 : 1);
+}
 const [kp, kl] = load(`${dir}/vmlinuz`), [dp, dl] = load(`${dir}/tegra210-p3450-0000.dtb`), [ip, il] = (() => {
   const a = fs.readFileSync(`${dir}/initramfs.cpio.gz`);
   if (!process.env.SBC_GPU) return put(a);
-  return put(Buffer.concat([a, Buffer.alloc(-a.length & 3), execFileSync('xz', ['-dc', process.env.SBC_GPU], { maxBuffer: 2 ** 28 })]));
+  return put(Buffer.concat([a, Buffer.alloc(-a.length & 3), unxz(process.env.SBC_GPU)]));
 })();
 const cmd = Buffer.from('console=tty0 console=ttyS0,115200 rdinit=/init'), cp = ex.sbc_alloc(cmd.length) >>> 0;
 mem().set(cmd, cp);
