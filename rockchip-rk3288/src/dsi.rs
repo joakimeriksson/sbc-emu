@@ -48,7 +48,7 @@ pub struct Dsi {
 impl Default for Dsi {
     fn default() -> Self {
         Self {
-            regs: Vec::new(),
+            regs: vec![0; 0x100 / 4],
             payload: Vec::new(),
             reply: Default::default(),
             max_return: 0,
@@ -95,11 +95,7 @@ impl Dsi {
                 self.packet(value);
             }
             o if o < 0x100 => {
-                let index = o as usize / 4;
-                if self.regs.len() <= index {
-                    self.regs.resize(index + 1, 0);
-                }
-                self.regs[index] = value;
+                self.regs[o as usize / 4] = value;
             }
             _ => {}
         }
@@ -135,7 +131,10 @@ impl Dsi {
     }
 }
 
-emu_core::snap_struct!(Dsi { payload, reply, max_return, packets } fixed { regs } skip { log });
+emu_core::snap_struct!(Dsi { payload, reply, max_return, packets } fixed { regs } skip { log } after |d| {
+    if d.max_return > 0xffff { return Err(emu_core::snap::SnapError(format!("DSI: replies of {} bytes", d.max_return))); }
+    Ok(())
+});
 
 #[cfg(test)]
 mod tests {

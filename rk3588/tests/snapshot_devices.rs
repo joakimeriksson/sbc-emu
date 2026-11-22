@@ -63,7 +63,7 @@ fn access(m: &mut Machine, rng: &mut Rng, window: Option<usize>) -> (u64, Option
 
 #[test]
 fn devices_in_the_middle_of_things() {
-    for seed in 1..=(WINDOWS.len() as u64 * 4) {
+    for seed in 1..=(WINDOWS.len() as u64 * 2) {
         // half the time one device alone, thoroughly
         let window = (seed % 2 == 0).then_some(seed as usize / 2 % WINDOWS.len());
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));

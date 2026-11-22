@@ -1,7 +1,7 @@
 //! A restored machine is the machine that was saved: both go on to the same state, byte for
 //! byte (cores, devices, RAM), whatever the guest was doing when the snapshot was taken.
 use emu_core::Bus as _;
-use rockchip_rk3288::{boot, cru, devices, CoreState, HdmiMode, Machine, BOOT_MAGIC, CRU_BASE, PMU_BASE, RAM_BASE, SMP_MAILBOX};
+use rockchip_rk3288::{boot, cru, devices, dwmmc, CoreState, HdmiMode, Machine, BOOT_MAGIC, CRU_BASE, PMU_BASE, RAM_BASE, SMP_MAILBOX};
 use emu_core::{disk::{Disk, MemDisk}, Stop};
 
 /// Run as a host would: idle time is skipped.
@@ -111,8 +111,7 @@ fn bare(cpus: usize) -> Machine {
 fn word(m: &Machine, at: usize) -> u32 { u32::from_le_bytes(m.soc.ram.mem[at..at + 4].try_into().unwrap()) }
 
 /// A machine nothing has been set up on: all it has after a restore is the snapshot's.
-fn blank(cpus: usize) -> Machine {
-    let _ = cpus;
+fn blank() -> Machine {
     { let mut m = Machine::with_ram_size(8 << 20); m.set_jit(false); m }
 }
 
@@ -122,7 +121,7 @@ fn bare_metal() {
         let mut m = bare(cpus);
         for (k, insns) in [1, 7, 333, 20_001, 100_000].into_iter().enumerate() {
             run(&mut m, insns);
-            let fresh = check(&mut m, blank(cpus), 50_000 + k as u64, &format!("{cpus} cores, point {k}"));
+            let fresh = check(&mut m, blank(), 50_000 + k as u64, &format!("{cpus} cores, point {k}"));
             // a snapshot of a restored machine is as good
             m = fresh;
         }
@@ -131,7 +130,7 @@ fn bare_metal() {
         // close together: in the interrupt handler, between the exclusives, asleep
         for k in 0..100 {
             run(&mut m, 13);
-            let fresh = check(&mut m, blank(cpus), 1_500, &format!("{cpus} cores, close point {k}"));
+            let fresh = check(&mut m, blank(), 1_500, &format!("{cpus} cores, close point {k}"));
             if k % 10 == 0 { m = fresh; }
         }
         // the restored machines went on taking interrupts
@@ -169,27 +168,27 @@ fn another_mapping() {
     for jit in [false, true] {
         // a loop storing r1 at virtual 0x5000_0000, mapped to `pa`
         let make = |pa: u32| {
-            let mut m = Machine::with_ram_size(0x7000_0000);
+            let mut m = Machine::with_ram_size(64 << 20);
             m.set_jit(jit);
             let mut place = |at: u32, w: u32| m.soc.ram.mem[(at - RAM_BASE as u32) as usize..][..4].copy_from_slice(&w.to_le_bytes());
-            for mb in 0..0x1000u32 { place(0x4030_0000 + 4 * mb, mb << 20 | 0xc02); } // sections, full access
-            place(0x4030_0000 + 4 * 0x500, pa | 0xc02);
-            for (k, w) in [0xe281_1001u32, 0xe582_1000, 0xe592_3000, 0xeaff_fffb].into_iter().enumerate() { place(0x4020_0000 + 4 * k as u32, w); }
+            for mb in 0..0x1000u32 { place(0x0030_0000 + 4 * mb, mb << 20 | 0xc02); } // sections, full access
+            place(0x0030_0000 + 4 * 0x500, pa | 0xc02);
+            for (k, w) in [0xe281_1001u32, 0xe582_1000, 0xe592_3000, 0xeaff_fffb].into_iter().enumerate() { place(0x0020_0000 + 4 * k as u32, w); }
             let c = &mut m.cpus[0];
-            (c.r[15], c.r[2], c.ttbr0, c.dacr) = (0x4020_0000, 0x5000_0000, 0x4030_0000, u32::MAX);
+            (c.r[15], c.r[2], c.ttbr0, c.dacr) = (0x0020_0000, 0x5000_0000, 0x0030_0000, u32::MAX);
             c.sctlr |= 1;
             m
         };
-        let (mut m, mut other) = (make(0x5010_0000), make(0x5020_0000));
+        let (mut m, mut other) = (make(0x0110_0000), make(0x0120_0000));
         run(&mut m, 100_000);
         run(&mut other, 100_000);
         let at = |m: &Machine, pa: u32| word(m, (pa - RAM_BASE as u32) as usize);
-        assert!(at(&m, 0x5010_0000) > 100 && at(&other, 0x5020_0000) > 100);
+        assert!(at(&m, 0x0110_0000) > 100 && at(&other, 0x0120_0000) > 100);
         other.restore(&m.save().unwrap()).unwrap();
-        let before = at(&other, 0x5010_0000);
+        let before = at(&other, 0x0110_0000);
         run(&mut other, 100_000);
-        assert!(at(&other, 0x5010_0000) > before + 100, "jit {jit}");
-        assert_eq!(at(&other, 0x5020_0000), 0, "jit {jit}");
+        assert!(at(&other, 0x0110_0000) > before + 100, "jit {jit}");
+        assert_eq!(at(&other, 0x0120_0000), 0, "jit {jit}");
     }
 }
 
@@ -210,23 +209,89 @@ fn another_machine_is_refused() {
     for cut in [0, 8, 20, file.len() / 2, file.len() - 1] { assert!(bare(2).restore(&file[..cut]).is_err(), "cut at {cut}"); }
 }
 
-/// A disk that writes through cannot be brought back: no snapshot, rather than a wrong one.
-#[test]
-fn a_persistent_card_is_refused() {
-    struct Through(MemDisk);
-    impl Disk for Through {
-        fn sectors(&self) -> u64 { self.0.sectors() }
-        fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.read(lba, out) }
-        fn write(&mut self, lba: u64, data: &[u8]) { self.0.write(lba, data) }
-        fn snapshots_disk(&self) -> bool { false }
-    }
-    let mut m = bare(1);
-    m.soc.periph.insert_sd(Some(Box::new(Through(MemDisk::new(64)))));
-    assert!(m.save().unwrap_err().contains("--sd-persist"));
+/// A card as the emulator's copy-on-write image: what was written is kept apart.
+struct Cow(MemDisk, emu_core::disk::Overlay);
+impl Disk for Cow {
+    fn sectors(&self) -> u64 { self.0.sectors() }
+    fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.read(lba, out); self.1.apply(lba, out); }
+    fn write(&mut self, lba: u64, data: &[u8]) { let n = self.sectors(); self.1.store(lba, data, n); }
+    fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.1.sorted() }
+    fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { let n = self.sectors(); self.1.replace(sectors, n); }
 }
 
-/// Linux with the HDMI monitor, the PMIC, an SD card and an eMMC, saved at points all through its
-/// boot and at the shell. Needs the guest of `scripts/tinker-board-fixture.sh` (`CACHE`, default
+/// The same image opened to write through (`--sd-persist`), as `CowFile` does it.
+struct Through(MemDisk);
+impl Disk for Through {
+    fn sectors(&self) -> u64 { self.0.sectors() }
+    fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.read(lba, out) }
+    fn write(&mut self, lba: u64, data: &[u8]) { self.0.write(lba, data) }
+    fn restore_overlay(&mut self, _: Vec<(u64, Vec<u8>)>) {}
+    fn snapshots_disk(&self) -> bool { false }
+}
+
+/// A disk that writes through cannot be brought back: no snapshot, rather than a wrong one. Nor is
+/// one restored onto such a disk: the guest would go on with caches of sectors the image does not
+/// have, and write them into it.
+#[test]
+fn a_persistent_card_is_refused() {
+    let with = |card: Box<dyn Disk>| { let mut m = bare(1); m.soc.periph.insert_sd(Some(card)); m };
+    assert!(with(Box::new(Through(MemDisk::new(64)))).save().unwrap_err().contains("--sd-persist"));
+    let mut m = with(Box::new(Cow(MemDisk::new(64), Default::default())));
+    for written in [false, true] {
+        if written { disk(&mut m, devices::SDMMC).write(3, &[7; 512]); }
+        let file = m.save().unwrap();
+        let e = with(Box::new(Through(MemDisk::new(64)))).restore(&file).unwrap_err();
+        assert!(e.contains("--sd-persist"), "{e}");
+    }
+}
+
+fn disk(m: &mut Machine, slot: usize) -> &mut dyn Disk {
+    match &mut m.soc.periph.mmc[slot].card {
+        dwmmc::Card::Sd(c) => c.disk.as_mut().unwrap().as_mut(),
+        dwmmc::Card::Emmc(c) => c.disk.as_mut().unwrap().as_mut(),
+        _ => panic!("no disk"),
+    }
+}
+
+/// What the guest wrote to the card and the eMMC comes back, and nothing else.
+#[test]
+fn written_sectors() {
+    let cow = || Some(Box::new(Cow(MemDisk::new(64), Default::default())) as Box<dyn Disk>);
+    let make = || {
+        let mut m = bare(1);
+        m.soc.periph.insert_sd(cow());
+        m.soc.periph.mmc[devices::EMMC].insert(cow());
+        m
+    };
+    let (mut m, mut other) = (make(), make());
+    for (k, slot) in [devices::SDMMC, devices::EMMC].into_iter().enumerate() {
+        disk(&mut m, slot).write(10 + k as u64, &[k as u8 + 1; 512]);
+        disk(&mut other, slot).write(40, &[9; 512]);
+    }
+    other.restore(&m.save().unwrap()).unwrap();
+    for (k, slot) in [devices::SDMMC, devices::EMMC].into_iter().enumerate() {
+        let mut all = vec![0; 64 * 512];
+        disk(&mut other, slot).read(0, &mut all);
+        for (lba, s) in all.chunks(512).enumerate() { assert!(s.iter().all(|&b| b == if lba == 10 + k { k as u8 + 1 } else { 0 }), "slot {slot}, sector {lba}"); }
+    }
+}
+
+/// (Its registers grew as they were written: such a snapshot could not be restored.)
+#[test]
+fn a_guest_that_set_up_the_dsi_host() {
+    let mut m = bare(1);
+    m.soc.write32(rockchip_rk3288::DSI0_BASE + 4, 0x1234).unwrap();
+    let mut fresh = blank();
+    fresh.restore(&m.save().unwrap()).unwrap();
+    assert_eq!(fresh.soc.read32(rockchip_rk3288::DSI0_BASE + 4).unwrap(), 0x1234);
+    // and over one that was
+    m.restore(&blank().save().unwrap()).unwrap();
+    assert_eq!(m.soc.read32(rockchip_rk3288::DSI0_BASE + 4).unwrap(), 0);
+}
+
+/// Linux, saved at points all through its boot and at the shell. A monitor, the PMIC, an SD card and
+/// an eMMC are fitted, but this guest's kernel has no drivers for them (`snapshot_devices.rs` has
+/// them). Needs the guest of `scripts/tinker-board-fixture.sh` (`CACHE`, default
 /// `cache/`); skipped without it.
 #[test]
 fn linux_boot() {

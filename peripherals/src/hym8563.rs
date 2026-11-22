@@ -131,7 +131,13 @@ impl I2cDevice for Hym8563 {
     }
 }
 
-emu_core::snap_struct!(Hym8563 { regs, pointer, seconds, epoch_ns, now_ns, time_written });
+/// Seconds a restored clock may show: `date_of` goes through the years one by one.
+const LIMIT: i64 = 1 << 40;
+
+emu_core::snap_struct!(Hym8563 { regs, pointer, seconds, epoch_ns, now_ns, time_written } after |c| {
+    if !(-LIMIT..LIMIT).contains(&c.seconds) { return Err(emu_core::snap::SnapError("a clock tens of thousands of years off".into())); }
+    Ok(())
+});
 
 #[cfg(test)]
 mod tests {

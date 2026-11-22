@@ -103,8 +103,7 @@ fn bare(cpus: usize) -> Machine {
 fn word(m: &Machine, at: usize) -> u32 { u32::from_le_bytes(m.soc.ram.mem[at..at + 4].try_into().unwrap()) }
 
 /// A machine nothing has been set up on: all it has after a restore is the snapshot's.
-fn blank(cpus: usize) -> Machine {
-    let _ = cpus;
+fn blank() -> Machine {
     { let mut m = Machine::with_ram_size(8 << 20); m.set_jit(false); m }
 }
 
@@ -114,7 +113,7 @@ fn bare_metal() {
         let mut m = bare(cpus);
         for (k, insns) in [1, 7, 333, 20_001, 100_000].into_iter().enumerate() {
             run(&mut m, insns);
-            let fresh = check(&mut m, blank(cpus), 50_000 + k as u64, &format!("{cpus} cores, point {k}"));
+            let fresh = check(&mut m, blank(), 50_000 + k as u64, &format!("{cpus} cores, point {k}"));
             // a snapshot of a restored machine is as good
             m = fresh;
         }
@@ -123,7 +122,7 @@ fn bare_metal() {
         // close together: in the interrupt handler, between the exclusives, asleep
         for k in 0..100 {
             run(&mut m, 13);
-            let fresh = check(&mut m, blank(cpus), 1_500, &format!("{cpus} cores, close point {k}"));
+            let fresh = check(&mut m, blank(), 1_500, &format!("{cpus} cores, close point {k}"));
             if k % 10 == 0 { m = fresh; }
         }
         // the restored machines went on taking interrupts

@@ -173,7 +173,8 @@ impl I2s {
     /// Play and record frames up to virtual time `now` (ns) with MCLK `mclk` Hz.
     pub fn update(&mut self, now: u64, mclk: u64) {
         self.rate = self.frame_rate(mclk);
-        let period = 1_000_000_000 / u64::from(self.rate.max(1));
+        // (a guest can program a rate of gigahertz)
+        let period = (1_000_000_000 / u64::from(self.rate.max(1))).max(1);
         if self.xfer & XFER_TXS != 0 {
             let words = self.tx_words();
             while self.tx_to + period <= now {
