@@ -7,21 +7,29 @@ use emu_core::disk::{Disk, Overlay};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-pub struct CowFile { file: File, sectors: u64, overlay: Overlay, persist: bool }
+/// `sectors` is what the guest sees; the file holds the first `stored` of them.
+pub struct CowFile { file: File, stored: u64, sectors: u64, overlay: Overlay, persist: bool }
 
 impl CowFile {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = File::open(path)?;
         file.try_lock_shared().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len() / 512;
-        Ok(CowFile { file, sectors, overlay: Overlay::default(), persist: false })
+        Ok(CowFile { file, stored: sectors, sectors, overlay: Overlay::default(), persist: false })
     }
     /// Writes go straight to the image file (`--sd-persist`): what the guest installs survives.
     pub fn open_persistent(path: &str) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         file.try_lock().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len() / 512;
-        Ok(CowFile { file, sectors, overlay: Overlay::default(), persist: true })
+        Ok(CowFile { file, stored: sectors, sectors, overlay: Overlay::default(), persist: true })
+    }
+    /// The image as an SD card: as large as a card's 512 KiB units need it to be, so that a card
+    /// never ends inside an image's last partition. The added sectors read as zeros until they
+    /// are written, and are kept like the others (with `--sd-persist` the file grows).
+    pub fn as_card(mut self) -> Self {
+        self.sectors = self.stored.next_multiple_of(emu_core::sdcard::UNIT);
+        self
     }
 }
 
@@ -32,17 +40,13 @@ pub struct SharedDisk(pub std::rc::Rc<std::cell::RefCell<CowFile>>);
 
 impl SharedDisk {
     /// Open `--sd PATH` (copy-on-write) or, with `--sd-persist`, write-through.
-    /// The card is an SDHC card: 512 KiB to 2 TiB (its CSD counts 512 KiB units). A size
-    /// that is not a multiple of 512 KiB works; the guest does not see the partial tail.
+    /// The card is an SDHC card: 512 KiB to 2 TiB (its CSD counts 512 KiB units; see `as_card`).
     pub fn open(path: &str, persist: bool) -> std::io::Result<Self> {
-        let disk = if persist { CowFile::open_persistent(path)? } else { CowFile::open(path)? };
+        let disk = if persist { CowFile::open_persistent(path)? } else { CowFile::open(path)? }.as_card();
         let sectors = disk.sectors();
         if !(1024..=(1u64 << 32)).contains(&sectors) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
                 "an SD (SDHC) image must be between 512 KiB and 2 TiB"));
-        }
-        if sectors % 1024 != 0 {
-            eprintln!("[sd] {path}: not a multiple of 512 KiB; the last {} KiB are not visible to the guest", sectors % 1024 / 2);
         }
         Ok(SharedDisk(std::rc::Rc::new(std::cell::RefCell::new(disk))))
     }
@@ -67,7 +71,7 @@ impl Disk for CowFile {
     fn read(&mut self, lba: u64, out: &mut [u8]) {
         // One host read for the valid part of the run (past the end reads as zero), then
         // patch overlaid sectors.
-        let valid = (self.sectors.saturating_sub(lba).saturating_mul(512)).min(out.len() as u64) as usize;
+        let valid = (self.stored.saturating_sub(lba).saturating_mul(512)).min(out.len() as u64) as usize;
         out[valid..].fill(0);
         if valid > 0 && self.file.read_exact_at(&mut out[..valid], lba * 512).is_err() {
             out[..valid].fill(0);
@@ -89,7 +93,9 @@ impl Disk for CowFile {
     fn write(&mut self, lba: u64, data: &[u8]) {
         if self.persist {
             let valid = (self.sectors.saturating_sub(lba).saturating_mul(512)).min(data.len() as u64) as usize;
-            if valid > 0 { let _ = self.file.write_all_at(&data[..valid], lba * 512); }
+            if valid > 0 && self.file.write_all_at(&data[..valid], lba * 512).is_ok() {
+                self.stored = self.stored.max(lba + valid as u64 / 512);
+            }
             return;
         }
         self.overlay.store(lba, data, self.sectors);
@@ -121,5 +127,37 @@ mod tests {
         assert!(disk.snapshots_disk());
         drop(disk);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_card_keeps_what_is_written_past_an_odd_sized_image() {
+        for persist in [false, true] {
+            let path = std::env::temp_dir().join(format!("sbc-emu-odd-{}-{persist}.img", std::process::id()));
+            let p = path.to_str().unwrap();
+            std::fs::write(&path, vec![7u8; 1500 * 512]).unwrap();
+            let open = || if persist { CowFile::open_persistent(p) } else { CowFile::open(p) }.unwrap().as_card();
+            let mut d = open();
+            assert_eq!(d.sectors(), 2048);
+            let mut out = [1u8; 1024];
+            d.read(1499, &mut out); // the last stored sector and the first added one
+            assert_eq!((out[0], out[511], out[512], out[1023]), (7, 7, 0, 0));
+            d.write(2047, &[9; 512]);
+            d.write(1499, &[5; 1024]);
+            d.write(2048, &[3; 512]); // past the card
+            let check = |d: &mut CowFile| {
+                let mut b = [1u8; 512];
+                for (lba, want) in [(1498, 7), (1499, 5), (1500, 5), (1501, 0), (2046, 0), (2047, 9), (2048, 0)] {
+                    d.read(lba, &mut b);
+                    assert_eq!(b, [want; 512], "sector {lba}, persist {persist}");
+                }
+            };
+            check(&mut d);
+            drop(d);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), if persist { 2048 } else { 1500 } * 512);
+            if persist {
+                check(&mut open());
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 }

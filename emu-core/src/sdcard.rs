@@ -4,6 +4,9 @@
 //! `command` says what the data phase is; `read_blocks`/`write_blocks` access the disk.
 use crate::disk::Disk;
 
+/// Sectors in the unit a card's size is counted in (CSD 2.0: 512 KiB).
+pub const UNIT: u64 = 1024;
+
 /// R1 card status bits used here.
 pub const OUT_OF_RANGE: u32 = 1 << 31;
 pub const READY_FOR_DATA: u32 = 1 << 8;
@@ -78,11 +81,10 @@ impl SdCard {
         self.state
     }
 
-    /// The card's capacity: the image's sectors, rounded up to the 512 KiB units of the CSD.
-    /// (Rounded down, a card ends inside an odd-sized image's last partition, which Linux
-    /// truncates or drops.) What the image lacks of the last unit reads as zeros.
+    /// The card's capacity: whole CSD units, never more than the disk stores. (An image of
+    /// another size is padded where it is opened: `CowFile::as_card`, the browser's disk.)
     pub fn sectors(&self) -> u64 {
-        self.disk.as_ref().map_or(0, |d| d.sectors().next_multiple_of(1024))
+        self.disk.as_ref().map_or(0, |d| d.sectors() / UNIT * UNIT)
     }
 
     /// R1 card status: current state and READY_FOR_DATA.
@@ -254,15 +256,11 @@ mod tests {
     }
 
     #[test]
-    fn an_odd_sized_image_fits_the_card() {
-        for (sectors, capacity) in [(2048, 2048), (2049, 3072), (3071, 3072), (1, 1024)] {
-            let mut card = SdCard::new(Some(Box::new(MemDisk::new(sectors))));
-            assert_eq!(((card.csd() >> 48 & 0x3f_ffff) + 1) * 1024, capacity);
-            assert!(card.in_range(sectors - 1, 1) && card.in_range(capacity as u64 - 1, 1) && !card.in_range(capacity as u64, 1));
-            let mut out = [0xff; 512];
-            card.write_blocks(capacity as u64 - 1, &[1; 512]);
-            card.read_blocks(capacity as u64 - 1, &mut out);
-            assert_eq!(out[0], (capacity as u64 - 1 < sectors) as u8, "past the image: zeros, and writes go nowhere");
+    fn the_card_offers_whole_units_of_what_is_stored() {
+        for (sectors, capacity) in [(2048u64, 2048), (2049, 2048), (3071, 2048), (3072, 3072)] {
+            let card = SdCard::new(Some(Box::new(MemDisk::new(sectors))));
+            assert_eq!(((card.csd() >> 48 & 0x3f_ffff) as u64 + 1) * 1024, capacity);
+            assert!(card.in_range(capacity - 1, 1) && !card.in_range(capacity, 1));
         }
     }
 
