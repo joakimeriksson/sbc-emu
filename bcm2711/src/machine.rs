@@ -940,7 +940,7 @@ impl Machine {
             dst.copy_from_slice(&data[done..done + n]);
             done += n;
         }
-        if let Some(j) = self.jit_mut() { j.flush(); }
+        for c in self.cpus.iter_mut() { c.jit_invalidate(u64::MAX); } // the 32-bit core's code too
         true
     }
 

@@ -618,6 +618,69 @@ mod tests {
 
     fn place(ram: &mut [u8], at: usize, program: [u32; 4]) { for (k, w) in program.iter().enumerate() { ram[at + 4 * k..][..4].copy_from_slice(&w.to_le_bytes()); } }
 
+    /// A 32-bit program under a 64-bit kernel, compiled by the 32-bit JIT: breakpoints stop in
+    /// the middle of its block, a step is one instruction, a write changes what runs.
+    fn exercise_32_bit<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, base: u64) {
+        let (code, data) = (base + 0x10_0000, base + 0x20_0000);
+        let read = |m: &mut M, a: u64| m.read(0, a, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap();
+        let pc = |m: &M| u64::from_le_bytes(m.reg(0, 32).unwrap().try_into().unwrap());
+        run(m, 2_000_000); // hot and compiled
+        assert_eq!(read(m, data), 1);
+        for n in [1, 2] {
+            m.breakpoint(code + 4 * n, true); // not where the block starts
+            assert!(matches!(run(m, 1_000_000), Stop::Breakpoint(0)), "instruction {n}");
+            assert_eq!(pc(m), code + 4 * n);
+            assert_eq!(m.step(0), None);
+            assert_eq!(pc(m), code + 4 * n + 4);
+            m.breakpoint(code + 4 * n, false);
+            run(m, 1_000_000);
+        }
+        for value in [2u32, 3] {
+            assert!(m.write(0, code, &(0xe3a0_0000 | value).to_le_bytes())); // mov r0, #value
+            run(m, 1_000_000);
+            assert_eq!(read(m, data), value);
+        }
+    }
+
+    /// EL1 at `base` entering a 32-bit loop at `base` + 1 MiB that stores r0 at `base` + 2 MiB.
+    fn place_32_bit(ram: &mut [u8], at: usize, base: u64) {
+        let hi = |a: u64| ((a >> 16) as u32) << 5;
+        let el1 = [
+            0xd280_0200,                          // mov x0, #0x10 (AArch32 user mode)
+            0xd518_4000,                          // msr spsr_el1, x0
+            0xd2a0_0001 | hi(base + 0x10_0000),   // movz x1, #code, lsl #16
+            0xd518_4021,                          // msr elr_el1, x1
+            0xd2a0_0002 | hi(base + 0x20_0000),   // movz x2, #data, lsl #16
+            0xd69f_03e0,                          // eret
+        ];
+        // mov r0, #1; add r3, r3, #1; add r4, r4, r3; str r0, [r2]; b
+        let user = [0xe3a0_0001u32, 0xe283_3001, 0xe084_4003, 0xe582_0000, 0xeaff_fffa];
+        for (o, w) in el1.iter().enumerate().map(|(k, w)| (at + 4 * k, w)).chain(user.iter().enumerate().map(|(k, w)| (at + 0x10_0000 + 4 * k, w))) {
+            ram[o..o + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn a_32_bit_program_under_a_64_bit_kernel() {
+        let mut m = bcm2711::Machine::new(65 << 20);
+        place_32_bit(&mut m.soc.ram, 0x40_0000, 0x40_0000);
+        m.cpus[0].enable_jit();
+        (m.cpus[0].el, m.cpus[0].spsel, m.cpus[0].pc) = (1, true, 0x40_0000);
+        exercise_32_bit(&mut m, |m, n| Host::Pi4(m).run(n), 0x40_0000);
+
+        let mut m = rk3588::Machine::with_cpus(128 << 20, 1).unwrap();
+        place_32_bit(&mut m.soc.ram, 0x40_0000, 0x40_0000);
+        m.enable_jit();
+        (m.cpus[0].el, m.cpus[0].pc) = (1, 0x40_0000);
+        exercise_32_bit(&mut m, |m, n| Host::OrangePi5(m).run(n), 0x40_0000);
+
+        let mut m = tegra210::Machine::with_cpus(128 << 20, 1).unwrap();
+        place_32_bit(&mut m.soc.ram, 0, tegra210::RAM_BASE);
+        m.enable_jit();
+        (m.cpus[0].el, m.cpus[0].pc) = (1, tegra210::RAM_BASE);
+        exercise_32_bit(&mut m, |m, n| Host::JetsonNano(m).run(n), tegra210::RAM_BASE);
+    }
+
     #[test]
     fn pi4() {
         let mut m = bcm2711::Machine::new(65 << 20);

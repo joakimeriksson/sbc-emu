@@ -118,6 +118,9 @@ pub struct Cpu {
     /// Compiled blocks may chain into each other while `instret < chain_until`; the machine
     /// sets it to its next deadline before each step (0 = return after one block).
     pub chain_until: u64,
+    /// Interpret user code under a 64-bit kernel although the JIT is on (a debugger stops or
+    /// steps between instructions). Compiled code is kept, and dropped when it changes.
+    pub jit_off: bool,
     /// The interpreter is finishing a block that is not hot yet (see `jit_step`).
     pub(crate) interp_run: bool,
     /// For compiled code while it runs: the dispatcher that chains blocks, and the JIT's
@@ -219,6 +222,7 @@ impl Cpu {
             ram_base: 0,
             ram_len: 0,
             ram_phys: 0,
+            jit_off: false,
             utlb: Box::new([Utlb::INVALID; 6 * UT]),
             io: false,
             jit: None,
