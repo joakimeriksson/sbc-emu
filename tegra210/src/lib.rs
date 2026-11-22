@@ -185,7 +185,8 @@ impl Soc {
             self.gpu.tick(self.now);
             self.gpu.read(word - gpu::BAR0)
         } else if at(gpu::BAR1, gpu::SIZE) {
-            self.gpu.bar1_read(word - gpu::BAR1, &self.smmu, &self.ram)
+            self.gpu.tick(self.now);
+            self.gpu.bar1_read(word - gpu::BAR1, &self.smmu, &mut self.ram)
         } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
             self.dc[k].read(word - dc::BASE[k])
         } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {

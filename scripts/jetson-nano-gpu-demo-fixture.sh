@@ -46,7 +46,7 @@ for d in "$work"/all/usr/share/doc/*/copyright; do
     [ -f "$d" ] && cp "$d" "$R/licenses/$(basename "$(dirname "$d")")"
 done
 # (which Debian's refer to)
-for l in GPL-2 GPL-3 LGPL-2 LGPL-2.1 LGPL-3; do cp "$work/all/usr/share/common-licenses/$l" "$R/licenses/"; done
+for l in Apache-2.0 GPL-1 GPL-2 GPL-3 LGPL-2 LGPL-2.1 LGPL-3; do cp "$work/all/usr/share/common-licenses/$l" "$R/licenses/"; done
 # the demos have Rust's standard library in them
 cp "$(dirname "$(dirname "$(rustup which rustc)")")/share/doc/rust/COPYRIGHT-library.html" "$R/licenses/rust-std.html"
 cp LICENSE "$R/licenses/nano-gl"

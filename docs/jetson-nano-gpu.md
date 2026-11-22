@@ -50,7 +50,8 @@ drivers' formulas.
 Host time per 1280 x 720 frame on an M-series Mac (sixteen threads): glmark2 build 3 ms, phong shading
 5 ms, effect2d 8 ms, jellyfish 12 ms, refract 32 ms. A submission is drawn when it
 starts; the next one starts no sooner than the host time later (`SBC_GPU_TIME` scales it, 0: at once),
-so the guest's frame rates are those of the emulation.
+so the guest's frame rates are those of the emulation. (A driver that looks whether a ring has room runs
+what waits: it would give up before the GPU's time is over.)
 
 ## Demos in the browser
 
@@ -67,9 +68,11 @@ so the guest's frame rates are those of the emulation.
 | `gpu-demo shadow` | a depth texture compared while sampling |
 
 `gpu-demo` runs all of them in turn, at 640 x 480 (`--mode 1280x720`); `--shot FILE --time T` writes a
-picture instead, on whatever Mesa chooses (llvmpipe needs a Mesa with its LLVM: Debian from the card), which is how they are compared with llvmpipe (`cubes`,
-`swarm`, `tunnel` and `shadow` are equal to 8 of 255; in `planet` and `fur` under 0.5 % of the pixels
-differ by more than 40). `scripts/jetson-nano-gpu-demo-fixture.sh` makes the archive from pinned Debian packages
+picture instead, on whatever Mesa chooses. Against llvmpipe (in Debian from the card, whose Mesa has its
+LLVM) `cubes`, `swarm`, `tunnel` and `shadow` are equal to 8 of 255; in `planet` and `fur` under 0.5 % of
+the pixels differ by more than 40.
+
+`scripts/jetson-nano-gpu-demo-fixture.sh` makes the archive from pinned Debian packages
 (13 MB) without LLVM, which Mesa's library names and nouveau does not use: a library of functions that
 return 0 is in its place (`tools/stub_library.py`). With it the 48 scenes `gles32test.c` then had came out the same.
 

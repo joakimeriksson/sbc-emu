@@ -62,7 +62,10 @@ const steps = process.env.SBC_GPU ? [
   ...demos.map((d) => ['frames/s', () => { const n = shot(d); console.log(`[${d}: ${n} colours]`); if (n < 100) dull++; }]),
   ['frames/s', () => '\x03printf "STOPPED_%s\\n" OK\r'],
   ['STOPPED_OK', 'gpu-demo planet\r'],
-  ['planet\r\n', '\x03printf "STOPPED_%s\\n" OK\r'],
+  ['on 640 x 480\r\n', null],
+  ['planet\r\n', null],
+  // (its first pictures)
+  [2, () => { const n = shot('planet-again'); console.log(`[planet again: ${n} colours]`); if (n < 100) dull++; return '\x03printf "STOPPED_%s\\n" OK\r'; }],
   ['STOPPED_OK', null],
 ] : [
   ['jetson-nano#', 'uname -m; grep -c ^processor /proc/cpuinfo\r'],
@@ -74,7 +77,7 @@ const steps = process.env.SBC_GPU ? [
   ['jetson-nano#', 'printf "REBOOT_%s\\n" OK\r'],
   ['REBOOT_OK', null],
 ];
-let uart = '', seen = 0, step = 0, pending = [], lastProgress = 0;
+let uart = '', seen = 0, since = 0, step = 0, pending = [], lastProgress = 0;
 const marks = [];
 while (performance.now() - t0 < secs * 1000 && step < steps.length) {
   while (pending.length && ex.sbc_uart_room()) ex.sbc_uart_in(pending.shift());
@@ -82,9 +85,11 @@ while (performance.now() - t0 < secs * 1000 && step < steps.length) {
   const n = ex.sbc_uart_take();
   if (n) { const s = new TextDecoder().decode(mem().slice(ex.sbc_uart_ptr() >>> 0, (ex.sbc_uart_ptr() >>> 0) + n)); uart += s; process.stdout.write(s); }
   const [want, send] = steps[step];
-  const at = uart.indexOf(want, seen);
+  // (a number: so many seconds of guest time later)
+  const at = typeof want === 'string' ? uart.indexOf(want, seen) : ex.sbc_now_ns() >= (since + want * 1e9) ? seen : -1;
   if (at >= 0) {
-    seen = at + want.length;
+    seen = at + (want.length ?? 0);
+    since = ex.sbc_now_ns();
     marks.push(`${want}: ${((performance.now() - t0) / 1000).toFixed(1)} s wall, ${(ex.sbc_insns() / 1e9).toFixed(2)} G insns, guest ${(ex.sbc_now_ns() / 1e9).toFixed(2)} s`);
     const text = typeof send === 'function' ? send() : send;
     if (text) pending.push(...Buffer.from(text));

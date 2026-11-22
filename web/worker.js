@@ -425,9 +425,10 @@ let lastLed = -1;
 let lastFrame = 0, lastStats = 0, lastInsns = 0, lastStatsT = performance.now(), frameEvery = 66, lastGpu = 0;
 function loop() {
   const sliceEnd = performance.now() + 40;
-  let r = 0;
+  let r = 0, ranAt = 0;
   while (performance.now() < sliceEnd) {
     while (serialQueue.length && ex.sbc_uart_room()) ex.sbc_uart_in(serialQueue.shift());
+    ranAt = performance.now();
     r = ex.sbc_run(2_000_000, wallNs());
     if (r !== 0) break;
   }
@@ -466,7 +467,8 @@ function loop() {
     return;
   }
   if (r === 1) {
-    const wait = Math.max(0, ex.sbc_wait_ms());
+    // (counted from before the run: a GPU may have drawn in it)
+    const wait = Math.max(0, ex.sbc_wait_ms() - (performance.now() - ranAt));
     setTimeout(() => { ex.sbc_wake(wallNs()); loop(); }, serialQueue.length ? 0 : wait);
   } else {
     setTimeout(loop, 0);

@@ -319,7 +319,15 @@ impl Gpu {
         mmu::space(((self.r(0x1704) & 0x0fff_ffff) as u64) << 12, smmu, ram)
     }
 
-    pub fn bar1_read(&mut self, offset: u64, smmu: &Smmu, ram: &[u8]) -> u32 {
+    pub fn bar1_read(&mut self, offset: u64, smmu: &Smmu, ram: &mut [u8]) -> u32 {
+        // the driver looks how far a channel has read when a ring is full, and gives up after a number
+        // of reads that takes no time here: what waits for the GPU runs now, and takes its time after
+        if matches!(offset & 0x1fc, 0x44 | 0x60 | 0x88) && self.waiting && self.now < self.busy_until {
+            let left = self.busy_until - self.now;
+            self.busy_until = 0;
+            self.run(smmu, ram);
+            self.busy_until = (self.busy_until.max(self.now) + left).min(self.now + MAX_BUSY_NS);
+        }
         let s = self.bar1_space(smmu, ram);
         self.mmu.translate(s, offset, smmu, ram).map_or(u32::MAX, |p| {
             let o = p.offset + (offset & 0xffc) as usize;
@@ -416,6 +424,26 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work waits while the GPU is busy, but not for a driver that looks whether a ring has room.
+    #[test]
+    fn busy_and_polled() {
+        let (smmu, mut ram) = (Smmu::default(), vec![0; 0x1000]);
+        let mut g = Gpu { busy_until: 5_000_000, ..Default::default() };
+        g.tick(1_000_000);
+        g.run(&smmu, &mut ram);
+        assert_eq!((g.waiting, g.next_event()), (true, Some(5_000_000)));
+        g.bar1_read(0x40, &smmu, &mut ram); // (something else)
+        assert!(g.waiting);
+        g.bar1_read(0x288, &smmu, &mut ram);
+        assert!(!g.waiting && g.busy_until >= 5_000_000);
+        // and later by itself
+        g.run(&smmu, &mut ram);
+        assert!(g.waiting);
+        g.tick(g.retry);
+        g.poll(&smmu, &mut ram);
+        assert!(!g.waiting);
+    }
 
     #[test]
     fn alarms_compare_the_low_word() {
