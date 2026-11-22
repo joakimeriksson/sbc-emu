@@ -132,9 +132,6 @@ impl Soc {
             self.gpio.read(word - GPIO)
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
             self.i2c[k].read(word - I2C[k].0)
-        } else if at(SDMMC, 4 * sdhci::SIZE) {
-            let k = (word - SDMMC) / sdhci::SIZE;
-            self.sd[k as usize].read(word - SDMMC - k * sdhci::SIZE)
         } else if at(FUSE, 0x400) {
             let o = word - FUSE;
             self.fuse.get(&o).copied().unwrap_or_else(|| fuse_preset(o))

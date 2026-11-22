@@ -22,7 +22,8 @@ mkdir -p "$DL"
 fetch() { # file url sha256 [other-url]
     if [ ! -f "$DL/$1" ]; then
         echo "fetching $2" >&2
-        curl -fL --retry 3 -o "$DL/$1.part" "$2" || { [ -n "${4:-}" ] && curl -fL --retry 3 -o "$DL/$1.part" "$4"; }
+        curl -fL --retry 3 -o "$DL/$1.part" "$2" ||
+            { [ -n "${4:-}" ] && curl -fL --retry 3 -o "$DL/$1.part" "$4"; } || exit 1
         mv "$DL/$1.part" "$DL/$1"
     fi
     actual=$(shasum -a 256 "$DL/$1" | cut -d' ' -f1)
@@ -67,6 +68,7 @@ done
 root=$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline)
 if [ -n "$root" ]; then
     dev=
+    case $root in card | /dev/* | LABEL=* | UUID=*) ;; *) echo "root=$root: use /dev/..., LABEL=, UUID= or card"; root= ;; esac
     for i in $(seq 100); do
         case $root in
             card) dev=$(blkid | grep 'TYPE="ext4"' | sed -n 's/^\(\/dev\/mmcblk[0-9]*p[0-9]*\):.*/\1/p' | head -n1) ;;
@@ -74,14 +76,15 @@ if [ -n "$root" ]; then
             *) dev=$root ;;
         esac
         [ -b "$dev" ] && break
+        [ -n "$root" ] || break
         usleep 100000
     done
     mkdir -p /new
-    if mount -t ext4 "$dev" /new; then
+    if [ -b "$dev" ] && mount -t ext4 "$dev" /new; then
         for d in dev proc sys; do mount -o move /$d /new/$d; done
         exec switch_root /new /sbin/init
     fi
-    echo "cannot mount root=$root (found: ${dev:-nothing}; use /dev/..., LABEL=, UUID= or card)"
+    [ -b "$dev" ] && echo "cannot mount $dev" || echo "no block device for root=$root"
 fi
 echo "TEGRA210_BOOT_OK: arm64 Linux BusyBox shell"
 exec setsid -c /bin/sh

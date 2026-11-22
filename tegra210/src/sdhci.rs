@@ -195,10 +195,12 @@ impl Sdhci {
         }
         let size = ((self.regs[BLKSIZE] & 0xfff) as usize).max(1);
         let blocks = if mode & 1 << 5 == 0 { 1 } else { (self.regs[BLKSIZE] >> 16).max(1) };
-        // card blocks are 512 bytes, and the transfer is on the card or not at all
+        // Card blocks are 512 bytes, and a counted transfer is on the card or not at all. Without
+        // the block count enable (bit 1) the host ends the transfer itself: checked per block.
+        let counted = if mode & 1 << 1 == 0 { 1 } else { blocks };
         let refused = match reply.data {
             Data::Read { lba } | Data::Write { lba } if with_data => {
-                let outside = !self.card.in_range(lba, blocks as u64);
+                let outside = !self.card.in_range(lba, counted as u64);
                 if outside {
                     self.regs[RESP0] |= OUT_OF_RANGE;
                 }
@@ -214,10 +216,11 @@ impl Sdhci {
             return;
         }
         if refused {
+            self.xfer = Xfer::None; // nor does an earlier transfer go on
             return self.raise(ERR_DATA_TIMEOUT); // the data phase never comes
         }
         self.pos = 0;
-        self.left = blocks - 1;
+        self.left = if mode & (1 << 5 | 1 << 1) == 1 << 5 { u32::MAX } else { blocks - 1 };
         match reply.data {
             Data::Bytes(mut b) => {
                 b.resize(size, 0);
@@ -236,7 +239,10 @@ impl Sdhci {
                 self.buf = vec![0; size];
             }
             // refused (out of range): the data phase never comes
-            Data::None => return self.raise(ERR_DATA_TIMEOUT),
+            Data::None => {
+                self.xfer = Xfer::None;
+                return self.raise(ERR_DATA_TIMEOUT);
+            }
         }
         let select = self.regs[CTRL] >> 3 & 3;
         if mode & 1 != 0 && select >= 2 {
@@ -314,10 +320,12 @@ impl Sdhci {
         if self.xfer == Xfer::Write {
             self.store();
         }
-        if self.left == 0 {
-            return true;
+        if self.left == 0 || !self.card.in_range(self.lba, 1) {
+            return true; // the last, or an open-ended transfer reached the card's end
         }
-        self.left -= 1;
+        if self.left != u32::MAX {
+            self.left -= 1;
+        }
         if self.xfer == Xfer::Read {
             self.load(self.buf.len());
         }
@@ -342,10 +350,13 @@ impl Sdhci {
         }
         let mut w = [0; 4];
         for b in w[..size.min(4)].iter_mut() {
+            if self.xfer != Xfer::Read {
+                break; // the transfer ended inside this access
+            }
             *b = self.buf.get(self.pos).copied().unwrap_or(0);
             self.pos += 1;
+            self.pio_step();
         }
-        self.pio_step();
         u32::from_le_bytes(w)
     }
 
@@ -354,12 +365,15 @@ impl Sdhci {
             return;
         }
         for b in &value.to_le_bytes()[..size.min(4)] {
+            if self.xfer != Xfer::Write {
+                break;
+            }
             if let Some(d) = self.buf.get_mut(self.pos) {
                 *d = *b;
             }
             self.pos += 1;
+            self.pio_step();
         }
-        self.pio_step();
     }
 }
 
@@ -512,5 +526,55 @@ mod tests {
             assert_eq!(s.read(0x20), 0x0909_0909);
         }
         assert_ne!(s.read(0x30) & INT_XFER_DONE, 0);
+    }
+
+    #[test]
+    fn a_refused_command_ends_what_was_there() {
+        let (mut s, mut ram) = ready();
+        let mut d = Dma { ram: &mut ram, base: BASE };
+        start(&mut s, &mut d, 24, 40, 1, 0);
+        s.write(0x2f, 2, 1, &mut d); // a command reset keeps it
+        let end = s.card.sectors() as u32 - 1;
+        start(&mut s, &mut d, 25, end, 8, 1 << 5 | 1 << 1);
+        for _ in 0..256 {
+            s.write(0x20, 0, 4, &mut d);
+        }
+        let mut out = [0; 512];
+        s.card.read_blocks(40, &mut out);
+        assert_eq!(out, [40; 512]);
+    }
+
+    #[test]
+    fn an_open_ended_read_to_the_cards_end() {
+        let (mut s, mut ram) = ready();
+        let mut d = Dma { ram: &mut ram, base: BASE };
+        let first = s.card.sectors() as u32 - 2;
+        start(&mut s, &mut d, 18, first, 8, 1 << 5 | 1 << 4); // the count register does not apply
+        assert_eq!(s.read(0x30) & 0xffff_0000, 0);
+        for _ in 0..256 {
+            assert_eq!(s.read(0x24) & 1 << 11, 1 << 11);
+            s.read(0x20);
+        }
+        assert_eq!(s.read(0x24) & 1 << 11, 0);
+    }
+
+    #[test]
+    fn accesses_across_a_block_boundary() {
+        let (mut s, mut ram) = ready();
+        let mut d = Dma { ram: &mut ram, base: BASE };
+        start(&mut s, &mut d, 18, 5, 2, 1 << 5 | 1 << 1 | 1 << 4);
+        assert_eq!(s.read_sized(0x20, 1), 5);
+        for _ in 0..127 {
+            assert_eq!(s.read(0x20), 0x0505_0505);
+        }
+        assert_eq!(s.read(0x20), 0x0605_0505);
+        start(&mut s, &mut d, 25, 20, 2, 1 << 5 | 1 << 1);
+        s.write(0x20, 1, 1, &mut d);
+        for _ in 0..256 {
+            s.write(0x20, 0x0202_0202, 4, &mut d);
+        }
+        let mut out = [0; 1024];
+        s.card.read_blocks(20, &mut out);
+        assert!(out[0] == 1 && out[1..] == [2; 1023]);
     }
 }

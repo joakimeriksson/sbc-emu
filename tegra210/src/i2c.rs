@@ -117,6 +117,7 @@ impl TegraI2c {
             BUS_CLEAR_CNFG => {
                 self.regs[BUS_CLEAR_CNFG / 4] = value & !1;
                 if value & 1 != 0 {
+                    self.release();
                     self.regs[INT_STATUS / 4] |= INT_BUS_CLR_DONE;
                 }
             }
@@ -186,7 +187,13 @@ impl TegraI2c {
                 self.rx.push_back(b);
             }
         } else {
-            ok = payload[..len].iter().all(|&b| d.write(b)) || flags & HEADER_CONT_ON_NAK != 0;
+            for &b in &payload[..len] {
+                ok &= d.write(b);
+                if !ok && flags & HEADER_CONT_ON_NAK == 0 {
+                    break;
+                }
+            }
+            ok |= flags & HEADER_CONT_ON_NAK != 0;
         }
         if flags & HEADER_CONTINUE != 0 && ok {
             self.current = Some((i, read));
@@ -284,7 +291,7 @@ mod tests {
 
     #[test]
     fn an_abandoned_continue_does_not_reach_the_next_transfer() {
-        for end in [(FIFO_CONTROL, 3), (CNFG, 0), (INT_STATUS, u32::MAX)] {
+        for end in [(FIFO_CONTROL, 3), (CNFG, 0), (BUS_CLEAR_CNFG, 1), (INT_STATUS, u32::MAX)] {
             let mut c = TegraI2c::default();
             c.attach(0x3c, Box::new(Mem { data: vec![0; 256], ..Default::default() }));
             c.attach(0x68, Box::new(Mem { data: vec![0x77; 256], ..Default::default() }));
@@ -323,5 +330,17 @@ mod tests {
         packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x30]);
         packet(&mut c, 0x3c, HEADER_READ, 1, &[]);
         assert_eq!(c.read(RX_FIFO as u64), 0x30);
+    }
+
+    #[test]
+    fn a_bus_clear_ends_an_abandoned_transfer_to_the_same_device() {
+        let mut c = TegraI2c::default();
+        c.attach(0x3c, Box::new(Mem { data: vec![0; 256], ..Default::default() }));
+        packet(&mut c, 0x3c, HEADER_CONTINUE, 2, &[0xaa10]);
+        c.write(BUS_CLEAR_CNFG as u64, 1, 0);
+        packet(&mut c, 0x3c, 0, 2, &[0x0120]); // register 0x20 = 1
+        packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x20]);
+        packet(&mut c, 0x3c, HEADER_READ, 1, &[]);
+        assert_eq!(c.read(RX_FIFO as u64), 1);
     }
 }
