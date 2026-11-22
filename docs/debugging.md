@@ -26,7 +26,8 @@ the guest is slower; the ESP32-S31 keeps its JIT for breakpoints. Detaching, or 
 away, clears them and the JIT comes back. With none set there is nothing to check on the way.
 Guest time stands still while the machine is halted.
 
-Not there: the browser pages have no debugger; no system registers (`CP15`, `CSR`s) beyond those
+Not there: watchpoints do not see the accesses of 32-bit processes under a 64-bit kernel (Pi 4,
+Orange Pi 5), whose registers are shown as AArch64; the browser pages have no debugger; no system registers (`CP15`, `CSR`s) beyond those
 above; no reverse execution.
 
 `tools/gdb-check.py [BOARD ...]` boots each board's guest and drives all of this over the
