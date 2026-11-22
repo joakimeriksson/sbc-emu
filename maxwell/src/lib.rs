@@ -3,13 +3,13 @@
 //! push buffers; everything runs at once, in order.
 pub mod inline;
 pub mod mme;
+pub mod pipe;
+pub mod raster;
+pub mod rop;
+pub mod threed;
 pub mod vertex;
 
-/// Memory at GPU virtual addresses.
-pub trait Memory {
-    fn read(&self, va: u64, out: &mut [u8]);
-    fn write(&mut self, va: u64, data: &[u8]);
-}
+pub use maxwell_tex::Memory;
 
 pub trait MemoryExt: Memory {
     fn read32(&self, va: u64) -> u32 {
@@ -23,3 +23,48 @@ pub trait MemoryExt: Memory {
 }
 
 impl<M: Memory + ?Sized> MemoryExt for M {}
+
+/// One channel's engine objects.
+#[derive(Default)]
+pub struct Engine {
+    pub threed: threed::Threed,
+    inline: inline::Inline,
+    /// (class, method) pairs without an effect, for reports
+    pub unknown: std::collections::BTreeSet<(u32, u32)>,
+}
+
+impl Engine {
+    /// A new submission: memory may have changed.
+    pub fn begin(&mut self) {
+        self.threed.pipe.invalidate();
+    }
+
+    /// The end of one: what is cached goes to memory.
+    pub fn end(&mut self, mem: &mut dyn Memory) {
+        self.threed.rop.flush(mem);
+    }
+
+    pub fn method(&mut self, class: u32, m: u32, v: u32, mem: &mut dyn Memory, now: u64) {
+        match class {
+            0xb197 => self.threed.method(m, v, mem, now),
+            0xa140 => {
+                if inline::Inline::owns(m) {
+                    if m == 0x1b0 {
+                        self.threed.rop.flush(mem);
+                    }
+                    self.inline.method(m, v, mem);
+                }
+            }
+            _ => {
+                self.unknown.insert((class, m));
+            }
+        }
+    }
+
+    /// A push buffer header's methods have all come.
+    pub fn end_group(&mut self, class: u32, mem: &mut dyn Memory, now: u64) {
+        if class == 0xb197 {
+            self.threed.end_group(mem, now);
+        }
+    }
+}

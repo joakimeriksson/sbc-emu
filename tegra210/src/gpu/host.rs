@@ -22,7 +22,7 @@ struct State {
     /// the method header being executed: (method, subchannel, words left, mode)
     header: Option<(u32, usize, u32, u32)>,
     copy: crate::gpu::copy::Copy,
-    unknown: std::collections::BTreeSet<(u32, u32)>,
+    engine: maxwell::Engine,
 }
 
 #[derive(Default)]
@@ -56,6 +56,7 @@ impl Host {
             let get = mmu::read32(userd + 0x88, view.smmu, view.ram).unwrap_or(0);
             let put = mmu::read32(userd + 0x8c, view.smmu, view.ram).unwrap_or(0);
             if get == put || get >= entries {
+                s.engine.end(view);
                 return done;
             }
             let (lo, hi) = (view.read32(base + 8 * get as u64), view.read32(base + 8 * get as u64 + 4));
@@ -66,6 +67,7 @@ impl Host {
                 eprintln!("[gpfifo] channel {id}: entry {get} at {at:#x}, {words} words");
             }
             done.entries += 1;
+            s.engine.begin();
             s.rest = Some((at, words));
         }
         done
@@ -90,12 +92,17 @@ impl State {
                     };
                     if left > 1 {
                         self.header = Some((next, sub, left - 1, if mode == 5 { 3 } else { mode }));
+                    } else {
+                        self.engine.end_group(self.class[sub], view, now);
                     }
                 }
                 None => {
                     let (mode, count, sub, method) = (w >> 29, w >> 16 & 0x1fff, (w >> 13 & 7) as usize, (w & 0xfff) << 2);
                     match mode {
-                        4 => self.method(sub, method, count, view, now, done, trace),
+                        4 => {
+                            self.method(sub, method, count, view, now, done, trace);
+                            self.engine.end_group(self.class[sub], view, now);
+                        }
                         1 | 3 | 5 if count != 0 => self.header = Some((method, sub, count, mode)),
                         _ => {}
                     }
@@ -115,12 +122,13 @@ impl State {
         }
         if method >= 0x100 {
             match self.class[sub] {
-                0xb0b5 => self.copy.method(method, v, view),
-                class => {
-                    if self.unknown.insert((class, method)) && trace {
-                        eprintln!("[gpu] class {class:04x} method {method:04x} not implemented");
+                0xb0b5 => {
+                    if method == 0x300 {
+                        self.engine.end(view);
                     }
+                    self.copy.method(method, v, view);
                 }
+                class => self.engine.method(class, method, v, view, now),
             }
             return;
         }
@@ -134,6 +142,7 @@ impl State {
                     1 => self.waiting = Some((at, payload, false)),
                     4 => self.waiting = Some((at, payload, true)),
                     2 => {
+                        self.engine.end(view);
                         view.write32(at, payload);
                         if v & 1 << 24 == 0 {
                             view.write(at + 8, &now.to_le_bytes()); // four words with a time stamp

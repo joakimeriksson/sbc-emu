@@ -127,6 +127,15 @@ pub struct View<'a> {
     pub fault: Cell<Option<(u64, bool)>>,
 }
 
+impl maxwell::Memory for View<'_> {
+    fn read(&self, va: u64, out: &mut [u8]) {
+        View::read(self, va, out);
+    }
+    fn write(&mut self, va: u64, data: &[u8]) {
+        View::write(self, va, data);
+    }
+}
+
 impl View<'_> {
     pub fn read(&self, mut va: u64, mut out: &mut [u8]) {
         while !out.is_empty() {
