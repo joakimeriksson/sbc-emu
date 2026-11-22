@@ -49,13 +49,28 @@ src=$work/deb/usr/lib/modules/$version
 dst=$work/root/lib/modules/$version
 mkdir -p "$dst"
 cp "$src/modules.builtin" "$src/modules.builtin.modinfo" "$src/modules.order" "$dst/"
-# drivers of the board and what they need (modules.dep is made in the guest)
-for m in drivers/i2c/busses/i2c-tegra drivers/regulator/fixed drivers/regulator/gpio-regulator \
-    drivers/regulator/max77620-regulator drivers/pwm/pwm-tegra drivers/regulator/pwm-regulator \
-    drivers/mmc/host/sdhci drivers/mmc/host/cqhci drivers/mmc/host/sdhci-pltfm drivers/mmc/host/sdhci-tegra \
-    fs/ext4/ext4 fs/jbd2/jbd2 fs/mbcache lib/crc16 lib/libcrc32c crypto/crc32c_generic; do
-    mkdir -p "$dst/kernel/$(dirname $m)"
-    xz -dc "$src/kernel/$m.ko.xz" > "$dst/kernel/$m.ko"
+# drivers of the board, and what each of them needs (modules.dep is made in the guest)
+find "$src/kernel" -name '*.ko.xz' > "$work/modules"
+todo="i2c-tegra fixed gpio-regulator max77620-regulator pwm-tegra pwm-regulator sdhci-tegra ext4 crc32c_generic
+    phy-tegra-xusb r8169 realtek af_packet"
+done=" "
+while [ -n "$todo" ]; do
+    set -- $todo
+    todo=
+    for m; do
+        case $done in *" $m "*) continue ;; esac
+        done="$done$m "
+        f=$(grep "/$(echo "$m" | sed 's/[-_]/[-_]/g')\.ko\.xz$" "$work/modules" | head -n1)
+        if [ -z "$f" ]; then
+            grep -q "/$(echo "$m" | sed 's/[-_]/[-_]/g')\.ko$" "$src/modules.builtin" && continue
+            echo "$m: no such module, and not built in" >&2
+            exit 1
+        fi
+        o=${f#"$src"/}
+        mkdir -p "$dst/$(dirname "$o")"
+        xz -dc "$f" > "$dst/${o%.xz}"
+        todo="$todo $(LC_ALL=C tr "\0" "\n" < "$dst/${o%.xz}" | LC_ALL=C sed -n 's/^depends=//p' | tr ',' ' ')"
+    done
 done
 cat > "$work/root/init" <<'INIT'
 #!/bin/busybox sh
@@ -66,7 +81,7 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 depmod -a
-for m in pwm-tegra fixed gpio-regulator i2c-tegra max77620-regulator pwm-regulator sdhci-tegra crc32c_generic ext4; do
+for m in pwm-tegra fixed gpio-regulator i2c-tegra max77620-regulator pwm-regulator sdhci-tegra crc32c_generic ext4 phy-tegra-xusb realtek r8169 af_packet; do
     modprobe $m || echo "modprobe $m failed"
 done
 # root=/dev/..., LABEL= or UUID= (BusyBox finds no PARTUUID=); "card" is the first ext4 partition of the microSD

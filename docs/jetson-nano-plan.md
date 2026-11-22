@@ -42,6 +42,11 @@ sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian   # Debian's k
 # (SHA-512 9e2f3958...), unpacked to disk.raw; the command line is in scripts/jetson-nano-debian.txt
 ```
 
+**Ethernet works**: the PCIe controller and the RTL8111H, through Debian's `pci-tegra` and `r8169`
+(1 Gbit/s, message-signalled interrupts, checksum and segmentation offload). `apt install` works in
+Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`). Check:
+`scripts/jetson-nano-net.txt`.
+
 ### What is modelled (`tegra210/`)
 
 | Block | Model |
@@ -59,6 +64,9 @@ sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian   # Debian's k
 | MAX77620 PMIC | a register file (regulators, GPIO) and its real-time clock |
 | GPIO | eight banks, masked writes, edge and level interrupts; the card-detect switch |
 | SDMMC ×4 | SDHCI 3.0, ADMA2 with 32- and 64-bit descriptors, PIO; an unanswered command completes with its timeout error (Linux masks the timeout's signal on Tegra) |
+| PCIe | AFI (configuration window, MSI, INTA), pads, two root ports; port 0 (M.2) is empty |
+| RTL8111H | the register window and its indirect spaces, the PHY, the transmit and receive rings, offloads; MSI (not MSI-X), no wake-on-LAN, VLAN tags or jumbo frames |
+| XUSB pad controller | its UPHY PLLs calibrate and lock; the rest is a register file |
 | Everything else in 0x0100_0000-0x8000_0000 | read-back registers; first-touched pages are listed at exit (`SBC_STUB_LOG=1` prints them as they happen) |
 
 PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
@@ -70,10 +78,10 @@ PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
    controllers (ADMA2 with 64-bit addresses); Debian 13 from a microSD card. Still to do: PSCI
    `CPU_SUSPEND`; UHS modes (the card offers 3.3 V high speed); UEFI-style or extlinux boot (the
    kernel and initramfs come from the command line); interrupts from the PMIC; APB DMA.
-3. **USB and network**: XUSB (the driver uploads NVIDIA's firmware, `nvidia/tegra210/xusb.bin`,
-   to a falcon microcontroller: accept it and present the xHCI behind it, reusing the Pi 4's
-   xHCI model) and the pad controller; then the PCIe controller and an RTL8111 (r8169), or
-   USB networking first. Debian's kernel has the drivers (Alpine's has neither the PMIC, PCIe nor the SMMU).
+3. **USB and network**: PCIe and the RTL8111H (done; Alpine's kernel has neither PCIe, the PMIC nor
+   the SMMU, Debian's has all); then XUSB (the driver uploads NVIDIA's firmware,
+   `nvidia/tegra210/xusb.bin`, to a falcon microcontroller: accept it and present the xHCI behind
+   it, reusing the Pi 4's xHCI model).
 4. **Display**: host1x (the command engine the display and the GPU sit behind), the display
    controllers, SOR/HDMI; `tegra-drm`.
 5. **GPU** (GM20B through nouveau and Mesa): the falcons (PMU, FECS, GPCCS) at a high level,

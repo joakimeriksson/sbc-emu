@@ -45,7 +45,7 @@ pub struct Dma<'a> {
 }
 
 impl Dma<'_> {
-    fn slice(&mut self, pa: u64, len: usize) -> Option<&mut [u8]> {
+    pub(crate) fn slice(&mut self, pa: u64, len: usize) -> Option<&mut [u8]> {
         let o = usize::try_from(pa.checked_sub(self.base)?).ok()?;
         self.ram.get_mut(o..o.checked_add(len)?)
     }
