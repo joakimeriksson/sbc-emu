@@ -678,7 +678,8 @@ fn opi5_restart(old: &rk3588::Machine, how: &mut Opi5Boot) -> Option<Board> {
 
 /// Start a Jetson Nano again from what it was booted with (after `reboot`).
 fn nano_restart(old: &tegra210::Machine, how: &mut DirectBoot, unix: f64) -> Option<Board> {
-    let unix = unix + old.now() as f64 / 1e9;
+    // (the page's wall clock goes on: the new machine's time catches up with it, so the clock
+    // counts from the same start)
     let mut m = nano_machine(old.soc.ram.len(), unix)?;
     let (kernel, dtb, initrd, cmdline) = std::mem::take(how);
     tegra210::boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), &cmdline).ok()?;
