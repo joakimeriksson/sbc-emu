@@ -356,7 +356,7 @@ async function start(os, ramMb, jit, file) {
     const c = await openCard(file);
     card = c.card;
     postMessage({ type: 'status', text: `firmware: reading config.txt and the kernel from ${file.name} (${(c.size / 2 ** 30).toFixed(2)} GiB card, ${c.how})…` });
-    const r = ex.sbc_boot_sd(ramMb, Math.floor(c.size / 512));
+    const r = ex.sbc_boot_sd(ramMb, c.size / 512);
     if (r === -2) throw new Error(`${file.name} has no Raspberry Pi boot partition (config.txt and a kernel on a FAT partition): is it an image for the Pi 4?`);
     if (r !== 0) throw new Error(`the kernel on ${file.name} did not start (${r})`);
     if (jit) ex.sbc_jit(1);

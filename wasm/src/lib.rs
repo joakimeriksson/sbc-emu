@@ -19,12 +19,24 @@ unsafe fn sbc_disk_read(_lba: f64, count: u32, out: *mut u8) { std::ptr::write_b
 
 /// The SD card image as the page serves it (read lazily by HTTP range requests in the worker);
 /// writes stay in this overlay, so the served image is never modified.
-struct WebDisk { sectors: u64, overlay: emu_core::disk::Overlay }
+/// `sectors`: what the guest sees, a whole number of an SD card's units; the page's image holds the
+/// first `stored`. The rest reads as zeros until it is written (the overlay keeps it).
+struct WebDisk { stored: u64, sectors: u64, overlay: emu_core::disk::Overlay }
+
+impl WebDisk {
+    /// A card for an image of `sectors` (a partial last sector counts; the page fills it with
+    /// zeros), or None for one below the smallest card (512 KiB), as in the CLI.
+    fn card(sectors: f64) -> Option<Box<dyn Disk>> {
+        let unit = emu_core::sdcard::UNIT;
+        let stored = sectors.ceil() as u64;
+        (sectors >= unit as f64).then(|| Box::new(WebDisk { stored, sectors: stored.next_multiple_of(unit), overlay: Default::default() }) as Box<dyn Disk>)
+    }
+}
 
 impl Disk for WebDisk {
     fn sectors(&self) -> u64 { self.sectors }
     fn read(&mut self, lba: u64, out: &mut [u8]) {
-        let valid = (self.sectors.saturating_sub(lba).saturating_mul(512)).min(out.len() as u64) as usize;
+        let valid = (self.stored.saturating_sub(lba).saturating_mul(512)).min(out.len() as u64) as usize;
         out[valid..].fill(0);
         if valid > 0 {
             // SAFETY: `out[..valid]` is a buffer of whole sectors; the import writes exactly that many
@@ -215,7 +227,7 @@ pub unsafe extern "C" fn sbc_boot(ram_mb: u32, k: *const u8, klen: usize, i: *co
 /// Pi firmware does (config.txt, cmdline.txt, kernel8.img, initramfs). Returns 0 on success.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
-    let mut disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
+    let Some(mut disk) = WebDisk::card(sectors) else { return -2 };
     let b = match bcm2711::boot::read_sd_boot(disk.as_mut()) { Ok(b) => b, Err(_) => return -2 };
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
     m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
@@ -270,7 +282,7 @@ pub unsafe extern "C" fn sbc_boot_tinker(ram_mb: u32, unix_now: f64, k: *const u
 /// the board's U-Boot does (`/boot/armbianEnv.txt`, zImage, dtb, uInitrd). Returns 0 on success.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_boot_tinker_sd(ram_mb: u32, unix_now: f64, sectors: f64) -> i32 {
-    let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
+    let Some(disk) = WebDisk::card(sectors) else { return -2 };
     let how = TinkerBoot { unix0: unix_now, direct: None };
     let mut m = tinker_machine((ram_mb as usize) << 20, unix_now, Some(disk));
     if tinker_boot(&mut m, &how).is_err() { return -2; }
@@ -633,9 +645,8 @@ pub extern "C" fn sbc_wake(wall_ns: f64) {
 /// Resume a Pi snapshot (made natively with the same SD image) instead of cold-booting.
 #[no_mangle]
 pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8, len: usize) -> i32 {
-    let disk: Box<dyn Disk> = Box::new(WebDisk { sectors: sectors as u64, overlay: Default::default() });
     let mut m = Machine::with_cpus((ram_mb as usize) << 20, smp());
-    m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(disk));
+    m.soc.sd = bcm2711::sdhci::Sdhci::new(WebDisk::card(sectors));
     m.connect_network(false, false);
     let snap = std::slice::from_raw_parts(snap, len);
     // a zstd frame holds the snapshot's inflated body (tools/snap-zstd.sh); otherwise it is the

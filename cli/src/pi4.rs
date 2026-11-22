@@ -56,7 +56,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     // last wall time the guest ran a full busy slice (for the wait-idle script step)
     let mut last_busy = Instant::now();
     let disk: Option<Box<dyn bcm2711::sdhci::Disk>> = match sd_path {
-        Some(p) => match if args.iter().any(|a| a == "--sd-persist") { disk::CowFile::open_persistent(p) } else { disk::CowFile::open(p) } {
+        Some(p) => match if args.iter().any(|a| a == "--sd-persist") { disk::CowFile::open_persistent(p) } else { disk::CowFile::open(p) }.and_then(disk::CowFile::as_card) {
             Ok(d) => Some(Box::new(d)), Err(e) => { eprintln!("{p}: {e}"); return ExitCode::FAILURE } },
         None => None,
     };

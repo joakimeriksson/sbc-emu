@@ -179,7 +179,10 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     let persist = args.iter().any(|a| a == "--sd-persist");
     let open = |option: &str| {
         arg(args, option)
-            .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
+            .map(|path| {
+                let disk = if option == "--emmc" { crate::disk::SharedDisk::open_emmc(path, persist) } else { crate::disk::SharedDisk::open(path, persist) };
+                disk.map_err(|e| format!("{path}: {e}"))
+            })
             .transpose()
     };
     let (sd, emmc) = (open("--sd")?, open("--emmc")?);
