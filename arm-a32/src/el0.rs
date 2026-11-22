@@ -41,7 +41,7 @@ pub trait El1Host {
     /// An MRC/MCR (or MRRC/MCRR) to coprocessor 15: `insn` in its A32 encoding (condition
     /// passed); `value` is what a write stores (Rt2:Rt for MCRR).
     fn cp15(&mut self, insn: u32, value: u64) -> Cp15;
-    /// The JIT compiled code from physical `pa` (the kernel's instruction-cache maintenance
+    /// The JIT compiled code from RAM offset `pa` (the kernel's instruction-cache maintenance
     /// of that page must reach `Cpu::code_changed`).
     fn compiled(&mut self, _pa: u32) {}
 }
@@ -91,19 +91,19 @@ impl Cpu {
     }
 
     /// Prepare to run user code from guest RAM at `ram` (`len` bytes at physical `base`).
-    /// The core then works in RAM offsets (`phys_bias` = `base`): up to 4 GiB of RAM is
-    /// reachable wherever it sits; a page outside it (a device a user process mapped) below
-    /// `base` is not, and faults. `mt`: other cores run in parallel on host threads (barriers
-    /// become host fences, store-exclusive a compare-and-swap).
+    /// The first 4 GiB of it are reached directly (and compiled); anything else the 64-bit MMU
+    /// maps, RAM beyond that or a device, goes through the bus. `mt`: other cores run in
+    /// parallel on host threads (barriers become host fences, store-exclusive a
+    /// compare-and-swap).
     ///
     /// # Safety
     /// As `set_ram`: `ram` must point to `len` writable bytes that outlive this `Cpu`.
     pub unsafe fn el0_setup(&mut self, ram: *mut u8, base: u64, len: u64, mt: bool) {
         let len = len.min(u32::MAX as u64) as u32;
-        if self.ram != ram || self.ram_len != len || self.ram_base != 0 || self.phys_bias != base {
-            self.phys_bias = base;
+        if self.ram != ram || self.ram_len != len || self.ram_base != 0 || self.ram_phys != base {
             // SAFETY: the caller's guarantee
             unsafe { self.set_ram(ram, 0, len) };
+            self.ram_phys = base; // the JIT's keys stay RAM offsets
         }
         self.mt = mt;
     }
@@ -224,13 +224,11 @@ impl Cpu {
     }
 
     /// Translate through the host (user access); the error is (VA, `HOST_FSC` | FSC).
-    pub(crate) fn el0_translate(&mut self, bus: &mut dyn Bus, va: u32, access: El0Access) -> Result<u32, (u32, u32)> {
+    pub(crate) fn el0_translate(&mut self, bus: &mut dyn Bus, va: u32, access: El0Access) -> Result<u64, (u32, u32)> {
         let host = self.el1.expect("el0_translate outside step_el0");
         // SAFETY: set by step_el0 for the duration of the step
         match unsafe { (*host).translate(bus, va, access) } {
-            // this core's physical address: the offset from `phys_bias`
-            Ok(pa) if pa.wrapping_sub(self.phys_bias) >> 32 == 0 => Ok(pa.wrapping_sub(self.phys_bias) as u32),
-            Ok(_) => Err((va, HOST_FSC | 0x10)), // 4 GiB or more past `phys_bias`: not reachable
+            Ok(pa) => Ok(pa),
             Err(fsc) => Err((va, HOST_FSC | fsc)),
         }
     }
@@ -441,5 +439,69 @@ mod tests {
         assert_eq!(cpu.r[2], 0x1234_5678);
         assert_eq!(u32::from_le_bytes(bus.mem[0x2004..0x2008].try_into().unwrap()), 42);
         assert!(bus.accesses > 0, "the slow path goes to the bus");
+    }
+
+    /// A device page a user process mapped, below RAM: the access reaches the bus at the
+    /// device's own address, and RAM is untouched.
+    #[test]
+    fn user_mapping_of_a_device_below_ram() {
+        const RAM: u64 = 0x8000_0000;
+        const DEVICE: u64 = 0x7000_0000;
+        struct Split {
+            ram: HighBus,
+            device: HighBus,
+        }
+        macro_rules! split {
+            ($($r:ident $w:ident $t:ty),*) => { $(
+                fn $r(&mut self, a: u64) -> Result<$t, emu_core::Fault> {
+                    if a < RAM { self.device.$r(a) } else { self.ram.$r(a) }
+                }
+                fn $w(&mut self, a: u64, v: $t) -> Result<(), emu_core::Fault> {
+                    if a < RAM { self.device.$w(a, v) } else { self.ram.$w(a, v) }
+                }
+            )* };
+        }
+        impl Bus for Split {
+            split!(read8 write8 u8, read16 write16 u16, read32 write32 u32, read64 write64 u64);
+        }
+        /// The page at 0x4000 is the device, the rest RAM.
+        struct Maps;
+        impl El1Host for Maps {
+            fn translate(&mut self, _bus: &mut dyn Bus, va: u32, _access: El0Access) -> Result<u64, u32> {
+                Ok(if va >> 12 == 4 { DEVICE + (va as u64 & 0xfff) } else { RAM + va as u64 })
+            }
+            fn cp15(&mut self, _insn: u32, _value: u64) -> Cp15 {
+                Cp15::Undefined
+            }
+        }
+        let mut ram = vec![0u8; 0x10000];
+        let code: [u32; 3] = [
+            0xe591_0804, // ldr r0, [r1, #0x804]
+            0xe280_0001, // add r0, r0, #1
+            0xe581_0808, // str r0, [r1, #0x808]
+        ];
+        for (i, w) in code.iter().enumerate() {
+            ram[0x1000 + 4 * i..0x1004 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+        let before = ram.clone();
+        let mut device = vec![0u8; 0x1000];
+        device[0x804..0x808].copy_from_slice(&0x0002_2110u32.to_le_bytes());
+        let mut bus = Split {
+            ram: HighBus { base: RAM, mem: ram, accesses: 0 },
+            device: HighBus { base: DEVICE, mem: device, accesses: 0 },
+        };
+        let mut cpu = Cpu::new_el0();
+        // 4 GiB claimed, as on the Nano: a 32-bit offset of the device would alias RAM. Only
+        // the first 64 KiB are touched.
+        // SAFETY: `bus.ram.mem` outlives `cpu`; the test accesses only its first 64 KiB
+        unsafe { cpu.el0_setup(bus.ram.mem.as_mut_ptr(), RAM, 4 << 30, false) };
+        cpu.r[15] = 0x1000;
+        cpu.r[1] = 0x4000;
+        for _ in 0..3 {
+            cpu.step_el0(&mut bus, &mut Maps).expect("no exception");
+        }
+        assert_eq!(cpu.r[0], 0x0002_2111);
+        assert_eq!(u32::from_le_bytes(bus.device.mem[0x808..0x80c].try_into().unwrap()), 0x0002_2111);
+        assert_eq!(bus.ram.mem, before);
     }
 }

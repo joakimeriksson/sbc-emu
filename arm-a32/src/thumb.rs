@@ -56,13 +56,13 @@ impl Cpu {
         }
     }
 
-    fn fetch_pa(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u32, Trap> {
+    fn fetch_pa(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u64, Trap> {
         self.translate_fill(bus, va, Access::Execute)
             .map_err(|(va, status)| self.prefetch_abort(va, status))
     }
 
-    fn read_code16(&mut self, bus: &mut dyn Bus, va: u32, pa: u32) -> Result<u32, Trap> {
-        bus.read16(self.bus_address(pa))
+    fn read_code16(&mut self, bus: &mut dyn Bus, va: u32, pa: u64) -> Result<u32, Trap> {
+        bus.read16(pa)
             .map(u32::from)
             .map_err(|_| self.prefetch_abort(va, 0x08))
     }

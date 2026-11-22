@@ -81,10 +81,9 @@ binaries are not redistributed by this project: visitors would bring their own i
   state, and on a PLLE reference not in its frequency table: the CAR starts as a bootloader
   leaves it (PLL reference = the oscillator, the CPU on PLLX, the system clock on PLLP).
 - 32-bit user programs (Alpine's kernel has `COMPAT`): the Nano's RAM runs from 0x8000_0000 to
-  0x1_8000_0000, and `arm-a32` has 32-bit physical addresses, so under a 64-bit kernel it works in
-  RAM offsets (`phys_bias`, set by `el0_setup`) and adds the base back on the bus. Before that,
-  every 32-bit process whose pages were above 4 GiB (most of them, with 4 GiB of RAM) died with
-  SIGBUS. Checked with Alpine's static armhf BusyBox: shell loops, and four parallel 32-bit
-  `md5sum`s of random data equal to the 64-bit ones, with the JIT and without.
+  0x1_8000_0000, so `arm-a32` carries 64-bit physical addresses from translation to the bus; its
+  JIT keys are RAM offsets under a 64-bit kernel (`ram_phys`, `ram_key`). Checked with Alpine's
+  static armhf BusyBox (shell loops; four parallel `md5sum`s equal to the 64-bit ones) and a
+  32-bit program that maps a device page through `/dev/mem`, with the JIT and without.
 - In Alpine's kernel the Tegra UART driver (`8250_tegra`) is a module, so the fixture's
   `/init` loads it before it opens the console, as any initramfs for this kernel must.
