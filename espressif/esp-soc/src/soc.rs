@@ -10,6 +10,8 @@ pub enum Stop {
     MaxInsns,
     Halted,
     Breakpoint(u32),
+    /// a debugger's watchpoint on (core): the range's address, the access (1 write, 2 read)
+    Watchpoint(usize, u32, u8),
     Unimplemented(u32, u32),
     /// a chip reset was requested (software, watchdog): `reboot()` and run again
     SwReset,

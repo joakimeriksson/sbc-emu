@@ -198,6 +198,28 @@ impl Hart {
         }
     }
 
+    /// Where `va` is mapped, for a debugger: no permission checks, no A or D bits set, no TLB.
+    pub fn debug_translate<B: Bus>(&self, bus: &mut B, va: u64) -> Option<u64> {
+        if self.satp >> 60 == 0 || self.prv == prv::M {
+            return Some(va);
+        }
+        let (base, mut table) = (bus.ram_base(), (self.satp & 0xfff_ffff_ffff) << 12);
+        for level in (0..3u32).rev() {
+            let o = (table + ((va >> (12 + 9 * level)) & 0x1ff) * 8).checked_sub(base)? as usize;
+            let pte = u64::from_le_bytes(bus.ram().get(o..o + 8)?.try_into().ok()?);
+            if pte & pte::V == 0 {
+                return None;
+            }
+            let ppn = (pte >> 10) & 0xfff_ffff_ffff;
+            if pte & (pte::R | pte::X) != 0 {
+                let low = (1u64 << (12 + 9 * level)) - 1;
+                return Some((ppn << 12) & !low | va & low);
+            }
+            table = ppn << 12;
+        }
+        None
+    }
+
     /// Translate `va` for `access`; on failure the exception cause.
     #[inline(always)]
     pub fn translate<B: Bus>(&mut self, bus: &mut B, va: u64, access: Access) -> Result<u64, u64> {

@@ -116,7 +116,8 @@ More options, mostly after QEMU's:
   with the same inputs is repeatable to the instruction (`--threads multi` seeds from the host).
 - `--gdb PORT [--gdb-wait]`: GDB remote stub (`gdb`: `target remote :PORT`, `lldb`:
   `gdb-remote PORT`); `--gdb-wait` holds the machine at reset until a debugger attaches. Cores are
-  threads; software/hardware breakpoints switch the cores to the interpreter while set.
+  threads; software/hardware breakpoints switch the cores to the interpreter while set
+  ([debugging](debugging.md)).
 - `--hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (repeatable): forward a host TCP port
   into the guest over Ethernet, e.g. `--hostfwd tcp::2222-:22` then `ssh -p 2222 pi@127.0.0.1`.
 - `--serial1 FILE`: the mini UART as `ttyS0`, its output to FILE (Bluetooth is then off: it

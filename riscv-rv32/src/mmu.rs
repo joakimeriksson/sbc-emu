@@ -90,6 +90,18 @@ impl Cpu {
         self.walk(bus, va, access)
     }
 
+    /// Where `va` is mapped, for a debugger: no permission checks, no A or D bits set, no TLB.
+    /// `read` gives a physical word.
+    pub fn debug_translate(&self, va: u32, mut read: impl FnMut(u32) -> Option<u32>) -> Option<u32> {
+        if !self.privileged || self.satp & 0x8000_0000 == 0 || self.priv_mode == privilege::MACHINE { return Some(va); }
+        let l1 = read(((self.satp & 0x3f_ffff) << 12).wrapping_add((va >> 22) * 4))?;
+        if l1 & pte::V == 0 { return None; }
+        if l1 & (pte::R | pte::X) != 0 { return Some((l1 >> 20) << 22 | va & 0x3f_ffff); }
+        let l0 = read(((l1 >> 10) << 12).wrapping_add(((va >> 12) & 0x3ff) * 4))?;
+        if l0 & pte::V == 0 || l0 & (pte::R | pte::X) == 0 { return None; }
+        Some((l0 >> 10) << 12 | va & 0xfff)
+    }
+
     /// The permission check of a leaf PTE for the access mode in effect.
     #[inline(always)]
     fn permits(&self, flags: u32, access: Access) -> bool {

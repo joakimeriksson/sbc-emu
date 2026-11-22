@@ -436,6 +436,9 @@ pub struct Machine {
     subtick: u64,
     /// The core that caused the last non-budget, non-idle stop (diagnostics).
     pub last_stop_core: usize,
+    /// a debugger's breakpoints (`debug_breakpoint`), and whether they turned the JIT off
+    pub breakpoints: emu_core::debug::Breakpoints,
+    debug_jit: bool,
     /// Compile hot code (the A32 JIT) on hosts that can run it.
     jit: bool,
     /// Debugging: print this many exceptions (vector, LR, SPSR, fault registers) to
@@ -471,6 +474,8 @@ impl Machine {
             exceptions: 0,
             subtick: 0,
             last_stop_core: 0,
+            breakpoints: Default::default(),
+            debug_jit: false,
             jit: arm_a32::jit::available() && std::env::var("SBC_JIT").map_or(true, |v| v != "0"),
             trace_exceptions: std::env::var("H3_TRACE_EXC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             trace_from: std::env::var("H3_TRACE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -542,6 +547,7 @@ impl Machine {
         cpu.undef_to_guest = true;
         cpu.firmware_calls_to_host = true;
         cpu.cntpct = now;
+        cpu.watch = self.cpus[index].watch.clone();
         self.cpus[index] = cpu;
         self.attach(index);
         self.state[index] = CoreState::Run;
@@ -759,6 +765,97 @@ impl Machine {
         result
     }
 
+    fn set_debugging(&mut self) {
+        let on = !self.breakpoints.at.is_empty() || !self.cpus[0].watch.is_empty();
+        if on && self.jit_enabled() {
+            self.set_jit(false);
+            self.debug_jit = true;
+        } else if !on && std::mem::take(&mut self.debug_jit) {
+            self.set_jit(true);
+        }
+    }
+
+    /// A debugger's breakpoint at `addr` (the cores are interpreted while any is set).
+    pub fn debug_breakpoint(&mut self, addr: u64, insert: bool) {
+        self.breakpoints.set(addr, insert);
+        self.set_debugging();
+    }
+
+    /// Watch [addr, addr + len) for accesses of `kind` (`emu_core::debug::WATCH_*`) on every core.
+    pub fn debug_watch(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        for c in &mut self.cpus {
+            c.set_watch(addr, len, kind, insert);
+        }
+        self.set_debugging();
+    }
+
+    /// Execute one instruction on core `k` (interpreted; a sleeping core is woken); a stop it
+    /// causes, if any. `run` does it, with the other cores off meanwhile.
+    #[cold]
+    pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
+        if !matches!(self.state[k], CoreState::Run | CoreState::Wait) {
+            return None;
+        }
+        let jit = self.jit_enabled();
+        if jit {
+            self.set_jit(false);
+        }
+        let states = std::mem::replace(&mut self.state, vec![CoreState::Off; NCPU]);
+        self.state[k] = CoreState::Run;
+        self.breakpoints.resume = Some((k, self.cpus[k].r[15] as u64));
+        let stop = self.run(1);
+        self.breakpoints.resume = None;
+        // a core the instruction started stays on
+        for (j, state) in states.into_iter().enumerate() {
+            if j != k && self.state[j] == CoreState::Off {
+                self.state[j] = state;
+            }
+        }
+        if jit {
+            self.set_jit(true);
+        }
+        (!matches!(stop, Stop::Budget | Stop::Idle(_))).then_some(stop)
+    }
+
+    /// The RAM behind [va, va + len) as core `k` maps it, a page at a time.
+    fn debug_pages(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<(usize, usize)>> {
+        let (base, size) = (self.soc.ram.base, self.soc.ram.mem.len());
+        let (mut pages, mut done) = (Vec::new(), 0);
+        while done < len {
+            let a = (va as u32).wrapping_add(done as u32);
+            let pa = self.cpus[k].debug_translate(&mut self.soc, a)? as u64;
+            let n = (len - done).min(0x1000 - (a & 0xfff) as usize);
+            let o = pa.checked_sub(base)? as usize;
+            if o + n > size {
+                return None;
+            }
+            pages.push((o, n));
+            done += n;
+        }
+        Some(pages)
+    }
+
+    /// Guest RAM at virtual address `va` as core `k` sees it.
+    pub fn debug_read(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<u8>> {
+        let pages = self.debug_pages(k, va, len)?;
+        Some(pages.into_iter().flat_map(|(o, n)| self.soc.ram.mem[o..o + n].to_vec()).collect())
+    }
+
+    /// Write guest RAM at virtual address `va`; compiled code is dropped.
+    pub fn debug_write(&mut self, k: usize, va: u64, data: &[u8]) -> bool {
+        let Some(pages) = self.debug_pages(k, va, data.len()) else { return false };
+        let mut done = 0;
+        for (o, n) in pages {
+            self.soc.ram.mem[o..o + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        if self.jit_enabled() {
+            self.set_jit(false);
+            self.set_jit(true);
+        }
+        true
+    }
+
     /// Run up to `budget` instructions across the cores. Returns `Stop::Idle(deadline_ns)`
     /// when every online core waits for an interrupt and nothing is due before then.
     pub fn run(&mut self, budget: u64) -> Stop {
@@ -779,7 +876,12 @@ impl Machine {
             };
             self.switch_to(k);
             let mut quantum = left.min(QUANTUM);
+            // what a debugger has set only changes between runs
+            let (breaks, watches) = (!self.breakpoints.at.is_empty(), !self.cpus[k].watch.is_empty());
             while quantum > 0 {
+                if breaks && self.breakpoints.hit(k, self.cpus[k].r[15] as u64) {
+                    return Stop::Breakpoint(k);
+                }
                 let i0 = self.cpus[k].instret;
                 self.cpus[k].chain_until = i0 + quantum.min(self.instructions_to_deadline());
                 let result = self.cpus[k].step(&mut self.soc);
@@ -853,6 +955,12 @@ impl Machine {
                     Err(Trap::Hlt(n)) => {
                         self.last_stop_core = k;
                         return Stop::Hlt(n);
+                    }
+                }
+                if watches {
+                    if let Some((address, access)) = self.cpus[k].watch.hit.take() {
+                        self.update_irqs();
+                        return Stop::Watchpoint(k, address, access);
                     }
                 }
                 // A device access (e.g. an IPI), a timer deadline or this core's own timer

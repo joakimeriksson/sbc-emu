@@ -330,7 +330,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         }
         if let Some(v) = vnc.as_mut() { v.poll(&mut m); }
         if let Some(g) = gdb.as_mut() {
-            let p = g.poll();
+            let p = g.poll(&mut m);
             if !matches!(p, gdb::Poll::Running) {
                 let t0 = Instant::now();
                 if let gdb::Resume::Kill = g.halted(&mut m, 0, 2, matches!(p, gdb::Poll::Interrupt)) { break Stop::Budget; }
@@ -349,13 +349,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         let mut stop = if std::mem::take(&mut reset_req) { Stop::Reset } else { HostMachine::Pi4(&mut m).run(budget) };
         // a debugger looks at breakpoints and at stops that would end the run
         if let Some(g) = gdb.as_mut().filter(|g| g.connected()) {
-            let hit = match stop {
-                Stop::Breakpoint(k) => Some((k, 5)),
-                Stop::Watchpoint(k, a, kind) => { g.reason = gdb::watch_reason(a, kind); Some((k, 5)) }
-                Stop::Unimplemented(..) => Some((0, 4)),
-                Stop::Brk(_) | Stop::Hlt(_) | Stop::ExceptionStorm { .. } => Some((0, 5)),
-                _ => None,
-            };
+            let hit = g.stop_signal(&stop, 0);
             if let Some((k, sig)) = hit {
                 let t0 = Instant::now();
                 if let gdb::Resume::Kill = g.halted(&mut m, k, sig, true) { break Stop::Budget; }
@@ -402,6 +396,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 let u = m.soc.devs.storage.take().map(|s| s.disk);
                 if let Some(n) = m.soc.net.as_mut() { n.nat = None; } // free forwarded host ports
                 m = match power_on(d, u) { Ok(m) => m, Err(e) => { eprintln!("reboot: {e}"); break Stop::Reset } };
+                if let Some(g) = gdb.as_ref() { g.rearm(&mut m); }
             }
             other => break other,
         }

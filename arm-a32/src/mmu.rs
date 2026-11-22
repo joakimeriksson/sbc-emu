@@ -135,6 +135,10 @@ impl Cpu {
     /// Remember a checked translation of RAM in the micro-TLB. Pages holding compiled
     /// code never enter the write table, so every store to them reaches `code_written`.
     fn utlb_fill(&mut self, va: u32, pa: u32, kind: usize) {
+        // while a debugger watches, data accesses take the slow path, which checks them
+        if !self.watch.is_empty() && kind != U_EXEC {
+            return;
+        }
         if !self.in_ram(pa) {
             self.io = true;
             return;
@@ -276,6 +280,18 @@ impl Cpu {
         Ok(entry.pa_page | (va & 0xfff))
     }
 
+    /// Set or clear a debugger's watch range (`emu_core::debug::Watch::set`).
+    pub fn set_watch(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        self.watch.set(addr, len, kind, insert);
+        self.utlb_flush();
+    }
+
+    /// Where `va` is mapped, for a debugger: no permission checks and no TLB changes.
+    pub fn debug_translate(&self, bus: &mut dyn Bus, va: u32) -> Option<u32> {
+        if self.sctlr & 1 == 0 { return Some(va); }
+        self.walk(bus, va).ok().map(|e| e.pa_page | (va & 0xfff))
+    }
+
     /// `translate` that also fills the micro-TLB (and notes device accesses).
     pub(crate) fn translate_fill(
         &mut self,
@@ -304,6 +320,7 @@ impl Cpu {
             // SAFETY: micro-TLB entries point into the guest RAM mapping
             return Ok(unsafe { p.read() });
         }
+        if !self.watch.is_empty() && access == Access::Read { self.watch.check(va as u64, 1, emu_core::debug::WATCH_READ); }
         let physical = self.translate_fill(bus, va, access)?;
         bus.read8(physical as u64).map_err(|_| (va, 0x08))
     }
@@ -317,6 +334,7 @@ impl Cpu {
             // SAFETY: as in mem_read8; the two bytes are in the same page
             return Ok(unsafe { (p as *const u16).read_unaligned() });
         }
+        if !self.watch.is_empty() { self.watch.check(va as u64, 2, emu_core::debug::WATCH_READ); }
         if self.crosses_page(va, 2) {
             let lo = self.mem_read8(bus, va, Access::Read)?;
             let hi = self.mem_read8(bus, va.wrapping_add(1), Access::Read)?;
@@ -337,6 +355,7 @@ impl Cpu {
             // SAFETY: as in mem_read8; the four bytes are in the same page
             return Ok(unsafe { (p as *const u32).read_unaligned() });
         }
+        if !self.watch.is_empty() && access == Access::Read { self.watch.check(va as u64, 4, emu_core::debug::WATCH_READ); }
         if self.crosses_page(va, 4) {
             let mut bytes = [0; 4];
             for (index, byte) in bytes.iter_mut().enumerate() {
@@ -370,6 +389,7 @@ impl Cpu {
             unsafe { p.write(value) };
             return Ok(());
         }
+        if !self.watch.is_empty() { self.watch.check(va as u64, 1, emu_core::debug::WATCH_WRITE); }
         let physical = self.translate_fill(bus, va, Access::Write)?;
         self.invalidate_exclusive(va);
         self.code_written(physical);
@@ -388,6 +408,7 @@ impl Cpu {
             unsafe { (p as *mut u16).write_unaligned(value) };
             return Ok(());
         }
+        if !self.watch.is_empty() { self.watch.check(va as u64, 2, emu_core::debug::WATCH_WRITE); }
         if self.crosses_page(va, 2) {
             // Check both pages before writing either byte.
             self.translate(bus, va.wrapping_add(1), Access::Write)?;
@@ -414,6 +435,7 @@ impl Cpu {
             unsafe { (p as *mut u32).write_unaligned(value) };
             return Ok(());
         }
+        if !self.watch.is_empty() { self.watch.check(va as u64, 4, emu_core::debug::WATCH_WRITE); }
         if self.crosses_page(va, 4) {
             self.translate(bus, va, Access::Write)?;
             self.translate(bus, va.wrapping_add(3), Access::Write)?;

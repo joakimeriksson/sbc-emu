@@ -127,6 +127,9 @@ pub struct Cpu {
     pub mt: bool,
     /// The value the last load-exclusive read (compare value of a multi-threaded store).
     pub(crate) exclusive_val: u64,
+    /// A debugger's watch ranges (interpreter only: run without the JIT while any are set).
+    /// Boxed, so that the core's own state keeps its layout: it costs 1.5% otherwise.
+    pub watch: Box<emu_core::debug::Watch>,
 }
 
 // SAFETY: the raw pointers (guest RAM, the bus during a step) are only dereferenced by the
@@ -177,6 +180,7 @@ impl Cpu {
             banked_usr_r8: [0; 5],
             exclusive_addr: None,
             exclusive_val: 0,
+            watch: Default::default(),
             el1: None,
             el0_exit: None,
             mt: false,

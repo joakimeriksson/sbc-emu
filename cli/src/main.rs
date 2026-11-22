@@ -6,6 +6,7 @@
 mod cpio;
 mod disk;
 #[cfg(not(target_arch = "wasm32"))]
+mod esp32s31;
 mod gdb;
 mod monitor;
 mod vnc;
@@ -72,7 +73,7 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs [--board pi4b|orangepi5] --busybox PATH -o OUT.cpio\n  sbc-emu run [--board pi4b] --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N[,password=PW]] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--hdmi-mode WxH] [--no-gpu] [--sd-persist]\n  sbc-emu run [--board pi4b] --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)");
+    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs [--board pi4b|orangepi5] --busybox PATH -o OUT.cpio\n  sbc-emu run [--board pi4b] --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N[,password=PW]] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--hdmi-mode WxH] [--no-gpu] [--sd-persist]\n  sbc-emu run [--board pi4b] --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)\n  sbc-emu run --board orangepi5|orangepi-one|tinkerboard|orangepi-rv [--kernel FILE --dtb FILE | --sd IMAGE] [--gdb PORT [--gdb-wait]] ...   (docs/BOARD.md)\n  sbc-emu run --board esp32s31 --rom ROM.elf --flash FLASH.bin [--gdb PORT [--gdb-wait]] ...");
     ExitCode::from(2)
 }
 
@@ -92,6 +93,7 @@ fn run(args: &[String]) -> ExitCode {
         Board::OrangePiOne => orangepi_one::run(args),
         Board::TinkerBoard => tinkerboard::run(args),
         Board::OrangePiRv => orangepi_rv::run(args),
+        Board::Esp32S31 => esp32s31::run(args),
         Board::Pi3 => unreachable!("checked above"),
     }
 }

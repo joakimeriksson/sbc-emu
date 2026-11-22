@@ -17,6 +17,34 @@ pub enum Machine<'a> {
     OrangePiOne(&'a mut allwinner_h3::Machine),
     TinkerBoard(&'a mut rockchip_rk3288::Machine),
     OrangePiRv(&'a mut starfive_jh7110::Machine),
+    Esp32S31(&'a mut esp32s31::Machine),
+}
+
+/// Virtual time of an ESP32-S31 in nanoseconds (320 MHz cycles).
+pub fn s31_now(m: &esp32s31::Machine) -> u64 {
+    use esp_soc::SocBus as _;
+    m.bus.cycles() * 25 / 8
+}
+
+/// Run an ESP32-S31 for `budget` scheduling steps. A chip reset goes back through its ROM here;
+/// `Idle` (nothing due later than now) once both harts wait, so the host can pace it.
+fn s31_run(m: &mut esp32s31::Machine, budget: u64) -> Stop {
+    use esp_soc::{CoreState, Soc as _};
+    match m.run(budget) {
+        esp_soc::Stop::MaxInsns => {
+            let asleep = |k: usize| m.cores[k].waiting || k > 0 && esp32s31::S31::core_state(&m.bus, k) != CoreState::Running;
+            if (0..m.cores.len()).all(asleep) { Stop::Idle(s31_now(m)) } else { Stop::Budget }
+        }
+        esp_soc::Stop::SwReset => {
+            m.reboot();
+            Stop::Budget
+        }
+        esp_soc::Stop::Breakpoint(_) => Stop::Breakpoint(m.debug_core()),
+        esp_soc::Stop::Watchpoint(k, a, kind) => Stop::Watchpoint(k, a as u64, kind),
+        esp_soc::Stop::Unimplemented(pc, insn) => Stop::Unimplemented(pc as u64, insn),
+        esp_soc::Stop::Ebreak(_) => Stop::Brk(0),
+        _ => Stop::PowerOff,
+    }
 }
 
 impl Machine<'_> {
@@ -33,6 +61,7 @@ impl Machine<'_> {
             Self::OrangePiOne(m) => m.run(budget),
             Self::TinkerBoard(m) => m.run(budget),
             Self::OrangePiRv(m) => m.run(budget),
+            Self::Esp32S31(m) => s31_run(m, budget),
         }
     }
 
@@ -45,6 +74,8 @@ impl Machine<'_> {
             Self::OrangePiOne(m) => m.idle_until(time_ns),
             Self::TinkerBoard(m) => m.idle_until(time_ns),
             Self::OrangePiRv(m) => m.idle_until(time_ns),
+            // its time only moves as it runs (and skips ahead while both harts wait)
+            Self::Esp32S31(_) => {}
         }
     }
 
@@ -56,6 +87,15 @@ impl Machine<'_> {
             Self::OrangePiOne(m) => m.serial_input(byte),
             Self::TinkerBoard(m) => m.serial_input(byte),
             Self::OrangePiRv(m) => m.serial_input(byte),
+            Self::Esp32S31(m) => {
+                use esp_soc::SocBus as _;
+                // UART0 takes input once the guest has enabled its clocks and receiver
+                let ready = m.bus.inner.uart_input(&[]).is_ok() && m.bus.inner.periph.uart0.rx_room() > 0;
+                if ready {
+                    m.bus.uart_input(0, &[byte]);
+                }
+                ready
+            }
             Self::Pi4(m) => {
                 if !m.soc.uart.rx_room() {
                     return false;
@@ -75,6 +115,7 @@ impl Machine<'_> {
             Self::OrangePiOne(m) => m.serial_output(),
             Self::TinkerBoard(m) => m.serial_output(),
             Self::OrangePiRv(m) => m.serial_output(),
+            Self::Esp32S31(m) => &m.console.uart0,
         }
     }
 
@@ -85,6 +126,7 @@ impl Machine<'_> {
             Self::OrangePiOne(m) => m.take_serial_output(),
             Self::TinkerBoard(m) => m.take_serial_output(),
             Self::OrangePiRv(m) => m.take_serial_output(),
+            Self::Esp32S31(m) => std::mem::take(&mut m.console.uart0),
         }
     }
 }

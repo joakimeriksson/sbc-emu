@@ -7,9 +7,14 @@ use emu_core::{CacheOperation, ControlEvent, ControlEventKind, StepKind, StepOut
 
 pub use emu_core::Trap;
 
+/// The bytes a bus accessor moves.
+macro_rules! WIDTH {
+    (read8) => { 1 }; (write8) => { 1 }; (read16) => { 2 }; (write16) => { 2 }; (read32) => { 4 }; (write32) => { 4 };
+}
 macro_rules! ld {
     ($cpu:expr, $bus:expr, $f:ident, $addr:expr, $pc:expr) => {{
         let va = $addr;
+        if !$cpu.watch.is_empty() { $cpu.watch_check(va, WIDTH!($f), 2); }
         let pa = if $cpu.privileged {
             match $cpu.translate($bus, va, crate::mmu::Access::Load) {
                 Ok(p) => p,
@@ -28,6 +33,7 @@ macro_rules! ld {
 macro_rules! st {
     ($cpu:expr, $bus:expr, $f:ident, $addr:expr, $v:expr, $pc:expr) => {{
         let va = $addr;
+        if !$cpu.watch.is_empty() { $cpu.watch_check(va, WIDTH!($f), 1); }
         let pa = if $cpu.privileged {
             match $cpu.translate($bus, va, crate::mmu::Access::Store) {
                 Ok(p) => p,

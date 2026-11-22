@@ -6,3 +6,4 @@ license.workspace = true
 description = "RV64GC hart (M/S/U, Sv39, Zba/Zbb) for sbc-emu's RISC-V boards"
 
 [dependencies]
+emu-core = { path = "../emu-core" }

@@ -907,12 +907,14 @@ pub struct Machine {
     rr: usize,
     /// the block JIT (shared by the harts: compiled code is keyed by physical address)
     jit: Option<Box<riscv64::jit::Jit>>,
+    /// a debugger's breakpoints (`debug_breakpoint`)
+    pub breakpoints: emu_core::debug::Breakpoints,
 }
 
 impl Machine {
     pub fn new(ram_size: usize) -> Self {
         let harts = (0..HARTS as u64).map(|h| Hart::new(Identity::sifive_u74(h))).collect();
-        Machine { harts, state: [HartState::Off; HARTS], soc: Soc::new(ram_size), rr: 0, jit: None }
+        Machine { harts, state: [HartState::Off; HARTS], soc: Soc::new(ram_size), rr: 0, jit: None, breakpoints: Default::default() }
     }
 
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Result<(), String> {
@@ -955,6 +957,7 @@ impl Machine {
         let mut left = budget;
         while left > 0 {
             let mut ran = 0;
+            let mut debug_stop = None;
             // time moved (or devices ticked) since the last round
             self.soc.dev_touched = true;
             for _ in 0..HARTS {
@@ -975,11 +978,20 @@ impl Machine {
                 self.soc.cur = h;
                 // another hart may have written the reserved location since
                 hart.reservation = u64::MAX;
+                let debugging = !self.breakpoints.at.is_empty() || !hart.watch.is_empty();
                 let n = match self.jit.as_mut() {
+                    _ if debugging => {
+                        let (n, stop) = hart.run_debug(&mut self.soc, QUANTUM.min(left), h, &mut self.breakpoints);
+                        debug_stop = stop;
+                        n
+                    }
                     Some(jit) => riscv64::jit::run(hart, &mut self.soc, jit, QUANTUM.min(left)),
                     None => hart.run(&mut self.soc, QUANTUM.min(left)),
                 };
                 ran = ran.max(n);
+                if debug_stop.is_some() {
+                    break;
+                }
             }
             if std::mem::take(&mut self.soc.gpio_reset) {
                 return Stop::Reset;
@@ -998,6 +1010,10 @@ impl Machine {
             self.soc.sdio0.tick(self.soc.now);
             let wifi = self.soc.sdio0.next_event();
             let bt = self.soc.bt_tick();
+            if let Some(stop) = debug_stop {
+                self.soc.now += ran;
+                return stop;
+            }
             if ran == 0 {
                 return Stop::Idle(self.next_deadline().min(self.soc.network_deadline()).min(vblank).min(usb).min(audio).min(bt).min(wifi));
             }
@@ -1005,6 +1021,78 @@ impl Machine {
             left = left.saturating_sub(ran);
         }
         Stop::Budget
+    }
+
+    /// A debugger's breakpoint at `addr` (the harts are interpreted while any is set).
+    pub fn debug_breakpoint(&mut self, addr: u64, insert: bool) {
+        self.breakpoints.set(addr, insert);
+    }
+
+    /// Watch [addr, addr + len) for accesses of `kind` (`emu_core::debug::WATCH_*`) on every hart.
+    pub fn debug_watch(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        for h in &mut self.harts {
+            h.watch.set(addr, len, kind, insert);
+        }
+    }
+
+    /// Execute one instruction on hart `k` (interpreted; a hart in WFI is woken, as the ISA
+    /// allows); a stop it causes, if any.
+    pub fn debug_step(&mut self, k: usize) -> Option<Stop> {
+        if self.state[k] != HartState::Run {
+            return None;
+        }
+        self.breakpoints.resume = Some((k, self.harts[k].pc));
+        self.soc.update_devices();
+        self.soc.cur = k;
+        let lines = self.soc.lines(k);
+        let hart = &mut self.harts[k];
+        hart.irq_lines = lines;
+        hart.wfi = false;
+        hart.reservation = u64::MAX;
+        let (n, stop) = hart.run_debug(&mut self.soc, 1, k, &mut self.breakpoints);
+        self.breakpoints.resume = None;
+        self.soc.now += n;
+        self.soc.dev_touched = true;
+        stop
+    }
+
+    /// The RAM behind [va, va + len) as hart `k` maps it, a page at a time.
+    fn debug_pages(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<(usize, usize)>> {
+        let (mut pages, mut done) = (Vec::new(), 0);
+        while done < len {
+            let a = va.wrapping_add(done as u64);
+            let o = self.harts[k].debug_translate(&mut self.soc, a)?.checked_sub(RAM_BASE)? as usize;
+            let n = (len - done).min(0x1000 - (a & 0xfff) as usize);
+            if o.checked_add(n)? > self.soc.ram.mem.len() {
+                return None;
+            }
+            pages.push((o, n));
+            done += n;
+        }
+        Some(pages)
+    }
+
+    /// Guest RAM at virtual address `va` as hart `k` sees it.
+    pub fn debug_read(&mut self, k: usize, va: u64, len: usize) -> Option<Vec<u8>> {
+        let pages = self.debug_pages(k, va, len)?;
+        Some(pages.into_iter().flat_map(|(o, n)| self.soc.ram.mem[o..o + n].to_vec()).collect())
+    }
+
+    /// Write guest RAM at virtual address `va`; compiled code is dropped.
+    pub fn debug_write(&mut self, k: usize, va: u64, data: &[u8]) -> bool {
+        let Some(pages) = self.debug_pages(k, va, data.len()) else { return false };
+        let mut done = 0;
+        for (o, n) in pages {
+            self.soc.ram.mem[o..o + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        if let Some(j) = self.jit.as_mut() {
+            j.flush();
+        }
+        for h in &mut self.harts {
+            h.tlb.jflush();
+        }
+        true
     }
 
     /// Plug GMAC0's port into the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP); `nat` also
