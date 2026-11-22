@@ -168,6 +168,26 @@ static void s_tess_uneven(void) { tess("quads, equal_spacing, ccw", "gl_TessLeve
 static void s_tess_isolines(void) { tess("isolines, equal_spacing", "gl_TessLevelOuter[0] = 8.0; gl_TessLevelOuter[1] = 16.0;", 0, MIXQ); }
 static void s_tess_points(void) { tess("quads, equal_spacing, point_mode", LEVELS("8.0", "8.0"), 0, "vec4(0, 0, 0, 0) + mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, t.x), mix(gl_in[2].gl_Position, gl_in[3].gl_Position, t.x), t.y)"); }
 
+/* which way triangles go: their facing, for both domains and windings, whole and with the back culled */
+static void s_tess_winding(void) {
+    clear(0.05f, 0.05f, 0.1f);
+    static const char *layouts[4] = {"triangles, ccw", "triangles, cw", "quads, ccw", "quads, cw"};
+    for (int k = 0; k < 8; k++) {
+        char tes[1024];
+        snprintf(tes, sizeof tes, "layout(%s) in; void main() { vec3 t = gl_TessCoord; gl_Position = %s; }", layouts[k & 3],
+                 k & 2 ? "mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, t.x), mix(gl_in[2].gl_Position, gl_in[3].gl_Position, t.x), t.y)" : "gl_in[0].gl_Position * t.x + gl_in[1].gl_Position * t.y + gl_in[2].gl_Position * t.z");
+        prog5("void main() { vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)); gl_Position = vec4(c * 1.7 - 0.85, 0.0, 1.0); }",
+              "layout(vertices = 4) out; void main() { gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; " LEVELS("3.0", "3.0") " }", tes, NULL,
+              "out vec4 o; void main() { o = gl_FrontFacing ? vec4(0.2, 0.9, 0.2, 1) : vec4(0.9, 0.2, 0.2, 1); }");
+        glPatchParameteri(GL_PATCH_VERTICES, 4);
+        glViewport((k & 3) * 32, (k >> 2) * 64, 32, 64);
+        if (k > 3) glEnable(GL_CULL_FACE);
+        glDrawArrays(GL_PATCHES, 0, 4);
+        glDisable(GL_CULL_FACE);
+    }
+    glViewport(0, 0, W, H);
+}
+
 static void s_feedback(void) {
     clear(0, 0, 0);
     GLuint p = glCreateProgram();
@@ -482,7 +502,7 @@ static const struct scene scenes[] = {
     {"compute_ssbo", s_compute_ssbo}, {"compute_shared", s_compute_shared}, {"compute_image", s_compute_image}, {"compute_indirect", s_compute_indirect},
     {"geometry_quads", s_geometry_quads}, {"geometry_lines", s_geometry_lines}, {"geometry_adjacency", s_geometry_adjacency}, {"geometry_layers", s_geometry_layers},
     {"tess_quads", s_tess_quads}, {"tess_quads_wire", s_tess_quads_wire}, {"tess_triangles", s_tess_triangles}, {"tess_triangles_wire", s_tess_triangles_wire},
-    {"tess_fraction", s_tess_fraction}, {"tess_uneven", s_tess_uneven}, {"tess_isolines", s_tess_isolines}, {"tess_points", s_tess_points},
+    {"tess_fraction", s_tess_fraction}, {"tess_uneven", s_tess_uneven}, {"tess_isolines", s_tess_isolines}, {"tess_points", s_tess_points}, {"tess_winding", s_tess_winding},
     {"feedback", s_feedback}, {"occlusion", s_occlusion}, {"msaa", s_msaa}, {"msaa_texture", s_msaa_texture}, {"mrt", s_mrt}, {"buffer_texture", s_buffer_texture},
     {"indirect_draw", s_indirect_draw}, {"restart", s_restart}, {"srgb", s_srgb}, {"gather", s_gather}, {"grad_lod", s_grad_lod}, {"ubo_bits", s_ubo_bits},
     {"advanced_interp", s_advanced_interp}, {"atomic_fs", s_atomic_fs}, {"cube_array", s_cube_array}, {"shadow", s_shadow}, {"clip_border", s_clip_border},

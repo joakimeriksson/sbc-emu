@@ -70,6 +70,41 @@ pub struct Gpu {
     waiting: bool,
     retry: u64,
     pause: u64,
+    /// what ran last takes until then: the next submission starts no earlier
+    busy_until: u64,
+    /// guest time for host time (`SBC_GPU_TIME`; 0: the GPU takes none)
+    time_scale: f64,
+}
+
+/// The longest that one submission keeps the GPU, in guest time: drivers give up at some point.
+const MAX_BUSY_NS: u64 = 1_000_000_000;
+
+/// Host time: `Instant` natively, the page's `performance.now()` in the browser.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn sbc_host_now_ms() -> f64;
+}
+struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant, #[cfg(target_arch = "wasm32")] f64);
+impl Clock {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn now() -> Clock {
+        Clock(std::time::Instant::now())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn now() -> Clock {
+        // SAFETY: a clock read that the page provides
+        Clock(unsafe { sbc_host_now_ms() })
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn elapsed(&self) -> std::time::Duration {
+        // SAFETY: as above
+        std::time::Duration::from_secs_f64((unsafe { sbc_host_now_ms() } - self.0).max(0.0) / 1000.0)
+    }
 }
 
 pub mod host;
@@ -106,6 +141,8 @@ impl Default for Gpu {
             waiting: false,
             retry: 0,
             pause: 0,
+            busy_until: 0,
+            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0),
         }
     }
 }
@@ -282,7 +319,15 @@ impl Gpu {
         mmu::space(((self.r(0x1704) & 0x0fff_ffff) as u64) << 12, smmu, ram)
     }
 
-    pub fn bar1_read(&mut self, offset: u64, smmu: &Smmu, ram: &[u8]) -> u32 {
+    pub fn bar1_read(&mut self, offset: u64, smmu: &Smmu, ram: &mut [u8]) -> u32 {
+        // the driver looks how far a channel has read when a ring is full, and gives up after a number
+        // of reads that takes no time here: what waits for the GPU runs now, and takes its time after
+        if matches!(offset & 0x1fc, 0x44 | 0x60 | 0x88) && self.waiting && self.now < self.busy_until {
+            let left = self.busy_until - self.now;
+            self.busy_until = 0;
+            self.run(smmu, ram);
+            self.busy_until = (self.busy_until.max(self.now) + left).min(self.now + MAX_BUSY_NS);
+        }
         let s = self.bar1_space(smmu, ram);
         self.mmu.translate(s, offset, smmu, ram).map_or(u32::MAX, |p| {
             let o = p.offset + (offset & 0xffc) as usize;
@@ -301,10 +346,14 @@ impl Gpu {
         }
     }
 
-    /// Run every channel that has work.
+    /// Run every channel that has work. All of it is done at once, and keeps the GPU for as long as the
+    /// host needed: what comes next waits, so that the guest sees the speed it gets.
     fn run(&mut self, smmu: &Smmu, ram: &mut [u8]) {
-        #[cfg(not(target_arch = "wasm32"))]
-        let start = std::time::Instant::now();
+        if self.now < self.busy_until {
+            (self.waiting, self.retry) = (true, self.busy_until);
+            return;
+        }
+        let start = Clock::now();
         // a channel may release the semaphore another waits for
         let mut moved = false;
         for _ in 0..64 {
@@ -318,10 +367,9 @@ impl Gpu {
         // a semaphore that stays away is looked at less and less often
         self.pause = if self.waiting && !moved { (2 * self.pause).clamp(RETRY_NS, MAX_RETRY_NS) } else { 0 };
         self.retry = self.now + self.pause.max(RETRY_NS);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.busy += start.elapsed();
-        }
+        let took = start.elapsed();
+        self.busy += took;
+        self.busy_until = self.now + ((took.as_nanos() as f64 * self.time_scale) as u64).min(MAX_BUSY_NS);
     }
 
     fn run_once(&mut self, smmu: &Smmu, ram: &mut [u8]) -> (bool, bool) {
@@ -376,6 +424,36 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work waits while the GPU is busy, but not for a driver that looks whether a ring has room.
+    #[test]
+    fn busy_and_polled() {
+        let (smmu, mut ram) = (Smmu::default(), vec![0; 0x1000]);
+        let mut g = Gpu { busy_until: 5_000_000, ..Default::default() };
+        g.tick(1_000_000);
+        g.run(&smmu, &mut ram);
+        assert_eq!((g.waiting, g.next_event()), (true, Some(5_000_000)));
+        g.bar1_read(0x40, &smmu, &mut ram); // (something else)
+        assert!(g.waiting);
+        g.bar1_read(0x288, &smmu, &mut ram);
+        assert!(!g.waiting && g.busy_until >= 5_000_000);
+        // what runs keeps the GPU, as long as the host took (which a coarse clock may not see at once)
+        let mut f = Gpu { time_scale: 1e6, ..Default::default() };
+        f.tick(1_000_000);
+        assert!((0..100_000).any(|_| {
+            f.run(&smmu, &mut ram);
+            f.busy_until > f.now
+        }));
+        let mut f = Gpu { time_scale: 0.0, ..Default::default() };
+        f.run(&smmu, &mut ram);
+        assert_eq!(f.busy_until, 0);
+        // and later by itself
+        g.run(&smmu, &mut ram);
+        assert!(g.waiting);
+        g.tick(g.retry);
+        g.poll(&smmu, &mut ram);
+        assert!(!g.waiting);
+    }
 
     #[test]
     fn alarms_compare_the_low_word() {

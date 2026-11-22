@@ -102,7 +102,7 @@ PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
 5. **GPU** (done): GM20B through nouveau and Mesa; see [jetson-nano-gpu.md](jetson-nano-gpu.md).
 6. **Browser** (a first page): `web/board.html?b=jetson-nano` boots the kernel and initramfs above to
    shells on the serial console and on HDMI (`tools/wasm-build.sh`; check: `tools/wasm-smoke-nano.mjs`, 12 s
-   to the shell in Node on an M-series Mac). Not yet: a guest with Mesa, so nothing draws with the GPU there.
+   to the shell in Node on an M-series Mac). The GPU demos are a page of their own, [below the GPU's documentation](jetson-nano-gpu.md#demos-in-the-browser).
 
 Stretch: NVIDIA's JetPack 4.6 image, booted from its `/boot/extlinux/extlinux.conf`: the
 bootloader's hand-off (EEPROM board ID, DT overlays, carve-outs, command line), the vendor
