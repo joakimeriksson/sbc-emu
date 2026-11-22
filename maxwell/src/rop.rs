@@ -371,7 +371,7 @@ pub struct Blend {
 impl Blend {
     pub fn new(t: &Threed, rt: usize) -> Self {
         let per_target = t.r(0x12e4) & 1 != 0;
-        let on = t.r(0x1360 + 4 * if per_target { rt as u32 } else { rt as u32 }) & 1 != 0;
+        let on = t.r(0x1360 + 4 * rt as u32) & 1 != 0;
         let (rgb, alpha) = if per_target {
             let b = 0x1e00 + 0x20 * rt as u32;
             let rgb = [t.r(b + 4), t.r(b + 8), t.r(b + 0xc)];

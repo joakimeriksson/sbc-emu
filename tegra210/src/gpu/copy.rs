@@ -1,36 +1,11 @@
 //! The copy engine (class B0B5, MAXWELL_DMA_COPY_A): lines between pitch and block-linear surfaces,
 //! component remapping, and a semaphore at the end.
 use super::mmu::View;
-use crate::dc::gob_offset;
+use maxwell::inline::Block;
 
 #[derive(Default, Clone)]
 pub struct Copy {
     regs: std::collections::HashMap<u32, u32>,
-}
-
-/// A block-linear surface's shape: sizes in bytes and lines, blocks in log2 GOBs.
-#[derive(Clone, Copy)]
-struct Block {
-    width: u64,
-    height: u64,
-    gobs_w: u32,
-    gobs_h: u32,
-    gobs_d: u32,
-}
-
-impl Block {
-    /// Byte `x` of line `y` in slice `z`.
-    fn offset(&self, x: u64, y: u64, z: u64) -> u64 {
-        let (bw, bh, bd) = (64u64 << self.gobs_w, 8u64 << self.gobs_h, 1u64 << self.gobs_d);
-        let size = bw * bh * bd;
-        let per_row = self.width.div_ceil(bw);
-        let rows = self.height.div_ceil(bh);
-        let block = (z / bd * rows + y / bh) * per_row + x / bw;
-        let (x, y, z) = (x % bw, y % bh, z % bd);
-        // a block's GOBs: down, then deeper, then to the right
-        let gob = (x / 64 * bd + z) * (bh / 8) + y / 8;
-        block * size + gob * 512 + gob_offset(x % 64, y % 8)
-    }
 }
 
 impl Copy {
@@ -122,27 +97,5 @@ fn runs(x: u64, bytes: u64, mut f: impl FnMut(u64, usize, usize)) {
         let n = (16 - (x + at) % 16).min(bytes - at);
         f(x + at, at as usize, n as usize);
         at += n;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn block_offsets_are_a_bijection() {
-        let b = Block { width: 256, height: 64, gobs_w: 0, gobs_h: 2, gobs_d: 1 };
-        let mut seen = std::collections::HashSet::new();
-        for z in 0..4 {
-            for y in 0..64 {
-                for x in 0..256 {
-                    let o = b.offset(x, y, z);
-                    assert!(o < 256 * 64 * 4 && seen.insert(o));
-                }
-            }
-        }
-        assert_eq!(b.offset(0, 8, 0), 512);
-        assert_eq!(b.offset(0, 0, 1), 4 * 512);
-        assert_eq!(b.offset(64, 0, 0), 8 * 512);
     }
 }

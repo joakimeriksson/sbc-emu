@@ -203,7 +203,7 @@ fn divide(f: f32, spacing: u32, out: &mut Vec<f32>) {
         1 => {
             let f = f.clamp(1.0, 63.0);
             let n = f.ceil() as u32;
-            (f, if n % 2 == 0 { n + 1 } else { n })
+            (f, if n.is_multiple_of(2) { n + 1 } else { n })
         }
         2 => {
             let f = f.clamp(2.0, 64.0);

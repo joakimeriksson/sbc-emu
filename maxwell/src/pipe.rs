@@ -49,18 +49,13 @@ impl Shader {
 }
 
 /// A constant buffer's words, read when they are first used.
+#[derive(Default)]
 pub struct Words {
     buffer: Cbuf,
     /// what they were read in
     generation: u64,
     words: Box<[Cell<u32>]>,
     valid: [Cell<u64>; 4],
-}
-
-impl Default for Words {
-    fn default() -> Self {
-        Self { buffer: Default::default(), generation: 0, words: Box::default(), valid: Default::default() }
-    }
 }
 
 impl Words {
@@ -796,7 +791,6 @@ fn shade_vertices(t: &mut Threed, vs: &Arc<Shader>, list: &[u32], arrays: bool, 
     let work = work(t, 0);
     let mut out = Verts::new(vs.sph.outputs().filter_map(word));
     out.grow(unique.len());
-    let stride = out.stride;
     let mut data = std::mem::take(&mut out.data);
     let workers = if vs.program.writes_memory() { 1 } else { threads().min(unique.len() / (2 * CHUNK)).max(1) };
     t.pipe.need_workers(workers);
@@ -804,7 +798,7 @@ fn shade_vertices(t: &mut Threed, vs: &Arc<Shader>, list: &[u32], arrays: bool, 
     #[cfg(not(target_arch = "wasm32"))]
     if workers > 1 && mem.share().is_some() {
         use std::sync::Mutex;
-        let jobs = Mutex::new(unique.chunks(CHUNK).zip(data.chunks_mut(CHUNK * stride)));
+        let jobs = Mutex::new(unique.chunks(CHUNK).zip(data.chunks_mut(CHUNK * out.stride)));
         let memory = &*mem;
         type Slot<'a> = Mutex<(&'a mut Worker, Box<dyn Memory + Send + 'a>, Option<String>)>;
         let slots: Vec<Slot> = t.pipe.workers[..workers].iter_mut().map(|w| Mutex::new((w, memory.share().unwrap(), None))).collect();
