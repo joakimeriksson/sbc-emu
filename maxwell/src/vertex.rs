@@ -136,13 +136,18 @@ pub fn assemble(op: u32, n: usize, first_provokes: bool, mut f: impl FnMut(&[u32
         9 => (2..n).for_each(|k| f(&[k - 1, k, 0])), // a polygon's first vertex provokes
         7 => (0..n / 4).for_each(|q| {
             let q = 4 * q;
-            f(&[q, q + 1, q + 3]);
-            f(&[q + 1, q + 2, q + 3]);
+            if first_provokes {
+                f(&[q, q + 1, q + 2]);
+                f(&[q, q + 2, q + 3]);
+            } else {
+                f(&[q, q + 1, q + 3]);
+                f(&[q + 1, q + 2, q + 3]);
+            }
         }),
         8 => (0..n.saturating_sub(2) / 2).for_each(|q| {
             let q = 2 * q;
             f(&[q, q + 1, q + 3]);
-            f(&[q + 2, q, q + 3]);
+            f(&if first_provokes { [q, q + 3, q + 2] } else { [q + 2, q, q + 3] });
         }),
         10 => (0..n / 4).for_each(|k| f(&[4 * k, 4 * k + 1, 4 * k + 2, 4 * k + 3])),
         11 => (3..n).for_each(|k| f(&[k - 3, k - 2, k - 1, k])),

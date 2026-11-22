@@ -11,14 +11,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <GLES2/gl2ext.h>
 
 enum { W = 128, H = 128 };
 static GLuint fb, rb[2];
 
 static GLuint shader(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
-    char all[16384];
-    snprintf(all, sizeof all, "#version 320 es\nprecision highp float; precision highp int; precision highp sampler2DArray; precision highp sampler2DMS; precision highp usampler2D; precision highp isampler2D; precision highp samplerBuffer; precision highp image2D;\n%s", src);
+    char all[16384], ext[512] = "";
+    /* (a first line of its own goes before the precisions: #extension) */
+    if (*src == 10) { const char *e = strchr(src + 1, 10); snprintf(ext, sizeof ext, "%.*s\n", (int)(e - src - 1), src + 1); src = e + 1; }
+    snprintf(all, sizeof all, "#version 320 es\n%sprecision highp float; precision highp int; precision highp sampler2DArray; precision highp sampler2DMS; precision highp usampler2D; precision highp isampler2D; precision highp samplerBuffer; precision highp image2D;\n%s", ext, src);
     const char *p = all;
     glShaderSource(s, 1, &p, NULL); glCompileShader(s);
     GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
@@ -355,6 +358,125 @@ static void s_clip_border(void) {
     full("in vec2 uv; uniform sampler2D s; out vec4 o; void main() { o = texture(s, uv * 4.0 - 1.5); }");
 }
 
+/* Found by review: each was wrong once. */
+#define HASH "float h(int n) { uint x = uint(n) * 0x9E3779B9u; x ^= x >> 15; x *= 0x85EBCA6Bu; x ^= x >> 13; x *= 0xC2B2AE35u; x ^= x >> 16; return float(x & 0xffffu) / 65536.0; }\n"
+static void reset(void) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fb); glViewport(0, 0, W, H);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE); glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+    glDisable(GL_SAMPLE_MASK); glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE); glDisable(GL_RASTERIZER_DISCARD);
+    glBlendEquation(GL_FUNC_ADD); glBlendFunc(GL_ONE, GL_ZERO); glBlendColor(0,0,0,0); glDepthFunc(GL_LESS); glDepthMask(1); glStencilMask(255); glStencilFunc(GL_ALWAYS, 0, 255); glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glColorMask(1,1,1,1); glFrontFace(GL_CCW); glCullFace(GL_BACK); glDepthRangef(0,1); glLineWidth(1); glClearDepthf(1); glClearStencil(0);
+    for (int k = 0; k < 8; k++) { glDisableVertexAttribArray(k); glVertexAttribDivisor(k, 0); }
+    glActiveTexture(GL_TEXTURE0); glBindBuffer(GL_ARRAY_BUFFER, 0); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glFrontFace(GL_CCW);
+    while (glGetError()) ;
+}
+#define VS_RECT "layout(location = 0) in vec4 unused; uniform vec4 r; uniform float z; out vec2 uv; void main() { vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)); uv = c; gl_Position = vec4(mix(r.xy, r.zw, c), z, 1.0); }\n"
+#define FS_C "uniform vec4 c; in vec2 uv; out vec4 o; void main() { o = c; }\n"
+static GLint R_, Z_, C_;
+static void pattern(void) { full("in vec2 uv; out vec4 o; void main() { ivec2 q = ivec2(gl_FragCoord.xy); o = vec4(float(q.x) / 127.0, float(q.y) / 127.0, float((q.x / 8 ^ q.y / 8) & 1), 1); }"); }
+static GLuint rectp(const char *fs) { GLuint p = prog(VS_RECT, fs); R_ = glGetUniformLocation(p, "r"); Z_ = glGetUniformLocation(p, "z"); C_ = glGetUniformLocation(p, "c"); return p; }
+static void rect(float x0, float y0, float x1, float y1, float z, float r, float g, float b, float a) { glUniform4f(R_, x0, y0, x1, y1); if (Z_ >= 0) glUniform1f(Z_, z); if (C_ >= 0) glUniform4f(C_, r, g, b, a); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); }
+static GLuint tex2d(GLenum fmt, int w, int h) { GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t); glTexStorage2D(GL_TEXTURE_2D, 1, fmt, w, h); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST); return t; }
+static void fbtex(GLuint t) { GLuint f; glGenFramebuffers(1, &f); glBindFramebuffer(GL_FRAMEBUFFER, f); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0); }
+static void show(GLuint t) { glBindFramebuffer(GL_FRAMEBUFFER, fb); glViewport(0,0,W,H); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, t); full("in vec2 uv; uniform sampler2D s; out vec4 o; void main() { o = texture(s, uv); }"); }
+static void count(const char *pre, float z) {
+    GLuint b; glGenBuffers(1, &b); glBindBuffer(GL_SHADER_STORAGE_BUFFER, b); GLuint zero[4] = {0}; glBufferData(GL_SHADER_STORAGE_BUFFER, 16, zero, GL_DYNAMIC_COPY); glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, b);
+    glEnable(GL_DEPTH_TEST);
+    rectp(FS_C); rect(-1,-1,1,1,0,0,0,1,1);
+    char fs[512]; snprintf(fs, sizeof fs, "%s layout(std430, binding=0) buffer B { uint n; }; out vec4 o; void main() { atomicAdd(n, 1u); o = vec4(1); }", pre);
+    rectp(fs); rect(-1,-1,1,0,z,0,0,0,0);
+    glMemoryBarrier(GL_ALL_BARRIER_BITS); glDisable(GL_DEPTH_TEST);
+    full("layout(std430, binding=0) buffer B { uint n; }; out vec4 o; void main() { o = vec4(float(n & 255u), float(n >> 8), 0.0, 255.0) / 255.0; }");
+}
+static void blitzs(GLbitfield m) {
+    GLuint f, r; glGenFramebuffers(1, &f); glGenRenderbuffers(1, &r); glBindRenderbuffer(GL_RENDERBUFFER, r); glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, W, H);
+    glBindFramebuffer(GL_FRAMEBUFFER, f); glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, r);
+    glClearDepthf(0.25f); glClearStencil(7); glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb); glClearDepthf(0.75f); glClearStencil(3); glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, f); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glBlitFramebuffer(0,0,64,128,0,0,64,128,m,GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    /* red where stencil 3, green where 7; blue where z 0.5 passes */
+    glEnable(GL_STENCIL_TEST); rectp(FS_C);
+    glStencilFunc(GL_EQUAL, 3, 255); rect(-1,-1,1,1,0, 1,0,0,1); glStencilFunc(GL_EQUAL, 7, 255); rect(-1,-1,1,1,0, 0,1,0,1);
+    glDisable(GL_STENCIL_TEST); glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LESS); glDepthMask(0); rect(-1,-1,1,0,0, 0,0,1,1);
+}
+static void layers(int single) {
+    GLuint t, f; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D_ARRAY, t); glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 64, 64, 4); glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, &f); glBindFramebuffer(GL_FRAMEBUFFER, f); glViewport(0,0,64,64);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, t, 0); clear(0.1f,0.2f,0.3f);
+    if (single) glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, t, 0, 1);
+    prog5(VS_FULL, NULL, NULL, "layout(triangles) in; layout(triangle_strip, max_vertices = 3) out; out vec4 v; void main() { for (int i = 0; i < 3; i++) { gl_Layer = 1; v = vec4(1,0,0,1); gl_Position = gl_in[i].gl_Position; EmitVertex(); } }", FS_V);
+    glDrawArrays(GL_TRIANGLES,0,3);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb); glViewport(0,0,W,H); glBindTexture(GL_TEXTURE_2D_ARRAY, t);
+    full("uniform sampler2DArray s; out vec4 o; void main() { ivec2 q = ivec2(gl_FragCoord.xy); o = texelFetch(s, ivec3(q % 64, (q.x >> 6) + (q.y >> 6) * 2), 0); }");
+}
+static void s_blend_clamp(void) {
+    clear(0.25f, 0.5f, 0.75f); glEnable(GL_BLEND);
+    rectp(FS_C);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); rect(-1,-1,-0.5f,1,0, 2,2,0,0.5f);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); rect(-0.5f,-1,0,1,0, 0.5f,0.5f,0.5f,2);
+    glBlendFunc(GL_ONE, GL_ONE); glBlendEquation(GL_FUNC_REVERSE_SUBTRACT); rect(0,-1,0.5f,1,0, -1,-1,-1,0);
+    glBlendEquation(GL_FUNC_ADD); glBlendColor(2,2,2,2); glBlendFunc(GL_CONSTANT_COLOR, GL_ZERO); rect(0.5f,-1,1,1,0, 0.3f,0.3f,0.3f,1);
+}
+static void s_dual_src(void) {
+    if (!strstr((const char*)glGetString(GL_EXTENSIONS), "GL_EXT_blend_func_extended")) return;
+    clear(0.3f,0.6f,0.9f); glEnable(GL_BLEND); glBlendFunc(0x88F9 /*SRC1_COLOR*/, 0x88FA /*ONE_MINUS_SRC1_COLOR*/);
+    rectp("\n#extension GL_EXT_blend_func_extended : require\nin vec2 uv; layout(location = 0, index = 0) out vec4 a; layout(location = 0, index = 1) out vec4 b; void main() { a = vec4(uv, 1, 1); b = vec4(uv.yx * 1.5, 0.3, 0.7); }"); rect(-0.9f,-0.9f,0.9f,0,0,0,0,0,0);
+    glBlendFunc(GL_ONE, 0x8589 /*SRC1_ALPHA*/); rect(-0.9f,0.1f,0.9f,0.9f,0,0,0,0,0);
+}
+static void s_blit_flip(void) {
+    GLuint t = tex2d(GL_RGBA8, W, H); fbtex(t); pattern(); GLint f; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &f);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, f); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glBlitFramebuffer(0,0,50,50, 0,50,50,0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBlitFramebuffer(0,0,50,50, 110,0,60,50, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBlitFramebuffer(3,5,53,55, 50,120,0,70, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBlitFramebuffer(53,5,3,55, 60,70,110,120, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
+static void s_blit_depth(void) { blitzs(GL_DEPTH_BUFFER_BIT); }
+static void s_blit_stencil(void) { blitzs(GL_STENCIL_BUFFER_BIT); }
+static void s_late_side(void) { count("", 0.5f); }
+static void s_early_side(void) { count("layout(early_fragment_tests) in;", 0.5f); }
+static void s_layer_single(void) { layers(1); }
+static void s_layer_vs(void) { /* out-of-range layer of a layered target */
+    GLuint t[2], f; glGenTextures(2,t); for (int k = 0; k < 2; k++) { glBindTexture(GL_TEXTURE_2D_ARRAY,t[k]); glTexStorage3D(GL_TEXTURE_2D_ARRAY,1,GL_RGBA8,64,64,2); glTexParameteri(GL_TEXTURE_2D_ARRAY,GL_TEXTURE_MIN_FILTER,GL_NEAREST); } glGenFramebuffers(1,&f); glBindFramebuffer(GL_FRAMEBUFFER,f); for (int k = 0; k < 2; k++) { glFramebufferTexture(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,t[k],0); glViewport(0,0,64,64); clear(0,0,0.4f); }
+    glFramebufferTexture(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,t[0],0); prog5(VS_FULL,NULL,NULL,"layout(triangles, invocations = 8) in; layout(triangle_strip, max_vertices = 3) out; out vec4 v; void main() { for (int i = 0; i < 3; i++) { gl_Layer = 2 + gl_InvocationID * 4; v = vec4(1,0,0,1); gl_Position = gl_in[i].gl_Position; EmitVertex(); } }",FS_V); glDrawArrays(GL_TRIANGLES,0,3); reset(); glBindTexture(GL_TEXTURE_2D_ARRAY,t[1]); full("uniform sampler2DArray s; out vec4 o; void main() { ivec2 q = ivec2(gl_FragCoord.xy); o = texelFetch(s, ivec3(q % 64, q.x / 64), 0); }"); }
+static void s_nan_lines(void) {
+    prog("layout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0, 1); }", "out vec4 o; void main() { o = vec4(1); }");
+    union { unsigned u; float f; } nan = {0x7fc00000};
+    float v[] = {-0.9f,0.1f, -0.5f,0.8f, -0.2f,nan.f, 0.1f,0.5f, 0.6f,0.9f, 0.9f,0.2f};
+    GLuint b; glGenBuffers(1,&b); glBindBuffer(GL_ARRAY_BUFFER,b); glBufferData(GL_ARRAY_BUFFER,sizeof v,v,GL_STATIC_DRAW);
+    glVertexAttribPointer(0,2,GL_FLOAT,0,0,0); glEnableVertexAttribArray(0); glDrawArrays(GL_LINE_STRIP,0,6);
+}
+static void s_restart_primid(void) {
+    prog("layout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0, 1); }", "out vec4 o; void main() { int k = gl_PrimitiveID; o = vec4(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1), 1) * 0.7 + 0.2; }");
+    float v[32]; for (int k = 0; k < 16; k++) { v[2*k] = (k & 1) * 0.4f - 0.95f + (k / 4) * 0.5f; v[2*k+1] = ((k >> 1) & 1) * 1.6f - 0.8f; }
+    GLushort e[20]; int n = 0; for (int k = 0; k < 16; k++) { e[n++] = k; if (k % 4 == 3) e[n++] = 0xffff; }
+    GLuint b[2]; glGenBuffers(2, b); glBindBuffer(GL_ARRAY_BUFFER, b[0]); glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[1]); glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof e, e, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, 0); glEnableVertexAttribArray(0); glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+    glDrawElements(GL_TRIANGLE_STRIP, n, GL_UNSIGNED_SHORT, 0);
+}
+static void s_tex3d_layers(void) {
+    GLuint t, f; glGenTextures(1,&t); glBindTexture(GL_TEXTURE_3D,t); glTexStorage3D(GL_TEXTURE_3D, 2, GL_RGBA8, 40, 40, 16); glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST); glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1,&f); glBindFramebuffer(GL_FRAMEBUFFER,f);
+    for (int l = 0; l < 2; l++) for (int z = 0; z < 16 >> l; z++) { glFramebufferTextureLayer(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,t,l,z); glViewport(0,0,40>>l,40>>l); clear(z/16.0f, l, 0.2f); rectp(FS_C); rect(-0.5f,-0.5f,0.5f,0.5f,0, 0.5f, z/16.0f, 1, 1); }
+    glFramebufferTexture(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,t,0); glViewport(0,0,40,40);
+    prog5(VS_FULL, NULL, NULL, "layout(triangles, invocations = 16) in; layout(triangle_strip, max_vertices = 3) out; out vec4 v; void main() { for (int i = 0; i < 3; i++) { gl_Layer = gl_InvocationID; v = vec4(1,float(gl_InvocationID) / 15.0,0,1); gl_Position = vec4(gl_in[i].gl_Position.xy * 0.5 - vec2(0.5) , 0, 1); EmitVertex(); } }", FS_V);
+    glEnable(GL_SCISSOR_TEST); glScissor(0,0,9,9); glDrawArrays(GL_TRIANGLES,0,3); glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb); glViewport(0,0,W,H);
+    full("uniform highp sampler3D s; out vec4 o; void main() { ivec2 q = ivec2(gl_FragCoord.xy); int z = q.x / 16 + (q.y / 32) * 8; o = textureLod(s, vec3(vec2(q % ivec2(16, 32)) / vec2(16.0, 32.0), (float(z & 15) + 0.5) / 16.0), float(z >> 4)); }");
+}
+static void s_lut3d(void) { /* a colour lookup table drawn slice by slice */ GLuint t, f; glGenTextures(1,&t); glBindTexture(GL_TEXTURE_3D,t); glTexStorage3D(GL_TEXTURE_3D,1,GL_RGBA8,16,16,16); glTexParameteri(GL_TEXTURE_3D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glGenFramebuffers(1,&f); glBindFramebuffer(GL_FRAMEBUFFER,f); glViewport(0,0,16,16); rectp("uniform vec4 c; in vec2 uv; out vec4 o; void main() { o = vec4(1.0 - uv, 1.0 - c.x, 1); }"); for (int z = 0; z < 16; z++) { glFramebufferTextureLayer(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,t,0,z); rect(-1,-1,1,1,0,z/15.0f,0,0,0); } reset(); glBindTexture(GL_TEXTURE_3D,t); full("uniform highp sampler3D s; in vec2 uv; out vec4 o; void main() { o = texture(s, vec3(uv, uv.x * uv.y)); }"); }
+static void s_points_far(void) {
+    prog(HASH "void main() { float e = h(gl_VertexID * 3) * 14.0, s = h(gl_VertexID * 3 + 1) * 14.0; float a = h(gl_VertexID * 3 + 2) * 6.28; gl_Position = vec4(cos(a) * pow(10.0, e), sin(a) * pow(10.0, e), 0, 1); gl_PointSize = pow(10.0, s); }", "out vec4 o; void main() { o = vec4(1,0,0,1); }");
+    glDrawArrays(GL_POINTS,0,20000); clear(0,1,0);
+}
+static void s_empty_indirect(void) {
+    GLuint args[10] = {0,1,0,0,0, 3,1,0,0,0}; GLuint b[2]; glGenBuffers(2,b); glBindBuffer(GL_DRAW_INDIRECT_BUFFER,b[0]); glBufferData(GL_DRAW_INDIRECT_BUFFER,sizeof args,args,GL_STATIC_DRAW); GLushort e[] = {0,1,2}; glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,b[1]); glBufferData(GL_ELEMENT_ARRAY_BUFFER,6,e,GL_STATIC_DRAW);
+    prog(VS_FULL, "out vec4 o; void main() { o = vec4(0,1,0,1); }"); glDrawElementsIndirect(GL_TRIANGLES,GL_UNSIGNED_SHORT,0); glDrawElementsIndirect(GL_TRIANGLES,GL_UNSIGNED_SHORT,(void*)20);
+}
+
 struct scene { const char *name; void (*fn)(void); };
 static const struct scene scenes[] = {
     {"compute_ssbo", s_compute_ssbo}, {"compute_shared", s_compute_shared}, {"compute_image", s_compute_image}, {"compute_indirect", s_compute_indirect},
@@ -364,6 +486,7 @@ static const struct scene scenes[] = {
     {"feedback", s_feedback}, {"occlusion", s_occlusion}, {"msaa", s_msaa}, {"msaa_texture", s_msaa_texture}, {"mrt", s_mrt}, {"buffer_texture", s_buffer_texture},
     {"indirect_draw", s_indirect_draw}, {"restart", s_restart}, {"srgb", s_srgb}, {"gather", s_gather}, {"grad_lod", s_grad_lod}, {"ubo_bits", s_ubo_bits},
     {"advanced_interp", s_advanced_interp}, {"atomic_fs", s_atomic_fs}, {"cube_array", s_cube_array}, {"shadow", s_shadow}, {"clip_border", s_clip_border},
+    {"blend_clamp", s_blend_clamp}, {"dual_src", s_dual_src}, {"blit_flip", s_blit_flip}, {"blit_depth", s_blit_depth}, {"blit_stencil", s_blit_stencil}, {"late_side", s_late_side}, {"early_side", s_early_side}, {"layer_single", s_layer_single}, {"layer_vs", s_layer_vs}, {"nan_lines", s_nan_lines}, {"restart_primid", s_restart_primid}, {"tex3d_layers", s_tex3d_layers}, {"lut3d", s_lut3d}, {"points_far", s_points_far}, {"empty_indirect", s_empty_indirect},
 };
 #define NSCENES (sizeof scenes / sizeof scenes[0])
 
@@ -388,6 +511,7 @@ static int run(const char *dir, const char *only) {
     static unsigned char px[W * H * 4];
     for (unsigned i = 0; i < NSCENES; i++) {
         if (only && strcmp(only, scenes[i].name)) continue;
+        reset();
         clear(0, 0, 0);
         scenes[i].fn();
         glBindFramebuffer(GL_FRAMEBUFFER, fb);

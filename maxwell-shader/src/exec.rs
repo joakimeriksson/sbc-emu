@@ -1213,8 +1213,9 @@ pub fn run<const N: usize, H: Host<N>>(
                 let off = if loc == IpaLoc::Offset {
                     let o = l.gpr[offset as usize];
                     [
-                        o.map(|x| x as i16 as f32 / 4096.0),
-                        o.map(|x| (x >> 16) as i16 as f32 / 4096.0),
+                        // 12 bits each; the bits above may hold something else
+                        o.map(|x| ((x << 20) as i32 >> 20) as f32 / 4096.0),
+                        o.map(|x| ((x << 4) as i32 >> 20) as f32 / 4096.0),
                     ]
                 } else {
                     [[0.0; N]; 2]

@@ -239,6 +239,11 @@ impl RtFormat {
         self.packed.ch.iter().any(|c| c.bits != 0 && matches!(c.num, Num::Unorm | Num::Snorm))
     }
 
+    /// Signed normalised values.
+    pub fn is_signed(&self) -> bool {
+        self.packed.ch.iter().any(|c| c.bits != 0 && matches!(c.num, Num::Snorm))
+    }
+
     /// 8-bit sRGB code of a linear value, as stored in sRGB formats.
     pub fn to_srgb8(v: f32) -> u8 {
         linear_to_srgb8(v)

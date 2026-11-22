@@ -38,6 +38,16 @@ impl Verts {
         self.data[at..].chunks_exact_mut(self.stride).for_each(|v| v[w] = 1f32.to_bits());
     }
 
+    /// Clamp the front and back colours to 0 to 1.
+    pub fn clamp_colors(&mut self) {
+        let slots: Vec<usize> = ((0x280 - 0x40) / 4..(0x2c0 - 0x40) / 4).filter_map(|w| self.slot(w)).collect();
+        for v in self.data.chunks_exact_mut(self.stride) {
+            for &s in &slots {
+                v[s] = f32::from_bits(v[s]).max(0.0).min(1.0).to_bits();
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.data.len() / self.stride
     }
@@ -65,11 +75,17 @@ pub struct Geometry {
     pub vertices: Verts,
     pub primitives: Vec<u32>,
     pub size: usize,
-    /// each primitive's number, if they do not count up from 0
+    /// the first primitive's number, or each one's
+    pub first_id: u32,
     pub ids: Option<Vec<u32>>,
 }
 
 impl Geometry {
+    /// Primitive `k`'s number.
+    pub fn id(&self, k: usize) -> u32 {
+        self.ids.as_ref().map_or(self.first_id.wrapping_add(k as u32), |i| i[k])
+    }
+
     /// Keep some vertices of each primitive.
     pub fn pick(self, which: &[usize]) -> Self {
         let primitives = self.primitives.chunks_exact(self.size).flat_map(|p| which.iter().map(|&k| p[k])).collect();
@@ -204,9 +220,21 @@ struct View {
     zero_to_one: bool,
     clamp_near: bool,
     clamp_far: bool,
+    /// clip distances, and cull distances
     planes: u32,
+    culls: u32,
     transform: bool,
 }
+
+/// Point sizes the hardware has.
+fn limit(size: f32) -> f32 {
+    if size >= 1.0 { size.min(MAX_POINT) } else { 1.0 }
+}
+
+const MAX_POINT: f32 = 63.0;
+
+/// Window coordinates that can be drawn: the products of their differences fit in 64 bits.
+const MAX_COORDINATE: f32 = 4_194_304.0;
 
 /// What setup needs of the registers.
 struct State {
@@ -229,8 +257,9 @@ struct State {
 /// Primitives a thread sets up at a time.
 const CHUNK: usize = 4096;
 
-/// Set up every primitive of `g`.
-pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
+/// Set up the primitives of `g` from `first` to `last`.
+pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup, first: usize, last: usize) -> Scene {
+    let culls = (0..8).fold(0, |m, k| m | (t.r(0x1940) >> (4 * k) & 1) << k);
     let state = State {
         view: View {
             scale: [t.f(0xa00), t.f(0xa04), t.f(0xa08)],
@@ -238,7 +267,8 @@ pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
             zero_to_one: t.r(0xd7c) & 1 != 0,
             clamp_near: t.r(0x193c) & 8 != 0,
             clamp_far: t.r(0x193c) & 0x10 != 0,
-            planes: t.r(0x1510) & 0xff,
+            planes: t.r(0x1510) & 0xff & !culls,
+            culls: t.r(0x1510) & culls,
             transform: t.r(0x192c) & 1 != 0,
         },
         cull: (t.r(0x1918) & 1 != 0).then(|| t.r(0x1920)),
@@ -262,7 +292,7 @@ pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
             lerp[k] = true;
         }
     }
-    let total = g.primitives.len() / g.size;
+    let total = last - first;
     let count = g.vertices.len() as u32;
     let one = |from: usize, to: usize| {
         let source = Source { verts: &g.vertices, count, extra: Vec::new(), lerp: &lerp };
@@ -272,7 +302,7 @@ pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
     if total > 2 * CHUNK && crate::pipe::threads() > 1 {
         let parts: Vec<std::sync::Mutex<Option<Scene>>> = (0..total.div_ceil(CHUNK)).map(|_| Default::default()).collect();
         crate::pool::run(parts.len(), &|k| {
-            *parts[k].lock().unwrap() = Some(one(k * CHUNK, ((k + 1) * CHUNK).min(total)));
+            *parts[k].lock().unwrap() = Some(one(first + k * CHUNK, first + ((k + 1) * CHUNK).min(total)));
         });
         let mut scene = Scene::default();
         let stride = g.vertices.stride;
@@ -299,7 +329,7 @@ pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup) -> Scene {
         }
         return scene;
     }
-    let mut scene = one(0, total);
+    let mut scene = one(first, last);
     g.vertices.data.append(&mut scene.extra);
     scene
 }
@@ -312,12 +342,30 @@ fn part(st: &State, g: &Geometry, s: &Setup, mut vs: Source, from: usize, to: us
     let mut spare: Vec<u32> = Vec::new();
     let mut wins: Vec<Win> = Vec::new();
     for (id, p) in g.primitives.chunks_exact(g.size).enumerate().take(to).skip(from) {
-        b.id = g.ids.as_ref().map_or(id as u32, |i| i[id]);
-        b.layer = vs.get(p[0], crate::pipe::LAYER);
+        b.id = g.id(id);
+        // (a layer the targets do not have is their first)
+        b.layer = s.layer.unwrap_or_else(|| vs.get(p[0], crate::pipe::LAYER));
+        if b.layer >= s.targets.layers {
+            b.layer = 0;
+        }
+        // cull distances: outside one with all its vertices
+        let mut culls = v.culls;
+        let mut culled = false;
+        while culls != 0 {
+            let k = culls.trailing_zeros() as usize;
+            culls &= culls - 1;
+            culled |= p.iter().all(|&i| {
+                let d = vs.f(i, CLIP + k);
+                d.is_nan() || d < 0.0
+            });
+        }
+        if culled {
+            continue;
+        }
         if g.size == 1 {
             let size = if st.attribute_size { vs.f(p[0], crate::pipe::POINT_SIZE) } else { st.point_size };
             if outside(v, &vs, p[0]) & !GUARDS == 0 {
-                b.point(p[0], window(v, &vs, p[0]), size.max(1.0));
+                b.point(p[0], window(v, &vs, p[0]), limit(size));
             }
             continue;
         }
@@ -338,7 +386,7 @@ fn part(st: &State, g: &Geometry, s: &Setup, mut vs: Source, from: usize, to: us
         wins.clear();
         wins.extend(poly.iter().map(|&i| window(v, &vs, i)));
         if g.size == 2 {
-            b.line([poly[0], poly[1]], [wins[0], wins[1]], provoking, st.width);
+            b.line([poly[0], poly[1]], [wins[0], wins[1]], provoking, st.width, true);
             continue;
         }
         let area = area_of(&wins);
@@ -358,10 +406,10 @@ fn part(st: &State, g: &Geometry, s: &Setup, mut vs: Source, from: usize, to: us
                 wins.iter_mut().for_each(|w| w.z += z);
                 for k in 0..poly.len() {
                     if mode == 0x1b00 {
-                        b.point(poly[k], wins[k], st.point_size.max(1.0));
+                        b.point(poly[k], wins[k], limit(st.point_size));
                     } else {
                         let n = (k + 1) % poly.len();
-                        b.line([poly[k], poly[n]], [wins[k], wins[n]], provoking, st.width);
+                        b.line([poly[k], poly[n]], [wins[k], wins[n]], provoking, st.width, front);
                     }
                 }
             }
@@ -601,7 +649,7 @@ impl Build<'_> {
     }
 
     /// A line as a parallelogram, `width` pixels wide across its minor axis.
-    fn line(&mut self, v: [u32; 2], [a, b]: [Win; 2], provoking: u32, width: f32) {
+    fn line(&mut self, v: [u32; 2], [a, b]: [Win; 2], provoking: u32, width: f32, front: bool) {
         let (dx, dy) = (b.x - a.x, b.y - a.y);
         if dx == 0.0 && dy == 0.0 {
             return;
@@ -616,7 +664,7 @@ impl Build<'_> {
         let (z, w) = (plane.through([a.z, b.z, b.z]), plane.through([a.w, b.w, b.w]));
         for t in [first, [q[0], q[2], q[3]]] {
             if let Some((edges, bounds)) = self.edges(&t) {
-                self.push(Prim { edges, bounds, z, w, v: [v[0], v[1], v[1]], provoking, at, point: None, front: true, id: self.id, layer: self.layer });
+                self.push(Prim { edges, bounds, z, w, v: [v[0], v[1], v[1]], provoking, at, point: None, front, id: self.id, layer: self.layer });
             }
         }
     }
@@ -624,6 +672,9 @@ impl Build<'_> {
     /// The edge functions and the bounds of a triangle: None if it covers nothing.
     #[allow(clippy::type_complexity)]
     fn edges(&self, w: &[Win; 3]) -> Option<([Edge; 3], (i32, i32, i32, i32))> {
+        if w.iter().any(|w| !(w.x.abs() <= MAX_COORDINATE && w.y.abs() <= MAX_COORDINATE)) {
+            return None;
+        }
         let fix = |v: f32| (v * 256.0).round() as i64;
         let mut p: [(i64, i64); 3] = std::array::from_fn(|k| (fix(w[k].x), fix(w[k].y)));
         let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[2].0 - p[0].0) * (p[1].1 - p[0].1);
@@ -647,11 +698,11 @@ impl Build<'_> {
         let max = |f: fn(&(i64, i64)) -> i64| p.iter().map(f).max().unwrap();
         // pixels whose samples may be inside: with one sample, those with their centre in the box
         let (low, high) = if self.s.samples == 1 { (127, 128) } else { (0, 255) };
-        let x0 = ((min(|p| p.0) + low) >> 8).max(r.x0 as i64) as i32;
-        let y0 = ((min(|p| p.1) + low) >> 8).max(r.y0 as i64) as i32;
-        let x1 = ((max(|p| p.0) + high) >> 8).min(r.x1 as i64) as i32;
-        let y1 = ((max(|p| p.1) + high) >> 8).min(r.y1 as i64) as i32;
-        (x0 < x1 && y0 < y1).then_some((edges, (x0, y0, x1, y1)))
+        let x0 = ((min(|p| p.0) + low) >> 8).max(r.x0 as i64);
+        let y0 = ((min(|p| p.1) + low) >> 8).max(r.y0 as i64);
+        let x1 = ((max(|p| p.0) + high) >> 8).min(r.x1 as i64);
+        let y1 = ((max(|p| p.1) + high) >> 8).min(r.y1 as i64);
+        (x0 < x1 && y0 < y1).then_some((edges, (x0 as i32, y0 as i32, x1 as i32, y1 as i32)))
     }
 
     fn push(&mut self, p: Prim) {
@@ -981,7 +1032,10 @@ impl Shade<'_, '_> {
             if !s.early {
                 let gpr: Option<[u32; L]> = out.depth.map(|r| lanes.gpr[r as usize]);
                 let z = |l: usize, k: usize| match &gpr {
-                    Some(g) => f32::from_bits(g[l]).clamp(0.0, 1.0),
+                    Some(g) => {
+                        let (low, high) = if s.clamp_z { s.zrange } else { (0.0, 1.0) };
+                        f32::from_bits(g[l]).max(low).min(high)
+                    }
                     None => z_at(l, k),
                 };
                 depth_test(s, self.set, &prims, &quads, &mut live, n, &z);
@@ -989,7 +1043,10 @@ impl Shade<'_, '_> {
             self.out.0.samples += live.iter().map(|m| m.count_ones() as u64).sum::<u64>();
             for (rt, o) in &s.outputs {
                 let regs = &out.color[if fs.sph.color0_broadcast { 0 } else { *rt }];
-                let color: [[u32; L]; 4] = std::array::from_fn(|i| regs[i].map_or([if i == 3 { 1f32.to_bits() } else { 0 }; L], |r| lanes.gpr[r as usize]));
+                let mut color: [[u32; L]; 4] = std::array::from_fn(|i| regs[i].map_or([if i == 3 { 1f32.to_bits() } else { 0 }; L], |r| lanes.gpr[r as usize]));
+                if s.alpha_to_one {
+                    color[3] = [1f32.to_bits(); L];
+                }
                 for (l, &m) in live.iter().enumerate().take(4 * n) {
                     let mut mask = m;
                     if mask == 0 {

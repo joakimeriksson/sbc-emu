@@ -115,16 +115,18 @@ impl Host<L> for Evaluation<'_, '_> {
 }
 
 /// Run the tessellation stages on patches of `size` vertices each.
-pub fn tessellate(t: &mut Threed, vertices: &Verts, list: &[u32], size: usize, control: Option<&Arc<Shader>>, eval: &Arc<Shader>, mem: &mut dyn Memory) -> Geometry {
+#[allow(clippy::too_many_arguments)]
+pub fn tessellate(t: &mut Threed, vertices: &Verts, list: &[u32], size: usize, control: Option<&Arc<Shader>>, eval: &Arc<Shader>, first_id: u32, mem: &mut dyn Memory) -> Geometry {
     let mode = t.r(0x320);
-    let mut out = Geometry { vertices: Verts::new(eval.sph.outputs().filter_map(pipe::word)), primitives: Vec::new(), size: 0, ids: Some(Vec::new()) };
+    let mut out = Geometry { vertices: Verts::new(eval.sph.outputs().filter_map(pipe::word)), primitives: Vec::new(), size: 0, first_id, ids: Some(Vec::new()) };
     let (control_work, eval_work) = (pipe::work(t, 1), pipe::work(t, 2));
     t.pipe.need_workers(1);
     let mut wide: Option<Box<Lanes<32>>> = None;
     let mut failed = None;
     let levels: [u32; 6] = std::array::from_fn(|k| t.r(0x324 + 4 * k as u32));
     let (mut points, mut triangles) = (Vec::new(), Vec::new());
-    for (id, inputs) in list.chunks_exact(size.max(1)).enumerate() {
+    for (k, inputs) in list.chunks_exact(size.max(1)).enumerate() {
+        let id = first_id.wrapping_add(k as u32);
         let mut patch: Patch = [0; PATCH];
         patch[..6].copy_from_slice(&levels);
         // the control points: the shader's, or the vertices as they are
@@ -143,7 +145,7 @@ pub fn tessellate(t: &mut Threed, vertices: &Verts, list: &[u32], size: usize, c
                 let (_, mut common) = w.parts(&control_work, mem);
                 lanes.set_local_size(c.local_size());
                 lanes.start(&c.program, (1u64 << n).wrapping_sub(1) as u32, 0);
-                let mut host = Control { common: &mut common, vertices, inputs, id: id as u32, layout: &v, out: &mut data, patch: &mut patch };
+                let mut host = Control { common: &mut common, vertices, inputs, id, layout: &v, out: &mut data, patch: &mut patch };
                 let mut fuel = FUEL;
                 let e = maxwell_shader::run(&c.program, lanes, &mut host, &mut fuel);
                 let stored = common.stored;
@@ -173,7 +175,7 @@ pub fn tessellate(t: &mut Threed, vertices: &Verts, list: &[u32], size: usize, c
         lanes.set_local_size(eval.local_size());
         for (chunk, outs) in points.chunks(L).zip(data[first as usize * stride..].chunks_mut(L * stride)) {
             lanes.start(&eval.program, (1u32 << chunk.len()).wrapping_sub(1), 0);
-            let mut host = Evaluation { common: &mut common, vertices: points_of, inputs: indices, patch: &patch, id: id as u32, points: chunk, layout: &out.vertices, out: outs };
+            let mut host = Evaluation { common: &mut common, vertices: points_of, inputs: indices, patch: &patch, id, points: chunk, layout: &out.vertices, out: outs };
             let mut fuel = FUEL;
             let e = maxwell_shader::run(&eval.program, lanes, &mut host, &mut fuel);
             if !matches!(e, Exit::Done) {
@@ -186,7 +188,7 @@ pub fn tessellate(t: &mut Threed, vertices: &Verts, list: &[u32], size: usize, c
         out.vertices.data = data;
         out.size = corners;
         out.primitives.extend(triangles.iter().map(|&k| first + k));
-        out.ids.as_mut().unwrap().extend(std::iter::repeat_n(id as u32, triangles.len() / corners));
+        out.ids.as_mut().unwrap().extend(std::iter::repeat_n(id, triangles.len() / corners));
     }
     out.size = out.size.max(1);
     if let Some(e) = failed {
@@ -505,7 +507,7 @@ pub fn geometry(t: &mut Threed, g: &Geometry, shader: &Arc<Shader>, mem: &mut dy
     let work: Work = pipe::work(t, 3);
     let words: Vec<usize> = shader.sph.outputs().filter_map(pipe::word).collect();
     let writes_id = shader.sph.writes(PRIMITIVE_ID);
-    let mut out = Geometry { vertices: Verts::new(words.into_iter()), primitives: Vec::new(), size: 1, ids: Some(Vec::new()) };
+    let mut out = Geometry { vertices: Verts::new(words.into_iter()), primitives: Vec::new(), size: 1, first_id: 0, ids: Some(Vec::new()) };
     let stride = out.vertices.stride;
     let topology = shader.sph.topology.unwrap_or(Topology::TriangleStrip);
     out.size = match topology {
@@ -532,7 +534,7 @@ pub fn geometry(t: &mut Threed, g: &Geometry, shader: &Arc<Shader>, mem: &mut dy
             common: &mut common,
             vertices: &g.vertices,
             inputs: std::array::from_fn(of),
-            ids: std::array::from_fn(|l| chunk.get(l).map_or(0, |j| g.ids.as_ref().map_or(j.0 as u32, |i| i[j.0]))),
+            ids: std::array::from_fn(|l| chunk.get(l).map_or(0, |j| g.id(j.0))),
             invocations: std::array::from_fn(|l| chunk.get(l).map_or(0, |j| j.1)),
             per: g.size as u32,
             layout: &out.vertices,
@@ -564,7 +566,7 @@ pub fn geometry(t: &mut Threed, g: &Geometry, shader: &Arc<Shader>, mem: &mut dy
                 let made = (out.primitives.len() - before) / out.size;
                 for k in 0..made {
                     let v = out.primitives[before + k * out.size];
-                    let id = if writes_id { out.vertices.get(v, pipe::word(PRIMITIVE_ID).unwrap()) } else { g.ids.as_ref().map_or(job.0 as u32, |i| i[job.0]) };
+                    let id = if writes_id { out.vertices.get(v, pipe::word(PRIMITIVE_ID).unwrap()) } else { g.id(job.0) };
                     out.ids.as_mut().unwrap().push(id);
                 }
                 start = start.max(end);

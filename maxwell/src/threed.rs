@@ -207,6 +207,11 @@ impl Threed {
                 self.draw(crate::pipe::Indices::Range(first, v), mem);
             }
             0x17e0 => self.draw_indexed(self.r(0x17dc), v, mem),
+            // as many vertices as transform feedback wrote bytes for
+            0x123c => {
+                let stride = self.r(0x1318).max(1);
+                self.draw(crate::pipe::Indices::Range(self.r(0x13a4) / stride, v / stride), mem);
+            }
             // (first, count, op) in one word: 8, 16 and 32-bit indices, and vertex arrays
             0x17e4 | 0x17e8 | 0x17ec | 0x17f0 | 0x17f4 | 0x17f8 | 0x1214 | 0x1218 => {
                 self.batch.op = v >> 28;
@@ -264,16 +269,7 @@ impl Threed {
 
     /// Conditional rendering.
     pub fn rendering(&self, mem: &dyn Memory) -> bool {
-        let at = self.address(0x1550);
-        match self.r(0x1558) & 7 {
-            0 => false,
-            1 => true,
-            2 => mem.read32(at + 4) != 0,
-            mode => {
-                let same = mem.read32(at) == mem.read32(at + 16) && mem.read32(at + 4) == mem.read32(at + 20);
-                same == (mode == 3)
-            }
-        }
+        condition(self.r(0x1558), self.address(0x1550), mem)
     }
 
     /// A semaphore release or a query's report.
@@ -378,6 +374,19 @@ impl Threed {
         self.counters.draws += 1;
         if self.rendering(mem) {
             crate::pipe::draw(self, indices, mem);
+        }
+    }
+}
+
+/// Whether a condition holds: of a query's report at `at`, or of two.
+pub fn condition(mode: u32, at: u64, mem: &dyn Memory) -> bool {
+    match mode & 7 {
+        0 => false,
+        1 => true,
+        2 => mem.read32(at + 4) != 0,
+        mode => {
+            let same = mem.read32(at) == mem.read32(at + 16) && mem.read32(at + 4) == mem.read32(at + 20);
+            same == (mode == 3)
         }
     }
 }

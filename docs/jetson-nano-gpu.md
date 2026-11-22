@@ -40,7 +40,7 @@ programs' `cmp`), results on Debian 13:
 |---|---|
 | `tests/gpu/gles2test.c` (GLES 2) | 24 of 25 against softpipe; `tex_etc1` has random blocks that are not valid ETC1, which ETC2 hardware decodes in ETC2's way |
 | `tests/gpu/gltest.c` (GLES 3) | 48 of 49 against llvmpipe; in `atlas_pbo` llvmpipe filters at texel centres and is off itself |
-| `tests/gpu/gles32test.c` (GLES 3.2) | 33 of 33 against llvmpipe |
+| `tests/gpu/gles32test.c` (GLES 3.2) | 48 of 48 against llvmpipe |
 
 `tests/gpu/run-nano.sh` is the guest's side (`scripts/jetson-nano-gl.txt`; start `tools/gpu_server.py`
 first). `cargo test -p maxwell -p maxwell-shader -p maxwell-tex` has the unit tests: shaders compiled by
@@ -56,6 +56,8 @@ frame rates mean little.
 - ASTC textures, colour keys, compression and ZCULL (both only speed), several viewports, conservative
   rasterization, sample shading's custom positions (the standard pattern is always used).
 - Page faults are not reported to the driver: unmapped memory reads as zero.
+- Window rectangles, line and polygon stipple, line smoothing, disabling multisampling on a multisampled
+  target.
 - Multiple vertex streams in transform feedback; subgroups wider than 16 lanes in compute.
 - Vulkan (NVK) and NVIDIA's own driver have not been tried.
 - The GPU runs on the CPU's thread (a core waits while it draws) and is not in the browser build's pages.
