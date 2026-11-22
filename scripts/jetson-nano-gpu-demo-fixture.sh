@@ -13,17 +13,17 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 DL=${DOWNLOADS:-$OUT/downloads}
 mkdir -p "$DL"
+DL=$(cd "$DL" && pwd)
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 while read -r want path; do
     f=$(basename "$path")
     [ -f "$DL/$f" ] && [ "$(sha "$DL/$f")" = "$want" ] && continue
-    for url in https://deb.debian.org/debian https://deb.debian.org/debian-security \
-        https://snapshot.debian.org/archive/debian/20261121T000000Z https://snapshot.debian.org/archive/debian-security/20261121T000000Z; do
+    for url in https://deb.debian.org/debian https://snapshot.debian.org/archive/debian/20261121T000000Z; do
         curl -fsSL --retry 3 -o "$DL/$f.part" "$url/$path" || continue
         [ "$(sha "$DL/$f.part")" = "$want" ] && mv "$DL/$f.part" "$DL/$f" && break
         echo "$url/$path: not the file with sha256 $want" >&2
     done
-    [ -f "$DL/$f" ] || { echo "cannot get $path" >&2; exit 1; }
+    [ -f "$DL/$f" ] && [ "$(sha "$DL/$f")" = "$want" ] || { echo "cannot get $path" >&2; exit 1; }
 done < scripts/jetson-nano-gpu-demo.packages
 work=$(mktemp -d)
 trap 'rm -rf "${work:?}"' EXIT
@@ -45,6 +45,11 @@ cp "$work/lib/libLLVM.so.19.1" "$R/lib/"
 for d in "$work"/all/usr/share/doc/*/copyright; do
     [ -f "$d" ] && cp "$d" "$R/licenses/$(basename "$(dirname "$d")")"
 done
+# (which Debian's refer to)
+for l in GPL-2 GPL-3 LGPL-2 LGPL-2.1 LGPL-3; do cp "$work/all/usr/share/common-licenses/$l" "$R/licenses/"; done
+# the demos have Rust's standard library in them
+cp "$(dirname "$(dirname "$(rustup which rustc)")")/share/doc/rust/COPYRIGHT-library.html" "$R/licenses/rust-std.html"
+cp LICENSE "$R/licenses/nano-gl"
 cp "$work/all/usr/share/glvnd/egl_vendor.d/50_mesa.json" "$R/share/glvnd/egl_vendor.d/"
 sh demos/nano-gl/build.sh "$A" "$R/nano-gl"
 cat > "$work/root/usr/bin/gpu-demo" <<'SH'

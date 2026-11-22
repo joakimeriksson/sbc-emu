@@ -27,7 +27,6 @@ e10bbb0802181992ecf091e9425171850eee16068729c109214ba4924f81fb52 pool/main/libx/
 924540bd59fdbfa77a0604360efdaca54411a43daf11c7e002a3c64791b67448 pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_arm64.deb
 a27576030704ff305adaef8bd143954b281680861d5bfe21aabd7d376a939149 pool/main/m/mesa/mesa-libgallium_25.0.7-2+deb13u1_arm64.deb
 0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_arm64.deb
-6827c1b3ad8dcbf3478803f9150359433e3376a3bde01c4503888a22eb3924e3 pool/main/libb/libbsd/libbsd0_0.12.2-2_arm64.deb
-772e86842fd3fa1816a0cfee4833a73996aaa550461491543b886b9c8f999052 pool/main/libm/libmd/libmd0_1.1.0-2+b1_arm64.deb
 d84a783b818f2386627604e64b793eb4ac5bb9ea1ba321a194a1c9c82fe09a01 pool/main/libf/libffi/libffi8_3.4.8-2_arm64.deb
 34ee90679b018c0e64234747a4c4c0ae6b7f63541115037465a8627c2dfbc594 pool/main/g/gcc-14/gcc-14-base_14.2.0-19_arm64.deb
+893616b7ce203a05a0528652f7d754cc5e3de7e8eff3b396f95383a5b8b1c668 pool/main/b/base-files/base-files_13.8+deb13u8_arm64.deb

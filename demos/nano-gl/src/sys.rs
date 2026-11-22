@@ -51,6 +51,7 @@ extern "C" {
     pub fn glGetShaderInfoLog(s: u32, n: i32, len: *mut i32, log: *mut c_char);
     pub fn glCreateProgram() -> u32;
     pub fn glAttachShader(p: u32, s: u32);
+    pub fn glDeleteShader(s: u32);
     pub fn glLinkProgram(p: u32);
     pub fn glGetProgramiv(p: u32, what: u32, v: *mut i32);
     pub fn glGetProgramInfoLog(p: u32, n: i32, len: *mut i32, log: *mut c_char);

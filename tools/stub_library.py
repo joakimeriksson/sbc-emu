@@ -91,7 +91,7 @@ def stub(symbols, soname, version):
     page = 0x10000
     n = len(symbols) + 1
     # one segment to read and run: the headers, the tables, the code
-    at = 64 + 56 * 3
+    at = 64 + 56 * 4
     dynsym = at + -at % 8
     hashes = dynsym + 24 * n
     versym = hashes + 4 * (2 + n + n)
@@ -123,8 +123,8 @@ def stub(symbols, soname, version):
     dynamic = b''.join(struct.pack('<QQ', t, v) for t, v in [
         (14, so), (4, hashes), (5, dynstr), (6, dynsym), (10, len(strings)), (11, 24),
         (0x6ffffff0, versym), (0x6ffffffc, verdef), (0x6ffffffd, 2), (0, 0)])
-    struct.pack_into('<16sHHIQQQIHHHHHH', out, 0, b'\x7fELF\x02\x01\x01' + bytes(9), 3, 183, 1, 0, 64, 0, 0, 64, 56, 3, 0, 0, 0)
-    heads = [(1, 5, 0, end, page), (1, 6, dyn, len(dynamic), page), (2, 6, dyn, len(dynamic), 8)]
+    struct.pack_into('<16sHHIQQQIHHHHHH', out, 0, b'\x7fELF\x02\x01\x01' + bytes(9), 3, 183, 1, 0, 64, 0, 0, 64, 56, 4, 0, 0, 0)
+    heads = [(1, 5, 0, end, page), (1, 6, dyn, len(dynamic), page), (2, 6, dyn, len(dynamic), 8), (0x6474e551, 6, 0, 0, 16)]  # (the last: the stack is not code)
     for k, (t, flags, at, size, align) in enumerate(heads):
         struct.pack_into('<IIQQQQQQ', out, 64 + 56 * k, t, flags, at, at, at, size, size, align)
     return bytes(out) + dynamic

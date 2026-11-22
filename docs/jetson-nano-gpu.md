@@ -67,7 +67,7 @@ so the guest's frame rates are those of the emulation.
 | `gpu-demo shadow` | a depth texture compared while sampling |
 
 `gpu-demo` runs all of them in turn, at 640 x 480 (`--mode 1280x720`); `--shot FILE --time T` writes a
-picture instead, on whatever Mesa chooses, which is how they are compared with llvmpipe (`cubes`,
+picture instead, on whatever Mesa chooses (llvmpipe needs a Mesa with its LLVM: Debian from the card), which is how they are compared with llvmpipe (`cubes`,
 `swarm`, `tunnel` and `shadow` are equal to 8 of 255; in `planet` and `fur` under 0.5 % of the pixels
 differ by more than 40). `scripts/jetson-nano-gpu-demo-fixture.sh` makes the archive from pinned Debian packages
 (13 MB) without LLVM, which Mesa's library names and nouveau does not use: a library of functions that
@@ -77,7 +77,7 @@ nouveau draws into tiled buffers that tegra-drm shows as they are (PRIME). Mesa'
 pair (opening the display's card, as kmscube does) hands on neither shader storage buffers nor the size
 of patches in 25.0: the first crashes it and the second draws nothing.
 
-In the browser the GPU has one thread, and nothing but the interpreter for shaders: expect some 5 to 30
+In the browser the GPU has one thread, and nothing but the interpreter for shaders: expect some 3 to 15
 frames per second. `SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs`
 runs them in Node.
 

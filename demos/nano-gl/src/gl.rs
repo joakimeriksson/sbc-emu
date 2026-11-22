@@ -31,6 +31,7 @@ fn link(parts: &[(u32, &str)], outputs: &[&str]) -> u32 {
                 panic!("{}\n{src}", std::ffi::CStr::from_ptr(log.as_ptr()).to_string_lossy());
             }
             glAttachShader(p, s);
+            glDeleteShader(s); // (with the program)
         }
         let names: Vec<CString> = outputs.iter().map(|o| CString::new(*o).unwrap()).collect();
         let pointers: Vec<_> = names.iter().map(|n| n.as_ptr()).collect();

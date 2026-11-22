@@ -127,10 +127,10 @@
 
   <h2>Jetson Nano: GPU demos</h2>
   <ul>
-    <li><strong>Mesa 25.0.7</strong> and the libraries it needs, unmodified, from Debian 13's arm64 packages, which <a href="https://github.com/joakimeriksson/sbc-emu/blob/main/scripts/jetson-nano-gpu-demo.packages"><code>scripts/jetson-nano-gpu-demo.packages</code></a> lists with their SHA-256: Mesa, libglvnd, libdrm, the X.Org and Wayland client libraries, libffi and Expat (MIT-style licences); glibc, libelf and libsensors (GNU LGPL); libgcc and libstdc++ (GNU GPL version 3 with the GCC runtime library exception); zstd and libbsd/libmd (BSD); zlib. Each package's copyright file is in the guest under <code>/opt/gpu/licenses</code>.</li>
+    <li><strong>Mesa 25.0.7</strong> and the libraries it needs, unmodified, from Debian 13's arm64 packages, which <a href="https://github.com/joakimeriksson/sbc-emu/blob/main/scripts/jetson-nano-gpu-demo.packages"><code>scripts/jetson-nano-gpu-demo.packages</code></a> lists with their SHA-256: Mesa, libglvnd, libdrm, the X.Org and Wayland client libraries, libffi and Expat (MIT-style licences); glibc, libelf and libsensors (GNU LGPL); libgcc and libstdc++ (GNU GPL version 3 with the GCC runtime library exception); zstd (BSD); zlib. Each package's copyright file, and the GNU licences those refer to, are in the guest under <code>/opt/gpu/licenses</code> (and the licences at <a href="https://www.gnu.org/licenses/">gnu.org</a>).</li>
     <li>Source: Debian's source packages of the same versions, from <a href="https://snapshot.debian.org/archive/debian/20261121T000000Z/">snapshot.debian.org</a>.</li>
     <li>Mesa's library also names LLVM, which the Nano's driver does not use: in its place is a library of functions that do nothing, written by <code>tools/stub_library.py</code>.</li>
-    <li><strong>The demos</strong> (<code>demos/nano-gl</code>) were written for sbc-emu, with its BSD licence. <code>scripts/jetson-nano-gpu-demo-fixture.sh</code> builds the archive.</li>
+    <li><strong>The demos</strong> (<code>demos/nano-gl</code>) were written for sbc-emu, with its BSD licence; Rust's standard library is in the program (MIT or Apache 2.0; <code>/opt/gpu/licenses/rust-std.html</code>). <code>scripts/jetson-nano-gpu-demo-fixture.sh</code> builds the archive.</li>
   </ul>
 
   <h2>ESP32-S31: mask ROM</h2>

@@ -44,7 +44,8 @@ fn options() -> Result<Options, String> {
             "--mode" => {
                 let v = value()?;
                 let (w, h) = v.split_once('x').ok_or("--mode WxH")?;
-                o.mode = Some((w.parse().map_err(|_| "--mode WxH")?, h.parse().map_err(|_| "--mode WxH")?));
+                o.mode = Some((w.parse().map_err(|_| "--mode WxH")?, h.parse().map_err(|_| "--mode WxH")?)).filter(|&(w, h)| (1..=8192).contains(&w) && (1..=8192).contains(&h));
+                o.mode.ok_or("--mode WxH, up to 8192")?;
             }
             "--seconds" => o.seconds = value()?.parse().map_err(|_| "--seconds N")?,
             "--shot" => o.shot = Some(value()?),
@@ -63,12 +64,16 @@ fn name() -> String {
 
 /// One picture of each demo, into a file.
 fn shot(o: &Options, file: &str) -> Result<(), String> {
+    if o.demos.len() > 1 && !file.contains('%') {
+        return Err("--shot FILE: with several demos, % in the name stands for theirs".into());
+    }
     let _gpu = kms::Gpu::any()?;
     let (w, h) = o.mode.unwrap_or((640, 480));
     let to = scenes::Target { fb: kms::offscreen(w, h), w: w as i32, h: h as i32, up: 1.0 };
     let (w, h) = (to.w, to.h);
     for d in &o.demos {
         let mut s = scenes::make(d).unwrap();
+        s.start();
         // (some start from where they were)
         for k in 1..=30 {
             s.draw(o.time * k as f32 / 30.0, o.time / 30.0, &to);
@@ -102,9 +107,13 @@ fn run() -> Result<(), String> {
     let gpu = kms::Gpu::open()?;
     let mut screen = kms::Screen::open(&gpu, o.mode)?;
     println!("{} on {} x {}", name(), screen.width, screen.height);
+    // each made once, when it is first its turn
+    let mut made: Vec<Option<Box<dyn scenes::Scene>>> = o.demos.iter().map(|_| None).collect();
     for k in 0.. {
-        let d = &o.demos[k % o.demos.len()];
-        let mut s = scenes::make(d).unwrap();
+        let k = k % o.demos.len();
+        let d = &o.demos[k];
+        let s = made[k].get_or_insert_with(|| scenes::make(d).unwrap());
+        s.start();
         println!("{d}");
         let start = Instant::now();
         let (mut last, mut frames) = (0.0, 0);

@@ -3,6 +3,8 @@ use crate::gl::*;
 use crate::sys::*;
 
 pub trait Scene {
+    /// Begin anew, where it depends on what was.
+    fn start(&mut self) {}
     /// Draw frame `t` (seconds), `dt` since the last.
     fn draw(&mut self, t: f32, dt: f32, to: &Target);
 }
@@ -157,7 +159,7 @@ impl Planet {
                 vec3 g = vec3(dFdx(height), dFdy(height), 0.0) * 30.0;
                 float d = max(dot(n, l) + (sea ? 0.0 : clamp(g.x + g.y, -0.15, 0.15)), 0.0);
                 float cloud = smoothstep(0.52, 0.72, noise(n * 5.0 + vec3(t * 0.1)) * 0.7 + noise(n * 12.0 - vec3(t * 0.15)) * 0.3);
-                o = vec4(mix(c, vec3(1), cloud * 0.8) * (0.06 + d) + (sea ? 0.0 : 0.0), 1);
+                o = vec4(mix(c, vec3(1), cloud * 0.8) * (0.06 + d), 1);
             }}"
         );
         Self(program(&[
@@ -264,9 +266,7 @@ impl Swarm {
                 }
             }
         }
-        let mut s = Self { step, show, buffers, arrays };
-        s.run(0.0, 0.0, true);
-        s
+        Self { step, show, buffers, arrays }
     }
 
     fn run(&mut self, t: f32, dt: f32, first: bool) {
@@ -291,6 +291,10 @@ impl Swarm {
 }
 
 impl Scene for Swarm {
+    fn start(&mut self) {
+        self.run(0.0, 0.0, true);
+    }
+
     fn draw(&mut self, t: f32, dt: f32, to: &Target) {
         // (steps small enough to be steady, however long a frame took)
         let n = (dt / 0.02).ceil().clamp(1.0, 4.0);
@@ -410,7 +414,8 @@ impl Tunnel {
                     d.xz = mat2(c, -s, s, c) * d.xz;
                     float z = 0.0, i = 0.0;
                     for (; i < 28.0; i += 1.0) { float m = map(e + d * z); if (m < 0.01 + z * 0.002 || z > 22.0) break; z += m; }
-                    vec3 p = e + d * z, n = normalize(vec3(map(p + vec3(0.02, 0, 0)), map(p + vec3(0, 0.02, 0)), map(p + vec3(0, 0, 0.02))) - map(p));
+                    vec3 p = e + d * z, n = vec3(map(p + vec3(0.02, 0, 0)), map(p + vec3(0, 0.02, 0)), map(p + vec3(0, 0, 0.02))) - map(p);
+                    n /= max(length(n), 1e-6);
                     vec3 col = 0.5 + 0.5 * cos(vec3(0, 2, 4) + p.z * 0.35 + length(p.xy));
                     col *= 0.25 + 0.75 * max(dot(n, normalize(vec3(0.3, 0.6, -0.7))), 0.0);
                     o = vec4(mix(col, vec3(0.02, 0.03, 0.08), smoothstep(6.0, 20.0, z)) + vec3(0.5, 0.35, 0.2) * i * 0.006, 1);

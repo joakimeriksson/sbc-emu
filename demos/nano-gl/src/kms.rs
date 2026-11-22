@@ -6,7 +6,7 @@ use crate::sys::*;
 use std::ffi::{c_int, CString};
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::null_mut;
 
 const XRGB8888: u32 = 0x3432_5258; // "XR24"
@@ -128,6 +128,9 @@ impl Screen {
                     let modes = std::slice::from_raw_parts(c.modes, c.count_modes as usize);
                     let fits = |m: &&Mode| want.is_none_or(|w| w == (m.hdisplay as u32, m.vdisplay as u32));
                     let mode = *modes.iter().find(fits).unwrap_or(&modes[0]);
+                    if let Some(w) = want.filter(|_| !fits(&&mode)) {
+                        eprintln!("gpu-demo: the monitor has no mode of {} x {}", w.0, w.1);
+                    }
                     let Some(e) = drmModeGetEncoder(fd, *c.encoders).as_ref() else { continue };
                     let Some(n) = (0..res.count_crtcs as usize).find(|n| e.possible_crtcs >> n & 1 != 0) else { continue };
                     let (crtc, connector) = (*res.crtcs.add(n), c.id);
@@ -157,10 +160,11 @@ impl Screen {
             }
             let proc_ = |name: &str| {
                 let n = CString::new(name).unwrap();
-                eglGetProcAddress(n.as_ptr())
+                let p = eglGetProcAddress(n.as_ptr());
+                if p.is_null() { Err(format!("no {name}")) } else { Ok(p) }
             };
-            let create: unsafe extern "C" fn(P, P, u32, P, *const c_int) -> P = std::mem::transmute(proc_("eglCreateImageKHR"));
-            let bind: unsafe extern "C" fn(u32, P) = std::mem::transmute(proc_("glEGLImageTargetTexture2DOES"));
+            let create: unsafe extern "C" fn(P, P, u32, P, *const c_int) -> P = std::mem::transmute(proc_("eglCreateImageKHR")?);
+            let bind: unsafe extern "C" fn(u32, P) = std::mem::transmute(proc_("glEGLImageTargetTexture2DOES")?);
             let image = create(gpu.display, null_mut(), 0x30b0, bo, [0x3038].as_ptr()); // a native pixmap
             if image.is_null() {
                 return Err("no image of the buffer".into());
@@ -174,7 +178,12 @@ impl Screen {
                 return Err("the shared buffer cannot be drawn into".into());
             }
             let (mut handle, mut kms) = (0, 0);
-            if drmPrimeFDToHandle(fd, gbm_bo_get_fd(bo), &mut handle) != 0 {
+            let prime = gbm_bo_get_fd(bo);
+            if prime < 0 {
+                return Err("the GPU's buffer cannot be shared".into());
+            }
+            let prime = OwnedFd::from_raw_fd(prime);
+            if drmPrimeFDToHandle(fd, prime.as_raw_fd(), &mut handle) != 0 {
                 return Err("the display does not take the GPU's buffer".into());
             }
             let (handles, pitches) = ([handle, 0, 0, 0], [gbm_bo_get_stride(bo), 0, 0, 0]);
@@ -215,7 +224,7 @@ impl Screen {
                     return Err("page flip failed".into());
                 }
                 // the event that it happened
-                let _ = self.file.read(&mut [0; 256]);
+                self.file.read(&mut [0; 256]).map_err(|e| format!("page flip: {e}"))?;
             }
         }
         self.next = 1 - self.next;
