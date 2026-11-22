@@ -365,7 +365,9 @@ impl Machine {
     /// The next timer deadline of any core that is on.
     fn next_deadline(&self) -> Option<u64> {
         let dev=[self.soc.xhci.next_event(&self.soc.usb),self.soc.audio.next_event(),self.soc.vop2.next_event()];
-        self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(dev.into_iter().flatten()).min()
+        self.cpus.iter().enumerate().filter(|(k,_)|self.state[*k]!=CoreState::Off).flat_map(|(_,c)|Self::timer_deadlines(c)).chain(dev.into_iter().flatten())
+            // an expired timer whose interrupt is off wakes nobody: it must not stop time
+            .filter(|&t|t>self.now).min()
     }
     fn devices(&mut self) { self.soc.service(self.now); self.soc.device_lines(); }
     fn update(&mut self) {
@@ -430,7 +432,9 @@ impl Machine {
             }
             let round_start=self.now;
             self.round_end=if runnable==1 {u64::MAX} else {round_start+quantum()};
-            for k in 0..self.cpus.len() {
+            let (last, n) = (self.cur, self.cpus.len());
+            for i in 0..n {
+                let k = self.breakpoints.turn(i, last, n);
                 if self.state[k]!=CoreState::Run || !self.breakpoints.may_run(k) {continue;}
                 if let Some(stop)=self.slice(k,round_start,&mut total,end,&mut steps,&mut storm) {break 'run stop;}
                 if total>=end || steps==0 {break;}

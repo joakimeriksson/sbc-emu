@@ -697,7 +697,9 @@ impl Machine {
             }
             let round_start = self.now;
             self.round_end = if runnable == 1 { u64::MAX } else { round_start + quantum() };
-            for k in 0..self.cpus.len() {
+            let (last, n) = (self.cur, self.cpus.len());
+            for i in 0..n {
+                let k = self.breakpoints.turn(i, last, n);
                 if self.state[k] != CoreState::Run { continue; }
                 if let Some(stop) = self.slice(k, round_start, &mut total, end, &mut steps, &mut storm) { break 'run stop; }
                 if total >= end || steps == 0 { break; }

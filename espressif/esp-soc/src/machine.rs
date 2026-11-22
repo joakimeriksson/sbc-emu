@@ -321,6 +321,7 @@ impl<S: Soc> Machine<S> {
         let cause = self.bus.reboot(self.mac);
         for (i, c) in self.cores.iter_mut().enumerate() { S::reset_core_with_bus(c, &mut self.bus, i); if i > 0 { self.core_held[i] = true; } }
         self.reboots += 1;
+        self.bp_resume = None; // nobody stands where they were reported
         self.model_ready_at.fill(self.bus.cycles());
         if let Some(model) = &mut self.cost {
             let facts = LifecycleFacts { kind: LifecycleKind::ChipReset, chip: S::NAME, cores: S::CORES, cpu_hz: S::CPU_HZ };
