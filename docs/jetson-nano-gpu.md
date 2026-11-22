@@ -56,7 +56,7 @@ frame rates mean little.
 - ASTC textures, colour keys, compression and ZCULL (both only speed), several viewports, conservative
   rasterization, sample shading's custom positions (the standard pattern is always used).
 - Page faults are not reported to the driver: unmapped memory reads as zero.
-- Window rectangles, line and polygon stipple, line smoothing, disabling multisampling on a multisampled
+- Window rectangles, line and polygon stipple, line smoothing, quads outlined without their diagonal, disabling multisampling on a multisampled
   target.
 - Multiple vertex streams in transform feedback; subgroups wider than 16 lanes in compute.
 - Vulkan (NVK) and NVIDIA's own driver have not been tried.

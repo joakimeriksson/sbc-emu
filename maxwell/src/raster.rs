@@ -1044,7 +1044,7 @@ impl Shade<'_, '_> {
             for (rt, o) in &s.outputs {
                 let regs = &out.color[if fs.sph.color0_broadcast { 0 } else { *rt }];
                 let mut color: [[u32; L]; 4] = std::array::from_fn(|i| regs[i].map_or([if i == 3 { 1f32.to_bits() } else { 0 }; L], |r| lanes.gpr[r as usize]));
-                if s.alpha_to_one {
+                if s.alpha_to_one && o.format.class == maxwell_tex::Class::Float {
                     color[3] = [1f32.to_bits(); L];
                 }
                 for (l, &m) in live.iter().enumerate().take(4 * n) {

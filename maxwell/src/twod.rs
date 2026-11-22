@@ -84,7 +84,7 @@ impl Twod {
         let bilinear = self.r(0x88c) >> 4 & 1 != 0;
         // where the first sample is: the pixel's corner, or its centre
         let centre = self.r(0x88c) & 1 == 0;
-        let (half_u, half_v) = if centre { (du.abs() / 2, dv.abs() / 2) } else { (0, 0) };
+        let (half_u, half_v) = if centre { ((du.unsigned_abs() / 2) as i64, (dv.unsigned_abs() / 2) as i64) } else { (0, 0) };
         let (mut cx0, mut cy0, mut cx1, mut cy1) = (0, 0, dst.width as i64, dst.height as i64);
         if let Some((x0, y0, x1, y1)) = self.clip() {
             (cx0, cy0, cx1, cy1) = (cx0.max(x0), cy0.max(y0), cx1.min(x1), cy1.min(y1));
