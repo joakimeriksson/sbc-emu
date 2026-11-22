@@ -1,0 +1,11 @@
+# Jetson Nano: USB (XUSB) in the Debian-kernel guest (scripts/jetson-nano-debian-fixture.sh), with
+# --usb-drive IMAGE (an 8 MiB image of zeros for the checksum below):
+wait-serial jetson-nano#
+sleep 4
+serial grep -q 'Virtual USB Keyboard' /proc/bus/input/devices && grep -q 'Virtual USB Tablet' /proc/bus/input/devices && printf 'HID_%s' OK; echo\r
+wait-serial HID_OK
+serial md5sum /dev/sda | grep -q 96995b58d4cbf6aaa9041b4f00c7f6ae && printf 'STICK_%s' OK; echo\r
+wait-serial STICK_OK
+serial grep -q xhci-hcd /proc/interrupts && printf 'IRQ_%s' OK; echo\r
+wait-serial IRQ_OK
+quit

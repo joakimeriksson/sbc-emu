@@ -38,18 +38,7 @@ const ERR_CMD_TIMEOUT: u32 = 1 << 16;
 const ERR_DATA_TIMEOUT: u32 = 1 << 20;
 const ERR_ADMA: u32 = 1 << 25;
 
-/// The machine's memory as the controller reaches it.
-pub struct Dma<'a> {
-    pub ram: &'a mut [u8],
-    pub base: u64,
-}
-
-impl Dma<'_> {
-    pub(crate) fn slice(&mut self, pa: u64, len: usize) -> Option<&mut [u8]> {
-        let o = usize::try_from(pa.checked_sub(self.base)?).ok()?;
-        self.ram.get_mut(o..o.checked_add(len)?)
-    }
-}
+pub use peripherals::dma::Dma;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Xfer {

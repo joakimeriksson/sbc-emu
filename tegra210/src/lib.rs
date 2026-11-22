@@ -1,7 +1,7 @@
 //! NVIDIA Tegra X1 (T210) and the Jetson Nano: four Cortex-A57 cores, a GIC-400, the
 //! Tegra timers, clock/reset controller and PMC, UART A, the fuses and chip ID, I²C with the
-//! MAX77620 PMIC, GPIO, the SDMMC controllers, PCIe with the RTL8111H Ethernet controller, and RAM
-//! at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host (the
+//! MAX77620 PMIC, GPIO, the SDMMC controllers, PCIe with the RTL8111H Ethernet controller, USB
+//! 3.0 (XUSB), and RAM at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host (the
 //! role of the secure monitor on a real Nano). Device addresses no model claims behave
 //! as read-back registers, and their pages are logged, so drivers probe without faults.
 //! Plan: docs/jetson-nano-plan.md.
@@ -16,6 +16,7 @@ pub mod pmc;
 pub mod rtl8168;
 pub mod sdhci;
 pub mod timer;
+pub mod xusb;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
@@ -94,6 +95,9 @@ pub struct Soc {
     pub sd: [sdhci::Sdhci; 4],
     pub pcie: pcie::Pcie,
     pub padctl: padctl::PadCtl,
+    pub xusb: xusb::Xusb,
+    /// the emulated USB devices: a keyboard and a tablet, and a stick on request
+    pub usb: emu_core::usb::Devices,
     /// the network behind the Ethernet port, and when to poll it next (ns)
     pub net: Option<sbc_net::net::VirtualNet>,
     net_next: u64,
@@ -147,6 +151,8 @@ impl Soc {
             self.pmc.read(word - PMC)
         } else if at(PADCTL, padctl::SIZE) {
             self.padctl.read(word - PADCTL)
+        } else if at(xusb::BASE, xusb::SIZE) {
+            self.xusb.read(word - xusb::BASE)
         } else if at(GPIO, gpio::SIZE) {
             self.gpio.read(word - GPIO)
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
@@ -176,7 +182,11 @@ impl Soc {
         } else if at(TMR, timer::SIZE) {
             self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
+            let usb_reset = self.car.in_reset(xusb::RESET);
             self.car.write(word - CAR, value);
+            if !usb_reset && self.car.in_reset(xusb::RESET) {
+                self.xusb.reset(&mut self.usb);
+            }
             self.pcie.set_reset(self.car.in_reset(PCIE_X_RESET));
             for (c, &id) in self.i2c.iter_mut().zip(&I2C_RESETS) {
                 if self.car.in_reset(id) {
@@ -187,6 +197,9 @@ impl Soc {
             self.pmc.write(word - PMC, value);
         } else if at(PADCTL, padctl::SIZE) {
             self.padctl.write(word - PADCTL, value);
+        } else if at(xusb::BASE, xusb::SIZE) {
+            let mut dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
+            self.xusb.write(word - xusb::BASE, value, &mut dma, &mut self.usb);
         } else if at(GPIO, gpio::SIZE) {
             self.gpio.write(word - GPIO, value);
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
@@ -271,6 +284,8 @@ impl Soc {
         for (c, &irq) in self.sd.iter().zip(&SDMMC_IRQS) {
             self.gic.set_level(irq, c.irq());
         }
+        self.xusb.xhci.tick(self.now, &mut sdhci::Dma { ram: &mut self.ram, base: RAM_BASE }, &mut self.usb);
+        self.gic.set_level(xusb::IRQ, self.xusb.irq());
         self.pump_network();
         self.pcie.update();
         self.gic.set_level(pcie::IRQ, self.pcie.irq());
@@ -308,7 +323,7 @@ impl Soc {
 
     fn next_event(&self) -> Option<u64> {
         let net = (self.net.is_some() && self.pcie.nic.receiving()).then_some(self.net_next);
-        self.timers.next_event().into_iter().chain(net).min()
+        self.timers.next_event().into_iter().chain(net).chain(self.xusb.xhci.next_event(&self.usb)).min()
     }
 }
 
@@ -394,6 +409,8 @@ impl Machine {
             sd: Default::default(),
             pcie: pcie::Pcie::new(MAC),
             padctl: Default::default(),
+            xusb: Default::default(),
+            usb: Default::default(),
             net: None,
             net_next: 0,
             fuse: Default::default(),
@@ -452,6 +469,12 @@ impl Machine {
         self.soc.net = Some(net);
         self.soc.pcie.nic.set_link(true);
         self.soc.dirty = true;
+    }
+
+    /// Plug a USB stick in.
+    pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
+        self.soc.usb.storage = Some(emu_core::usb::Storage::new(disk));
+        self.soc.xusb.attach(true);
     }
 
     /// Put a card in the microSD slot.
