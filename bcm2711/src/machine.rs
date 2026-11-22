@@ -496,6 +496,8 @@ pub struct Machine {
     round_end: u64,
     /// a debugger's breakpoints (interpreter only, see `set_debugging`)
     pub breakpoints: emu_core::debug::Breakpoints,
+    /// a restore failed half way: nothing but a reset may follow
+    pub in_pieces: bool,
     /// the deadline of the last idle stop (`idle_until` wakes sleeping cores there, not before)
     idle_target: u64,
     /// run the cores on their own host threads (faster with several busy cores, not repeatable);
@@ -513,7 +515,7 @@ impl Machine {
         let ncpu = ncpu.clamp(1, 4);
         let fb_base = (ram as u64).saturating_sub(GPU_MEM); // tiny test machines have less RAM than that
         let soc = Soc { ram: vec![0; ram], cur: 0, gic: Gic::with_cpus(ncpu), uart: Pl011::new(), mbox: Mailbox::new(fb_base, GPU_MEM, 1024, 768), sd: Sdhci::new(None), wifi: { let mut h = Sdhci::new(None); h.sdio = Some(Box::new(crate::wifi::Cyw43455::new())); h }, wifi_net: None, usb: { let mut d = Dwc2::new(); d.port = None; d }, pcie: { let mut p = crate::pcie::Pcie::new(); p.xhci.attach(&[crate::usbdev::DevId::Keyboard, crate::usbdev::DevId::Tablet]); p }, devs: Default::default(), genet: Genet::new(), gpio: crate::gpio::Gpio::new(), i2c: crate::i2c::I2c::new(), spi: crate::spi::Spi::new(), rng: crate::periph::Rng200::new(), avs: crate::periph::Avs { temp_mc: 45_000 }, pm: crate::periph::Pm::new(), systimer: crate::periph::SysTimer::new(), aux: crate::periph::AuxUart::new(), asb: [0; 12], dma: crate::dma::Dma::new(), i2s: crate::i2s::I2s::new(), pace_next: None, bt: None, vc4: None, v3d: None, net: None, unknown: Vec::new(), dirty: true };
-        let mut m = Machine { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Default::default(), idle_target: 0, multi: false,
+        let mut m = Machine { in_pieces: false, cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0, round_end: u64::MAX, breakpoints: Default::default(), idle_target: 0, multi: false,
                              #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
@@ -1041,6 +1043,12 @@ impl Machine {
         if !v5 { r.p = 0; r.tag("machine-v4").map_err(e)?; }
         let ram = r.u64().map_err(e)? as usize;
         if ram != self.soc.ram.len() { return Err(format!("snapshot RAM is {} MiB, machine has {} MiB", ram >> 20, self.soc.ram.len() >> 20)); }
+        // an image written through (--sd-persist) since it was opened is not what any snapshot has seen
+        if self.soc.sd.disk.as_ref().is_some_and(|d| d.written_through()) {
+            return Err("the guest has written to the image since it was opened (--sd-persist): going back would corrupt it".into());
+        }
+        // from here on an error leaves the machine in pieces
+        self.in_pieces = true;
         self.now = r.u64().map_err(e)?; self.exceptions = r.u64().map_err(e)?; self.irqs = r.u64().map_err(e)?;
         // the JIT's code is stale after a restore; keep one (empty) cache with core 0
         let mut jit = self.cpus[self.cur].jit.take();
@@ -1113,13 +1121,14 @@ impl Machine {
         for _ in 0..r.u64().map_err(e)? {
             let p = r.u32().map_err(e)? as usize;
             let b = r.b.get(r.p..r.p + 4096).ok_or("truncated RAM page")?;
-            self.soc.ram[p * 4096..(p + 1) * 4096].copy_from_slice(b);
+            self.soc.ram.get_mut(p * 4096..(p + 1) * 4096).ok_or("a RAM page out of range")?.copy_from_slice(b);
             r.p += 4096;
         }
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }
         self.cpus[0].jit = jit;
         self.next_check = 0;
         self.soc.dirty = true;
+        self.in_pieces = false;
         Ok(())
     }
 }

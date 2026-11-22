@@ -9,21 +9,21 @@ use std::os::unix::fs::FileExt;
 
 /// `sectors` is what the guest sees; the file holds the first `stored` of them (a partial last
 /// sector counts, the rest of it zeros).
-pub struct CowFile { file: File, path: String, stored: u64, sectors: u64, overlay: Overlay, persist: bool, reported: bool }
+pub struct CowFile { file: File, path: String, stored: u64, sectors: u64, overlay: Overlay, persist: bool, reported: bool, written: bool }
 
 impl CowFile {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = File::open(path)?;
         file.try_lock_shared().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len().div_ceil(512);
-        Ok(CowFile { file, path: path.into(), stored: sectors, sectors, overlay: Overlay::default(), persist: false, reported: false })
+        Ok(CowFile { file, path: path.into(), stored: sectors, sectors, overlay: Overlay::default(), persist: false, reported: false, written: false })
     }
     /// Writes go straight to the image file (`--sd-persist`): what the guest installs survives.
     pub fn open_persistent(path: &str) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         file.try_lock().map_err(|_| in_use(path))?;
         let sectors = file.metadata()?.len().div_ceil(512);
-        Ok(CowFile { file, path: path.into(), stored: sectors, sectors, overlay: Overlay::default(), persist: true, reported: false })
+        Ok(CowFile { file, path: path.into(), stored: sectors, sectors, overlay: Overlay::default(), persist: true, reported: false, written: false })
     }
     /// The image as an SD card: as large as a card's 512 KiB units need it to be, so that a card
     /// never ends inside an image's last partition. The added sectors read as zeros until they
@@ -93,6 +93,7 @@ impl Disk for SharedDisk {
     fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.0.borrow().overlay() }
     fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { self.0.borrow_mut().restore_overlay(sectors); }
     fn snapshots_disk(&self) -> bool { self.0.borrow().snapshots_disk() }
+    fn written_through(&self) -> bool { self.0.borrow().written_through() }
 }
 
 fn in_use(_path: &str) -> std::io::Error {
@@ -135,8 +136,10 @@ impl Disk for CowFile {
         }
     }
     fn snapshots_disk(&self) -> bool { !self.persist }
+    fn written_through(&self) -> bool { self.written }
     fn write(&mut self, lba: u64, data: &[u8]) {
         if self.persist {
+            self.written = true;
             let valid = (self.sectors.saturating_sub(lba).saturating_mul(512)).min(data.len() as u64) as usize;
             if valid > 0 {
                 let past = lba * 512 + valid as u64 > self.stored * 512;

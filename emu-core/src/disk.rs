@@ -28,6 +28,11 @@ pub trait Disk {
     fn snapshots_disk(&self) -> bool {
         true
     }
+    /// Whether anything has been written through to the backing store since it was opened: an
+    /// earlier snapshot then no longer fits it.
+    fn written_through(&self) -> bool {
+        false
+    }
 }
 
 /// An in-memory disk (tests, small images).

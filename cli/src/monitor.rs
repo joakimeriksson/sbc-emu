@@ -135,9 +135,10 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
         ("loadvm", [f]) => {
             out = match std::fs::read(f).map_err(|e| e.to_string()).and_then(|b| m.restore(&b)) {
                 Ok(()) => format!("restored {f}: guest time {:.1} s\n", m.now as f64 / 1e9),
+                Err(e) if m.in_pieces => format!("{f}: {e}\nthe machine is in pieces: it is reset\n"),
                 Err(e) => format!("{f}: {e}\n"),
             };
-            Effect::None
+            if m.in_pieces { Effect::Reset } else { Effect::None }
         }
         ("screendump", [f]) => {
             let mut rgba = Vec::new();

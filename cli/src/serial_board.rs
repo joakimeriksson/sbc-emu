@@ -336,6 +336,9 @@ pub(crate) fn run<B: SerialBoard>(
                 "reset" => {
                     m = make_machine()?;
                     owed = None; // it was the old machine's
+                    if std::mem::take(&mut save_asked) {
+                        eprintln!("\r[{tag}] no snapshot: the machine was reset\r");
+                    }
                     if let Some(g) = gdb.as_ref() {
                         g.rearm(&mut m);
                     }
