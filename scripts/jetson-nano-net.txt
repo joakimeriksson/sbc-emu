@@ -1,0 +1,16 @@
+# Jetson Nano: Ethernet (PCIe, RTL8111H) in the Debian-kernel guest
+# (scripts/jetson-nano-debian-fixture.sh), on the emulator's own network:
+#   sbc-emu run --board jetson-nano --kernel .../vmlinuz --dtb .../tegra210-p3450-0000.dtb \
+#     --initrd .../initramfs.cpio.gz --append console=ttyS0,115200 --net local \
+#     --script scripts/jetson-nano-net.txt
+wait-serial jetson-nano#
+sleep 2
+serial ip link set eth0 up; sleep 3; udhcpc -i eth0 -n -q 2>&1 | grep -q 'lease of 10.0.2.15' && printf 'DHCP_%s' OK; echo\r
+wait-serial DHCP_OK
+serial ping -c 3 10.0.2.2 | grep -q ' 0% packet loss' && printf 'PING_%s' OK; echo\r
+wait-serial PING_OK
+serial dmesg | grep -q 'Link is Up - 1Gbps/Full' && printf 'LINK_%s' OK; echo\r
+wait-serial LINK_OK
+serial grep -q 'Tegra PCIe MSI.*eth0' /proc/interrupts && printf 'MSI_%s' OK; echo\r
+wait-serial MSI_OK
+quit

@@ -30,6 +30,10 @@ impl SerialBoard for Machine {
         if self.soc.sd[0].blocks_read + self.soc.sd[0].blocks_written > 0 {
             eprintln!("[{tag}] SD card: {} blocks read, {} written", self.soc.sd[0].blocks_read, self.soc.sd[0].blocks_written);
         }
+        let nic = &self.soc.pcie.nic;
+        if nic.tx_frames + nic.rx_frames > 0 {
+            eprintln!("[{tag}] Ethernet: {} frames sent, {} received", nic.tx_frames, nic.rx_frames);
+        }
         if !self.soc.stub_pages.is_empty() {
             let pages: Vec<String> = self.soc.stub_pages.iter().map(|p| format!("{p:#010x}")).collect();
             eprintln!("[{tag}] unmodelled device pages (read-back stubs): {}", pages.join(" "));
@@ -48,7 +52,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--smp"])?;
+    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net"])?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel Image|vmlinuz is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb tegra210-p3450-0000.dtb is required")?)?;
@@ -69,6 +73,10 @@ fn execute(args: &[String]) -> Result<(), String> {
     let disk = arg(args, "--sd")
         .map(|path| crate::disk::SharedDisk::open(path, persist).map_err(|e| format!("{path}: {e}")))
         .transpose()?;
+    let net = arg(args, "--net").unwrap_or("nat");
+    if !matches!(net, "nat" | "local" | "none") {
+        return Err("--net nat|local|none".into());
+    }
     let no_jit = args.iter().any(|a| a == "--no-jit") || std::env::var("SBC_JIT").is_ok_and(|v| v == "0");
     let log_stubs = std::env::var("SBC_STUB_LOG").is_ok_and(|v| v == "1");
     let make_machine = || -> Result<Machine, String> {
@@ -83,12 +91,15 @@ fn execute(args: &[String]) -> Result<(), String> {
         if let Some(d) = disk.clone() {
             m.insert_sd(Box::new(d));
         }
+        if net != "none" {
+            m.connect_network(net == "nat", std::env::var_os("SBC_NET_LOG").is_some());
+        }
         boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), &cmdline)?;
         Ok(m)
     };
     eprintln!(
         "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
-         fuses, I2C with the PMIC, GPIO, SD card; PSCI by the host; other devices are read-back stubs",
+         fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller; PSCI by the host; other devices are read-back stubs",
         if no_jit { "interpreter" } else { "JIT" }
     );
     serial_board::run(config, make_machine)

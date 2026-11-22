@@ -1,7 +1,8 @@
 //! NVIDIA Tegra X1 (T210) and the Jetson Nano: four Cortex-A57 cores, a GIC-400, the
 //! Tegra timers, clock/reset controller and PMC, UART A, the fuses and chip ID, I²C with the
-//! MAX77620 PMIC, GPIO, the SDMMC controllers, and RAM at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host
-//! (the role of the secure monitor on a real Nano). Device addresses no model claims behave
+//! MAX77620 PMIC, GPIO, the SDMMC controllers, PCIe with the RTL8111H Ethernet controller, and RAM
+//! at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host (the
+//! role of the secure monitor on a real Nano). Device addresses no model claims behave
 //! as read-back registers, and their pages are logged, so drivers probe without faults.
 //! Plan: docs/jetson-nano-plan.md.
 pub mod boot;
@@ -9,7 +10,10 @@ pub mod car;
 pub mod gpio;
 pub mod i2c;
 pub mod max77620;
+pub mod padctl;
+pub mod pcie;
 pub mod pmc;
+pub mod rtl8168;
 pub mod sdhci;
 pub mod timer;
 
@@ -41,6 +45,12 @@ pub const SDMMC: u64 = 0x700b_0000;
 pub const SDMMC_IRQS: [usize; 4] = [32 + 0x0e, 32 + 0x0f, 32 + 0x13, 32 + 0x1f];
 /// The slot's card-detect switch: low with a card in.
 pub const CARD_DETECT: usize = 0xc9;
+/// The XUSB pad controller (the PCIe and USB 3 PHYs).
+pub const PADCTL: u64 = 0x7009_f000;
+/// The "pcie_x" reset (PERST# and the controller's link side).
+const PCIE_X_RESET: usize = 74;
+/// The Ethernet controller's address: sbc-emu's locally administered one.
+const MAC: [u8; 6] = [0x02, 0x53, 0x42, 0x4e, 0x4e, 0x01];
 pub const PMC: u64 = 0x7000_e400;
 pub const FUSE: u64 = 0x7000_f800;
 /// The memory controller: its DMA-flush handshake is modelled, the rest reads back.
@@ -82,6 +92,11 @@ pub struct Soc {
     pub gpio: gpio::Gpio,
     pub i2c: [i2c::TegraI2c; 6],
     pub sd: [sdhci::Sdhci; 4],
+    pub pcie: pcie::Pcie,
+    pub padctl: padctl::PadCtl,
+    /// the network behind the Ethernet port, and when to poll it next (ns)
+    pub net: Option<sbc_net::net::VirtualNet>,
+    net_next: u64,
     fuse: std::collections::HashMap<u64, u32>,
     /// virtual time (ns) at the last device update
     pub now: u64,
@@ -130,6 +145,8 @@ impl Soc {
             self.car.read(word - CAR)
         } else if at(PMC, 0xc00) {
             self.pmc.read(word - PMC)
+        } else if at(PADCTL, padctl::SIZE) {
+            self.padctl.read(word - PADCTL)
         } else if at(GPIO, gpio::SIZE) {
             self.gpio.read(word - GPIO)
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
@@ -160,6 +177,7 @@ impl Soc {
             self.timers.write(word - TMR, value);
         } else if at(CAR, car::SIZE) {
             self.car.write(word - CAR, value);
+            self.pcie.set_reset(self.car.in_reset(PCIE_X_RESET));
             for (c, &id) in self.i2c.iter_mut().zip(&I2C_RESETS) {
                 if self.car.in_reset(id) {
                     c.reset();
@@ -167,6 +185,8 @@ impl Soc {
             }
         } else if at(PMC, 0xc00) {
             self.pmc.write(word - PMC, value);
+        } else if at(PADCTL, padctl::SIZE) {
+            self.padctl.write(word - PADCTL, value);
         } else if at(GPIO, gpio::SIZE) {
             self.gpio.write(word - GPIO, value);
         } else if let Some(k) = I2C.iter().position(|&(b, _)| at(b, i2c::SIZE)) {
@@ -195,6 +215,9 @@ impl Soc {
             let k = (addr - SDMMC) / sdhci::SIZE;
             return Ok(self.sd[k as usize].read_sized(addr - SDMMC - k * sdhci::SIZE, size) as u64);
         }
+        if pcie::Pcie::contains(addr) {
+            return Ok(self.pcie.read(addr, size) as u64);
+        }
         let word = self.reg_read(addr & !3).ok_or(Fault::Unmapped)?;
         Ok((word >> ((addr & 3) * 8)) as u64 & ((1u64 << (size * 8)) - 1))
     }
@@ -215,6 +238,11 @@ impl Soc {
             // SDHCI registers are 8, 16 and 32 bits wide, and commands start from part of a word
             let mut dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
             self.sd[k as usize].write(addr - SDMMC - k * sdhci::SIZE, value as u32, size, &mut dma);
+            return Ok(());
+        }
+        if pcie::Pcie::contains(addr) {
+            let mut dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
+            self.pcie.write(addr, value as u32, size, &mut dma);
             return Ok(());
         }
         let v = if size == 4 || (UARTA..UARTA + 0x40).contains(&word) && addr & 3 == 0 {
@@ -243,6 +271,10 @@ impl Soc {
         for (c, &irq) in self.sd.iter().zip(&SDMMC_IRQS) {
             self.gic.set_level(irq, c.irq());
         }
+        self.pump_network();
+        self.pcie.update();
+        self.gic.set_level(pcie::IRQ, self.pcie.irq());
+        self.gic.set_level(pcie::MSI_IRQ, self.pcie.msi_irq());
         for (b, &irq) in gpio::IRQS.iter().enumerate() {
             self.gic.set_level(irq, self.gpio.irq(b));
         }
@@ -253,8 +285,30 @@ impl Soc {
         }
     }
 
+    /// Exchange frames between the Ethernet controller and the network: what the guest sends goes
+    /// out at once, the network is polled every millisecond.
+    fn pump_network(&mut self) {
+        let nic = &mut self.pcie.nic;
+        if nic.tx_out.is_empty() && self.now < self.net_next {
+            return;
+        }
+        let now_us = self.now / 1000;
+        let sent = std::mem::take(&mut nic.tx_out);
+        if let Some(net) = self.net.as_mut() {
+            for frame in sent {
+                nic.deliver(net.handle(&frame, now_us));
+            }
+            if self.now >= self.net_next {
+                nic.deliver(net.poll(now_us));
+                self.net_next = self.now + 1_000_000;
+            }
+        }
+        nic.service(&mut sdhci::Dma { ram: &mut self.ram, base: RAM_BASE });
+    }
+
     fn next_event(&self) -> Option<u64> {
-        self.timers.next_event()
+        let net = (self.net.is_some() && self.pcie.nic.receiving()).then_some(self.net_next);
+        self.timers.next_event().into_iter().chain(net).min()
     }
 }
 
@@ -338,6 +392,10 @@ impl Machine {
                 buses
             },
             sd: Default::default(),
+            pcie: pcie::Pcie::new(MAC),
+            padctl: Default::default(),
+            net: None,
+            net_next: 0,
             fuse: Default::default(),
             now: 0,
             dirty: true,
@@ -380,6 +438,21 @@ impl Machine {
         }
     }
     pub fn enable_jit(&mut self) -> bool { self.cpus[self.cur].enable_jit() }
+
+    /// Plug the Ethernet port into the virtual 10.0.2.0/24 network (DHCP, DNS, ICMP); `nat` also
+    /// relays guest TCP/UDP to the host's network (native builds only).
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        #[allow(unused_mut)]
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.net = Some(net);
+        self.soc.pcie.nic.set_link(true);
+        self.soc.dirty = true;
+    }
 
     /// Put a card in the microSD slot.
     pub fn insert_sd(&mut self, disk: Box<dyn emu_core::disk::Disk>) {

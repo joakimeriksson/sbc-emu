@@ -9,4 +9,5 @@ description = "NVIDIA Tegra X1 (T210) / Jetson Nano: four Cortex-A57s, GIC-400 a
 arm-a64 = { path = "../arm-a64" }
 emu-core = { path = "../emu-core" }
 peripherals = { path = "../peripherals" }
+sbc-net = { path = "../sbc-net" }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
