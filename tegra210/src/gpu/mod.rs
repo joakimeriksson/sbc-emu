@@ -20,6 +20,7 @@ const BOOT0: u32 = 0x12b0_00a1;
 const CHANNELS: u32 = 512;
 /// How often a semaphore the CPU may write is looked at (nanoseconds).
 const RETRY_NS: u64 = 100_000;
+const MAX_RETRY_NS: u64 = 2_000_000;
 
 // PMC interrupt bits
 const INTR_FIFO: u32 = 1 << 8;
@@ -68,6 +69,7 @@ pub struct Gpu {
     /// a channel waits for a semaphore; when to look again
     waiting: bool,
     retry: u64,
+    pause: u64,
 }
 
 pub mod host;
@@ -103,6 +105,7 @@ impl Default for Gpu {
             busy: Default::default(),
             waiting: false,
             retry: 0,
+            pause: 0,
         }
     }
 }
@@ -220,6 +223,9 @@ impl Gpu {
             0x80_0000..=0x80_0fff => {
                 let c = &mut self.channels[(o as usize >> 3) & 0x1ff];
                 if o & 4 == 0 {
+                    if c.inst != v {
+                        self.host.forget((o as u32 >> 3) & 0x1ff);
+                    }
                     c.inst = v;
                 } else {
                     if v & 1 << 10 != 0 {
@@ -307,7 +313,9 @@ impl Gpu {
                 break;
             }
         }
-        self.retry = self.now + RETRY_NS;
+        // a semaphore that stays away is looked at less and less often
+        self.pause = if self.waiting { (2 * self.pause).clamp(RETRY_NS, MAX_RETRY_NS) } else { 0 };
+        self.retry = self.now + self.pause.max(RETRY_NS);
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.busy += start.elapsed();
@@ -316,6 +324,7 @@ impl Gpu {
 
     fn run_once(&mut self, smmu: &Smmu, ram: &mut [u8]) -> (bool, bool) {
         let (mut waiting, mut progress) = (false, false);
+        let now = self.time();
         for k in 0..self.runlist.len() {
             let id = self.runlist[k];
             let Some(c) = self.channels.get(id as usize).copied() else { continue };
@@ -323,7 +332,7 @@ impl Gpu {
                 let inst = ((c.inst & 0x0fff_ffff) as u64) << 12;
                 let space = mmu::space(inst, smmu, ram);
                 let mut view = mmu::View { ram, smmu, mmu: &self.mmu, space, fault: Default::default() };
-                let done = self.host.run_channel(id, inst, &mut view, self.now);
+                let done = self.host.run_channel(id, inst, &mut view, now);
                 self.submissions += done.entries;
                 waiting |= done.waiting;
                 progress |= done.resumed || done.entries != 0;
@@ -353,7 +362,14 @@ impl Gpu {
     fn alarm(&self) -> Option<u64> {
         let a = self.regs.get(&0x9420).copied()? as u64;
         let t = self.now & !0xffff_ffff | a;
-        Some(if t + (1 << 31) < self.now { t + (1 << 32) } else { t })
+        // the nearest time with that low word
+        Some(if t + (1 << 31) < self.now {
+            t + (1 << 32)
+        } else if t > self.now + (1 << 31) {
+            t.saturating_sub(1 << 32)
+        } else {
+            t
+        })
     }
 
     pub fn next_event(&self) -> Option<u64> {

@@ -146,7 +146,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     };
     eprintln!(
         "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
-         fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive), HDMI; PSCI by the host; other devices are read-back stubs",
+         fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive), HDMI, the GM20B GPU; PSCI by the host; other devices are read-back stubs",
         if no_jit { "interpreter" } else { "JIT" }
     );
     serial_board::run(config, make_machine)

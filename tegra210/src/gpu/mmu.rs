@@ -31,14 +31,15 @@ struct Entry {
     to: Page,
 }
 
+const NONE: Entry = Entry { space: u64::MAX, page: u64::MAX, to: Page { offset: 0, write: false, kind: 0 } };
+
 pub struct Mmu {
     tlb: Vec<Cell<Entry>>,
 }
 
 impl Default for Mmu {
     fn default() -> Self {
-        let none = Entry { space: u64::MAX, page: u64::MAX, to: Page { offset: 0, write: false, kind: 0 } };
-        Self { tlb: vec![Cell::new(none); TLB] }
+        Self { tlb: vec![Cell::new(NONE); TLB] }
     }
 }
 
@@ -78,7 +79,7 @@ pub fn space(inst: u64, smmu: &Smmu, ram: &[u8]) -> Space {
 
 impl Mmu {
     pub fn invalidate(&mut self) {
-        *self = Self::default();
+        self.tlb.iter().for_each(|e| e.set(NONE));
     }
 
     /// The 4 KiB page of `va`.
@@ -160,7 +161,7 @@ impl maxwell::Memory for Reader<'_> {
                 None => part.fill(0),
             }
             out = rest;
-            va += n as u64;
+            va = va.wrapping_add(n as u64);
         }
     }
     fn write(&mut self, _va: u64, _data: &[u8]) {}
@@ -182,7 +183,7 @@ impl View<'_> {
                 }
             }
             out = rest;
-            va += n as u64;
+            va = va.wrapping_add(n as u64);
         }
     }
 
@@ -197,7 +198,7 @@ impl View<'_> {
                 _ => self.note(va, true),
             }
             data = &data[n..];
-            va += n as u64;
+            va = va.wrapping_add(n as u64);
         }
     }
 

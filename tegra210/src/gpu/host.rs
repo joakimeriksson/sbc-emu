@@ -14,13 +14,31 @@ pub struct Done {
     pub resumed: bool,
 }
 
+/// How a semaphore is compared.
+#[derive(Clone, Copy, Debug)]
+enum Test {
+    Equal,
+    AtLeast,
+    And,
+}
+
+impl Test {
+    fn passes(self, v: u32, value: u32) -> bool {
+        match self {
+            Test::Equal => v == value,
+            Test::AtLeast => v.wrapping_sub(value) as i32 >= 0,
+            Test::And => v & value != 0,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// the class bound to each subchannel
     class: [u32; 8],
     semaphore: [u32; 4],
-    /// a semaphore acquire that has to be retried: (address, value, at least)
-    waiting: Option<(u64, u32, bool)>,
+    /// a semaphore acquire that has to be retried: (address, value, how they compare)
+    waiting: Option<(u64, u32, Test)>,
     /// the rest of the segment being executed: (address, words)
     rest: Option<(u64, u32)>,
     /// the method header being executed: (method, subchannel, words left, mode)
@@ -29,32 +47,42 @@ struct State {
     engine: maxwell::Engine,
 }
 
-#[derive(Default)]
 pub struct Host {
     channels: HashMap<u32, State>,
-    pub trace: bool,
+    trace: bool,
+}
+
+impl Default for Host {
+    fn default() -> Self {
+        Self { channels: HashMap::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
+    }
 }
 
 impl Host {
+    /// A channel was bound or unbound: nothing of an earlier one with its number is left.
+    pub fn forget(&mut self, id: u32) {
+        self.channels.remove(&id);
+    }
+
     pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64) -> Done {
         let mut done = Done::default();
-        let trace = std::env::var_os("SBC_TRACE_GPFIFO").is_some();
+        let trace = self.trace;
         let s = self.channels.entry(id).or_default();
         let ramfc = |o: u64, v: &View| mmu::read32(inst + o, v.smmu, v.ram).unwrap_or(0);
         let userd = (ramfc(0x08, view) & !0x1ff) as u64 | (ramfc(0x0c, view) as u64) << 32;
         let base = ramfc(0x48, view) as u64 | ((ramfc(0x4c, view) & 0xff) as u64) << 32;
         let entries = 1u32 << (ramfc(0x4c, view) >> 16 & 31);
         for _ in 0..1 << 20 {
-            if let Some((at, value, ge)) = s.waiting {
+            if let Some((at, value, test)) = s.waiting {
                 let v = view.read32(at);
-                if if ge { v.wrapping_sub(value) as i32 >= 0 } else { v == value } {
+                if test.passes(v, value) {
                     s.waiting = None;
                     done.resumed = true;
                 } else {
                     done.waiting = true;
                     s.engine.end(view);
                     if trace {
-                        eprintln!("[gpfifo] channel {id}: waits at {at:#x} for {value:#x} (is {v:#x}, at least: {ge})");
+                        eprintln!("[gpfifo] channel {id}: waits at {at:#x} for {value:#x} (is {v:#x}, {test:?})");
                     }
                     return done;
                 }
@@ -87,6 +115,9 @@ impl Host {
             s.engine.begin();
             s.rest = Some((at, words));
         }
+        // (a ring without end: the rest later)
+        s.engine.end(view);
+        done.waiting = true;
         done
     }
 }
@@ -143,7 +174,10 @@ impl State {
                     if method == 0x300 {
                         self.engine.end(view);
                     }
-                    self.copy.method(method, v, view);
+                    self.copy.method(method, v, view, now);
+                    if method == 0x300 {
+                        self.engine.written();
+                    }
                 }
                 class => self.engine.method(class, method, v, view, now),
             }
@@ -156,13 +190,16 @@ impl State {
                 let at = ((self.semaphore[0] & 0xff) as u64) << 32 | (self.semaphore[1] & !3) as u64;
                 let payload = self.semaphore[2];
                 match v & 0xf {
-                    1 => self.waiting = Some((at, payload, false)),
-                    4 => self.waiting = Some((at, payload, true)),
+                    1 => self.waiting = Some((at, payload, Test::Equal)),
+                    8 => self.waiting = Some((at, payload, Test::And)),
+                    4 => self.waiting = Some((at, payload, Test::AtLeast)),
                     2 => {
                         self.engine.end(view);
                         view.write32(at, payload);
                         if v & 1 << 24 == 0 {
-                            view.write(at + 8, &now.to_le_bytes()); // four words with a time stamp
+                            // four words with a time stamp
+                            view.write32(at + 4, 0);
+                            view.write(at + 8, &now.to_le_bytes());
                         }
                     }
                     _ => {}

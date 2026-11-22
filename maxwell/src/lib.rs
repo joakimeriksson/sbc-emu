@@ -36,14 +36,18 @@ pub struct Engine {
     inline: inline::Inline,
     twod: twod::Twod,
     compute: compute::Compute,
-    /// (class, method) pairs without an effect, for reports
-    pub unknown: std::collections::BTreeSet<(u32, u32)>,
 }
 
 impl Engine {
     /// A new submission: memory may have changed.
     pub fn begin(&mut self) {
         self.threed.pipe.invalidate();
+    }
+
+    /// Memory was written other than by drawing: what was read from it is stale.
+    pub fn written(&mut self) {
+        self.threed.pipe.invalidate_textures();
+        self.threed.pipe.cbufs_changed = true;
     }
 
     /// The end of one: what is cached goes to memory.
@@ -60,6 +64,9 @@ impl Engine {
                         self.threed.rop.flush(mem);
                     }
                     self.inline.method(m, v, mem);
+                    if m == 0x1b4 {
+                        self.written();
+                    }
                 }
             }
             0xb1c0 => {
@@ -67,19 +74,18 @@ impl Engine {
                     self.threed.rop.flush(mem);
                 }
                 if self.compute.method(m, v, &mut self.threed.pipe, mem, now) {
-                    self.threed.pipe.invalidate_textures();
-                    self.threed.pipe.cbufs_changed = true;
+                    self.written();
                 }
             }
             0x902d => {
                 if matches!(m, 0x8dc | 0x860) {
                     self.threed.rop.flush(mem);
                 }
-                self.twod.method(m, v, mem);
+                if self.twod.method(m, v, mem) {
+                    self.written();
+                }
             }
-            _ => {
-                self.unknown.insert((class, m));
-            }
+            _ => {}
         }
     }
 

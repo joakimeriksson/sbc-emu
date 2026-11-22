@@ -62,6 +62,7 @@ pub struct Threed {
     pub rop: Rop,
     pub counters: Counters,
     pub pipe: crate::pipe::Pipe,
+    in_macro: bool,
 }
 
 impl Default for Threed {
@@ -75,7 +76,7 @@ impl Default for Threed {
             regs[(0x1a00 + 4 * k) / 4] = 0x1111;
         }
         regs[0x37c / 4] = 1;
-        Self { regs, mme: Mme::default(), inline: Inline::default(), cbufs: Default::default(), batch: Batch::default(), rop: Rop::default(), counters: Counters::default(), pipe: Default::default() }
+        Self { regs, mme: Mme::default(), inline: Inline::default(), cbufs: Default::default(), batch: Batch::default(), rop: Rop::default(), counters: Counters::default(), pipe: Default::default(), in_macro: false }
     }
 }
 
@@ -121,11 +122,17 @@ impl Threed {
     fn run_macro(&mut self, (k, params): (usize, Vec<u32>), mem: &mut dyn Memory, now: u64) {
         let (code, entry) = self.mme.program(k);
         let code = code.to_vec();
+        self.in_macro = true;
         mme::run(&code, entry, &params, &mut Macro { t: self, mem, now });
+        self.in_macro = false;
     }
 
     pub fn method(&mut self, m: u32, v: u32, mem: &mut dyn Memory, now: u64) {
         if m >= 0x3800 {
+            // (macros do not call macros)
+            if self.in_macro {
+                return;
+            }
             if let Some(call) = self.mme.call(m, v) {
                 self.run_macro(call, mem, now);
             }
@@ -151,12 +158,15 @@ impl Threed {
                 self.rop.flush(mem);
                 self.pipe.invalidate_textures();
             }
-            0x21c | 0x1280 => self.pipe.invalidate_shaders(),
+            0x21c | 0x1280 => {
+                self.pipe.invalidate_shaders();
+                self.pipe.cbufs_changed = true;
+            }
             0x238c => {}
             0x2390..=0x23cc => {
                 let at = self.address(0x2384) + self.r(0x238c) as u64;
                 mem.write32(at, v);
-                self.regs[0x238c / 4] += 4;
+                self.regs[0x238c / 4] = self.regs[0x238c / 4].wrapping_add(4);
                 self.pipe.cbufs_changed = true;
             }
             0x2410 | 0x2430 | 0x2450 | 0x2470 | 0x2490 => {

@@ -22,7 +22,8 @@ kmscube -D /dev/dri/card0          # or: glmark2-es2-drm
 hardware. The model does not run it: it answers the messages nouveau exchanges with it. nouveau still
 wants files with valid headers, so the guest has placeholders (`tools/nano_gpu_firmware.py`) without
 any code. With NVIDIA's own files in their place nouveau should load those the same way; this has not
-been tried.
+been tried. The placeholders are in the initramfs only: to load nouveau again from the card, write them
+to its `/lib/firmware` (`tools/nano_gpu_firmware.py /lib/firmware`).
 
 **A draw.** Vertices are fetched and shaded once each, sixteen at a time; tessellation, geometry shaders
 and transform feedback follow. Triangles are clipped, set up and binned to 32 x 32 pixel tiles, and the
