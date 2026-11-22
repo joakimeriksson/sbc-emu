@@ -1143,7 +1143,8 @@ impl Machine {
 
     /// Continue from a snapshot made by `save`. After an error the machine is in pieces.
     pub fn restore(&mut self, file: &[u8]) -> Result<(), String> {
-        let state = snap::unpack(Self::BOARD, Self::VERSION, file).map_err(|e| e.0)?;
+        let limit = snap::limit(self.soc.ram.mem.len(), self.soc.mmc.card.disk.as_ref().map_or(0, |d| d.sectors()));
+        let state = snap::unpack(Self::BOARD, Self::VERSION, limit, file).map_err(|e| e.0)?;
         self.load_state(&state).map_err(|e| e.0)
     }
 
@@ -1179,7 +1180,9 @@ impl Machine {
         self.exceptions.load(r)?;
         self.subtick.load(r)?;
         self.last_stop_core.load(r)?;
-        if self.cur >= NCPU { return Err(snap::SnapError(format!("core {} of {NCPU}", self.cur))); }
+        for k in [self.cur, self.last_stop_core] {
+            if k >= NCPU { return Err(snap::SnapError(format!("core {k} of {NCPU}"))); }
+        }
         if r.p != state.len() { return Err(snap::SnapError(format!("{} bytes too many", state.len() - r.p))); }
         Ok(())
     }

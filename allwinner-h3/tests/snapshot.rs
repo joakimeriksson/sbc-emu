@@ -190,19 +190,53 @@ fn another_machine_is_refused() {
     for cut in [0, 8, 20, file.len() / 2, file.len() - 1] { assert!(bare(2).restore(&file[..cut]).is_err(), "cut at {cut}"); }
 }
 
-/// A disk that writes through cannot be brought back: no snapshot, rather than a wrong one.
+/// A card as the emulator's copy-on-write image: what was written is kept apart.
+struct Cow(MemDisk, emu_core::disk::Overlay);
+impl Disk for Cow {
+    fn sectors(&self) -> u64 { self.0.sectors() }
+    fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.read(lba, out); self.1.apply(lba, out); }
+    fn write(&mut self, lba: u64, data: &[u8]) { let n = self.sectors(); self.1.store(lba, data, n); }
+    fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.1.sorted() }
+    fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { let n = self.sectors(); self.1.replace(sectors, n); }
+}
+
+/// The same image opened to write through (`--sd-persist`), as `CowFile` does it.
+struct Through(MemDisk);
+impl Disk for Through {
+    fn sectors(&self) -> u64 { self.0.sectors() }
+    fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.read(lba, out) }
+    fn write(&mut self, lba: u64, data: &[u8]) { self.0.write(lba, data) }
+    fn restore_overlay(&mut self, _: Vec<(u64, Vec<u8>)>) {}
+    fn snapshots_disk(&self) -> bool { false }
+}
+
+/// A disk that writes through cannot be brought back: no snapshot, rather than a wrong one. Nor is
+/// one restored onto such a disk: the guest would go on with caches of sectors the image does not
+/// have, and write them into it.
 #[test]
 fn a_persistent_card_is_refused() {
-    struct Through(MemDisk);
-    impl Disk for Through {
-        fn sectors(&self) -> u64 { self.0.sectors() }
-        fn read(&mut self, lba: u64, out: &mut [u8]) { self.0.read(lba, out) }
-        fn write(&mut self, lba: u64, data: &[u8]) { self.0.write(lba, data) }
-        fn snapshots_disk(&self) -> bool { false }
+    let with = |card: Box<dyn Disk>| { let mut m = bare(1); m.soc.mmc.card.disk = Some(card); m };
+    assert!(with(Box::new(Through(MemDisk::new(64)))).save().unwrap_err().contains("--sd-persist"));
+    let mut m = with(Box::new(Cow(MemDisk::new(64), Default::default())));
+    for written in [false, true] {
+        if written { m.soc.mmc.card.disk.as_mut().unwrap().write(3, &[7; 512]); }
+        let file = m.save().unwrap();
+        let e = with(Box::new(Through(MemDisk::new(64)))).restore(&file).unwrap_err();
+        assert!(e.contains("--sd-persist"), "{e}");
     }
-    let mut m = bare(1);
-    m.soc.mmc.card.disk = Some(Box::new(Through(MemDisk::new(64))));
-    assert!(m.save().unwrap_err().contains("--sd-persist"));
+}
+
+/// What the guest wrote to the card comes back, and nothing else.
+#[test]
+fn written_sectors() {
+    let make = || { let mut m = bare(1); m.soc.mmc.card.disk = Some(Box::new(Cow(MemDisk::new(64), Default::default()))); m };
+    let (mut m, mut other) = (make(), make());
+    m.soc.mmc.card.disk.as_mut().unwrap().write(10, &[5; 512]);
+    other.soc.mmc.card.disk.as_mut().unwrap().write(40, &[9; 512]);
+    other.restore(&m.save().unwrap()).unwrap();
+    let mut all = vec![0; 64 * 512];
+    other.soc.mmc.card.disk.as_mut().unwrap().read(0, &mut all);
+    for (lba, s) in all.chunks(512).enumerate() { assert!(s.iter().all(|&b| b == if lba == 10 { 5 } else { 0 }), "sector {lba}"); }
 }
 
 /// Linux, saved at points all through its boot and at the shell. Needs the guest of
