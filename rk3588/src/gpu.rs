@@ -162,7 +162,7 @@ impl Gpu {
         }
     }
 }
-emu_core::snap_struct!(Gpu { raw, firmware, mask, ready, regs, spaces } skip { cost_ns });
+emu_core::snap_struct!(Gpu { raw, firmware, mask, ready, regs, spaces, cost_ns });
 
 #[cfg(test)]
 mod tests {

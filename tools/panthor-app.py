@@ -39,7 +39,9 @@ else:
     benchmarks = ' '.join(f"-b '{b}'" for b in a.benchmark)
     # glmark2-es2-drm renders full screen at the largest mode the monitor offers.
     program = f'glmark2-es2-drm {benchmarks}'
-    started = '======================================================='
+    # glmark2 prints a scene's name when it starts drawing it (and its score after).
+    first = a.benchmark[0].split(':')[0] if a.benchmark else 'build'
+    started = f'[{first}]'
 setup = ('mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs none /tmp; '
          'modprobe fixed; modprobe panthor; modprobe phy-rockchip-samsung-hdptx; modprobe rockchipdrm; '
          'sleep 2; stty -echo')
@@ -48,7 +50,7 @@ lines = ['wait-serial root@', f'serial {setup}; echo APP-READY-$((6*7))\\n', 'wa
          f'serial {a.env} {program} 2>&1; echo APP-EXIT-$((6*7))\\n',
          f'wait-serial {started}']
 for n, shot in enumerate(shots):
-    if n:
+    if n or a.app == 'glmark2':
         lines.append(f'sleep {a.interval}')
     lines.append(f'screenshot {shot.resolve()}')
 lines += ['wait-serial APP-EXIT-42', 'quit']
