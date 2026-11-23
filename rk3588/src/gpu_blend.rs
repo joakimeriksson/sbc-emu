@@ -88,9 +88,10 @@ impl Blend {
         if words[0] & 0xffff & !0x901 != 0x200
             || words[2] & !(3 | (3 << 3) | (15 << 16)) != 0
             || !matches!(words[2] & 3, 1 | 2)
-            // Conversion: memory format, no raw, any register format (F16 to U16).
+            // Conversion: memory format, no raw, a float register format (F16, F32):
+            // integer ones would need the raw path, which writeback does not take.
             || words[3] & 0xf8c0_0000 != 0
-            || (words[3] >> 24) & 7 > 5
+            || (words[3] >> 24) & 7 > 1
             || words[1] & 0x0f000000 != 0
         {
             return Err(());
@@ -168,9 +169,11 @@ mod tests {
         // glmark2's desktop scene: opaque, round to FB precision, F32 register format.
         let b = Blend::decode([0xa00, 0xf0122122, 0x19, 0x010ed000]).unwrap();
         assert_eq!(b.apply_f([0.25, 0.5, 0.75, 1.], [0.; 4], true), [0.25, 0.5, 0.75, 1.]);
-        // Raw conversions and register formats past U16 are not.
+        // Raw conversions and integer register formats (I32 to U16) are not.
         assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x004ed000]).is_err());
-        assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x060ed000]).is_err());
+        for format in 2..8u32 {
+            assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x000ed000 | format << 24]).is_err());
+        }
     }
     #[test]
     fn captured_source_over_preserves_alpha_and_draw_order() {
