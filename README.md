@@ -63,7 +63,7 @@ tools/site-build.sh && python3 -m http.server -d out/site 8792
 - **Four CPU cores, written for this project:** 64-bit Arm (`arm-a64`), 32-bit Arm with Thumb-2
   (`arm-a32`), 64-bit RISC-V (`riscv64`) and 32-bit RISC-V (`riscv-rv32`, from
   [esp32sim](https://github.com/mikroverk/esp32sim)). The Arm cores have JITs to AArch64 and to
-  WebAssembly ([jit.md](docs/jit.md)); the RV64 core has one to WebAssembly.
+  WebAssembly ([jit.md](docs/jit.md)), and so does the RV64 core.
 - **One model per SoC:** the interrupt controller, timers, storage, display, USB, network and
   GPU, down to the registers the stock Linux drivers use.
 - **One deterministic virtual clock:** by default the same run gives the same result every time.
@@ -97,6 +97,6 @@ RV32 decoder tests compare against sampled `objdump` listings of Espressif's pub
 the PowerVR "firmware" file is a stand-in the emulator generates, with no Imagination code.)
 
 Raspberry Pi is a trademark of Raspberry Pi Ltd. Orange Pi, ASUS Tinker Board, Rockchip,
-Allwinner, StarFive, Broadcom, Arm, Mali, Espressif, ESP32 and Ubuntu are trademarks of their
-respective owners. sbc-emu is an independent project, not affiliated with or endorsed by any of
-them; the names only say which hardware it emulates.
+Allwinner, StarFive, Broadcom, NVIDIA, Jetson, Tegra, Arm, Mali, PowerVR, Espressif, ESP32,
+Ubuntu and Debian are trademarks of their respective owners. sbc-emu is an independent project,
+not affiliated with or endorsed by any of them; the names only say which hardware it emulates.
