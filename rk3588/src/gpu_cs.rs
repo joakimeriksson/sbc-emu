@@ -185,6 +185,26 @@ impl Stream {
                     next = addr;
                     Ok(())
                 }
+                // JUMP: continue in another buffer (Mesa chains command-stream chunks
+                // this way); returns from enclosing CALLs are kept. Not in the kernel's
+                // ring, whose extent the queue tracks.
+                33 if !self.stack.is_empty() => {
+                    let addr = match self.pair(src) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    let len = self.regs[((insn >> 32) & 255) as usize] as u64;
+                    if addr & 7 != 0 || len & 7 != 0 {
+                        return Stop::InvalidStream;
+                    }
+                    let Some(end) = addr.checked_add(len) else {
+                        return Stop::InvalidStream;
+                    };
+                    self.start = addr;
+                    self.end = end;
+                    next = addr;
+                    Ok(())
+                }
                 23 if insn & 0x00ff_ffff_ffff_ff00 == 0 => Ok(()), // synchronous scoreboard selection
                 40 if (insn >> 32) & 255 == 3 && insn & 0x00f0_0000_0000_0000 == 0 => {
                     let addr = match self.pair(src) {
@@ -590,5 +610,30 @@ mod tests {
         assert_eq!(s.run(&mmu, &mut ram, 64), Stop::Complete);
         assert_eq!(s.regs[4], 42);
         assert_eq!(u64::from_le_bytes(ram[512..520].try_into().unwrap()), 1);
+    }
+    #[test]
+    fn jump_moves_to_another_chunk_and_the_call_still_returns() {
+        let mmu = AddressSpace {
+            transtab: 0,
+            transcfg: 2,
+        };
+        let mut ram = vec![0u8; 1024];
+        let put = |ram: &mut Vec<u8>, at: usize, code: &[u64]| {
+            for (i, v) in code.iter().enumerate() {
+                ram[at + i * 8..at + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        // Kernel ring: call the user stream at 128 (24 bytes), then set r9.
+        put(&mut ram, 0, &[ins(1, 0, 0, 128), ins(2, 2, 0, 24), ins(32, 0, 0, 2 << 32), ins(2, 9, 0, 1)]);
+        // User chunk 1: jump to chunk 2 at 256 (8 bytes).
+        put(&mut ram, 128, &[ins(1, 6, 0, 256), ins(2, 8, 0, 8), ins(33, 0, 6, 8 << 32)]);
+        put(&mut ram, 256, &[ins(2, 5, 0, 7)]);
+        let mut s = Stream::new(0, 32).unwrap();
+        assert_eq!(s.run(&mmu, &mut ram, 64), Stop::Complete);
+        assert_eq!((s.regs[5], s.regs[9]), (7, 1));
+        // A JUMP in the ring itself is not followed.
+        put(&mut ram, 512, &[ins(1, 6, 0, 256), ins(2, 8, 0, 8), ins(33, 0, 6, 8 << 32)]);
+        let mut s = Stream::new(512, 24).unwrap();
+        assert!(matches!(s.run(&mmu, &mut ram, 64), Stop::Unsupported { opcode: 33, .. }));
     }
 }
