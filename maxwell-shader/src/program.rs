@@ -12,6 +12,8 @@ pub struct Program {
     pub(crate) words: Vec<(u32, u64)>,
     pub(crate) entry: u32,
     gprs: u32,
+    /// The JIT's code, made when first wanted.
+    jit: std::sync::OnceLock<Option<std::sync::Arc<crate::jit::Code>>>,
 }
 
 /// Upper bound on the instructions of one program (a runaway decode of garbage).
@@ -72,7 +74,7 @@ impl Program {
             words.push((addr, word));
         }
         let entry = index(entry).map_err(|_| "no entry".to_string())?;
-        Ok(Program { code, words, entry, gprs })
+        Ok(Program { code, words, entry, gprs, jit: Default::default() })
     }
 
     /// Decodes a program at address 0 of `code`.
@@ -107,6 +109,15 @@ impl Program {
     /// Number of general registers the program writes (the highest, plus one).
     pub fn gprs(&self) -> u32 {
         self.gprs
+    }
+
+    /// The JIT's blocks of this program (compiled the first time), if the JIT is on.
+    #[inline]
+    pub fn jit(&self) -> Option<&crate::jit::Code> {
+        if !crate::jit::enabled() {
+            return None;
+        }
+        self.jit.get_or_init(|| crate::jit::Code::compile(self).map(std::sync::Arc::new)).as_deref()
     }
 
     /// Whether the program has an instruction that satisfies `f` (for example: one that stores,

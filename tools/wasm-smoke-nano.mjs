@@ -7,6 +7,8 @@
 // SBC_GPU=FILE loads the GPU demos (scripts/jetson-nano-gpu-demo-fixture.sh's gpu-demo.cpio.xz) behind
 // the initramfs, unpacked as the page does, and instead runs the demos, stops one with Ctrl-C, and reports their frames per second
 // (SBC_SHOTS=DIR: and writes a picture of each).
+// SBC_STEP=S runs the demos a fixed step of S seconds per picture, each once (--step S), so that
+// the pictures are the same each run; SBC_SHADER_JIT=0 turns the GPU's shader JIT off.
 // SBC_JIT=0 turns the JIT off, SBC_JIT_HOT=n sets the compile threshold, SBC_WASM picks another
 // build, SBC_RAM_MB the guest's RAM (1024, as the page), SBC_PROGRESS=1 reports every 10 s.
 import fs from 'node:fs';
@@ -63,10 +65,13 @@ ex.sbc_kms(1280, 720);
 if (ex.sbc_boot_nano(Number(process.env.SBC_RAM_MB ?? 1024), Date.now() / 1000, kp, kl, dp, dl, ip, il, cp, cmd.length) !== 0) throw new Error('boot setup failed');
 console.log('jit', process.env.SBC_JIT === '0' ? (ex.sbc_jit(0), 'off') : (ex.sbc_jit(1) ? 'on' : 'unavailable'));
 if (process.env.SBC_JIT_HOT) ex.sbc_jit_hot(Number(process.env.SBC_JIT_HOT));
+console.log('shader jit', process.env.SBC_SHADER_JIT === '0' ? (ex.sbc_shader_jit(0), 'off') : ex.sbc_shader_jit(1) ? 'on' : 'unavailable');
 
+const fixed = process.env.SBC_STEP;
 const t0 = performance.now(), wall = () => (performance.now() - t0) * 1e6;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const demos = ['cubes', 'planet', 'swarm', 'fur', 'tunnel', 'shadow'];
+// (SBC_DEMOS=a,b: only those, with SBC_STEP)
+const demos = fixed && process.env.SBC_DEMOS ? process.env.SBC_DEMOS.split(',') : ['cubes', 'planet', 'swarm', 'fur', 'tunnel', 'shadow'];
 // a picture of the screen: how many different colours it has
 function shot(name) {
   const p = ex.sbc_fb_render() >>> 0;
@@ -81,9 +86,10 @@ function shot(name) {
 }
 let dull = 0;
 const steps = process.env.SBC_GPU ? [
-  ['jetson-nano#', 'gpu-demo --seconds 6\r'],
-  ...demos.map((d) => ['frames/s', () => { const n = shot(d); console.log(`[${d}: ${n} colours]`); if (n < 100) dull++; }]),
-  ['frames/s', () => '\x03printf "STOPPED_%s\\n" OK\r'],
+  ['jetson-nano#', fixed ? `gpu-demo --step ${fixed} --seconds ${process.env.SBC_SECONDS ?? 1} ${demos.join(' ')} cubes\r` : 'gpu-demo --seconds 6\r'],
+  ...demos.map((d) => ['frames/s', () => { const n = shot(d); console.log(`[${d}: ${n} colours, ${((performance.now() - t0) / 1000).toFixed(1)} s]`); if (n < 100) dull++; }]),
+  // (with --step the demos end after one round: one more, so that the last picture stays)
+  [fixed ? 'jetson-nano#' : 'frames/s', () => '\x03printf "STOPPED_%s\\n" OK\r'],
   ['STOPPED_OK', 'gpu-demo planet\r'],
   ['on 640 x 480\r\n', null],
   ['planet\r\n', null],

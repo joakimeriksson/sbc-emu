@@ -102,7 +102,7 @@ const BOARDS = {
     note: 'Downloads 33 MB (the emulator, Debian’s kernel, Mesa and the demos), boots Linux and starts the demos, one after the other.',
     tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA, and none of its firmware or drivers are downloaded.',
     start: ['jetson-nano#', 'gpu-demo'],
-    stop: true, about: 'GPU shaders interpreted',
+    stop: true,
     try: ['gpu-demo cubes', 'gpu-demo planet', 'gpu-demo swarm', 'gpu-demo fur', 'gpu-demo tunnel', 'gpu-demo shadow', 'gpu-demo', 'dmesg | grep -i nouveau'],
   },
   'esp32s31': {
@@ -160,7 +160,7 @@ $('powerbtn').onclick = () => {
       if ($('canvas').width !== m.w || $('canvas').height !== m.h) { $('canvas').width = m.w; $('canvas').height = m.h; }
       ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
     } else if (m.type === 'stats') {
-      $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s` + (m.jit ? ` · ${m.jit} blocks compiled to WebAssembly` : '') + (board.about ? ` · ${board.about}` : '');
+      $('status').textContent = `running · ${m.mips.toFixed(0)} million instructions/s · guest time ${m.simS.toFixed(1)} s` + (m.jit ? ` · ${m.jit} blocks compiled to WebAssembly` : '') + (m.shaders ? ` · ${m.shaders} blocks of GPU shaders compiled to WebAssembly` : '') + (board.about ? ` · ${board.about}` : '');
     }
   };
   worker.postMessage({ type: 'start', os: board.os, ramMb: board.ramMb, jit: new URLSearchParams(location.search).get('jit') !== '0' });

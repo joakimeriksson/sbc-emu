@@ -18,6 +18,7 @@ allwinner-h3 = { path = "../allwinner-h3" }
 starfive-jh7110 = { path = "../starfive-jh7110" }
 rk3588 = { path = "../rk3588" }
 tegra210 = { path = "../tegra210" }
+maxwell-shader = { path = "../maxwell-shader" }
 peripherals = { path = "../peripherals" }
 esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }
