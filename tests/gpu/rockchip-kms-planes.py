@@ -98,7 +98,7 @@ rc = function('drmModeSetCrtc', I, [I, U32, U32, U32, U32, C.POINTER(U32), I, C.
 assert rc == 0, 'drmModeSetCrtc failed: %d' % rc
 
 pr = function('drmModeGetPlaneResources', C.POINTER(PlaneRes), [I])(fd).contents
-overlays = []
+overlays, primary_plane = [], None
 for i in range(pr.count_planes):
     pid = pr.planes[i]
     pl = function('drmModeGetPlane', C.POINTER(Plane), [I, U32])(fd, pid).contents
@@ -106,8 +106,10 @@ for i in range(pr.count_planes):
     kind = {0: 'overlay', 1: 'primary', 2: 'cursor'}.get(pp['type'][1], '?')
     zpos = pp.get('zpos', (0, -1, {}))[1]
     print('plane %d: %s, zpos %d, CRTCs 0x%x, blend modes %s' % (pid, kind, zpos, pl.possible_crtcs, sorted(pp.get('pixel blend mode', (0, 0, {}))[2])), flush=True)
+    # (on rk3588 only the Esmart windows take linear NV12, the Cluster windows do not)
+    esmart = 0x3231564e in [pl.formats[k] for k in range(pl.count_formats)]
     if kind == 'overlay' and pl.possible_crtcs & 1:
-        overlays.append((zpos, pid, pp))
+        overlays.append((zpos, pid, pp, esmart))
     if kind == 'primary' and pl.possible_crtcs & 1:
         primary_plane = pid
 overlays.sort()
@@ -116,7 +118,7 @@ assert len(overlays) >= 4, 'need four overlay planes, have %d' % len(overlays)
 set_plane = function('drmModeSetPlane', I, [I, U32, U32, U32, U32, I, I, U32, U32, U32, U32, U32, U32])
 set_property = function('drmModeObjectSetProperty', I, [I, U32, U32, U32, C.c_uint64])
 def show(plane, fb, x, y, w, h, blend=None):
-    zpos, pid, pp = plane
+    zpos, pid, pp, _ = plane
     if blend:
         prop, _, enums = pp['pixel blend mode']
         assert set_property(fd, pid, OBJECT_PLANE, prop, enums[blend]) == 0
@@ -137,6 +139,8 @@ if os.environ.get('KMS_SCENE') == 'bottom-alpha':
     # picture at half plane alpha; Linux sets up MIX0 as Cs + (1 - As) Cd Agd and the HDR0
     # mixer. (A's window is already on a layer: rockchipdrm 6.18 mis-selects a window that
     # its saved OVL_LAYER_SEL does not hold yet when it goes to layer 0.)
+    if primary_plane is None or not overlays[-3][3]:
+        raise SystemExit('KMS_SCENE=bottom-alpha needs a primary plane on CRTC 0 and an Esmart window for plane A')
     for plane in (primary_plane, overlays[0][1], overlays[-1][1]):
         assert set_plane(fd, plane, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == 0, 'disabling plane %d failed' % plane
     bottom = overlays[-3]

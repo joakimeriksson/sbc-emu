@@ -19,8 +19,9 @@
 //! For what Linux usually sets up that leaves the picture as it is, but with a bottom plane
 //! whose global alpha is below opaque (`Cd = Cs + (1 - As) Cd Agd`) the whole bottom plane is
 //! dimmed, not only the part under the upper window. The HDR0 mixer (0x6c0) comes last when
-//! Linux enables it (only for such a bottom plane): the mixed picture (its source) over the
-//! black background.
+//! Linux enables it (only for such a bottom plane): the mixed picture (its source, taken as
+//! pre-multiplied) over the black background. A bottom plane with global alpha and no plane
+//! above it is not dimmed: no mixer Linux sets up applies its alpha.
 //!
 //! The Cluster windows have no XRGB format: XRGB8888 and ARGB8888 are one format code, and
 //! no window register tells them apart. Whether the X byte counts as alpha is decided by the
@@ -280,16 +281,31 @@ impl Vop2 {
         out.resize(w as usize * h as usize * 4, 0);
         let layers = if self.running() && self.hdmi0() { self.layers() } else { Vec::new() };
         for (n, (layer, k, win)) in layers.into_iter().enumerate() {
-            if win.afbc {
-                continue;
-            }
-            let bpp: i64 = match win.format { 0 => 4, 1 => 3, 2 => 2, _ => continue };
-            let cluster = WINDOWS[k].1.then(|| self.mixer(CLUSTER0_MIX + 0x10 * k as u64)).filter(|m| m.enabled && !m.passes_dst());
             // the lowest layer is drawn as is, the others through their overlay mixer
             let ovl = (n > 0 && layer > 0).then(|| self.mixer(MIX0 + 0x10 * u64::from(layer - 1))).filter(|m| m.enabled);
-            // the mixer also acts where the window is not, with an empty source: usually that
-            // keeps what is below, but not for a bottom plane with global alpha (Cd x Agd)
-            if let Some(m) = ovl.filter(|m| !m.empty_keeps_dst()) {
+            // the mixer also acts where the window gives no pixel, with an empty source:
+            // usually that keeps what is below, but not for a bottom plane with global alpha
+            // (Cd x Agd)
+            let empty = ovl.filter(|m| !m.empty_keeps_dst());
+            let bpp: Option<i64> = match win.format {
+                _ if win.afbc => None,
+                0 => Some(4),
+                1 => Some(3),
+                2 => Some(2),
+                _ => None,
+            };
+            let Some(bpp) = bpp else {
+                // a window not decoded (AFBC, other formats) gives no pixels, but its mixer acts
+                if let Some(m) = empty {
+                    for d in out.chunks_exact_mut(4) {
+                        let m = m.mix_empty([d[0], d[1], d[2], d[3]]);
+                        d.copy_from_slice(&m);
+                    }
+                }
+                continue;
+            };
+            let cluster = WINDOWS[k].1.then(|| self.mixer(CLUSTER0_MIX + 0x10 * k as u64)).filter(|m| m.enabled && !m.passes_dst());
+            if let Some(m) = empty {
                 let (x0, y0) = (win.pos.0.min(w), win.pos.1.min(h));
                 let (x1, y1) = ((win.pos.0 + win.dst.0).min(w), (win.pos.1 + win.dst.1).min(h));
                 for y in 0..h {
@@ -316,9 +332,17 @@ impl Vop2 {
                         break;
                     }
                     let sx = i64::from(dx * win.src.0 / win.dst.0);
+                    let d = &mut out[((y * w + x) * 4) as usize..][..4];
                     // (a Y-mirrored window starting low in memory reaches below 0)
-                    let Ok(a) = usize::try_from(line + sx * bpp) else { continue };
-                    let Some(s) = a.checked_add(bpp as usize).and_then(|e| ram.get(a..e)) else { continue };
+                    let s = usize::try_from(line + sx * bpp).ok().and_then(|a| ram.get(a..a.checked_add(bpp as usize)?));
+                    let Some(s) = s else {
+                        // no pixel outside RAM: the mixer's empty source
+                        if let Some(m) = empty {
+                            let m = m.mix_empty([d[0], d[1], d[2], d[3]]);
+                            d.copy_from_slice(&m);
+                        }
+                        continue;
+                    };
                     // (r, g, b, pixel alpha): formats without an alpha channel have none (255)
                     let (mut r, g, mut b, al) = match win.format {
                         0 => (s[2], s[1], s[0], s[3]),
@@ -337,15 +361,21 @@ impl Vop2 {
                     if let Some(m) = &cluster {
                         p = m.mix([0; 4], p);
                     }
-                    let d = &mut out[((y * w + x) * 4) as usize..][..4];
                     let m = match &ovl { Some(m) => m.mix(p, [d[0], d[1], d[2], d[3]]), None => p };
                     d.copy_from_slice(&m);
                 }
             }
         }
-        // the HDR mixer: the mixed layers over the (black) background
-        let hdr = self.mixer(HDR0_MIX);
-        if hdr.enabled {
+        // the HDR mixer: the mixed layers over the (black) background. Its source, the overlay
+        // mixers' output, is pre-multiplied already, and is taken as such whatever the colour
+        // mode bit says: Linux copies that bit from the plane at zpos 1 ("Coverage" sets it,
+        // and with no plane there it stays 0), and honouring it would multiply the mixed
+        // colour by the mixed alpha again (the bottom plane's alpha squared, or black for an
+        // XRGB bottom plane with X = 0). Not checked on hardware.
+        let mut hdr = self.mixer(HDR0_MIX);
+        hdr.ctrl[0].mul_alpha = false;
+        // (factor one over black: the source unchanged)
+        if hdr.enabled && hdr.ctrl[0].factor != 1 {
             for px in out.chunks_exact_mut(4) {
                 let m = hdr.mix([px[0], px[1], px[2], px[3]], [0; 4]);
                 px.copy_from_slice(&m);
@@ -902,23 +932,120 @@ mod tests {
 
     /// Skipping a mixer outside its window when an empty source keeps the destination is
     /// exact; Linux's usual overlay set-up does, the one above a bottom plane with global
-    /// alpha does not.
+    /// alpha does not. Exhaustive over what an empty source depends on: the destination colour
+    /// and alpha controls (colour mode, alpha mode, blend mode, factor) and both global alphas.
     #[test]
     fn empty_source_skip_is_exact() {
         assert!(Mixer::new(parse_alpha(true, true, true, true, 0xff, 0xff)).empty_keeps_dst());
         assert!(Mixer::new(parse_alpha(false, true, false, true, 0x80, 0xff)).empty_keeps_dst());
         assert!(!Mixer::new(parse_alpha(true, false, true, true, 0xff, 0x80)).empty_keeps_dst());
-        let mut regs = 0u32;
-        for _ in 0..4096 {
-            regs = regs.wrapping_mul(1_103_515_245).wrapping_add(12345);
-            let pick = |r: u32| r & 0x00ff_01ff;
-            let m = Mixer::new([pick(regs), pick(regs.rotate_left(7)) | 0x00ff_0000 * (regs >> 31), pick(regs.rotate_left(13)), pick(regs.rotate_left(19))]);
-            if m.empty_keeps_dst() {
-                for p in [[0, 0, 0, 0], [10, 20, 30, 40], [200, 100, 50, 255], [255, 255, 255, 0], [1, 128, 254, 127]] {
-                    assert_eq!(m.mix_empty(p), p, "{regs:08x}");
+        let pixels = [[0, 0, 0, 0], [10, 20, 30, 40], [200, 100, 50, 255], [255, 255, 255, 0], [1, 128, 254, 127], [255, 0, 128, 1]];
+        // (skips seen, and the destination colour and alpha factors they used)
+        let (mut kept, mut factors) = (0, [[false; 8]; 2]);
+        for dc in 0..256u32 {
+            // (bit 4, the saturation mode, is not modelled)
+            if dc & 0x10 != 0 {
+                continue;
+            }
+            for da in (0..256u32).filter(|v| v & 0x10 == 0) {
+                for (gs, gd) in [(0xff, 0xff), (0xff, 0x80), (0x80, 0xff), (0x80, 0x80), (0, 0)] {
+                    let m = Mixer::new([1 << 8 | gs << 16, dc | gd << 16, 0, da]);
+                    if m.empty_keeps_dst() {
+                        kept += 1;
+                        factors[0][(dc >> 5) as usize] = true;
+                        factors[1][(da >> 5) as usize] = true;
+                        for p in pixels {
+                            assert_eq!(m.mix_empty(p), p, "{dc:02x} {da:02x} {gs:02x} {gd:02x}");
+                        }
+                    }
                 }
             }
         }
+        assert!(kept > 500, "{kept}");
+        // every factor that can keep the destination did: one, 1 - src alpha, dst alpha, dst
+        // global (colour); one, 1 - src alpha, src global (alpha)
+        assert_eq!(factors, [[false, true, false, true, true, true, false, false], [false, true, false, true, true, false, false, false]]);
+    }
+
+    /// "Coverage" on a plane with pixel alpha and global alpha: `vop2_parse_alpha` picks
+    /// "per-pixel times global", for which it sets the colour mode to pre-multiplied and the
+    /// factor to the global alpha whatever the blend mode, so the plane is mixed as if
+    /// pre-multiplied: `Ag Cs + (1 - Ag As) Cd` (223 here), not DRM's Coverage (207).
+    #[test]
+    fn coverage_with_pixel_and_global_alpha_mixes_as_pre_multiplied() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = two_planes(&mut ram, true, false, 0x00ff_ffff, 0x8040_4040);
+        write_mixer(&mut v, MIX0, parse_alpha(false, true, true, true, 0x80, 0xff));
+        v.render(&ram, &mut out);
+        assert_grey(pixel(&out, 120, 120), drm_blend(true, 0x40, 0x80, 0x80, 255.0));
+        assert_grey(pixel(&out, 10, 10), 255.0);
+    }
+
+    /// Esmart1 white at the bottom with plane alpha 0x80, its X byte `x`; Esmart0 above it
+    /// with `over` as Linux sets the mixers up: MIX0 `Cs + (1 - As) Cd Agd` in the plane's
+    /// blend mode, and the HDR0 mixer with that blend mode as its source's colour mode.
+    fn bottom_alpha_scene(ram: &mut [u8], premulti: bool, x: u32, over: u32) -> Vop2 {
+        let mut v = two_planes(ram, true, premulti, 0x00ff_ffff, over);
+        esmart1_bottom(&mut v, ram, x << 24 | 0x00ff_ffff);
+        v.write(0x1000, 0, 0); // Cluster0 off
+        v.write(OVL_LAYER_SEL, 0x7654_1023, 0); // layer 0 Esmart1, layer 1 Esmart0
+        write_mixer(&mut v, MIX0, parse_alpha(premulti, false, true, true, 0xff, 0x80));
+        write_mixer(&mut v, HDR0_MIX, parse_alpha(premulti, true, true, true, 0xff, 0xff));
+        v
+    }
+
+    /// A "Coverage" plane at zpos 1 above a bottom plane with plane alpha, whatever the bottom
+    /// plane's X byte: DRM's values (the HDR0 mixer takes its source as pre-multiplied).
+    #[test]
+    fn coverage_plane_above_a_bottom_plane_with_global_alpha() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let bottom = 255.0 * 128.0 / 255.0;
+        for x in [0, 0xff] {
+            let v = bottom_alpha_scene(&mut ram, false, x, 0x8040_4040);
+            v.render(&ram, &mut out);
+            assert_grey(pixel(&out, 10, 10), bottom);
+            assert_grey(pixel(&out, 120, 120), drm_blend(false, 0x40, 0x80, 0xff, bottom));
+        }
+    }
+
+    /// A bottom plane with plane alpha and nothing above it: Linux sets up no mixer that
+    /// applies the alpha (MIX0 is for the layer above, which has no window, and HDR0 passes
+    /// the picture on), so it shows at full brightness, not DRM's half.
+    #[test]
+    fn lone_bottom_plane_with_global_alpha() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        for x in [0, 0xff] {
+            let mut v = bottom_alpha_scene(&mut ram, true, x, 0);
+            v.write(0x1800 + 0x10, 0, 0); // Esmart0 off
+            write_mixer(&mut v, MIX0, [0; 4]);
+            // vop2_setup_alpha with no plane at zpos 1: gpremulti_en stays 0
+            write_mixer(&mut v, HDR0_MIX, parse_alpha(false, true, true, true, 0xff, 0xff));
+            v.render(&ram, &mut out);
+            assert_grey(pixel(&out, 10, 10), 255.0);
+            assert_grey(pixel(&out, 120, 120), 255.0);
+        }
+    }
+
+    /// A window above a bottom plane with plane alpha that gives no pixels (a format not
+    /// decoded, or a buffer outside RAM): its mixer still dims the bottom plane everywhere.
+    #[test]
+    fn mixer_of_a_window_without_pixels_still_acts() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let bottom = 255.0 * 128.0 / 255.0;
+        let mut v = bottom_alpha_scene(&mut ram, true, 0, 0x8040_4040);
+        v.write(0x1800 + 0x10, 1 | 4 << 1, 0); // Esmart0 in format 4 (YUV420SP)
+        v.render(&ram, &mut out);
+        assert_grey(pixel(&out, 10, 10), bottom);
+        assert_grey(pixel(&out, 120, 120), bottom);
+        let mut v = bottom_alpha_scene(&mut ram, true, 0, 0x8040_4040);
+        v.write(0x1800 + 0x14, 0xff00_0000, 0); // Esmart0's buffer beyond RAM
+        v.render(&ram, &mut out);
+        assert_grey(pixel(&out, 10, 10), bottom);
+        assert_grey(pixel(&out, 120, 120), bottom);
     }
 
     #[test]
