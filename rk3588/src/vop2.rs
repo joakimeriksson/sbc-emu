@@ -4,9 +4,15 @@
 //! per-port config-done bits read 0). While VP0 runs (DSP_CTRL.STANDBY clear), a frame starts
 //! every htotal x vtotal pixel clocks (the dclk's SCMI rate), raising FS_FIELD; going to
 //! standby raises DSP_HOLD_VALID. The picture is composed from the enabled windows (Cluster
-//! and Esmart) on VP0's layers, bottom to top, the lowest opaque and the others blended by
-//! their alpha; linear ARGB/XRGB/ABGR/XBGR8888, RGB888 and RGB565, scaled to their display
-//! size. AFBC-compressed windows are not decoded (they show as black).
+//! and Esmart) on VP0's layers, bottom to top: linear ARGB/XRGB/ABGR/XBGR8888, RGB888 and
+//! RGB565, scaled to their display size. AFBC-compressed windows are not decoded (they show as
+//! black). The lowest layer is drawn as is; each one above it goes through its overlay mixer
+//! (MIXn), and a Cluster window first through its Cluster mixer, as Linux programs them
+//! (`vop2_setup_alpha`, `vop2_setup_cluster_alpha`): per-pixel or global alpha (a format
+//! without alpha is mixed with the plane's global alpha only, so its X byte is ignored),
+//! source colour pre-multiplied or not (the plane's "pixel blend mode": "Pre-multiplied" or
+//! "Coverage"), and the source and destination factors. A mixer Linux has not set up (its
+//! ALPHA_EN clear) lets the upper layer cover what is below.
 
 pub const BASE: u64 = 0xfdd9_0000;
 pub const SIZE: u64 = 0x4200;
@@ -34,6 +40,12 @@ const HTOTAL: u64 = 0x48;
 const HACT: u64 = 0x4c;
 const VTOTAL: u64 = 0x50;
 const VACT: u64 = 0x54;
+
+/// The Cluster windows' own mixers (win1 over win0), 0x10 apart: SRC_COLOR, DST_COLOR,
+/// SRC_ALPHA, DST_ALPHA control.
+const CLUSTER0_MIX: u64 = 0x610;
+/// The overlay mixers of layers 1 up, 0x10 apart (layer n uses MIX n-1 on VP0).
+const MIX0: u64 = 0x650;
 
 /// A window: register base, whether it is a Cluster (else Esmart), its layer select ID and
 /// the position of its 2-bit field in OVL_PORT_SEL.
@@ -210,17 +222,29 @@ impl Vop2 {
         })
     }
 
-    /// VP0's windows, bottom to top.
-    fn layers(&self) -> Vec<Win> {
+    /// VP0's windows, bottom to top: (layer, index in WINDOWS, window). A window selected by
+    /// more than one layer is on the lowest: Linux puts the planes on layers 0 up and leaves
+    /// the layers above with what they selected before, starting from all zero (Cluster0).
+    fn layers(&self) -> Vec<(u32, usize, Win)> {
         let (sel, port) = (self.reg(OVL_LAYER_SEL), self.reg(OVL_PORT_SEL));
         let top = (port & 0xf).min(7);
+        let mut seen = 0u32;
         (0..=top)
             .filter_map(|n| {
                 let id = (sel >> (4 * n)) & 7;
                 let k = WINDOWS.iter().position(|w| w.2 == id)?;
-                ((port >> WINDOWS[k].3) & 3 == 0).then(|| self.window(k)).flatten()
+                if seen & 1 << k != 0 {
+                    return None;
+                }
+                seen |= 1 << k;
+                ((port >> WINDOWS[k].3) & 3 == 0).then(|| self.window(k)).flatten().map(|w| (n, k, w))
             })
             .collect()
+    }
+
+    /// The mixer whose four control registers start at `base`.
+    fn mixer(&self, base: u64) -> Mixer {
+        Mixer::new([0, 4, 8, 12].map(|o| self.reg(base + o)))
     }
 
     /// What the HDMI monitor gets, as RGBA: VP0's picture, black while VP0 is off or drives
@@ -231,16 +255,17 @@ impl Vop2 {
         }
         let (w, h) = self.size()?;
         out.clear();
+        // black background, alpha 0
         out.resize(w as usize * h as usize * 4, 0);
-        for px in out.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
         let layers = if self.running() && self.hdmi0() { self.layers() } else { Vec::new() };
-        for (n, win) in layers.iter().enumerate() {
+        for (n, (layer, k, win)) in layers.into_iter().enumerate() {
             if win.afbc {
                 continue;
             }
             let bpp: i64 = match win.format { 0 => 4, 1 => 3, 2 => 2, _ => continue };
+            let cluster = WINDOWS[k].1.then(|| self.mixer(CLUSTER0_MIX + 0x10 * k as u64)).filter(|m| m.enabled && !m.passes_dst());
+            // the lowest layer is drawn as is, the others through their overlay mixer
+            let ovl = (n > 0 && layer > 0).then(|| self.mixer(MIX0 + 0x10 * u64::from(layer - 1))).filter(|m| m.enabled);
             for dy in 0..win.dst.1 {
                 let y = win.pos.1 + dy;
                 if y >= h {
@@ -257,7 +282,7 @@ impl Vop2 {
                     // (a Y-mirrored window starting low in memory reaches below 0)
                     let Ok(a) = usize::try_from(line + sx * bpp) else { continue };
                     let Some(s) = a.checked_add(bpp as usize).and_then(|e| ram.get(a..e)) else { continue };
-                    // (r, g, b, alpha)
+                    // (r, g, b, pixel alpha): formats without an alpha channel have none (255)
                     let (mut r, g, mut b, al) = match win.format {
                         0 => (s[2], s[1], s[0], s[3]),
                         1 => (s[2], s[1], s[0], 255),
@@ -270,19 +295,112 @@ impl Vop2 {
                     if win.rb_swap {
                         std::mem::swap(&mut r, &mut b);
                     }
-                    let d = &mut out[((y * w + x) * 4) as usize..][..4];
-                    if n == 0 || al == 255 {
-                        d[..3].copy_from_slice(&[r, g, b]);
-                    } else {
-                        let mix = |s: u8, o: u8| ((u32::from(s) * u32::from(al) + u32::from(o) * (255 - u32::from(al))) / 255) as u8;
-                        let m = [mix(r, d[0]), mix(g, d[1]), mix(b, d[2])];
-                        d[..3].copy_from_slice(&m);
+                    let mut p = [r, g, b, al];
+                    // a Cluster's mixer: its win1 (unused by Linux, all zero) over win0
+                    if let Some(m) = &cluster {
+                        p = m.mix([0; 4], p);
                     }
+                    let d = &mut out[((y * w + x) * 4) as usize..][..4];
+                    let m = match &ovl { Some(m) => m.mix(p, [d[0], d[1], d[2], d[3]]), None => p };
+                    d.copy_from_slice(&m);
                 }
             }
         }
+        // (the 4th byte held the mixers' alpha; the monitor shows colour only)
+        for px in out.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
         self.shown.set(self.shown.get() + 1);
         Some((w, h))
+    }
+}
+
+/// A VOP2 alpha mixer's control registers (SRC_COLOR, DST_COLOR, SRC_ALPHA, DST_ALPHA_CTRL),
+/// each laid out as Linux's `union vop2_alpha_ctrl`: [0] colour mode (0: the colour is
+/// pre-multiplied, 1: multiply it by its alpha), [1] alpha mode (1: inverted), [3:2] blend mode
+/// (0: global alpha, 1: per-pixel alpha, 2: per-pixel times global), [7:5] factor, [8] alpha
+/// enable (in SRC_COLOR), [23:16] global alpha. The global alphas are the colour registers'.
+#[derive(Clone, Copy)]
+struct Mixer {
+    enabled: bool,
+    /// SRC_COLOR, DST_COLOR, SRC_ALPHA, DST_ALPHA
+    ctrl: [Ctrl; 4],
+    /// global alpha of the source and the destination
+    glb: [u32; 2],
+}
+
+/// One control register, decoded.
+#[derive(Clone, Copy)]
+struct Ctrl {
+    /// multiply the colour by its alpha (the colour is not pre-multiplied)
+    mul_alpha: bool,
+    inverted: bool,
+    blend: u32,
+    factor: u32,
+}
+
+/// a x b / 255, rounded
+fn mul(a: u32, b: u32) -> u32 {
+    (a * b + 127) / 255
+}
+
+impl Ctrl {
+    fn new(v: u32) -> Self {
+        Self { mul_alpha: v & 1 != 0, inverted: v & 2 != 0, blend: (v >> 2) & 3, factor: (v >> 5) & 7 }
+    }
+
+    /// The alpha it selects from a pixel alpha and a global alpha.
+    fn alpha(&self, pixel: u32, global: u32) -> u32 {
+        let pixel = if self.inverted { 255 - pixel } else { pixel };
+        match self.blend {
+            0 => global,
+            1 => pixel,
+            _ => mul(pixel, global),
+        }
+    }
+}
+
+impl Mixer {
+    fn new(regs: [u32; 4]) -> Self {
+        Self { enabled: regs[0] & (1 << 8) != 0, ctrl: regs.map(Ctrl::new), glb: [(regs[0] >> 16) & 0xff, (regs[1] >> 16) & 0xff] }
+    }
+
+    /// `src` mixed over `dst` (both r, g, b, alpha).
+    fn mix(&self, src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+        let [sc, dc, sa, da] = &self.ctrl;
+        let [gs, gd] = self.glb;
+        let (ps, pd) = (u32::from(src[3]), u32::from(dst[3]));
+        let (a_s, a_d) = (sc.alpha(ps, gs), dc.alpha(pd, gd));
+        // colour factors: source (zero, one, dst alpha, 1 - dst alpha, src alpha, src global),
+        // destination (zero, one, src alpha, 1 - src alpha, dst alpha, dst global)
+        let fs = match sc.factor { 1 => 255, 2 => a_d, 3 => 255 - a_d, 4 => a_s, 5 => gs, _ => 0 };
+        let fd = match dc.factor { 1 => 255, 2 => a_s, 3 => 255 - a_s, 4 => a_d, 5 => gd, _ => 0 };
+        let mut out = [0u8; 4];
+        for i in 0..3 {
+            let s = if sc.mul_alpha { mul(u32::from(src[i]), a_s) } else { u32::from(src[i]) };
+            let d = if dc.mul_alpha { mul(u32::from(dst[i]), a_d) } else { u32::from(dst[i]) };
+            out[i] = (mul(s, fs) + mul(d, fd)).min(255) as u8;
+        }
+        // alpha factors: zero, one, src alpha, 1 - src alpha, src global
+        let f = |c: &Ctrl| match c.factor { 1 => 255, 2 => a_s, 3 => 255 - a_s, 4 => gs, _ => 0 };
+        out[3] = (mul(sa.alpha(ps, gs), f(sa)) + mul(da.alpha(pd, gd), f(da))).min(255) as u8;
+        out
+    }
+
+    /// An all-zero source mixed over any destination gives the destination unchanged (a
+    /// Cluster mixer as Linux sets it up for a plane with opaque global alpha).
+    fn passes_dst(&self) -> bool {
+        let [sc, dc, sa, da] = &self.ctrl;
+        let [gs, gd] = self.glb;
+        let a_s = sc.alpha(0, gs);
+        let alpha_factor = |c: &Ctrl| match c.factor { 1 => 255, 2 => a_s, 3 => 255 - a_s, 4 => gs, _ => 0 };
+        // colour: Cd x (its alpha, if not pre-multiplied) x the destination factor, all 1
+        let colour = dc.blend == 0
+            && (!dc.mul_alpha || gd == 255)
+            && match dc.factor { 1 => true, 2 => a_s == 255, 3 => a_s == 0, 5 => gd == 255, _ => false };
+        // alpha: the destination's pixel alpha, nothing from the source
+        let alpha = !da.inverted && da.blend == 1 && alpha_factor(da) == 255 && mul(sa.alpha(0, gs), alpha_factor(sa)) == 0;
+        colour && alpha
     }
 }
 
@@ -338,6 +456,194 @@ mod tests {
         assert!(v.taken_over());
         assert_eq!(v.render(&ram, &mut out), Some((1280, 720)));
         assert!(out.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    /// Linux's `vop2_parse_alpha` (rockchip_vop2_reg.c): the four control registers of a
+    /// mixer, from (src premultiplied, dst premultiplied, src pixel alpha, dst pixel alpha,
+    /// src global alpha, dst global alpha), global alphas 8-bit.
+    fn parse_alpha(src_pre: bool, dst_pre: bool, src_px: bool, dst_px: bool, src_glb: u32, dst_glb: u32) -> [u32; 4] {
+        // bitfields of union vop2_alpha_ctrl
+        let ctrl = |color_mode: u32, blend: u32, cal: u32, factor: u32, en: u32, glb: u32| {
+            color_mode | blend << 2 | cal << 4 | factor << 5 | en << 8 | glb << 16
+        };
+        let (src_glb_en, dst_glb_en) = (src_glb != 0xff, dst_glb != 0xff);
+        // enum color_mode: ALPHA_SRC_PRE_MUL = 0, ALPHA_SRC_NO_PRE_MUL = 1
+        let (scm, dcm) = (u32::from(!src_pre), u32::from(!dst_pre));
+        // enum global_blend_mode: ALPHA_GLOBAL, ALPHA_PER_PIX, ALPHA_PER_PIX_GLOBAL
+        let sblend = if !src_px { 0 } else if !src_glb_en { 1 } else { 2 };
+        // enum src_factor_mode: SRC_FAC_ALPHA_ONE = 1, SRC_FAC_ALPHA_SRC_GLOBAL = 5
+        let (scm, sfac) = match sblend { 0 => (scm, 5), 1 => (scm, 1), _ => (0, 5) };
+        let src_color = ctrl(scm, sblend, 0, sfac, 1, src_glb);
+        // ALPHA_SRC_INVERSE = 3
+        let dst_color = ctrl(dcm, 0, 0, 3, 0, dst_glb);
+        let src_alpha = ctrl(0, sblend, 0, 1, 0, 0);
+        let dblend = if dst_px && !dst_glb_en { 1 } else { 2 };
+        let dst_alpha = ctrl(0, dblend, 1, 3, 0, 0);
+        [src_color, dst_color, src_alpha, dst_alpha]
+    }
+
+    fn write_mixer(v: &mut Vop2, base: u64, regs: [u32; 4]) {
+        for (i, r) in regs.into_iter().enumerate() {
+            v.write(base + 4 * i as u64, r, 0);
+        }
+    }
+
+    /// A 64x64 window at (100, 100) on Esmart0 (layer select ID 2), on VP0.
+    fn esmart0(v: &mut Vop2, fb: u32) {
+        let b = 0x1800;
+        v.write(b + 0x14, fb, 0);
+        v.write(b + 0x1c, 64, 0);
+        v.write(b + 0x20, 63 << 16 | 63, 0);
+        v.write(b + 0x24, 63 << 16 | 63, 0);
+        v.write(b + 0x28, 100 << 16 | 100, 0);
+        v.write(b + 0x10, 1, 0); // enabled, format 0 (ARGB8888/XRGB8888)
+    }
+
+    /// Cluster0 at the bottom (layer 0) and Esmart0 above it (layer 1), with the mixers set
+    /// up as `vop2_setup_cluster_alpha` and `vop2_setup_alpha` do for an Esmart plane with
+    /// opaque global alpha, of a format with alpha or not, pre-multiplied or coverage.
+    fn two_planes(ram: &mut [u8], has_alpha: bool, premulti: bool, under: u32, over: u32) -> Vop2 {
+        let mut v = Vop2::default();
+        let (fb, ov) = (0x10_0000u32, 0x60_0000u32);
+        for i in 0..1280 * 720 {
+            ram[fb as usize + 4 * i..][..4].copy_from_slice(&under.to_le_bytes());
+        }
+        for i in 0..64 * 64 {
+            ram[ov as usize + 4 * i..][..4].copy_from_slice(&over.to_le_bytes());
+        }
+        modeset(&mut v, fb);
+        esmart0(&mut v, ov);
+        v.write(OVL_LAYER_SEL, 0x7654_3120, 0); // layer 0 Cluster0, layer 1 Esmart0
+        v.write(OVL_PORT_SEL, 0x7881, 0); // VP0 has layers 0..1
+        // Cluster0's mixer: an all-zero win1 over win0, global alpha opaque
+        write_mixer(&mut v, CLUSTER0_MIX, parse_alpha(false, false, false, true, 0, 0xff));
+        // MIX0, layer 1: Cd = Cs + (1 - As) * Cd
+        write_mixer(&mut v, MIX0, parse_alpha(premulti, true, has_alpha, true, 0xff, 0xff));
+        v
+    }
+
+    fn pixel(out: &[u8], x: usize, y: usize) -> [u8; 4] {
+        out[(y * 1280 + x) * 4..][..4].try_into().unwrap()
+    }
+
+    /// An XRGB8888 overlay plane covers what is below whatever its X byte holds.
+    #[test]
+    fn xrgb_overlay_plane_is_opaque() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        // X byte 0, as Mesa writes it
+        let v = two_planes(&mut ram, false, true, 0x00ff_ffff, 0x0010_2030);
+        assert_eq!(v.render(&ram, &mut out), Some((1280, 720)));
+        assert_eq!(pixel(&out, 120, 120), [0x10, 0x20, 0x30, 255]);
+        assert_eq!(pixel(&out, 99, 120), [0xff, 0xff, 0xff, 255]);
+        let v = two_planes(&mut ram, false, false, 0x00ff_ffff, 0x4410_2030);
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [0x10, 0x20, 0x30, 255]);
+
+        // the same over an Esmart plane (Esmart1 at the bottom)
+        let mut v = two_planes(&mut ram, false, true, 0, 0x0010_2030);
+        let b = 0x1a00;
+        v.write(b + 0x14, 0x10_0000, 0);
+        v.write(b + 0x1c, 1280, 0);
+        v.write(b + 0x20, 719 << 16 | 1279, 0);
+        v.write(b + 0x24, 719 << 16 | 1279, 0);
+        v.write(b + 0x10, 1, 0);
+        v.write(OVL_LAYER_SEL, 0x7654_1023, 0); // layer 0 Esmart1, layer 1 Esmart0
+        v.write(OVL_PORT_SEL, 0x7881, 0);
+        for i in 0..1280 * 720 {
+            ram[0x10_0000 + 4 * i..][..4].copy_from_slice(&0x00c0_c0c0u32.to_le_bytes());
+        }
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [0x10, 0x20, 0x30, 255]);
+        assert_eq!(pixel(&out, 10, 10), [0xc0, 0xc0, 0xc0, 255]);
+    }
+
+    /// ARGB8888 with the default "Pre-multiplied" blend mode: Cs + (1 - As) * Cd; with
+    /// "Coverage": As * Cs + (1 - As) * Cd.
+    #[test]
+    fn argb_overlay_blends_by_the_planes_blend_mode() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        // half-transparent grey 0x40 (pre-multiplied: 0x40 is already alpha x colour) over white
+        let v = two_planes(&mut ram, true, true, 0x00ff_ffff, 0x8040_4040);
+        v.render(&ram, &mut out);
+        // 0x40 + 255 x 127/255
+        assert_eq!(pixel(&out, 120, 120), [191, 191, 191, 255]);
+        let v = two_planes(&mut ram, true, false, 0x00ff_ffff, 0x8040_4040);
+        v.render(&ram, &mut out);
+        // 0x40 x 128/255 + 255 x 127/255
+        assert_eq!(pixel(&out, 120, 120), [159, 159, 159, 255]);
+        // fully transparent: the plane below shows, in both modes
+        for premulti in [true, false] {
+            let v = two_planes(&mut ram, true, premulti, 0x0012_3456, 0x0000_0000);
+            v.render(&ram, &mut out);
+            assert_eq!(pixel(&out, 120, 120), [0x12, 0x34, 0x56, 255]);
+        }
+        // opaque: covers
+        let v = two_planes(&mut ram, true, true, 0x00ff_ffff, 0xff01_0203);
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [1, 2, 3, 255]);
+    }
+
+    /// A plane's global alpha ("alpha" property) with a format without alpha:
+    /// Ag x Cs + (1 - Ag) x Cd.
+    #[test]
+    fn global_alpha_of_an_xrgb_plane() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = two_planes(&mut ram, false, true, 0x0000_0000, 0x00ff_ffff);
+        write_mixer(&mut v, MIX0, parse_alpha(true, true, false, true, 0x80, 0xff));
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [128, 128, 128, 255]);
+    }
+
+    /// What Linux leaves in OVL_LAYER_SEL with two planes on VP0 (all eight layers): the
+    /// layers above select Cluster0 again, with mixers it does not set up.
+    #[test]
+    fn a_window_on_several_layers_is_drawn_once() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = two_planes(&mut ram, false, true, 0x00ff_ffff, 0x0010_2030);
+        v.write(OVL_LAYER_SEL, 0x0000_0020, 0);
+        v.write(OVL_PORT_SEL, 0x7887, 0);
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [0x10, 0x20, 0x30, 255]);
+        assert_eq!(pixel(&out, 10, 10), [0xff, 0xff, 0xff, 255]);
+    }
+
+    /// Skipping a Cluster mixer that passes win0 through changes nothing: Linux's set-up for
+    /// an opaque plane does; one with global alpha 0x80 halves the colour.
+    #[test]
+    fn cluster_mixer_pass_through_is_exact() {
+        let opaque = Mixer::new(parse_alpha(false, false, false, true, 0, 0xff));
+        let half = Mixer::new(parse_alpha(false, false, false, true, 0, 0x80));
+        assert!(opaque.passes_dst() && !half.passes_dst());
+        assert_eq!(half.mix([0; 4], [200, 100, 50, 255]), [100, 50, 25, 128]);
+        let mut regs = 0u32;
+        for _ in 0..4096 {
+            // a fixed pseudo-random walk over control values and pixels
+            regs = regs.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let pick = |r: u32| r & 0x00ff_01ff;
+            let m = Mixer::new([pick(regs), pick(regs.rotate_left(7)) | 0x00ff_0000 * (regs >> 31), pick(regs.rotate_left(13)), pick(regs.rotate_left(19))]);
+            if m.passes_dst() {
+                for p in [[0, 0, 0, 0], [10, 20, 30, 40], [200, 100, 50, 255], [255, 255, 255, 0], [1, 128, 254, 127]] {
+                    assert_eq!(m.mix([0; 4], p), p, "{regs:08x}");
+                }
+            }
+        }
+    }
+
+    /// Mixers Linux has not set up (ALPHA_EN clear): the upper layer covers.
+    #[test]
+    fn unset_mixers_cover() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = two_planes(&mut ram, true, true, 0x00ff_ffff, 0x0010_2030);
+        write_mixer(&mut v, CLUSTER0_MIX, [0; 4]);
+        write_mixer(&mut v, MIX0, [0; 4]);
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [0x10, 0x20, 0x30, 255]);
+        assert_eq!(pixel(&out, 10, 10), [0xff, 0xff, 0xff, 255]);
     }
 
     #[test]
