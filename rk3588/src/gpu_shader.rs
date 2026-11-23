@@ -753,8 +753,8 @@ impl Shader {
             },
         }
     }
-    /// Start the thread again at `pc` with the given register allocation, keeping
-    /// register contents (as hardware does not clear them either).
+    /// Start the thread again at `pc` with the given register allocation and all
+    /// registers zeroed.
     pub fn restart(&mut self, pc: u64, allocation: RegisterAllocation) {
         // A fresh thread: what a shader reads before writing must not depend on which
         // thread ran on this lane before (that varies with the fragment workers' split).

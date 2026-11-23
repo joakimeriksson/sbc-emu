@@ -649,3 +649,47 @@ fn parallel_fragment_bands_match_the_serial_result() {
     assert!(serial.1 > 0);
     assert!(serial.0.chunks(4).any(|p| p == [0, 255, 0, 255]));
 }
+#[test]
+fn a_frame_that_falls_back_to_serial_is_charged_once() {
+    // Draw 1 covers the frame without stores; draw 2's fragment shader stores to memory
+    // before BLEND, so the fragment workers give up and the job renders serially. The
+    // workers' work must not be charged on top of the serial pass's.
+    let render = |bands: Option<(usize, u32)>| {
+        let (m, mut ram, mut r) = fixture();
+        let f = coloured(&mut ram, &mut r);
+        put(&mut ram, 0x5400, &[7, 0, 0, 0, (1 << 29) | (1 << 27)]);
+        r[52] = 0x5400;
+        let mut t = Tiler::default();
+        let half = |v: f32| crate::gpu_shader::f32_to_f16(v) as u32;
+        draw(&mut t, &m, &mut ram, &mut r, 0.75, [half(1.), half(1.) << 16], 0x7100);
+        // Draw 2: MOV r0/r1 = u0/u1, MOV r4/r5 = u2/u3, STORE.i32 r0 -> [r4:r5], ATEST, BLEND.
+        put(&mut ram, 0x5240, &[0x80000128, 0x3000, 0x6400, 0, 0, 0, 0, 0]);
+        let code = [
+            0x0091c00000000080u64,
+            0x0091c10000000081,
+            0x0091c40000000082,
+            0x0091c50000000083,
+            0x0061400218000004,
+            0x087dbc0208ea407c,
+            0x787f4004333c00f0,
+        ];
+        for (n, i) in code.iter().enumerate() {
+            ram[0x6400 + n * 8..0x6408 + n * 8].copy_from_slice(&i.to_le_bytes());
+        }
+        r[20] = 0x5240;
+        r[13] = 2 << 24; // four uniforms
+        draw(&mut t, &m, &mut ram, &mut r, 0.25, [half(0.) | half(1.) << 16, half(1.) << 16], 0x7108);
+        put(&mut ram, 0x7110, &[0x1f000, 0]);
+        crate::gpu_raster::BANDS.with(|b| b.set(bands));
+        crate::gpu::take_work();
+        t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        let work = crate::gpu::take_work();
+        crate::gpu_raster::BANDS.with(|b| b.set(None));
+        (ram[0xe000..0xe400].to_vec(), ram[0x1f000..0x1f004].to_vec(), work)
+    };
+    let serial = render(Some((1, 16)));
+    // The store happened and draw 2 rendered.
+    assert_ne!(serial.1, [0; 4]);
+    assert!(serial.0.chunks(4).any(|p| p == [0, 255, 0, 255]));
+    assert_eq!(render(Some((4, 4))), serial);
+}
