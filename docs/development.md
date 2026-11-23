@@ -9,8 +9,9 @@ cargo test --release --workspace
 GitHub Actions runs the suite on every pull request and push to `main` ([.github/workflows/ci.yml](../.github/workflows/ci.yml)):
 - macOS on Apple silicon: everything, including the JIT and the differential tests against the
   host CPU;
-- Linux x86-64: the interpreter, as a portability check, and the 32-bit Arm core's x86-64 JIT
-  backend (`arm-a32/tests/jit_diff.rs` and `jit_flags.rs` compare it with the interpreter);
+- Linux x86-64: all tests, with the x86-64 JIT backends of the 64-bit and 32-bit Arm cores
+  (`SBC_JIT=1` for the 64-bit core's tests too; `arm-a64/tests/jit_diff.rs`,
+  `arm-a32/tests/jit_diff.rs` and `jit_flags.rs` compare them with the interpreter);
 - the WebAssembly build.
 
 - `arm-a64/tests/diff_host.rs`, `diff_neon.rs`, `diff_fp.rs`: **differential tests against the

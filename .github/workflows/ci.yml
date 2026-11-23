@@ -31,7 +31,7 @@ jobs:
         run: cargo build --release
 
   linux:
-    name: Linux x86-64 - tests (interpreter)
+    name: Linux x86-64 - tests, A64 JIT to x86-64
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +40,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --release --workspace
+      # the A64 JIT's x86-64 backend: every arm-a64 test with it on (its differential test
+      # against the interpreter and its encoder test against llvm-mc run in the step above)
+      - name: JIT on for the CPU tests too
+        run: SBC_JIT=1 cargo test --release -p arm-a64
 
   wasm:
     name: WebAssembly build
