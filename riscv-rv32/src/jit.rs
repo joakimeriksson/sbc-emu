@@ -22,11 +22,11 @@
 //!   `h_exec` (which may read them) and at every exit. `note_pc` is made before every access (in
 //!   the helpers) and for the last instruction at exit (`Ctx::last_pc`).
 //!
-//! Backends: AArch64 on macOS and Linux, WebAssembly with the `wasm-jit` feature (the page
-//! compiles the modules). Elsewhere [`AVAILABLE`] is false.
-// Without a backend (x86-64, wasm without a page to compile for) only the shared front end is
-// built, and nothing calls it.
-#![cfg_attr(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))), allow(dead_code))]
+//! Backends: AArch64 on macOS and Linux, x86-64 on Linux (`jit/x64.rs`), WebAssembly with the
+//! `wasm-jit` feature (the page compiles the modules). Elsewhere [`AVAILABLE`] is false.
+// Without a backend (x86-64 off Linux, wasm without a page to compile for) only the shared front
+// end is built, and nothing calls it.
+#![cfg_attr(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))), allow(dead_code))]
 use crate::block::{decode_block, Decoded};
 use crate::bus::Bus;
 use crate::decode::{Insn, Op};
@@ -240,8 +240,12 @@ pub(crate) fn region<B: Bus>(cpu: &Cpu, bus: &mut B, pc: u32, phys: u32, insns: 
 pub use a64::{Jit, AVAILABLE};
 #[cfg(all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))]
 pub use wasm::{Jit, AVAILABLE};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod x64;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use x64::{Jit, AVAILABLE};
 
-#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))))]
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))))]
 mod none {
     use super::*;
     pub const AVAILABLE: bool = false;
@@ -258,7 +262,7 @@ mod none {
         pub unsafe fn call<B: Bus>(&self, _code: u32, _cpu: &mut Cpu, _bus: &mut B, _ctx: &mut Ctx, _budget: u32) -> u64 { unreachable!() }
     }
 }
-#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))))]
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "wasm32", any(feature = "wasm-jit", feature = "wasm-jit-host")))))]
 pub use none::{Jit, AVAILABLE};
 
 /// Counts not yet added to the Cpu: instructions (`insn_count`, `cycle_count`) and those retired
