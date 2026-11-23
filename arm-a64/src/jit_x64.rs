@@ -263,6 +263,14 @@ pub(super) mod asm {
         /// movd xmm, m32 (upper bits zeroed)
         pub fn movd_load(&mut self, x: u8, mm: Mem) { self.rm(&[0x66], false, &[0x0f, 0x6e], x, mm, false) }
         pub fn pxor(&mut self, x: u8, y: u8) { self.rr(&[0x66], false, &[0x0f, 0xef], x, y, false, false) }
+        /// SSE2 `66 0F op /r` on two xmm registers (x = x op y): PCMPEQB 74, PCMPEQW 75,
+        /// PCMPEQD 76, PMAXUB DE, PMINUB DA, PAND DB, PANDN DF, POR EB, PXOR EF, PACKUSWB 67,
+        /// MOVDQA 6F
+        pub fn sse(&mut self, op: u8, x: u8, y: u8) { self.rr(&[0x66], false, &[0x0f, op], x, y, false, false) }
+        /// psrlw xmm, imm8
+        pub fn psrlw(&mut self, x: u8, n: u8) { self.rr(&[0x66], false, &[0x0f, 0x71], 2, x, false, false); self.byte(n) }
+        /// movq m64, xmm
+        pub fn movq_store(&mut self, mm: Mem, x: u8) { self.rm(&[0x66], false, &[0x0f, 0xd6], x, mm, false) }
         /// point the rel32 at `at` to position `to` of this buffer
         pub fn patch(&mut self, at: usize, to: usize) {
             let v = (to as i64 - (at as i64 + 4)) as i32;
@@ -1495,6 +1503,89 @@ fn movi_const(i: u32) -> bool {
     !bit(i, 31) && bits(i, 28, 19) == 0b0111100000 && bit(i, 10) && { let cmode = bits(i, 15, 12); cmode & 1 == 0 || cmode >= 12 }
 }
 
+/// The byte-vector NEON operations glibc's string functions use, done with SSE2 on the V
+/// registers in `Cpu`: CMEQ (register, zero), CMHS (bytes), AND/BIC/ORR/ORN/EOR/BSL/BIT/BIF,
+/// UMAXP/UMINP (16 bytes) and SHRN/SHRN2 (halfwords to bytes). None = not one of them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Neon { CmeqReg(u32), CmeqZero(u32), CmhsB, Logic(u32), MaxMinP(bool), Shrn(u8) }
+
+fn neon_op(i: u32) -> Option<Neon> {
+    let (q, size) = (bit(i, 30), bits(i, 23, 22));
+    if bit(i, 31) { return None; }
+    if i & 0x9f20_0400 == 0x0e20_0400 {
+        // three registers of the same type
+        return match (bit(i, 29), bits(i, 15, 11), size) {
+            (true, 0b10001, 0..=2) => Some(Neon::CmeqReg(size)),
+            (true, 0b00111, 0) => Some(Neon::CmhsB),
+            (u, 0b00011, _) => Some(Neon::Logic((u as u32) << 2 | size)),
+            (true, 0b10100, 0) if q => Some(Neon::MaxMinP(true)),
+            (true, 0b10101, 0) if q => Some(Neon::MaxMinP(false)),
+            _ => None,
+        };
+    }
+    if i & 0xbf3f_fc00 == 0x0e20_9800 && size <= 2 { return Some(Neon::CmeqZero(size)); }
+    if i & 0xbf78_fc00 == 0x0f08_8400 { return Some(Neon::Shrn((16 - bits(i, 22, 16)) as u8)); }
+    None
+}
+
+impl E<'_> {
+    fn neon(&mut self, i: u32, op: Neon) {
+        let (q, rd, rn, rm) = (bit(i, 30), i & 31, (i >> 5) & 31, (i >> 16) & 31);
+        let v = |r: u32| m(CPU, self.o.v + 16 * r as i32);
+        let (vd, vn, vm) = (v(rd), v(rn), v(rm));
+        // xmm3 = 0x00ff in every halfword
+        let low_bytes = |a: &mut Asm| { a.sse(0x76, 3, 3); a.psrlw(3, 8); };
+        self.a.movdqu_load(0, vn);
+        let mut res = 0;
+        match op {
+            Neon::CmeqReg(size) => { self.a.movdqu_load(1, vm); self.a.sse(0x74 + size as u8, 0, 1); }
+            Neon::CmeqZero(size) => { self.a.pxor(1, 1); self.a.sse(0x74 + size as u8, 0, 1); }
+            Neon::CmhsB => {
+                // n >= m (unsigned) exactly where max(n, m) == n
+                self.a.movdqu_load(1, vm);
+                self.a.sse(0x6f, 2, 0);
+                self.a.sse(0xde, 2, 1);
+                self.a.sse(0x74, 0, 2);
+            }
+            Neon::Logic(k) => {
+                self.a.movdqu_load(1, vm);
+                match k {
+                    0 => self.a.sse(0xdb, 0, 1), // AND
+                    1 => { self.a.sse(0xdf, 1, 0); res = 1; } // BIC: ~m & n
+                    2 => self.a.sse(0xeb, 0, 1), // ORR
+                    3 => { self.a.sse(0x76, 2, 2); self.a.pxor(1, 2); self.a.sse(0xeb, 0, 1); } // ORN
+                    4 => self.a.pxor(0, 1), // EOR
+                    5 => { self.a.movdqu_load(2, vd); self.a.pxor(0, 1); self.a.sse(0xdb, 0, 2); self.a.pxor(0, 1); } // BSL: m ^ ((m ^ n) & d)
+                    6 => { self.a.movdqu_load(2, vd); self.a.pxor(0, 2); self.a.sse(0xdb, 0, 1); self.a.pxor(0, 2); } // BIT: d ^ ((d ^ n) & m)
+                    _ => { self.a.movdqu_load(2, vd); self.a.pxor(0, 2); self.a.sse(0xdf, 1, 0); self.a.pxor(1, 2); res = 1; } // BIF: d ^ (~m & (d ^ n))
+                }
+            }
+            Neon::MaxMinP(max) => {
+                // each source: max/min of its even and odd bytes into halfwords, then packed
+                self.a.movdqu_load(1, vm);
+                low_bytes(&mut self.a);
+                for x in [0u8, 1] {
+                    self.a.sse(0x6f, 2, x);
+                    self.a.psrlw(2, 8);
+                    self.a.sse(0xdb, x, 3);
+                    self.a.sse(if max { 0xde } else { 0xda }, x, 2);
+                }
+                self.a.sse(0x67, 0, 1);
+            }
+            Neon::Shrn(sh) => {
+                self.a.psrlw(0, sh);
+                low_bytes(&mut self.a);
+                self.a.sse(0xdb, 0, 3);
+                self.a.sse(0x67, 0, 0);
+                // SHRN2 writes the upper half and keeps the lower
+                if q { self.a.movq_store(m(CPU, vd.disp + 8), 0); } else { self.a.movq_store(vd, 0); self.a.store_imm(8, m(CPU, vd.disp + 8), 0); }
+                return;
+            }
+        }
+        if q { self.a.movdqu_store(vd, res); } else { self.a.movq_store(vd, res); self.a.store_imm(8, m(CPU, vd.disp + 8), 0); }
+    }
+}
+
 impl Jit {
     /// The value an instruction that writes Vd from its immediate alone leaves there, from
     /// running it once on the scratch core (None: the interpreter does not take it).
@@ -1570,8 +1661,8 @@ impl Cpu {
         let fp_on = (self.sys.cpacr_el1 >> 20) & 3 == 3;
         static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         // debugging: SBC_JIT_NATIVE bits select what is translated (1 data processing,
-        // 2 branches, 4 other integer, 8 loads/stores, 16 exclusives); the rest is interpreted
-        let mask = *MASK.get_or_init(|| std::env::var("SBC_JIT_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(31));
+        // 2 branches, 4 other integer, 8 loads/stores, 16 exclusives, 32 NEON); the rest is interpreted
+        let mask = *MASK.get_or_init(|| std::env::var("SBC_JIT_NATIVE").ok().and_then(|v| v.parse().ok()).unwrap_or(63));
         let mut pc = self.pc;
         let mut a = pa;
         let mut ended = false;
@@ -1638,6 +1729,10 @@ impl Cpu {
             } else if mask & 4 != 0 && fp_on && simd_gp(i).is_some() && self.jit.as_mut().is_some_and(|j| j.interp_supports(i)) {
                 // DUP (general), UMOV, SMOV: between general and vector registers
                 e.simd_gp(i);
+                e.pending += 1;
+            } else if let Some(op) = neon_op(i).filter(|_| mask & 32 != 0 && fp_on && self.jit.as_mut().is_some_and(|j| j.interp_supports(i))) {
+                // byte-vector NEON (string functions)
+                e.neon(i, op);
                 e.pending += 1;
             } else if let Some(v) = if mask & 4 != 0 && fp_on && movi_const(i) { self.jit.as_mut().and_then(|j| j.simd_const(i)) } else { None } {
                 // MOVI / MVNI / FMOV (vector, immediate): a constant
@@ -1987,6 +2082,11 @@ mod tests {
         c(&|a| a.cqo(true), "cqo".into());
         c(&|a| a.cqo(false), "cdq".into());
         c(&|a| a.pxor(0, 9), "pxor xmm0, xmm9".into());
+        for (op, n) in [(0x74u8, "pcmpeqb"), (0x75, "pcmpeqw"), (0x76, "pcmpeqd"), (0xde, "pmaxub"), (0xda, "pminub"), (0xdb, "pand"), (0xdf, "pandn"), (0xeb, "por"), (0xef, "pxor"), (0x67, "packuswb"), (0x6f, "movdqa")] {
+            for (x, y) in [(0u8, 1u8), (3, 2), (8, 1), (2, 12)] { c(&|a| a.sse(op, x, y), format!("{n} xmm{x}, xmm{y}")); }
+        }
+        for x in [0u8, 3, 9] { c(&|a| a.psrlw(x, 4), format!("psrlw xmm{x}, 4")); }
+        for &mm in &mems { c(&|a| a.movq_store(mm, 0), format!("movq qword ptr {}, xmm0", mem(mm))); }
         // assemble the expected text; byte-identical or the same instruction when disassembled
         let input: String = cases.iter().map(|(_, s)| format!("{s}\n")).collect();
         let out = run_mc(&mc, &["-triple=x86_64", "-x86-asm-syntax=intel", "-show-encoding"], &input);

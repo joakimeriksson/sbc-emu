@@ -50,7 +50,7 @@ fn insn(g: &mut G, k: usize, n: usize) -> u32 {
     let sf = g.bit();
     let w = if sf == 1 { 64 } else { 32 };
     let (rd, rn, rm) = (g.d(), g.dz(), g.dz());
-    match g.below(38) {
+    match g.below(39) {
         0 | 1 => {
             // ADD/SUB (immediate); S forms may compare (rd = ZR), sources may be SP
             let s = g.bit();
@@ -160,6 +160,21 @@ fn insn(g: &mut G, k: usize, n: usize) -> u32 {
                 4 => 0xd51b_d040 | rd,                        // msr tpidr_el0, xd
                 5 => 0xd53b_d040 | rd,                        // mrs xd, tpidr_el0
                 _ => 0x9e67_0000 | (rn << 5) | g.below(8),    // fmov d, xn
+            }
+        }
+        34 => {
+            // byte-vector NEON: CMEQ, CMHS, vector logic, UMAXP/UMINP, SHRN (and neighbours)
+            // (valid encodings only: the interpreter takes some reserved ones, see `neon.rs`)
+            let (q, size, d, n, m) = (g.bit(), g.below(4), g.below(8), g.below(8), g.below(8));
+            let q = if size == 3 { 1 } else { q };
+            let regs = (m << 16) | (n << 5) | d;
+            match g.below(6) {
+                0 => 0x2e20_8c00 | (q << 30) | (size << 22) | regs,
+                1 => 0x2e20_3c00 | (q << 30) | (size << 22) | regs,
+                2 => 0x0e20_1c00 | (q << 30) | (g.bit() << 29) | (g.below(4) << 22) | regs,
+                3 => 0x2e20_a400 | (q << 30) | (g.bit() << 11) | (size.min(2) << 22) | regs,
+                4 => 0x0e20_9800 | (q << 30) | (size << 22) | (n << 5) | d,
+                _ => 0x0f00_8400 | (q << 30) | ((8 + g.below(8)) << 16) | (n << 5) | d,
             }
         }
         33 => {
