@@ -636,12 +636,16 @@ fn parallel_fragment_bands_match_the_serial_result() {
         draw(&mut t, &m, &mut ram, &mut r, 0.75, [half(1.), half(1.) << 16], 0x7100);
         draw(&mut t, &m, &mut ram, &mut r, 0.25, [half(0.) | half(1.) << 16, half(1.) << 16], 0x7108);
         crate::gpu_raster::BANDS.with(|b| b.set(bands));
+        crate::gpu::take_work();
         t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        // The GPU time charged does not depend on how the job was split either.
+        let work = crate::gpu::take_work();
         crate::gpu_raster::BANDS.with(|b| b.set(None));
-        ram[0xe000..0xe400].to_vec()
+        (ram[0xe000..0xe400].to_vec(), work)
     };
     let serial = render(Some((1, 16)));
     assert_eq!(render(Some((4, 4))), serial);
     assert_eq!(render(Some((3, 2))), serial);
-    assert!(serial.chunks(4).any(|p| p == [0, 255, 0, 255]));
+    assert!(serial.1 > 0);
+    assert!(serial.0.chunks(4).any(|p| p == [0, 255, 0, 255]));
 }

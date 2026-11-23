@@ -1,16 +1,28 @@
 //! Mali-G610 control registers and host-modeled CSF management.
 //! MCU instructions remain unsupported; supported clear and scalar compute work runs synchronously.
 use crate::gpu_mmu::AddressSpace;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
-/// Work the GPU did since it was last charged, in picoseconds of a Mali-G610 MP4 at
-/// about 1 GHz: shader instructions at 64 threads per cycle, fragments at 16 pixels per
-/// cycle, and tile writeback at 20 GB/s. Jobs run synchronously in the doorbell write,
-/// so the submitting core's clock is moved on by this much: programs that measure
-/// frame times see a GPU that takes time.
-static WORK_PS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Work the GPU did since it was last charged, in picoseconds of a Mali-G610 MP4 at
+    /// about 1 GHz: shader instructions at 64 threads per cycle, fragments at 16 pixels
+    /// per cycle, and tile writeback at 20 GB/s. Jobs run synchronously in the doorbell
+    /// write, so the submitting core's clock is moved on by this much: programs that
+    /// measure frame times see a GPU that takes time. Per thread: a doorbell write runs
+    /// its jobs on the writing thread from start to end (taking what was there before),
+    /// so machines on other threads do not mix in; fragment workers return theirs to the
+    /// job's thread only when their result is kept (`take_work`, `add_work`).
+    static WORK_PS: Cell<u64> = const { Cell::new(0) };
+}
 pub(crate) fn work(instructions: u64, pixels: u64, bytes: u64) {
-    WORK_PS.fetch_add(instructions * 16 + pixels * 63 + bytes * 50, Ordering::Relaxed);
+    add_work(instructions * 16 + pixels * 63 + bytes * 50);
+}
+/// Work charged on this thread so far (and start again from 0).
+pub(crate) fn take_work() -> u64 {
+    WORK_PS.with(|w| w.replace(0))
+}
+pub(crate) fn add_work(ps: u64) {
+    WORK_PS.with(|w| w.set(w.get().saturating_add(ps)));
 }
 #[derive(Default)]
 pub struct Gpu {
@@ -85,9 +97,9 @@ impl Gpu {
             }
         }
         if (0x80000..=0x170000).contains(&off) && off%0x10000==0 {
-            WORK_PS.store(0, Ordering::Relaxed);
+            take_work();
             match self.firmware.queues(&self.spaces,ram){Ok(bits)=>self.raw[0]|=bits,Err(e)=>eprintln!("[mali] firmware queue error {:?}",e)}
-            let ps=WORK_PS.swap(0, Ordering::Relaxed);
+            let ps=take_work();
             if ps>0 {
                 self.cost_ns+=ps/1000+1000;
                 if std::env::var_os("SBC_MALI_TIMING").is_some() { eprintln!("[mali] doorbell work: {} us virtual", ps/1_000_000); }

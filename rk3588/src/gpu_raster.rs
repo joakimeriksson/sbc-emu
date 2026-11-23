@@ -379,8 +379,8 @@ pub fn draw(
 ) -> Result<(), Stop> {
     let (workers, min_rows) = BANDS.with(|b| b.get()).unwrap_or((workers(), 16));
     let occlusion = match draw_parallel(m, ram, fb, tb, frame, workers, min_rows) {
-        Some(result) => result?,
-        None => render(m, Ram::Rw(ram), fb, tb, frame)?,
+        Some(counts) => counts,
+        None => render(m, Ram::Rw(ram), fb, tb, frame)?.into_iter().map(|(c, _)| c).collect(),
     };
     for (draw, count) in frame.draws.iter().zip(occlusion) {
         let Some((address, mode)) = State::occlusion(draw) else { continue };
@@ -393,8 +393,9 @@ pub fn draw(
     Ok(())
 }
 
-/// Rasterize every draw of a frame into `tb`. Returns each draw's occlusion count.
-fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &Frame) -> Result<Vec<u64>, Stop> {
+/// Rasterize every draw of a frame into `tb`. Returns each draw's occlusion count and
+/// the shader instructions it spent.
+fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &Frame) -> Result<Vec<(u64, u64)>, Stop> {
     let mut code = Code::default();
     let mut tlb = Tlb::default();
     let mut textures = crate::gpu_texture::Cache::default();
@@ -409,14 +410,17 @@ fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &
         let env = Env::with_ram(m, view, uniforms, &mut code, &mut tlb, &mut textures);
         let mut r = Raster { env, fb, tb, budget: FRAME_BUDGET, occlusion: 0, lanes: None, frame: None };
         r.draw(draw, &st)?;
-        occlusion.push(r.occlusion);
+        occlusion.push((r.occlusion, FRAME_BUDGET - r.budget));
     }
     Ok(occlusion)
 }
 
-/// Fragment workers: bands of rows rendered at once, each into its own copy of the
-/// tile buffer with read-only guest memory. A shader that stores to memory makes the
-/// whole job run serially instead (`None`); a fault leaves `tb` unchanged.
+/// Fragment workers: interleaved stripes of rows rendered at once, each into its own
+/// copy of the tile buffer with read-only guest memory. The parallel result is kept only
+/// when it is the serial one: when any worker fails (a shader that stores to memory, a
+/// fault, a host panic) or the workers together spend more of a draw's instruction
+/// budget than one serial pass may, the job is rendered serially instead (`None`), so
+/// faults, budgets and the GPU time charged do not depend on the number of workers.
 fn draw_parallel(
     m: &AddressSpace,
     ram: &[u8],
@@ -425,34 +429,42 @@ fn draw_parallel(
     frame: &Frame,
     workers: usize,
     min_rows: u32,
-) -> Option<Result<Vec<u64>, Stop>> {
+) -> Option<Vec<u64>> {
     if workers < 2 || tb.h < 2 * min_rows || frame.draws.is_empty() {
         return None;
     }
     let mut bands: Vec<TileBuffer> = (0..workers as u32).map(|k| tb.stripes(k, workers as u32)).collect();
-    let results: Vec<Result<Vec<u64>, Stop>> = std::thread::scope(|s| {
+    let results: Vec<Option<(Vec<(u64, u64)>, u64)>> = std::thread::scope(|s| {
         let handles: Vec<_> = bands
             .iter_mut()
-            .map(|band| s.spawn(move || render(m, Ram::Ro(ram), fb, band, frame)))
+            .map(|band| {
+                s.spawn(move || {
+                    let r = render(m, Ram::Ro(ram), fb, band, frame).ok();
+                    r.map(|counts| (counts, crate::gpu::take_work()))
+                })
+            })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(bad()))).collect()
+        handles.into_iter().map(|h| h.join().ok().flatten()).collect()
     });
     let mut total = vec![0u64; frame.draws.len()];
-    for r in &results {
-        match r {
-            Err(Stop::Shader(crate::gpu_shader::Error::Serial)) => return None,
-            Err(e) => return Some(Err(*e)),
-            Ok(counts) => {
-                for (t, c) in total.iter_mut().zip(counts) {
-                    *t += c;
-                }
-            }
+    let mut spent = vec![0u64; frame.draws.len()];
+    let mut work = 0u64;
+    for r in results {
+        let (counts, ps) = r?;
+        for (n, (c, i)) in counts.into_iter().enumerate() {
+            total[n] += c;
+            spent[n] += i;
         }
+        work = work.saturating_add(ps);
+    }
+    if spent.iter().any(|&s| s > FRAME_BUDGET) {
+        return None;
     }
     for band in &bands {
         tb.merge(band);
     }
-    Some(Ok(total))
+    crate::gpu::add_work(work);
+    Some(total)
 }
 
 thread_local! {
