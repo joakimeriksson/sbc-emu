@@ -210,10 +210,11 @@ node tools/wasm-rv-jit-diff.mjs                         # the JIT against the in
 
 ## The JIT
 
-The harts run through a block JIT (`riscv64/src/jit.rs`) with two code generators: RISC-V to
-AArch64 natively on AArch64 macOS and Linux hosts (`jit_a64.rs`; on by default, `--no-jit` or
-`SBC_JIT=0` turns it off) and RISC-V to WebAssembly in the browser build (`jit_wasm.rs`). Other
-hosts interpret.
+The harts run through a block JIT (`riscv64/src/jit.rs`) with three code generators: RISC-V to
+AArch64 natively on AArch64 macOS and Linux hosts (`jit_a64.rs`), RISC-V to x86-64 natively on
+x86-64 Linux hosts (`jit_x64.rs`, which follows `jit_a64.rs` instruction for instruction), both
+on by default (`--no-jit` or `SBC_JIT=0` turns them off), and RISC-V to WebAssembly in the
+browser build (`jit_wasm.rs`). Other hosts interpret.
 
 - **Regions.** A hot entry (64 executions) is compiled with the basic blocks its constant branches
   reach on the same 4 KiB page, so loops run inside compiled code while the cycle budget lasts.
@@ -226,8 +227,8 @@ hosts interpret.
   hart's jump cache knows (one table per mode, filled with each region the driver enters, emptied
   on `satp` writes, `sfence.vma`, `fence.i` and flushes) jumps straight into that region while the
   budget lasts, so control flow between compiled regions, calls and returns included, does not
-  come back to the driver. A region keeps the guest registers it uses more than once (up to 14)
-  and the cycle count in host registers; they are written back before an instruction goes to the
+  come back to the driver. A region keeps the guest registers it uses more than once (up to 14
+  on AArch64, 7 on x86-64) and the cycle count in host registers; they are written back before an instruction goes to the
   interpreter and on the way out.
 - **Shared and keyed by physical address.** The four harts share the code, and a page mapped at
   several virtual addresses is compiled once; the code computes PCs from the page's virtual
@@ -241,13 +242,15 @@ hosts interpret.
   DMA is caught as well as stores. (Linux issues about 9,000 `fence.i`s while it boots, so
   dropping everything at each one is not an option.)
 
-`cargo test -p riscv64` (natively, with the AArch64 backend; `SBC_JIT_CASES=n` for more) and
-`node tools/wasm-rv-jit-diff.mjs` (the WebAssembly backend) run random programs (integer, M, Zba,
-Zbb, loads and stores with misaligned, page-straddling and device accesses, floating-point loads
-and stores with the FPU on and off, AMOs, LR/SC, CSRs, compressed instructions, branches, jumps
-and loops, placed anywhere in a page so some run on into the next) in M mode and in S mode with
-Sv39, and compare registers (integer and floating point), counters, CSRs and memory with the
-interpreter: 120,000 cases natively and 18,000 in WebAssembly match.
+`cargo test -p riscv64` (natively, with the AArch64 or x86-64 backend; `SBC_JIT_CASES=n` for
+more) and `node tools/wasm-rv-jit-diff.mjs` (the WebAssembly backend) run random programs
+(integer, M, Zba, Zbb, loads and stores with misaligned, page-straddling and device accesses,
+floating-point loads and stores with the FPU on and off, AMOs, LR/SC, CSRs, compressed
+instructions, branches, jumps and loops, placed anywhere in a page so some run on into the next)
+in M mode and in S mode with Sv39, and compare registers (integer and floating point), counters,
+CSRs and memory with the interpreter: 120,000 cases with each native backend and 18,000 in
+WebAssembly match. On x86-64, `cargo test -p riscv64` also checks the backend's instruction
+encoder against llvm-mc where it is installed (`LLVM_MC` names it).
 
 | Mainline to the BusyBox shell (M5) | Wall time | Instructions |
 |---|---|---|

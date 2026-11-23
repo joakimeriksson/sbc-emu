@@ -17,6 +17,8 @@ pub mod jit;
 pub mod jit_check;
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 mod jit_a64;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod jit_x64;
 #[cfg(target_arch = "wasm32")]
 mod jit_wasm;
 pub mod mmu;

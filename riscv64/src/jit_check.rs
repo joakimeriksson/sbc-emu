@@ -1,7 +1,7 @@
 //! A differential test of the block JIT: random programs run in the interpreter and through
 //! [`crate::jit::run`], then registers, CSRs, counters and memory are compared: natively with
-//! the AArch64 code generator (`cargo test -p riscv64`; elsewhere the driver alone), and in
-//! the browser build with the WebAssembly one (`tools/wasm-rv-jit-diff.mjs`).
+//! the AArch64 or x86-64 code generator (`cargo test -p riscv64`; elsewhere the driver
+//! alone), and in the browser build with the WebAssembly one (`tools/wasm-rv-jit-diff.mjs`).
 use crate::jit::{self, Jit};
 use crate::{prv, Bus, Hart, Identity};
 
@@ -422,7 +422,8 @@ pub fn run_cases(cases: u32, seed: u64, loops: bool, smode: bool, hot: u32) -> (
 
 #[cfg(test)]
 mod tests {
-    /// On AArch64 hosts this runs the native code generator; elsewhere the driver alone.
+    /// On AArch64 and x86-64 Linux hosts this runs the native code generator; elsewhere the
+    /// driver alone.
     /// SBC_JIT_CASES sets the cases per configuration (default 300).
     #[test]
     fn jit_matches_the_interpreter() {
@@ -432,5 +433,22 @@ mod tests {
             let (fails, first) = super::run_cases(cases, seed, loops, smode, hot);
             assert_eq!(fails, 0, "{}", first.unwrap_or_default());
         }
+    }
+
+    /// Where there is a native code generator, the comparison above goes through it.
+    #[test]
+    fn native_hosts_compile() {
+        if !crate::jit::AVAILABLE || cfg!(target_arch = "wasm32") {
+            return;
+        }
+        let mut rng = super::Rng(0x5eed);
+        let code = super::random_program(&mut rng, true);
+        let (mut h, mut bus) = super::setup(&code, 0x1234, false);
+        let mut j = super::Jit::new();
+        j.hot = 1;
+        while !h.wfi && h.cycle < 100_000 {
+            super::jit::run(&mut h, &mut bus, &mut j, 1000);
+        }
+        assert!(j.compiled > 0);
     }
 }
