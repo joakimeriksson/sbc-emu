@@ -940,9 +940,11 @@ impl Machine {
     fn next_deadline(&self) -> u64 {
         (0..HARTS)
             .filter(|&h| self.state[h] == HartState::Run)
-            .map(|h| self.soc.clint.mtimecmp[h])
+            .map(|h| self.soc.clint.mtimecmp[h].saturating_mul(NS_PER_TICK))
+            // an expired timer whose interrupt is off wakes nobody: it must not stop time
+            .filter(|&t| t > self.soc.now)
             .min()
-            .map_or(u64::MAX, |t| t.saturating_mul(NS_PER_TICK))
+            .unwrap_or(u64::MAX)
     }
 
     pub fn idle_until(&mut self, time_ns: u64) {

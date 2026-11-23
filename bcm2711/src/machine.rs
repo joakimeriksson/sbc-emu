@@ -657,7 +657,8 @@ impl Machine {
             for (t, off) in [(s.vtimer, s.cntvoff), (s.ptimer, 0)] {
                 if t.ctl & 3 == 1 {
                     let ns = Self::ns_of_count(t.cval.wrapping_add(off));
-                    d = Some(d.map_or(ns, |x: u64| x.min(ns)));
+                    // an expired timer whose interrupt is off wakes nobody: it must not stop time
+                    if ns > self.now { d = Some(d.map_or(ns, |x: u64| x.min(ns))); }
                 }
             }
         }
@@ -697,9 +698,10 @@ impl Machine {
             }
             let round_start = self.now;
             self.round_end = if runnable == 1 { u64::MAX } else { round_start + quantum() };
-            let (last, n) = (self.cur, self.cpus.len());
+            let (last, n) = (self.breakpoints.last_turn(self.cur), self.cpus.len());
+            let watching = !self.cpus[0].watch.is_empty();
             for i in 0..n {
-                let k = self.breakpoints.turn(i, last, n);
+                let k = self.breakpoints.turn(i, last, n, watching);
                 if self.state[k] != CoreState::Run { continue; }
                 if let Some(stop) = self.slice(k, round_start, &mut total, end, &mut steps, &mut storm) { break 'run stop; }
                 if total >= end || steps == 0 { break; }
@@ -904,6 +906,7 @@ impl Machine {
         self.state[k] = CoreState::Run;
         let jit_off = self.cpus[k].jit_off;
         self.cpus[k].jit_off = true;
+        let turn = self.breakpoints.last_turn(self.cur);
         self.breakpoints.begin_step(k, self.cpus[k].pc);
         self.round_end = u64::MAX;
         let (mut total, mut steps, mut storm) = (self.instret(), 1, 0);
@@ -911,6 +914,7 @@ impl Machine {
         let t = self.cpus[k].now_ns().max(self.now);
         let r = self.slice(k, t, &mut total, u64::MAX, &mut steps, &mut storm);
         self.breakpoints.end_step(k);
+        self.breakpoints.keep_turn(turn);
         self.cpus[k].jit_off = jit_off;
         let t = self.cpus[k].now_ns();
         if t > self.now { self.now = t; }
