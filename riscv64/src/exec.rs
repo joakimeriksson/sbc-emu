@@ -351,7 +351,7 @@ impl Hart {
                 // fence, fence.i: memory is sequentially consistent; instructions are
                 // decoded from memory on every fetch
                 if f3(i) == 1 {
-                    self.fence_i += 1;
+                    self.fence_i = self.fence_i.wrapping_add(1);
                 }
             }
             0x2f => self.amo(bus, i, x1, x2)?,

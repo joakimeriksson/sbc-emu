@@ -42,6 +42,8 @@ const HDMI_INTERRUPT_STATUS1: usize = 0xc1;
 const HDMI_STATUS: usize = 0xc8;
 const M_INT_EDID_READY: u8 = 1 << 2;
 const M_HOTPLUG: u8 = 1 << 7;
+/// Where the EDID FIFO's read position stops (any address past the 128-byte block reads 0).
+const FIFO_END: usize = 1 << 16;
 
 /// A display timing, as an EDID detailed timing descriptor describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,7 +209,7 @@ impl Display {
         const FRAME_NS: u64 = 16_666_667;
         if now >= self.next_vblank {
             self.pending |= (self.panel_on(0) as u32) | (self.panel_on(1) as u32) << 1;
-            self.frames += 1;
+            self.frames = self.frames.wrapping_add(1);
             self.next_vblank = now - now % FRAME_NS + FRAME_NS;
         }
         Some(self.next_vblank)
@@ -218,7 +220,8 @@ impl Display {
         match r {
             HDMI_EDID_FIFO_ADDR => {
                 let b = self.edid_byte();
-                self.fifo_pos += 1;
+                // past the block every address reads 0: the position stops there
+                self.fifo_pos = (self.fifo_pos + 1).min(FIFO_END);
                 b as u32
             }
             // PHY pre-PLL and post-PLL locked
@@ -366,7 +369,16 @@ mod tests {
         let mut back = crate::Machine::new(8 << 20);
         back.restore(&m.save().unwrap()).unwrap();
         assert_eq!((back.soc.display.fifo_pos, back.soc.display.mode), (200, Mode::MODES[1]));
+        assert!(crate::machine::refused(|m| m.soc.display.fifo_pos = FIFO_END + 1).contains("EDID FIFO"));
         assert!(crate::machine::refused(|m| m.soc.display.fifo_pos = usize::MAX).contains("EDID FIFO"));
+        // the guest's own reads stop at FIFO_END, so what it saves restores
+        let mut m = crate::Machine::new(8 << 20);
+        m.soc.display.fifo_pos = FIFO_END - 1;
+        for _ in 0..3 {
+            assert_eq!(m.soc.display.hdmi_read(4 * HDMI_EDID_FIFO_ADDR as u64), 0);
+        }
+        assert_eq!(m.soc.display.fifo_pos, FIFO_END);
+        crate::Machine::new(8 << 20).restore(&m.save().unwrap()).unwrap();
         assert!(crate::machine::refused(|m| m.soc.display.mode.width = u32::MAX).contains("monitor mode"));
     }
 
@@ -399,9 +411,9 @@ mod tests {
 // Snapshots: the monitor's mode is the snapshot's (`--hdmi-mode`) until the guest reboots.
 emu_core::snap_struct!(Mode { clock_khz, width, hfp, hsync, hbp, height, vfp, vsync, vbp });
 emu_core::snap_struct!(Display { edid, fifo_pos, mode, pending, next_vblank, frames } fixed { dc, hdmi } after |d| {
-    // what a guest could not have made: the EDID FIFO read two billion bytes past its start
-    // (the address of the next byte would overflow), a monitor mode `--hdmi-mode` does not offer
-    if d.fifo_pos > i32::MAX as usize { return Err(emu_core::snap::SnapError(format!("the HDMI EDID FIFO at byte {}", d.fifo_pos))); }
+    // what a guest could not have made: the EDID FIFO read past where its position stops (the
+    // address of the next byte could overflow), a monitor mode `--hdmi-mode` does not offer
+    if d.fifo_pos > FIFO_END { return Err(emu_core::snap::SnapError(format!("the HDMI EDID FIFO at byte {}", d.fifo_pos))); }
     if !Mode::MODES.contains(&d.mode) { return Err(emu_core::snap::SnapError(format!("a monitor mode of {}x{}", d.mode.width, d.mode.height))); }
     Ok(())
 });

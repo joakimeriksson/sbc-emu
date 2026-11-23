@@ -382,7 +382,7 @@ impl AxiDmac {
 
     fn finish_block(&mut self, k: usize, ram: &mut [u8], ram_base: u64, sinks: &mut Sinks) {
         let Some(b) = self.ch[k].block.take() else { return };
-        self.transfers += 1;
+        self.transfers = self.transfers.wrapping_add(1);
         self.ch[k].regs[(CH_LLP / 8) as usize] = b.next;
         self.raise(k, IRQ_BLOCK_TRF);
         if b.last {
@@ -407,7 +407,8 @@ impl AxiDmac {
             }
             let rate = sinks.rate(b.dar, b.width);
             let c = &mut self.ch[k];
-            c.owed += elapsed * rate as u64;
+            // saturating: time since `last` may be anything a snapshot holds (or the clock jumped)
+            c.owed = c.owed.saturating_add(elapsed.saturating_mul(rate as u64));
             let due = c.owed / 1_000_000_000;
             c.owed %= 1_000_000_000;
             let n = due.min(b.items - b.done);
@@ -550,5 +551,21 @@ mod tests {
             assert!(crate::machine::refused(with(bad)).contains("audio DMA block"), "case {k}");
         }
         assert!(crate::machine::refused(|m| m.soc.dmac.ch[1].owed = u64::MAX).contains("owing"));
+    }
+
+    /// A transfer to the DAC that last moved at time 0, updated at the latest time a snapshot
+    /// may hold: the samples owed saturate rather than overflow, and the block completes.
+    #[test]
+    fn a_dac_transfer_after_a_long_gap_does_not_overflow() {
+        let mut ram = vec![0u8; 0x10000];
+        let mut dac = Pwmdac::default();
+        dac.write(4, 1 | (1 << 4), 48000);
+        let mut i2s = I2s::default();
+        let mut d = AxiDmac::default();
+        d.ch[0].enabled = true;
+        d.ch[0].block = Some(Block { sar: BASE + 0x1000, dar: PWMDAC_BASE, items: 480, done: 0, width: 4, last: true, next: 0 });
+        d.update(crate::machine::MAX_TIME_NS, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        assert_eq!(dac.capture.frames, 480);
+        assert!(!d.ch[0].enabled && d.ch[0].block.is_none());
     }
 }

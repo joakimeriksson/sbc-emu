@@ -592,7 +592,7 @@ impl Xhci {
         }
         if td.is_empty() { return None; }
         if self.trace { eprintln!("[xhci] slot {slot} dci {dci} TD {:?}", td.iter().map(|t| (t.ty(), t.len(), t.param)).collect::<Vec<_>>()); }
-        self.transfers += 1;
+        self.transfers = self.transfers.wrapping_add(1);
         let ev = |x: &mut Self, ram: &mut [u8], t: &Trb, cc: u32, residue: usize| {
             let ed = if t.ty() == T_EVENT_DATA { 1 << 2 } else { 0 };
             let param = t.addr;

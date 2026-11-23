@@ -197,7 +197,7 @@ impl Port {
         }
         let vector = self.ep[MSI_CAP + 3] & 31;
         self.bridge[(ISTATUS_MSI / 4) as usize] |= 1 << vector;
-        self.msis += 1;
+        self.msis = self.msis.wrapping_add(1);
         true
     }
 

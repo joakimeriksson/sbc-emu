@@ -105,7 +105,7 @@ impl SpiNor {
             let o = page + ((addr as usize + k) & 0xff);
             self.data[o] &= b;
         }
-        self.programmed += bytes.len() as u64;
+        self.programmed = self.programmed.wrapping_add(bytes.len() as u64);
         self.sr1 &= !2;
     }
 
@@ -115,7 +115,7 @@ impl SpiNor {
         }
         let start = addr as usize & !(size - 1) & (FLASH_SIZE - 1);
         self.data[start..start + size].fill(0xff);
-        self.erased += 1;
+        self.erased = self.erased.wrapping_add(1);
         self.sr1 &= !2;
     }
 
@@ -173,7 +173,7 @@ impl SpiNor {
             0xc7 | 0x60 => {
                 if self.wel() {
                     self.data.fill(0xff);
-                    self.erased += 1;
+                    self.erased = self.erased.wrapping_add(1);
                 }
                 self.sr1 &= !2;
                 Vec::new()

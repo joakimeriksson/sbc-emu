@@ -415,7 +415,7 @@ impl TempSensor {
         let start = v & 4 != 0 && self.ctrl & 4 == 0 && v & 1 != 0 && v & 2 == 0;
         self.ctrl = v;
         if start {
-            self.conversions += 1;
+            self.conversions = self.conversions.wrapping_add(1);
         }
         start
     }

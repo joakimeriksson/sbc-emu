@@ -256,7 +256,7 @@ impl Gmac {
                     }
                     if flags & LD != 0 && !self.tx_partial.is_empty() {
                         self.tx_out.push(std::mem::take(&mut self.tx_partial));
-                        self.tx_frames += 1;
+                        self.tx_frames = self.tx_frames.wrapping_add(1);
                     }
                     Self::put_word(ram, d + 12, flags & (FD | LD));
                 } else {
@@ -296,7 +296,7 @@ impl Gmac {
                 Self::put_word(ram, d + 8, 0);
                 Self::put_word(ram, d + 12, FD | LD | len as u32);
                 self.rx_queue.pop_front();
-                self.rx_frames += 1;
+                self.rx_frames = self.rx_frames.wrapping_add(1);
                 self.rx_index = (self.rx_index + 1) % count;
                 let s = self.r(CH_STATUS) | RI;
                 self.set(CH_STATUS, s);

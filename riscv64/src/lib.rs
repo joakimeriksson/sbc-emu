@@ -455,7 +455,7 @@ impl Hart {
 
     /// Take an exception (`interrupt` false) or interrupt with `cause` at the current pc.
     pub fn trap(&mut self, cause: u64, tval: u64, interrupt: bool) {
-        self.traps += 1;
+        self.traps = self.traps.wrapping_add(1);
         self.invalidate_fetch();
         let deleg = if interrupt { self.mideleg } else { self.medeleg };
         let code = if interrupt { cause | 1 << 63 } else { cause };

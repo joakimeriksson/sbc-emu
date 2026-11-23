@@ -132,7 +132,7 @@ pub fn run(fw: &mut Firmware, ram: &mut FlatRam, vm: &mut Vm, cmd: u32) {
         }
         cdm.kernel(&mut mem, k);
     }
-    fw.invocations += cdm.invocations;
+    fw.invocations = fw.invocations.wrapping_add(cdm.invocations);
     fw.gpu_faults += cdm.faults;
     if trace {
         eprintln!("[gpu cdm] job done: {} kernels, {} invocations, {} faults", kernels.len(), cdm.invocations, cdm.faults);

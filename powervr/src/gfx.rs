@@ -391,7 +391,7 @@ impl Gfx {
                         job.stats.vertices += verts.len() as u64;
                         assemble(&verts, topology, &ppp, &mut prims, &mut job.stats, trace)?;
                     }
-                    self.draws += 1;
+                    self.draws = self.draws.wrapping_add(1);
                 }
                 // STREAM_LINK
                 4 => {
@@ -406,7 +406,7 @@ impl Gfx {
                 t => return Err(format!("VDM control block type {t} ({w0:#010x})")),
             }
         }
-        self.prims += prims.len() as u64;
+        self.prims = self.prims.wrapping_add(prims.len() as u64);
         if trace {
             eprintln!("[gpu geom] hwrt {hwrt:#x}: {} primitives, {:?}", prims.len(), job.stats);
         }
@@ -1078,7 +1078,7 @@ impl Gfx {
         };
         let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace, stats: JobStats::default() };
         let tiles = render.run(&mut job, &scene.prims)?;
-        self.tiles += tiles;
+        self.tiles = self.tiles.wrapping_add(tiles);
         if trace {
             eprintln!("[gpu frag] hwrt {hwrt:#x}: {w}x{h}, {} primitives, {tiles} tiles, {:?}", scene.prims.len(), job.stats);
         }
@@ -1132,7 +1132,7 @@ impl Gfx {
         };
         let mut job = Job { mem, pds: Pds::default(), cache: HashMap::new(), trace, stats: JobStats::default() };
         let tiles = render.run(&mut job, &[])?;
-        self.tiles += tiles;
+        self.tiles = self.tiles.wrapping_add(tiles);
         if trace {
             eprintln!("[gpu tq] {tiles} tiles from tile {:?}", render.origin);
         }
