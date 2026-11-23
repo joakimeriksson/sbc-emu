@@ -60,3 +60,51 @@ fn a_refused_restore_changes_nothing() {
     m.restore(&early).unwrap();
     assert!(!m.in_pieces);
 }
+
+/// A restore that fails half way leaves the disks as they were, the card and the stick: they outlive
+/// the machine. Nor does it take the JIT away.
+#[test]
+fn the_disks_survive_a_failed_restore() {
+    let card = || Card { image: MemDisk::new(4096), written: Overlay::default(), persist: false, through: false };
+    let new = |sector: u64| {
+        let mut m = machine(false);
+        m.soc.devs.storage = Some(bcm2711::usbdev::Storage::new(Box::new(card())));
+        m.soc.sd.disk.as_mut().unwrap().write(sector, &[1; 512]);
+        m.soc.devs.storage.as_mut().unwrap().disk.write(sector, &[1; 512]);
+        m
+    };
+    let mut other = new(7);
+    other.soc.ram[65000] = 1;
+    let whole = miniz_oxide::inflate::decompress_to_vec(&other.save()[8..]).unwrap();
+    let mut m = new(9);
+    let jit = m.enable_jit();
+    assert!(m.restore_raw(&whole[..whole.len() - 10]).unwrap_err().contains("truncated") && m.in_pieces);
+    let (mut sd, mut stick) = ([0; 3 * 512], [0; 3 * 512]);
+    m.soc.sd.disk.as_mut().unwrap().read(7, &mut sd);
+    m.soc.devs.storage.as_mut().unwrap().disk.read(7, &mut stick);
+    for s in [sd, stick] { assert_eq!([s[0], s[512], s[1024]], [0, 0, 1]); }
+    assert_eq!(m.jit().is_some(), jit);
+    // a page that is not there: its number is in front of its 4096 bytes
+    let mut page = whole.clone();
+    let at = whole.len() - 4100;
+    assert_eq!(page[at..at + 4], (65000u32 / 4096).to_le_bytes());
+    page[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(m.restore_raw(&page).unwrap_err().contains("out of range"));
+    // and the whole one is as good as ever
+    m.restore_raw(&whole).unwrap();
+    m.soc.sd.disk.as_mut().unwrap().read(7, &mut sd);
+    assert_eq!([sd[0], sd[512], sd[1024]], [1, 0, 0]);
+    assert_eq!(m.jit().is_some(), jit);
+}
+
+/// What is set on the cores from outside (`--cpu-crypto`, a debugger) is not the guest's: it stays.
+#[test]
+fn a_restore_keeps_what_is_set_from_outside() {
+    let mut m = Machine::with_cpus(65 << 20, 2);
+    let snap = m.save();
+    m.set_crypto(true);
+    m.set_debugging(true);
+    for c in m.cpus.iter_mut() { c.watch = vec![(0x1000, 4, 1)]; }
+    m.restore(&snap).unwrap();
+    for c in &m.cpus { assert!(c.crypto && c.jit_off && c.watch == [(0x1000, 4, 1)]); }
+}

@@ -8,6 +8,8 @@ pub enum Effect {
     /// pause (true) or resume (false) the guest
     Pause(bool),
     Reset,
+    /// another machine state has been loaded: what was pending is not its
+    Restored,
     /// start a gdb stub on this port
     Gdb(u16),
 }
@@ -128,17 +130,28 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
         ("stop", _) => { out = "paused\n".into(); Effect::Pause(true) }
         ("cont" | "c", _) => Effect::Pause(false),
         ("savevm", [f]) => {
+            if m.in_pieces {
+                return ("no snapshot: the machine is in pieces\n".into(), Effect::None);
+            }
             let snap = m.save();
             out = match std::fs::write(f, &snap) { Ok(()) => format!("snapshot {} MiB -> {f}\n", snap.len() >> 20), Err(e) => format!("{f}: {e}\n") };
             Effect::None
         }
         ("loadvm", [f]) => {
-            out = match std::fs::read(f).map_err(|e| e.to_string()).and_then(|b| m.restore(&b)) {
-                Ok(()) => format!("restored {f}: guest time {:.1} s\n", m.now as f64 / 1e9),
-                Err(e) if m.in_pieces => format!("{f}: {e}\nthe machine is in pieces: it is reset\n"),
-                Err(e) => format!("{f}: {e}\n"),
-            };
-            if m.in_pieces { Effect::Reset } else { Effect::None }
+            match std::fs::read(f).map_err(|e| e.to_string()).and_then(|b| m.restore(&b)) {
+                Ok(()) => {
+                    out = format!("restored {f}: guest time {:.1} s\n", m.now as f64 / 1e9);
+                    Effect::Restored
+                }
+                Err(e) if m.in_pieces => {
+                    out = format!("{f}: {e}\nthe machine is in pieces: it is reset\n");
+                    Effect::Reset
+                }
+                Err(e) => {
+                    out = format!("{f}: {e}\n");
+                    Effect::None
+                }
+            }
         }
         ("screendump", [f]) => {
             let mut rgba = Vec::new();
@@ -189,4 +202,49 @@ pub fn command(m: &mut Machine, line: &str) -> (String, Effect) {
         _ => { out = format!("unknown command: {line} (help lists them)\n"); Effect::None }
     };
     (out, effect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn file(&self, name: &str, data: &[u8]) -> String {
+            let path = self.0.join(name).to_str().unwrap().to_string();
+            std::fs::write(&path, data).unwrap();
+            path
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn loadvm() {
+        let dir = Dir(std::env::temp_dir().join(format!("sbc-monitor-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let mut m = Machine::new(65 << 20);
+        let good = dir.file("good", &m.save());
+        assert!(matches!(command(&mut m, &format!("loadvm {good}")).1, Effect::Restored));
+        // nothing changed: nothing to reset
+        for (bad, why) in [(dir.file("cut", &m.save()[..60]), "damaged"), (dir.file("no", b"hello"), "not an"), (dir.file("cores", &Machine::with_cpus(65 << 20, 2).save()), "--smp 2")] {
+            let (text, effect) = command(&mut m, &format!("loadvm {bad}"));
+            assert!(matches!(effect, Effect::None) && text.contains(why) && text.len() < 400 && !m.in_pieces, "{text}");
+        }
+        // half way (written sectors, which cannot go onto a write-through image): the machine is
+        // reset, and is not saved before
+        let card = dir.file("card", &vec![0; 2 << 20]);
+        let mut cow = Machine::new(65 << 20);
+        cow.soc.sd.disk = Some(Box::new(crate::disk::CowFile::open(&card).unwrap()));
+        cow.soc.sd.disk.as_mut().unwrap().write(7, &[1; 512]);
+        let half = dir.file("half", &cow.save());
+        drop(cow); // the image's lock
+        m.soc.sd.disk = Some(Box::new(crate::disk::CowFile::open_persistent(&card).unwrap()));
+        let (text, effect) = command(&mut m, &format!("loadvm {half}"));
+        assert!(matches!(effect, Effect::Reset) && m.in_pieces, "{text}");
+        let piece = dir.file("piece", b"");
+        assert!(command(&mut m, &format!("savevm {piece}")).0.contains("in pieces") && std::fs::read(&piece).unwrap().is_empty());
+        assert!(matches!(command(&mut m, &format!("loadvm {good}")).1, Effect::Restored) && !m.in_pieces);
+    }
 }
