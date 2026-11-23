@@ -83,11 +83,14 @@ impl Blend {
             });
         }
         // Enabled, non-sRGB fixed-function/opaque output to any render target with a
-        // non-raw conversion; no blend shader.
+        // non-raw conversion; no blend shader. The conversion's register format is
+        // the shader's (BLEND with an auto register format).
         if words[0] & 0xffff & !0x901 != 0x200
             || words[2] & !(3 | (3 << 3) | (15 << 16)) != 0
             || !matches!(words[2] & 3, 1 | 2)
-            || words[3] & 0xffc0_0000 != 0
+            // Conversion: memory format, no raw, any register format (F16 to U16).
+            || words[3] & 0xf8c0_0000 != 0
+            || (words[3] >> 24) & 7 > 5
             || words[1] & 0x0f000000 != 0
         {
             return Err(());
@@ -160,6 +163,15 @@ impl Blend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_conversion_with_a_float_register_format_decodes() {
+        // glmark2's desktop scene: opaque, round to FB precision, F32 register format.
+        let b = Blend::decode([0xa00, 0xf0122122, 0x19, 0x010ed000]).unwrap();
+        assert_eq!(b.apply_f([0.25, 0.5, 0.75, 1.], [0.; 4], true), [0.25, 0.5, 0.75, 1.]);
+        // Raw conversions and register formats past U16 are not.
+        assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x004ed000]).is_err());
+        assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x060ed000]).is_err());
+    }
     #[test]
     fn captured_source_over_preserves_alpha_and_draw_order() {
         let b = Blend::decode([0x201, 0xf0503503, 0x1a, 0xed000]).unwrap();

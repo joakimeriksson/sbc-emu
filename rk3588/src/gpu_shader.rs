@@ -60,6 +60,11 @@ pub struct Fragment {
     pub sample_positions: u64,
     /// The thread's lane in its 2x2 quad: x in bit 0, y in bit 1.
     pub lane: u32,
+    /// The thread's pixel.
+    pub pixel: [u32; 2],
+    /// The framebuffer size, for a pre/post-frame shader: its varyings (LD_VAR_IMM)
+    /// interpolate across Mesa's full-screen rectangle.
+    pub frame: Option<[u32; 2]>,
 }
 impl Fragment {
     pub fn new(blend: [u32; 2]) -> Self {
@@ -992,6 +997,7 @@ impl Shader {
                 return Ok(Next::Continue);
             }
             0x045 => return Ok(Next::Continue), // BARRIER: threads run in order
+            0x054 => return self.ld_var_imm(env, i),
             0x056 => return self.ld_var_special(i),
             0x05c | 0x05d | 0x06c | 0x06d => return self.ld_var_buf(i, u),
             0x05e => return self.lea_buf_imm(env, i),

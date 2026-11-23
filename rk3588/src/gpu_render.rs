@@ -20,7 +20,12 @@ fn word(b: &[u8], n: usize) -> u32 {
 fn pair(b: &[u8], n: usize) -> u64 {
     word(b, n) as u64 | (word(b, n + 1) as u64) << 32
 }
+/// An unsupported fragment job setting (where, with `SBC_MALI_DEBUG=1`).
+#[track_caller]
 fn unsupported() -> Stop {
+    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+        eprintln!("[mali] unsupported fragment job setting at {}", std::panic::Location::caller());
+    }
     Stop::Unsupported { pc: 0, opcode: 7 }
 }
 fn trace() -> bool {
@@ -343,7 +348,7 @@ pub fn fragment_frame(
         let w0 = word(&rt, 0);
         let w1 = word(&rt, 1);
         let internal = w0 >> 26;
-        let layout = tib_layout(internal).ok_or_else(unsupported)?;
+        let layout = tib_layout(internal).ok_or_else(|| unsupported())?;
         if w0 & 15 != 0 || w0 & (1 << 24) != 0 {
             return Err(unsupported()); // AFRC/YUV writeback
         }
@@ -379,7 +384,7 @@ pub fn fragment_frame(
         let block = (w1 >> 8) & 15;
         let format = (w1 >> 3) & 31;
         let write = if write_enable {
-            let bpp = writeback_bytes(format).ok_or_else(unsupported)?;
+            let bpp = writeback_bytes(format).ok_or_else(|| unsupported())?;
             // AFBC: no split or wide (32x8) blocks.
             if !matches!(block, 1 | 2 | 12 | 13) || block >= 12 && word(&rt, 2) & 6 != 0 {
                 return Err(unsupported());

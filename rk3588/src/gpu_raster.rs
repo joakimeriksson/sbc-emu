@@ -21,7 +21,12 @@ fn word(b: &[u8], n: usize) -> u32 {
 fn reg(r: &[u32; 256], n: usize) -> u64 {
     r[n] as u64 | ((r[n + 1] as u64) << 32)
 }
+/// An unsupported fragment job setting (where, with `SBC_MALI_DEBUG=1`).
+#[track_caller]
 fn bad() -> Stop {
+    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+        eprintln!("[mali] unsupported fragment job setting at {}", std::panic::Location::caller());
+    }
     Stop::Unsupported { pc: 0, opcode: 7 }
 }
 
@@ -216,8 +221,13 @@ impl State {
                 );
             }
             blend_words[k] = [word(&b, 2), word(&b, 3)];
-            let blend = crate::gpu_blend::Blend::decode(std::array::from_fn(|n| word(&b, n)))
-                .map_err(|_| bad())?;
+            let words: [u32; 4] = std::array::from_fn(|n| word(&b, n));
+            let blend = crate::gpu_blend::Blend::decode(words).map_err(|e| {
+                if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                    eprintln!("[mali] blend descriptor {k} {words:08x?}: {e:?}");
+                }
+                bad()
+            })?;
             blends.push((k, blend));
         }
         let spd = r.spd;
@@ -356,6 +366,8 @@ struct Raster<'a, 'b> {
     occlusion: u64,
     /// The fragment threads of the current quad, reused across quads.
     lanes: Option<Box<[Shader; 4]>>,
+    /// The framebuffer size when running a pre/post-frame shader.
+    frame: Option<[u32; 2]>,
 }
 
 pub fn draw(
@@ -395,7 +407,7 @@ fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &
             Ram::Ro(r) => Ram::Ro(r),
         };
         let env = Env::with_ram(m, view, uniforms, &mut code, &mut tlb, &mut textures);
-        let mut r = Raster { env, fb, tb, budget: FRAME_BUDGET, occlusion: 0, lanes: None };
+        let mut r = Raster { env, fb, tb, budget: FRAME_BUDGET, occlusion: 0, lanes: None, frame: None };
         r.draw(draw, &st)?;
         occlusion.push(r.occlusion);
     }
@@ -423,7 +435,7 @@ fn draw_parallel(
             .iter_mut()
             .map(|band| s.spawn(move || render(m, Ram::Ro(ram), fb, band, frame)))
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or(Err(bad()))).collect()
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(bad()))).collect()
     });
     let mut total = vec![0u64; frame.draws.len()];
     for r in &results {
@@ -489,6 +501,7 @@ pub fn frame_shader(
         budget: FRAME_BUDGET,
         occlusion: 0,
         lanes: None,
+        frame: Some([fb.width, fb.height]),
     };
     let pixel = |_x: u32, _y: u32| Pixel {
         covered: true,
@@ -903,6 +916,8 @@ impl Raster<'_, '_> {
             f.frag_w = p.w;
             f.point = p.point;
             f.lane = k as u32;
+            f.pixel = [x, y];
+            f.frame = self.frame;
             f.color = [None; 8];
             f.raw = [None; 8];
             f.depth = None;
@@ -949,7 +964,7 @@ impl Raster<'_, '_> {
         run_quad(&mut lanes, &mut self.env, budget).map_err(Stop::Shader)?;
         let spent: u64 = lanes.iter().map(|l| l.instructions).sum();
         crate::gpu::work(spent, px.iter().filter(|p| p.passed).count() as u64, 0);
-        self.budget = self.budget.checked_sub(spent).ok_or_else(bad)?;
+        self.budget = self.budget.checked_sub(spent).ok_or_else(|| bad())?;
         for (k, lane) in lanes.iter().enumerate() {
             let p = px[k];
             let f = lane.fragment.as_ref().unwrap();

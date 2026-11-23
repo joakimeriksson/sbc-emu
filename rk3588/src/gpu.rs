@@ -88,7 +88,10 @@ impl Gpu {
             WORK_PS.store(0, Ordering::Relaxed);
             match self.firmware.queues(&self.spaces,ram){Ok(bits)=>self.raw[0]|=bits,Err(e)=>eprintln!("[mali] firmware queue error {:?}",e)}
             let ps=WORK_PS.swap(0, Ordering::Relaxed);
-            if ps>0 { self.cost_ns+=ps/1000+1000; }
+            if ps>0 {
+                self.cost_ns+=ps/1000+1000;
+                if std::env::var_os("SBC_MALI_TIMING").is_some() { eprintln!("[mali] doorbell work: {} us virtual", ps/1_000_000); }
+            }
         }
     }
     /// Take the virtual time of the GPU work done by the last writes (ns).

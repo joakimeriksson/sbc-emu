@@ -340,6 +340,33 @@ mod tests {
         }
     }
     #[test]
+    fn frame_shader_varyings_interpolate_mesas_full_screen_rectangle() {
+        // Mesa's preload: LD_VAR_IMM.v2.f32 r0:r1, table 1, index 0; the attribute's
+        // four vertices are the framebuffer's corners (here 8x4), in window coordinates.
+        let (m, resources, mut ram) = fixture();
+        put(&mut ram, 0x3004, 32);
+        for (n, v) in [0f32, 0., 8., 0., 0., 4., 8., 4.].into_iter().enumerate() {
+            put(&mut ram, 0x4000 + n * 4, v.to_bits());
+        }
+        let i: u64 = 0x54 << 48 | 2 << 46 | 2 << 33 | 1 << 28 | 2 << 24 | 1 << 8 | 0x7d;
+        ram[..8].copy_from_slice(&i.to_le_bytes());
+        let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+        shader.resources = resources;
+        shader.fragment = Some(crate::gpu_shader::Fragment {
+            frame: Some([8, 4]),
+            pixel: [3, 1],
+            active: true,
+            ..Default::default()
+        });
+        assert_eq!(shader.run(&m, &mut ram, &[], 1), Err(crate::gpu_shader::Error::Budget));
+        assert_eq!(&shader.regs[..2], &[3.5f32.to_bits(), 1.5f32.to_bits()]);
+        // Outside a frame shader it is not modelled.
+        let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+        shader.resources = resources;
+        shader.fragment = Some(crate::gpu_shader::Fragment::default());
+        assert!(matches!(shader.run(&m, &mut ram, &[], 1), Err(crate::gpu_shader::Error::Unsupported { .. })));
+    }
+    #[test]
     fn signed_offsets_instance_frequency_and_buffer_bounds() {
         let (m, resources, mut ram) = fixture();
         put(&mut ram, 0x2008, (-8i32) as u32);
