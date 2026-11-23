@@ -1,15 +1,19 @@
 //! Valhall fragment jobs: framebuffer descriptors, the tile buffer and writeback
 //! (Mesa genxml v10.xml: Framebuffer Parameters, ZS CRC Extension, Render Target).
 //!
-//! The job's bounding box is rendered at once into a host tile buffer: colour per render
-//! target (in the internal format's precision), depth and stencil. Render targets start
-//! from their clear colour, or are loaded from memory when the frame has pre-frame
-//! (preload) shaders and the target is not cleared. Draws from the tiler are then
-//! rasterized (gpu_raster.rs) and the result is written back, linear or 16x16
-//! u-interleaved, with the target's swizzle and writeback format. Depth/stencil
-//! writeback follows the ZS CRC extension. Every memory destination is validated before
-//! any pixel is written. AFBC/AFRC targets, multisampled writeback and raw (non-blendable)
-//! internal formats fault.
+//! The job's bounding box is rendered into a host tile buffer: colour per render target
+//! (in the internal format's precision), depth and stencil. Render targets start from
+//! their clear colour, or are loaded from memory when the frame has pre-frame (preload)
+//! shaders and the target is not cleared. Draws from the tiler are then rasterized
+//! (gpu_raster.rs) and the result is written back, linear, 16x16 u-interleaved or AFBC,
+//! with the target's swizzle and writeback format. Depth/stencil writeback follows the
+//! ZS CRC extension. Every memory destination is validated before any pixel is written.
+//! AFRC targets, multisampled writeback and raw (non-blendable) internal formats fault.
+//!
+//! The tile buffer holds at most `PASS_BYTES`: a larger box is rendered in passes of
+//! whole 16-row tile rows, each written back before the next (a fault in a later pass
+//! leaves the earlier ones written, as a GPU's finished tiles are). A job that only
+//! clears writes its clear values without a tile buffer.
 use crate::{
     gpu_cs::Stop,
     gpu_mmu::{Access, AddressSpace, Fault},
@@ -25,6 +29,14 @@ fn pair(b: &[u8], n: usize) -> u64 {
 fn unsupported() -> Stop {
     if std::env::var_os("SBC_MALI_DEBUG").is_some() {
         eprintln!("[mali] unsupported fragment job setting at {}", std::panic::Location::caller());
+    }
+    Stop::Unsupported { pc: 0, opcode: 7 }
+}
+/// A fragment job over a host bound: a job error the guest sees as a queue fault.
+#[track_caller]
+fn limit(what: &str) -> Stop {
+    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+        eprintln!("[mali] fragment job refused at {}: {what}", std::panic::Location::caller());
     }
     Stop::Unsupported { pc: 0, opcode: 7 }
 }
@@ -91,6 +103,8 @@ pub struct TileBuffer {
     pub y0: u32,
     pub w: u32,
     pub h: u32,
+    /// Per render target; empty for a target that is not written back (no shader reads
+    /// the tile buffer, so it could not be seen).
     pub color: Vec<Vec<[f32; 4]>>,
     pub depth: Vec<f32>,
     pub stencil: Vec<u8>,
@@ -104,7 +118,41 @@ pub struct TileBuffer {
 }
 /// Rows per stripe of a fragment worker (a multiple of the 2x2 quad).
 const STRIPE: u32 = 16;
+/// Host bytes of a tile buffer (per pixel 16 per written render target, depth and stencil).
+const PASS_BYTES: usize = 64 << 20;
+/// Primitive and draw visits of a job rendered in passes (each pass visits all of them).
+const PASS_VISITS: usize = 1 << 26;
+thread_local! {
+    /// Tests: force the bytes and visits of a pass.
+    pub(crate) static PASS: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    /// The last tile buffer's storage, reused (allocating and faulting in tens of MB for
+    /// every frame showed up in the frame time).
+    static SPARE: std::cell::RefCell<(Vec<Vec<[f32; 4]>>, Vec<f32>, Vec<u8>)> = Default::default();
+}
 impl TileBuffer {
+    /// A tile buffer for the box holding the clear values (`None`: a target that is not
+    /// written back), from reused storage.
+    fn cleared(x0: u32, y0: u32, w: u32, h: u32, clears: &[Option<[f32; 4]>], depth: f32, stencil: u8) -> Self {
+        let mut t = TileBuffer::new(x0, y0, w, h);
+        let count = (w * h) as usize;
+        (t.color, t.depth, t.stencil) = SPARE.take();
+        t.color.resize_with(clears.len(), Vec::new);
+        for (c, v) in t.color.iter_mut().zip(clears) {
+            c.clear();
+            if let Some(v) = v {
+                c.resize(count, *v);
+            }
+        }
+        t.depth.clear();
+        t.depth.resize(count, depth);
+        t.stencil.clear();
+        t.stencil.resize(count, stencil);
+        t
+    }
+    /// Keep this buffer's storage for the next one.
+    fn recycle(self) {
+        SPARE.set((self.color, self.depth, self.stencil));
+    }
     pub fn new(x0: u32, y0: u32, w: u32, h: u32) -> Self {
         TileBuffer {
             x0,
@@ -145,8 +193,8 @@ impl TileBuffer {
         }
         let w = self.w as usize;
         for (k, c) in self.color.iter().enumerate() {
-            t.color.push(Vec::with_capacity(owned.len() * w));
-            for &y in &owned {
+            t.color.push(Vec::with_capacity(if c.is_empty() { 0 } else { owned.len() * w }));
+            for &y in owned.iter().filter(|_| !c.is_empty()) {
                 let a = self.index(self.x0, y);
                 t.color[k].extend_from_slice(&c[a..a + w]);
             }
@@ -163,7 +211,7 @@ impl TileBuffer {
         let w = self.w as usize;
         for y in (self.y0..self.y0 + self.h).filter(|&y| part.owns(y)) {
             let (a, b) = (self.index(self.x0, y), part.index(self.x0, y));
-            for (c, p) in self.color.iter_mut().zip(&part.color) {
+            for (c, p) in self.color.iter_mut().zip(&part.color).filter(|(c, _)| !c.is_empty()) {
                 c[a..a + w].copy_from_slice(&p[b..b + w]);
             }
             self.depth[a..a + w].copy_from_slice(&part.depth[b..b + w]);
@@ -512,71 +560,118 @@ pub fn fragment_frame(
             }
         }
     }
-    // The tile buffer: clear or preload.
-    let count = (w * h) as usize;
-    let mut tb = TileBuffer::new(x0, y0, w, h);
-    tb.depth = vec![f32::from_bits(word(&f, 13)); count];
-    tb.stencil = vec![word(&f, 12) as u8; count];
-    for t in fb.targets.iter() {
-        tb.color.push(vec![t.clear; count]);
-    }
-    // Pre-frame shaders (Mesa's preload) load targets that are not cleared.
-    let dcds = pair(&f, 6);
-    for k in 0..2 {
-        if (word(&f, 0) >> (3 * k)) & 7 != 0 {
-            crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 128 * k as u64)?;
-        }
-    }
-    if let Some(frame) = frame {
-        crate::gpu_raster::draw(m, ram, &fb, &mut tb, frame)?;
-    }
-    if (word(&f, 0) >> 6) & 7 != 0 {
-        crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 256)?;
-    }
-    // Writeback.
+    // The tile buffer: clear or preload, then draws, a pass of rows at a time.
+    let draws = frame.map_or(0, |f| f.draws.len());
+    let shaders = word(&f, 0) & 0x1ff != 0;
+    let depth = f32::from_bits(word(&f, 13));
+    let stencil = word(&f, 12) as u8;
+    let clears: Vec<Option<[f32; 4]>> = fb.targets.iter().map(|t| t.write.map(|_| t.clear)).collect();
     let written = destinations.iter().map(|(n, _)| fb.targets[*n].write.unwrap().bpp).sum::<u64>()
         + zs.map_or(0, |(_, s)| s.bpp);
     crate::gpu::work(0, 0, written * w as u64 * h as u64);
-    for (n, rows) in &destinations {
-        let t = &fb.targets[*n];
-        let s = t.write.unwrap();
-        let mut px = [0u8; 4];
-        let f = |i: usize, out: &mut [u8]| {
-            let bytes = t.pack(tb.color[*n][i], &mut px);
-            out.copy_from_slice(&px[..bytes]);
-        };
-        match s.afbc {
-            Some(l) => afbc_store(m, ram, &l, x0, y0, w, h, f)?,
-            None => store(ram, &s, rows, x0, y0, w, h, f),
-        }
-    }
-    if let (Some((format, s)), Some(rows)) = (zs, zs_rows.as_ref()) {
-        let f = |i: usize, out: &mut [u8]| {
-            let z = tb.depth[i].clamp(0., 1.);
-            let st = tb.stencil[i] as u32;
-            match format {
-                1 => out.copy_from_slice(&((z * 65535.).round() as u16).to_le_bytes()),
-                14 => out.copy_from_slice(&z.to_bits().to_le_bytes()),
-                _ => {
-                    let d = (z as f64 * 16777215.).round() as u32;
-                    let mut old = u32::from_le_bytes(out[..4].try_into().unwrap());
-                    if z_write {
-                        old = (old & 0xff00_0000) | d;
-                    }
-                    if s_write && format == 5 {
-                        old = (old & 0x00ff_ffff) | st << 24;
-                    }
-                    out.copy_from_slice(&old.to_le_bytes());
-                }
+    // Write rows py0..py0 + ph back, from the tile buffer or (only clears) the clear values.
+    let writeback = |ram: &mut [u8], py0: u32, ph: u32, tb: Option<&TileBuffer>| -> Result<(), Stop> {
+        // This pass's rows (linear) or tile rows (u-interleaved) of the validated spans.
+        let part = |rows: &Vec<Vec<(usize, usize)>>, tiled: bool| -> std::ops::Range<usize> {
+            if rows.is_empty() {
+                0..0
+            } else if tiled {
+                (py0 / 16 - y0 / 16) as usize..((py0 + ph - 1) / 16 - y0 / 16) as usize + 1
+            } else {
+                (py0 - y0) as usize..(py0 - y0 + ph) as usize
             }
         };
-        match s.afbc {
-            Some(l) => afbc_store(m, ram, &l, x0, y0, w, h, f)?,
-            None => store(ram, &s, rows, x0, y0, w, h, f),
+        for (n, rows) in &destinations {
+            let t = &fb.targets[*n];
+            let s = t.write.unwrap();
+            let mut px = [0u8; 4];
+            let bytes = t.pack(t.clear, &mut px);
+            let clear = px;
+            let f = |i: usize, out: &mut [u8]| match tb {
+                Some(tb) => {
+                    let bytes = t.pack(tb.color[*n][i], &mut px);
+                    out.copy_from_slice(&px[..bytes]);
+                }
+                None => out.copy_from_slice(&clear[..bytes]),
+            };
+            match s.afbc {
+                Some(l) => afbc_store(m, ram, &l, x0, py0, w, ph, f)?,
+                None => store(ram, &s, &rows[part(rows, s.tiled)], x0, py0, w, ph, f),
+            }
+        }
+        if let (Some((format, s)), Some(rows)) = (zs, zs_rows.as_ref()) {
+            let f = |i: usize, out: &mut [u8]| {
+                let (z, st) = tb.map_or((depth, stencil), |tb| (tb.depth[i], tb.stencil[i]));
+                let z = z.clamp(0., 1.);
+                let st = st as u32;
+                match format {
+                    1 => out.copy_from_slice(&((z * 65535.).round() as u16).to_le_bytes()),
+                    14 => out.copy_from_slice(&z.to_bits().to_le_bytes()),
+                    _ => {
+                        let d = (z as f64 * 16777215.).round() as u32;
+                        let mut old = u32::from_le_bytes(out[..4].try_into().unwrap());
+                        if z_write {
+                            old = (old & 0xff00_0000) | d;
+                        }
+                        if s_write && format == 5 {
+                            old = (old & 0x00ff_ffff) | st << 24;
+                        }
+                        out.copy_from_slice(&old.to_le_bytes());
+                    }
+                }
+            };
+            match s.afbc {
+                Some(l) => afbc_store(m, ram, &l, x0, py0, w, ph, f)?,
+                None => store(ram, &s, &rows[part(rows, s.tiled)], x0, py0, w, ph, f),
+            }
+        }
+        Ok(())
+    };
+    let mut touched = false;
+    if draws == 0 && !shaders {
+        // Only clears: every pixel holds its clear values.
+        writeback(ram, y0, h, None)?;
+    } else {
+        let row_bytes = w as usize * (16 * destinations.len() + 5);
+        let (pass_bytes, pass_visits) = PASS.with(|p| p.get()).unwrap_or((PASS_BYTES, PASS_VISITS));
+        let fit = pass_bytes / row_bytes;
+        let pass_rows = if fit >= h as usize { h } else { (fit as u32 / 16 * 16).max(16) };
+        let passes = if pass_rows >= h { 1 } else { (y1 / pass_rows - y0 / pass_rows + 1) as usize };
+        let primitives: usize = frame.map_or(0, |f| f.draws.iter().map(|d| d.primitives.len()).sum());
+        if passes > 1 && (primitives + draws).saturating_mul(passes) > pass_visits {
+            return Err(limit("primitives times passes of rows"));
+        }
+        let mut budget = crate::gpu_raster::BUDGET.with(|b| b.get()).unwrap_or(crate::gpu_raster::FRAME_BUDGET);
+        let mut counts = vec![0u64; draws];
+        let dcds = pair(&f, 6);
+        let mut py0 = y0;
+        while py0 <= y1 {
+            let py1 = if passes == 1 { y1 } else { ((py0 / pass_rows + 1) * pass_rows - 1).min(y1) };
+            let ph = py1 - py0 + 1;
+            let mut tb = TileBuffer::cleared(x0, py0, w, ph, &clears, depth, stencil);
+            // Pre-frame shaders (Mesa's preload) load targets that are not cleared.
+            for k in 0..2 {
+                if (word(&f, 0) >> (3 * k)) & 7 != 0 {
+                    crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 128 * k as u64, &mut budget)?;
+                }
+            }
+            if let Some(frame) = frame {
+                crate::gpu_raster::draw(m, ram, &fb, &mut tb, frame, &mut budget, &mut counts)?;
+            }
+            if (word(&f, 0) >> 6) & 7 != 0 {
+                crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 256, &mut budget)?;
+            }
+            writeback(ram, py0, ph, Some(&tb))?;
+            touched |= tb.touched;
+            tb.recycle();
+            py0 = py1 + 1;
+        }
+        if let Some(frame) = frame {
+            crate::gpu_raster::occlusion(m, ram, frame, &counts)?;
         }
     }
     // A drawn tile is not a uniform clear: invalidate its checksum.
-    let checksum = if frame.is_some_and(|f| !f.draws.is_empty()) || tb.touched {
+    let checksum = if draws != 0 || touched {
         0u64.to_le_bytes()
     } else {
         pair(&ext, 2).to_le_bytes()
@@ -693,17 +788,9 @@ fn afbc_store(
     Ok(())
 }
 
-/// Physical address of byte `offset` within a validated row's spans.
-fn locate(spans: &[(usize, usize)], mut offset: usize) -> Option<usize> {
-    for &(p, len) in spans {
-        if offset < len {
-            return Some(p + offset);
-        }
-        offset -= len;
-    }
-    None
-}
-/// Visit every pixel of the box with its bytes in memory.
+/// Visit every pixel of the box with its bytes in memory: `rows` are the box's validated
+/// spans, one per row (linear) or per tile row (u-interleaved, 16 rows contiguously). Each
+/// is gathered, updated and scattered back.
 #[allow(clippy::too_many_arguments)]
 fn store(
     ram: &mut [u8],
@@ -716,55 +803,32 @@ fn store(
     mut f: impl FnMut(usize, &mut [u8]),
 ) {
     let bpp = s.bpp as usize;
-    if !s.tiled {
-        // Linear rows: gather, update and scatter each row through its spans.
-        let mut row = vec![0u8; w as usize * bpp];
-        for (r, spans) in rows.iter().enumerate() {
-            let mut off = 0;
-            for &(p, len) in spans {
-                row[off..off + len].copy_from_slice(&ram[p..p + len]);
-                off += len;
-            }
-            let base = r * w as usize;
-            for (x, px) in row.chunks_exact_mut(bpp).enumerate() {
-                f(base + x, px);
-            }
-            let mut off = 0;
-            for &(p, len) in spans {
-                ram[p..p + len].copy_from_slice(&row[off..off + len]);
-                off += len;
-            }
+    let mut buf = Vec::new();
+    for (r, spans) in rows.iter().enumerate() {
+        buf.clear();
+        for &(p, len) in spans {
+            buf.extend_from_slice(&ram[p..p + len]);
         }
-        return;
-    }
-    for y in y0..y0 + h {
-        for x in x0..x0 + w {
-            let (row, off) = if s.tiled {
-                let ty = (y / 16 - y0 / 16) as usize;
-                let first = s.offset(x0 & !15, (y / 16) * 16);
-                (ty, (s.offset(x, y) - first) as usize)
-            } else {
-                ((y - y0) as usize, ((x - x0) as usize) * bpp)
-            };
-            let i = ((y - y0) * w + (x - x0)) as usize;
-            // Pixels never straddle a page within a validated span unless bpp does not
-            // divide 4096 (RGB888); gather bytes individually then.
-            let spans = &rows[row];
-            if let (Some(a), Some(b)) = (locate(spans, off), locate(spans, off + bpp - 1)) {
-                if b == a + bpp - 1 {
-                    f(i, &mut ram[a..a + bpp]);
-                    continue;
+        if s.tiled {
+            let ty = y0 / 16 + r as u32;
+            let first = s.offset(x0 & !15, ty * 16);
+            for y in (ty * 16).max(y0)..(ty * 16 + 16).min(y0 + h) {
+                let base = ((y - y0) * w) as usize;
+                for x in x0..x0 + w {
+                    let at = (s.offset(x, y) - first) as usize;
+                    f(base + (x - x0) as usize, &mut buf[at..at + bpp]);
                 }
             }
-            let mut tmp = [0u8; 4];
-            let addrs: Vec<usize> = (0..bpp).filter_map(|k| locate(spans, off + k)).collect();
-            for (k, &a) in addrs.iter().enumerate() {
-                tmp[k] = ram[a];
+        } else {
+            let base = r * w as usize;
+            for (x, px) in buf.chunks_exact_mut(bpp).enumerate() {
+                f(base + x, px);
             }
-            f(i, &mut tmp[..bpp]);
-            for (k, &a) in addrs.iter().enumerate() {
-                ram[a] = tmp[k];
-            }
+        }
+        let mut off = 0;
+        for &(p, len) in spans {
+            ram[p..p + len].copy_from_slice(&buf[off..off + len]);
+            off += len;
         }
     }
 }

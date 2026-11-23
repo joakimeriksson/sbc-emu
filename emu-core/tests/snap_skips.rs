@@ -26,6 +26,7 @@ const APPROVED: &[(&str, &str, &str)] = &[
     ("rk3588", "I2sTdm", "capture out"),                    // --audio-out, what was recorded
     ("rk3588", "Machine", "breakpoints dtb mt multi"),      // the debugger's; the boot's; threads and the choice to use them
     ("rk3588", "Pe", "cached"),                             // a cache, dropped by the Gic's `after`
+    ("rk3588", "Tiler", "bytes primitives"),                // totals of its frames, counted again by `after`
     ("rk3588", "Xhci", "trace"),                            // debugging output
     ("powervr", "Firmware", "trace trace_jobs"),           // debugging output
     ("powervr", "Gpu", "trace"),                            // debugging output

@@ -196,3 +196,69 @@ fn afbc_render_target_round_trips_through_its_headers() {
         assert_eq!(p, expected);
     }
 }
+/// Bytes of the tile-buffer storage kept on this thread.
+fn spare_bytes() -> usize {
+    SPARE.with(|s| {
+        let s = s.borrow();
+        s.0.iter().map(|c| c.capacity() * 16).sum::<usize>() + s.1.capacity() * 4 + s.2.capacity()
+    })
+}
+#[test]
+fn a_clear_only_job_needs_no_tile_buffer() {
+    // A full 1080p clear: written straight from the clear colour.
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let (w, h) = (1920u32, 1080u32);
+    let mut r = vec![0u8; 0x10000 + (w * h * 4) as usize];
+    let mut f = [0u32; 48];
+    f[8] = (w - 1) | ((h - 1) << 16);
+    f[10] = (w - 1) | ((h - 1) << 16);
+    f[12] = 1 << 29;
+    f[32] = 1 << 26;
+    f[33] = 1 | (19 << 3) | (2 << 8) | (0x688 << 16);
+    f[40] = 0x10000;
+    f[42] = w * 4;
+    f[44..48].fill(0xff112233);
+    for (i, v) in f.iter().enumerate() {
+        r[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut regs = [0; 256];
+    regs[43] = (w - 1) | ((h - 1) << 16);
+    fragment(&m, &mut r, &regs).unwrap();
+    assert!(r[0x10000..].chunks_exact(4).all(|p| p == [0x33, 0x22, 0x11, 0xff]));
+    assert_eq!(spare_bytes(), 0);
+}
+#[test]
+fn the_tile_buffer_of_a_huge_box_stays_bounded() {
+    // 8192x8192 with eight render targets that are not written back (a tiny descriptor):
+    // these took (16 x 8 + 5) bytes per pixel, 9 GB. Now no storage for the targets, and
+    // depth/stencil in passes of PASS_BYTES.
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let mut r = vec![0u8; 0x1000];
+    let mut f = [0u32; 32 + 8 * 16];
+    let size = 8191 | (8191 << 16);
+    f[8] = size;
+    f[10] = size;
+    f[11] = (7 << 19) | (2 << 6);
+    f[12] = 1 << 29;
+    f[14] = 0x800; // a tiler context: the frame below
+    for n in 0..8 {
+        f[32 + 16 * n] = 1 << 26;
+    }
+    for (i, v) in f.iter().enumerate() {
+        r[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut regs = [0; 256];
+    regs[43] = size;
+    // One triangle far outside the box, skipped by every pass.
+    let mut draw = crate::gpu_tiler::Draw::default();
+    draw.regs[43] = size;
+    draw.positions = vec![[-100., -100., 0., 1.], [-90., -100., 0., 1.], [-100., -90., 0., 1.]];
+    draw.primitives = vec![[0, 1, 2, 2]];
+    let mut frame = crate::gpu_tiler::Frame::default();
+    frame.draws.push(draw);
+    crate::gpu_raster::BANDS.with(|b| b.set(Some((1, 16))));
+    fragment_frame(&m, &mut r, &regs, Some(&frame)).unwrap();
+    crate::gpu_raster::BANDS.with(|b| b.set(None));
+    let kept = spare_bytes();
+    assert!(kept > 0 && kept <= PASS_BYTES, "{kept}");
+}
