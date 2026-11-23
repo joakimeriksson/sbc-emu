@@ -806,7 +806,8 @@ impl Shader {
             i & (1 << 46) != 0
         };
         // VAR_TEX has no write mask: it writes the first components that fill its staging
-        // registers (Mesa shrinks them to the components the shader uses).
+        // registers. (Mesa 25.0 fuses VAR_TEX only before v9, always for four components;
+        // the staging count is the instruction's to give.)
         let mask = if var_tex {
             (1 << (write_count * if wide { 1 } else { 2 }).min(4)) - 1
         } else {

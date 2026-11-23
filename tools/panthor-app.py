@@ -37,7 +37,7 @@ def guest_program(app, frames, benchmarks):
         return f'kmscube -c {frames}', 'Rendered'
     for b in benchmarks:
         # The emulator's script expands \n, \r, \t; the guest's shell reads a line.
-        if '\\' in b or any(ord(c) < 32 for c in b):
+        if '\\' in b or any(ord(c) < 32 or ord(c) == 127 for c in b):
             raise ValueError(f'benchmark option with a backslash or control character: {b!r}')
     # glmark2-es2-drm renders full screen at the largest mode the monitor offers.
     program = 'glmark2-es2-drm ' + ' '.join(f'-b {shlex.quote(b)}' for b in benchmarks)
