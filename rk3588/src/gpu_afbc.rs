@@ -23,29 +23,34 @@ pub struct Layout {
     pub body_offset: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Memory(Fault),
     Compressed,
 }
 
+/// Bytes of a pixel the headers can hold as a solid colour (bytes 8-15).
+pub const MAX_BPP: usize = 8;
+
 impl Layout {
-    fn index(&self, sx: u32, sy: u32) -> u64 {
+    /// The superblock's header index (None: beyond 64-bit addresses).
+    fn index(&self, sx: u32, sy: u32) -> Option<u64> {
+        let (x, y, stride) = (sx as u64, sy as u64, self.stride as u64);
         if self.tiled {
-            let (x, y) = (sx, sy);
             let i = (x & 1) | ((y << 1) & 2) | ((x << 1) & 4) | ((y << 2) & 8) | ((x << 2) & 16) | ((y << 3) & 32);
-            ((y & !7) * self.stride + ((x & !7) << 3) + i) as u64
+            (y & !7).checked_mul(stride)?.checked_add((x & !7) << 3)?.checked_add(i)
         } else {
-            (sy * self.stride + sx) as u64
+            (y * stride).checked_add(x)
         }
     }
-    pub fn header_address(&self, sx: u32, sy: u32) -> u64 {
-        self.header + 16 * self.index(sx, sy)
+    pub fn header_address(&self, sx: u32, sy: u32) -> Option<u64> {
+        self.index(sx, sy)?.checked_mul(16)?.checked_add(self.header)
     }
     fn subblock(px: u32, py: u32) -> usize {
         ((py / 4) * 4 + px / 4) as usize
     }
-    /// Read the pixel at (x, y): `bpp` bytes into `out`.
+    /// Read the pixel at (x, y): `bpp` bytes into `out`. Pixels wider than 8 bytes have
+    /// no AFBC form (`Compressed`, as for data the model cannot decode).
     pub fn read_pixel(
         &self,
         read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), Fault>,
@@ -53,8 +58,12 @@ impl Layout {
         y: u32,
         out: &mut [u8],
     ) -> Result<(), Error> {
+        if self.bpp > MAX_BPP || out.len() != self.bpp {
+            return Err(Error::Compressed);
+        }
+        let far = Error::Memory(Fault::AddressSize);
         let mut h = [0u8; 16];
-        read(self.header_address(x / 16, y / 16), &mut h).map_err(Error::Memory)?;
+        read(self.header_address(x / 16, y / 16).ok_or(far)?, &mut h).map_err(Error::Memory)?;
         let bits = u128::from_le_bytes(h);
         let size = |n: usize| ((bits >> (32 + 6 * n)) & 63) as u64;
         let (px, py) = (x % 16, y % 16);
@@ -76,7 +85,8 @@ impl Layout {
             return Err(Error::Compressed);
         }
         let within = ((py % 4) * 4 + px % 4) as u64 * self.bpp as u64;
-        read(self.header + offset + within, out).map_err(Error::Memory)
+        let a = self.header.checked_add(offset + within).ok_or(far)?;
+        read(a, out).map_err(Error::Memory)
     }
     /// Read a whole superblock's pixels, row-major (256 * bpp bytes).
     pub fn read_superblock(
@@ -95,10 +105,14 @@ impl Layout {
         Ok(pixels)
     }
     /// Encode a superblock (row-major pixels) as sixteen uncompressed subblocks:
-    /// (header address, header, payload address, payload).
-    pub fn encode(&self, sx: u32, sy: u32, pixels: &[u8]) -> (u64, [u8; 16], u64, Vec<u8>) {
-        let slot = self.body_offset + self.index(sx, sy) * 256 * self.bpp as u64;
-        let mut bits = slot as u32 as u128;
+    /// (header address, header, payload address, payload). None when the payload slot
+    /// is past the header's 32-bit offset or the addresses pass 2^64.
+    pub fn encode(&self, sx: u32, sy: u32, pixels: &[u8]) -> Option<(u64, [u8; 16], u64, Vec<u8>)> {
+        let slot = self.index(sx, sy)?.checked_mul(256 * self.bpp as u64)?.checked_add(self.body_offset)?;
+        let offset = u32::try_from(slot).ok()?;
+        let header = self.header_address(sx, sy)?;
+        let payload = self.header.checked_add(slot)?;
+        let mut bits = offset as u128;
         for n in 0..16 {
             bits |= 1u128 << (32 + 6 * n);
         }
@@ -110,7 +124,7 @@ impl Layout {
                 body.extend_from_slice(&pixels[at..at + 4 * self.bpp]);
             }
         }
-        (self.header_address(sx, sy), bits.to_le_bytes(), self.header + slot, body)
+        Some((header, bits.to_le_bytes(), payload, body))
     }
 }
 
@@ -123,7 +137,7 @@ mod tests {
         for tiled in [false, true] {
             let l = Layout { header: 0x100, stride: 8, tiled, bpp: 4, body_offset: 0x1000 };
             let pixels: Vec<u8> = (0..1024u32).map(|n| (n * 7 + tiled as u32) as u8).collect();
-            let (ha, h, ba, body) = l.encode(3, 2, &pixels);
+            let (ha, h, ba, body) = l.encode(3, 2, &pixels).unwrap();
             mem[ha as usize..ha as usize + 16].copy_from_slice(&h);
             mem[ba as usize..ba as usize + body.len()].copy_from_slice(&body);
             let mut read = |a: u64, out: &mut [u8]| {
@@ -148,6 +162,28 @@ mod tests {
     fn tiled_headers_follow_mesas_morton_order() {
         let l = Layout { header: 0, stride: 16, tiled: true, bpp: 4, body_offset: 0 };
         // Mesa get_morton_index(1, 0) = 1, (0, 1) = 2, (2, 0) = 4, (8, 0) = 64, (0, 8) = 128.
-        assert_eq!([l.index(1, 0), l.index(0, 1), l.index(2, 0), l.index(8, 0), l.index(0, 8)], [1, 2, 4, 64, 128]);
+        assert_eq!([(1, 0), (0, 1), (2, 0), (8, 0), (0, 8)].map(|(x, y)| l.index(x, y).unwrap()), [1, 2, 4, 64, 128]);
+    }
+    #[test]
+    fn guest_layouts_fault_instead_of_overflowing_or_panicking() {
+        let mut read = |_: u64, out: &mut [u8]| {
+            out.fill(0); // a zeroed header: one solid colour
+            Ok(())
+        };
+        // A 16-byte format (RGBA32F) cannot be a solid colour in a 16-byte header.
+        let wide = Layout { header: 0, stride: 1, tiled: false, bpp: 16, body_offset: 0 };
+        assert_eq!(wide.read_pixel(&mut read, 0, 0, &mut [0u8; 16]), Err(Error::Compressed));
+        // Headers and payload slots past 2^64, or past the 32-bit payload offset.
+        for tiled in [false, true] {
+            let far = Layout { header: u64::MAX - 64, stride: 1 << 28, tiled, bpp: 4, body_offset: 0 };
+            assert_eq!(
+                far.read_pixel(&mut read, 64, u32::MAX, &mut [0u8; 4]),
+                Err(Error::Memory(Fault::AddressSize))
+            );
+            assert!(far.encode(u32::MAX / 16, u32::MAX / 16, &[0u8; 1024]).is_none());
+        }
+        let l = Layout { header: 0, stride: 1 << 20, tiled: false, bpp: 4, body_offset: 0 };
+        assert!(l.encode(0, 5, &[0u8; 1024]).is_none()); // slot 5 << 30 does not fit 32 bits
+        assert!(l.encode(0, 3, &[0u8; 1024]).is_some());
     }
 }

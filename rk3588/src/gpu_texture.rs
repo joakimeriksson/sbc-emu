@@ -328,11 +328,17 @@ impl Texture {
                     return Err(Error::Unsupported);
                 }
                 let tiled = word(&p, 0) & (1 << 19) != 0;
+                // AFBC has no format wider than 64 bits (a solid colour fills the rest
+                // of a 16-byte header).
+                let bpp = format_info(format).unwrap().0;
+                if bpp > crate::gpu_afbc::MAX_BPP {
+                    return Err(Error::Unsupported);
+                }
                 Some(crate::gpu_afbc::Layout {
                     header: pair(&p, 2),
                     stride: word(&p, 4) / (16 * if tiled { 8 } else { 1 }),
                     tiled,
-                    bpp: format_info(format).unwrap().0,
+                    bpp,
                     body_offset: 0,
                 })
             } else {
@@ -859,6 +865,19 @@ mod tests {
     }
     fn bytes(v: [f32; 4]) -> [u8; 4] {
         v.map(|v| (v * 255.).round() as u8)
+    }
+    #[test]
+    fn afbc_planes_of_formats_wider_than_64_bits_fault() {
+        // An AFBC plane (type 6) with RGBA32F and a zeroed (solid-colour) header: the
+        // 16-byte texel cannot come from the header; this used to panic the host.
+        let (m, resources, mut ram, h) = test_fixture();
+        set(&mut ram, 0x2100, (2 << 24) | 0x6a);
+        ram[0x3000..0x3080].fill(0);
+        set(&mut ram, 0x2040, (191 << 22) | 0x22);
+        assert_eq!(sample2d(&m, &mut ram, resources, h, [0.25, 0.25]), Err(Error::Unsupported));
+        // The same header as RGBA8 is a solid colour.
+        set(&mut ram, 0x2040, (187 << 22) | 0x22);
+        assert_eq!(sample2d(&m, &mut ram, resources, h, [0.25, 0.25]), Ok([0.; 4]));
     }
     #[test]
     fn native_resources_sample_padded_rows_and_descriptor_indices() {

@@ -611,7 +611,9 @@ fn rows(
         // Headers and payload slots of every superblock the box touches.
         for sy in y0 / 16..=(y0 + h - 1) / 16 {
             for sx in x0 / 16..=(x0 + w - 1) / 16 {
-                let (ha, _, ba, body) = l.encode(sx, sy, &vec![0u8; 256 * l.bpp]);
+                let Some((ha, _, ba, body)) = l.encode(sx, sy, &vec![0u8; 256 * l.bpp]) else {
+                    return Err(Stop::Memory(Fault::AddressSize));
+                };
                 let check = m.chunks(ram, ha, 16, access, true).and_then(|_| m.chunks(ram, ba, body.len(), access, true));
                 if let Err(f) = check {
                     if std::env::var_os("SBC_MALI_DEBUG").is_some() {
@@ -683,7 +685,7 @@ fn afbc_store(
                     f(((y - y0) * w + (x - x0)) as usize, &mut pixels[at..at + bpp]);
                 }
             }
-            let (ha, header, ba, body) = l.encode(sx, sy, &pixels);
+            let (ha, header, ba, body) = l.encode(sx, sy, &pixels).ok_or(Stop::Memory(Fault::AddressSize))?;
             m.write(ram, ha, &header, true).map_err(Stop::Memory)?;
             m.write(ram, ba, &body, true).map_err(Stop::Memory)?;
         }
