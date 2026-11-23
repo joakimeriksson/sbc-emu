@@ -10,7 +10,10 @@ TXZ=debian-13-nocloud-arm64-20261116-2664.tar.xz
 URL=https://cloud.debian.org/images/cloud/trixie/20261116-2664/$TXZ
 SHA=9e2f39589c5eac8d727099e42dba91746231dfe425995c6a90b6a541735d6776c5b08f71ee6841f0b0f31080eddfb2f09998a0e0553292dbdce9994c405fb0b1
 mkdir -p "$OUT"
-[ -f "$OUT/$TXZ" ] || { curl -fL --retry 3 -o "$OUT/$TXZ.part" "$URL" && mv "$OUT/$TXZ.part" "$OUT/$TXZ"; }
+if [ ! -f "$OUT/$TXZ" ]; then
+  curl -fL --retry 3 -o "$OUT/$TXZ.part" "$URL"
+  mv "$OUT/$TXZ.part" "$OUT/$TXZ"
+fi
 actual=$(shasum -a 512 "$OUT/$TXZ" | cut -d' ' -f1)
 [ "$actual" = "$SHA" ] || { echo "$TXZ: sha512 $actual, expected $SHA (delete it to fetch it again)" >&2; exit 1; }
 if [ ! -f "$OUT/disk.raw" ]; then
