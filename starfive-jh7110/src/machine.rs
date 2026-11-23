@@ -552,7 +552,7 @@ impl Soc {
             // word (PHY register 1) reads 0: no requests, so no clock switches.
             _ if a == DMC_CTRL + 0x504 => r32(*self.stub(a) | 1 << 31),
             _ if a == DMC_CTRL + 0x518 => {
-                self.dmc_status_reads = self.dmc_status_reads.wrapping_add(1);
+                self.dmc_status_reads = self.dmc_status_reads.saturating_add(1);
                 r32(if self.dmc_status_reads == 1 { 2 } else { 0 })
             }
             _ if a == DMC_PHY + 4 => r32(0),

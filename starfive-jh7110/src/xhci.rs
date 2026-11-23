@@ -661,7 +661,7 @@ impl Xhci {
             let epn = (dci / 2) as u8;
             if dci % 2 == 1 {
                 let want: usize = td.iter().map(buf_len).sum();
-                let Some(got) = dev.data_in(epn, want) else { self.transfers -= 1; return Some(false) };
+                let Some(got) = dev.data_in(epn, want) else { self.transfers = self.transfers.wrapping_sub(1); return Some(false) };
                 self.scatter(ram, &td, &got);
                 complete(self, ram, &td, got.len());
             } else {
