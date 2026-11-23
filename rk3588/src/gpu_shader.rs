@@ -72,8 +72,14 @@ impl Fragment {
     }
 }
 
+/// binary16 to binary32 for every half value (256 KiB, built on first use).
+static HALF: std::sync::OnceLock<Box<[u32]>> = std::sync::OnceLock::new();
 #[inline]
 fn half(value: u16) -> f32 {
+    let table = HALF.get_or_init(|| (0..=u16::MAX).map(|h| half_slow(h).to_bits()).collect());
+    f32::from_bits(table[value as usize])
+}
+fn half_slow(value: u16) -> f32 {
     let sign = ((value as u32) & 0x8000) << 16;
     let exp = ((value >> 10) & 31) as u32;
     let mant = (value & 1023) as u32;
@@ -85,6 +91,19 @@ fn half(value: u16) -> f32 {
 /// IEEE binary32 to binary16, round to nearest with ties to even.
 #[inline]
 fn pack_half(value: f32) -> u16 {
+    let b = value.to_bits();
+    let e = (b >> 23) & 255;
+    if (113..=142).contains(&e) {
+        // Normal binary16 results: round the mantissa to nearest, ties to even.
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let r = ((e - 112) << 10) | ((b & 0x7fffff) >> 13);
+        let rem = b & 0x1fff;
+        let r = r + u32::from(rem > 0x1000 || rem == 0x1000 && r & 1 == 1);
+        return sign | r as u16;
+    }
+    pack_half_slow(value)
+}
+fn pack_half_slow(value: f32) -> u16 {
     let b = value.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 255) as i32;
