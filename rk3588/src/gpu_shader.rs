@@ -519,6 +519,24 @@ fn frexp(x: f32, sqrt: bool, log: bool) -> (f32, i32) {
     }
     (m, e)
 }
+/// FLOGD: log2(m)/(m - 1) of the log-reduced mantissa m of x, so that Mesa's
+/// FMA(FLOGD(x), FADD_LSCALE(-1, x), exponent of x) is log2(x). For 0 the product must
+/// be -inf with FADD_LSCALE(-1, 0) = -1, so FLOGD(0) is +inf.
+fn flogd(x: f32) -> f32 {
+    if x < 0. || x.is_nan() {
+        f32::NAN
+    } else if x == 0. || x.is_infinite() {
+        f32::INFINITY
+    } else {
+        let m = frexp(x, false, true).0 as f64;
+        let r = if (m - 1.).abs() < 1e-12 { std::f64::consts::LOG2_E } else { m.log2() / (m - 1.) };
+        r as f32
+    }
+}
+/// FADD_LSCALE: `a` plus the log-reduced mantissa of `b` (see flogd).
+fn fadd_lscale(a: f32, b: f32) -> f32 {
+    a + frexp(b, false, true).0
+}
 fn fmin(a: f32, b: f32) -> f32 {
     a.min(b)
 }
@@ -1168,7 +1186,7 @@ impl Shader {
                     }
                     // FADD_LSCALE: A plus the log-reduced mantissa of B (see FLOGD).
                     9 => {
-                        clamp(cl, o.f32_plain(0)? + frexp(o.f32_plain(1)?, false, true).0).to_bits()
+                        clamp(cl, fadd_lscale(o.f32_plain(0)?, o.f32_plain(1)?)).to_bits()
                     }
                     _ => return Err(None),
                 }
@@ -1464,24 +1482,8 @@ impl Shader {
                 }
             }
             8 => {
-                // FLOGD: log2(m)/(m - 1) of the log-reduced mantissa m, so that
-                // FLOGD(x) * FADD_LSCALE(-1, x) + exponent = log2(x).
-                let x = o.f32(0)?;
-                if x < 0. || x.is_nan() {
-                    f32::NAN.to_bits()
-                } else if x == 0. {
-                    f32::NEG_INFINITY.to_bits()
-                } else if x.is_infinite() {
-                    f32::INFINITY.to_bits()
-                } else {
-                    let m = frexp(x, false, true).0 as f64;
-                    let r = if (m - 1.).abs() < 1e-12 {
-                        std::f64::consts::LOG2_E
-                    } else {
-                        m.log2() / (m - 1.)
-                    };
-                    (r as f32).to_bits()
-                }
+                // FLOGD: log2(m)/(m - 1) of the log-reduced mantissa m (see flogd).
+                flogd(o.f32(0)?).to_bits()
             }
             10 | 11 => {
                 let x = if sub == 10 { o.f32(0)? } else { o.v2f16(0)?[0] };
