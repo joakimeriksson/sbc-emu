@@ -181,9 +181,11 @@ impl Tiler {
         }
         // A frame without draws (only clears) still has a tiler context.
         let empty = Frame::default();
-        let started = std::time::Instant::now();
+        // (Instant::now panics in the browser, so only when timing is asked for.)
+        let timing = std::env::var_os("SBC_MALI_TIMING").is_some();
+        let started = timing.then(std::time::Instant::now);
         crate::gpu_render::fragment_frame(m, ram, r, Some(frame.unwrap_or(&empty)))?;
-        if std::env::var_os("SBC_MALI_TIMING").is_some() {
+        if let Some(started) = started {
             let f = frame.unwrap_or(&empty);
             let prims: usize = f.draws.iter().map(|d| d.primitives.len()).sum();
             eprintln!(
