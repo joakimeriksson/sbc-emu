@@ -873,6 +873,35 @@ pub(crate) fn test_fixture() -> (crate::gpu_mmu::AddressSpace, Resources, Vec<u8
     (m, Resources(0x1020), ram, (4 << 27) | (3 << 11))
 }
 
+/// Make the fixture's texture `cubes` cube maps of `levels` levels (2x2, 1x1, ...) with
+/// nearest mipmapping. Each surface is one colour: red = 20 x layer + 5 x level + 5, where
+/// layer = 6 x cube + face (Mesa's order: faces as layers, levels innermost).
+#[cfg(test)]
+pub(crate) fn cube_fixture(ram: &mut [u8], cubes: u32, levels: u32) {
+    let set = |ram: &mut [u8], at: usize, v: u32| ram[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    set(ram, 0x2040, (187 << 22) | 0x02); // texture, dimension cube
+    set(ram, 0x2048, 0x688 | ((levels - 1) << 16));
+    set(ram, 0x2058, cubes - 1);
+    let ctl = u32::from_le_bytes(ram[0x2000..0x2004].try_into().unwrap());
+    set(ram, 0x2000, (ctl & !(3 << 30)) | (2 << 30)); // nearest mipmap
+    for layer in 0..6 * cubes {
+        for level in 0..levels {
+            let n = layer * levels + level;
+            let plane = 0x2100 + n as usize * 32;
+            let texels = 0x4000 + n * 0x80;
+            let size = if level == 0 { 0x10001 } else { 0 };
+            let words = [(2 << 24) | (2 << 8) | 0x1a, 72, texels, 0, 64, 0, 128, size];
+            for (k, &w) in words.iter().enumerate() {
+                set(ram, plane + k * 4, w);
+            }
+            for at in [0, 4, 64, 68] {
+                let at = texels as usize + at;
+                ram[at..at + 4].copy_from_slice(&[(20 * layer + 5 * level + 5) as u8, 0, 0, 255]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +995,38 @@ mod tests {
             };
             let (v, _) = sample(&mut env, resources, &r).unwrap();
             assert_eq!(bytes(v.map(f32::from_bits)), [face as u8 * 40, 0, 0, 255], "face {face}");
+        }
+    }
+    #[test]
+    fn cube_arrays_and_levels_select_their_surface() {
+        // Two cubes of two levels: 24 surfaces.
+        let (m, resources, mut ram, _) = test_fixture();
+        cube_fixture(&mut ram, 2, 2);
+        for cube in 0..2u32 {
+            for face in 0..6u32 {
+                for level in 0..2u32 {
+                    let mut code = crate::gpu_shader::Code::default();
+                    let mut tlb = crate::gpu_shader::Tlb::default();
+                    let mut textures = Cache::default();
+                    let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+                    let s = 0.5f32.to_bits();
+                    let r = Request {
+                        texture: (4, 0),
+                        sampler: (3, 0),
+                        dim: 3,
+                        coords: [(face << 29) | (s & 0x1fff_ffff), 0.5f32.to_bits(), 0, 0],
+                        integer: false,
+                        layer: Some(cube),
+                        reference: None,
+                        offset: [0; 3],
+                        lod: Lod::Explicit(level as f32),
+                        gather: None,
+                    };
+                    let (v, _) = sample(&mut env, resources, &r).unwrap();
+                    let red = (20 * (6 * cube + face) + 5 * level + 5) as u8;
+                    assert_eq!(bytes(v.map(f32::from_bits)), [red, 0, 0, 255], "cube {cube} face {face} level {level}");
+                }
+            }
         }
     }
     #[test]

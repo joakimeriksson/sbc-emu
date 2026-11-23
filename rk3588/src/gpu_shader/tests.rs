@@ -461,6 +461,44 @@ mod fragment_tests {
         assert_eq!(run(false, 3), None);
         assert_eq!(run(true, 5), None);
     }
+    #[test]
+    fn implicit_lod_on_a_cube_face_differentiates_s_without_the_face() {
+        // TEX_SINGLE, cube, implicit LOD, coordinates in r4 (face 2 over s) and r5 (t),
+        // four f32 results from r0; a 2x2 quad whose s steps by `ds` per pixel. The
+        // texture is two levels (2x2, 1x1) of one cube.
+        let run = |ds: f32| -> [u32; 4] {
+            let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+            crate::gpu_texture::cube_fixture(&mut ram, 1, 2);
+            let mut i = 0x4128009413c02042u64
+                & !((15 << 22) | (7 << 36) | (1 << 46) | (63 << 16) | (63 << 40) | (7 << 13) | (3 << 28) | (7 << 33));
+            i |= (15 << 22) | (3 << 36) | (1 << 46) | (4 << 40) | (1 << 13) | (3 << 28) | (2 << 33);
+            ram[..8].copy_from_slice(&i.to_le_bytes());
+            ram[8..16].copy_from_slice(&0x7800c00000000000u64.to_le_bytes());
+            let (mut code, mut tlb, mut textures) = (Code::default(), Tlb::default(), crate::gpu_texture::Cache::default());
+            let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+            let mut lanes: [Shader; 4] = std::array::from_fn(|k| {
+                let mut s = Shader::with_allocation(0, RegisterAllocation::Registers32);
+                s.resources = resources;
+                let mut f = Fragment::new([0, 0]);
+                f.lane = k as u32;
+                s.fragment = Some(f);
+                let sv = 0.25 + ds * (k & 1) as f32;
+                s.regs[2] = h;
+                s.regs[4] = (2 << 29) | (sv.to_bits() & 0x1fff_ffff);
+                s.regs[5] = (0.25 + 0.01 * (k >> 1) as f32).to_bits();
+                s
+            });
+            run_quad(&mut lanes, &mut env, 16).unwrap();
+            std::array::from_fn(|k| lanes[0].regs[k])
+        };
+        // Face 2 is layer 2: level 0 red 45, level 1 red 50.
+        let red = |v: u8| [f32::from(v) / 255., 0., 0., 1.].map(f32::to_bits);
+        // s steps by half a texel of level 0 per pixel: level 0. (With the face bits the
+        // difference would be about 2^63 and select the last level.)
+        assert_eq!(run(0.25), red(45));
+        // Two texels per pixel: level 1.
+        assert_eq!(run(1.), red(50));
+    }
     fn interpolation_fixture() -> Interpolation {
         let values = [0f32, 1., 0., 0., 0.5, 0.5, 0., 0., 1., 0., 0., 0.];
         Interpolation {
