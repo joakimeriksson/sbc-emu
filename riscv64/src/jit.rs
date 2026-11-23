@@ -1,9 +1,10 @@
 //! The block JIT's driver: which code is compiled, when compiled code is still valid, and the
 //! loop that runs a hart through compiled blocks and the interpreter.
 //!
-//! Two code generators share this driver: `jit_a64.rs` (RISC-V to AArch64, on AArch64 macOS
-//! and Linux hosts) and `jit_wasm.rs` (RISC-V to WebAssembly, browser builds). Elsewhere
-//! [`AVAILABLE`] is false and [`run`] interprets everything.
+//! Three code generators share this driver: `jit_a64.rs` (RISC-V to AArch64, on AArch64 macOS
+//! and Linux hosts), `jit_x64.rs` (RISC-V to x86-64, on x86-64 Linux hosts) and `jit_wasm.rs`
+//! (RISC-V to WebAssembly, browser builds). Elsewhere [`AVAILABLE`] is false and [`run`]
+//! interprets everything.
 //!
 //! - **Keyed by physical address.** A compiled region lies in one 4 KiB page and is found by
 //!   the physical address of its entry, so the four harts share it and a page mapped at
@@ -63,11 +64,14 @@ fn front_slot(pa: u64) -> usize {
     (pa >> 1) as usize & (FRONT - 1)
 }
 
-/// Whether this build can compile (AArch64 macOS and Linux hosts, browser builds).
-pub const AVAILABLE: bool = cfg!(any(target_arch = "wasm32", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))));
+/// Whether this build can compile (AArch64 macOS and Linux hosts, x86-64 Linux hosts, browser
+/// builds).
+pub const AVAILABLE: bool = cfg!(any(target_arch = "wasm32", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")));
 
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 use crate::jit_a64 as native;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use crate::jit_x64 as native;
 
 /// Executions of a block's entry before it is compiled.
 pub const DEFAULT_HOT: u32 = 64;
@@ -113,7 +117,7 @@ pub struct Jit {
     /// functions installed and not yet freed by a flush
     slots: usize,
     /// the native code buffer (allocated at the first compile)
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")))]
     code: Option<native::CodeCache>,
 }
 
@@ -130,7 +134,7 @@ impl Default for Jit {
             epoch: 0,
             generation: 0,
             slots: 0,
-            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")))]
             code: None,
         }
     }
@@ -150,7 +154,7 @@ impl Jit {
         if self.slots > 0 {
             #[cfg(target_arch = "wasm32")]
             crate::jit_wasm::reset();
-            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")))]
             if let Some(c) = self.code.as_mut() {
                 c.reset();
             }
@@ -275,7 +279,7 @@ pub fn run<B: Bus>(h: &mut Hart, bus: &mut B, jit: &mut Jit, budget: u64) -> u64
 }
 
 /// Whether compiled code links regions through the jump cache (native code).
-const LINKS: bool = cfg!(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")));
+const LINKS: bool = cfg!(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")));
 
 /// Run the compiled region `f` (the hart's pc is its entry).
 #[inline(always)]
@@ -284,7 +288,7 @@ fn call(h: &mut Hart, f: usize) {
     // the reserved address clears it); LR and SC leave compiled code, so this is re-decided
     let table = if h.reservation != u64::MAX { UT_NONE } else { h.utlb_table() };
     h.jit_ut = h.tlb.utlb.as_ptr() as usize + table * 2 * UT * std::mem::size_of::<crate::mmu::UEntry>();
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")))]
     {
         // fetches are made in the current mode: the region's code for this pc in this mode
         let table = h.prv as usize;
@@ -306,7 +310,7 @@ fn compile(jit: &mut Jit, h: &Hart, code: &[u8], pc: u64) -> Entry {
     if let Some(r) = crate::jit_wasm::compile(code, pc, h.jit_step as u32) {
         return region(r);
     }
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux")))]
     {
         if jit.code.is_none() {
             jit.code = native::CodeCache::new(native::CODE_BYTES);
