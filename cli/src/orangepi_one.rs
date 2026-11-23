@@ -194,7 +194,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     eprintln!(
         "[orangepi-one] experimental Allwinner H3: four Cortex-A7s ({}, A32 + Thumb-2 + VFPv4 + NEON), GIC-400, UART0, timers, SD card, \
          HDMI (DE2 mixer, TCON, DW-HDMI), USB, Ethernet; PSCI by the host; other devices are stubs",
-        if jit { "JIT to AArch64" } else { "interpreter" }
+        if !jit { "interpreter" } else if cfg!(target_arch = "x86_64") { "JIT to x86-64" } else { "JIT to AArch64" }
     );
     serial_board::run(config, make_machine)
 }
