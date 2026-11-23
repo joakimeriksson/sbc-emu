@@ -85,11 +85,13 @@ pub fn run(code: &[u32], entry: usize, params: &[u32], m: &mut dyn Methods) {
         let imm = (i as i32 >> 14) as u32;
         let ending = last;
         let taken = branch.take();
-        let exit = i >> 7 & 1 != 0 && i & 7 != 7;
+        // (a branch with it: the end when it is not taken)
+        let mut exit = i >> 7 & 1 != 0;
         let mut skip_delay = false;
         if i & 7 == 7 {
             // branch on a register being zero (or not); bit 5: no delay slot
             if (r[a] != 0) == (i >> 4 & 1 != 0) {
+                exit = false;
                 let target = (pc as i64 + imm as i32 as i64) as usize;
                 if i >> 5 & 1 != 0 {
                     skip_delay = true;
@@ -216,6 +218,19 @@ mod tests {
         let mut m = M(Vec::new());
         run(&code, 0, &[5, 3], &mut m);
         assert_eq!(m.0, [(0x1800, 6), (0x1804, 7), (0x1808, 8), (0x180c, 77)]);
+    }
+
+    #[test]
+    fn a_branch_not_taken_can_be_the_end() {
+        // Mesa's VERTEX_ARRAY_PER_INSTANCE: $r1 times a bit of the parameter, "exit branz"; then the
+        // next macro's code, which must not run
+        let code = [
+            0x0000_0301, 0x0000_0211, 0x0588_0021, 0xffff_c911, 0x0040_d043, 0xffff_8897, 0x0000_5211,
+            0x0536_0021, 0x0040_4042, 0x0040_4042,
+        ];
+        let mut m = M(Vec::new());
+        run(&code, 0, &[2, 2], &mut m);
+        assert_eq!(m.0, [(0x1880, 0), (0x1884, 1)]);
     }
 
     #[test]
