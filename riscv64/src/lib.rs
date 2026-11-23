@@ -731,3 +731,19 @@ impl Hart {
         }
     }
 }
+
+// Snapshots: the architectural state and what reports count. The TLBs and the JIT's tables are
+// caches (dropped); `id` is the machine's, `watch` the debugger's.
+emu_core::snap_struct!(Hart {
+    x, f, pc, prv, misa, mstatus, mie, mip_sw, irq_lines, mideleg, medeleg, mtvec, mscratch, mepc, mcause, mtval,
+    mcounteren, mcountinhibit, stvec, sscratch, sepc, scause, stval, satp, scounteren, fcsr, pmpcfg, pmpaddr,
+    cycle, instret, wfi, reservation, traps, fence_i, dev_access, last_illegal,
+} skip { id, tlb, fetch_page, fetch_off, jit_ut, jit_bus, jit_step, chain_until, jit_jc, jit_gen, jit_lr, jit_tmp, jit_fence_seen, watch }
+after |h| {
+    if !matches!(h.prv, prv::U | prv::S | prv::M) {
+        return Err(emu_core::snap::SnapError(format!("hart in privilege mode {}", h.prv)));
+    }
+    h.tlb.flush();
+    h.invalidate_fetch();
+    Ok(())
+});

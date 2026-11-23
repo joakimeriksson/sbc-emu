@@ -426,8 +426,59 @@ impl Nvme {
     }
 }
 
+// Snapshots: what the guest wrote to the SSD, not the image.
+emu_core::snap_struct!(Sq { base, size, head, tail, cq, live });
+emu_core::snap_struct!(Cq { base, size, tail, phase, ien, live });
+
+impl emu_core::snap::Snap for Nvme {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { disk, cc, csts, aqa, asq, acq, intms, sq, cq, features, irq_request, reads, writes } = self;
+        for v in [cc, csts, aqa, intms] { v.save(w); }
+        for v in [asq, acq, reads, writes] { v.save(w); }
+        sq.save(w);
+        cq.save(w);
+        features.save(w);
+        irq_request.save(w);
+        emu_core::snap::save_disk(w, disk.as_ref().map(|d| d.as_ref() as &dyn Disk));
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { disk, cc, csts, aqa, asq, acq, intms, sq, cq, features, irq_request, reads, writes } = self;
+        for v in [cc, csts, aqa, intms] { v.load(r)?; }
+        for v in [asq, acq, reads, writes] { v.load(r)?; }
+        sq.load(r)?;
+        cq.load(r)?;
+        // what the guest could not have made: indexes and sizes the queues' arithmetic relies on
+        if sq.iter().any(|q| q.cq >= MAX_QUEUES || q.live && (q.size == 0 || q.head >= q.size || q.tail >= q.size))
+            || cq.iter().any(|q| q.live && (q.size == 0 || q.tail >= q.size))
+        {
+            return Err(emu_core::snap::SnapError("NVMe queues out of range".into()));
+        }
+        features.load(r)?;
+        irq_request.load(r)?;
+        emu_core::snap::load_disk(r, disk.as_mut().map(|d| d.as_mut() as &mut dyn Disk), "an NVMe SSD (--nvme)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Queues a guest could not have made are refused, not divided by: a hand-made snapshot.
+    #[test]
+    fn a_snapshot_with_impossible_queues_is_refused() {
+        use emu_core::snap::Snap;
+        for (k, bad) in [Sq { live: true, size: 0, ..Default::default() }, Sq { live: true, size: 4, tail: 4, ..Default::default() }].into_iter().enumerate() {
+            let mut n = Nvme::new(None);
+            n.sq[1] = bad;
+            let mut w = emu_core::snap::W::default();
+            n.save(&mut w);
+            assert!(Nvme::new(None).load(&mut emu_core::snap::R::new(&w.0)).is_err(), "case {k}");
+        }
+        let mut n = Nvme::new(None);
+        n.cq[2] = Cq { live: true, size: 0, ..Default::default() };
+        let mut w = emu_core::snap::W::default();
+        n.save(&mut w);
+        assert!(Nvme::new(None).load(&mut emu_core::snap::R::new(&w.0)).is_err());
+    }
+
     use super::*;
     use emu_core::disk::MemDisk;
 

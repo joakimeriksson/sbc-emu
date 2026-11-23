@@ -468,3 +468,12 @@ impl Trng {
         self.ie & Self::IE_GLBL_EN != 0 && self.istat & self.ie & 0x13 != 0
     }
 }
+
+// Snapshots. A clock generator's register offsets and banks are the board's.
+emu_core::snap_struct!(Clint { msip, mtimecmp });
+emu_core::snap_struct!(Plic { priority, pending, active, level, enable, threshold });
+emu_core::snap_struct!(Crg {} fixed { regs } skip { assert_off, status_off, banks });
+emu_core::snap_struct!(Regs {} fixed { regs });
+emu_core::snap_struct!(Pmu { regs, on });
+emu_core::snap_struct!(TempSensor { ctrl, conversions });
+emu_core::snap_struct!(Trng { ie, istat, mode, smode, rand, state });

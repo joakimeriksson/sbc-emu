@@ -251,3 +251,5 @@ mod tests {
         assert_eq!(got as u128, want);
     }
 }
+
+emu_core::snap_struct!(Sec { a, e, n, cacr, done, ops } fixed { regs });

@@ -17,8 +17,12 @@ const CMD_READ: u32 = 1 << 8;
 const TAR: usize = 1;
 const CMD_STOP: u32 = 1 << 9;
 
+/// A device on a bus of this machine: one a snapshot can hold.
+pub trait BusDevice: I2cDevice + emu_core::snap::Snap {}
+impl<T: I2cDevice + emu_core::snap::Snap> BusDevice for T {}
+
 pub struct DwI2c {
-    pub devices: Vec<(u8, Box<dyn I2cDevice>)>,
+    pub devices: Vec<(u8, Box<dyn BusDevice>)>,
     regs: [u32; 64],
     rx: VecDeque<u8>,
     raw: u32,
@@ -37,11 +41,11 @@ impl Default for DwI2c {
 }
 
 impl DwI2c {
-    pub fn attach(&mut self, addr: u8, dev: Box<dyn I2cDevice>) {
+    pub fn attach(&mut self, addr: u8, dev: Box<dyn BusDevice>) {
         self.devices.push((addr, dev));
     }
 
-    fn target(&mut self) -> Option<&mut Box<dyn I2cDevice>> {
+    fn target(&mut self) -> Option<&mut Box<dyn BusDevice>> {
         let tar = (self.regs[TAR] & 0x7f) as u8;
         self.devices.iter_mut().find(|(a, _)| *a == tar).map(|(_, d)| d)
     }
@@ -261,6 +265,58 @@ impl I2cDevice for Axp15060 {
         Some(self)
     }
 }
+
+// Snapshots. The devices on a bus are the machine's: the same, at the same addresses.
+impl emu_core::snap::Snap for DwI2c {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { devices, regs, rx, raw, active, nacked, aborted, abort_source } = self;
+        regs.save(w);
+        rx.save(w);
+        raw.save(w);
+        active.save(w);
+        nacked.save(w);
+        aborted.save(w);
+        abort_source.save(w);
+        w.u64(devices.len() as u64);
+        for (address, device) in devices { address.save(w); device.save(w); }
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { devices, regs, rx, raw, active, nacked, aborted, abort_source } = self;
+        regs.load(r)?;
+        rx.load(r)?;
+        raw.load(r)?;
+        active.load(r)?;
+        nacked.load(r)?;
+        aborted.load(r)?;
+        abort_source.load(r)?;
+        let n = r.u64()?;
+        if n != devices.len() as u64 {
+            return Err(emu_core::snap::SnapError(format!("the snapshot has {n} I2C devices on a bus, this machine {}", devices.len())));
+        }
+        for (address, device) in devices {
+            if r.u8()? != *address { return Err(emu_core::snap::SnapError("other I2C devices in the snapshot".into())); }
+            device.load(r)?;
+        }
+        Ok(())
+    }
+}
+
+/// Both halves save the whole EEPROM (it is shared): what the second loads is what the first did.
+impl emu_core::snap::Snap for At24c04 {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { data, half: _, ptr } = self;
+        data.lock().unwrap().save(w);
+        ptr.save(w);
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { data, half: _, ptr } = self;
+        data.lock().unwrap().load(r)?;
+        ptr.load(r)
+    }
+}
+
+emu_core::snap_enum!(PowerRequest { None, Reset, Off });
+emu_core::snap_struct!(Axp15060 { regs, ptr, request });
 
 #[cfg(test)]
 mod tests {

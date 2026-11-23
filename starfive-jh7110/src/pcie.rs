@@ -241,6 +241,9 @@ impl Port {
     }
 }
 
+// Snapshots. The port's addresses and interrupt are the board's.
+emu_core::snap_struct!(Port { root, ep, last_level, msis } fixed { bridge } fitted { xhci: "the VL805 USB controller", nvme: "an NVMe SSD (--nvme)" } skip { apb, cfg, irq });
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,20 @@ const APPROVED: &[(&str, &str, &str)] = &[
     ("rk3588", "Machine", "breakpoints dtb mt multi"),      // the debugger's; the boot's; threads and the choice to use them
     ("rk3588", "Pe", "cached"),                             // a cache, dropped by the Gic's `after`
     ("rk3588", "Xhci", "trace"),                            // debugging output
+    ("powervr", "Firmware", "trace trace_jobs"),           // debugging output
+    ("powervr", "Gpu", "trace"),                            // debugging output
+    ("riscv64", "Hart", "chain_until fetch_off fetch_page id jit_bus jit_fence_seen jit_gen jit_jc jit_lr jit_step jit_tmp jit_ut tlb watch"), // the machine's set-up, caches (dropped), what lives during compiled code, the debugger's
+    ("starfive-jh7110", "At24c04", "half"),                 // which half of the EEPROM the address serves: the board's
+    ("starfive-jh7110", "Bcm43456", "trace"),               // debugging output
+    ("starfive-jh7110", "Bluetooth", "trace"),              // debugging output
+    ("starfive-jh7110", "Crg", "assert_off banks status_off"), // constants of the board
+    ("starfive-jh7110", "DwMmc", "base fifo_depth irq trace"), // constants of the board; debugging output
+    ("starfive-jh7110", "I2s", "capture"),                  // --audio-out, what was recorded
+    ("starfive-jh7110", "Machine", "breakpoints jit"),      // the debugger's; the JIT
+    ("starfive-jh7110", "Port", "apb cfg irq"),             // constants of the board
+    ("starfive-jh7110", "Pwmdac", "capture"),               // --audio-out, what was recorded
+    ("starfive-jh7110", "Soc", "audio_source"),             // --audio-out, which output it records
+    ("starfive-jh7110", "Xhci", "trace"),                   // debugging output
     ("sbc-net", "VirtualNet", "log nat"),                   // debugging output; host sockets
 ];
 

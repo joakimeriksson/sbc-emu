@@ -201,20 +201,6 @@ impl Bluetooth {
     }
 
     pub fn next_event(&self) -> Option<u64> { self.le_scanning.then_some(self.next_adv) }
-
-    pub fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("bt-v1");
-        w.bytes(&self.name); w.bytes(&self.event_mask); w.bytes(&self.le_event_mask);
-        w.u8(self.scan_enable); w.bool(self.le_scanning); w.u64(self.next_adv); w.u32(self.adv_count); w.bool(self.le_active);
-    }
-    pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        r.tag("bt-v1")?;
-        self.name = r.bytes()?.to_vec();
-        self.event_mask = r.bytes()?.try_into().unwrap_or([0xff; 8]);
-        self.le_event_mask = r.bytes()?.try_into().unwrap_or([0x1f, 0, 0, 0, 0, 0, 0, 0]);
-        self.scan_enable = r.u8()?; self.le_scanning = r.bool()?; self.next_adv = r.u64()?; self.adv_count = r.u32()?; self.le_active = r.bool()?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -247,3 +233,5 @@ mod tests {
         assert_eq!(bt.name, b"BCM4345C5");
     }
 }
+
+emu_core::snap_struct!(Bluetooth { rx, tx, name, event_mask, le_event_mask, scan_enable, le_scanning, le_active, now, next_adv, adv_count, commands } skip { trace });

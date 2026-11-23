@@ -125,3 +125,6 @@ impl Gpu {
         self.irq_status & 1 != 0
     }
 }
+
+// Snapshots: the registers, the firmware's state and scenes in flight.
+emu_core::snap_struct!(Gpu { regs, fw, irq_status } skip { trace });

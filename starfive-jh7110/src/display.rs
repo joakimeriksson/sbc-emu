@@ -381,3 +381,7 @@ mod tests {
         assert_eq!(&out[..4], &[0xff, 0x80, 0x40, 255]);
     }
 }
+
+// Snapshots: the monitor's mode is the snapshot's (`--hdmi-mode`) until the guest reboots.
+emu_core::snap_struct!(Mode { clock_khz, width, hfp, hsync, hbp, height, vfp, vsync, vbp });
+emu_core::snap_struct!(Display { edid, fifo_pos, mode, pending, next_vblank, frames } fixed { dc, hdmi });

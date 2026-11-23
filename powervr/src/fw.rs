@@ -436,3 +436,7 @@ mod tests {
         assert_eq!(fw.rd(&ram, ctl + CCCB_READ_OFFSET), 0x40);
     }
 }
+
+emu_core::snap_struct!(Firmware {
+    running, boot_data, kccb_ctl, kccb, kccb_rtn, osdata, sysdata, irq, boots, commands, jobs, invocations, gpu_faults, gfx,
+} skip { trace, trace_jobs });

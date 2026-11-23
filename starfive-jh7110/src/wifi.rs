@@ -802,60 +802,46 @@ impl SdioCard for Bcm43456 {
         self.pending_scans.front().map(|&(_, due)| due)
     }
 
-    fn save_state(&self, w: &mut emu_core::snap::W) {
-        w.tag("bcm43456-v3");
-        for v in [self.ioe, self.ien, self.bus_if, self.bus_speed, self.brcm_cardctrl, self.watermark, self.devctl, self.clkcsr, self.pullup, self.mesbusy, self.sleepcsr, self.rx_seq, self.host_seq] { w.u8(v); }
-        for v in self.fn_blksize { w.u16(v); }
-        w.u32(self.window);
-        w.bool(self.ram_written); w.bool(self.running); w.bool(self.associated);
-        w.u32(self.intstatus); w.u32(self.hostintmask);
-        w.bytes(&self.mac); w.bytes(&self.event_mask);
-        let mut regs: Vec<(u32, u32)> = self.regs.iter().map(|(k, v)| (*k, *v)).collect();
-        regs.sort();
-        w.u64(regs.len() as u64);
-        for (k, v) in regs { w.u32(k); w.u32(v); }
-        w.u64(self.rx.len() as u64);
-        for f in &self.rx { w.bytes(f); }
-        w.u64(self.net as u64);
-        w.u8(match self.wpa { Wpa::Open => 0, Wpa::AwaitM2 => 1, Wpa::AwaitM4 => 2, Wpa::Installed => 3 });
-        w.bytes(&self.pmk); w.bytes(&self.anonce); w.u64(self.replay);
-        w.u64(self.now);
-        w.u64(self.pending_scans.len() as u64);
-        for &(sync, due) in &self.pending_scans { w.u16(sync); w.u64(due); }
-        // the firmware image in RAM is not needed once running (the emulated firmware replaces it)
-    }
+    fn save_state(&self, w: &mut emu_core::snap::W) { emu_core::snap::Snap::save(self, w) }
+    fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> { emu_core::snap::Snap::load(self, r) }
+}
 
-    fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        let tag = r.bytes()?;
-        let v3 = tag == b"bcm43456-v3";
-        let v2 = v3 || tag == b"bcm43456-v2";
-        if !v2 && tag != b"bcm43456-v1" { return Err(emu_core::snap::SnapError("snapshot layout mismatch: Wi-Fi chip".into())); }
-        for v in [&mut self.ioe, &mut self.ien, &mut self.bus_if, &mut self.bus_speed, &mut self.brcm_cardctrl, &mut self.watermark, &mut self.devctl,
-                  &mut self.clkcsr, &mut self.pullup, &mut self.mesbusy, &mut self.sleepcsr, &mut self.rx_seq, &mut self.host_seq] { *v = r.u8()?; }
-        for v in self.fn_blksize.iter_mut() { *v = r.u16()?; }
-        self.window = r.u32()?;
-        self.ram_written = r.bool()?; self.running = r.bool()?; self.associated = r.bool()?;
-        self.intstatus = r.u32()?; self.hostintmask = r.u32()?;
-        self.mac.copy_from_slice(&r.bytes()?[..6]);
-        self.event_mask = r.bytes()?.to_vec();
-        self.regs.clear();
-        for _ in 0..r.u64()? { let k = r.u32()?; let v = r.u32()?; self.regs.insert(k, v); }
-        self.rx.clear();
-        for _ in 0..r.u64()? { self.rx.push_back(r.bytes()?.to_vec()); }
-        if v2 {
-            self.net = (r.u64()? as usize).min(NETWORKS.len() - 1);
-            self.wpa = match r.u8()? { 1 => Wpa::AwaitM2, 2 => Wpa::AwaitM4, 3 => Wpa::Installed, _ => Wpa::Open };
-            self.pmk.copy_from_slice(&r.bytes()?[..32]);
-            self.anonce.copy_from_slice(&r.bytes()?[..32]);
-            self.replay = r.u64()?;
-        }
-        self.pending_scans.clear();
-        if v3 {
-            self.now = r.u64()?;
-            for _ in 0..r.u64()? { let sync = r.u16()?; let due = r.u64()?; self.pending_scans.push_back((sync, due)); }
-        }
-        self.rx_cur = None;
-        self.tx_buf.clear();
-        Ok(())
+// Snapshots: the chip's registers and RAM, and the emulated firmware's state.
+emu_core::snap_enum!(Wpa { Open, AwaitM2, AwaitM4, Installed });
+emu_core::snap_struct!(Bcm43456 {
+    now, pending_scans, ioe, ien, bus_if, bus_speed, brcm_cardctrl, fn_blksize, window, watermark, devctl, clkcsr, pullup, mesbusy,
+    sleepcsr, regs, ram_written, running, intstatus, hostintmask, tx_buf, rx, rx_cur, rx_seq, host_seq, mac, event_mask,
+    associated, net, vars, wpa, pmk, anonce, replay, tx_out, ioctls,
+} fixed { ram } skip { trace } after |c| {
+    if c.net >= NETWORKS.len() { return Err(emu_core::snap::SnapError(format!("Wi-Fi network {} of {}", c.net, NETWORKS.len()))); }
+    if c.rx_cur.as_ref().is_some_and(|(f, pos)| *pos > f.len()) { return Err(emu_core::snap::SnapError("a Wi-Fi frame read past its end".into())); }
+    Ok(())
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_core::snap::Snap;
+
+    /// The chip comes back as it was; a frame read past its end (a hand-made snapshot) is refused.
+    #[test]
+    fn snapshots() {
+        let mut c = Bcm43456::new();
+        c.associated = true;
+        c.rx.push_back(vec![1, 2, 3]);
+        c.rx_cur = Some((vec![4; 100], 60));
+        c.vars.insert("cur_etheraddr".into(), vec![2, 0, 0, 0, 0, 1]);
+        c.ram[0x1234] = 0x56;
+        let mut w = emu_core::snap::W::default();
+        c.save(&mut w);
+        let mut back = Bcm43456::new();
+        back.load(&mut emu_core::snap::R::new(&w.0)).unwrap();
+        let mut again = emu_core::snap::W::default();
+        back.save(&mut again);
+        assert!(w.0 == again.0 && back.associated && back.vars.len() == 1 && back.ram[0x1234] == 0x56);
+        c.rx_cur = Some((vec![4; 10], 11));
+        let mut w = emu_core::snap::W::default();
+        c.save(&mut w);
+        assert!(Bcm43456::new().load(&mut emu_core::snap::R::new(&w.0)).is_err());
     }
 }
