@@ -204,7 +204,21 @@ python3 tools/panthor-app.py --image <image with kmscube> --app kmscube \
 - **AFBC**: Mesa compresses textures, render targets and depth buffers with AFBC (16x16 superblocks, sparse, YTR, tiled headers for large images) by default. It never looks inside the payloads (it blits through the GPU, and its packing shader moves payloads by their header sizes only), so the model writes uncompressed subblocks under real AFBC headers and reads those or solid-colour superblocks.
 - **Textures**: 1D/2D/3D, cube maps and arrays; linear and u-interleaved planes; mipmaps with nearest/linear/trilinear filtering and LOD bias/clamps; every wrap mode and border colours; depth comparison, gather and texel fetch; unorm/snorm/float/integer, packed and depth formats with component orders, swizzles and sRGB.
 
-Instruction pages, translations, attribute and texture descriptors are cached per job, so the page tables are walked once per page. Fragment jobs render in interleaved 16-row stripes on host threads (`SBC_MALI_THREADS`, default half the cores, at most eight; one in the browser), each with read-only guest memory; a shader that stores to memory makes the job run serially. Jobs run synchronously in the doorbell write, so the work they did (shader instructions, fragments, tile writeback) is turned into the time a Mali-G610 MP4 at about 1 GHz would take (64 thread-instructions and 16 pixels per cycle, 20 GB/s writeback) and the submitting core's clock moves on by that much: programs that time their frames see a GPU that takes time. `SBC_MALI_TIMING=1` logs each fragment job's host time.
+Instruction pages, translations, attribute and texture descriptors are cached per job, so the page tables are walked once per page. Fragment jobs render in interleaved 16-row stripes on host threads (`SBC_MALI_THREADS`, default half the cores, at most eight; one in the browser), each with read-only guest memory; a shader that stores to memory makes the job run serially. Jobs run synchronously in the doorbell write, so the work they did (shader instructions, fragments, tile writeback) is turned into the time a Mali-G610 MP4 at about 1 GHz would take (64 thread-instructions and 16 pixels per cycle, 20 GB/s writeback) and the submitting core's clock moves on by that much: programs that time their frames see a GPU that takes time. `SBC_MALI_TIMING=1` logs each fragment job's host time and each doorbell's modelled time; `SBC_MALI_DEBUG=1` says why a job or shader was refused and logs the firmware's group and queue state.
+
+```sh
+python3 tools/panthor-app.py --image <image with glmark2> --app glmark2 \
+  --benchmark shading:shading=phong:duration=1 --output out/phong.png
+```
+
+`glmark2-es2-drm` (2023.01) always renders at the monitor's largest mode, 1920x1080. All 33
+scenes of its default benchmark set run without GPU faults or Mesa errors: build, texture,
+shading, bump, effect2d, pulsar, desktop, buffer, ideas, jellyfish, terrain, shadow, refract,
+conditionals, function and loop. Its FPS figures are virtual-time figures, those of the
+modelled GPU (see below), not of the host; a 1-second scene takes one to several minutes of
+host time at 1080p. The monitor does not always show glmark2's current frame: after a scene
+starts, VOP2 often keeps scanning out one buffer while the GPU renders into four others (its
+"mailbox" page flips stop reaching the display), so some screenshots are black or stale.
 
 The image is the Mesa fixture above with Debian's `kmscube` and `glmark2-es2-drm` packages: boot a copy with `--net nat --sd-persist --append init=/bin/bash`, bring up `eth0` (10.0.2.15/24, gateway 10.0.2.2), and `apt-get install --no-install-recommends kmscube glmark2-es2-drm`. Guest name resolution through the NAT did not work in that session, so `deb.debian.org` and `security.debian.org` went into `/etc/hosts` for the install.
 
