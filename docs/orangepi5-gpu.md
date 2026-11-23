@@ -1,6 +1,6 @@
 # Orange Pi 5 GPU bring-up
 
-The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Single-target linear RGBA8 clears, bounded compute dispatch and an initial opaque triangle path are supported. The Mesa GLES demo below now executes real vertex and fragment shaders, and its output can be shown on the HDMI screen through the Rockchip display driver; broader graphics remain incomplete.
+The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Clears, bounded compute dispatch and Mesa's GLES 3D pipeline (vertex and fragment shaders, clipping, depth/stencil, blending, textures) are supported, and the output can be shown on the HDMI screen through the Rockchip display driver: `kmscube` runs on the emulated monitor (see [3D programs](#3d-programs-kmscube)).
 
 The first building blocks in `rk3588` are a GPU virtual-address walker for the 4 KiB AArch64 stage-1 page tables used by Panthor and a bounded interpreter for a small subset of Valhall command-stream instructions. Tests exercise memory mapping and faults, instructions and their interaction. The control register block is connected to guest MMIO and the three GPU interrupt lines. Address-space UPDATE commands latch the programmed translation settings. A synchronous CSF queue path now connects Linux submissions to the command interpreter, including kernel CALL and completion synchronization. Unsupported work raises a queue fault.
 
@@ -188,6 +188,27 @@ The buffer is XRGB8888: Mesa's render target writes it back with a B,G,R,0 swizz
 
 ![GLES on HDMI](img/orangepi5-gles-hdmi.png)
 
+## 3D programs: kmscube
+
+```sh
+python3 tools/panthor-app.py --image <image with kmscube> --app kmscube \
+  --hdmi-mode 1280x720 --output out/kmscube.png
+```
+
+`kmscube` (Debian's package) draws its rotating, lit cube through Mesa's Panfrost driver on the emulated Mali-G610 and flips its frames to the HDMI monitor with page flips; the tool takes screenshots of the monitor while it runs and fails on any GPU queue fault or Mesa error. The model now runs the 3D pipeline Mesa drives:
+
+- **Vertex stage (`RUN_IDVS`)**: every distinct (vertex, instance) is shaded once by the position shader and, when the fragment stage reads varyings, by the varying shader. Positions and varyings stay on the host: on the GPU they go through a 64 KiB FIFO into the tiler heap, a private format. Draw modes: points, lines, line strips/loops, triangles, strips, fans; 8/16/32-bit indices with base vertex, instancing and primitive restart; first or last provoking vertex.
+- **Rasterization**: Mesa's vertex shaders end with the viewport transform, so positions are window x, y, z and 1/w. Triangles crossing w = 0 are clipped in homogeneous space; the near/far planes act per fragment through the draw's depth range (cull or clamp), as on Mali. Front-face culling, scissor, polygon offset, and the top-left fill rule on 1/256-pixel snapped coordinates. Varyings are interpolated perspective-correctly (also through clipped edges); flat varyings use the provoking vertex.
+- **Fragment stage**: shaders run as 2x2 quads (helper threads when the shader asks for them), so cross-lane permutes (`CLPER`) and implicit-LOD texturing see their neighbours. Early or late depth/stencil tests with all compare functions and stencil operations, fixed-function blending into up to eight render targets, occlusion queries, and pre-/post-frame shaders (Mesa's preload). The tile buffer keeps each target's internal precision (RGBA8, RGB10A2, RGB565, RGBA4, RGB5A1); writeback is linear or 16x16 u-interleaved in any of the matching writeback formats, with sRGB; depth/stencil (D16, D24S8, D24X8, D32) write back through the ZS CRC extension.
+- **Shaders**: the interpreter decodes the Valhall ALU (FMA/CVT/SFU: float, half-float, integer, 8/16-bit vector forms, conversions, compares, selects, shifts, cross-lane permutes, Mesa's transcendental sequences) and the messages Mesa emits for GLES: varyings, attributes in any vertex format, UBO/SSBO buffers, global loads and stores, blending, depth output, and texturing.
+- **Textures**: 1D/2D/3D, cube maps and arrays; linear and u-interleaved planes; mipmaps with nearest/linear/trilinear filtering and LOD bias/clamps; every wrap mode and border colours; depth comparison, gather and texel fetch; unorm/snorm/float/integer, packed and depth formats with component orders, swizzles and sRGB.
+
+Instruction pages, translations and texture descriptors are cached per job, so the page tables are walked once per page.
+
+The image is the Mesa fixture above with Debian's `kmscube` and `glmark2-es2-drm` packages: boot a copy with `--net nat --sd-persist --append init=/bin/bash`, bring up `eth0` (10.0.2.15/24, gateway 10.0.2.2), and `apt-get install --no-install-recommends kmscube glmark2-es2-drm`. Guest name resolution through the NAT did not work in that session, so `deb.debian.org` and `security.debian.org` went into `/etc/hosts` for the install.
+
+![kmscube on HDMI](img/orangepi5-kmscube.png)
+
 ## Real Mesa GLES rendering demo
 
 ```sh
@@ -292,9 +313,8 @@ python3 tools/panthor-test.py --image <mesa-image> \
 These Linux/Mesa fixtures check every pixel in six color-gradient frames
 (highp/mediump, both windings) and six textured frames (nearest/bilinear, both
 windings and multiple triangle sizes). Texture coordinates come from the native
-varying shader, not per-fragment CPU uniforms. Flat/integer varyings, indirect
-varying loads, sample/explicit interpolation positions and fused varying/texture
-instructions remain unsupported.
+varying shader, not per-fragment CPU uniforms. Flat varyings, indirect varying loads and fused varying/texture instructions are
+now supported too; sample/explicit interpolation positions use the pixel centre.
 
 Fixed-function blending now decodes Mali's `A + B × C` equations independently
 for RGB and alpha. Supported operands include source/destination color and alpha,
@@ -306,10 +326,9 @@ and alpha-to-one are honored; a disabled Off descriptor can omit
 its fragment program when the render-target mask is zero and depth/stencil and
 occlusion have no side effects.
 
-Fragments composite in submission order against the clear color and earlier
-fragments, with RGBA8 conversion after each write. A bounded sparse color cache
-preserves overlapping draws; framebuffer clear/writeback remains deferred until
-all supported draws validate and finish. Shader memory side effects are not
+Fragments composite in submission order in the tile buffer, converted to the
+target's internal precision after each write; writeback happens once all draws
+have validated and finished. Shader memory side effects are not
 rolled back on faults. The native ATEST datum may be copied through a register;
 only the disabled, zero datum is supported.
 
@@ -323,17 +342,13 @@ The test checks all pixels in 16 frames, including three overlapping layers,
 straight/premultiplied alpha, separate RGB/alpha factors, addition, multiplication,
 constants, subtraction, channel masks, disabled color writes, and translucent
 rectangles with a shared edge and scissoring. Its oracle uses GL factors, not the
-Mali descriptor equation. Blend shaders, logic operations, sRGB conversion and
-framebuffer preload/incremental rendering remain unsupported; these draws share
-a clear-backed render pass.
+Mali descriptor equation. Blend shaders and logic operations remain unsupported.
 
-This is still a subset: triangle lists with basic position FIFO, W=1, finite
-supported coordinates and depth in [0,1], one linear RGBA8 target and supported fixed-function blending.
-Per-dispatch geometry and aggregate shader/pixel budgets bound host work.
-Nonzero global attribute/index/instance offsets, primitive restart, other
-primitive modes, perspective/clipping, broader varying modes and texture
-formats/layouts, mipmaps, anisotropy, shadow/array/cube sampling,
-blend shaders, logic operations, depth/stencil, MSAA, framebuffer preload shaders,
-non-linear/compressed surfaces, incremental rendering/OOM recovery, cross-queue
-synchronization and GPU preemption remain incomplete. Passing the
-demo does not establish general GLES, Vulkan or desktop support.
+The section on kmscube above describes the 3D pipeline these tests now run on. Still
+missing: AFBC/AFRC compressed surfaces (run Mesa with `PAN_MESA_DEBUG=noafbc` for
+programs that render to textures), block-compressed and ASTC textures, blend shaders
+and logic operations, sRGB blending, multisampled rendering (draws are single-sampled
+at pixel centres), alpha-to-coverage, anisotropic filtering, explicit-gradient
+texturing, image load/store and atomics, non-power-of-two instance divisors' rounding
+corner cases, incremental rendering/OOM recovery, cross-queue synchronization and GPU
+preemption. Vulkan (PanVK) is untested.

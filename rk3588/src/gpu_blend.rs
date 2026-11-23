@@ -53,6 +53,7 @@ pub struct Blend {
     mask: u32,
     constant: f32,
     alpha_to_one: bool,
+    rt: u8,
 }
 impl Blend {
     pub fn decode(words: [u32; 4]) -> Result<Self, ()> {
@@ -64,14 +65,15 @@ impl Blend {
                 mask: 0,
                 constant: 0.,
                 alpha_to_one: false,
+                rt: ((words[2] >> 16) & 15) as u8,
             });
         }
-        // Enabled, non-sRGB fixed-function/opaque output; no blend shader,
-        // additional render targets or raw conversion. FB precision is RGBA8.
+        // Enabled, non-sRGB fixed-function/opaque output to any render target with a
+        // non-raw conversion; no blend shader.
         if words[0] & 0xffff & !0x901 != 0x200
-            || words[2] & !3 != 0x18
+            || words[2] & !(3 | (3 << 3) | (15 << 16)) != 0
             || !matches!(words[2] & 3, 1 | 2)
-            || words[3] != 237 << 12
+            || words[3] & 0xffc0_0000 != 0
             || words[1] & 0x0f000000 != 0
             || words[0] >> 16 > 0xff00
         {
@@ -90,7 +92,35 @@ impl Blend {
             // into the 16-bit descriptor field (255 << 8), not by 65535.
             constant: (words[0] >> 16) as f32 / 65280.,
             alpha_to_one: words[0] & 256 != 0,
+            rt: ((words[2] >> 16) & 15) as u8,
         })
+    }
+    /// Blend in floating point; `unorm` clamps sources, factors and results to [0, 1].
+    pub fn apply_f(self, source: [f32; 4], dest: [f32; 4], unorm: bool) -> [f32; 4] {
+        let mut source = if unorm {
+            source.map(|v| v.clamp(0., 1.))
+        } else {
+            source
+        };
+        if self.alpha_to_one {
+            source[3] = 1.;
+        }
+        std::array::from_fn(|n| {
+            if self.mask & (1 << n) == 0 {
+                dest[n]
+            } else {
+                let f = if n == 3 { self.alpha } else { self.rgb };
+                let v = f.apply(n, source, dest, self.constant);
+                if unorm {
+                    v.clamp(0., 1.)
+                } else {
+                    v
+                }
+            }
+        })
+    }
+    pub fn rt(self) -> usize {
+        self.rt as usize
     }
     pub fn apply(self, source: [f32; 4], destination: [u8; 4]) -> [u8; 4] {
         let mut source = source.map(|v| v.clamp(0., 1.));

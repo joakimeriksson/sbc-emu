@@ -1,10 +1,18 @@
-//! Valhall single-target linear RGBA8 clears and ordered blended writeback.
-//! The tile buffer is RGBA8; the render target's writeback swizzle orders the bytes in memory
-//! (identity for RGBA8, B,G,R,0 for the BGRA/BGRX formats of XRGB8888 scanout buffers).
-//! Compression, depth/stencil and MSAA remain unsupported.
+//! Valhall fragment jobs: framebuffer descriptors, the tile buffer and writeback
+//! (Mesa genxml v10.xml: Framebuffer Parameters, ZS CRC Extension, Render Target).
+//!
+//! The job's bounding box is rendered at once into a host tile buffer: colour per render
+//! target (in the internal format's precision), depth and stencil. Render targets start
+//! from their clear colour, or are loaded from memory when the frame has pre-frame
+//! (preload) shaders and the target is not cleared. Draws from the tiler are then
+//! rasterized (gpu_raster.rs) and the result is written back, linear or 16x16
+//! u-interleaved, with the target's swizzle and writeback format. Depth/stencil
+//! writeback follows the ZS CRC extension. Every memory destination is validated before
+//! any pixel is written. AFBC/AFRC targets, multisampled writeback and raw (non-blendable)
+//! internal formats fault.
 use crate::{
     gpu_cs::Stop,
-    gpu_mmu::{AddressSpace, Fault},
+    gpu_mmu::{Access, AddressSpace, Fault},
 };
 fn word(b: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(b[n * 4..n * 4 + 4].try_into().unwrap())
@@ -12,9 +20,168 @@ fn word(b: &[u8], n: usize) -> u32 {
 fn pair(b: &[u8], n: usize) -> u64 {
     word(b, n) as u64 | (word(b, n + 1) as u64) << 32
 }
+fn unsupported() -> Stop {
+    Stop::Unsupported { pc: 0, opcode: 7 }
+}
+fn trace() -> bool {
+    std::env::var_os("SBC_MALI_TRACE").is_some()
+}
+
+/// Tile-buffer channel layout of a colour internal format (Mesa pan_clear.c tib_layouts):
+/// (integer bits, fraction bits) for R, G, B, A.
+fn tib_layout(internal: u32) -> Option<[(u32, u32); 4]> {
+    Some(match internal {
+        1 => [(8, 0), (8, 0), (8, 0), (8, 0)],
+        2 => [(10, 0), (10, 0), (10, 0), (2, 0)],
+        3 => [(8, 2), (8, 2), (8, 2), (2, 0)],
+        4 => [(4, 4), (4, 4), (4, 4), (4, 4)],
+        5 => [(5, 5), (6, 4), (5, 5), (0, 2)],
+        6 => [(5, 5), (5, 5), (5, 5), (1, 1)],
+        _ => return None,
+    })
+}
+
+/// A memory surface: linear or 16x16 u-interleaved.
+#[derive(Clone, Copy, Debug)]
+pub struct Surface {
+    pub base: u64,
+    pub row_stride: u64,
+    pub tiled: bool,
+    pub bpp: u64,
+}
+impl Surface {
+    pub fn offset(&self, x: u32, y: u32) -> u64 {
+        const DUP: [u64; 16] = [
+            0, 3, 12, 15, 48, 51, 60, 63, 192, 195, 204, 207, 240, 243, 252, 255,
+        ];
+        const SPACE: [u64; 16] = [0, 1, 4, 5, 16, 17, 20, 21, 64, 65, 68, 69, 80, 81, 84, 85];
+        let (x, y) = (x as u64, y as u64);
+        if self.tiled {
+            (y >> 4) * self.row_stride
+                + ((x >> 4) * 256 + (DUP[(y & 15) as usize] ^ SPACE[(x & 15) as usize])) * self.bpp
+        } else {
+            y * self.row_stride + x * self.bpp
+        }
+    }
+}
+
+/// One render target: its tile-buffer precision, clear colour and writeback.
+pub struct Target {
+    /// Channel bits (integer + fraction) for quantizing blended values.
+    pub layout: [(u32, u32); 4],
+    pub clear: [f32; 4],
+    pub write: Option<Surface>,
+    /// Writeback format (Color Format enum) and swizzle: memory component k takes
+    /// tile channel swizzle[k] (4 = zero, 5 = one).
+    pub format: u32,
+    pub swizzle: [u32; 4],
+    pub srgb: bool,
+}
+
+/// The host tile buffer for a fragment job's bounding box.
+pub struct TileBuffer {
+    pub x0: u32,
+    pub y0: u32,
+    pub w: u32,
+    pub h: u32,
+    pub color: Vec<Vec<[f32; 4]>>,
+    pub depth: Vec<f32>,
+    pub stencil: Vec<u8>,
+    /// Pixels a draw wrote, per render target.
+    pub touched: bool,
+}
+impl TileBuffer {
+    pub fn index(&self, x: u32, y: u32) -> usize {
+        ((y - self.y0) * self.w + (x - self.x0)) as usize
+    }
+}
+
+/// Decoded framebuffer descriptor.
+pub struct Fb {
+    pub width: u32,
+    pub height: u32,
+    pub targets: Vec<Target>,
+    pub frame_arg: u64,
+    pub z_bits: u32,
+    pub z_float: bool,
+    pub sample_positions: u64,
+}
+
+/// Bytes per pixel of a writeback (Color Format) format.
+fn writeback_bytes(f: u32) -> Option<u64> {
+    Some(match f {
+        16 => 1,
+        17 | 20 | 21 | 28 | 29 => 2,
+        18 => 3,
+        19 | 22 | 24 | 25 => 4,
+        _ => return None,
+    })
+}
+
+fn quantize(v: f32, (int, frac): (u32, u32)) -> f32 {
+    if int == 0 {
+        return 1.;
+    }
+    let max = ((1u32 << int) - 1) as f32;
+    let _ = frac;
+    (v.clamp(0., 1.) * max).round_ties_even() / max
+}
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1. / 2.4) - 0.055
+    }
+}
+impl Target {
+    pub fn quantize(&self, c: [f32; 4]) -> [f32; 4] {
+        std::array::from_fn(|n| quantize(c[n], self.layout[n]))
+    }
+    /// Pack one pixel in the writeback format.
+    fn pack(&self, c: [f32; 4], out: &mut [u8; 4]) -> usize {
+        let mut c = c;
+        if self.srgb {
+            for v in c.iter_mut().take(3) {
+                *v = linear_to_srgb(*v);
+            }
+        }
+        let comp: [f32; 4] = std::array::from_fn(|k| match self.swizzle[k] {
+            4 => 0.,
+            5 => 1.,
+            s => c[s as usize],
+        });
+        let unorm = |v: f32, bits: u32| {
+            ((v.clamp(0., 1.) * ((1u32 << bits) - 1) as f32).round_ties_even()) as u32
+        };
+        let fields: &[u32] = match self.format {
+            16 => &[8],
+            17 => &[8, 8],
+            18 => &[8, 8, 8],
+            19 | 22 => &[8, 8, 8, 8],
+            20 => &[4, 4, 4, 4],
+            21 => &[5, 6, 5],
+            24 => &[10, 10, 10, 2],
+            25 => &[2, 10, 10, 10],
+            28 => &[5, 5, 5, 1],
+            29 => &[1, 5, 5, 5],
+            _ => &[],
+        };
+        let bytes = writeback_bytes(self.format).unwrap_or(0) as usize;
+        let mut v = 0u32;
+        let mut shift = 0;
+        for (k, &bits) in fields.iter().enumerate() {
+            v |= unorm(comp[k], bits) << shift;
+            shift += bits;
+        }
+        out[..4].copy_from_slice(&v.to_le_bytes());
+        bytes
+    }
+}
+
 pub fn fragment(m: &AddressSpace, ram: &mut [u8], regs: &[u32; 256]) -> Result<(), Stop> {
     fragment_frame(m, ram, regs, None)
 }
+
 pub fn fragment_frame(
     m: &AddressSpace,
     ram: &mut [u8],
@@ -24,72 +191,113 @@ pub fn fragment_frame(
     let fbd = (regs[40] as u64 | ((regs[41] as u64) << 32)) & !63;
     let mut f = [0; 128];
     m.read(ram, fbd, &mut f, true).map_err(Stop::Memory)?;
-    if std::env::var_os("SBC_MALI_TRACE").is_some() {
+    if trace() {
         eprintln!(
             "[mali] fragment regs40..48={:x?} fbd={:x?}",
             &regs[40..48],
-            f.chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>()
+            (0..32).map(|n| word(&f, n)).collect::<Vec<_>>()
         );
     }
-    let unsupported = || Stop::Unsupported { pc: 0, opcode: 7 };
     let width = (word(&f, 8) & 65535) + 1;
     let height = (word(&f, 8) >> 16) + 1;
-    if width > 4096
-        || height > 4096
-        || word(&f, 0) != 0
+    let rt_count = ((word(&f, 11) >> 19) & 15) as usize + 1;
+    // Post-frame shaders, downscaling, CRC-only multisample patterns and preload/unload
+    // fields of the legacy depth path are not modelled.
+    if width > 8192
+        || height > 8192
+        || word(&f, 0) & !0xff00_01ff != 0
         || (pair(&f, 14) != 0) != frame.is_some()
-        || word(&f, 11) & ((7 << 0) | (7 << 3) | (15 << 19)) != 0
-        || word(&f, 12) & !((3 << 16) | (1 << 21) | (15 << 28)) != 0
+        || rt_count > 8
+        || frame.is_some_and(|f| !f.draws.is_empty()) && (word(&f, 11) >> 6) & 7 != 2
+        || word(&f, 12) & ((1 << 19) | (1 << 20)) != 0
     {
         return Err(unsupported());
     }
     if let Some(frame) = frame {
-        if frame.width != width || frame.height != height || (word(&f, 11) >> 6) & 7 != 2 {
+        if frame.width != 0 && (frame.width != width || frame.height != height) {
             return Err(unsupported());
         }
     }
-    // CRC reads may elide identical tiles on hardware. This synchronous clear
-    // path always writes the pixels instead, preserving the same result.
-    let has_crc = word(&f, 12) & (1 << 21) != 0;
-    let mut extension = [0u8; 64];
-    if has_crc {
-        m.read(ram, fbd + 128, &mut extension, true)
+    let has_ext = word(&f, 12) & (1 << 21) != 0;
+    let mut ext = [0u8; 64];
+    if has_ext {
+        m.read(ram, fbd + 128, &mut ext, true)
             .map_err(Stop::Memory)?;
-        // This path supports CRC-only extensions, with no depth/stencil target.
-        if word(&extension, 0) != 0 || extension[24..].iter().any(|&b| b != 0) {
-            return Err(unsupported());
-        }
     } else if word(&f, 12) & (3 << 30) != 0 {
         return Err(unsupported());
     }
-    let mut target = [0u8; 64];
-    m.read(
-        ram,
-        fbd + if has_crc { 192 } else { 128 },
-        &mut target,
-        true,
-    )
-    .map_err(Stop::Memory)?;
-    let rt = &target[..];
-    let ctl = word(rt, 1);
-    if std::env::var_os("SBC_MALI_TRACE").is_some() {
-        eprintln!("[mali] render target={:x?}", rt.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>());
-    }
-    // writeback swizzle: memory byte k takes channel sw[k] (0-3: R, G, B, A; 4: 0; 5: 1)
-    let sw: [u32; 4] = std::array::from_fn(|k| (ctl >> (16 + 3 * k)) & 7);
-    if word(rt, 0) != (1 << 26)
-        || ctl & !((1 << 15) | (1 << 31) | (0xfff << 16)) != (1 | (19 << 3) | (2 << 8))
-        || sw.iter().any(|&c| c > 5)
-    {
-        return Err(unsupported());
-    }
-    let swizzle = |c: [u8; 4]| -> [u8; 4] { std::array::from_fn(|k| match sw[k] { 0..=3 => c[sw[k] as usize], 4 => 0, _ => 255 }) };
-    let base = pair(rt, 8);
-    let stride = word(rt, 10) as u64;
-    if stride < (width as u64) * 4 {
-        return Err(Stop::InvalidStream);
+    // Render targets.
+    let mut targets = Vec::with_capacity(rt_count);
+    let rt_base = fbd + if has_ext { 192 } else { 128 };
+    let mut writes = Vec::new();
+    for n in 0..rt_count {
+        let mut rt = [0u8; 64];
+        m.read(ram, rt_base + n as u64 * 64, &mut rt, true)
+            .map_err(Stop::Memory)?;
+        if trace() {
+            eprintln!(
+                "[mali] render target {n}={:x?}",
+                (0..16).map(|k| word(&rt, k)).collect::<Vec<_>>()
+            );
+        }
+        let w0 = word(&rt, 0);
+        let w1 = word(&rt, 1);
+        let internal = w0 >> 26;
+        let layout = tib_layout(internal).ok_or_else(unsupported)?;
+        if w0 & 15 != 0 || w0 & (1 << 24) != 0 {
+            return Err(unsupported()); // AFRC/YUV writeback
+        }
+        let swizzle: [u32; 4] = std::array::from_fn(|k| (w1 >> (16 + 3 * k)) & 7);
+        if swizzle.iter().any(|&c| c > 5) || (w1 >> 12) & 3 > 1 {
+            return Err(unsupported());
+        }
+        // Clear colour in the tile-buffer layout; dithered clears scale by the full field.
+        let packed = word(&rt, 12);
+        let dithered = w0 & (1 << 25) != 0;
+        let mut clear = [0f32; 4];
+        let mut shift = 0;
+        for (k, &(int, frac)) in layout.iter().enumerate() {
+            let bits = int + frac;
+            let v = (packed >> shift) & ((1u64 << bits) - 1) as u32;
+            clear[k] = if int == 0 {
+                1.
+            } else if dithered {
+                v as f32 / (((1u32 << int) - 1) << frac) as f32
+            } else {
+                (v >> frac) as f32 / ((1u32 << int) - 1) as f32
+            };
+            shift += bits;
+        }
+        let write_enable = w1 & 1 != 0;
+        let block = (w1 >> 8) & 15;
+        let format = (w1 >> 3) & 31;
+        let write = if write_enable {
+            let bpp = writeback_bytes(format).ok_or_else(unsupported)?;
+            if !matches!(block, 1 | 2) {
+                return Err(unsupported()); // AFBC writeback
+            }
+            let s = Surface {
+                base: pair(&rt, 8),
+                row_stride: word(&rt, 10) as u64,
+                tiled: block == 1,
+                bpp,
+            };
+            if !s.tiled && s.row_stride < width as u64 * bpp {
+                return Err(Stop::InvalidStream);
+            }
+            writes.push(n);
+            Some(s)
+        } else {
+            None
+        };
+        targets.push(Target {
+            layout,
+            clear,
+            write,
+            format,
+            swizzle,
+            srgb: w1 & (1 << 14) != 0,
+        });
     }
     let min = word(&f, 9);
     let max = word(&f, 10);
@@ -100,86 +308,148 @@ pub fn fragment_frame(
     if x0 > x1 || y0 > y1 || x1 >= width || y1 >= height {
         return Err(Stop::InvalidStream);
     }
-    let color = word(rt, 12).to_le_bytes();
-    let mut row = Vec::with_capacity((x1 - x0 + 1) as usize * 4);
-    for _ in x0..=x1 {
-        row.extend_from_slice(&swizzle(color));
-    }
-    if (13..16).any(|i| word(rt, i) != word(rt, 12)) {
-        return Err(unsupported());
-    }
-    // Keep physical spans, not a host allocation proportional to every pixel.
-    let mut destinations = Vec::new();
-    for y in y0..=y1 {
-        let addr = base
-            .checked_add(y as u64 * stride + x0 as u64 * 4)
-            .ok_or(Stop::Memory(Fault::AddressSize))?;
-        let spans = m
-            .chunks(ram, addr, row.len(), crate::gpu_mmu::Access::Write, true)
-            .map_err(Stop::Memory)?;
-        destinations.push(spans);
-    }
-    let mut crc_destinations = Vec::new();
-    if word(&f, 12) & (3 << 30) != 0 {
-        // The descriptor supplies the checksum for a uniform clear. Only whole
-        // 16x16 checksum tiles are supported until partial-tile CRC is modeled.
-        if x0 != 0
-            || y0 != 0
-            || x1 + 1 != width
-            || y1 + 1 != height
-            || width % 16 != 0
-            || height % 16 != 0
-        {
+    let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+    // Depth/stencil surface (ZS CRC extension).
+    let z_write = word(&f, 12) & (1 << 18) != 0;
+    let s_write = word(&f, 12) & (1 << 8) != 0;
+    let zs_format = word(&ext, 0) & 15;
+    let zs = if has_ext && (z_write || s_write) && zs_format != 0 {
+        let block = (word(&ext, 0) >> 4) & 15;
+        let bpp = match zs_format {
+            1 => 2,
+            2 | 4 | 5 | 14 => 4,
+            _ => return Err(unsupported()),
+        };
+        if !matches!(block, 1 | 2) || (word(&ext, 0) >> 8) & 3 > 1 {
             return Err(unsupported());
         }
-        let base = pair(&extension, 4);
-        let stride = word(&extension, 1) as u64;
-        let columns = width as usize / 16;
+        Some((
+            zs_format,
+            Surface {
+                base: pair(&ext, 8),
+                row_stride: word(&ext, 10) as u64,
+                tiled: block == 1,
+                bpp,
+            },
+        ))
+    } else {
+        None
+    };
+    let fb = Fb {
+        width,
+        height,
+        targets,
+        frame_arg: pair(&f, 2),
+        z_bits: match (word(&f, 12) >> 16) & 3 {
+            0 => 16,
+            1 => 24,
+            _ => 32,
+        },
+        z_float: (word(&f, 12) >> 16) & 3 == 2,
+        sample_positions: pair(&f, 4),
+    };
+    // Validate all destinations before any memory changes.
+    let mut destinations: Vec<(usize, Vec<Vec<(usize, usize)>>)> = Vec::new();
+    for &n in &writes {
+        let s = fb.targets[n].write.unwrap();
+        destinations.push((n, rows(m, ram, &s, x0, y0, w, h, Access::Write)?));
+    }
+    let zs_rows = match zs {
+        Some((_, s)) => Some(rows(m, ram, &s, x0, y0, w, h, Access::Write)?),
+        None => None,
+    };
+    let mut crc = Vec::new();
+    if word(&f, 12) & (3 << 30) != 0 {
+        // CRC tiles (16x16): validated here, written after the pixels.
+        let base = pair(&ext, 4);
+        let stride = word(&ext, 1) as u64;
+        let columns = width.div_ceil(16) as usize;
         if stride < (columns * 8) as u64 {
             return Err(Stop::InvalidStream);
         }
-        for y in 0..height / 16 {
+        for ty in y0 / 16..=y1 / 16 {
             let addr = base
-                .checked_add(y as u64 * stride)
+                .checked_add(ty as u64 * stride)
                 .ok_or(Stop::Memory(Fault::AddressSize))?;
             if word(&f, 12) & (1 << 30) != 0 {
-                m.chunks(ram, addr, columns * 8, crate::gpu_mmu::Access::Read, true)
+                m.chunks(ram, addr, columns * 8, Access::Read, true)
                     .map_err(Stop::Memory)?;
             }
             if word(&f, 12) & (1 << 31) != 0 {
-                crc_destinations.push(
-                    m.chunks(ram, addr, columns * 8, crate::gpu_mmu::Access::Write, true)
+                crc.push((
+                    ty,
+                    m.chunks(ram, addr, columns * 8, Access::Write, true)
                         .map_err(Stop::Memory)?,
-                );
+                ));
             }
         }
     }
-    let pixels = if let Some(frame) = frame {
-        crate::gpu_raster::pixels(m, ram, frame, [x0, y0, x1, y1], pair(&f, 2), color)?
-    } else {
-        Vec::new()
+    // The tile buffer: clear or preload.
+    let count = (w * h) as usize;
+    let mut tb = TileBuffer {
+        x0,
+        y0,
+        w,
+        h,
+        color: Vec::with_capacity(fb.targets.len()),
+        depth: vec![f32::from_bits(word(&f, 13)); count],
+        stencil: vec![word(&f, 12) as u8; count],
+        touched: false,
     };
-    for spans in destinations {
-        let mut offset = 0;
-        for (p, len) in spans {
-            ram[p..p + len].copy_from_slice(&row[offset..offset + len]);
-            offset += len;
+    for t in fb.targets.iter() {
+        tb.color.push(vec![t.clear; count]);
+    }
+    // Pre-frame shaders (Mesa's preload) load targets that are not cleared.
+    let dcds = pair(&f, 6);
+    for k in 0..2 {
+        if (word(&f, 0) >> (3 * k)) & 7 != 0 {
+            crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 128 * k as u64)?;
         }
     }
-    for (x, y, color) in pixels {
-        let address = base
-            .checked_add(y as u64 * stride + x as u64 * 4)
-            .ok_or(Stop::Memory(Fault::AddressSize))?;
-        m.write(ram, address, &swizzle(color), true).map_err(Stop::Memory)?;
+    if let Some(frame) = frame {
+        crate::gpu_raster::draw(m, ram, &fb, &mut tb, frame)?;
     }
-    // A drawn tile is not a uniform clear. Invalidate its opaque checksum rather
-    // than publishing the clear's checksum for non-uniform pixels.
-    let checksum = if frame.is_some() {
+    if (word(&f, 0) >> 6) & 7 != 0 {
+        crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 256)?;
+    }
+    // Writeback.
+    for (n, rows) in &destinations {
+        let t = &fb.targets[*n];
+        let s = t.write.unwrap();
+        let mut px = [0u8; 4];
+        store(ram, &s, rows, x0, y0, w, h, |i, out| {
+            let bytes = t.pack(tb.color[*n][i], &mut px);
+            out.copy_from_slice(&px[..bytes]);
+        });
+    }
+    if let (Some((format, s)), Some(rows)) = (zs, zs_rows.as_ref()) {
+        store(ram, &s, rows, x0, y0, w, h, |i, out| {
+            let z = tb.depth[i].clamp(0., 1.);
+            let st = tb.stencil[i] as u32;
+            match format {
+                1 => out.copy_from_slice(&((z * 65535.).round() as u16).to_le_bytes()),
+                14 => out.copy_from_slice(&z.to_bits().to_le_bytes()),
+                _ => {
+                    let d = (z as f64 * 16777215.).round() as u32;
+                    let mut old = u32::from_le_bytes(out[..4].try_into().unwrap());
+                    if z_write {
+                        old = (old & 0xff00_0000) | d;
+                    }
+                    if s_write && format == 5 {
+                        old = (old & 0x00ff_ffff) | st << 24;
+                    }
+                    out.copy_from_slice(&old.to_le_bytes());
+                }
+            }
+        });
+    }
+    // A drawn tile is not a uniform clear: invalidate its checksum.
+    let checksum = if frame.is_some_and(|f| !f.draws.is_empty()) || tb.touched {
         0u64.to_le_bytes()
     } else {
-        pair(&extension, 2).to_le_bytes()
+        pair(&ext, 2).to_le_bytes()
     };
-    for spans in crc_destinations {
+    for (_, spans) in crc {
         let mut offset = 0;
         for (p, len) in spans {
             for byte in &mut ram[p..p + len] {
@@ -190,106 +460,101 @@ pub fn fragment_frame(
     }
     Ok(())
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn fixture() -> (AddressSpace, Vec<u8>, [u32; 256]) {
-        let mut r = vec![0x55; 8192];
-        let mut f = [0u32; 48];
-        f[8] = 3 | (3 << 16);
-        f[9] = 1 | (1 << 16);
-        f[10] = 2 | (2 << 16);
-        f[12] = 1 << 29;
-        f[32] = 1 << 26;
-        f[33] = 1 | (19 << 3) | (2 << 8) | (0x688 << 16);
-        f[40] = 4096;
-        f[42] = 16;
-        f[44..48].fill(0xff332211);
-        for (i, v) in f.iter().enumerate() {
-            r[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+
+/// Translated spans of each row of a surface's box (one Vec per row, or per tile row for
+/// u-interleaved surfaces, which cover 16 rows contiguously).
+#[allow(clippy::too_many_arguments)]
+fn rows(
+    m: &AddressSpace,
+    ram: &[u8],
+    s: &Surface,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    access: Access,
+) -> Result<Vec<Vec<(usize, usize)>>, Stop> {
+    let mut out = Vec::new();
+    if s.tiled {
+        for ty in y0 / 16..=(y0 + h - 1) / 16 {
+            let first = s.offset(x0 & !15, ty * 16);
+            let last = s.offset(((x0 + w - 1) | 15) - 15, ty * 16) + 256 * s.bpp;
+            let addr = s
+                .base
+                .checked_add(first)
+                .ok_or(Stop::Memory(Fault::AddressSize))?;
+            out.push(
+                m.chunks(ram, addr, (last - first) as usize, access, true)
+                    .map_err(Stop::Memory)?,
+            );
         }
-        let mut regs = [0; 256];
-        regs[43] = 3 | (3 << 16);
-        (
-            AddressSpace {
-                transtab: 0,
-                transcfg: 2,
-            },
-            r,
-            regs,
-        )
+    } else {
+        for y in y0..y0 + h {
+            let addr = s
+                .base
+                .checked_add(s.offset(x0, y))
+                .ok_or(Stop::Memory(Fault::AddressSize))?;
+            out.push(
+                m.chunks(ram, addr, (w as u64 * s.bpp) as usize, access, true)
+                    .map_err(Stop::Memory)?,
+            );
+        }
     }
-    #[test]
-    fn fragment_clear_respects_bounds_and_stride() {
-        let (m, mut r, regs) = fixture();
-        fragment(&m, &mut r, &regs).unwrap();
-        for y in 0..4 {
-            for x in 0..4 {
-                let expected = if (1..=2).contains(&x) && (1..=2).contains(&y) {
-                    [0x11, 0x22, 0x33, 0xff]
-                } else {
-                    [0x55; 4]
-                };
-                assert_eq!(&r[4096 + y * 16 + x * 4..4100 + y * 16 + x * 4], &expected);
+    Ok(out)
+}
+/// Physical address of byte `offset` within a validated row's spans.
+fn locate(spans: &[(usize, usize)], mut offset: usize) -> Option<usize> {
+    for &(p, len) in spans {
+        if offset < len {
+            return Some(p + offset);
+        }
+        offset -= len;
+    }
+    None
+}
+/// Visit every pixel of the box with its bytes in memory.
+#[allow(clippy::too_many_arguments)]
+fn store(
+    ram: &mut [u8],
+    s: &Surface,
+    rows: &[Vec<(usize, usize)>],
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    mut f: impl FnMut(usize, &mut [u8]),
+) {
+    let bpp = s.bpp as usize;
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            let (row, off) = if s.tiled {
+                let ty = (y / 16 - y0 / 16) as usize;
+                let first = s.offset(x0 & !15, (y / 16) * 16);
+                (ty, (s.offset(x, y) - first) as usize)
+            } else {
+                ((y - y0) as usize, ((x - x0) as usize) * bpp)
+            };
+            let i = ((y - y0) * w + (x - x0)) as usize;
+            // Pixels never straddle a page within a validated span unless bpp does not
+            // divide 4096 (RGB888); gather bytes individually then.
+            let spans = &rows[row];
+            if let (Some(a), Some(b)) = (locate(spans, off), locate(spans, off + bpp - 1)) {
+                if b == a + bpp - 1 {
+                    f(i, &mut ram[a..a + bpp]);
+                    continue;
+                }
+            }
+            let mut tmp = [0u8; 4];
+            let addrs: Vec<usize> = (0..bpp).filter_map(|k| locate(spans, off + k)).collect();
+            for (k, &a) in addrs.iter().enumerate() {
+                tmp[k] = ram[a];
+            }
+            f(i, &mut tmp[..bpp]);
+            for (k, &a) in addrs.iter().enumerate() {
+                ram[a] = tmp[k];
             }
         }
     }
-    #[test]
-    fn mesa_clear_handles_crc_extension_and_prevalidates_checksum_destination() {
-        let (m, mut r, mut regs) = fixture();
-        let target = r[128..192].to_vec();
-        r[128..192].fill(0);
-        r[192..256].copy_from_slice(&target);
-        r[32..36].copy_from_slice(&0x000f000fu32.to_le_bytes());
-        r[36..40].fill(0);
-        r[40..44].copy_from_slice(&0x000f000fu32.to_le_bytes());
-        r[44..48].copy_from_slice(&0x04001480u32.to_le_bytes());
-        r[48..52].copy_from_slice(&0x80210000u32.to_le_bytes());
-        r[132..136].copy_from_slice(&16u32.to_le_bytes());
-        let checksum = 0xc0008020ffdf8020u64;
-        r[136..144].copy_from_slice(&checksum.to_le_bytes());
-        r[144..152].copy_from_slice(&6144u64.to_le_bytes());
-        r[196..200].copy_from_slice(
-            &(1u32 | (19 << 3) | (2 << 8) | (0x688 << 16) | (1 << 15) | (1 << 31)).to_le_bytes(),
-        );
-        r[232..236].copy_from_slice(&64u32.to_le_bytes());
-        regs[42] = 0;
-        regs[43] = 0x000f000f;
-        fragment(&m, &mut r, &regs).unwrap();
-        assert!(r[4096..5120]
-            .chunks_exact(4)
-            .all(|p| p == [0x11, 0x22, 0x33, 0xff]));
-        assert_eq!(&r[6144..6152], &checksum.to_le_bytes());
-        assert_eq!(&r[6152..6160], &[0x55; 8]);
-        r[144..152].copy_from_slice(&8192u64.to_le_bytes());
-        let before = r.clone();
-        assert!(matches!(fragment(&m, &mut r, &regs), Err(Stop::Memory(_))));
-        assert_eq!(r, before);
-        // Even though CRC reads do not elide pixels, their memory access must
-        // still fault when the checksum target is unmapped.
-        r[48..52].copy_from_slice(&0x40210000u32.to_le_bytes());
-        let before = r.clone();
-        assert!(matches!(fragment(&m, &mut r, &regs), Err(Stop::Memory(_))));
-        assert_eq!(r, before);
-    }
-    /// An XRGB8888 scanout buffer (Mesa's B8G8R8X8 writeback): blue first, alpha 0.
-    #[test]
-    fn bgrx_writeback_swizzle() {
-        let (m, mut r, regs) = fixture();
-        r[132..136].copy_from_slice(&(1u32 | (19 << 3) | (2 << 8) | (0x80a << 16)).to_le_bytes());
-        fragment(&m, &mut r, &regs).unwrap();
-        assert_eq!(&r[4096 + 16 + 4..4096 + 16 + 8], &[0x33, 0x22, 0x11, 0]);
-    }
-    #[test]
-    fn unsupported_geometry_and_bad_destination_leave_memory_unchanged() {
-        let (m, mut r, regs) = fixture();
-        let before = r.clone();
-        r[56] = 1;
-        assert!(fragment(&m, &mut r, &regs).is_err());
-        assert_eq!(&r[4096..], &before[4096..]);
-        r[56] = 0;
-        r[160..164].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(fragment(&m, &mut r, &regs).is_err());
-        assert_eq!(&r[4096..], &before[4096..]);
-    }
 }
+#[cfg(test)]
+mod tests;

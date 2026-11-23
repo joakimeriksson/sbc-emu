@@ -109,6 +109,98 @@ impl Resources {
         }
         .element(element)
     }
+    /// A Buffer descriptor's base address and size (LD_BUFFER, LEA_BUFFER).
+    pub fn buffer(
+        &self,
+        m: &AddressSpace,
+        ram: &[u8],
+        table: u32,
+        index: u32,
+    ) -> Result<(u64, u64), Error> {
+        if table >= 12 {
+            return Err(Error::Unsupported);
+        }
+        let b = self.descriptor(m, ram, table, index)?;
+        if word(&b, 0) & 15 != 9 {
+            return Err(Error::Unsupported);
+        }
+        Ok((pair(&b, 2), word(&b, 1) as u64))
+    }
+    /// Load an attribute in any supported pixel format. Returns four components as
+    /// float bits (`true`) or integers, with missing components defaulting to
+    /// (0, 0, 0, 1). Out-of-bounds elements read as zero.
+    pub fn attribute_any(
+        &self,
+        m: &AddressSpace,
+        ram: &[u8],
+        table: u32,
+        index: u32,
+        vertex: u32,
+        instance: u32,
+    ) -> Result<([u32; 4], bool), Error> {
+        if table >= 12 {
+            return Err(Error::Unsupported);
+        }
+        let a = self.descriptor(m, ram, table, index)?;
+        if word(&a, 0) & 15 != 5 {
+            return Err(Error::Unsupported);
+        }
+        let kind = (word(&a, 0) >> 4) & 15;
+        let frequency = (word(&a, 1) >> 6) & 3;
+        let element = match (kind, frequency) {
+            (1, 0) => vertex,
+            (1, 1) => instance,
+            (2, _) => instance >> ((word(&a, 1) >> 24) & 31),
+            (3, _) => {
+                // NPOT divisor: ((instance + e) * magic) >> 32 >> shift (Mesa
+                // panfrost_compute_magic_divisor).
+                let shift = (word(&a, 1) >> 24) & 31;
+                let e = (word(&a, 1) >> 29) & 1;
+                let magic = word(&a, 5) as u64;
+                ((((instance as u64 + e as u64) * magic) >> 32) >> shift) as u32
+            }
+            _ => return Err(Error::Unsupported),
+        };
+        let pixel = word(&a, 0) >> 10;
+        let format = (pixel >> 12) & 255;
+        let order = pixel & 255;
+        let (bytes, count, float) =
+            crate::gpu_texture::attribute_format(format).ok_or(Error::Unsupported)?;
+        let map = crate::gpu_texture::order(order).ok_or(Error::Unsupported)?;
+        let b = self.descriptor(m, ram, word(&a, 1) & 63, word(&a, 3))?;
+        if word(&b, 0) & 15 != 9 {
+            return Err(Error::Unsupported);
+        }
+        let offset = element as i128 * word(&a, 4) as i128 + (word(&a, 2) as i32) as i128;
+        let one = if float { 1f32.to_bits() } else { 1 };
+        let mut raw = [0u32; 4];
+        if offset >= 0 && offset + bytes as i128 <= word(&b, 1) as i128 {
+            let address = pair(&b, 2)
+                .checked_add(offset as u64)
+                .ok_or(Error::Memory(Fault::AddressSize))?;
+            let mut data = [0; 16];
+            m.read(ram, address, &mut data[..bytes], true)
+                .map_err(Error::Memory)?;
+            raw = crate::gpu_texture::decode_texel(format, &data);
+        }
+        let packed = count == 4 && bytes <= 4 && !matches!(format, 187 | 123 | 155 | 219);
+        let mut out = [0, 0, 0, one];
+        for (n, o) in out.iter_mut().enumerate() {
+            *o = match map[n] {
+                4 => 0,
+                5 => one,
+                k if (k as usize) < count || packed => raw[k as usize],
+                _ => {
+                    if n == 3 {
+                        one
+                    } else {
+                        0
+                    }
+                }
+            };
+        }
+        Ok((out, float))
+    }
     /// Load a complete attribute, including default missing components. Buffer
     /// bounds are checked before translating data; an out-of-range fetch returns
     /// zero source channels, with the format's implicit alpha component retained.
@@ -347,27 +439,37 @@ mod tests {
             8f32.to_bits(),
             0.5f32.to_bits(),
         ];
+        // The position output is the host-side IDVS record buffer (16 bytes per vertex).
+        let mut output = vec![0xa5u8; 48];
         for (id, xy) in [(0, [2f32, 2.]), (1, [14., 2.]), (2, [8., 14.])] {
             let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
             shader.resources = resources;
-            shader.position_output = Some(Buffer {
-                address: 0x6000,
-                size: 48,
-                stride: 4,
-            });
             // Mesa adds view/attribute offsets in dwords to this internal ID.
             shader.regs[59] = id * 4;
             shader.regs[60] = id;
-            shader.run(&m, &mut ram, &uniforms, 16).unwrap();
-            let at = 0x6000 + id as usize * 16;
+            let mut code = crate::gpu_shader::Code::default();
+            let mut tlb = crate::gpu_shader::Tlb::default();
+            let mut textures = crate::gpu_texture::Cache::default();
+            let mut env = crate::gpu_shader::Env::new(
+                &m,
+                &mut ram,
+                &uniforms,
+                &mut code,
+                &mut tlb,
+                &mut textures,
+            );
+            env.output = Some(&mut output);
+            env.output_unit = (4, 1);
+            shader.run_env(&mut env, 16).unwrap();
+            let at = id as usize * 16;
             let expected: Vec<u8> = [xy[0], xy[1], 0.5, 1.]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            assert_eq!(&ram[at..at + 16], &expected);
+            assert_eq!(&output[at..at + 16], &expected);
         }
-        assert_eq!(&ram[0x5ff0..0x6000], &[0xa5; 16]);
-        assert_eq!(&ram[0x6030..0x6040], &[0xa5; 16]);
+        // Guest memory is untouched.
+        assert!(ram[0x5000..0x7000].iter().all(|&v| v == 0xa5));
         // The reserved position table cannot leak into ordinary compute use.
         assert_eq!(
             resources.buffer_address(&m, &ram, 13, 0, 0, None),
