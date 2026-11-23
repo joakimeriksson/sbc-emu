@@ -18,6 +18,8 @@ pub enum Error {
     Memory(Fault),
     Unsupported { pc: u64, instruction: u64 },
     Budget,
+    /// A memory store in a stage running in parallel: the job must run serially.
+    Serial,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum RegisterAllocation {
@@ -58,6 +60,11 @@ pub struct Fragment {
     pub sample_positions: u64,
     /// The thread's lane in its 2x2 quad: x in bit 0, y in bit 1.
     pub lane: u32,
+    /// The thread's pixel.
+    pub pixel: [u32; 2],
+    /// The framebuffer size, for a pre/post-frame shader: its varyings (LD_VAR_IMM)
+    /// interpolate across Mesa's full-screen rectangle.
+    pub frame: Option<[u32; 2]>,
 }
 impl Fragment {
     pub fn new(blend: [u32; 2]) -> Self {
@@ -70,7 +77,14 @@ impl Fragment {
     }
 }
 
+/// binary16 to binary32 for every half value (256 KiB, built on first use).
+static HALF: std::sync::OnceLock<Box<[u32]>> = std::sync::OnceLock::new();
+#[inline]
 fn half(value: u16) -> f32 {
+    let table = HALF.get_or_init(|| (0..=u16::MAX).map(|h| half_slow(h).to_bits()).collect());
+    f32::from_bits(table[value as usize])
+}
+fn half_slow(value: u16) -> f32 {
     let sign = ((value as u32) & 0x8000) << 16;
     let exp = ((value >> 10) & 31) as u32;
     let mant = (value & 1023) as u32;
@@ -80,7 +94,21 @@ fn half(value: u16) -> f32 {
     f32::from_bits(sign | (if exp == 31 { 255 } else { exp + 112 }) << 23 | mant << 13)
 }
 /// IEEE binary32 to binary16, round to nearest with ties to even.
+#[inline]
 fn pack_half(value: f32) -> u16 {
+    let b = value.to_bits();
+    let e = (b >> 23) & 255;
+    if (113..=142).contains(&e) {
+        // Normal binary16 results: round the mantissa to nearest, ties to even.
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let r = ((e - 112) << 10) | ((b & 0x7fffff) >> 13);
+        let rem = b & 0x1fff;
+        let r = r + u32::from(rem > 0x1000 || rem == 0x1000 && r & 1 == 1);
+        return sign | r as u16;
+    }
+    pack_half_slow(value)
+}
+fn pack_half_slow(value: f32) -> u16 {
     let b = value.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 255) as i32;
@@ -187,13 +215,21 @@ impl Interpolation {
 /// executes a job, so each 4 KiB page is translated and copied once.
 #[derive(Default)]
 pub struct Code {
-    pages: HashMap<u64, Box<[u64; 512]>>,
+    pages: HashMap<u64, usize>,
+    words: Vec<Box<[u64; 512]>>,
+    /// The most recently used page (page number + 1, index).
+    last: (u64, usize),
 }
 impl Code {
+    #[inline]
     pub fn fetch(&mut self, m: &AddressSpace, ram: &[u8], pc: u64) -> Result<u64, Fault> {
         let page = pc >> 12;
-        if let Some(p) = self.pages.get(&page) {
-            return Ok(p[((pc >> 3) & 511) as usize]);
+        if self.last.0 == page + 1 {
+            return Ok(self.words[self.last.1][((pc >> 3) & 511) as usize]);
+        }
+        if let Some(&n) = self.pages.get(&page) {
+            self.last = (page + 1, n);
+            return Ok(self.words[n][((pc >> 3) & 511) as usize]);
         }
         let mut bytes = vec![0u8; 4096];
         if m.read(ram, page << 12, &mut bytes, true).is_err() {
@@ -207,7 +243,9 @@ impl Code {
             *w = u64::from_le_bytes(bytes[n * 8..n * 8 + 8].try_into().unwrap());
         }
         let insn = words[((pc >> 3) & 511) as usize];
-        self.pages.insert(page, words);
+        self.pages.insert(page, self.words.len());
+        self.last = (page + 1, self.words.len());
+        self.words.push(words);
         Ok(insn)
     }
 }
@@ -217,6 +255,8 @@ impl Code {
 pub struct Tlb {
     read: HashMap<u64, usize>,
     write: HashMap<u64, usize>,
+    /// The most recent read translation (page number + 1, physical page).
+    last: (u64, usize),
 }
 impl Tlb {
     fn page(
@@ -227,12 +267,18 @@ impl Tlb {
         access: Access,
     ) -> Result<usize, Fault> {
         let vpn = va >> 12;
+        if access == Access::Read && self.last.0 == vpn + 1 {
+            return Ok(self.last.1);
+        }
         let map = if access == Access::Write {
             &mut self.write
         } else {
             &mut self.read
         };
         if let Some(&pa) = map.get(&vpn) {
+            if access == Access::Read {
+                self.last = (vpn + 1, pa);
+            }
             return Ok(pa);
         }
         let pa = usize::try_from(m.translate(ram, vpn << 12, access, true)?)
@@ -241,6 +287,9 @@ impl Tlb {
             map.clear();
         }
         map.insert(vpn, pa);
+        if access == Access::Read {
+            self.last = (vpn + 1, pa);
+        }
         Ok(pa)
     }
     pub fn read(
@@ -291,9 +340,25 @@ impl Tlb {
 }
 
 /// What a running thread can reach besides its registers.
+/// Guest RAM as a shader stage sees it: writable, or shared read-only by parallel
+/// fragment workers (whose memory stores then ask for a serial rerun).
+pub enum Ram<'a> {
+    Rw(&'a mut [u8]),
+    Ro(&'a [u8]),
+}
+impl std::ops::Deref for Ram<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Ram::Rw(r) => r,
+            Ram::Ro(r) => r,
+        }
+    }
+}
+
 pub struct Env<'a> {
     pub m: &'a AddressSpace,
-    pub ram: &'a mut [u8],
+    pub ram: Ram<'a>,
     pub uniforms: &'a [u32],
     pub code: &'a mut Code,
     pub tlb: &'a mut Tlb,
@@ -303,11 +368,33 @@ pub struct Env<'a> {
     pub output_unit: (u32, u32),
     /// Texture and sampler descriptors decoded during this job.
     pub textures: &'a mut crate::gpu_texture::Cache,
+    /// Vertex attribute descriptors decoded during this stage.
+    pub attributes: HashMap<(u64, u32, u32), crate::gpu_resources::Attr>,
 }
 impl<'a> Env<'a> {
     pub fn new(
         m: &'a AddressSpace,
         ram: &'a mut [u8],
+        uniforms: &'a [u32],
+        code: &'a mut Code,
+        tlb: &'a mut Tlb,
+        textures: &'a mut crate::gpu_texture::Cache,
+    ) -> Self {
+        Env {
+            m,
+            ram: Ram::Rw(ram),
+            uniforms,
+            code,
+            tlb,
+            output: None,
+            output_unit: (0, 1),
+            textures,
+            attributes: HashMap::new(),
+        }
+    }
+    pub fn with_ram(
+        m: &'a AddressSpace,
+        ram: Ram<'a>,
         uniforms: &'a [u32],
         code: &'a mut Code,
         tlb: &'a mut Tlb,
@@ -322,13 +409,18 @@ impl<'a> Env<'a> {
             output: None,
             output_unit: (0, 1),
             textures,
+            attributes: HashMap::new(),
         }
     }
     pub fn read(&mut self, va: u64, out: &mut [u8]) -> Result<(), Fault> {
-        self.tlb.read(self.m, self.ram, va, out)
+        self.tlb.read(self.m, &self.ram, va, out)
     }
-    pub fn write(&mut self, va: u64, data: &[u8]) -> Result<(), Fault> {
-        self.tlb.write(self.m, self.ram, va, data)
+    /// Write guest memory; `Error::Serial` when the RAM is shared read-only.
+    pub fn write(&mut self, va: u64, data: &[u8]) -> Result<(), Error> {
+        match &mut self.ram {
+            Ram::Rw(ram) => self.tlb.write(self.m, ram, va, data).map_err(Error::Memory),
+            Ram::Ro(_) => Err(Error::Serial),
+        }
     }
 }
 
@@ -354,6 +446,7 @@ const LUT: [u32; 32] = [
     0x2e660000, 0x34000000, 0x38000000, 0x3c000000, 0x40000000, 0x44000000, 0x48000000, 0x42480000,
 ];
 
+#[inline]
 fn bits(i: u64, start: u32, count: u32) -> u32 {
     ((i >> start) & ((1u64 << count) - 1)) as u32
 }
@@ -386,6 +479,7 @@ fn icmp<T: PartialOrd>(cond: u32, x: T, y: T) -> Option<bool> {
 }
 /// Result clamps (ISA.xml Clamp): NaN goes to the lower bound, and -0 to +0 for
 /// clamp_0_inf and clamp_0_1 (`f32::max`/`min` return the operand that is not NaN).
+#[inline]
 fn clamp(mode: u32, v: f32) -> f32 {
     match mode {
         1 => v.max(0.) + 0.,
@@ -430,6 +524,24 @@ fn frexp(x: f32, sqrt: bool, log: bool) -> (f32, i32) {
     }
     (m, e)
 }
+/// FLOGD: log2(m)/(m - 1) of the log-reduced mantissa m of x, so that Mesa's
+/// FMA(FLOGD(x), FADD_LSCALE(-1, x), exponent of x) is log2(x). For 0 the product must
+/// be -inf with FADD_LSCALE(-1, 0) = -1, so FLOGD(0) is +inf.
+fn flogd(x: f32) -> f32 {
+    if x < 0. || x.is_nan() {
+        f32::NAN
+    } else if x == 0. || x.is_infinite() {
+        f32::INFINITY
+    } else {
+        let m = frexp(x, false, true).0 as f64;
+        let r = if (m - 1.).abs() < 1e-12 { std::f64::consts::LOG2_E } else { m.log2() / (m - 1.) };
+        r as f32
+    }
+}
+/// FADD_LSCALE: `a` plus the log-reduced mantissa of `b` (see flogd).
+fn fadd_lscale(a: f32, b: f32) -> f32 {
+    a + frexp(b, false, true).0
+}
 fn fmin(a: f32, b: f32) -> f32 {
     a.min(b)
 }
@@ -450,6 +562,7 @@ fn widen32(v: u32, field: u32, signed: bool) -> Option<u32> {
 fn pack2(lo: u32, hi: u32) -> u32 {
     (lo & 0xffff) | (hi << 16)
 }
+#[inline]
 fn f2h(v: [f32; 2]) -> u32 {
     pack_half(v[0]) as u32 | (pack_half(v[1]) as u32) << 16
 }
@@ -489,9 +602,11 @@ struct Ops<'s> {
 }
 type R<T> = Result<T, Option<Error>>;
 impl Ops<'_> {
+    #[inline]
     fn raw(&self, n: usize) -> R<u32> {
         self.s.source(self.i, n, self.uniforms).ok_or(None)
     }
+    #[inline]
     fn absneg(&self, n: usize, mut v: f32) -> f32 {
         let shift = 38 - 2 * n as u32;
         if self.i & (1 << (shift + 1)) != 0 {
@@ -503,6 +618,7 @@ impl Ops<'_> {
         v
     }
     /// 32-bit float source with the half-widening swizzle (Widen enum) and abs/neg.
+    #[inline]
     fn f32(&self, n: usize) -> R<f32> {
         let b = self.raw(n)?;
         let v = match bits(self.i, 28 - 2 * n as u32, 2) {
@@ -517,6 +633,7 @@ impl Ops<'_> {
     fn f32_plain(&self, n: usize) -> R<f32> {
         Ok(self.absneg(n, f32::from_bits(self.raw(n)?)))
     }
+    #[inline]
     fn swizzle16(&self, n: usize) -> R<[u16; 2]> {
         let b = self.raw(n)?;
         let h = [b as u16, (b >> 16) as u16];
@@ -528,6 +645,7 @@ impl Ops<'_> {
         })
     }
     /// Two 16-bit floats with a 16-bit swizzle (h00 h10 h01 h11) and abs/neg.
+    #[inline]
     fn v2f16(&self, n: usize) -> R<[f32; 2]> {
         Ok(self.swizzle16(n)?.map(|h| self.absneg(n, half(h))))
     }
@@ -635,6 +753,22 @@ impl Shader {
             },
         }
     }
+    /// Start the thread again at `pc` with the given register allocation and all
+    /// registers zeroed.
+    pub fn restart(&mut self, pc: u64, allocation: RegisterAllocation) {
+        // A fresh thread: what a shader reads before writing must not depend on which
+        // thread ran on this lane before (that varies with the fragment workers' split).
+        self.regs = [0; 64];
+        self.pc = pc;
+        self.instructions = 0;
+        self.done = false;
+        self.scratch.clear();
+        self.register_mask = match allocation {
+            RegisterAllocation::Registers32 => 0xffff_0000_0000_ffff,
+            RegisterAllocation::Registers64 => u64::MAX,
+        };
+    }
+    #[inline]
     fn registers_available(&self, first: usize, count: usize) -> bool {
         count != 0
             && first < 64
@@ -643,6 +777,7 @@ impl Shader {
     }
     /// The 32-bit value of source byte `index`: a register, a uniform, an immediate
     /// from the lookup table or a special FAU value (page in bits 57-58).
+    #[inline]
     fn source(&self, i: u64, index: usize, uniforms: &[u32]) -> Option<u32> {
         let s = ((i >> (index * 8)) & 255) as usize;
         let page = ((i >> 57) & 3) as usize;
@@ -774,7 +909,7 @@ impl Shader {
             }
             let i = env
                 .code
-                .fetch(env.m, env.ram, self.pc)
+                .fetch(env.m, &env.ram, self.pc)
                 .map_err(Error::Memory)?;
             self.step(env, i, None)?;
         }
@@ -865,6 +1000,7 @@ impl Shader {
                 return Ok(Next::Continue);
             }
             0x045 => return Ok(Next::Continue), // BARRIER: threads run in order
+            0x054 => return self.ld_var_imm(env, i),
             0x056 => return self.ld_var_special(i),
             0x05c | 0x05d | 0x06c | 0x06d => return self.ld_var_buf(i, u),
             0x05e => return self.lea_buf_imm(env, i),
@@ -1059,7 +1195,7 @@ impl Shader {
                     }
                     // FADD_LSCALE: A plus the log-reduced mantissa of B (see FLOGD).
                     9 => {
-                        clamp(cl, o.f32_plain(0)? + frexp(o.f32_plain(1)?, false, true).0).to_bits()
+                        clamp(cl, fadd_lscale(o.f32_plain(0)?, o.f32_plain(1)?)).to_bits()
                     }
                     _ => return Err(None),
                 }
@@ -1355,24 +1491,8 @@ impl Shader {
                 }
             }
             8 => {
-                // FLOGD: log2(m)/(m - 1) of the log-reduced mantissa m, so that
-                // FLOGD(x) * FADD_LSCALE(-1, x) + exponent = log2(x).
-                let x = o.f32(0)?;
-                if x < 0. || x.is_nan() {
-                    f32::NAN.to_bits()
-                } else if x == 0. {
-                    f32::NEG_INFINITY.to_bits()
-                } else if x.is_infinite() {
-                    f32::INFINITY.to_bits()
-                } else {
-                    let m = frexp(x, false, true).0 as f64;
-                    let r = if (m - 1.).abs() < 1e-12 {
-                        std::f64::consts::LOG2_E
-                    } else {
-                        m.log2() / (m - 1.)
-                    };
-                    (r as f32).to_bits()
-                }
+                // FLOGD: log2(m)/(m - 1) of the log-reduced mantissa m (see flogd).
+                flogd(o.f32(0)?).to_bits()
             }
             10 | 11 => {
                 let x = if sub == 10 { o.f32(0)? } else { o.v2f16(0)?[0] };
@@ -1691,33 +1811,40 @@ impl Shader {
 pub fn run_quad(lanes: &mut [Shader; 4], env: &mut Env, budget: usize) -> Result<(), Error> {
     let mut spent = 0;
     loop {
-        let mut pc = u64::MAX;
-        for l in lanes.iter() {
-            if !l.done {
-                pc = pc.min(l.pc);
+        // Each thread runs on its own up to the next instruction that reads other
+        // lanes (cross-lane permutes, implicit-LOD texturing) or its end.
+        for lane in lanes.iter_mut() {
+            while !lane.done {
+                let i = env.code.fetch(env.m, &env.ram, lane.pc).map_err(Error::Memory)?;
+                if msg::needs_quad(i) {
+                    break;
+                }
+                if spent >= budget {
+                    return Err(Error::Budget);
+                }
+                lane.step(env, i, None)?;
+                spent += 1;
             }
         }
-        if pc == u64::MAX {
+        // The lanes waiting at the lowest such instruction execute it together.
+        let Some(pc) = lanes.iter().filter(|l| !l.done).map(|l| l.pc).min() else {
             return Ok(());
-        }
+        };
         if spent >= budget {
             return Err(Error::Budget);
         }
-        let i = env.code.fetch(env.m, env.ram, pc).map_err(Error::Memory)?;
+        let i = env.code.fetch(env.m, &env.ram, pc).map_err(Error::Memory)?;
         let active: [bool; 4] = std::array::from_fn(|n| !lanes[n].done && lanes[n].pc == pc);
-        let cross = msg::needs_quad(i);
-        let mut view = cross.then(|| QuadView {
+        let mut view = QuadView {
             regs: std::array::from_fn(|n| lanes[n].regs),
             active,
             lane: 0,
             tex: msg::quad_coords(lanes, &active, i, env.uniforms),
-        });
+        };
         for n in 0..4 {
             if active[n] {
-                if let Some(v) = view.as_mut() {
-                    v.lane = n;
-                }
-                lanes[n].step(env, i, view.as_ref())?;
+                view.lane = n;
+                lanes[n].step(env, i, Some(&view))?;
                 spent += 1;
             }
         }

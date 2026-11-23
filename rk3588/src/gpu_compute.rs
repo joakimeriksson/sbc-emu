@@ -94,6 +94,7 @@ pub fn dispatch(
                                 .run(m, ram, &uniforms, remaining.min(4096))
                                 .map_err(Stop::Shader)?;
                             remaining -= shader.instructions as usize;
+                            crate::gpu::work(shader.instructions, 0, 0);
                         }
                     }
                 }
@@ -199,7 +200,10 @@ mod tests {
         for allocation in [0u32, 2] {
             ram[..4].copy_from_slice(&(0x18 | (allocation << 30)).to_le_bytes());
             ram[1024..1056].fill(0);
+            crate::gpu::take_work();
             dispatch(&m, &mut ram, &regs, 4 << 56).unwrap();
+            // Compute work takes GPU time too.
+            assert!(crate::gpu::take_work() > 0);
             let values: Vec<u32> = ram[1024..1056]
                 .chunks_exact(4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))

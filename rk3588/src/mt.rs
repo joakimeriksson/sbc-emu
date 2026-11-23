@@ -171,6 +171,9 @@ impl MtBus<'_> {
         let soc = unsafe { self.sh.soc() };
         soc.gic.cur = self.k;
         let r = f(soc);
+        // Cores here run on the host's wall clock, which went on while the GPU worked:
+        // its modelled time is not charged on top.
+        soc.gpu.take_cost();
         if soc.dirty { soc.device_lines(); soc.dirty = false; self.sh.publish(soc); }
         r
     }

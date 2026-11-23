@@ -83,11 +83,15 @@ impl Blend {
             });
         }
         // Enabled, non-sRGB fixed-function/opaque output to any render target with a
-        // non-raw conversion; no blend shader.
+        // non-raw conversion; no blend shader. The conversion's register format is
+        // the shader's (BLEND with an auto register format).
         if words[0] & 0xffff & !0x901 != 0x200
             || words[2] & !(3 | (3 << 3) | (15 << 16)) != 0
             || !matches!(words[2] & 3, 1 | 2)
-            || words[3] & 0xffc0_0000 != 0
+            // Conversion: memory format, no raw, a float register format (F16, F32):
+            // integer ones would need the raw path, which writeback does not take.
+            || words[3] & 0xf8c0_0000 != 0
+            || (words[3] >> 24) & 7 > 1
             || words[1] & 0x0f000000 != 0
         {
             return Err(());
@@ -118,6 +122,10 @@ impl Blend {
         };
         if self.alpha_to_one {
             source[3] = 1.;
+        }
+        // Replace (A = Src, B = Src, C = 0) with all channels written: the source.
+        if self.mask == 15 && self.rgb.0 == 0x122 && self.alpha.0 == 0x122 {
+            return source;
         }
         std::array::from_fn(|n| {
             if self.mask & (1 << n) == 0 {
@@ -156,6 +164,17 @@ impl Blend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_conversion_with_a_float_register_format_decodes() {
+        // glmark2's desktop scene: opaque, round to FB precision, F32 register format.
+        let b = Blend::decode([0xa00, 0xf0122122, 0x19, 0x010ed000]).unwrap();
+        assert_eq!(b.apply_f([0.25, 0.5, 0.75, 1.], [0.; 4], true), [0.25, 0.5, 0.75, 1.]);
+        // Raw conversions and integer register formats (I32 to U16) are not.
+        assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x004ed000]).is_err());
+        for format in 2..8u32 {
+            assert!(Blend::decode([0xa00, 0xf0122122, 0x19, 0x000ed000 | format << 24]).is_err());
+        }
+    }
     #[test]
     fn captured_source_over_preserves_alpha_and_draw_order() {
         let b = Blend::decode([0x201, 0xf0503503, 0x1a, 0xed000]).unwrap();

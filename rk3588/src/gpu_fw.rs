@@ -95,6 +95,9 @@ impl Firmware {
                 self.queues.retain(|&(group, _), _| group != g);
                 self.tiler.clear_group(g);
             }
+            if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                eprintln!("[mali fw] group {g} req {req:#x} ack {ack:#x}");
+            }
             if req & 7 != 1 && req & 7 != 3 {
                 continue;
             }
@@ -137,6 +140,9 @@ impl Firmware {
                 let ro = r64(ram, ci + 56)?;
                 let insert = r64(ram, ri)?;
                 let mut extract = r64(ram, ro)?;
+                if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                    eprintln!("[mali fw] group {g} queue {q} req {cr:#x} extract {extract:#x} insert {insert:#x}");
+                }
                 if size == 0
                     || size > 1 << 20
                     || !size.is_power_of_two()
@@ -177,12 +183,10 @@ impl Firmware {
                         eprintln!("[mali] queue stopped: {:?}", stop);
                         // Report CS_FATAL, never signal success for unsupported work.
                         write(m, ram, co + 132, 0x40)?;
-                        let ca = read(m, ram, co)?;
-                        write(m, ram, co, ca ^ (1 << 30))?;
+                        raise(m, ram, ci, co, 1 << 30)?;
                         self.failed_queues.insert((g, q));
                         failed = true;
-                        let bits = read(m, ram, output + 12)?;
-                        write(m, ram, output + 12, bits ^ (1 << q))?;
+                        raise(m, ram, input + 12, output + 12, 1 << q)?;
                         break;
                     }
                     self.queues.insert((g, q), Queue { binding, stream });
@@ -192,8 +196,7 @@ impl Firmware {
                     queue_completed = true;
                 }
                 if queue_completed {
-                    let bits = read(m, ram, output + 12)?;
-                    write(m, ram, output + 12, bits ^ (1 << q))?;
+                    raise(m, ram, input + 12, output + 12, 1 << q)?;
                 }
             }
             if failed {
@@ -202,8 +205,8 @@ impl Firmware {
             let db = read(m, ram, input + 8)?;
             write(m, ram, output + 8, db)?;
             if completed {
-                let a = read(m, ram, output)?;
-                write(m, ram, output, a ^ (1 << 28))?;
+                // CSG_SYNC_UPDATE
+                raise(m, ram, input, output, 1 << 28)?;
                 irq |= 1 << g;
             }
         }
@@ -231,6 +234,15 @@ impl Firmware {
 
 emu_core::snap_struct!(Queue { binding, stream });
 emu_core::snap_struct!(Firmware { running, input, output, groups, stride, failed_queues, queues, tiler });
+
+/// Raise a toggle-style event (bit `bit` of the word at `event`, acknowledged by the host
+/// copying it into the word at `ack`): the event is pending while the two differ. An event
+/// still pending stays pending; toggling it again would withdraw it before the host saw it.
+fn raise(m: &AddressSpace, ram: &mut [u8], ack: u64, event: u64, bit: u32) -> Result<(), Fault> {
+    let a = read(m, ram, ack)?;
+    let e = read(m, ram, event)?;
+    write(m, ram, event, (e & !bit) | (!a & bit))
+}
 
 #[cfg(test)]
 mod tests {
@@ -392,5 +404,22 @@ mod tests {
         write(&m, &mut r, SHARED + 0x3000, 0).unwrap();
         f.queues(&spaces, &mut r).unwrap();
         assert!(f.queues.is_empty());
+    }
+    #[test]
+    fn a_second_completion_keeps_an_unacknowledged_sync_update_pending() {
+        // Two jobs complete before the kernel acknowledges the first CSG_SYNC_UPDATE:
+        // toggling twice used to withdraw the event, and the kernel timed the job out.
+        let m = AddressSpace { transtab: 0, transcfg: 2 };
+        let mut ram = vec![0u8; 64];
+        let (req, ack) = (0u64, 8u64);
+        raise(&m, &mut ram, req, ack, 1 << 28).unwrap();
+        assert_ne!(read(&m, &ram, ack).unwrap() & (1 << 28), read(&m, &ram, req).unwrap() & (1 << 28));
+        raise(&m, &mut ram, req, ack, 1 << 28).unwrap();
+        assert_ne!(read(&m, &ram, ack).unwrap() & (1 << 28), read(&m, &ram, req).unwrap() & (1 << 28));
+        // The kernel acknowledges by copying the bit; the next completion raises it again.
+        let a = read(&m, &ram, ack).unwrap();
+        write(&m, &mut ram, req, a).unwrap();
+        raise(&m, &mut ram, req, ack, 1 << 28).unwrap();
+        assert_ne!(read(&m, &ram, ack).unwrap() & (1 << 28), read(&m, &ram, req).unwrap() & (1 << 28));
     }
 }

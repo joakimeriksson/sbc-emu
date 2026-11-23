@@ -19,7 +19,7 @@ p.add_argument('--app', choices=('kmscube', 'glmark2'), default='kmscube')
 p.add_argument('--frames', type=int, default=900, help='kmscube frame count')
 p.add_argument('--benchmark', action='append', default=[],
                help='glmark2 benchmark (repeatable), e.g. build:use-vbo=true')
-p.add_argument('--hdmi-mode', default='640x480', help='monitor mode: 640x480, 1280x720 or 1920x1080')
+p.add_argument('--hdmi-mode', default='640x480', help='preferred monitor mode: 640x480, 1280x720 or 1920x1080')
 p.add_argument('--screenshots', type=int, default=3, help='screenshots taken while the program runs')
 p.add_argument('--interval', type=float, default=2, help='seconds between screenshots')
 p.add_argument('--env', default='', help='extra guest environment, e.g. PAN_MESA_DEBUG=linear')
@@ -29,6 +29,7 @@ p.add_argument('--emulator', type=pathlib.Path, default=root / 'target/release/s
 p.add_argument('--timeout', type=int, default=900)
 a = p.parse_args()
 
+
 a.output.parent.mkdir(parents=True, exist_ok=True)
 shots = [a.output] + [a.output.with_name(f'{a.output.stem}-{n}{a.output.suffix}') for n in range(2, a.screenshots + 1)]
 if a.app == 'kmscube':
@@ -36,8 +37,11 @@ if a.app == 'kmscube':
     started = 'Rendered'
 else:
     benchmarks = ' '.join(f"-b '{b}'" for b in a.benchmark)
+    # glmark2-es2-drm renders full screen at the largest mode the monitor offers.
     program = f'glmark2-es2-drm {benchmarks}'
-    started = '======================================================='
+    # glmark2 prints a scene's name when it starts drawing it (and its score after).
+    first = a.benchmark[0].split(':')[0] if a.benchmark else 'build'
+    started = f'[{first}]'
 setup = ('mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t tmpfs none /tmp; '
          'modprobe fixed; modprobe panthor; modprobe phy-rockchip-samsung-hdptx; modprobe rockchipdrm; '
          'sleep 2; stty -echo')
@@ -46,7 +50,7 @@ lines = ['wait-serial root@', f'serial {setup}; echo APP-READY-$((6*7))\\n', 'wa
          f'serial {a.env} {program} 2>&1; echo APP-EXIT-$((6*7))\\n',
          f'wait-serial {started}']
 for n, shot in enumerate(shots):
-    if n:
+    if n or a.app == 'glmark2':
         lines.append(f'sleep {a.interval}')
     lines.append(f'screenshot {shot.resolve()}')
 lines += ['wait-serial APP-EXIT-42', 'quit']

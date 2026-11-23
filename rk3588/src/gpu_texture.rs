@@ -59,6 +59,8 @@ struct Plane {
     width: u32,
     height: u32,
     tiled: bool,
+    /// AFBC planes: header layout (`pointer` is the headers).
+    afbc: Option<crate::gpu_afbc::Layout>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -288,8 +290,8 @@ impl Texture {
                 Ok(table)
             }
         };
-        let td = resources.descriptor(env.m, env.ram, fold(t.0)?, t.1)?;
-        let sd = resources.descriptor(env.m, env.ram, fold(s.0)?, s.1)?;
+        let td = resources.descriptor(env.m, &env.ram, fold(t.0)?, t.1)?;
+        let sd = resources.descriptor(env.m, &env.ram, fold(s.0)?, s.1)?;
         if word(&td, 0) & 15 != 2 || word(&sd, 0) & 15 != 1 {
             return Err(Error::Unsupported);
         }
@@ -320,8 +322,30 @@ impl Texture {
             env.read(at, &mut p).map_err(Error::Memory)?;
             let kind = (word(&p, 0) >> 4) & 15;
             let ordering = (word(&p, 0) >> 8) & 15;
-            if word(&p, 0) & 15 != 10 || kind != 1 || !matches!(ordering, 1 | 2) {
-                return Err(Error::Unsupported); // AFBC, AFRC, ASTC and YUV planes
+            let afbc = if kind == 6 {
+                // 16x16 superblocks, no split blocks; tiled headers are 8x8 groups.
+                if (word(&p, 0) >> 8) & 7 != 0 || word(&p, 0) & (1 << 17) != 0 {
+                    return Err(Error::Unsupported);
+                }
+                let tiled = word(&p, 0) & (1 << 19) != 0;
+                // AFBC has no format wider than 64 bits (a solid colour fills the rest
+                // of a 16-byte header).
+                let bpp = format_info(format).unwrap().0;
+                if bpp > crate::gpu_afbc::MAX_BPP {
+                    return Err(Error::Unsupported);
+                }
+                Some(crate::gpu_afbc::Layout {
+                    header: pair(&p, 2),
+                    stride: word(&p, 4) / (16 * if tiled { 8 } else { 1 }),
+                    tiled,
+                    bpp,
+                    body_offset: 0,
+                })
+            } else {
+                None
+            };
+            if word(&p, 0) & 15 != 10 || !(kind == 1 && matches!(ordering, 1 | 2) || afbc.is_some()) {
+                return Err(Error::Unsupported); // AFRC, ASTC and YUV planes
             }
             planes.push(Plane {
                 pointer: pair(&p, 2),
@@ -331,6 +355,7 @@ impl Texture {
                 width: (word(&p, 7) & 0xffff) + 1,
                 height: (word(&p, 7) >> 16) + 1,
                 tiled: ordering == 1,
+                afbc,
             });
         }
         let c = word(&sd, 0);
@@ -387,6 +412,20 @@ impl Texture {
             return Ok(None);
         }
         let bpp = format_info(self.format).unwrap().0 as u64;
+        if let Some(l) = p.afbc {
+            let mut b = [0u8; 16];
+            let mut read = |a: u64, out: &mut [u8]| env.read(a, out);
+            return match l.read_pixel(&mut read, x as u32, y as u32, &mut b[..bpp as usize]) {
+                Ok(()) => Ok(Some(decode(self.format, &b))),
+                Err(crate::gpu_afbc::Error::Memory(f)) => {
+                    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                        eprintln!("[mali] AFBC texture {l:x?} texel {x},{y}: {f:?}");
+                    }
+                    Err(Error::Memory(f))
+                }
+                Err(crate::gpu_afbc::Error::Compressed) => Err(Error::Unsupported),
+            };
+        }
         let (x, y) = (x as u64, y as u64);
         const DUP: [u64; 16] = [
             0, 3, 12, 15, 48, 51, 60, 63, 192, 195, 204, 207, 240, 243, 252, 255,
@@ -828,6 +867,19 @@ mod tests {
         v.map(|v| (v * 255.).round() as u8)
     }
     #[test]
+    fn afbc_planes_of_formats_wider_than_64_bits_fault() {
+        // An AFBC plane (type 6) with RGBA32F and a zeroed (solid-colour) header: the
+        // 16-byte texel cannot come from the header; this used to panic the host.
+        let (m, resources, mut ram, h) = test_fixture();
+        set(&mut ram, 0x2100, (2 << 24) | 0x6a);
+        ram[0x3000..0x3080].fill(0);
+        set(&mut ram, 0x2040, (191 << 22) | 0x22);
+        assert_eq!(sample2d(&m, &mut ram, resources, h, [0.25, 0.25]), Err(Error::Unsupported));
+        // The same header as RGBA8 is a solid colour.
+        set(&mut ram, 0x2040, (187 << 22) | 0x22);
+        assert_eq!(sample2d(&m, &mut ram, resources, h, [0.25, 0.25]), Ok([0.; 4]));
+    }
+    #[test]
     fn native_resources_sample_padded_rows_and_descriptor_indices() {
         let (m, resources, mut ram, h) = test_fixture();
         for (uv, expected) in [
@@ -1010,7 +1062,9 @@ mod tests {
         );
         // Trilinear blends the two levels.
         let ctl = word(&env.ram[0x2000..], 0) | (3 << 30);
-        set(env.ram, 0x2000, ctl);
+        if let crate::gpu_shader::Ram::Rw(ram) = &mut env.ram {
+            set(ram, 0x2000, ctl);
+        }
         env.textures.map.clear();
         r.lod = Lod::Explicit(0.5);
         assert_eq!(

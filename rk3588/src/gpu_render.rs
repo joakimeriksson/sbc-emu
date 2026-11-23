@@ -20,7 +20,12 @@ fn word(b: &[u8], n: usize) -> u32 {
 fn pair(b: &[u8], n: usize) -> u64 {
     word(b, n) as u64 | (word(b, n + 1) as u64) << 32
 }
+/// An unsupported fragment job setting (where, with `SBC_MALI_DEBUG=1`).
+#[track_caller]
 fn unsupported() -> Stop {
+    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+        eprintln!("[mali] unsupported fragment job setting at {}", std::panic::Location::caller());
+    }
     Stop::Unsupported { pc: 0, opcode: 7 }
 }
 fn trace() -> bool {
@@ -48,6 +53,8 @@ pub struct Surface {
     pub row_stride: u64,
     pub tiled: bool,
     pub bpp: u64,
+    /// AFBC surfaces (16x16 superblocks, sparse payloads).
+    pub afbc: Option<crate::gpu_afbc::Layout>,
 }
 impl Surface {
     pub fn offset(&self, x: u32, y: u32) -> u64 {
@@ -89,10 +96,80 @@ pub struct TileBuffer {
     pub stencil: Vec<u8>,
     /// Pixels a draw wrote, per render target.
     pub touched: bool,
+    /// A fragment worker's share: the rows y with (y / STRIPE) % parts == part, stored
+    /// compacted from row `base` on (parts 1: every row).
+    part: u32,
+    parts: u32,
+    base: u32,
 }
+/// Rows per stripe of a fragment worker (a multiple of the 2x2 quad).
+const STRIPE: u32 = 16;
 impl TileBuffer {
+    pub fn new(x0: u32, y0: u32, w: u32, h: u32) -> Self {
+        TileBuffer {
+            x0,
+            y0,
+            w,
+            h,
+            color: Vec::new(),
+            depth: Vec::new(),
+            stencil: Vec::new(),
+            touched: false,
+            part: 0,
+            parts: 1,
+            base: 0,
+        }
+    }
+    fn row(&self, y: u32) -> u32 {
+        if self.parts <= 1 {
+            y - self.y0
+        } else {
+            (y / STRIPE / self.parts) * STRIPE + y % STRIPE - self.base
+        }
+    }
     pub fn index(&self, x: u32, y: u32) -> usize {
-        ((y - self.y0) * self.w + (x - self.x0)) as usize
+        (self.row(y) * self.w + (x - self.x0)) as usize
+    }
+    /// Whether this (worker's) tile buffer holds row `y`.
+    pub fn owns(&self, y: u32) -> bool {
+        self.parts <= 1 || (y / STRIPE) % self.parts == self.part
+    }
+    /// Worker `part` of `parts`: a copy of its interleaved stripes of rows, so that
+    /// workers share geometry that covers part of the screen evenly.
+    pub fn stripes(&self, part: u32, parts: u32) -> TileBuffer {
+        let mut t = TileBuffer::new(self.x0, self.y0, self.w, self.h);
+        (t.part, t.parts) = (part, parts);
+        let owned: Vec<u32> = (self.y0..self.y0 + self.h).filter(|&y| t.owns(y)).collect();
+        if let Some(&first) = owned.first() {
+            t.base = (first / STRIPE / parts) * STRIPE + first % STRIPE;
+        }
+        let w = self.w as usize;
+        for (k, c) in self.color.iter().enumerate() {
+            t.color.push(Vec::with_capacity(owned.len() * w));
+            for &y in &owned {
+                let a = self.index(self.x0, y);
+                t.color[k].extend_from_slice(&c[a..a + w]);
+            }
+        }
+        for &y in &owned {
+            let a = self.index(self.x0, y);
+            t.depth.extend_from_slice(&self.depth[a..a + w]);
+            t.stencil.extend_from_slice(&self.stencil[a..a + w]);
+        }
+        t
+    }
+    /// Copy a worker's stripes back.
+    pub fn merge(&mut self, part: &TileBuffer) {
+        let w = self.w as usize;
+        for y in (self.y0..self.y0 + self.h).filter(|&y| part.owns(y)) {
+            let (a, b) = (self.index(self.x0, y), part.index(self.x0, y));
+            for (c, p) in self.color.iter_mut().zip(&part.color) {
+                c[a..a + w].copy_from_slice(&p[b..b + w]);
+            }
+            self.depth[a..a + w].copy_from_slice(&part.depth[b..b + w]);
+            self.stencil[a..a + w].copy_from_slice(&part.stencil[b..b + w]);
+        }
+        self.touched |= part.touched;
     }
 }
 
@@ -156,6 +233,17 @@ impl Target {
     }
     /// Pack one pixel in the writeback format.
     fn pack(&self, c: [f32; 4], out: &mut [u8; 4]) -> usize {
+        if matches!(self.format, 19 | 22) && !self.srgb {
+            // RGBA8 (the common case): one byte per swizzled channel.
+            for k in 0..4 {
+                out[k] = match self.swizzle[k] {
+                    4 => 0,
+                    5 => 255,
+                    s => (c[s as usize].clamp(0., 1.) * 255.).round_ties_even() as u8,
+                };
+            }
+            return 4;
+        }
         let mut c = c;
         if self.srgb {
             for v in c.iter_mut().take(3) {
@@ -260,7 +348,7 @@ pub fn fragment_frame(
         let w0 = word(&rt, 0);
         let w1 = word(&rt, 1);
         let internal = w0 >> 26;
-        let layout = tib_layout(internal).ok_or_else(unsupported)?;
+        let layout = tib_layout(internal).ok_or_else(|| unsupported())?;
         if w0 & 15 != 0 || w0 & (1 << 24) != 0 {
             return Err(unsupported()); // AFRC/YUV writeback
         }
@@ -296,17 +384,26 @@ pub fn fragment_frame(
         let block = (w1 >> 8) & 15;
         let format = (w1 >> 3) & 31;
         let write = if write_enable {
-            let bpp = writeback_bytes(format).ok_or_else(unsupported)?;
-            if !matches!(block, 1 | 2) {
-                return Err(unsupported()); // AFBC writeback
+            let bpp = writeback_bytes(format).ok_or_else(|| unsupported())?;
+            // AFBC: no split or wide (32x8) blocks.
+            if !matches!(block, 1 | 2 | 12 | 13) || block >= 12 && word(&rt, 2) & 6 != 0 {
+                return Err(unsupported());
             }
             let s = Surface {
                 base: pair(&rt, 8),
                 row_stride: word(&rt, 10) as u64,
                 tiled: block == 1,
                 bpp,
+                afbc: (block >= 12).then(|| crate::gpu_afbc::Layout {
+                    header: pair(&rt, 8),
+                    // v9+: header bytes per superblock row (8 rows when tiled).
+                    stride: word(&rt, 10) / (16 * if block == 13 { 8 } else { 1 }),
+                    tiled: block == 13,
+                    bpp: bpp as usize,
+                    body_offset: word(&rt, 11) as u64,
+                }),
             };
-            if !s.tiled && s.row_stride < width as u64 * bpp {
+            if !s.tiled && s.afbc.is_none() && s.row_stride < width as u64 * bpp {
                 return Err(Stop::InvalidStream);
             }
             writes.push(n);
@@ -344,7 +441,7 @@ pub fn fragment_frame(
             2 | 4 | 5 | 14 => 4,
             _ => return Err(unsupported()),
         };
-        if !matches!(block, 1 | 2) || (word(&ext, 0) >> 8) & 3 > 1 {
+        if !matches!(block, 1 | 2 | 12 | 13) || (word(&ext, 0) >> 8) & 3 > 1 {
             return Err(unsupported());
         }
         Some((
@@ -354,6 +451,13 @@ pub fn fragment_frame(
                 row_stride: word(&ext, 10) as u64,
                 tiled: block == 1,
                 bpp,
+                afbc: (block >= 12).then(|| crate::gpu_afbc::Layout {
+                    header: pair(&ext, 8),
+                    stride: word(&ext, 10) / (16 * if block == 13 { 8 } else { 1 }),
+                    tiled: block == 13,
+                    bpp: bpp as usize,
+                    body_offset: word(&ext, 11) as u64,
+                }),
             },
         ))
     } else {
@@ -410,16 +514,9 @@ pub fn fragment_frame(
     }
     // The tile buffer: clear or preload.
     let count = (w * h) as usize;
-    let mut tb = TileBuffer {
-        x0,
-        y0,
-        w,
-        h,
-        color: Vec::with_capacity(fb.targets.len()),
-        depth: vec![f32::from_bits(word(&f, 13)); count],
-        stencil: vec![word(&f, 12) as u8; count],
-        touched: false,
-    };
+    let mut tb = TileBuffer::new(x0, y0, w, h);
+    tb.depth = vec![f32::from_bits(word(&f, 13)); count];
+    tb.stencil = vec![word(&f, 12) as u8; count];
     for t in fb.targets.iter() {
         tb.color.push(vec![t.clear; count]);
     }
@@ -437,17 +534,24 @@ pub fn fragment_frame(
         crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 256)?;
     }
     // Writeback.
+    let written = destinations.iter().map(|(n, _)| fb.targets[*n].write.unwrap().bpp).sum::<u64>()
+        + zs.map_or(0, |(_, s)| s.bpp);
+    crate::gpu::work(0, 0, written * w as u64 * h as u64);
     for (n, rows) in &destinations {
         let t = &fb.targets[*n];
         let s = t.write.unwrap();
         let mut px = [0u8; 4];
-        store(ram, &s, rows, x0, y0, w, h, |i, out| {
+        let f = |i: usize, out: &mut [u8]| {
             let bytes = t.pack(tb.color[*n][i], &mut px);
             out.copy_from_slice(&px[..bytes]);
-        });
+        };
+        match s.afbc {
+            Some(l) => afbc_store(m, ram, &l, x0, y0, w, h, f)?,
+            None => store(ram, &s, rows, x0, y0, w, h, f),
+        }
     }
     if let (Some((format, s)), Some(rows)) = (zs, zs_rows.as_ref()) {
-        store(ram, &s, rows, x0, y0, w, h, |i, out| {
+        let f = |i: usize, out: &mut [u8]| {
             let z = tb.depth[i].clamp(0., 1.);
             let st = tb.stencil[i] as u32;
             match format {
@@ -465,7 +569,11 @@ pub fn fragment_frame(
                     out.copy_from_slice(&old.to_le_bytes());
                 }
             }
-        });
+        };
+        match s.afbc {
+            Some(l) => afbc_store(m, ram, &l, x0, y0, w, h, f)?,
+            None => store(ram, &s, rows, x0, y0, w, h, f),
+        }
     }
     // A drawn tile is not a uniform clear: invalidate its checksum.
     let checksum = if frame.is_some_and(|f| !f.draws.is_empty()) || tb.touched {
@@ -499,6 +607,24 @@ fn rows(
     access: Access,
 ) -> Result<Vec<Vec<(usize, usize)>>, Stop> {
     let mut out = Vec::new();
+    if let Some(l) = s.afbc {
+        // Headers and payload slots of every superblock the box touches.
+        for sy in y0 / 16..=(y0 + h - 1) / 16 {
+            for sx in x0 / 16..=(x0 + w - 1) / 16 {
+                let Some((ha, _, ba, body)) = l.encode(sx, sy, &vec![0u8; 256 * l.bpp]) else {
+                    return Err(Stop::Memory(Fault::AddressSize));
+                };
+                let check = m.chunks(ram, ha, 16, access, true).and_then(|_| m.chunks(ram, ba, body.len(), access, true));
+                if let Err(f) = check {
+                    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                        eprintln!("[mali] AFBC {l:x?} superblock {sx},{sy} header {ha:#x} body {ba:#x}: {f:?}");
+                    }
+                    return Err(Stop::Memory(f));
+                }
+            }
+        }
+        return Ok(out);
+    }
     if s.tiled {
         for ty in y0 / 16..=(y0 + h - 1) / 16 {
             let first = s.offset(x0 & !15, ty * 16);
@@ -526,6 +652,47 @@ fn rows(
     }
     Ok(out)
 }
+/// Write the box into an AFBC surface: each superblock it touches is read (outside the
+/// box), updated and written back uncompressed.
+#[allow(clippy::too_many_arguments)]
+fn afbc_store(
+    m: &AddressSpace,
+    ram: &mut [u8],
+    l: &crate::gpu_afbc::Layout,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    mut f: impl FnMut(usize, &mut [u8]),
+) -> Result<(), Stop> {
+    let bpp = l.bpp;
+    for sy in y0 / 16..=(y0 + h - 1) / 16 {
+        for sx in x0 / 16..=(x0 + w - 1) / 16 {
+            let full = sx * 16 >= x0 && sx * 16 + 15 < x0 + w && sy * 16 >= y0 && sy * 16 + 15 < y0 + h;
+            let mut pixels = if full {
+                vec![0u8; 256 * bpp]
+            } else {
+                let mut read = |a: u64, out: &mut [u8]| m.read(ram, a, out, true);
+                l.read_superblock(&mut read, sx, sy).unwrap_or_else(|_| vec![0u8; 256 * bpp])
+            };
+            for py in 0..16 {
+                for px in 0..16 {
+                    let (x, y) = (sx * 16 + px, sy * 16 + py);
+                    if x < x0 || x >= x0 + w || y < y0 || y >= y0 + h {
+                        continue;
+                    }
+                    let at = ((py * 16 + px) as usize) * bpp;
+                    f(((y - y0) * w + (x - x0)) as usize, &mut pixels[at..at + bpp]);
+                }
+            }
+            let (ha, header, ba, body) = l.encode(sx, sy, &pixels).ok_or(Stop::Memory(Fault::AddressSize))?;
+            m.write(ram, ha, &header, true).map_err(Stop::Memory)?;
+            m.write(ram, ba, &body, true).map_err(Stop::Memory)?;
+        }
+    }
+    Ok(())
+}
+
 /// Physical address of byte `offset` within a validated row's spans.
 fn locate(spans: &[(usize, usize)], mut offset: usize) -> Option<usize> {
     for &(p, len) in spans {
@@ -549,6 +716,27 @@ fn store(
     mut f: impl FnMut(usize, &mut [u8]),
 ) {
     let bpp = s.bpp as usize;
+    if !s.tiled {
+        // Linear rows: gather, update and scatter each row through its spans.
+        let mut row = vec![0u8; w as usize * bpp];
+        for (r, spans) in rows.iter().enumerate() {
+            let mut off = 0;
+            for &(p, len) in spans {
+                row[off..off + len].copy_from_slice(&ram[p..p + len]);
+                off += len;
+            }
+            let base = r * w as usize;
+            for (x, px) in row.chunks_exact_mut(bpp).enumerate() {
+                f(base + x, px);
+            }
+            let mut off = 0;
+            for &(p, len) in spans {
+                ram[p..p + len].copy_from_slice(&row[off..off + len]);
+                off += len;
+            }
+        }
+        return;
+    }
     for y in y0..y0 + h {
         for x in x0..x0 + w {
             let (row, off) = if s.tiled {

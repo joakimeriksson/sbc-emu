@@ -181,7 +181,22 @@ impl Tiler {
         }
         // A frame without draws (only clears) still has a tiler context.
         let empty = Frame::default();
+        // (Instant::now panics in the browser, so only when timing is asked for.)
+        let timing = std::env::var_os("SBC_MALI_TIMING").is_some();
+        let started = timing.then(std::time::Instant::now);
         crate::gpu_render::fragment_frame(m, ram, r, Some(frame.unwrap_or(&empty)))?;
+        if let Some(started) = started {
+            let f = frame.unwrap_or(&empty);
+            let prims: usize = f.draws.iter().map(|d| d.primitives.len()).sum();
+            eprintln!(
+                "[mali] fragment job: {}x{}, {} draws, {} primitives, {:.1} ms",
+                f.width,
+                f.height,
+                f.draws.len(),
+                prims,
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if let Some(f) = self.frames.remove(&k) {
             self.vertices -= f.vertices;
         }
@@ -523,6 +538,7 @@ fn run_stage(
                 .run_env(&mut env, (*budget).min(THREAD_BUDGET))
                 .map_err(Stop::Shader)?;
             *budget = budget.saturating_sub(shader.instructions as usize);
+            crate::gpu::work(shader.instructions, 0, 0);
             if *budget == 0 {
                 return Err(unsupported(6));
             }

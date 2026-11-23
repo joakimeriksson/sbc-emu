@@ -775,3 +775,24 @@ fn thread_local_storage_is_private_to_each_thread() {
     }
     assert_eq!(ram, before);
 }
+
+#[test]
+fn mesas_log2_sequence_handles_zero_and_infinity() {
+    // Mesa: log2(x) = FMA(FLOGD(x), FADD_LSCALE(-1, x), S32_TO_F32(FREXPE.log(x))).
+    let log2 = |x: f32| super::flogd(x).mul_add(super::fadd_lscale(-1., x), super::frexp(x, false, true).1 as f32);
+    assert_eq!(log2(0.), f32::NEG_INFINITY);
+    assert_eq!(log2(f32::INFINITY), f32::INFINITY);
+    assert!(log2(-1.).is_nan());
+    for x in [1f32, 8., 0.3, 1.4, 1e-20, 3e30] {
+        assert!((log2(x) - x.log2()).abs() < 1e-5, "{x}");
+    }
+}
+
+#[test]
+fn a_restarted_thread_does_not_see_the_previous_threads_registers() {
+    let mut s = Shader::with_allocation(0x100, RegisterAllocation::Registers64);
+    s.regs[3] = 0xdead_beef;
+    s.regs[63] = 7;
+    s.restart(0x200, RegisterAllocation::Registers32);
+    assert_eq!((s.pc, s.regs), (0x200, [0; 64]));
+}

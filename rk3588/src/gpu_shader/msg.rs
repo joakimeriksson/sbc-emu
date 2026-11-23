@@ -229,7 +229,7 @@ impl Shader {
             OUTPUT_BASE + offset
         } else {
             self.resources
-                .buffer_address(env.m, env.ram, table, index, element, None)
+                .buffer_address(env.m, &env.ram, table, index, element, None)
                 .map_err(memory)?
         };
         self.regs[r] = address as u32;
@@ -368,8 +368,7 @@ impl Shader {
             }
             self.scratch[off..off + bytes].copy_from_slice(&data);
         } else {
-            env.write(address, &data)
-                .map_err(|f| Some(super::Error::Memory(f)))?;
+            env.write(address, &data).map_err(Some)?;
         }
         Ok(Next::Continue)
     }
@@ -408,10 +407,17 @@ impl Shader {
         {
             return Err(None);
         }
-        let (values, float) = self
-            .resources
-            .attribute_any(env.m, env.ram, table, index, vertex, instance)
-            .map_err(memory)?;
+        let key = (self.resources.0, table, index);
+        let attr = match env.attributes.get(&key) {
+            Some(a) => *a,
+            None => {
+                let a = self.resources.attribute_desc(env.m, &env.ram, table, index).map_err(memory)?;
+                env.attributes.insert(key, a);
+                a
+            }
+        };
+        let (m, ram, tlb) = (env.m, &*env.ram, &mut *env.tlb);
+        let (values, float) = attr.fetch(|a, out| tlb.read(m, ram, a, out), vertex, instance).map_err(memory)?;
         let r = self.staging(i, count).ok_or(None)?;
         write_values(
             self,
@@ -428,6 +434,54 @@ impl Shader {
             },
             float,
         )?;
+        Ok(Next::Continue)
+    }
+
+    /// LD_VAR_IMM: a varying from attribute descriptors, as Mesa's frame-shader preload
+    /// (pan_fb_preload.c) uses it: four vertices at the framebuffer's corners
+    /// (0,0), (w,0), (0,h), (w,h), interpolated at the pixel centre. Elsewhere (draws
+    /// without IDVS) it is not modelled.
+    pub(super) fn ld_var_imm(&mut self, env: &mut Env, i: u64) -> R<Next> {
+        let f = self.fragment.as_ref().ok_or(None)?;
+        let ([w, h], [px, py]) = (f.frame.ok_or(None)?, f.pixel);
+        let components = bits(i, 28, 2) as usize + 1;
+        let format = bits(i, 24, 3);
+        let count = bits(i, 33, 3) as usize;
+        let expected = if matches!(format, 3 | 5 | 7) { components.div_ceil(2) } else { components };
+        if bits(i, 46, 2) != 2 || count != expected || bits(i, 36, 4) != 0 || !matches!(format, 0 | 2 | 3) {
+            return Err(None);
+        }
+        let (table, index) = (bits(i, 8, 4), bits(i, 12, 8));
+        if table >= 12 || w == 0 || h == 0 {
+            return Err(None);
+        }
+        let key = (self.resources.0, table, index);
+        let attr = match env.attributes.get(&key) {
+            Some(a) => *a,
+            None => {
+                let a = self.resources.attribute_desc(env.m, &env.ram, table, index).map_err(memory)?;
+                env.attributes.insert(key, a);
+                a
+            }
+        };
+        let (m, ram, tlb) = (env.m, &*env.ram, &mut *env.tlb);
+        let mut corners = [[0f32; 4]; 4];
+        for (k, c) in corners.iter_mut().enumerate() {
+            let (v, float) = attr.fetch(|a, out| tlb.read(m, ram, a, out), k as u32, 0).map_err(memory)?;
+            if !float {
+                return Err(None);
+            }
+            *c = v.map(f32::from_bits);
+        }
+        let u = (px as f32 + 0.5) / w as f32;
+        let t = (py as f32 + 0.5) / h as f32;
+        let values: [u32; 4] = std::array::from_fn(|n| {
+            let top = corners[0][n] * (1. - u) + corners[1][n] * u;
+            let bottom = corners[2][n] * (1. - u) + corners[3][n] * u;
+            (top * (1. - t) + bottom * t).to_bits()
+        });
+        let r = self.staging(i, count).ok_or(None)?;
+        write_values(self, r, &values[..components], if format == 0 { 2 } else { format }, true)?;
         Ok(Next::Continue)
     }
 
@@ -455,7 +509,7 @@ impl Shader {
         let bytes: usize = [1, 2, 3, 4, 6, 8, 12, 16][size as usize];
         let (base, len) = self
             .resources
-            .buffer(env.m, env.ram, handle >> 24, handle & 0xff_ffff)
+            .buffer(env.m, &env.ram, handle >> 24, handle & 0xff_ffff)
             .map_err(memory)?;
         let mut data = [0u8; 16];
         // Out of the buffer (or past the top of the address space): zeros.
@@ -479,7 +533,7 @@ impl Shader {
         let handle = o.raw(1)?;
         let (base, _) = self
             .resources
-            .buffer(env.m, env.ram, handle >> 24, handle & 0xff_ffff)
+            .buffer(env.m, &env.ram, handle >> 24, handle & 0xff_ffff)
             .map_err(memory)?;
         let r = self.staging(i, 2).ok_or(None)?;
         let a = base.wrapping_add(offset);
@@ -493,8 +547,31 @@ impl Shader {
     pub(super) fn blend(&mut self, i: u64, u: &[u32]) -> R<Next> {
         self.fragment.as_ref().ok_or(None)?;
         let count = bits(i, 33, 3) as usize;
-        let format = bits(i, 24, 3);
+        let descriptor = self.source64(i, 0, u).ok_or(None)?;
         let components = bits(i, 28, 2) as usize + 1;
+        // An auto register format takes the blend descriptor's conversion's (Register
+        // File Format F16, F32, I32, U32, I16, U16) when its width matches the staging
+        // count; otherwise the registers are passed on as 32-bit values.
+        let format = match bits(i, 24, 3) {
+            0 => {
+                let f = match (descriptor >> 56) & 7 {
+                    0 => 3,
+                    1 => 2,
+                    2 => 4,
+                    3 => 6,
+                    4 => 5,
+                    5 => 7,
+                    _ => 0,
+                };
+                let half = matches!(f, 3 | 5 | 7);
+                if f != 0 && count == if half { components.div_ceil(2) } else { components } {
+                    f
+                } else {
+                    0
+                }
+            }
+            f => f,
+        };
         let wide = !matches!(format, 3 | 5 | 7);
         if bits(i, 46, 2) != 1
             || count
@@ -507,7 +584,6 @@ impl Shader {
             return Err(None);
         }
         let r = self.staging(i, count).ok_or(None)?;
-        let descriptor = self.source64(i, 0, u).ok_or(None)?;
         // A 64-bit source takes two source slots: coverage is source byte 2.
         let o = Ops {
             s: self,
