@@ -725,3 +725,28 @@ mod mesa_encodings {
         }
     }
 }
+
+#[test]
+fn thread_local_storage_is_private_to_each_thread() {
+    // MOV r0/r1 = thread_local_pointer, MOV r2 = u0, STORE.i32 r2 -> [r0:r1],
+    // LOAD.i32 r4 <- [r0:r1], END. Guest memory is not touched.
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let code = [
+        0x0291c000000000e2u64,
+        0x0291c100000000e3,
+        0x0091c20000000080,
+        0x0061420218000000,
+        0x0060848218000000,
+        0x7800c00000000000,
+    ];
+    let mut ram: Vec<u8> = code.iter().flat_map(|i| i.to_le_bytes()).collect();
+    ram.resize(4096, 0x55);
+    let before = ram.clone();
+    for value in [7u32, 9] {
+        let mut s = Shader::new(0);
+        s.run(&m, &mut ram, &[value], 8).unwrap();
+        assert_eq!(s.regs[4], value);
+        assert_eq!((s.regs[0] as u64) | (s.regs[1] as u64) << 32, TLS_BASE);
+    }
+    assert_eq!(ram, before);
+}

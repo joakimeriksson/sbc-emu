@@ -305,7 +305,6 @@ impl Tiler {
             spd,
             fau,
             resources,
-            tls: reg(r, 24),
         };
         run_stage(
             m,
@@ -442,7 +441,6 @@ struct Stage {
     spd: u64,
     fau: u64,
     resources: u64,
-    tls: u64,
 }
 /// Read a shader program descriptor: the binary, register allocation and preload mask.
 pub(crate) fn shader_program(
@@ -513,7 +511,6 @@ fn run_stage(
             let slot = instance * vertices.len() as u32 + n as u32;
             let mut shader = Shader::with_allocation(binary, allocation);
             shader.resources = Resources(stage.resources);
-            shader.tls = stage.tls;
             let values = [slot * index_scale, vertex, instance, 0, 0];
             for (k, &value) in values.iter().enumerate() {
                 if preload & (1 << (11 + k)) != 0 {

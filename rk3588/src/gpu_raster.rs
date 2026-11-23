@@ -88,7 +88,6 @@ struct State {
     shader: Option<(u64, RegisterAllocation, u32, Vec<u32>, Resources, bool)>,
     occlusion: Option<(u64, u32)>,
     point_size: f32,
-    tls: u64,
 }
 
 /// The draw state inputs: CSF registers of RUN_IDVS, or a frame-shader Draw descriptor.
@@ -100,7 +99,6 @@ struct Inputs {
     spd: u64,
     fau: u64,
     srt: u64,
-    tls: u64,
     scissor: [u32; 4],
     z_range: [f32; 2],
     z_cull: [bool; 2],
@@ -125,7 +123,6 @@ impl Inputs {
                     0
                 },
             ),
-            tls: reg(r, 24),
             scissor: [r[42] & 0xffff, r[42] >> 16, r[43] & 0xffff, r[43] >> 16],
             z_range: [f32::from_bits(r[44]), f32::from_bits(r[45])],
             z_cull: [r[56] & (1 << 16) != 0, r[56] & (1 << 17) != 0],
@@ -145,7 +142,6 @@ impl Inputs {
             spd: pair(26),
             fau: (pair(30) & 0xffff_ffff_ffff) | ((d[17] as u64 & 255) << 56),
             srt: pair(24),
-            tls: pair(28),
             scissor: [tb.x0, tb.y0, tb.x0 + tb.w - 1, tb.y0 + tb.h - 1],
             z_range: [f32::from_bits(d[6]), f32::from_bits(d[7])],
             z_cull: [false; 2],
@@ -260,7 +256,6 @@ impl State {
             shader,
             occlusion,
             point_size: r.point_size,
-            tls: r.tls,
         })
     }
 }
@@ -824,7 +819,6 @@ impl Raster<'_, '_> {
             let (x, y) = (qx + (k as u32 & 1), qy + (k as u32 >> 1));
             let mut s = Shader::with_allocation(*binary, *allocation);
             s.resources = *resources;
-            s.tls = st.tls;
             let mut f = Fragment {
                 blend: st.blend_words,
                 active: p.passed,

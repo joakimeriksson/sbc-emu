@@ -29,6 +29,11 @@ pub enum RegisterAllocation {
 /// records stay on the host: on the GPU they stream through an internal FIFO into the
 /// tiler heap, in a format only the GPU reads.
 pub const OUTPUT_BASE: u64 = 0xffff_0000_0000_0000;
+/// Base of each thread's private local storage (the thread-local pointer). Mesa uses
+/// packed TLS addressing, where the GPU places each thread's storage itself, so the
+/// model keeps it with the thread.
+pub const TLS_BASE: u64 = 0xfffe_0000_0000_0000;
+const TLS_LIMIT: usize = 1 << 20;
 
 /// Fragment-thread state: what fixed-function hardware supplies, and what the shader
 /// sends to the blender and the depth/stencil unit.
@@ -330,9 +335,10 @@ pub struct Shader {
     pub resources: Resources,
     pub fragment: Option<Fragment>,
     pub interpolation: Option<Interpolation>,
-    /// Thread and workgroup local storage pointers (FAU page 1).
-    pub tls: u64,
+    /// Workgroup local storage pointer (FAU page 1).
     pub wls: u64,
+    /// This thread's local storage (register spills), at [`TLS_BASE`].
+    scratch: Vec<u8>,
     register_mask: u64,
     pub pc: u64,
     pub instructions: u64,
@@ -613,7 +619,7 @@ impl Shader {
             resources: Resources::default(),
             fragment: None,
             interpolation: None,
-            tls: 0,
+            scratch: Vec::new(),
             wls: 0,
             pc,
             instructions: 0,
@@ -666,7 +672,7 @@ impl Shader {
                         }
                     }
                     1 => match n {
-                        1 => Some(half(self.tls)),
+                        1 => Some(half(TLS_BASE)),
                         3 => Some(half(self.wls)),
                         7 => Some(half(self.resources.0)),
                         _ => None,

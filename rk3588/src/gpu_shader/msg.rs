@@ -1,5 +1,5 @@
 //! Message-passing instructions: varyings, attributes, memory, blending and texturing.
-use super::{bits, half, pack_half, sext, Env, Next, Ops, QuadView, Shader, OUTPUT_BASE, R};
+use super::{bits, half, pack_half, sext, Env, Next, Ops, QuadView, Shader, OUTPUT_BASE, R, TLS_BASE, TLS_LIMIT};
 use crate::gpu_resources::Error as ResourceError;
 use crate::gpu_texture::{Lod, Request};
 
@@ -250,6 +250,14 @@ impl Shader {
             let off = (address - OUTPUT_BASE) as usize;
             let out = env.output.as_ref().ok_or(None)?;
             data[..bytes].copy_from_slice(out.get(off..off + bytes).ok_or(None)?);
+        } else if address >= TLS_BASE {
+            let off = (address - TLS_BASE) as usize;
+            if off + bytes > TLS_LIMIT {
+                return Err(None);
+            }
+            for (k, d) in data[..bytes].iter_mut().enumerate() {
+                *d = self.scratch.get(off + k).copied().unwrap_or(0);
+            }
         } else {
             env.read(address, &mut data[..bytes])
                 .map_err(|f| Some(super::Error::Memory(f)))?;
@@ -352,6 +360,15 @@ impl Shader {
             out.get_mut(off..off + bytes)
                 .ok_or(None)?
                 .copy_from_slice(&data);
+        } else if address >= TLS_BASE {
+            let off = (address - TLS_BASE) as usize;
+            if off + bytes > TLS_LIMIT {
+                return Err(None);
+            }
+            if self.scratch.len() < off + bytes {
+                self.scratch.resize(off + bytes, 0);
+            }
+            self.scratch[off..off + bytes].copy_from_slice(&data);
         } else {
             env.write(address, &data)
                 .map_err(|f| Some(super::Error::Memory(f)))?;
