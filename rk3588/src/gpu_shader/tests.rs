@@ -426,6 +426,41 @@ mod fragment_tests {
         shader.regs[2] = h;
         assert!(shader.run(&m, &mut ram, &[], 1).is_err());
     }
+    #[test]
+    fn var_tex_writes_as_many_components_as_its_staging_registers_hold() {
+        // VAR_TEX_SINGLE, LOD 0, coordinates from the varying at offset 0: f32 (width 1)
+        // with 1-4 registers, f16 (width 0) with 1-2.
+        let run = |wide: bool, count: u64| -> Option<[u32; 6]> {
+            let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+            let i = (0x4128000413c02042u64 & !(0x1ff << 48) & !(7 << 13) & !(3 << 24))
+                | (0x138 << 48)
+                | ((count - 1) << 36)
+                | (u64::from(wide) << 24);
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+            shader.resources = resources;
+            shader.fragment = Some(Fragment::new([0x19, 237 << 12]));
+            shader.interpolation = Some(interpolation_fixture());
+            shader.regs[..6].fill(0xdeadbeef);
+            shader.regs[6] = h;
+            ram[..8].copy_from_slice(&(i & !0xff | 6).to_le_bytes());
+            ram[8..16].copy_from_slice(&0x7800c00000000000u64.to_le_bytes());
+            shader.run(&m, &mut ram, &[], 2).ok()?;
+            Some(std::array::from_fn(|n| shader.regs[n]))
+        };
+        let full = run(true, 4).unwrap();
+        for count in 1..4 {
+            let mut expected = [0xdeadbeef; 6];
+            expected[..count].copy_from_slice(&full[..count]);
+            assert_eq!(run(true, count as u64), Some(expected), "{count}");
+        }
+        let half = run(false, 2).unwrap();
+        let h = |v: u32| pack_half(f32::from_bits(v)) as u32;
+        assert_eq!(half[..2], [h(full[0]) | h(full[1]) << 16, h(full[2]) | h(full[3]) << 16]);
+        assert_eq!(run(false, 1).unwrap()[..2], [half[0], 0xdeadbeef]);
+        // More registers than four components fill: reserved.
+        assert_eq!(run(false, 3), None);
+        assert_eq!(run(true, 5), None);
+    }
     fn interpolation_fixture() -> Interpolation {
         let values = [0f32, 1., 0., 0., 0.5, 0.5, 0., 0., 1., 0., 0., 0.];
         Interpolation {
