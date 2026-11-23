@@ -267,8 +267,11 @@ fn compiled_32_bit_code_ends_as_interpreted() {
     assert_eq!((ga, gb), (a, b), "memory");
     assert_eq!(got.x[..15], want.x[..15], "registers");
     assert_eq!(got.instret, want.instret, "instructions");
-    let (compiled, runs, _) = got.aarch32_jit_stats().expect("the 32-bit core has a JIT");
-    assert!(compiled > 0 && runs > 1000, "{compiled} blocks compiled, {runs} runs");
+    // the 32-bit core's own JIT, where the host has one
+    if arm_a32::jit::available() {
+        let (compiled, runs, _) = got.aarch32_jit_stats().expect("the 32-bit core has a JIT");
+        assert!(compiled > 0 && runs > 1000, "{compiled} blocks compiled, {runs} runs");
+    }
 }
 
 /// Two cores on host threads (`mt`), each a 32-bit program incrementing one counter with

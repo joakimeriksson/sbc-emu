@@ -1,4 +1,6 @@
-//! A64 → A64 block JIT (AArch64 macOS/Linux hosts).
+//! A64 → A64 block JIT (AArch64 macOS/Linux hosts); the driver here (block map, front cache,
+//! links, invalidation, verify mode) also serves the x86-64 Linux backend (`jit_x64.rs`, a
+//! translator) and the WebAssembly one (`jit_wasm.rs`).
 //!
 //! Guest and host share the instruction set, so integer and FP/SIMD data-processing
 //! instructions are emitted *as themselves* with the guest registers renamed to the host
@@ -96,9 +98,56 @@ mod host {
         }
     }
     pub const AVAILABLE: bool = true;
+    pub fn supported() -> bool { true }
 }
 
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod host {
+    use std::ffi::{c_int, c_void};
+    extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+    }
+
+    /// Executable code buffer (bump allocated; reset as a whole). x86 keeps instruction fetch
+    /// coherent with stores of the same thread, so writes need no cache maintenance.
+    pub struct CodeCache { base: *mut u8, size: usize, used: usize }
+
+    impl CodeCache {
+        pub fn new(size: usize) -> Option<CodeCache> {
+            // SAFETY: anonymous mapping chosen by the OS; failure is checked
+            let p = unsafe { mmap(std::ptr::null_mut(), size, 7, 0x0002 | 0x0020, -1, 0) }; // RWX, PRIVATE | ANONYMOUS
+            if p as isize == -1 || p.is_null() { return None; }
+            Some(CodeCache { base: p as *mut u8, size, used: 0 })
+        }
+        pub fn reset(&mut self) { self.used = 0; }
+        /// Where the next `write_bytes` puts its code (blocks start 16-byte aligned).
+        pub fn next_addr(&self) -> usize { self.base as usize + self.used.next_multiple_of(16) }
+        /// Copy machine code in; returns its entry address.
+        pub fn write_bytes(&mut self, bytes: &[u8]) -> Option<*const u8> {
+            let off = self.used.next_multiple_of(16);
+            if off + bytes.len() > self.size { return None; }
+            // SAFETY: the range is inside the mapping
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len()) };
+            self.used = off + bytes.len();
+            Some(self.base.wrapping_add(off))
+        }
+        /// (AArch64 words: not used on this host)
+        pub fn write(&mut self, words: &[u32]) -> Option<*const u8> {
+            let b: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            self.write_bytes(&b)
+        }
+        /// Replace the rel32 of a direct jump (4 bytes, unaligned) in already written code.
+        pub fn patch(&mut self, at: usize, v: u32) {
+            debug_assert!(at >= self.base as usize && at + 4 <= self.base as usize + self.used);
+            // SAFETY: `at` is a rel32 field of code written earlier into the mapping
+            unsafe { (at as *mut u32).write_unaligned(v) };
+        }
+    }
+    pub const AVAILABLE: bool = true;
+    pub fn supported() -> bool { super::x64::host_ok() }
+}
+
+#[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), all(target_arch = "x86_64", target_os = "linux"))))]
 mod host {
     /// No native code buffer: the wasm32 build compiles through `jit_wasm` instead.
     pub struct CodeCache;
@@ -109,7 +158,13 @@ mod host {
         pub fn patch(&mut self, _at: usize, _word: u32) {}
     }
     pub const AVAILABLE: bool = cfg!(target_arch = "wasm32");
+    pub fn supported() -> bool { true }
 }
+
+/// The x86-64 backend (a translator; see its module comment).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "jit_x64.rs"]
+mod x64;
 
 /// Compiled block entry: `fn(cpu) -> status` (0 = continue at cpu.pc, 1 = trap in cpu.jit_trap).
 pub(crate) type BlockFn = unsafe extern "C" fn(*mut Cpu) -> u32;
@@ -188,7 +243,7 @@ impl Jit {
     }
 
     pub fn with(code_bytes: usize, hot: u32) -> Option<Box<Jit>> {
-        if !host::AVAILABLE { return None; }
+        if !available() { return None; }
         Some(Box::new(Jit { code: host::CodeCache::new(code_bytes)?, blocks: Map::default(), front: vec![(u64::MAX, u64::MAX, 0); FRONT].into_boxed_slice(),
                             hotc: vec![(u64::MAX, u64::MAX, 0); HOTC].into_boxed_slice(), probe: Map::default(), scratch: None, pages: Map::default(), compiled: 0, flushes: 0, native: 0, hot, verify: false, report: None, code_hash: Map::default(), stale_skips: 0, execs: 0, exec_insns: 0, disp: None, exit: 0, enter: 0, interp: 0, refill: 0, links: Map::default(), new_sites: Vec::new(), xlinks: Map::default(), linked: 0, full_flushes: 0, inval_pages: 0, inval_blocks: 0 }))
     }
@@ -214,7 +269,11 @@ impl Jit {
     /// past the prologue (the frame is already set up).
     fn link(&mut self, k: (u64, u64), f: usize) {
         const BODY: usize = LINKED_ENTRY;
+        // the patched word: an A64 B, or on x86-64 the rel32 of a JMP (`site` is its address)
+        #[cfg(not(target_arch = "x86_64"))]
         let branch = |site: usize, to: usize| 0x1400_0000 | ((((to as i64 - site as i64) >> 2) as u32) & 0x3ff_ffff);
+        #[cfg(target_arch = "x86_64")]
+        let branch = |site: usize, to: usize| (to as i64 - (site as i64 + 4)) as i32 as u32;
         let mode = k.1 & !((1u64 << 48) - 1);
         let page_pa = k.1 & ((1u64 << 48) - 1) & !0xfff;
         for (site, t, tpa, orig) in std::mem::take(&mut self.new_sites) {
@@ -959,7 +1018,16 @@ impl Cpu {
     /// `f` must be a block of this core's JIT, `jit_bus` set.
     #[inline(always)]
     unsafe fn call_block(&mut self, f: BlockFn) -> u32 {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            // the guest flags go in and come back in the generated code's form
+            let enter = self.jit.as_ref().map_or(0, |j| j.enter);
+            let enter = std::mem::transmute::<usize, x64::EnterFn>(enter as usize);
+            let r = enter(self as *mut Cpu, f as usize, x64::nzcv_to_fl(self.nzcv));
+            self.nzcv = x64::fl_to_nzcv(r.fl);
+            r.status as u32
+        }
+        #[cfg(not(any(target_arch = "wasm32", all(target_arch = "x86_64", target_os = "linux"))))]
         {
             let enter = self.jit.as_ref().map_or(0, |j| j.enter);
             let enter = std::mem::transmute::<usize, unsafe extern "C" fn(*mut Cpu, usize) -> u32>(enter as usize);
@@ -1072,6 +1140,11 @@ impl Cpu {
             // browser: one small wasm module per block; keep the live set bounded
             if self.jit.as_ref().is_some_and(|j| j.blocks.len() >= WASM_MAX_BLOCKS) { self.jit.as_mut()?.flush(); }
             return self.compile_wasm(pa);
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let _ = retry;
+            return self.compile_x64(pa, sb);
         }
         #[allow(unreachable_code)]
         let c = ctx();
@@ -2032,4 +2105,4 @@ pub(crate) fn is_block_end(i: u32) -> bool {
         || (bits(i, 31, 25) == 0b110_1011) // branch-register class incl. ERET
 }
 
-pub fn available() -> bool { host::AVAILABLE }
+pub fn available() -> bool { host::AVAILABLE && host::supported() }

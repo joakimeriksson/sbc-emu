@@ -50,6 +50,45 @@ host profiler samples, e.g. from `samply`); `SBC_JIT_DUMP=<pc>[,<pc>...]` writes
 instruction words of the blocks at those PCs to `jit-<pc>.guest`/`.host`;
 `SBC_JIT_WATCH=<page>` traces compiles and invalidations on one physical page.
 
+## The A64 JIT on x86-64 Linux hosts
+
+`arm-a64/src/jit_x64.rs` translates A64 to x86-64 (x86 cannot run A64 instructions as
+themselves). It shares the driver in `jit.rs` (block map and front cache, hotness counters,
+direct links as patched `jmp rel32`, invalidation by IC IALLU/IVAU, verify mode, the fallback
+profile) and has its own dispatcher and stubs. Native: integer data processing, branches,
+loads and stores of every addressing form through the micro-TLB (way 0 inline, way 1, the refill
+and the interpreter out of line), exclusives and acquire/release, DC ZVA, FMOV/DUP/UMOV/SMOV
+between the register files, constant MOVI, the thread-pointer MRS, and the byte-vector NEON that
+glibc's string functions use (CMEQ, CMHS, vector logic, UMAXP/UMINP, SHRN) with SSE2. Everything
+else goes to the interpreter one instruction at a time; FP/SIMD registers and FPSR stay in `Cpu`.
+
+Guest registers: rbx = `Cpu`, r13 = guest RAM, r14 = instret, r15 = NZCV; rbp, rsi, rdi and r8–r12
+cache guest X registers and SP inside a block. NZCV is kept in x86 form with the carry inverted
+(N = SF, Z = ZF, V = OF, C = NOT CF: SUB/CMP give it directly, ADD/CMN add a CMC, logical S forms an
+STC), so every A64 condition is one x86 condition code and SBC is a plain SBB. Within a block the
+flags stay in EFLAGS until code that would clobber them; then `lahf; seto al` saves them to r15,
+and `add al, 0x7f; sahf` brings them back for a consumer. With a host thread per core, full
+DMB/DSB become MFENCE, STLR an XCHG and store-exclusive a LOCK CMPXCHG.
+
+Known gaps: FP/SIMD arithmetic beyond the operations above runs in the interpreter; only eight
+host registers cache guest registers; x86-64 macOS is not wired up. The interpreter stub leaves
+to the dispatcher by dropping its return address (`add rsp, 8` and a jump), which a CET user
+shadow stack would refuse on `ret`; Linux enables those only for binaries marked for them, and
+this one is not.
+
+Tests: `jit_x64.rs` checks its encoder against llvm-mc; `arm-a64/tests/jit_diff.rs` runs random
+instruction sequences (half with the MMU on and a scrambled mapping) on the JIT and the
+interpreter and compares registers, flags, V registers, memory and instruction counts; every
+arm-a64 test also runs with `SBC_JIT=1`. On an i9-12900F (one host thread unless noted):
+
+| | interpreter | JIT |
+|---|---|---|
+| Raspberry Pi OS Lite to `raspberrypi login:` | 522 s | 44.4 s (30.3 s with `--threads multi`) |
+| Pi 4, Pi kernel + BusyBox initramfs to `pi4#` | 18.7 s | 1.7 s |
+| Orange Pi 5, Debian kernel + initramfs to `orangepi5#` | 18.2 s | 1.1 s |
+| Jetson Nano, kernel + initramfs to `TEGRA210_BOOT_OK` | 20.6 s | 2.0 s |
+| shell loop (300,000 iterations) + `md5sum` of 64 MiB, Pi 4 / Orange Pi 5 / Jetson Nano | 106 / 105 / 101 s | 5.5 / 4.8 / 5.2 s |
+
 ## In the browser
 
 `arm-a64/src/jit_wasm.rs` compiles a hot **region** into its own small WebAssembly module
