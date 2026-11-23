@@ -374,8 +374,17 @@ fn modf<const N: usize>(v: [u32; N], m: Mod, ftz: bool) -> [f32; N] {
     }
 }
 
+/// The GPU's float arithmetic returns one NaN, 0x7fffffff, whatever the operands' were (which of
+/// two NaNs the host's instruction returns depends on their order, which the compiler may swap).
 #[inline(always)]
-fn finish<const N: usize>(mut v: [f32; N], ftz: bool, sat: bool) -> [f32; N] {
+fn canon<const N: usize>(v: [f32; N]) -> [f32; N] {
+    // (on the bits: as a float select the compiler may take any NaN for any other)
+    v.map(|x| f32::from_bits(fp::canon(x.to_bits())))
+}
+
+#[inline(always)]
+fn finish<const N: usize>(v: [f32; N], ftz: bool, sat: bool) -> [f32; N] {
+    let mut v = canon(v);
     if ftz {
         v = v.map(|x| f32::from_bits(fp::ftz(x.to_bits())));
     }
@@ -1500,14 +1509,15 @@ fn lop_flags<const N: usize>(
 fn mufu<const N: usize>(x: [u32; N], md: Mod, op: Mufu) -> [u32; N] {
     let v = x.map(|x| f32::from_bits(x & md.and() ^ md.xor()));
     let wide = |x: f32| f64::from_bits((x.to_bits() as u64) << 32);
+    let f = |r: [f32; N]| canon(r).map(f32::to_bits);
     match op {
-        Mufu::Cos => v.map(|x| x.cos().to_bits()),
-        Mufu::Sin => v.map(|x| x.sin().to_bits()),
-        Mufu::Ex2 => v.map(|x| x.exp2().to_bits()),
-        Mufu::Lg2 => v.map(|x| x.log2().to_bits()),
-        Mufu::Rcp => v.map(|x| (1.0 / x).to_bits()),
-        Mufu::Rsq => v.map(|x| ((1.0 / (x as f64).sqrt()) as f32).to_bits()),
-        Mufu::Sqrt => v.map(|x| x.sqrt().to_bits()),
+        Mufu::Cos => f(v.map(f32::cos)),
+        Mufu::Sin => f(v.map(f32::sin)),
+        Mufu::Ex2 => f(v.map(f32::exp2)),
+        Mufu::Lg2 => f(v.map(f32::log2)),
+        Mufu::Rcp => f(v.map(|x| 1.0 / x)),
+        Mufu::Rsq => f(v.map(|x| (1.0 / (x as f64).sqrt()) as f32)),
+        Mufu::Sqrt => f(v.map(f32::sqrt)),
         Mufu::Rcp64h => v.map(|x| ((1.0 / wide(x)).to_bits() >> 32) as u32),
         Mufu::Rsq64h => v.map(|x| ((1.0 / wide(x).sqrt()).to_bits() >> 32) as u32),
     }

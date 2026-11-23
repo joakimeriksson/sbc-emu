@@ -53,6 +53,8 @@ pub enum Un {
     Ftz,
     /// Clamp to [0, 1], NaN to 0.
     Sat,
+    /// Any NaN to the GPU's own (`fp::NAN`).
+    Canon,
     /// MUFU's sine, cosine, powers and logarithms of two, and the double-precision halves: by
     /// the host's library, lane by lane.
     Sin,
@@ -414,6 +416,7 @@ impl Lower {
         v
     }
     fn finish(&mut self, v: Id, ftz: bool, sat: bool) -> Id {
+        let v = self.un(Un::Canon, v);
         let v = if ftz { self.un(Un::Ftz, v) } else { v };
         if sat {
             self.un(Un::Sat, v)
@@ -667,6 +670,7 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
                 Mufu::Rcp64h => l.un(Un::Rcp64h, x),
                 Mufu::Rsq64h => l.un(Un::Rsq64h, x),
             };
+            let v = if matches!(op, Mufu::Rcp64h | Mufu::Rsq64h) { v } else { l.un(Un::Canon, v) };
             let v = if sat { l.un(Un::Sat, v) } else { v };
             l.put(d, m, v);
         }
@@ -945,6 +949,7 @@ pub fn unary(op: Un, x: u32) -> u32 {
         Un::Rsq => ((1.0 / (f as f64).sqrt()) as f32).to_bits(),
         Un::Ftz => crate::fp::ftz(x),
         Un::Sat => crate::fp::sat(f).to_bits(),
+        Un::Canon => crate::fp::canon(x),
         Un::Sin => f.sin().to_bits(),
         Un::Cos => f.cos().to_bits(),
         Un::Ex2 => f.exp2().to_bits(),

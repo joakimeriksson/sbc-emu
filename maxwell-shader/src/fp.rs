@@ -2,6 +2,19 @@
 
 use crate::isa::Rnd;
 
+/// The NaN the GPU's single-precision arithmetic returns.
+pub const NAN: u32 = 0x7fff_ffff;
+
+/// A single's bits with any NaN made the GPU's.
+#[inline(always)]
+pub fn canon(x: u32) -> u32 {
+    if x & 0x7fff_ffff > 0x7f80_0000 {
+        NAN
+    } else {
+        x
+    }
+}
+
 /// Flushes a denormal to zero, keeping the sign.
 #[inline(always)]
 pub fn ftz(x: u32) -> u32 {

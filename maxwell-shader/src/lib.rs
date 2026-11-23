@@ -11,7 +11,9 @@
 //! Range reduction (RRO) passes its operand on and MUFU takes the sine, cosine or power of that,
 //! so the pair gives the right result. Physical attribute addresses (AL2P) are the logical
 //! ones. A lane that executes KIL goes on as a helper (`discard` is `demote` in nouveau).
-//! Scheduling words, memory barriers and cache control do nothing.
+//! Scheduling words, memory barriers and cache control do nothing. Single-precision arithmetic
+//! (FADD, FMUL, FFMA, F2F, MUFU) returns the GPU's one NaN, 0x7fffffff (`fp::NAN`): the host's
+//! NaN would depend on the order of operands, which the compiler may change.
 
 // (unsafe only where the browser's JIT calls the code it made: jit/wasm.rs)
 #![deny(unsafe_code)]

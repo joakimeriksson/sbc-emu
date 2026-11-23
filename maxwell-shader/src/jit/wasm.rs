@@ -580,6 +580,15 @@ fn emit_un(w: &mut W, op: Un, a: Vec4) -> Vec4 {
             w.simd(0x44); // f32x4.gt
             w.simd(0x52);
         }),
+        Un::Canon => each(w, a.uniform, |w, c| {
+            // x where it equals itself, else the GPU's NaN
+            w.get(a.l[c]);
+            w.v128c([crate::fp::NAN; 4]);
+            w.get(a.l[c]);
+            w.get(a.l[c]);
+            w.simd(0x41); // f32x4.eq
+            w.simd(0x52);
+        }),
         Un::Rsq => each(w, a.uniform, |w, c| {
             // in double: the low two lanes, then the high two
             for half in 0..2 {
