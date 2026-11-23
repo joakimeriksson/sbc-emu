@@ -111,6 +111,9 @@ pub mod host;
 
 impl Default for Gpu {
     fn default() -> Self {
+        // the shader JIT shares the page's function table with the CPU's
+        #[cfg(target_arch = "wasm32")]
+        maxwell_shader::jit::set_reset_count(arm_a64::wasm_jit_resets);
         let mut regs = HashMap::new();
         for (r, v) in [
             (0x12006c, 1),            // L2 caches (and ROPs)

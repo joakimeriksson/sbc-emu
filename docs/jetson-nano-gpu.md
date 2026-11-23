@@ -15,7 +15,7 @@ kmscube -D /dev/dri/card0          # or: glmark2-es2-drm
 |---|---|
 | `tegra210/src/gpu/` | BAR0 and BAR1, page tables and TLB (through the SMMU where an address says so), the PMU's and FECS's answers, runlists and channels, push buffers, semaphores, the copy engine (B0B5) |
 | `maxwell/` | the engine: 3D (B197) with its macro processor, 2D (902D), compute (B1C0), inline to memory (A140) |
-| `maxwell-shader/` | the shader instruction set: decoder, disassembler, interpreter (16 or 32 lanes at a time), program headers |
+| `maxwell-shader/` | the shader instruction set: decoder, disassembler, interpreter (16 or 32 lanes at a time), program headers; in the browser a JIT to WebAssembly (`src/jit/`) |
 | `maxwell-tex/` | texture and sampler descriptors, block-linear layouts, filtering, BC1-7, ETC2/EAC, render target and depth formats |
 
 **Firmware.** The GPU's microcontrollers (PMU, FECS, GPCCS) need NVIDIA's signed firmware on real
@@ -81,9 +81,30 @@ nouveau draws into tiled buffers that tegra-drm shows as they are (PRIME). Mesa'
 pair (opening the display's card, as kmscube does) hands on neither shader storage buffers nor the size
 of patches in 25.0: the first crashes it and the second draws nothing.
 
-In the browser the GPU has one thread, and nothing but the interpreter for shaders: expect some 1 to 15
-frames per second. `SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs`
-runs them in Node.
+In the browser the GPU has one thread: expect some 1 to 15 frames per second.
+`SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs` runs them in Node;
+with `SBC_STEP=0.0333333` each picture moves the demos on a fixed 1/30 s (`gpu-demo --step`), so the
+pictures (`SBC_SHOTS=DIR`) are the same from run to run, and `SBC_SHADER_JIT=0` turns the shader JIT off.
+
+## Shader JIT (browser)
+
+In the browser, runs of plain arithmetic in a shader (floating point, integer, logic, shifts,
+conversions, comparisons, predicates, MUFU) become WebAssembly with 128-bit SIMD
+(`maxwell-shader/src/jit/`): an instruction's 16 lanes are four vectors, and within a run the registers
+stay in the function's locals. Everything else (interpolation, textures, memory, control flow) and runs
+of fewer than two such instructions stay in the interpreter. Each program becomes one module, compiled
+by the page the way the CPU's blocks are (`sbc_jit_compile`); when the CPU's JIT frees the table, the
+module is put back. MUFU's sine, cosine, powers and logarithms, and a fused multiply-add whose sum in
+double might round twice, call the same Rust code as the interpreter, so the results are the same to the
+bit.
+
+Checks: `cargo test -p maxwell-shader jit` (random blocks, the IR against the interpreter),
+`node tools/wasm-shader-jit-check.mjs` (the same with the WebAssembly code, in the browser build), and
+the demos with `SBC_STEP` and `SBC_SHOTS`, with and without the JIT: the six pictures are the same to the
+bit. In Node on a loaded Apple M-series machine, 30 pictures of 640 x 480 took (without / with the JIT):
+planet 4.5 / 2.0 s, tunnel 2.2 / 1.5 s, shadow 3.4 / 2.5 s, swarm 1.6 / 1.3 s, fur 2.4 / 2.4 s. Shaders
+are then about a fifth of the time; the CPU (a third) and the rasterizer (a quarter) take the most.
+Natively the interpreter runs on all the host's cores and has no JIT.
 
 ## Not done
 
@@ -94,6 +115,6 @@ runs them in Node.
   target.
 - Multiple vertex streams in transform feedback; subgroups wider than 16 lanes in compute.
 - Vulkan (NVK) and NVIDIA's own driver have not been tried.
-- The GPU runs on the CPU's thread (a core waits while it draws); no JIT for shaders.
+- The GPU runs on the CPU's thread (a core waits while it draws); the shader JIT has no native backend.
 
 `SBC_TRACE_GPU=1` prints register accesses, `SBC_TRACE_GPFIFO=1` every method.

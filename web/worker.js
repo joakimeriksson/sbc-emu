@@ -456,7 +456,7 @@ function loop() {
   if (now - lastStats > 500) {
     const insns = ex.sbc_insns();
     const gpu = ex.sbc_gpu_frames();
-    postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20, jit: ex.sbc_jit_blocks(),
+    postMessage({ type: 'stats', mips: (insns - lastInsns) / ((now - lastStatsT) * 1e3), insns, simS: ex.sbc_now_ns() / 1e9, diskMiB: fetched / 2 ** 20, jit: ex.sbc_jit_blocks(), shaders: ex.sbc_shader_jit_blocks(),
                   gpuFps: (gpu - lastGpu) / ((now - lastStatsT) / 1e3), gpuFrames: gpu, gpuMs: ex.sbc_gpu_ms() });
     lastInsns = insns; lastStatsT = now; lastStats = now; lastGpu = gpu;
   }

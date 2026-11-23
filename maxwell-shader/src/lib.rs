@@ -13,7 +13,8 @@
 //! ones. A lane that executes KIL goes on as a helper (`discard` is `demote` in nouveau).
 //! Scheduling words, memory barriers and cache control do nothing.
 
-#![forbid(unsafe_code)]
+// (unsafe only where the browser's JIT calls the code it made: jit/wasm.rs)
+#![deny(unsafe_code)]
 #![allow(clippy::needless_range_loop, clippy::precedence, clippy::large_enum_variant)]
 
 pub mod decode;
@@ -22,6 +23,7 @@ pub mod exec;
 pub mod fp;
 pub mod host;
 pub mod isa;
+pub mod jit;
 pub mod program;
 pub mod sph;
 

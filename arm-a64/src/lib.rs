@@ -8,6 +8,8 @@ mod exec;
 pub mod fpu;
 pub mod jit;
 mod jit_wasm;
+#[cfg(target_arch = "wasm32")]
+pub use jit_wasm::resets as wasm_jit_resets;
 pub mod mmu;
 mod neon;
 mod simd;

@@ -451,6 +451,48 @@ pub extern "C" fn sbc_board() -> u32 {
     with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4, Board::OrangePi5(..) => 5, Board::Esp32S31(..) => 6, Board::JetsonNano(..) => 7 }).unwrap_or(0)
 }
 
+/// Turn the Jetson Nano's shader JIT on (1) or off (0) (maxwell-shader/src/jit); returns whether
+/// it is on.
+#[no_mangle]
+pub extern "C" fn sbc_shader_jit(on: u32) -> u32 {
+    maxwell_shader::jit::set_enabled(on != 0);
+    maxwell_shader::jit::enabled() as u32
+}
+
+/// Blocks of GPU shader code the shader JIT has compiled.
+#[no_mangle]
+pub extern "C" fn sbc_shader_jit_blocks() -> u32 {
+    maxwell_shader::jit::blocks()
+}
+
+thread_local! {
+    static SHADER_JIT_REPORT: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The shader JIT's code against the interpreter on `cases` random blocks
+/// (tools/wasm-shader-jit-check.mjs): 0 if every one agreed. The report (the kinds of
+/// instruction tried, or what differed) is at `sbc_shader_jit_report`.
+#[no_mangle]
+pub extern "C" fn sbc_shader_jit_check(seed: f64, cases: u32) -> u32 {
+    let (r, text) = match maxwell_shader::jit::check::check(seed as u64, cases as usize) {
+        Ok(ops) => (0, format!("{ops:?}")),
+        Err(e) => (1, e),
+    };
+    SHADER_JIT_REPORT.with(|s| *s.borrow_mut() = text);
+    r
+}
+
+/// The report of the last `sbc_shader_jit_check`: its address, and its length at `sbc_shader_jit_report_len`.
+#[no_mangle]
+pub extern "C" fn sbc_shader_jit_report() -> *const u8 {
+    SHADER_JIT_REPORT.with(|s| s.borrow().as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn sbc_shader_jit_report_len() -> usize {
+    SHADER_JIT_REPORT.with(|s| s.borrow().len())
+}
+
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
 #[no_mangle]
 pub extern "C" fn sbc_jit(on: u32) -> u32 {

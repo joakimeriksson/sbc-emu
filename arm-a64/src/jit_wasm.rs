@@ -21,8 +21,17 @@ extern "C" {
     fn sbc_jit_reset();
 }
 
+static RESETS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Tell the page the compiled code is gone (called from `Jit::flush`).
-pub(crate) fn reset() { unsafe { sbc_jit_reset() } }
+pub(crate) fn reset() {
+    RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    unsafe { sbc_jit_reset() }
+}
+
+/// How often the page has freed the JIT's table slots: the GPU's shader JIT, which puts its
+/// code in the same table, compiles again after that.
+pub fn resets() -> u32 { RESETS.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// Interpreter for one instruction (called by generated code through the table).
 /// 0 = continue, 1 = leave the block (pc set), 2 = trap stored in jit_trap.

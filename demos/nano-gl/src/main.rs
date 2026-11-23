@@ -1,5 +1,7 @@
 //! OpenGL ES 3.2 demos on the screen, without a window system.
-//!     nano-gl [DEMO...] [--mode WxH] [--seconds N] [--shot FILE --time T]
+//!     nano-gl [DEMO...] [--mode WxH] [--seconds N] [--step S] [--shot FILE --time T]
+//! --step S: each picture moves the demo on S seconds, whatever the time (for recordings); the demos are
+//! then shown once each, --seconds long.
 mod gl;
 mod kms;
 mod scenes;
@@ -33,10 +35,11 @@ struct Options {
     seconds: f32,
     shot: Option<String>,
     time: f32,
+    step: Option<f32>,
 }
 
 fn options() -> Result<Options, String> {
-    let mut o = Options { demos: Vec::new(), mode: None, seconds: 12.0, shot: None, time: 2.0 };
+    let mut o = Options { demos: Vec::new(), mode: None, seconds: 12.0, shot: None, time: 2.0, step: None };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().ok_or(format!("{a} what?"));
@@ -50,8 +53,9 @@ fn options() -> Result<Options, String> {
             "--seconds" => o.seconds = value()?.parse().map_err(|_| "--seconds N")?,
             "--shot" => o.shot = Some(value()?),
             "--time" => o.time = value()?.parse().map_err(|_| "--time T")?,
+            "--step" => o.step = Some(value()?.parse().ok().filter(|&s: &f32| s > 0.0 && s.is_finite()).ok_or("--step S, S > 0")?),
             d if scenes::NAMES.contains(&d) => o.demos.push(a),
-            _ => return Err(format!("usage: gpu-demo [{}]... [--mode WxH] [--seconds N]", scenes::NAMES.join("|"))),
+            _ => return Err(format!("usage: gpu-demo [{}]... [--mode WxH] [--seconds N] [--step S]", scenes::NAMES.join("|"))),
         }
     }
     Ok(o)
@@ -109,7 +113,8 @@ fn run() -> Result<(), String> {
     println!("{} on {} x {}", name(), screen.width, screen.height);
     // each made once, when it is first its turn
     let mut made: Vec<Option<Box<dyn scenes::Scene>>> = o.demos.iter().map(|_| None).collect();
-    for k in 0.. {
+    let rounds = if o.step.is_some() { o.demos.len() } else { usize::MAX };
+    for k in 0..rounds {
         let k = k % o.demos.len();
         let d = &o.demos[k];
         let s = made[k].get_or_insert_with(|| scenes::make(d).unwrap());
@@ -118,13 +123,18 @@ fn run() -> Result<(), String> {
         let start = Instant::now();
         let (mut last, mut frames) = (0.0, 0);
         loop {
-            let t = start.elapsed().as_secs_f32();
+            let t = o.step.map_or_else(|| start.elapsed().as_secs_f32(), |s| frames as f32 * s);
             let to = scenes::Target { fb: screen.target(), w: screen.width as i32, h: screen.height as i32, up: -1.0 };
             s.draw(t, (t - last).min(0.1), &to);
             screen.show()?;
             last = t;
             frames += 1;
-            if o.demos.len() > 1 && t > o.seconds {
+            // (with --step: as many pictures as there are steps in --seconds)
+            let done = match o.step {
+                Some(s) => frames as f32 * s + s / 2.0 > o.seconds,
+                None => o.demos.len() > 1 && t > o.seconds,
+            };
+            if done {
                 break;
             }
         }
