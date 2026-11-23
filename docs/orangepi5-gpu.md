@@ -1,6 +1,6 @@
 # Orange Pi 5 GPU bring-up
 
-The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Clears, bounded compute dispatch and Mesa's GLES 3D pipeline (vertex and fragment shaders, clipping, depth/stencil, blending, textures) are supported, and the output can be shown on the HDMI screen through the Rockchip display driver: `kmscube` runs on the emulated monitor (see [3D programs](#3d-programs-kmscube)).
+The RK3588S uses a Mali-G610 (Valhall, command-stream frontend), rather than the Pi 4's V3D. Linux uses Panthor and Mesa's Panfrost/PanVK drivers. A scanout device is separate from the GPU. The opt-in `--gpu probe` mode presents the experimental GPU control interface to Linux. Clears, bounded compute dispatch and Mesa's GLES 3D pipeline (vertex and fragment shaders, clipping, depth/stencil, blending, textures) are supported, and the output can be shown on the HDMI screen through the Rockchip display driver: `kmscube` runs on the emulated monitor (see [3D programs](#3d-programs-kmscube-and-glmark2)).
 
 The first building blocks in `rk3588` are a GPU virtual-address walker for the 4 KiB AArch64 stage-1 page tables used by Panthor and a bounded interpreter for a small subset of Valhall command-stream instructions. Tests exercise memory mapping and faults, instructions and their interaction. The control register block is connected to guest MMIO and the three GPU interrupt lines. Address-space UPDATE commands latch the programmed translation settings. A synchronous CSF queue path now connects Linux submissions to the command interpreter, including kernel CALL and completion synchronization. Unsupported work raises a queue fault.
 
@@ -188,7 +188,7 @@ The buffer is XRGB8888: Mesa's render target writes it back with a B,G,R,0 swizz
 
 ![GLES on HDMI](img/orangepi5-gles-hdmi.png)
 
-## 3D programs: kmscube
+## 3D programs: kmscube and glmark2
 
 ```sh
 python3 tools/panthor-app.py --image <image with kmscube> --app kmscube \
@@ -201,9 +201,10 @@ python3 tools/panthor-app.py --image <image with kmscube> --app kmscube \
 - **Rasterization**: Mesa's vertex shaders end with the viewport transform, so positions are window x, y, z and 1/w. Triangles crossing w = 0 are clipped in homogeneous space; the near/far planes act per fragment through the draw's depth range (cull or clamp), as on Mali. Front-face culling, scissor, polygon offset, and the top-left fill rule on 1/256-pixel snapped coordinates. Varyings are interpolated perspective-correctly (also through clipped edges); flat varyings use the provoking vertex.
 - **Fragment stage**: shaders run as 2x2 quads (helper threads when the shader asks for them), so cross-lane permutes (`CLPER`) and implicit-LOD texturing see their neighbours. Early or late depth/stencil tests with all compare functions and stencil operations, fixed-function blending into up to eight render targets, occlusion queries, and pre-/post-frame shaders (Mesa's preload). The tile buffer keeps each target's internal precision (RGBA8, RGB10A2, RGB565, RGBA4, RGB5A1); writeback is linear or 16x16 u-interleaved in any of the matching writeback formats, with sRGB; depth/stencil (D16, D24S8, D24X8, D32) write back through the ZS CRC extension.
 - **Shaders**: the interpreter decodes the Valhall ALU (FMA/CVT/SFU: float, half-float, integer, 8/16-bit vector forms, conversions, compares, selects, shifts, cross-lane permutes, Mesa's transcendental sequences) and the messages Mesa emits for GLES: varyings, attributes in any vertex format, UBO/SSBO buffers, global loads and stores, blending, depth output, and texturing.
+- **AFBC**: Mesa compresses textures, render targets and depth buffers with AFBC (16x16 superblocks, sparse, YTR, tiled headers for large images) by default. It never looks inside the payloads (it blits through the GPU, and its packing shader moves payloads by their header sizes only), so the model writes uncompressed subblocks under real AFBC headers and reads those or solid-colour superblocks.
 - **Textures**: 1D/2D/3D, cube maps and arrays; linear and u-interleaved planes; mipmaps with nearest/linear/trilinear filtering and LOD bias/clamps; every wrap mode and border colours; depth comparison, gather and texel fetch; unorm/snorm/float/integer, packed and depth formats with component orders, swizzles and sRGB.
 
-Instruction pages, translations, attribute and texture descriptors are cached per job, so the page tables are walked once per page. Fragment jobs render in bands of rows on host threads (`SBC_MALI_THREADS`, default half the cores, at most eight; one in the browser), each with read-only guest memory; a shader that stores to memory makes the job run serially. Jobs run synchronously in the doorbell write, so the work they did (shader instructions, fragments, tile writeback) is turned into the time a Mali-G610 MP4 at about 1 GHz would take (64 thread-instructions and 16 pixels per cycle, 20 GB/s writeback) and the submitting core's clock moves on by that much: programs that time their frames see a GPU that takes time. `SBC_MALI_TIMING=1` logs each fragment job's host time.
+Instruction pages, translations, attribute and texture descriptors are cached per job, so the page tables are walked once per page. Fragment jobs render in interleaved 16-row stripes on host threads (`SBC_MALI_THREADS`, default half the cores, at most eight; one in the browser), each with read-only guest memory; a shader that stores to memory makes the job run serially. Jobs run synchronously in the doorbell write, so the work they did (shader instructions, fragments, tile writeback) is turned into the time a Mali-G610 MP4 at about 1 GHz would take (64 thread-instructions and 16 pixels per cycle, 20 GB/s writeback) and the submitting core's clock moves on by that much: programs that time their frames see a GPU that takes time. `SBC_MALI_TIMING=1` logs each fragment job's host time.
 
 The image is the Mesa fixture above with Debian's `kmscube` and `glmark2-es2-drm` packages: boot a copy with `--net nat --sd-persist --append init=/bin/bash`, bring up `eth0` (10.0.2.15/24, gateway 10.0.2.2), and `apt-get install --no-install-recommends kmscube glmark2-es2-drm`. Guest name resolution through the NAT did not work in that session, so `deb.debian.org` and `security.debian.org` went into `/etc/hosts` for the install.
 
@@ -345,8 +346,8 @@ rectangles with a shared edge and scissoring. Its oracle uses GL factors, not th
 Mali descriptor equation. Blend shaders and logic operations remain unsupported.
 
 The section on kmscube above describes the 3D pipeline these tests now run on. Still
-missing: AFBC/AFRC compressed surfaces (run Mesa with `PAN_MESA_DEBUG=noafbc` for
-programs that render to textures), block-compressed and ASTC textures, blend shaders
+missing: AFRC and AFBC data compressed by something other than this model (split or
+wide blocks), block-compressed and ASTC textures, blend shaders
 and logic operations, sRGB blending, multisampled rendering (draws are single-sampled
 at pixel centres), alpha-to-coverage, anisotropic filtering, explicit-gradient
 texturing, seamless filtering across cube-map faces (each face is filtered on its own), the

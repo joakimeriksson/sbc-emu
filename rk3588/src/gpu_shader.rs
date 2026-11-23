@@ -1800,33 +1800,40 @@ impl Shader {
 pub fn run_quad(lanes: &mut [Shader; 4], env: &mut Env, budget: usize) -> Result<(), Error> {
     let mut spent = 0;
     loop {
-        let mut pc = u64::MAX;
-        for l in lanes.iter() {
-            if !l.done {
-                pc = pc.min(l.pc);
+        // Each thread runs on its own up to the next instruction that reads other
+        // lanes (cross-lane permutes, implicit-LOD texturing) or its end.
+        for lane in lanes.iter_mut() {
+            while !lane.done {
+                let i = env.code.fetch(env.m, &env.ram, lane.pc).map_err(Error::Memory)?;
+                if msg::needs_quad(i) {
+                    break;
+                }
+                if spent >= budget {
+                    return Err(Error::Budget);
+                }
+                lane.step(env, i, None)?;
+                spent += 1;
             }
         }
-        if pc == u64::MAX {
+        // The lanes waiting at the lowest such instruction execute it together.
+        let Some(pc) = lanes.iter().filter(|l| !l.done).map(|l| l.pc).min() else {
             return Ok(());
-        }
+        };
         if spent >= budget {
             return Err(Error::Budget);
         }
         let i = env.code.fetch(env.m, &env.ram, pc).map_err(Error::Memory)?;
         let active: [bool; 4] = std::array::from_fn(|n| !lanes[n].done && lanes[n].pc == pc);
-        let cross = msg::needs_quad(i);
-        let mut view = cross.then(|| QuadView {
+        let mut view = QuadView {
             regs: std::array::from_fn(|n| lanes[n].regs),
             active,
             lane: 0,
             tex: msg::quad_coords(lanes, &active, i, env.uniforms),
-        });
+        };
         for n in 0..4 {
             if active[n] {
-                if let Some(v) = view.as_mut() {
-                    v.lane = n;
-                }
-                lanes[n].step(env, i, view.as_ref())?;
+                view.lane = n;
+                lanes[n].step(env, i, Some(&view))?;
                 spent += 1;
             }
         }
