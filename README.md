@@ -41,16 +41,19 @@ board's page says exactly what works, how it was tested and what is missing.
 
 ## Quick start
 
+One command boots a board to a shell in your terminal (macOS or Linux, with
+[Rust](https://rustup.rs)). The first run builds sbc-emu and fetches a small, checksummed guest:
+
 ```sh
-cargo build --release
-./target/release/sbc-emu boards list
-./target/release/sbc-emu run --sd raspios-lite.img --input usb   # your own Raspberry Pi OS image
+git clone https://github.com/joakimeriksson/sbc-emu && cd sbc-emu
+scripts/quickstart.sh pi4b      # or orangepi5, orangepi-one, tinkerboard, orangepi-rv, jetson-nano, esp32s31
 ```
 
-`Ctrl-A x` quits. `--board NAME` picks another board; the board pages have the recipes,
-including the downloads each one needs. `--gdb PORT` lets gdb or lldb debug the guest, on every
-board ([debugging](docs/debugging.md)). sbc-emu ships no operating system images: you bring
-your own.
+`Ctrl-A x` quits. **[Getting started](docs/getting-started.md)** has every board, the full
+operating systems (Raspberry Pi OS, Armbian, Ubuntu, Debian) with a fetch script for each, the
+screen over VNC, and gdb (`--gdb PORT`, on every board: [debugging](docs/debugging.md)).
+The repository holds no operating system images: the scripts fetch them, checksummed, from their
+publishers (the ESP32-S31's, built from Espressif's sources, from this project's releases).
 
 To build the browser site locally:
 
@@ -71,6 +74,7 @@ tools/site-build.sh && python3 -m http.server -d out/site 8792
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md): every board in one command, then the full operating systems
 - [Raspberry Pi 4](docs/raspberry-pi-4.md): what runs, the emulated hardware, running it,
   known gaps, and a comparison with QEMU's `raspi4b`
 - [The GPUs](docs/gpu.md) (V3D), [Mali-T760](docs/mali-t760.md), [Orange Pi 5's Mali-G610](docs/orangepi5-gpu.md), [Jetson Nano's Maxwell](docs/jetson-nano-gpu.md)

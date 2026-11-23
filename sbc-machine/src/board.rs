@@ -31,14 +31,14 @@ impl Board {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Pi4 => "BCM2711 (4x Cortex-A72, GIC-400, UART, SD, USB keyboard, Ethernet, Wi-Fi, GPIO/I2C/SPI)",
-            Self::Pi3 => "unverified: BCM2837 SoC model not yet implemented",
-            Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (4x A55 + 4x A76, GICv3, SD, Ethernet, Mali-G610, audio)",
-            Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (one A7, GIC-400, UART0, direct Linux boot)",
-            Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (four Cortex-A12s, GIC-400, UART2, direct Linux boot)",
-            Self::OrangePiRv => "experimental: Orange Pi RV / StarFive JH7110 (four RV64GC U74s, CLINT, PLIC, UART0, OpenSBI + direct Linux boot)",
-            Self::Esp32S31 => "experimental: ESP32-S31-Function-CoreBoard-1 (two RV32IMAC harts, UART0; mask ROM and Linux flash image)",
-            Self::JetsonNano => "experimental: NVIDIA Jetson Nano / Tegra X1 (four Cortex-A57s, GIC-400, UART A, timers, CAR, PMC, direct Linux boot)",
+            Self::Pi4 => "Raspberry Pi 4 Model B / BCM2711 (4x Cortex-A72): Raspberry Pi OS and Ubuntu from SD; HDMI, USB, Ethernet, Wi-Fi, audio, V3D GPU",
+            Self::Pi3 => "not implemented: BCM2837",
+            Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (4x A76 + 4x A55): Armbian from SD, or a kernel and initramfs; HDMI, USB, NVMe, audio, Mali-G610 GPU",
+            Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (4x Cortex-A7): Armbian from SD, or a kernel and initramfs; HDMI, USB, Ethernet, Mali-400 GPU",
+            Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (4x Cortex-A12): Armbian from SD or eMMC, or a kernel and initramfs; HDMI, Mali-T760 GPU",
+            Self::OrangePiRv => "experimental: Orange Pi RV / StarFive JH7110 (4x RV64GC U74): U-Boot from SPI flash or SD to Ubuntu, or OpenSBI and a kernel; Ethernet, Wi-Fi, NVMe, PowerVR GPU",
+            Self::Esp32S31 => "experimental: ESP32-S31-Function-CoreBoard-1 (2x RV32IMAC): the mask ROM and Espressif's Linux flash image",
+            Self::JetsonNano => "experimental: NVIDIA Jetson Nano / Tegra X1 (4x Cortex-A57): a kernel and initramfs, Debian's root on the microSD card; Ethernet, USB, HDMI, Maxwell GPU",
         }
     }
 
