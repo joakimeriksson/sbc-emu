@@ -742,8 +742,9 @@ emu_core::snap_struct!(Hart {
     cycle, instret, wfi, reservation, traps, fence_i, dev_access, last_illegal,
 } skip { id, tlb, fetch_page, fetch_off, jit_ut, jit_bus, jit_step, chain_until, jit_jc, jit_gen, jit_lr, jit_tmp, jit_fence_seen, watch }
 after |h| {
-    if !matches!(h.prv, prv::U | prv::S | prv::M) {
-        return Err(emu_core::snap::SnapError(format!("hart in privilege mode {}", h.prv)));
+    // mode 2 is reserved: writes to mstatus keep it out of MPP, and an mret would enter it
+    if !matches!(h.prv, prv::U | prv::S | prv::M) || (h.mstatus & mstatus::MPP) >> 11 == 2 {
+        return Err(emu_core::snap::SnapError(format!("hart in privilege mode {}, mstatus.MPP {}", h.prv, (h.mstatus & mstatus::MPP) >> 11)));
     }
     h.tlb.flush();
     h.invalidate_fetch();

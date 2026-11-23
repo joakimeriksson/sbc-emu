@@ -1175,9 +1175,31 @@ emu_core::snap_struct!(Soc {
 after |s| {
     if s.cur >= HARTS { return Err(emu_core::snap::SnapError(format!("hart {} of {HARTS}", s.cur))); }
     if s.stubs.iter().any(|(&at, page)| page.len() != 1024 || at & 0xfff != 0) { return Err(emu_core::snap::SnapError("a device page of another size".into())); }
-    Ok(())
+    check_time(s.now, "the machine")
 });
 emu_core::snap_enum!(HartState { Off, Run });
+
+/// Virtual time no guest reaches (146 years): deadlines are computed by adding to it.
+pub(crate) const MAX_TIME_NS: u64 = 1 << 62;
+
+/// A clock in a snapshot: refused past `MAX_TIME_NS` (only a hand-made file gets there).
+pub(crate) fn check_time(ns: u64, what: &str) -> Result<(), emu_core::snap::SnapError> {
+    if ns > MAX_TIME_NS { return Err(emu_core::snap::SnapError(format!("{what}: virtual time {ns} ns is out of range"))); }
+    Ok(())
+}
+
+/// The error a restore gives after `spoil` changed the saved machine's state: what a hand-made
+/// snapshot can hold. Panics if the restore succeeds.
+#[cfg(test)]
+pub(crate) fn refused(spoil: impl FnOnce(&mut Machine)) -> String {
+    let mut m = Machine::new(8 << 20);
+    spoil(&mut m);
+    let file = m.save().unwrap();
+    match Machine::new(8 << 20).restore(&file) {
+        Ok(()) => panic!("a snapshot the guest could not have made was restored"),
+        Err(e) => e,
+    }
+}
 
 /// Snapshots: harts, devices, virtual time, what was written to the disks and the flash, and RAM.
 /// See `docs/snapshots.md`.
@@ -1233,5 +1255,17 @@ impl Machine {
         // compiled code is of the RAM that was here
         if let Some(j) = self.jit.as_mut() { j.flush(); }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A machine restores; with a clock no guest reaches, it is refused.
+    #[test]
+    fn a_snapshot_with_an_impossible_clock_is_refused() {
+        Machine::new(8 << 20).restore(&Machine::new(8 << 20).save().unwrap()).unwrap();
+        assert!(refused(|m| m.soc.now = u64::MAX - 1).contains("virtual time"));
     }
 }

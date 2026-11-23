@@ -356,6 +356,20 @@ mod tests {
         assert!(!d.hdmi_irq());
     }
 
+    /// A FIFO position the guest could not have reached, or a mode the monitor does not offer,
+    /// is refused on restore rather than overflowing the EDID address or sizing the screen.
+    #[test]
+    fn a_snapshot_with_an_impossible_display_is_refused() {
+        let mut m = crate::Machine::new(8 << 20);
+        m.soc.display = Display::new(Mode::MODES[1]);
+        m.soc.display.fifo_pos = 200;
+        let mut back = crate::Machine::new(8 << 20);
+        back.restore(&m.save().unwrap()).unwrap();
+        assert_eq!((back.soc.display.fifo_pos, back.soc.display.mode), (200, Mode::MODES[1]));
+        assert!(crate::machine::refused(|m| m.soc.display.fifo_pos = usize::MAX).contains("EDID FIFO"));
+        assert!(crate::machine::refused(|m| m.soc.display.mode.width = u32::MAX).contains("monitor mode"));
+    }
+
     #[test]
     fn panel_vblank_and_xrgb_scanout() {
         let mut d = Display::new(Mode::MODES[0]);
@@ -384,4 +398,10 @@ mod tests {
 
 // Snapshots: the monitor's mode is the snapshot's (`--hdmi-mode`) until the guest reboots.
 emu_core::snap_struct!(Mode { clock_khz, width, hfp, hsync, hbp, height, vfp, vsync, vbp });
-emu_core::snap_struct!(Display { edid, fifo_pos, mode, pending, next_vblank, frames } fixed { dc, hdmi });
+emu_core::snap_struct!(Display { edid, fifo_pos, mode, pending, next_vblank, frames } fixed { dc, hdmi } after |d| {
+    // what a guest could not have made: the EDID FIFO read two billion bytes past its start
+    // (the address of the next byte would overflow), a monitor mode `--hdmi-mode` does not offer
+    if d.fifo_pos > i32::MAX as usize { return Err(emu_core::snap::SnapError(format!("the HDMI EDID FIFO at byte {}", d.fifo_pos))); }
+    if !Mode::MODES.contains(&d.mode) { return Err(emu_core::snap::SnapError(format!("a monitor mode of {}x{}", d.mode.width, d.mode.height))); }
+    Ok(())
+});

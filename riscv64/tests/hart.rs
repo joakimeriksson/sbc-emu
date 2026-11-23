@@ -148,3 +148,24 @@ fn time_csr_reads_the_platform_timer_when_counteren_allows() {
     assert_eq!(h.csr_read(&mut m, 0x30a), None);
     assert_eq!(h.csr_read(&mut m, 0x14d), None);
 }
+
+/// A hart restores; in the reserved mode 2, or with it in mstatus.MPP for an mret to enter, it
+/// is refused (only a hand-made snapshot holds that).
+#[test]
+fn a_snapshot_in_the_reserved_mode_is_refused() {
+    use emu_core::snap::{Snap, R, W};
+    let load = |h: &Hart| {
+        let mut w = W::default();
+        h.save(&mut w);
+        Hart::new(Identity::sifive_u74(1)).load(&mut R::new(&w.0))
+    };
+    let mut h = Hart::new(Identity::sifive_u74(1));
+    h.prv = prv::S;
+    h.mstatus = (h.mstatus & !mstatus::MPP) | prv::S << 11;
+    load(&h).unwrap();
+    h.mstatus = (h.mstatus & !mstatus::MPP) | 2 << 11;
+    assert!(load(&h).is_err());
+    h.mstatus &= !mstatus::MPP;
+    h.prv = 2;
+    assert!(load(&h).is_err());
+}

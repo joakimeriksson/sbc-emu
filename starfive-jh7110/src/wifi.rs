@@ -815,7 +815,7 @@ emu_core::snap_struct!(Bcm43456 {
 } fixed { ram } skip { trace } after |c| {
     if c.net >= NETWORKS.len() { return Err(emu_core::snap::SnapError(format!("Wi-Fi network {} of {}", c.net, NETWORKS.len()))); }
     if c.rx_cur.as_ref().is_some_and(|(f, pos)| *pos > f.len()) { return Err(emu_core::snap::SnapError("a Wi-Fi frame read past its end".into())); }
-    Ok(())
+    crate::machine::check_time(c.now, "the Wi-Fi chip")
 });
 
 #[cfg(test)]
@@ -823,7 +823,8 @@ mod tests {
     use super::*;
     use emu_core::snap::Snap;
 
-    /// The chip comes back as it was; a frame read past its end (a hand-made snapshot) is refused.
+    /// The chip comes back as it was; a frame read past its end, or a clock no guest reaches (a
+    /// hand-made snapshot), is refused.
     #[test]
     fn snapshots() {
         let mut c = Bcm43456::new();
@@ -843,5 +844,10 @@ mod tests {
         let mut w = emu_core::snap::W::default();
         c.save(&mut w);
         assert!(Bcm43456::new().load(&mut emu_core::snap::R::new(&w.0)).is_err());
+        c.rx_cur = None;
+        c.now = u64::MAX;
+        let mut w = emu_core::snap::W::default();
+        c.save(&mut w);
+        assert!(Bcm43456::new().load(&mut emu_core::snap::R::new(&w.0)).unwrap_err().0.contains("virtual time"));
     }
 }

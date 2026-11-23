@@ -398,7 +398,14 @@ impl emu_core::snap::Snap for SpiNor {
     }
 }
 
-emu_core::snap_struct!(Qspi { regs, rd, rd_done, wr, wr_done, irqstatus } fitted { flash: "an SPI flash (--spi-flash)" });
+emu_core::snap_struct!(Qspi { regs, rd, rd_done, wr, wr_done, irqstatus } fitted { flash: "an SPI flash (--spi-flash)" }
+after |q| {
+    // an indirect write ends when its data is complete
+    if q.wr.as_ref().is_some_and(|(_, len, data)| data.len() > *len) {
+        return Err(emu_core::snap::SnapError("a QSPI indirect write with more data than its length".into()));
+    }
+    Ok(())
+});
 
 #[cfg(test)]
 mod tests {
@@ -474,5 +481,18 @@ mod tests {
         assert_eq!(indirect_read(&mut q, 0x1100, 8), [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
         // direct access reads the flash
         assert_eq!(q.ahb_read(0x2000, 4) as u32, u32::from_le_bytes(image[0x2000..0x2004].try_into().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    /// An indirect write holding more data than its length is refused on restore (the next AHB
+    /// write would compute a negative remainder).
+    #[test]
+    fn a_snapshot_with_an_overfull_indirect_write_is_refused() {
+        let mut m = crate::Machine::new(8 << 20);
+        m.soc.qspi.wr = Some((0x1000, 256, vec![0; 256]));
+        crate::Machine::new(8 << 20).restore(&m.save().unwrap()).unwrap();
+        assert!(crate::machine::refused(|m| m.soc.qspi.wr = Some((0x1000, 4, vec![0; 8]))).contains("QSPI"));
     }
 }
