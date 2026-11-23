@@ -9,8 +9,8 @@ IMG=Armbian_26.8.1_Orangepi5_trixie_current_6.18.43_minimal.img
 URL=${ARMBIAN_ARCHIVE:-https://archive.armbian.com}/orangepi5/archive/$IMG.xz
 SHA=a7633627a54b6d8c5f03294cbf1b3b998d55b8e1e15cfb5296a3c440b981fcb5
 mkdir -p "$OUT"
-[ -f "$OUT/$IMG.xz" ] || curl -fL --retry 3 -o "$OUT/$IMG.xz" "$URL"
+[ -f "$OUT/$IMG.xz" ] || { curl -fL --retry 3 -o "$OUT/$IMG.xz.part" "$URL" && mv "$OUT/$IMG.xz.part" "$OUT/$IMG.xz"; }
 actual=$(shasum -a 256 "$OUT/$IMG.xz" | cut -d' ' -f1)
-[ "$actual" = "$SHA" ] || { echo "$IMG.xz: sha256 $actual, expected $SHA" >&2; exit 1; }
-[ -f "$OUT/$IMG" ] || xz -dk "$OUT/$IMG.xz"
+[ "$actual" = "$SHA" ] || { echo "$IMG.xz: sha256 $actual, expected $SHA (delete it to fetch it again)" >&2; exit 1; }
+[ -f "$OUT/$IMG" ] || { xz -dc "$OUT/$IMG.xz" > "$OUT/$IMG.part" && mv "$OUT/$IMG.part" "$OUT/$IMG"; }
 echo "$OUT/$IMG"

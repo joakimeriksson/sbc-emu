@@ -8,8 +8,10 @@ under the board. Everything stays on your computer.
 
 ## On your computer
 
-You need [Rust](https://rustup.rs) (stable) and, for the guests, `curl`, `tar`, `gzip`, `cpio`, `ar`
-and `python3` (all there on macOS with the Xcode command line tools, and on most Linux systems).
+You need [Rust](https://rustup.rs) and, for the guests, `curl`, `tar`, `gzip`, `cpio`, `ar`,
+`shasum` and `python3` (all there on macOS with the Xcode command line tools; on Linux, install
+`cpio` and `binutils` if they are missing). The full operating systems below also need `xz`
+(macOS: `brew install xz`; Debian and Ubuntu: `xz-utils`).
 sbc-emu runs on macOS and Linux. Its JITs, which make it fast, generate AArch64 code, so it is
 fastest on Apple silicon and other AArch64 machines; on x86-64 it interprets, which is slower.
 
@@ -85,14 +87,14 @@ scripts/armbian-tinkerboard-fixture.sh
 sbc-emu run --board tinkerboard --sd cache/tinker-board-armbian/Armbian_26.8.1_Tinkerboard_trixie_current_6.18.43_minimal.img
 ```
 
-Armbian's login is on the serial console, in your terminal. On the Orange Pi One and the Tinker
-Board the first login is Armbian's first-run wizard: it asks for a root password and offers to
-create a user (Ctrl-C skips that); the Orange Pi 5 image logs root in by itself. Add `--vnc :1`
-for HDMI. More, including the GPUs: [orangepi5.md](orangepi5.md), [orangepi-one.md](orangepi-one.md), [mali-t760.md](mali-t760.md).
+Armbian's login is on the serial console, in your terminal. The first login is Armbian's
+first-run wizard (the Orange Pi 5 image logs root in by itself and then starts it): it asks for a
+root password and offers to create a user (Ctrl-C skips that). Add `--vnc :1` for HDMI. More, including the GPUs: [orangepi5.md](orangepi5.md), [orangepi-one.md](orangepi-one.md), [mali-t760.md](mali-t760.md).
 
 ### Orange Pi RV: Ubuntu 24.04
 
 ```sh
+scripts/orangepi-rv-fixture.sh                  # OpenSBI, which U-Boot's image includes
 scripts/orangepi-rv-uboot.sh                    # the board's SPI flash: mainline U-Boot, built in Docker
 scripts/orangepi-rv-ubuntu.sh                   # Canonical's image for JH7110 boards, 1.1 GB download
 sbc-emu run --board orangepi-rv --spi-flash cache/orangepi-rv/uboot/spi-flash.img \

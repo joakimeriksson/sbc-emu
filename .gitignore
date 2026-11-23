@@ -7,3 +7,5 @@ web/wasm/
 web/assets/
 out/
 tests/gpu/gltest
+# snapshots saved with Ctrl-A s from the repository root
+/*.snap

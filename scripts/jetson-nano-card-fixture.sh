@@ -12,6 +12,13 @@ SHA=9e2f39589c5eac8d727099e42dba91746231dfe425995c6a90b6a541735d6776c5b08f71ee68
 mkdir -p "$OUT"
 [ -f "$OUT/$TXZ" ] || { curl -fL --retry 3 -o "$OUT/$TXZ.part" "$URL" && mv "$OUT/$TXZ.part" "$OUT/$TXZ"; }
 actual=$(shasum -a 512 "$OUT/$TXZ" | cut -d' ' -f1)
-[ "$actual" = "$SHA" ] || { echo "$TXZ: sha512 $actual, expected $SHA" >&2; exit 1; }
-[ -f "$OUT/disk.raw" ] || tar -xJf "$OUT/$TXZ" -C "$OUT" disk.raw
+[ "$actual" = "$SHA" ] || { echo "$TXZ: sha512 $actual, expected $SHA (delete it to fetch it again)" >&2; exit 1; }
+if [ ! -f "$OUT/disk.raw" ]; then
+  # unpack beside it and move it in when complete: an interrupted unpack leaves no disk.raw
+  rm -rf "$OUT/.unpack"
+  mkdir "$OUT/.unpack"
+  tar -xJf "$OUT/$TXZ" -C "$OUT/.unpack" disk.raw
+  mv "$OUT/.unpack/disk.raw" "$OUT/disk.raw"
+  rmdir "$OUT/.unpack"
+fi
 echo "$OUT/disk.raw"
