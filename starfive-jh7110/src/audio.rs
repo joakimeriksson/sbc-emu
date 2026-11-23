@@ -42,7 +42,7 @@ const IRQ_LLI_RD_DEC_ERR: u32 = 1 << 9;
 const LLI_LAST: u32 = 1 << 30;
 
 /// A block being transferred.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Block {
     sar: u64,
     dar: u64,
@@ -431,6 +431,13 @@ impl AxiDmac {
         next
     }
 }
+
+// Snapshots. What was recorded for `--audio-out` is the host's.
+emu_core::snap_struct!(Block { sar, dar, items, done, width, last, next });
+emu_core::snap_struct!(Chan { regs, enabled, block, intstatus, owed });
+emu_core::snap_struct!(Pwmdac { ctrl } skip { capture });
+emu_core::snap_struct!(I2s {} fixed { regs } skip { capture });
+emu_core::snap_struct!(AxiDmac { cfg, ch, last, transfers });
 
 #[cfg(test)]
 mod tests {

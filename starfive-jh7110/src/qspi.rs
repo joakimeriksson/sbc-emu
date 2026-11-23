@@ -377,6 +377,29 @@ impl Qspi {
     }
 }
 
+// Snapshots: what the flash holds now (writes stay in memory), whatever `--spi-flash` held.
+impl emu_core::snap::Snap for SpiNor {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { data, sr1, sr2, programmed, erased } = self;
+        w.bytes(data);
+        for v in [sr1, sr2] { v.save(w); }
+        for v in [programmed, erased] { v.save(w); }
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { data, sr1, sr2, programmed, erased } = self;
+        let b = r.bytes()?;
+        if b.len() != data.len() {
+            return Err(emu_core::snap::SnapError(format!("the snapshot's SPI flash has {} bytes, this one {}", b.len(), data.len())));
+        }
+        data.copy_from_slice(b);
+        for v in [sr1, sr2] { v.load(r)?; }
+        for v in [programmed, erased] { v.load(r)?; }
+        Ok(())
+    }
+}
+
+emu_core::snap_struct!(Qspi { regs, rd, rd_done, wr, wr_done, irqstatus } fitted { flash: "an SPI flash (--spi-flash)" });
+
 #[cfg(test)]
 mod tests {
     use super::*;

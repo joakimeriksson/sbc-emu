@@ -151,6 +151,7 @@ impl DmaMem<'_> {
 }
 
 /// A PIO write in progress: the FIFO collects `bytes` before they go to the card.
+#[derive(Default)]
 struct PioWrite {
     lba: Option<u64>,
     bytes: usize,
@@ -592,6 +593,21 @@ impl DwMmc {
         false
     }
 }
+
+// Snapshots. Where the controller is and its FIFO's depth are the board's.
+impl emu_core::snap::Snap for Card {
+    fn save(&self, w: &mut emu_core::snap::W) { self.0.save(w) }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> { self.0.load(r) }
+}
+
+impl emu_core::snap::Snap for Box<dyn SdioCard> {
+    fn save(&self, w: &mut emu_core::snap::W) { self.save_state(w) }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> { self.load_state(r) }
+}
+
+emu_core::snap_struct!(PioWrite { lba, bytes, data });
+emu_core::snap_struct!(DwMmc { card, sdio_rca, sdio_selected, sdio_target, regs, rintsts, idsts, fifo, pio_write }
+    fitted { sdio: "the Wi-Fi module" } skip { base, irq, fifo_depth, trace });
 
 #[cfg(test)]
 mod tests {

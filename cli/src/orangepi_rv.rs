@@ -16,6 +16,12 @@ impl SerialBoard for Machine {
     fn instret(&self) -> u64 {
         Machine::instret(self)
     }
+    fn save(&self) -> Result<Vec<u8>, String> {
+        Machine::save(self)
+    }
+    fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        Machine::restore(self, file)
+    }
     fn screen(&mut self) -> Option<&mut dyn Screen> {
         Some(self)
     }
@@ -144,7 +150,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             checked.push(a.clone());
         }
     }
-    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme", "--audio-out", "--spi-flash"])?;
+    serial_board::validate_options(&checked, &["--dtb", "--dump-dtb", "--firmware", "--sd", "--net", "--screenshot", "--vnc", "--hdmi-mode", "--usb-drive", "--nvme", "--audio-out", "--spi-flash", "--restore", "--snapshot"])?;
     let mode = match arg(args, "--hdmi-mode") {
         Some(spec) => {
             let (w, h) = spec.split_once('x').ok_or("--hdmi-mode WxH")?;
@@ -162,6 +168,9 @@ fn execute(args: &[String]) -> Result<(), String> {
     // U-Boot SPL from the SPI NOR flash (--spi-flash, a 16 MiB image of the board's flash) or,
     // without one, from --sd, and SPL, OpenSBI and U-Boot take it from there.
     let direct = arg(args, "--kernel").is_some();
+    // a snapshot has the kernel in its RAM: something to boot is needed only when the guest reboots
+    let restore = arg(args, "--restore").is_some();
+    let can_boot = direct || arg(args, "--sd").is_some() || arg(args, "--spi-flash").is_some();
     let spi_flash = arg(args, "--spi-flash").map(read).transpose()?;
     let (kernel, dtb, firmware) = if direct {
         (
@@ -170,7 +179,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             read(arg(args, "--firmware").ok_or("--firmware fw_dynamic.bin (OpenSBI, generic platform) is required with --kernel")?)?,
         )
     } else {
-        if arg(args, "--sd").is_none() && spi_flash.is_none() {
+        if !can_boot && !restore {
             return Err("--kernel Image (direct boot), --spi-flash FLASH.img (the board's firmware) or --sd CARD.img to boot from the card's U-Boot".into());
         }
         // the card's U-Boot loads the kernel, device tree and initrd itself
@@ -187,7 +196,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     if ram < (128 << 20) || ram > (16 << 30) {
         return Err("--ram-mb must be between 128 and 16384".into());
     }
-    if !direct && !boot::uboot_ram_ok(ram as u64) {
+    if !direct && can_boot && !boot::uboot_ram_ok(ram as u64) {
         return Err("booting from the SD card needs --ram-mb 2048, 4096, 8192 or 16384: U-Boot knows only the board's DRAM sizes".into());
     }
     let config = RunConfig::from_args("orangepi-rv", args)?;
@@ -203,6 +212,8 @@ fn execute(args: &[String]) -> Result<(), String> {
     let nvme = arg(args, "--nvme");
     // the RV64 JIT (AArch64 hosts): on unless --no-jit or SBC_JIT=0
     let jit = riscv64::jit::AVAILABLE && !args.iter().any(|a| a == "--no-jit") && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
+    // the machine restored into is not booted first; when the guest reboots, a new one is
+    let restored = std::cell::Cell::new(false);
     let make_machine = || -> Result<Machine, String> {
         let mut m = Machine::new(ram);
         m.set_jit(jit);
@@ -225,7 +236,12 @@ fn execute(args: &[String]) -> Result<(), String> {
                 m.soc.boot_mode = starfive_jh7110::machine::BOOT_MODE_SPI;
             }
         }
-        if direct {
+        if restore && !restored.replace(true) {
+            // nothing: the snapshot has it all
+            return Ok(m);
+        } else if !can_boot {
+            return Err("the guest rebooted: give --kernel, --sd or --spi-flash with --restore to boot it again".into());
+        } else if direct {
             boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
         } else {
             boot::boot_rom(&mut m)?;

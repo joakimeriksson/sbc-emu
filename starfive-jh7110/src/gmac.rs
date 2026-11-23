@@ -455,3 +455,7 @@ mod tests {
         assert!(g.irq());
     }
 }
+
+// Snapshots
+emu_core::snap_struct!(Yt8531 { regs, ext, page, cable, latched_low });
+emu_core::snap_struct!(Gmac { tx_index, rx_index, tx_partial, tx_out, rx_queue, tx_frames, rx_frames } fixed { regs } fitted { phy: "a PHY" });

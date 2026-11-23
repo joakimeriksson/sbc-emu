@@ -236,6 +236,14 @@ impl Snap for std::sync::Arc<[u8]> {
     fn load(&mut self, r: &mut R) -> Result<(), SnapError> { *self = r.bytes()?.into(); Ok(()) }
 }
 
+impl Snap for String {
+    fn save(&self, w: &mut W) { w.bytes(self.as_bytes()); }
+    fn load(&mut self, r: &mut R) -> Result<(), SnapError> {
+        *self = String::from_utf8(r.bytes()?.to_vec()).map_err(|_| SnapError("a string that is not UTF-8".into()))?;
+        Ok(())
+    }
+}
+
 macro_rules! snap_tuple {
     ($($t:ident $n:tt),*) => {
         impl<$($t: Snap),*> Snap for ($($t,)*) {

@@ -426,6 +426,34 @@ impl Nvme {
     }
 }
 
+// Snapshots: what the guest wrote to the SSD, not the image.
+emu_core::snap_struct!(Sq { base, size, head, tail, cq, live });
+emu_core::snap_struct!(Cq { base, size, tail, phase, ien, live });
+
+impl emu_core::snap::Snap for Nvme {
+    fn save(&self, w: &mut emu_core::snap::W) {
+        let Self { disk, cc, csts, aqa, asq, acq, intms, sq, cq, features, irq_request, reads, writes } = self;
+        for v in [cc, csts, aqa, intms] { v.save(w); }
+        for v in [asq, acq, reads, writes] { v.save(w); }
+        sq.save(w);
+        cq.save(w);
+        features.save(w);
+        irq_request.save(w);
+        emu_core::snap::save_disk(w, disk.as_ref().map(|d| d.as_ref() as &dyn Disk));
+    }
+    fn load(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        let Self { disk, cc, csts, aqa, asq, acq, intms, sq, cq, features, irq_request, reads, writes } = self;
+        for v in [cc, csts, aqa, intms] { v.load(r)?; }
+        for v in [asq, acq, reads, writes] { v.load(r)?; }
+        sq.load(r)?;
+        cq.load(r)?;
+        if sq.iter().any(|q| q.cq >= MAX_QUEUES) { return Err(emu_core::snap::SnapError("an NVMe submission queue without its completion queue".into())); }
+        features.load(r)?;
+        irq_request.load(r)?;
+        emu_core::snap::load_disk(r, disk.as_mut().map(|d| d.as_mut() as &mut dyn Disk), "an NVMe SSD (--nvme)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

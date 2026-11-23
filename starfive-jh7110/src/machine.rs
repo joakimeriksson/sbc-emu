@@ -137,7 +137,7 @@ pub struct Soc {
     pub voutcrg: Crg,
     pub sys_syscon: Regs,
     pub pmu: Pmu,
-    pub i2c: Vec<DwI2c>,
+    pub i2c: [DwI2c; I2C.len()],
     /// SDIO0 (the Wi-Fi module's slot, empty here) and SDIO1 (the microSD slot)
     pub sec: Sec,
     /// the AXI DMA controller and the PWM DAC (the board's audio output)
@@ -177,7 +177,7 @@ pub struct Soc {
     /// kept here so the per-quantum interrupt update needs no register-page lookups
     gpio_cfg: [u32; 10],
     /// read-back stand-ins for unmodelled device pages
-    pub stubs: BTreeMap<u64, Box<[u32; 1024]>>,
+    pub stubs: BTreeMap<u64, Vec<u32>>,
     /// the Cadence QSPI controller and the board's SPI NOR flash (`--spi-flash`)
     pub qspi: crate::qspi::Qspi,
     /// the boot-mode straps: `BOOT_MODE_SD`, or `BOOT_MODE_SPI` when the flash holds firmware
@@ -218,18 +218,16 @@ impl Soc {
             voutcrg: Crg::new(0x10000, 0x48, 0x4c, 1),
             sys_syscon: sys_syscon(),
             pmu: Pmu::default(),
-            i2c: (0..I2C.len())
-                .map(|k| {
-                    let mut bus = DwI2c::default();
-                    if k == 5 {
-                        bus.attach(PMIC_ADDR, Box::new(Axp15060::default()));
-                        let (lo, hi) = At24c04::pair(crate::boot::board_eeprom(ram_size as u64));
-                        bus.attach(EEPROM_ADDR, Box::new(lo));
-                        bus.attach(EEPROM_ADDR + 1, Box::new(hi));
-                    }
-                    bus
-                })
-                .collect(),
+            i2c: std::array::from_fn(|k| {
+                let mut bus = DwI2c::default();
+                if k == 5 {
+                    bus.attach(PMIC_ADDR, Box::new(Axp15060::default()));
+                    let (lo, hi) = At24c04::pair(crate::boot::board_eeprom(ram_size as u64));
+                    bus.attach(EEPROM_ADDR, Box::new(lo));
+                    bus.attach(EEPROM_ADDR + 1, Box::new(hi));
+                }
+                bus
+            }),
             stubs: BTreeMap::new(),
             qspi: Default::default(),
             boot_mode: BOOT_MODE_SD,
@@ -501,7 +499,7 @@ impl Soc {
     }
 
     fn stub(&mut self, addr: u64) -> &mut u32 {
-        let page = self.stubs.entry(addr & !0xfff).or_insert_with(|| Box::new([0; 1024]));
+        let page = self.stubs.entry(addr & !0xfff).or_insert_with(|| vec![0; 1024]);
         &mut page[((addr & 0xfff) / 4) as usize]
     }
 
@@ -1164,5 +1162,76 @@ impl Machine {
 
     pub fn take_serial_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.soc.uart.out)
+    }
+}
+
+// ---------------------------------------------------------------------- snapshots
+
+emu_core::snap_struct!(Soc {
+    ram, sram, dmc_status_reads, clint, plic, uart, uart1, bt, syscrg, aoncrg, stgcrg, ispcrg, voutcrg, sys_syscon, pmu, i2c, sec,
+    dmac, pwmdac, i2s, pcie, usb, temp, gpu, trng, display, gmac0, gmac1, net_next, sdio0, sdio1, gpio_reset, gpio_prev,
+    gpio_edges, gpio_cfg, stubs, qspi, boot_mode, now, cur, irq_dirty, dev_touched,
+} fitted { net: "a network (--net)", wifi_net: "a network (--net)" } skip { audio_source }
+after |s| {
+    if s.cur >= HARTS { return Err(emu_core::snap::SnapError(format!("hart {} of {HARTS}", s.cur))); }
+    if s.stubs.iter().any(|(&at, page)| page.len() != 1024 || at & 0xfff != 0) { return Err(emu_core::snap::SnapError("a device page of another size".into())); }
+    Ok(())
+});
+emu_core::snap_enum!(HartState { Off, Run });
+
+/// Snapshots: harts, devices, virtual time, what was written to the disks and the flash, and RAM.
+/// See `docs/snapshots.md`.
+impl Machine {
+    const BOARD: &'static str = "orangepi-rv";
+    /// Of the layout: raise it when what is saved changes.
+    const VERSION: u32 = 1;
+
+    fn disks(&self) -> [Option<&dyn emu_core::disk::Disk>; 3] {
+        [
+            self.soc.sdio1.card.0.disk.as_deref(),
+            self.soc.pcie.iter().find_map(|p| p.nvme.as_ref()).and_then(|n| n.disk.as_deref()).map(|d| d as &dyn emu_core::disk::Disk),
+            self.soc.usb.storage.as_ref().map(|s| &*s.disk as &dyn emu_core::disk::Disk),
+        ]
+    }
+
+    /// The machine as a snapshot file; an error when it has state that cannot be saved (a disk
+    /// that writes through to its image).
+    pub fn save(&self) -> Result<Vec<u8>, String> {
+        for d in self.disks() { emu_core::snap::check_disk(d)?; }
+        Ok(emu_core::snap::pack(Self::BOARD, Self::VERSION, &self.state()))
+    }
+
+    /// Continue from a snapshot made by `save`. After an error the machine is in pieces.
+    pub fn restore(&mut self, file: &[u8]) -> Result<(), String> {
+        let sectors = self.disks().iter().flatten().map(|d| d.sectors()).sum();
+        let limit = emu_core::snap::limit(self.soc.ram.mem.len(), sectors);
+        let state = emu_core::snap::unpack(Self::BOARD, Self::VERSION, limit, file).map_err(|e| e.0)?;
+        self.load_state(&state).map_err(|e| e.0)
+    }
+
+    /// The state in a snapshot, unpacked.
+    pub fn state(&self) -> Vec<u8> {
+        use emu_core::snap::Snap;
+        let Self { harts, state, soc, rr, jit: _, breakpoints: _ } = self;
+        let mut w = emu_core::snap::W::default();
+        emu_core::snap::save_each(&mut w, harts);
+        emu_core::snap::save_each(&mut w, state);
+        soc.save(&mut w);
+        rr.save(&mut w);
+        w.0
+    }
+
+    fn load_state(&mut self, state: &[u8]) -> Result<(), emu_core::snap::SnapError> {
+        use emu_core::snap::Snap;
+        let r = &mut emu_core::snap::R::new(state);
+        emu_core::snap::load_each(r, &mut self.harts, "harts")?;
+        emu_core::snap::load_each(r, &mut self.state, "harts")?;
+        self.soc.load(r)?;
+        self.rr.load(r)?;
+        if self.rr >= HARTS { return Err(emu_core::snap::SnapError(format!("hart {} of {HARTS}", self.rr))); }
+        if r.p != state.len() { return Err(emu_core::snap::SnapError(format!("{} bytes too many", state.len() - r.p))); }
+        // compiled code is of the RAM that was here
+        if let Some(j) = self.jit.as_mut() { j.flush(); }
+        Ok(())
     }
 }

@@ -63,7 +63,7 @@ struct Ppp {
     ppp_ctrl: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Prim {
     v: [Vertex; 3],
     ppp: Ppp,
@@ -1337,3 +1337,13 @@ mod tests {
         assert_eq!(p.viewports, vec![[32.0, 32.0, 32.0, 32.0, 0.0, 1.0]]);
     }
 }
+
+// Snapshots: scenes waiting for their fragment job.
+emu_core::snap_struct!(Vertex { win, out });
+emu_core::snap_struct!(Ppp {
+    ispctl, ispa, ispb, ispa_back, ispb_back, dbsc, pds, varyingbase, texturedatabase, uniformdatabase, region_clip,
+    viewports, wclamp, outsel, varying, ppp_ctrl,
+});
+emu_core::snap_struct!(Prim { v, ppp, back, flat, flat_z });
+emu_core::snap_struct!(Scene { prims });
+emu_core::snap_struct!(Gfx { scenes, draws, prims, tiles });
