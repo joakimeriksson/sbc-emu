@@ -268,3 +268,93 @@ fn a_hardware_loop_runs_its_body_count_times_in_blocks() {
         assert_eq!(c.blocks.builds > 0, jit);
     }
 }
+
+/// The instructions the JIT compiles to host code (integer, M, Zba/Zbb/Zbs, jumps and branches)
+/// on the values where hosts and RISC-V part ways: division by zero and INT_MIN / -1, shift and
+/// bit indices of 31, 32 and more, zero for clz/ctz, the sign bits of each width. Straight-line
+/// programs in a counted loop, compiled on their first run, against the interpreter.
+#[test]
+fn native_instructions_match_the_interpreter_on_edge_values() {
+    const EDGE: [u32; 16] = [0, 1, 2, 31, 32, 33, 0x7f, 0x80, 0xff, 0x8000, 0xffff, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0xffff_fffe, 0x1234_5678];
+    let seeds: u64 = std::env::var("RV_NATIVE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let r_type = |f7: u32, f3: u32, rd: u32, rs1: u32, rs2: u32| 0x33 | rd << 7 | f3 << 12 | rs1 << 15 | rs2 << 20 | f7 << 25;
+    let (mut compiled, mut insns) = (0, 0);
+    for kind in [0u32, 3] {
+        for seed in 0..seeds {
+            let mut r = Rng((seed * 2 + kind as u64 / 3).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            // x31 counts the loop down; the body never writes it
+            let reg = |r: &mut Rng| r.below(31);
+            let mut prog: Vec<u32> = Vec::new();
+            for _ in 0..(8 + r.below(40)) {
+                let (rd, rs1, rs2) = (1 + r.below(30), reg(&mut r), reg(&mut r));
+                let imm = if r.below(2) == 0 { EDGE[r.below(16) as usize] as i32 } else { r.next() as i32 } & 0xfff;
+                let imm = (imm << 20) >> 20;
+                let sh = [0, 1, 7, 15, 16, 31][r.below(6) as usize] | (r.below(2) * r.below(32));
+                let w = match r.below(if kind == 3 { 9 } else { 6 }) {
+                    // base R-type
+                    0 => { let f3 = r.below(8); r_type(if f3 == 0 || f3 == 5 { [0, 0x20][r.below(2) as usize] } else { 0 }, f3, rd, rs1, rs2) }
+                    // M
+                    1 | 2 => r_type(1, [0, 1, 3, 4, 5, 6, 7][r.below(7) as usize], rd, rs1, rs2),
+                    // base I-type (shifts with legal shamt)
+                    3 => match r.below(8) {
+                        1 => i_type(0x13, 1, rd, rs1, sh as i32),
+                        5 => i_type(0x13, 5, rd, rs1, (sh | r.below(2) << 10) as i32),
+                        f3 => i_type(0x13, f3, rd, rs1, imm),
+                    },
+                    4 => 0x37 | rd << 7 | (r.next() & 0xffff_f000),
+                    5 => 0x17 | rd << 7 | (r.next() & 0xffff_f000),
+                    // Zba, Zbb, Zbs: R-type
+                    6 | 7 => {
+                        let (f7, f3) = [(0x20, 7), (0x20, 6), (0x20, 4), (0x05, 4), (0x05, 5), (0x05, 6), (0x05, 7), (0x30, 1), (0x30, 5),
+                            (0x10, 2), (0x10, 4), (0x10, 6), (0x24, 1), (0x24, 5), (0x34, 1), (0x14, 1)][r.below(16) as usize];
+                        r_type(f7, f3, rd, rs1, rs2)
+                    }
+                    // Zbb, Zbs: unary and immediate forms (zext.h, clz, ctz, sext.b/h, rev8, rori, b*i)
+                    _ => match r.below(9) {
+                        0 => r_type(0x04, 4, rd, rs1, 0),
+                        1 => i_type(0x13, 1, rd, rs1, 0x600 | [0, 1, 4, 5][r.below(4) as usize]),
+                        2 => i_type(0x13, 5, rd, rs1, 0x698),
+                        3 => i_type(0x13, 5, rd, rs1, (0x600 | sh) as i32),
+                        4 => i_type(0x13, 1, rd, rs1, (0x480 | sh) as i32),
+                        5 => i_type(0x13, 5, rd, rs1, (0x480 | sh) as i32),
+                        6 => i_type(0x13, 1, rd, rs1, (0x680 | sh) as i32),
+                        7 => i_type(0x13, 1, rd, rs1, (0x280 | sh) as i32),
+                        _ => i_type(0x13, 5, rd, rs1, sh as i32),
+                    },
+                };
+                prog.push(w);
+                // now and then a forward branch over the next instruction, or a jal/jalr pair
+                match r.below(10) {
+                    0 => prog.push(b_type(0x63, [0, 1, 4, 5, 6, 7][r.below(6) as usize], reg(&mut r), reg(&mut r), 8)),
+                    1 => prog.push(j_type(rd, 8)),
+                    _ => {}
+                }
+            }
+            // nop (a branch at the end skips it) ; addi x31, x31, -1 ; bne x31, x0, start ; j .
+            prog.push(i_type(0x13, 0, 0, 0, 0));
+            let back = -(4 * prog.len() as i32) - 4;
+            prog.extend([i_type(0x13, 0, 31, 31, -1), b_type(0x63, 1, 31, 0, back), j_type(0, 0)]);
+            let mut bus = TestBus::new();
+            for (k, w) in prog.iter().enumerate() { bus.ram[0x200 + 4 * k..][..4].copy_from_slice(&w.to_le_bytes()); }
+            let mut a = core(kind);
+            let mut b = core(kind);
+            let mut regs = [0u32; 32];
+            for x in regs.iter_mut().skip(1) { *x = if r.below(4) == 0 { r.next() } else { EDGE[r.below(16) as usize] }; }
+            regs[31] = 3 + r.below(5);
+            for c in [&mut a, &mut b] { c.pc = CODE; c.mtvec = HANDLER; c.x = regs; }
+            a.blocks.jit_hot = 1;
+            b.set_jit(false);
+            let mut bus_b = bus.clone();
+            let budget = 64 * prog.len() as u32;
+            let (ra, rb) = (a.run(&mut bus, budget), b.run(&mut bus_b, budget));
+            let (sa, sb) = (state(&a), state(&b));
+            assert!(ra == rb && sa == sb, "kind {kind} seed {seed}: jit {ra:?} vs interpreter {rb:?}\njit         {sa}\ninterpreter {sb}\nprogram {prog:08x?}");
+            // every instruction is legal: the loop ran out to the final `j .`
+            assert_eq!((a.pc, ra.1), (CODE + 4 * (prog.len() as u32 - 1), None), "kind {kind} seed {seed}: trapped or stopped early");
+            compiled += a.blocks.compiled;
+            insns += a.insn_count;
+        }
+    }
+    eprintln!("native edge values: {} programs, {compiled} regions compiled, {insns} instructions", 2 * seeds);
+    if riscv_rv32::jit::AVAILABLE && std::env::var_os("RV32_JIT").is_none() { assert!(compiled >= seeds, "the programs must exercise the JIT"); }
+}
