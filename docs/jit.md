@@ -50,7 +50,7 @@ host profiler samples, e.g. from `samply`); `SBC_JIT_DUMP=<pc>[,<pc>...]` writes
 instruction words of the blocks at those PCs to `jit-<pc>.guest`/`.host`;
 `SBC_JIT_WATCH=<page>` traces compiles and invalidations on one physical page.
 
-## On x86-64 Linux hosts
+## The A64 JIT on x86-64 Linux hosts
 
 `arm-a64/src/jit_x64.rs` translates A64 to x86-64 (x86 cannot run A64 instructions as
 themselves). It shares the driver in `jit.rs` (block map and front cache, hotness counters,
