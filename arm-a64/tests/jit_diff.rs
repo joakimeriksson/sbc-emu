@@ -432,6 +432,10 @@ fn misaligned_stlr_on_host_threads_goes_to_the_interpreter() {
     if !jit::available() { return; }
     // loop: stlr x1, [x19]; subs x20, x20, #1; b.ne -8 (the random test uses other registers)
     let code = [0xc89f_fe61u32, 0xf100_0694, 0x54ff_ffc1];
+    // the fallback profile is global: off again when the test ends, also on a panic
+    struct ProfileOff;
+    impl Drop for ProfileOff { fn drop(&mut self) { jit::PROFILE.store(false, std::sync::atomic::Ordering::Relaxed); } }
+    let _off = ProfileOff;
     jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed);
     for (off, slow) in [(0x43cu64, true), (0x440, false)] {
         let c = fixed(&code, &[(19, DATA + off), (20, 500), (1, 0x1122_3344_5566_7788)], true);
