@@ -146,7 +146,18 @@ fn insn(g: &mut G, k: usize, n: usize) -> u32 {
                 2 => (size << 30) | (0b001000 << 24) | (1 << 23) | (1 << 22) | (31 << 16) | (1 << 15) | (31 << 10) | (23 << 5) | rd,
                 3 => (size << 30) | (0b001000 << 24) | (1 << 23) | (31 << 16) | (1 << 15) | (31 << 10) | (23 << 5) | rd,
                 // a plain store into or next to the reserved granule
-                4 | 5 => (size << 30) | (0b111001 << 24) | (g.below(128 >> size) << 10) | (23 << 5) | rd,
+                4 => (size << 30) | (0b111001 << 24) | (g.below(128 >> size) << 10) | (23 << 5) | rd,
+                // a store pair (W, X or Q) ending in the reserved granule from below
+                5 => {
+                    // STP W, X or Q (opc 00, 10, 10 with V) at x23 - 1..3 elements
+                    let (head, rt, rt2) = match g.below(3) {
+                        0 => (0u32, rd, g.dz()),
+                        1 => (2 << 30, rd, g.dz()),
+                        _ => ((2 << 30) | (1 << 26), g.below(8), g.below(8)),
+                    };
+                    let imm7 = (-(1 + g.below(3) as i32)) as u32 & 0x7f;
+                    head | (0b101 << 27) | (2 << 23) | (imm7 << 15) | (rt2 << 10) | (23 << 5) | rt
+                }
                 _ => 0xd503_305f,
             }
         }
@@ -243,12 +254,14 @@ fn ldst_pair(g: &mut G) -> u32 {
         let (a, b) = if vec { (g.below(8), g.below(8)) } else { (g.dz(), g.dz()) };
         if load == 0 || a != b { break (a, b); }
     };
-    let (mode, rn) = match g.below(5) { 0 => (2, 19), 1 => (2, 31), 2 => (if g.bit() == 0 { 1 } else { 3 }, 22), 3 => (2, 24), _ => (0, 19) };
+    let (mode, rn) = match g.below(6) { 0 => (2, 19), 1 => (2, 31), 2 => (if g.bit() == 0 { 1 } else { 3 }, 22), 3 => (2, 24), 4 => (2, 23), _ => (0, 19) };
     let mode = if mode == 0 && opc == 1 && !vec { 2 } else { mode };
-    (opc << 30) | (0b101 << 27) | ((vec as u32) << 26) | (mode << 23) | (load << 22) | (g.below(128) << 15) | (rt2 << 10) | (rn << 5) | rt
+    // around x23 (the exclusives' address): a pair that may straddle the reserved granule
+    let imm7 = if rn == 23 { (g.below(8) as i32 - 4) as u32 & 0x7f } else { g.below(128) };
+    (opc << 30) | (0b101 << 27) | ((vec as u32) << 26) | (mode << 23) | (load << 22) | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
-struct Case { code: Vec<u32>, x: [u64; 31], nzcv: u32, v: [u128; 32], mem: Vec<u8>, mmu: bool }
+struct Case { code: Vec<u32>, x: [u64; 31], nzcv: u32, v: [u128; 32], mem: Vec<u8>, mmu: bool, mt: bool }
 
 /// MMU on (x25 is free): MAIR, TTBR0 = TABLES, TCR (4 KiB granule, 39-bit VA), SCTLR.M.
 const MMU_ON: [u32; 12] = [
@@ -303,7 +316,7 @@ fn case(seed: u64) -> Case {
     for r in v.iter_mut() { *r = (g.next() as u128) << 64 | g.next() as u128; }
     // DATA and ALIAS where the MMU is off, and where it maps them
     let mem: Vec<u8> = (0..(TABLES - DATA as usize) / 8).flat_map(|_| g.next().to_le_bytes()).collect();
-    Case { code, x, nzcv: (g.below(16)) << 28, v, mem, mmu }
+    Case { code, x, nzcv: (g.below(16)) << 28, v, mem, mmu, mt: false }
 }
 
 fn run(c: &Case, jit: bool) -> (Cpu, FlatRam, Trap) {
@@ -319,6 +332,7 @@ fn run(c: &Case, jit: bool) -> (Cpu, FlatRam, Trap) {
     cpu.brk_to_host = true;
     cpu.ram = ram.mem.as_mut_ptr();
     cpu.ram_len = RAM as u64;
+    cpu.mt = c.mt;
     if jit {
         cpu.jit = jit::Jit::with(1 << 20, 1);
         cpu.chain_until = arm_a64::UNBOUNDED;
@@ -342,6 +356,93 @@ fn run(c: &Case, jit: bool) -> (Cpu, FlatRam, Trap) {
     panic!("no brk");
 }
 
+/// What differs between the interpreter's run and the JIT's (None: nothing).
+fn differences(i: (&Cpu, &FlatRam, &Trap), j: (&Cpu, &FlatRam, &Trap)) -> Option<String> {
+    let ((i, iram, it), (j, jram, jt)) = (i, j);
+    let mut d = Vec::new();
+    if it != jt { d.push(format!("trap: interp {it:?} jit {jt:?}")); }
+    for r in 0..31 { if i.x[r] != j.x[r] { d.push(format!("x{r}: interp {:#x} jit {:#x}", i.x[r], j.x[r])); } }
+    if i.sp != j.sp { d.push(format!("sp: interp {:x?} jit {:x?}", i.sp, j.sp)); }
+    if i.pc != j.pc { d.push(format!("pc: interp {:#x} jit {:#x}", i.pc, j.pc)); }
+    if i.nzcv != j.nzcv { d.push(format!("nzcv: interp {:#x} jit {:#x}", i.nzcv, j.nzcv)); }
+    if i.instret != j.instret { d.push(format!("instret: interp {} jit {}", i.instret, j.instret)); }
+    if i.excl() != j.excl() { d.push(format!("exclusive monitor: interp {:x?} jit {:x?}", i.excl(), j.excl())); }
+    for r in 0..32 { if i.v[r] != j.v[r] { d.push(format!("v{r}: interp {:#x} jit {:#x}", i.v[r], j.v[r])); } }
+    if iram.mem != jram.mem {
+        let a = (0..RAM).find(|&a| iram.mem[a] != jram.mem[a]).unwrap();
+        d.push(format!("memory first differs at {a:#x}"));
+    }
+    (!d.is_empty()).then(|| d.join("; "))
+}
+
+/// A fixed sequence (then brk #0) from registers `x` (the rest zero), MMU off.
+fn fixed(code: &[u32], x: &[(usize, u64)], mt: bool) -> Case {
+    let mut c = case(0);
+    c.code = code.to_vec();
+    c.code.push(0xd420_0000);
+    c.x = [0; 31];
+    for &(r, v) in x { c.x[r] = v; }
+    (c.mmu, c.mt) = (false, mt);
+    c
+}
+
+fn fixed_differences(c: &Case) -> Option<String> {
+    let (i, iram, it) = run(c, false);
+    let (j, jram, jt) = run(c, true);
+    differences((&i, &iram, &it), (&j, &jram, &jt))
+}
+
+/// Stores next to a held reservation: a pair whose second store lands in the reserved
+/// granule clears it in the interpreter (two stores), so the store-exclusive after it fails.
+#[test]
+fn store_pairs_next_to_the_reserved_granule() {
+    if !jit::available() { return; }
+    let mut bad = Vec::new();
+    // ldxr x1, [x19]; stp x2, x3 / q2, q3 / w2, w3, [x20]; stxr w4, x1, [x19]
+    for (stp, name) in [(0xa900_0e82u32, "stp x"), (0xad00_0e82, "stp q"), (0x2900_0e82, "stp w"), (0xf900_0282, "str x"), (0x3d80_0282, "str q")] {
+        for mt in [false, true] {
+            for back in [4u64, 8, 12, 16, 24, 32, 64] {
+                let granule = DATA + 0x440;
+                let c = fixed(&[0xc85f_7e61, stp, 0xc804_7e61], &[(19, granule), (20, granule - back), (1, 0x55), (2, 0x66), (3, 0x77), (4, 9)], mt);
+                if let Some(d) = fixed_differences(&c) { bad.push(format!("{name} at granule - {back} (mt {mt}): {d}")); }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// SMOV encodings the interpreter takes although they are reserved (X from a doubleword, W
+/// from a word) stay with the interpreter.
+#[test]
+fn reserved_smov_matches_the_interpreter() {
+    if !jit::available() { return; }
+    for w in [0x0e04_2c25u32, 0x4e08_2c25, 0x0e08_2c25, 0x4e04_2c25, 0x0e01_2c25, 0x4e02_2c25] {
+        let mut c = fixed(&[w], &[], false);
+        c.v[1] = 0x8081_8283_8485_8687_f8f9_fafb_fcfd_feff;
+        assert_eq!(fixed_differences(&c), None, "{w:08x}");
+    }
+}
+
+/// With cores on host threads, a misaligned STLR is not a host XCHG (a split lock across
+/// cache lines): it goes to the interpreter, which stores plainly. Aligned ones stay native.
+/// x86-64 only: the AArch64 backend emits a host STLR there, which faults when misaligned.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn misaligned_stlr_on_host_threads_goes_to_the_interpreter() {
+    if !jit::available() { return; }
+    // loop: stlr x1, [x19]; subs x20, x20, #1; b.ne -8 (the random test uses other registers)
+    let code = [0xc89f_fe61u32, 0xf100_0694, 0x54ff_ffc1];
+    jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed);
+    for (off, slow) in [(0x43cu64, true), (0x440, false)] {
+        let c = fixed(&code, &[(19, DATA + off), (20, 500), (1, 0x1122_3344_5566_7788)], true);
+        let before = jit::profile_fallbacks().iter().find(|f| f.0 == code[0]).map_or(0, |f| f.1);
+        assert_eq!(fixed_differences(&c), None, "offset {off:#x}");
+        let n = jit::profile_fallbacks().iter().find(|f| f.0 == code[0]).map_or(0, |f| f.1) - before;
+        // the interpreter's own run is not counted (only compiled blocks' fallbacks are)
+        if slow { assert!(n >= 400, "misaligned STLR: {n} interpreter calls"); } else { assert!(n < 10, "aligned STLR: {n} interpreter calls"); }
+    }
+}
+
 #[test]
 fn random_sequences_match_the_interpreter() {
     if !jit::available() { return; }
@@ -355,22 +456,9 @@ fn random_sequences_match_the_interpreter() {
         assert_eq!(i.sctlr[1] & 1 != 0, c.mmu, "seed {seed}: the MMU");
         let (j, jram, jt) = run(&c, true);
         if let Some(s) = j.jit.as_ref() { compiled += s.compiled; linked += s.linked; insns += s.exec_insns; }
-        let mut d = Vec::new();
-        if it != jt { d.push(format!("trap: interp {it:?} jit {jt:?}")); }
-        for r in 0..31 { if i.x[r] != j.x[r] { d.push(format!("x{r}: interp {:#x} jit {:#x}", i.x[r], j.x[r])); } }
-        if i.sp != j.sp { d.push(format!("sp: interp {:x?} jit {:x?}", i.sp, j.sp)); }
-        if i.pc != j.pc { d.push(format!("pc: interp {:#x} jit {:#x}", i.pc, j.pc)); }
-        if i.nzcv != j.nzcv { d.push(format!("nzcv: interp {:#x} jit {:#x}", i.nzcv, j.nzcv)); }
-        if i.instret != j.instret { d.push(format!("instret: interp {} jit {}", i.instret, j.instret)); }
-        if i.excl() != j.excl() { d.push(format!("exclusive monitor: interp {:x?} jit {:x?}", i.excl(), j.excl())); }
-        for r in 0..32 { if i.v[r] != j.v[r] { d.push(format!("v{r}: interp {:#x} jit {:#x}", i.v[r], j.v[r])); } }
-        if iram.mem != jram.mem {
-            let a = (0..RAM).find(|&a| iram.mem[a] != jram.mem[a]).unwrap();
-            d.push(format!("memory first differs at {a:#x}"));
-        }
-        if !d.is_empty() {
+        if let Some(d) = differences((&i, &iram, &it), (&j, &jram, &jt)) {
             let words: Vec<String> = c.code.iter().map(|w| format!("{w:08x}")).collect();
-            bad.push(format!("seed {seed}: {}\n  code: {}", d.join("; "), words.join(" ")));
+            bad.push(format!("seed {seed}: {d}\n  code: {}", words.join(" ")));
         }
     }
     eprintln!("{compiled} blocks compiled, {linked} links, {insns} instructions in compiled blocks");

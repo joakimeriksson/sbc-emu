@@ -1356,8 +1356,9 @@ impl E<'_> {
             fail.push(self.a.jcc(NE));
         }
         self.probe(cpu.el, if load { 1 } else { 2 }, size, false, !load && o2, &mut slow, false);
-        if self.mt && !load && !o2 && sz > 0 {
-            // the host's locked accesses must not split (the interpreter stores plainly)
+        if self.mt && !load && sz > 0 {
+            // the host's locked accesses (LOCK CMPXCHG for STXR, XCHG for STLR) must not split
+            // across cache lines: misaligned ones go to the interpreter, which stores plainly
             self.a.test_imm(false, RDX, size as i32 - 1);
             slow.push(self.a.jcc(NE));
         }
@@ -1457,12 +1458,18 @@ impl E<'_> {
                 self.a.jmp_to(back);
             }
             if let Some((site, back)) = sp.granule {
-                // a reservation is held: a store to another granule leaves it alone
+                // a reservation is held: a store to another granule leaves it alone. Both the
+                // first and the last byte are checked: a pair is two stores in the interpreter,
+                // and either can clear the reservation (an access spans two granules at most)
                 self.a.bind(site);
-                self.a.load(true, RAX, m(CPU, self.o.excl_addr));
-                self.a.alu(Alu::Xor, true, RAX, RDX);
-                self.a.shift(Sh::Shr, true, RAX, 6);
-                sites.push(self.a.jcc(E));
+                let span = (sp.arg >> 8) as i32;
+                let bytes: &[i32] = if span > 1 { &[0, span - 1] } else { &[0] };
+                for &b in bytes {
+                    if b == 0 { self.a.mov(true, RAX, RDX); } else { self.a.lea(true, RAX, m(RDX, b)); }
+                    self.a.alu_load(Alu::Xor, true, RAX, m(CPU, self.o.excl_addr));
+                    self.a.shift(Sh::Shr, true, RAX, 6);
+                    sites.push(self.a.jcc(E));
+                }
                 self.a.jmp_to(back);
             }
             for s in &sites { self.a.bind(*s); }
@@ -1494,6 +1501,9 @@ fn simd_gp(i: u32) -> Option<(u32, u32, u32)> {
     let imm5 = bits(i, 20, 16);
     if imm5 & 0xf == 0 { return None; }
     let size = imm5.trailing_zeros();
+    // SMOV: bytes and halfwords to W or X, words only to X (the interpreter takes some
+    // reserved forms, which are left to it)
+    if kind == 2 && (size > 2 || (size == 2 && !bit(i, 30))) { return None; }
     Some((kind, size, imm5 >> (size + 1)))
 }
 
@@ -1998,7 +2008,12 @@ mod tests {
     /// another valid encoding).
     #[test]
     fn encodings_match_llvm_mc() {
-        let Some(mc) = llvm_mc() else { eprintln!("llvm-mc not found: encoder test skipped"); return; };
+        let Some(mc) = llvm_mc() else {
+            // CI must run it (GitHub's ubuntu-24.04 image has llvm-mc-18)
+            assert!(std::env::var_os("CI").is_none(), "llvm-mc not found (CI is set): the encoder test must run");
+            eprintln!("llvm-mc not found: encoder test skipped");
+            return;
+        };
         let regs = [RAX, RCX, RDX, RBX, RBP, RSI, RDI, R8, R12, R13, R15];
         let mems = [m(RBX, 0), m(RBX, 8), m(RBX, -128), m(RBX, 4096), m(RBP, 0), m(R13, 0), m(R12, 0), m(RSP, 16), m(R12, 300), mx(RBX, RCX, 0, 0x1000), mx(R13, RAX, 0, 8), mx(RBP, R12, 3, 0), mx(RAX, RAX, 1, 0), mx(R12, R9, 2, -8)];
         let alus = [(Alu::Add, "add"), (Alu::Or, "or"), (Alu::Adc, "adc"), (Alu::Sbb, "sbb"), (Alu::And, "and"), (Alu::Sub, "sub"), (Alu::Xor, "xor"), (Alu::Cmp, "cmp")];

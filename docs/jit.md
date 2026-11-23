@@ -70,6 +70,12 @@ flags stay in EFLAGS until code that would clobber them; then `lahf; seto al` sa
 and `add al, 0x7f; sahf` brings them back for a consumer. With a host thread per core, full
 DMB/DSB become MFENCE, STLR an XCHG and store-exclusive a LOCK CMPXCHG.
 
+Known gaps: FP/SIMD arithmetic beyond the operations above runs in the interpreter; only eight
+host registers cache guest registers; x86-64 macOS is not wired up. The interpreter stub leaves
+to the dispatcher by dropping its return address (`add rsp, 8` and a jump), which a CET user
+shadow stack would refuse on `ret`; Linux enables those only for binaries marked for them, and
+this one is not.
+
 Tests: `jit_x64.rs` checks its encoder against llvm-mc; `arm-a64/tests/jit_diff.rs` runs random
 instruction sequences (half with the MMU on and a scrambled mapping) on the JIT and the
 interpreter and compares registers, flags, V registers, memory and instruction counts; every
