@@ -58,6 +58,7 @@ impl Module {
         let idx = unsafe { sbc_jit_compile(self.bytes.as_ptr(), self.bytes.len()) };
         if idx < 0 {
             self.slot.store(NONE, Ordering::Relaxed);
+            self.epoch.store(epoch, Ordering::Relaxed);
             return None;
         }
         self.slot.store(idx as u32, Ordering::Relaxed);
@@ -67,7 +68,12 @@ impl Module {
 
     pub fn run(&self, b: u16, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], frame: &mut Frame, active: u32) -> bool {
         let mut slot = self.slot.load(Ordering::Relaxed);
-        if slot == NONE || self.epoch.load(Ordering::Relaxed) != resets() {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        if slot == NONE && epoch == resets() {
+            // (putting it back failed: not again before the table starts over)
+            return false;
+        }
+        if slot == NONE || epoch != resets() {
             match self.install() {
                 Some(s) => slot = s,
                 None => return false,

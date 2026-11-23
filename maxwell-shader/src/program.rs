@@ -117,7 +117,7 @@ impl Program {
         if !crate::jit::enabled() {
             return None;
         }
-        self.jit.get_or_init(|| crate::jit::Code::compile(self).map(std::sync::Arc::new)).as_deref()
+        self.jit.get_or_init(|| crate::jit::code_for(self)).as_deref()
     }
 
     /// Whether the program has an instruction that satisfies `f` (for example: one that stores,

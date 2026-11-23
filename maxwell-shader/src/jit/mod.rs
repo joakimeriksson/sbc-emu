@@ -26,6 +26,9 @@ pub const LANES: usize = 16;
 pub const SCRATCH: usize = 3 * LANES;
 /// Blocks shorter than this are left to the interpreter.
 const MIN_BLOCK: usize = 2;
+/// A block ends before its IR gets longer than this (ids are 16 bits; `forward` adds at most two
+/// nodes a write and one a register).
+const MAX_NODES: usize = 16384;
 
 /// An IR value: the index of the node that makes it.
 pub type Id = u16;
@@ -160,6 +163,8 @@ impl Node {
 pub struct Block {
     pub len: u32,
     pub ir: Vec<Node>,
+    /// The constant buffer words it reads (indices into `Code::cbs`).
+    pub cbs: Vec<u16>,
 }
 
 /// The compiled blocks of a program.
@@ -236,12 +241,16 @@ impl Code {
         while k < code.len() {
             let mut low = Lower { cbs: std::mem::take(&mut c.cbs), ..Lower::default() };
             let mut n = 0;
-            while k + n < code.len() && (n == 0 || !entry[k + n]) && lower(&mut low, &code[k + n]).is_some() {
+            while k + n < code.len() && (n == 0 || !entry[k + n]) && low.ir.len() < MAX_NODES && lower(&mut low, &code[k + n]).is_some() {
                 n += 1;
             }
             if n >= MIN_BLOCK && c.blocks.len() < u16::MAX as usize - 1 {
                 c.start[k] = c.blocks.len() as u16 + 1;
-                c.blocks.push(Block { len: n as u32, ir: forward(&low.ir) });
+                let ir = forward(&low.ir);
+                let mut cbs: Vec<u16> = ir.iter().filter_map(|n| if let Node::Cb(i) = n { Some(*i) } else { None }).collect();
+                cbs.sort_unstable();
+                cbs.dedup();
+                c.blocks.push(Block { len: n as u32, ir, cbs });
             }
             c.cbs = low.cbs;
             k += n.max(1);
@@ -267,20 +276,61 @@ impl Code {
     }
 
     /// Fills the frame's constant buffer words.
-    pub fn fill(&self, frame: &mut Frame, cbuf: impl Fn(u32, u32) -> u32) {
-        frame.cb.clear();
-        frame.cb.extend(self.cbs.iter().map(|&(i, o)| cbuf(i as u32, o)));
+    /// Fetches the constant buffer words block `b` reads into the frame (when the block is
+    /// entered, as the interpreter would read them).
+    pub fn fill(&self, b: u16, frame: &mut Frame, cbuf: impl Fn(u32, u32) -> u32) {
+        frame.cb.resize(self.cbs.len(), 0);
+        for &k in &self.blocks[b as usize].cbs {
+            let (i, o) = self.cbs[k as usize];
+            frame.cb[k as usize] = cbuf(i as u32, o);
+        }
     }
 
     /// Runs block `b` on the lanes. False if it cannot be run here (then nothing changed).
     pub fn run(&self, b: u16, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], frame: &mut Frame, active: u32) -> bool {
         #[cfg(target_arch = "wasm32")]
         if let Some(w) = &self.wasm {
-            return w.run(b, gpr, pred, frame, active);
+            let ran = w.run(b, gpr, pred, frame, active);
+            if ran {
+                RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return ran;
         }
         let _ = (b, gpr, pred, frame, active);
         false
     }
+}
+
+static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Blocks run by compiled code so far.
+pub fn runs() -> u64 {
+    RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Programs compiled, by their code: the GPU decodes its programs again after each submission
+/// (memory may have changed), and the same code must not be compiled (and given a table slot)
+/// again each time.
+type Key = (u32, Vec<(u32, u64)>);
+static CACHE: std::sync::Mutex<Option<std::collections::HashMap<Key, Option<std::sync::Arc<Code>>>>> = std::sync::Mutex::new(None);
+/// Programs kept; past that the cache starts again (the page frees the slots of what was
+/// dropped when the CPU's JIT next starts over).
+const CACHE_MAX: usize = 4096;
+
+/// The code of a program: from the cache, or compiled.
+pub fn code_for(p: &Program) -> Option<std::sync::Arc<Code>> {
+    let key = (p.entry, p.words.clone());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(Default::default);
+    if let Some(c) = map.get(&key) {
+        return c.clone();
+    }
+    if map.len() >= CACHE_MAX {
+        map.clear();
+    }
+    let c = Code::compile(p).map(std::sync::Arc::new);
+    map.insert(key, c.clone());
+    c
 }
 
 /// The IR of instructions, being built.
@@ -301,11 +351,8 @@ impl Lower {
         self.node(Node::Imm(v))
     }
     fn reg(&mut self, r: Reg) -> Id {
-        if r == RZ {
-            self.imm(0)
-        } else {
-            self.node(Node::Reg(r))
-        }
+        // (RZ too: the interpreter reads its register, which stays zero)
+        self.node(Node::Reg(r))
     }
     fn src(&mut self, s: Src) -> Id {
         match s {

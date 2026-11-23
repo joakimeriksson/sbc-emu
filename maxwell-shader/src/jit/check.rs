@@ -5,7 +5,7 @@ use crate::exec::{run, Exit, Lanes};
 use crate::host::Host;
 use std::collections::BTreeMap;
 
-struct Cb;
+pub struct Cb;
 
 impl Host<LANES> for Cb {
     fn cbuf(&self, index: u32, offset: u32) -> u32 {
@@ -87,6 +87,10 @@ fn random_inst(r: &mut Rng, tops: &[Vec<u64>]) -> u64 {
                 w = w & !(((1u64 << len) - 1) << pos) | v << pos;
             }
         }
+        // small immediates too (shift amounts below 32)
+        if r.next().is_multiple_of(4) {
+            w &= !(((1u64 << 14) - 1) << 25);
+        }
         let p = [0u64, 1, 2, 3, 7, 7, 7, 7][(r.next() % 8) as usize] | r.next().is_multiple_of(4) as u64 * 8;
         w = w & !(0xf << 16) | p << 16;
         let inst = crate::decode::decode(8, w);
@@ -96,13 +100,47 @@ fn random_inst(r: &mut Rng, tops: &[Vec<u64>]) -> u64 {
     }
 }
 
+/// A program of these instructions (then EXIT).
+pub fn program(ins: &[u64]) -> Program {
+    Program::decode(&assemble(ins)).unwrap()
+}
+
+/// An instruction the JIT leaves to the interpreter (POPC), to put between blocks.
+fn separator(r: &mut Rng) -> u64 {
+    loop {
+        let w = r.next() & !(0xf << 16) | 7 << 16;
+        let inst = crate::decode::decode(8, w);
+        if kind(&inst.op) == "PopC" && lower(&mut Lower::default(), &inst).is_none() {
+            return w;
+        }
+    }
+}
+
+/// Random registers and predicates.
+fn randomize(l: &mut Lanes<LANES>, r: &mut Rng) {
+    for k in 0..255 {
+        for i in 0..LANES {
+            l.gpr[k][i] = word(r.next());
+        }
+    }
+    for k in 0..7 {
+        l.pred[k] = r.next() as u32;
+    }
+}
+
 /// Runs `cases` random blocks both ways; the kinds of instruction tried, or what differed.
+/// Every fourth case is a program of several blocks run by `exec::run` with the JIT on and off
+/// (on where there is a backend).
 pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String> {
     let mut r = Rng(seed | 1);
     let tops = opcodes();
     let mut ops = BTreeMap::new();
     let was = ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     for case in 0..cases {
+        if case % 4 == 3 {
+            several(&mut r, &tops, case, was)?;
+            continue;
+        }
         let n = 2 + (r.next() % 8) as usize;
         let ins: Vec<u64> = (0..n).map(|_| random_inst(&mut r, &tops)).collect();
         let p = Program::decode(&assemble(&ins)).map_err(|e| format!("case {case}: {e}"))?;
@@ -116,18 +154,14 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
         let mut l = Lanes::<LANES>::new();
         let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & 0xffff | 1 } else { 0xffff };
         l.start(&p, lanes, 0);
-        for k in 0..255 {
-            for i in 0..LANES {
-                l.gpr[k][i] = word(r.next());
-            }
-        }
-        for k in 0..7 {
-            l.pred[k] = r.next() as u32;
-        }
+        randomize(&mut l, &mut r);
         let (mut gpr, mut pred) = (l.gpr.clone(), l.pred);
         let mut frame = Frame::default();
-        code.fill(&mut frame, |i, o| Host::<LANES>::cbuf(&Cb, i, o));
+        code.fill(0, &mut frame, |i, o| Host::<LANES>::cbuf(&Cb, i, o));
         if !code.run(0, &mut gpr, &mut pred, &mut frame, lanes) {
+            if cfg!(target_arch = "wasm32") {
+                return Err(format!("case {case}: the compiled code did not run"));
+            }
             eval(&code.blocks[0], &mut gpr, &mut pred, &frame.cb, lanes);
         }
         // the interpreter alone
@@ -150,4 +184,46 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
         }
     }
     Ok(ops)
+}
+
+/// A program of two to four blocks with POPC between them, run whole with the JIT and without.
+fn several(r: &mut Rng, tops: &[Vec<u64>], case: usize, was: bool) -> Result<(), String> {
+    let mut ins = Vec::new();
+    for k in 0..2 + r.next() % 3 {
+        if k > 0 {
+            ins.push(separator(r));
+        }
+        for _ in 0..2 + r.next() % 6 {
+            ins.push(random_inst(r, tops));
+        }
+    }
+    let p = Program::decode(&assemble(&ins)).map_err(|e| format!("case {case}: {e}"))?;
+    let mut a = Lanes::<LANES>::new();
+    let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & 0xffff | 1 } else { 0xffff };
+    a.start(&p, lanes, 0);
+    randomize(&mut a, r);
+    let mut b = a.clone();
+    let before = runs();
+    set_enabled(true);
+    let (mut f1, mut f2) = (1000, 1000);
+    let e1 = run(&p, &mut a, &mut Cb, &mut f1);
+    set_enabled(false);
+    let e2 = run(&p, &mut b, &mut Cb, &mut f2);
+    set_enabled(was);
+    if cfg!(target_arch = "wasm32") && runs() == before {
+        return Err(format!("case {case}: no compiled block ran"));
+    }
+    let text = || p.code.iter().map(|i| format!("{i:?}")).collect::<Vec<_>>().join("\n");
+    if (e1, f1) != (e2, f2) {
+        return Err(format!("case {case}: {e1:?} fuel {f1}, interpreter {e2:?} fuel {f2}\n{}", text()));
+    }
+    for k in 0..256 {
+        if a.gpr[k] != b.gpr[k] {
+            return Err(format!("case {case}: R{k} {:08x?}\n    interpreter {:08x?}\n{}", a.gpr[k], b.gpr[k], text()));
+        }
+    }
+    if a.pred.map(|p| p & 0xffff) != b.pred.map(|p| p & 0xffff) {
+        return Err(format!("case {case}: predicates {:08x?}\n    interpreter {:08x?}\n{}", a.pred, b.pred, text()));
+    }
+    Ok(())
 }

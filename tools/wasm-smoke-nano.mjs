@@ -7,8 +7,8 @@
 // SBC_GPU=FILE loads the GPU demos (scripts/jetson-nano-gpu-demo-fixture.sh's gpu-demo.cpio.xz) behind
 // the initramfs, unpacked as the page does, and instead runs the demos, stops one with Ctrl-C, and reports their frames per second
 // (SBC_SHOTS=DIR: and writes a picture of each).
-// SBC_STEP=S runs the demos a fixed step of S seconds per picture, each once (--step S), so that
-// the pictures are the same each run; SBC_SHADER_JIT=0 turns the GPU's shader JIT off.
+// SBC_STEP=S runs the demos a fixed step of S seconds per picture, each once (--step S, in demos
+// built since it was added), so that the pictures are the same each run; SBC_SHADER_JIT=0 turns the GPU's shader JIT off.
 // SBC_JIT=0 turns the JIT off, SBC_JIT_HOT=n sets the compile threshold, SBC_WASM picks another
 // build, SBC_RAM_MB the guest's RAM (1024, as the page), SBC_PROGRESS=1 reports every 10 s.
 import fs from 'node:fs';

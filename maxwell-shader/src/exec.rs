@@ -564,8 +564,6 @@ pub fn run<const N: usize, H: Host<N>>(
     let code = &p.code[..];
     let fault = |pc: u32| Exit::Fault(p.words.get(pc as usize).or(p.words.last()).map_or(0, |w| w.0));
     let jit = if N == crate::jit::LANES { p.jit() } else { None };
-    // the constant buffer words of the JIT's blocks are fetched when first needed
-    let mut filled = false;
     loop {
         if *fuel == 0 {
             return Exit::Timeout;
@@ -573,10 +571,7 @@ pub fn run<const N: usize, H: Host<N>>(
         if let Some(j) = jit {
             if let Some((b, len)) = j.block_at(l.pc) {
                 if l.active != 0 && *fuel >= len as u64 {
-                    if !filled {
-                        j.fill(&mut l.frame, |i, o| h.cbuf(i, o));
-                        filled = true;
-                    }
+                    j.fill(b, &mut l.frame, |i, o| h.cbuf(i, o));
                     let gpr = (&mut *l.gpr as &mut dyn std::any::Any).downcast_mut::<[[u32; crate::jit::LANES]; 256]>();
                     if let Some(gpr) = gpr {
                         if j.run(b, gpr, &mut l.pred, &mut l.frame, l.active) {
