@@ -1,6 +1,17 @@
 //! Mali-G610 control registers and host-modeled CSF management.
 //! MCU instructions remain unsupported; supported clear and scalar compute work runs synchronously.
 use crate::gpu_mmu::AddressSpace;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Work the GPU did since it was last charged, in picoseconds of a Mali-G610 MP4 at
+/// about 1 GHz: shader instructions at 64 threads per cycle, fragments at 16 pixels per
+/// cycle, and tile writeback at 20 GB/s. Jobs run synchronously in the doorbell write,
+/// so the submitting core's clock is moved on by this much: programs that measure
+/// frame times see a GPU that takes time.
+static WORK_PS: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn work(instructions: u64, pixels: u64, bytes: u64) {
+    WORK_PS.fetch_add(instructions * 16 + pixels * 63 + bytes * 50, Ordering::Relaxed);
+}
 #[derive(Default)]
 pub struct Gpu {
     raw: [u32; 3],
@@ -9,6 +20,8 @@ pub struct Gpu {
     ready: [u64; 3],
     regs: std::collections::BTreeMap<u64, u32>,
     pub spaces: [AddressSpace; 16],
+    /// Virtual time the work submitted by the last writes takes (ns).
+    cost_ns: u64,
 }
 impl Gpu {
     pub fn irq(&self, line: usize) -> bool {
@@ -72,8 +85,15 @@ impl Gpu {
             }
         }
         if (0x80000..=0x170000).contains(&off) && off%0x10000==0 {
+            WORK_PS.store(0, Ordering::Relaxed);
             match self.firmware.queues(&self.spaces,ram){Ok(bits)=>self.raw[0]|=bits,Err(e)=>eprintln!("[mali] firmware queue error {:?}",e)}
+            let ps=WORK_PS.swap(0, Ordering::Relaxed);
+            if ps>0 { self.cost_ns+=ps/1000+1000; }
         }
+    }
+    /// Take the virtual time of the GPU work done by the last writes (ns).
+    pub fn take_cost(&mut self) -> u64 {
+        std::mem::take(&mut self.cost_ns)
     }
     pub fn write(&mut self, off: u64, v: u32) {
         for (i, base) in [0x1000, 0x2000, 0x20].into_iter().enumerate() {
@@ -142,7 +162,7 @@ impl Gpu {
         }
     }
 }
-emu_core::snap_struct!(Gpu { raw, firmware, mask, ready, regs, spaces });
+emu_core::snap_struct!(Gpu { raw, firmware, mask, ready, regs, spaces } skip { cost_ns });
 
 #[cfg(test)]
 mod tests {

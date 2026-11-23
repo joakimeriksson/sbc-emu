@@ -229,7 +229,7 @@ impl Shader {
             OUTPUT_BASE + offset
         } else {
             self.resources
-                .buffer_address(env.m, env.ram, table, index, element, None)
+                .buffer_address(env.m, &env.ram, table, index, element, None)
                 .map_err(memory)?
         };
         self.regs[r] = address as u32;
@@ -368,8 +368,7 @@ impl Shader {
             }
             self.scratch[off..off + bytes].copy_from_slice(&data);
         } else {
-            env.write(address, &data)
-                .map_err(|f| Some(super::Error::Memory(f)))?;
+            env.write(address, &data).map_err(Some)?;
         }
         Ok(Next::Continue)
     }
@@ -408,10 +407,17 @@ impl Shader {
         {
             return Err(None);
         }
-        let (values, float) = self
-            .resources
-            .attribute_any(env.m, env.ram, table, index, vertex, instance)
-            .map_err(memory)?;
+        let key = (self.resources.0, table, index);
+        let attr = match env.attributes.get(&key) {
+            Some(a) => *a,
+            None => {
+                let a = self.resources.attribute_desc(env.m, &env.ram, table, index).map_err(memory)?;
+                env.attributes.insert(key, a);
+                a
+            }
+        };
+        let (m, ram, tlb) = (env.m, &*env.ram, &mut *env.tlb);
+        let (values, float) = attr.fetch(|a, out| tlb.read(m, ram, a, out), vertex, instance).map_err(memory)?;
         let r = self.staging(i, count).ok_or(None)?;
         write_values(
             self,
@@ -455,7 +461,7 @@ impl Shader {
         let bytes: usize = [1, 2, 3, 4, 6, 8, 12, 16][size as usize];
         let (base, len) = self
             .resources
-            .buffer(env.m, env.ram, handle >> 24, handle & 0xff_ffff)
+            .buffer(env.m, &env.ram, handle >> 24, handle & 0xff_ffff)
             .map_err(memory)?;
         let mut data = [0u8; 16];
         // Out of the buffer (or past the top of the address space): zeros.
@@ -479,7 +485,7 @@ impl Shader {
         let handle = o.raw(1)?;
         let (base, _) = self
             .resources
-            .buffer(env.m, env.ram, handle >> 24, handle & 0xff_ffff)
+            .buffer(env.m, &env.ram, handle >> 24, handle & 0xff_ffff)
             .map_err(memory)?;
         let r = self.staging(i, 2).ok_or(None)?;
         let a = base.wrapping_add(offset);

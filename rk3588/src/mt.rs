@@ -157,7 +157,7 @@ impl Shared {
 }
 
 /// The bus a core thread sees: RAM directly, devices under the lock.
-struct MtBus<'a> { sh: &'a Shared, k: usize, ram: *mut u8, ram_len: u64 }
+struct MtBus<'a> { sh: &'a Shared, k: usize, ram: *mut u8, ram_len: u64, gpu_ns: u64 }
 
 impl MtBus<'_> {
     #[inline]
@@ -171,6 +171,7 @@ impl MtBus<'_> {
         let soc = unsafe { self.sh.soc() };
         soc.gic.cur = self.k;
         let r = f(soc);
+        self.gpu_ns += soc.gpu.take_cost();
         if soc.dirty { soc.device_lines(); soc.dirty = false; self.sh.publish(soc); }
         r
     }
@@ -309,7 +310,7 @@ impl Drop for Leave<'_> {
 fn run_core(sh: &Shared, k: usize) {
     // SAFETY: core k's own thread during the run phase
     let cpu = unsafe { sh.cpu(k) };
-    let mut bus = MtBus { sh, k, ram: cpu.ram, ram_len: cpu.ram_len };
+    let mut bus = MtBus { sh, k, ram: cpu.ram, ram_len: cpu.ram_len, gpu_ns: 0 };
     let mut last_lv = None;
     let mut next_sync = 0;
     let mut storm = 0u32;
@@ -332,6 +333,8 @@ fn run_core(sh: &Shared, k: usize) {
         // a kick that came in before this point is answered at the top of the next round
         if sh.has_inval[k].load(SeqCst) { continue; }
         let r = cpu.step(&mut bus);
+        // GPU work runs inside the doorbell write: this core waited for it.
+        if bus.gpu_ns > 0 { cpu.sys.time_base_ns += std::mem::take(&mut bus.gpu_ns); }
         if let Some(op) = cpu.tlbi_bcast.take() { sh.broadcast(k, true, op, cpu); }
         if let Some(op) = cpu.ic_bcast.take() { sh.broadcast(k, false, op, cpu); }
         match r {

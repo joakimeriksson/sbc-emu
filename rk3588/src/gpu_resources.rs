@@ -39,6 +39,70 @@ fn word(b: &[u8], n: usize) -> u32 {
 fn pair(b: &[u8], n: usize) -> u64 {
     word(b, n) as u64 | ((word(b, n + 1) as u64) << 32)
 }
+/// A decoded vertex attribute: its Attribute and Buffer descriptors.
+#[derive(Clone, Copy)]
+pub struct Attr {
+    a: [u8; 32],
+    b: [u8; 32],
+}
+impl Attr {
+    /// Fetch one element through `read`, converting it to four components.
+    pub fn fetch(
+        &self,
+        mut read: impl FnMut(u64, &mut [u8]) -> Result<(), Fault>,
+        vertex: u32,
+        instance: u32,
+    ) -> Result<([u32; 4], bool), Error> {
+        let (a, b) = (&self.a, &self.b);
+        let kind = (word(a, 0) >> 4) & 15;
+        let frequency = (word(a, 1) >> 6) & 3;
+        let element = match (kind, frequency) {
+            (1, 0) => vertex,
+            (1, _) => instance,
+            (2, _) => instance >> ((word(a, 1) >> 24) & 31),
+            _ => {
+                // NPOT divisor: ((instance + e) * magic) >> 32 >> shift (Mesa
+                // panfrost_compute_magic_divisor).
+                let shift = (word(a, 1) >> 24) & 31;
+                let e = (word(a, 1) >> 29) & 1;
+                let magic = word(a, 5) as u64;
+                ((((instance as u64 + e as u64) * magic) >> 32) >> shift) as u32
+            }
+        };
+        let pixel = word(a, 0) >> 10;
+        let format = (pixel >> 12) & 255;
+        let (bytes, count, float) = crate::gpu_texture::attribute_format(format).unwrap();
+        let map = crate::gpu_texture::order(pixel & 255).unwrap();
+        let offset = element as i128 * word(a, 4) as i128 + (word(a, 2) as i32) as i128;
+        let one = if float { 1f32.to_bits() } else { 1 };
+        let mut raw = [0u32; 4];
+        if offset >= 0 && offset + bytes as i128 <= word(b, 1) as i128 {
+            let address = pair(b, 2)
+                .checked_add(offset as u64)
+                .ok_or(Error::Memory(Fault::AddressSize))?;
+            let mut data = [0; 16];
+            read(address, &mut data[..bytes]).map_err(Error::Memory)?;
+            raw = crate::gpu_texture::decode_texel(format, &data);
+        }
+        let mut out = [0, 0, 0, one];
+        for (n, o) in out.iter_mut().enumerate() {
+            *o = match map[n] {
+                4 => 0,
+                5 => one,
+                k if (k as usize) < count => raw[k as usize],
+                _ => {
+                    if n == 3 {
+                        one
+                    } else {
+                        0
+                    }
+                }
+            };
+        }
+        Ok((out, float))
+    }
+}
+
 impl Resources {
     pub(crate) fn descriptor(
         &self,
@@ -138,68 +202,26 @@ impl Resources {
         vertex: u32,
         instance: u32,
     ) -> Result<([u32; 4], bool), Error> {
+        self.attribute_desc(m, ram, table, index)?
+            .fetch(|a, out| m.read(ram, a, out, true), vertex, instance)
+    }
+    /// Decode an attribute descriptor and its buffer descriptor.
+    pub fn attribute_desc(&self, m: &AddressSpace, ram: &[u8], table: u32, index: u32) -> Result<Attr, Error> {
         if table >= 12 {
             return Err(Error::Unsupported);
         }
         let a = self.descriptor(m, ram, table, index)?;
-        if word(&a, 0) & 15 != 5 {
+        if word(&a, 0) & 15 != 5 || !matches!((word(&a, 0) >> 4) & 15, 1..=3) {
             return Err(Error::Unsupported);
         }
-        let kind = (word(&a, 0) >> 4) & 15;
-        let frequency = (word(&a, 1) >> 6) & 3;
-        let element = match (kind, frequency) {
-            (1, 0) => vertex,
-            (1, 1) => instance,
-            (2, _) => instance >> ((word(&a, 1) >> 24) & 31),
-            (3, _) => {
-                // NPOT divisor: ((instance + e) * magic) >> 32 >> shift (Mesa
-                // panfrost_compute_magic_divisor).
-                let shift = (word(&a, 1) >> 24) & 31;
-                let e = (word(&a, 1) >> 29) & 1;
-                let magic = word(&a, 5) as u64;
-                ((((instance as u64 + e as u64) * magic) >> 32) >> shift) as u32
-            }
-            _ => return Err(Error::Unsupported),
-        };
         let pixel = word(&a, 0) >> 10;
-        let format = (pixel >> 12) & 255;
-        let order = pixel & 255;
-        let (bytes, count, float) =
-            crate::gpu_texture::attribute_format(format).ok_or(Error::Unsupported)?;
-        let map = crate::gpu_texture::order(order).ok_or(Error::Unsupported)?;
+        crate::gpu_texture::attribute_format((pixel >> 12) & 255).ok_or(Error::Unsupported)?;
+        crate::gpu_texture::order(pixel & 255).ok_or(Error::Unsupported)?;
         let b = self.descriptor(m, ram, word(&a, 1) & 63, word(&a, 3))?;
         if word(&b, 0) & 15 != 9 {
             return Err(Error::Unsupported);
         }
-        let offset = element as i128 * word(&a, 4) as i128 + (word(&a, 2) as i32) as i128;
-        let one = if float { 1f32.to_bits() } else { 1 };
-        let mut raw = [0u32; 4];
-        if offset >= 0 && offset + bytes as i128 <= word(&b, 1) as i128 {
-            let address = pair(&b, 2)
-                .checked_add(offset as u64)
-                .ok_or(Error::Memory(Fault::AddressSize))?;
-            let mut data = [0; 16];
-            m.read(ram, address, &mut data[..bytes], true)
-                .map_err(Error::Memory)?;
-            raw = crate::gpu_texture::decode_texel(format, &data);
-        }
-        let packed = count == 4 && bytes <= 4 && !matches!(format, 187 | 123 | 155 | 219);
-        let mut out = [0, 0, 0, one];
-        for (n, o) in out.iter_mut().enumerate() {
-            *o = match map[n] {
-                4 => 0,
-                5 => one,
-                k if (k as usize) < count || packed => raw[k as usize],
-                _ => {
-                    if n == 3 {
-                        one
-                    } else {
-                        0
-                    }
-                }
-            };
-        }
-        Ok((out, float))
+        Ok(Attr { a, b })
     }
     /// Load a complete attribute, including default missing components. Buffer
     /// bounds are checked before translating data; an out-of-range fetch returns

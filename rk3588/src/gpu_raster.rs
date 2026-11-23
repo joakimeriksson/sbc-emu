@@ -12,7 +12,7 @@ use crate::{
     gpu_mmu::AddressSpace,
     gpu_render::{Fb, TileBuffer},
     gpu_resources::Resources,
-    gpu_shader::{run_quad, Code, Env, Fragment, Interpolation, RegisterAllocation, Shader, Tlb},
+    gpu_shader::{run_quad, Code, Env, Fragment, Interpolation, Ram, RegisterAllocation, Shader, Tlb},
     gpu_tiler::{Draw, Frame, LINES, POINTS},
 };
 fn word(b: &[u8], n: usize) -> u32 {
@@ -86,7 +86,6 @@ struct State {
     rt_mask: u32,
     may_discard: bool,
     shader: Option<(u64, RegisterAllocation, u32, Vec<u32>, Resources, bool)>,
-    occlusion: Option<(u64, u32)>,
     point_size: f32,
 }
 
@@ -102,7 +101,6 @@ struct Inputs {
     scissor: [u32; 4],
     z_range: [f32; 2],
     z_cull: [bool; 2],
-    occlusion: u64,
     point_size: f32,
 }
 impl Inputs {
@@ -126,7 +124,6 @@ impl Inputs {
             scissor: [r[42] & 0xffff, r[42] >> 16, r[43] & 0xffff, r[43] >> 16],
             z_range: [f32::from_bits(r[44]), f32::from_bits(r[45])],
             z_cull: [r[56] & (1 << 16) != 0, r[56] & (1 << 17) != 0],
-            occlusion: reg(r, 46),
             point_size: f32::from_bits(r[60]),
         }
     }
@@ -145,13 +142,19 @@ impl Inputs {
             scissor: [tb.x0, tb.y0, tb.x0 + tb.w - 1, tb.y0 + tb.h - 1],
             z_range: [f32::from_bits(d[6]), f32::from_bits(d[7])],
             z_cull: [false; 2],
-            occlusion: pair(14),
             point_size: 1.,
         }
     }
 }
 
 impl State {
+    /// The draw's occlusion query: address and mode.
+    fn occlusion(draw: &Draw) -> Option<(u64, u32)> {
+        match (draw.regs[57] >> 14) & 3 {
+            0 => None,
+            mode => Some((reg(&draw.regs, 46), mode)),
+        }
+    }
     fn decode(m: &AddressSpace, ram: &[u8], r: &Inputs) -> Result<State, Stop> {
         let f0 = r.f0;
         let f1 = r.f1;
@@ -238,10 +241,6 @@ impl State {
         } else {
             None
         };
-        let occlusion = match (f0 >> 14) & 3 {
-            0 => None,
-            mode => Some((r.occlusion, mode)),
-        };
         Ok(State {
             front_ccw: f0 & (1 << 16) != 0,
             cull: [f0 & (1 << 17) != 0, f0 & (1 << 18) != 0],
@@ -254,7 +253,6 @@ impl State {
             rt_mask: (f1 >> 16) & 0xff,
             may_discard: f0 & (1 << 20) != 0,
             shader,
-            occlusion,
             point_size: r.point_size,
         })
     }
@@ -356,6 +354,8 @@ struct Raster<'a, 'b> {
     tb: &'b mut TileBuffer,
     budget: u64,
     occlusion: u64,
+    /// The fragment threads of the current quad, reused across quads.
+    lanes: Option<Box<[Shader; 4]>>,
 }
 
 pub fn draw(
@@ -365,36 +365,99 @@ pub fn draw(
     tb: &mut TileBuffer,
     frame: &Frame,
 ) -> Result<(), Stop> {
+    let (workers, min_rows) = BANDS.with(|b| b.get()).unwrap_or((workers(), 16));
+    let occlusion = match draw_parallel(m, ram, fb, tb, frame, workers, min_rows) {
+        Some(result) => result?,
+        None => render(m, Ram::Rw(ram), fb, tb, frame)?,
+    };
+    for (draw, count) in frame.draws.iter().zip(occlusion) {
+        let Some((address, mode)) = State::occlusion(draw) else { continue };
+        let mut b = [0u8; 8];
+        m.read(ram, address, &mut b, true).map_err(Stop::Memory)?;
+        let v = u64::from_le_bytes(b);
+        let v = if mode == 3 { v.wrapping_add(count) } else { (v != 0 || count != 0) as u64 };
+        m.write(ram, address, &v.to_le_bytes(), true).map_err(Stop::Memory)?;
+    }
+    Ok(())
+}
+
+/// Rasterize every draw of a frame into `tb`. Returns each draw's occlusion count.
+fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &Frame) -> Result<Vec<u64>, Stop> {
     let mut code = Code::default();
     let mut tlb = Tlb::default();
     let mut textures = crate::gpu_texture::Cache::default();
+    let mut occlusion = Vec::with_capacity(frame.draws.len());
     for draw in &frame.draws {
-        let st = State::decode(m, ram, &Inputs::from_draw(draw))?;
+        let st = State::decode(m, &ram, &Inputs::from_draw(draw))?;
         let uniforms: &[u32] = st.shader.as_ref().map_or(&[], |s| &s.3);
-        let env = Env::new(m, ram, uniforms, &mut code, &mut tlb, &mut textures);
-        let mut r = Raster {
-            env,
-            fb,
-            tb,
-            budget: FRAME_BUDGET,
-            occlusion: 0,
+        let view = match &mut ram {
+            Ram::Rw(r) => Ram::Rw(r),
+            Ram::Ro(r) => Ram::Ro(r),
         };
+        let env = Env::with_ram(m, view, uniforms, &mut code, &mut tlb, &mut textures);
+        let mut r = Raster { env, fb, tb, budget: FRAME_BUDGET, occlusion: 0, lanes: None };
         r.draw(draw, &st)?;
-        let occlusion = r.occlusion;
-        if let Some((address, mode)) = st.occlusion {
-            let mut b = [0u8; 8];
-            m.read(ram, address, &mut b, true).map_err(Stop::Memory)?;
-            let v = u64::from_le_bytes(b);
-            let v = if mode == 3 {
-                v.wrapping_add(occlusion)
-            } else {
-                (v != 0 || occlusion != 0) as u64
-            };
-            m.write(ram, address, &v.to_le_bytes(), true)
-                .map_err(Stop::Memory)?;
+        occlusion.push(r.occlusion);
+    }
+    Ok(occlusion)
+}
+
+/// Fragment workers: bands of rows rendered at once, each into its own copy of the
+/// tile buffer with read-only guest memory. A shader that stores to memory makes the
+/// whole job run serially instead (`None`); a fault leaves `tb` unchanged.
+fn draw_parallel(
+    m: &AddressSpace,
+    ram: &[u8],
+    fb: &Fb,
+    tb: &mut TileBuffer,
+    frame: &Frame,
+    workers: usize,
+    min_rows: u32,
+) -> Option<Result<Vec<u64>, Stop>> {
+    if workers < 2 || tb.h < 2 * min_rows || frame.draws.is_empty() {
+        return None;
+    }
+    let rows = tb.h.div_ceil(workers as u32).max(min_rows);
+    let mut bands: Vec<TileBuffer> = (0..tb.h).step_by(rows as usize).map(|y| tb.band(y, rows.min(tb.h - y))).collect();
+    let results: Vec<Result<Vec<u64>, Stop>> = std::thread::scope(|s| {
+        let handles: Vec<_> = bands
+            .iter_mut()
+            .map(|band| s.spawn(move || render(m, Ram::Ro(ram), fb, band, frame)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(Err(bad()))).collect()
+    });
+    let mut total = vec![0u64; frame.draws.len()];
+    for r in &results {
+        match r {
+            Err(Stop::Shader(crate::gpu_shader::Error::Serial)) => return None,
+            Err(e) => return Some(Err(*e)),
+            Ok(counts) => {
+                for (t, c) in total.iter_mut().zip(counts) {
+                    *t += c;
+                }
+            }
         }
     }
-    Ok(())
+    for band in &bands {
+        tb.merge(band);
+    }
+    Some(Ok(total))
+}
+
+thread_local! {
+    /// Tests: force (workers, minimum rows per band).
+    pub(crate) static BANDS: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fragment worker threads (`SBC_MALI_THREADS`, default 4; one in the browser).
+fn workers() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        return 1;
+    }
+    std::env::var("SBC_MALI_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(4))
 }
 
 /// Run a pre- or post-frame shader (Mesa's preload/resolve): its Draw descriptor's
@@ -425,6 +488,7 @@ pub fn frame_shader(
         tb,
         budget: FRAME_BUDGET,
         occlusion: 0,
+        lanes: None,
     };
     let pixel = |_x: u32, _y: u32| Pixel {
         covered: true,
@@ -814,30 +878,48 @@ impl Raster<'_, '_> {
             }
             return Ok(());
         };
-        let mut lanes: [Shader; 4] = std::array::from_fn(|k| {
+        // The quad's threads are reused from quad to quad: only their per-pixel state
+        // changes (building them anew dominated small shaders).
+        let lanes = self.lanes.get_or_insert_with(|| {
+            Box::new(std::array::from_fn(|_| {
+                let mut s = Shader::with_allocation(*binary, *allocation);
+                s.fragment = Some(Fragment::default());
+                s
+            }))
+        });
+        for (k, s) in lanes.iter_mut().enumerate() {
             let p = px[k];
             let (x, y) = (qx + (k as u32 & 1), qy + (k as u32 >> 1));
-            let mut s = Shader::with_allocation(*binary, *allocation);
+            s.restart(*binary, *allocation);
             s.resources = *resources;
-            let mut f = Fragment {
-                blend: st.blend_words,
-                active: p.passed,
-                frag_z: p.z,
-                frag_w: p.w,
-                point: p.point,
-                lane: k as u32,
-                ..Fragment::default()
-            };
+            let f = s.fragment.get_or_insert_with(Fragment::default);
+            f.blend = st.blend_words;
+            f.active = p.passed;
+            f.frag_z = p.z;
+            f.frag_w = p.w;
+            f.point = p.point;
+            f.lane = k as u32;
+            f.color = [None; 8];
+            f.raw = [None; 8];
+            f.depth = None;
+            f.stencil = None;
             f.sample_positions = self.fb.sample_positions;
-            s.fragment = Some(f);
-            if let Some((stride, data)) = varyings {
-                s.interpolation = Some(Interpolation {
-                    data: data.clone(),
-                    stride: *stride,
-                    vertices,
-                    weights: p.weights,
-                    provoking,
-                });
+            match (varyings, s.interpolation.as_mut()) {
+                (Some((stride, data)), Some(i)) if std::sync::Arc::ptr_eq(&i.data, data) && i.stride == *stride => {
+                    i.vertices = vertices;
+                    i.weights = p.weights;
+                    i.provoking = provoking;
+                }
+                (Some((stride, data)), _) => {
+                    s.interpolation = Some(Interpolation {
+                        data: data.clone(),
+                        stride: *stride,
+                        vertices,
+                        weights: p.weights,
+                        provoking,
+                    })
+                }
+                (None, _) => s.interpolation = None,
             }
             // r58 front facing (0), r59 pixel, r60 coverage, r61 sample mask, r62-63 frame argument
             let values = [
@@ -857,11 +939,12 @@ impl Raster<'_, '_> {
             if !p.passed && !helpers {
                 s.done = true;
             }
-            s
-        });
+        }
+        let mut lanes = self.lanes.take().unwrap();
         let budget = (self.budget.min(THREAD_BUDGET as u64 * 4)) as usize;
         run_quad(&mut lanes, &mut self.env, budget).map_err(Stop::Shader)?;
         let spent: u64 = lanes.iter().map(|l| l.instructions).sum();
+        crate::gpu::work(spent, px.iter().filter(|p| p.passed).count() as u64, 0);
         self.budget = self.budget.checked_sub(spent).ok_or_else(bad)?;
         for (k, lane) in lanes.iter().enumerate() {
             let p = px[k];
@@ -894,6 +977,7 @@ impl Raster<'_, '_> {
                 self.tb.touched = true;
             }
         }
+        self.lanes = Some(lanes);
         Ok(())
     }
 }

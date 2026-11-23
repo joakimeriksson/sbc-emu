@@ -288,8 +288,8 @@ impl Texture {
                 Ok(table)
             }
         };
-        let td = resources.descriptor(env.m, env.ram, fold(t.0)?, t.1)?;
-        let sd = resources.descriptor(env.m, env.ram, fold(s.0)?, s.1)?;
+        let td = resources.descriptor(env.m, &env.ram, fold(t.0)?, t.1)?;
+        let sd = resources.descriptor(env.m, &env.ram, fold(s.0)?, s.1)?;
         if word(&td, 0) & 15 != 2 || word(&sd, 0) & 15 != 1 {
             return Err(Error::Unsupported);
         }
@@ -1010,7 +1010,9 @@ mod tests {
         );
         // Trilinear blends the two levels.
         let ctl = word(&env.ram[0x2000..], 0) | (3 << 30);
-        set(env.ram, 0x2000, ctl);
+        if let crate::gpu_shader::Ram::Rw(ram) = &mut env.ram {
+            set(ram, 0x2000, ctl);
+        }
         env.textures.map.clear();
         r.lod = Lod::Explicit(0.5);
         assert_eq!(

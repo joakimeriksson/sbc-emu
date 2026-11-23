@@ -18,6 +18,8 @@ pub enum Error {
     Memory(Fault),
     Unsupported { pc: u64, instruction: u64 },
     Budget,
+    /// A memory store in a stage running in parallel: the job must run serially.
+    Serial,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum RegisterAllocation {
@@ -187,13 +189,21 @@ impl Interpolation {
 /// executes a job, so each 4 KiB page is translated and copied once.
 #[derive(Default)]
 pub struct Code {
-    pages: HashMap<u64, Box<[u64; 512]>>,
+    pages: HashMap<u64, usize>,
+    words: Vec<Box<[u64; 512]>>,
+    /// The most recently used page (page number + 1, index).
+    last: (u64, usize),
 }
 impl Code {
+    #[inline]
     pub fn fetch(&mut self, m: &AddressSpace, ram: &[u8], pc: u64) -> Result<u64, Fault> {
         let page = pc >> 12;
-        if let Some(p) = self.pages.get(&page) {
-            return Ok(p[((pc >> 3) & 511) as usize]);
+        if self.last.0 == page + 1 {
+            return Ok(self.words[self.last.1][((pc >> 3) & 511) as usize]);
+        }
+        if let Some(&n) = self.pages.get(&page) {
+            self.last = (page + 1, n);
+            return Ok(self.words[n][((pc >> 3) & 511) as usize]);
         }
         let mut bytes = vec![0u8; 4096];
         if m.read(ram, page << 12, &mut bytes, true).is_err() {
@@ -207,7 +217,9 @@ impl Code {
             *w = u64::from_le_bytes(bytes[n * 8..n * 8 + 8].try_into().unwrap());
         }
         let insn = words[((pc >> 3) & 511) as usize];
-        self.pages.insert(page, words);
+        self.pages.insert(page, self.words.len());
+        self.last = (page + 1, self.words.len());
+        self.words.push(words);
         Ok(insn)
     }
 }
@@ -217,6 +229,8 @@ impl Code {
 pub struct Tlb {
     read: HashMap<u64, usize>,
     write: HashMap<u64, usize>,
+    /// The most recent read translation (page number + 1, physical page).
+    last: (u64, usize),
 }
 impl Tlb {
     fn page(
@@ -227,12 +241,18 @@ impl Tlb {
         access: Access,
     ) -> Result<usize, Fault> {
         let vpn = va >> 12;
+        if access == Access::Read && self.last.0 == vpn + 1 {
+            return Ok(self.last.1);
+        }
         let map = if access == Access::Write {
             &mut self.write
         } else {
             &mut self.read
         };
         if let Some(&pa) = map.get(&vpn) {
+            if access == Access::Read {
+                self.last = (vpn + 1, pa);
+            }
             return Ok(pa);
         }
         let pa = usize::try_from(m.translate(ram, vpn << 12, access, true)?)
@@ -241,6 +261,9 @@ impl Tlb {
             map.clear();
         }
         map.insert(vpn, pa);
+        if access == Access::Read {
+            self.last = (vpn + 1, pa);
+        }
         Ok(pa)
     }
     pub fn read(
@@ -291,9 +314,25 @@ impl Tlb {
 }
 
 /// What a running thread can reach besides its registers.
+/// Guest RAM as a shader stage sees it: writable, or shared read-only by parallel
+/// fragment workers (whose memory stores then ask for a serial rerun).
+pub enum Ram<'a> {
+    Rw(&'a mut [u8]),
+    Ro(&'a [u8]),
+}
+impl std::ops::Deref for Ram<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Ram::Rw(r) => r,
+            Ram::Ro(r) => r,
+        }
+    }
+}
+
 pub struct Env<'a> {
     pub m: &'a AddressSpace,
-    pub ram: &'a mut [u8],
+    pub ram: Ram<'a>,
     pub uniforms: &'a [u32],
     pub code: &'a mut Code,
     pub tlb: &'a mut Tlb,
@@ -303,11 +342,33 @@ pub struct Env<'a> {
     pub output_unit: (u32, u32),
     /// Texture and sampler descriptors decoded during this job.
     pub textures: &'a mut crate::gpu_texture::Cache,
+    /// Vertex attribute descriptors decoded during this stage.
+    pub attributes: HashMap<(u64, u32, u32), crate::gpu_resources::Attr>,
 }
 impl<'a> Env<'a> {
     pub fn new(
         m: &'a AddressSpace,
         ram: &'a mut [u8],
+        uniforms: &'a [u32],
+        code: &'a mut Code,
+        tlb: &'a mut Tlb,
+        textures: &'a mut crate::gpu_texture::Cache,
+    ) -> Self {
+        Env {
+            m,
+            ram: Ram::Rw(ram),
+            uniforms,
+            code,
+            tlb,
+            output: None,
+            output_unit: (0, 1),
+            textures,
+            attributes: HashMap::new(),
+        }
+    }
+    pub fn with_ram(
+        m: &'a AddressSpace,
+        ram: Ram<'a>,
         uniforms: &'a [u32],
         code: &'a mut Code,
         tlb: &'a mut Tlb,
@@ -322,13 +383,18 @@ impl<'a> Env<'a> {
             output: None,
             output_unit: (0, 1),
             textures,
+            attributes: HashMap::new(),
         }
     }
     pub fn read(&mut self, va: u64, out: &mut [u8]) -> Result<(), Fault> {
-        self.tlb.read(self.m, self.ram, va, out)
+        self.tlb.read(self.m, &self.ram, va, out)
     }
-    pub fn write(&mut self, va: u64, data: &[u8]) -> Result<(), Fault> {
-        self.tlb.write(self.m, self.ram, va, data)
+    /// Write guest memory; `Error::Serial` when the RAM is shared read-only.
+    pub fn write(&mut self, va: u64, data: &[u8]) -> Result<(), Error> {
+        match &mut self.ram {
+            Ram::Rw(ram) => self.tlb.write(self.m, ram, va, data).map_err(Error::Memory),
+            Ram::Ro(_) => Err(Error::Serial),
+        }
     }
 }
 
@@ -635,6 +701,18 @@ impl Shader {
             },
         }
     }
+    /// Start the thread again at `pc` with the given register allocation, keeping
+    /// register contents (as hardware does not clear them either).
+    pub fn restart(&mut self, pc: u64, allocation: RegisterAllocation) {
+        self.pc = pc;
+        self.instructions = 0;
+        self.done = false;
+        self.scratch.clear();
+        self.register_mask = match allocation {
+            RegisterAllocation::Registers32 => 0xffff_0000_0000_ffff,
+            RegisterAllocation::Registers64 => u64::MAX,
+        };
+    }
     fn registers_available(&self, first: usize, count: usize) -> bool {
         count != 0
             && first < 64
@@ -774,7 +852,7 @@ impl Shader {
             }
             let i = env
                 .code
-                .fetch(env.m, env.ram, self.pc)
+                .fetch(env.m, &env.ram, self.pc)
                 .map_err(Error::Memory)?;
             self.step(env, i, None)?;
         }
@@ -1703,7 +1781,7 @@ pub fn run_quad(lanes: &mut [Shader; 4], env: &mut Env, budget: usize) -> Result
         if spent >= budget {
             return Err(Error::Budget);
         }
-        let i = env.code.fetch(env.m, env.ram, pc).map_err(Error::Memory)?;
+        let i = env.code.fetch(env.m, &env.ram, pc).map_err(Error::Memory)?;
         let active: [bool; 4] = std::array::from_fn(|n| !lanes[n].done && lanes[n].pc == pc);
         let cross = msg::needs_quad(i);
         let mut view = cross.then(|| QuadView {

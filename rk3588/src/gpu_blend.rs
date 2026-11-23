@@ -119,6 +119,10 @@ impl Blend {
         if self.alpha_to_one {
             source[3] = 1.;
         }
+        // Replace (A = Src, B = Src, C = 0) with all channels written: the source.
+        if self.mask == 15 && self.rgb.0 == 0x122 && self.alpha.0 == 0x122 {
+            return source;
+        }
         std::array::from_fn(|n| {
             if self.mask & (1 << n) == 0 {
                 dest[n]

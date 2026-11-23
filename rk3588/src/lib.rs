@@ -461,6 +461,9 @@ impl Machine {
             let i0=cpu.instret;
             cpu.chain_until=i0.saturating_add(self.round_end-t).min(self.next_check).min(i0+(end-*total));
             let r=cpu.step(&mut self.soc);
+            // GPU work runs inside the doorbell write: the core waited for it.
+            let gpu_ns=self.soc.gpu.take_cost();
+            if gpu_ns>0 { self.cpus[k].sys.time_base_ns+=gpu_ns; }
             *total+=self.cpus[k].instret-i0;
             if watches { if let Some((a,kind))=self.cpus[k].watch_hit.take() { if r.is_ok() {return Some(Stop::Watchpoint(k,a,kind));} } }
             if let Some(op)=self.cpus[k].tlbi_bcast.take() {

@@ -94,6 +94,31 @@ impl TileBuffer {
     pub fn index(&self, x: u32, y: u32) -> usize {
         ((y - self.y0) * self.w + (x - self.x0)) as usize
     }
+    /// A copy of `rows` rows starting `first` rows down, for a fragment worker.
+    pub fn band(&self, first: u32, rows: u32) -> TileBuffer {
+        let (a, b) = ((first * self.w) as usize, ((first + rows) * self.w) as usize);
+        TileBuffer {
+            x0: self.x0,
+            y0: self.y0 + first,
+            w: self.w,
+            h: rows,
+            color: self.color.iter().map(|c| c[a..b].to_vec()).collect(),
+            depth: self.depth[a..b].to_vec(),
+            stencil: self.stencil[a..b].to_vec(),
+            touched: false,
+        }
+    }
+    /// Copy a worker's band back.
+    pub fn merge(&mut self, band: &TileBuffer) {
+        let a = ((band.y0 - self.y0) * self.w) as usize;
+        let n = (band.h * band.w) as usize;
+        for (c, b) in self.color.iter_mut().zip(&band.color) {
+            c[a..a + n].copy_from_slice(b);
+        }
+        self.depth[a..a + n].copy_from_slice(&band.depth);
+        self.stencil[a..a + n].copy_from_slice(&band.stencil);
+        self.touched |= band.touched;
+    }
 }
 
 /// Decoded framebuffer descriptor.
@@ -156,6 +181,17 @@ impl Target {
     }
     /// Pack one pixel in the writeback format.
     fn pack(&self, c: [f32; 4], out: &mut [u8; 4]) -> usize {
+        if matches!(self.format, 19 | 22) && !self.srgb {
+            // RGBA8 (the common case): one byte per swizzled channel.
+            for k in 0..4 {
+                out[k] = match self.swizzle[k] {
+                    4 => 0,
+                    5 => 255,
+                    s => (c[s as usize].clamp(0., 1.) * 255.).round_ties_even() as u8,
+                };
+            }
+            return 4;
+        }
         let mut c = c;
         if self.srgb {
             for v in c.iter_mut().take(3) {
@@ -437,6 +473,9 @@ pub fn fragment_frame(
         crate::gpu_raster::frame_shader(m, ram, &fb, &mut tb, dcds + 256)?;
     }
     // Writeback.
+    let written = destinations.iter().map(|(n, _)| fb.targets[*n].write.unwrap().bpp).sum::<u64>()
+        + zs.map_or(0, |(_, s)| s.bpp);
+    crate::gpu::work(0, 0, written * w as u64 * h as u64);
     for (n, rows) in &destinations {
         let t = &fb.targets[*n];
         let s = t.write.unwrap();
@@ -549,6 +588,27 @@ fn store(
     mut f: impl FnMut(usize, &mut [u8]),
 ) {
     let bpp = s.bpp as usize;
+    if !s.tiled {
+        // Linear rows: gather, update and scatter each row through its spans.
+        let mut row = vec![0u8; w as usize * bpp];
+        for (r, spans) in rows.iter().enumerate() {
+            let mut off = 0;
+            for &(p, len) in spans {
+                row[off..off + len].copy_from_slice(&ram[p..p + len]);
+                off += len;
+            }
+            let base = r * w as usize;
+            for (x, px) in row.chunks_exact_mut(bpp).enumerate() {
+                f(base + x, px);
+            }
+            let mut off = 0;
+            for &(p, len) in spans {
+                ram[p..p + len].copy_from_slice(&row[off..off + len]);
+                off += len;
+            }
+        }
+        return;
+    }
     for y in y0..y0 + h {
         for x in x0..x0 + w {
             let (row, off) = if s.tiled {

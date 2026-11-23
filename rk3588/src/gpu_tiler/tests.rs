@@ -624,3 +624,24 @@ fn strips_fans_lines_and_restart_assemble_with_provoking_vertices() {
     assert_eq!(d.primitives.len(), 2);
     assert_eq!(d.positions.len(), 3);
 }
+#[test]
+fn parallel_fragment_bands_match_the_serial_result() {
+    let render = |bands: Option<(usize, u32)>| {
+        let (m, mut ram, mut r) = fixture();
+        let f = coloured(&mut ram, &mut r);
+        put(&mut ram, 0x5400, &[7, 0, 0, 0, (1 << 29) | (1 << 27)]);
+        r[52] = 0x5400;
+        let mut t = Tiler::default();
+        let half = |v: f32| crate::gpu_shader::f32_to_f16(v) as u32;
+        draw(&mut t, &m, &mut ram, &mut r, 0.75, [half(1.), half(1.) << 16], 0x7100);
+        draw(&mut t, &m, &mut ram, &mut r, 0.25, [half(0.) | half(1.) << 16, half(1.) << 16], 0x7108);
+        crate::gpu_raster::BANDS.with(|b| b.set(bands));
+        t.fragment(&m, &mut ram, &f, (0, 0)).unwrap();
+        crate::gpu_raster::BANDS.with(|b| b.set(None));
+        ram[0xe000..0xe400].to_vec()
+    };
+    let serial = render(Some((1, 16)));
+    assert_eq!(render(Some((4, 4))), serial);
+    assert_eq!(render(Some((3, 2))), serial);
+    assert!(serial.chunks(4).any(|p| p == [0, 255, 0, 255]));
+}
