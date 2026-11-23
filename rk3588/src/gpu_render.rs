@@ -391,7 +391,8 @@ pub fn fragment_frame(
                 bpp,
                 afbc: (block >= 12).then(|| crate::gpu_afbc::Layout {
                     header: pair(&rt, 8),
-                    stride: word(&rt, 10),
+                    // v9+: header bytes per superblock row (8 rows when tiled).
+                    stride: word(&rt, 10) / (16 * if block == 13 { 8 } else { 1 }),
                     tiled: block == 13,
                     bpp: bpp as usize,
                     body_offset: word(&rt, 11) as u64,
@@ -447,7 +448,7 @@ pub fn fragment_frame(
                 bpp,
                 afbc: (block >= 12).then(|| crate::gpu_afbc::Layout {
                     header: pair(&ext, 8),
-                    stride: word(&ext, 10),
+                    stride: word(&ext, 10) / (16 * if block == 13 { 8 } else { 1 }),
                     tiled: block == 13,
                     bpp: bpp as usize,
                     body_offset: word(&ext, 11) as u64,
@@ -606,8 +607,13 @@ fn rows(
         for sy in y0 / 16..=(y0 + h - 1) / 16 {
             for sx in x0 / 16..=(x0 + w - 1) / 16 {
                 let (ha, _, ba, body) = l.encode(sx, sy, &vec![0u8; 256 * l.bpp]);
-                m.chunks(ram, ha, 16, access, true).map_err(Stop::Memory)?;
-                m.chunks(ram, ba, body.len(), access, true).map_err(Stop::Memory)?;
+                let check = m.chunks(ram, ha, 16, access, true).and_then(|_| m.chunks(ram, ba, body.len(), access, true));
+                if let Err(f) = check {
+                    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                        eprintln!("[mali] AFBC {l:x?} superblock {sx},{sy} header {ha:#x} body {ba:#x}: {f:?}");
+                    }
+                    return Err(Stop::Memory(f));
+                }
             }
         }
         return Ok(out);

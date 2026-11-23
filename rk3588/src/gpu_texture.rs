@@ -411,7 +411,12 @@ impl Texture {
             let mut read = |a: u64, out: &mut [u8]| env.read(a, out);
             return match l.read_pixel(&mut read, x as u32, y as u32, &mut b[..bpp as usize]) {
                 Ok(()) => Ok(Some(decode(self.format, &b))),
-                Err(crate::gpu_afbc::Error::Memory(f)) => Err(Error::Memory(f)),
+                Err(crate::gpu_afbc::Error::Memory(f)) => {
+                    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+                        eprintln!("[mali] AFBC texture {l:x?} texel {x},{y}: {f:?}");
+                    }
+                    Err(Error::Memory(f))
+                }
                 Err(crate::gpu_afbc::Error::Compressed) => Err(Error::Unsupported),
             };
         }

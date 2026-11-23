@@ -173,7 +173,7 @@ fn afbc_render_target_round_trips_through_its_headers() {
     put(&mut r, 132, 1 | (19 << 3) | (12 << 8) | (0x688 << 16));
     put(&mut r, 160, 0x8000); // header
     put(&mut r, 164, 0);
-    put(&mut r, 168, 2); // superblocks per row
+    put(&mut r, 168, 32); // header bytes per superblock row
     put(&mut r, 172, 0x400); // body offset
     regs[43] = 31 | (15 << 16);
     fragment(&m, &mut r, &regs).unwrap();
