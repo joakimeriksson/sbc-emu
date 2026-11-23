@@ -72,6 +72,7 @@ impl Fragment {
     }
 }
 
+#[inline]
 fn half(value: u16) -> f32 {
     let sign = ((value as u32) & 0x8000) << 16;
     let exp = ((value >> 10) & 31) as u32;
@@ -82,6 +83,7 @@ fn half(value: u16) -> f32 {
     f32::from_bits(sign | (if exp == 31 { 255 } else { exp + 112 }) << 23 | mant << 13)
 }
 /// IEEE binary32 to binary16, round to nearest with ties to even.
+#[inline]
 fn pack_half(value: f32) -> u16 {
     let b = value.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
@@ -420,6 +422,7 @@ const LUT: [u32; 32] = [
     0x2e660000, 0x34000000, 0x38000000, 0x3c000000, 0x40000000, 0x44000000, 0x48000000, 0x42480000,
 ];
 
+#[inline]
 fn bits(i: u64, start: u32, count: u32) -> u32 {
     ((i >> start) & ((1u64 << count) - 1)) as u32
 }
@@ -452,6 +455,7 @@ fn icmp<T: PartialOrd>(cond: u32, x: T, y: T) -> Option<bool> {
 }
 /// Result clamps (ISA.xml Clamp): NaN goes to the lower bound, and -0 to +0 for
 /// clamp_0_inf and clamp_0_1 (`f32::max`/`min` return the operand that is not NaN).
+#[inline]
 fn clamp(mode: u32, v: f32) -> f32 {
     match mode {
         1 => v.max(0.) + 0.,
@@ -516,6 +520,7 @@ fn widen32(v: u32, field: u32, signed: bool) -> Option<u32> {
 fn pack2(lo: u32, hi: u32) -> u32 {
     (lo & 0xffff) | (hi << 16)
 }
+#[inline]
 fn f2h(v: [f32; 2]) -> u32 {
     pack_half(v[0]) as u32 | (pack_half(v[1]) as u32) << 16
 }
@@ -555,9 +560,11 @@ struct Ops<'s> {
 }
 type R<T> = Result<T, Option<Error>>;
 impl Ops<'_> {
+    #[inline]
     fn raw(&self, n: usize) -> R<u32> {
         self.s.source(self.i, n, self.uniforms).ok_or(None)
     }
+    #[inline]
     fn absneg(&self, n: usize, mut v: f32) -> f32 {
         let shift = 38 - 2 * n as u32;
         if self.i & (1 << (shift + 1)) != 0 {
@@ -569,6 +576,7 @@ impl Ops<'_> {
         v
     }
     /// 32-bit float source with the half-widening swizzle (Widen enum) and abs/neg.
+    #[inline]
     fn f32(&self, n: usize) -> R<f32> {
         let b = self.raw(n)?;
         let v = match bits(self.i, 28 - 2 * n as u32, 2) {
@@ -583,6 +591,7 @@ impl Ops<'_> {
     fn f32_plain(&self, n: usize) -> R<f32> {
         Ok(self.absneg(n, f32::from_bits(self.raw(n)?)))
     }
+    #[inline]
     fn swizzle16(&self, n: usize) -> R<[u16; 2]> {
         let b = self.raw(n)?;
         let h = [b as u16, (b >> 16) as u16];
@@ -594,6 +603,7 @@ impl Ops<'_> {
         })
     }
     /// Two 16-bit floats with a 16-bit swizzle (h00 h10 h01 h11) and abs/neg.
+    #[inline]
     fn v2f16(&self, n: usize) -> R<[f32; 2]> {
         Ok(self.swizzle16(n)?.map(|h| self.absneg(n, half(h))))
     }
@@ -713,6 +723,7 @@ impl Shader {
             RegisterAllocation::Registers64 => u64::MAX,
         };
     }
+    #[inline]
     fn registers_available(&self, first: usize, count: usize) -> bool {
         count != 0
             && first < 64
@@ -721,6 +732,7 @@ impl Shader {
     }
     /// The 32-bit value of source byte `index`: a register, a uniform, an immediate
     /// from the lookup table or a special FAU value (page in bits 57-58).
+    #[inline]
     fn source(&self, i: u64, index: usize, uniforms: &[u32]) -> Option<u32> {
         let s = ((i >> (index * 8)) & 255) as usize;
         let page = ((i >> 57) & 3) as usize;

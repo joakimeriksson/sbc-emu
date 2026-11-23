@@ -91,35 +91,80 @@ pub struct TileBuffer {
     pub stencil: Vec<u8>,
     /// Pixels a draw wrote, per render target.
     pub touched: bool,
+    /// A fragment worker's share: the rows y with (y / STRIPE) % parts == part, stored
+    /// compacted from row `base` on (parts 1: every row).
+    part: u32,
+    parts: u32,
+    base: u32,
 }
+/// Rows per stripe of a fragment worker (a multiple of the 2x2 quad).
+const STRIPE: u32 = 16;
 impl TileBuffer {
-    pub fn index(&self, x: u32, y: u32) -> usize {
-        ((y - self.y0) * self.w + (x - self.x0)) as usize
-    }
-    /// A copy of `rows` rows starting `first` rows down, for a fragment worker.
-    pub fn band(&self, first: u32, rows: u32) -> TileBuffer {
-        let (a, b) = ((first * self.w) as usize, ((first + rows) * self.w) as usize);
+    pub fn new(x0: u32, y0: u32, w: u32, h: u32) -> Self {
         TileBuffer {
-            x0: self.x0,
-            y0: self.y0 + first,
-            w: self.w,
-            h: rows,
-            color: self.color.iter().map(|c| c[a..b].to_vec()).collect(),
-            depth: self.depth[a..b].to_vec(),
-            stencil: self.stencil[a..b].to_vec(),
+            x0,
+            y0,
+            w,
+            h,
+            color: Vec::new(),
+            depth: Vec::new(),
+            stencil: Vec::new(),
             touched: false,
+            part: 0,
+            parts: 1,
+            base: 0,
         }
     }
-    /// Copy a worker's band back.
-    pub fn merge(&mut self, band: &TileBuffer) {
-        let a = ((band.y0 - self.y0) * self.w) as usize;
-        let n = (band.h * band.w) as usize;
-        for (c, b) in self.color.iter_mut().zip(&band.color) {
-            c[a..a + n].copy_from_slice(b);
+    fn row(&self, y: u32) -> u32 {
+        if self.parts <= 1 {
+            y - self.y0
+        } else {
+            (y / STRIPE / self.parts) * STRIPE + y % STRIPE - self.base
         }
-        self.depth[a..a + n].copy_from_slice(&band.depth);
-        self.stencil[a..a + n].copy_from_slice(&band.stencil);
-        self.touched |= band.touched;
+    }
+    pub fn index(&self, x: u32, y: u32) -> usize {
+        (self.row(y) * self.w + (x - self.x0)) as usize
+    }
+    /// Whether this (worker's) tile buffer holds row `y`.
+    pub fn owns(&self, y: u32) -> bool {
+        self.parts <= 1 || (y / STRIPE) % self.parts == self.part
+    }
+    /// Worker `part` of `parts`: a copy of its interleaved stripes of rows, so that
+    /// workers share geometry that covers part of the screen evenly.
+    pub fn stripes(&self, part: u32, parts: u32) -> TileBuffer {
+        let mut t = TileBuffer::new(self.x0, self.y0, self.w, self.h);
+        (t.part, t.parts) = (part, parts);
+        let owned: Vec<u32> = (self.y0..self.y0 + self.h).filter(|&y| t.owns(y)).collect();
+        if let Some(&first) = owned.first() {
+            t.base = (first / STRIPE / parts) * STRIPE + first % STRIPE;
+        }
+        let w = self.w as usize;
+        for (k, c) in self.color.iter().enumerate() {
+            t.color.push(Vec::with_capacity(owned.len() * w));
+            for &y in &owned {
+                let a = self.index(self.x0, y);
+                t.color[k].extend_from_slice(&c[a..a + w]);
+            }
+        }
+        for &y in &owned {
+            let a = self.index(self.x0, y);
+            t.depth.extend_from_slice(&self.depth[a..a + w]);
+            t.stencil.extend_from_slice(&self.stencil[a..a + w]);
+        }
+        t
+    }
+    /// Copy a worker's stripes back.
+    pub fn merge(&mut self, part: &TileBuffer) {
+        let w = self.w as usize;
+        for y in (self.y0..self.y0 + self.h).filter(|&y| part.owns(y)) {
+            let (a, b) = (self.index(self.x0, y), part.index(self.x0, y));
+            for (c, p) in self.color.iter_mut().zip(&part.color) {
+                c[a..a + w].copy_from_slice(&p[b..b + w]);
+            }
+            self.depth[a..a + w].copy_from_slice(&part.depth[b..b + w]);
+            self.stencil[a..a + w].copy_from_slice(&part.stencil[b..b + w]);
+        }
+        self.touched |= part.touched;
     }
 }
 
@@ -463,16 +508,9 @@ pub fn fragment_frame(
     }
     // The tile buffer: clear or preload.
     let count = (w * h) as usize;
-    let mut tb = TileBuffer {
-        x0,
-        y0,
-        w,
-        h,
-        color: Vec::with_capacity(fb.targets.len()),
-        depth: vec![f32::from_bits(word(&f, 13)); count],
-        stencil: vec![word(&f, 12) as u8; count],
-        touched: false,
-    };
+    let mut tb = TileBuffer::new(x0, y0, w, h);
+    tb.depth = vec![f32::from_bits(word(&f, 13)); count];
+    tb.stencil = vec![word(&f, 12) as u8; count];
     for t in fb.targets.iter() {
         tb.color.push(vec![t.clear; count]);
     }

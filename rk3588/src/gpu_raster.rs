@@ -417,8 +417,7 @@ fn draw_parallel(
     if workers < 2 || tb.h < 2 * min_rows || frame.draws.is_empty() {
         return None;
     }
-    let rows = tb.h.div_ceil(workers as u32).max(min_rows);
-    let mut bands: Vec<TileBuffer> = (0..tb.h).step_by(rows as usize).map(|y| tb.band(y, rows.min(tb.h - y))).collect();
+    let mut bands: Vec<TileBuffer> = (0..workers as u32).map(|k| tb.stripes(k, workers as u32)).collect();
     let results: Vec<Result<Vec<u64>, Stop>> = std::thread::scope(|s| {
         let handles: Vec<_> = bands
             .iter_mut()
@@ -449,7 +448,8 @@ thread_local! {
     pub(crate) static BANDS: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
 }
 
-/// Fragment worker threads (`SBC_MALI_THREADS`, default 4; one in the browser).
+/// Fragment worker threads (`SBC_MALI_THREADS`, default half the host's cores, at most
+/// eight; one in the browser).
 fn workers() -> usize {
     if cfg!(target_arch = "wasm32") {
         return 1;
@@ -457,7 +457,7 @@ fn workers() -> usize {
     std::env::var("SBC_MALI_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(4))
+        .unwrap_or_else(|| (std::thread::available_parallelism().map_or(1, |n| n.get()) / 2).clamp(1, 8))
 }
 
 /// Run a pre- or post-frame shader (Mesa's preload/resolve): its Draw descriptor's
@@ -750,6 +750,10 @@ impl Raster<'_, '_> {
         let late = st.may_discard || st.zs.is_some_and(|z| z.depth_from_shader);
         let mut qy = y0 & !1;
         while qy <= y1 {
+            if !self.tb.owns(qy) {
+                qy += 2;
+                continue;
+            }
             let mut qx = x0 & !1;
             while qx <= x1 {
                 let mut px = [Pixel::default(); 4];
