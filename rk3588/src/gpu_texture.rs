@@ -59,6 +59,8 @@ struct Plane {
     width: u32,
     height: u32,
     tiled: bool,
+    /// AFBC planes: header layout (`pointer` is the headers).
+    afbc: Option<crate::gpu_afbc::Layout>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -320,8 +322,24 @@ impl Texture {
             env.read(at, &mut p).map_err(Error::Memory)?;
             let kind = (word(&p, 0) >> 4) & 15;
             let ordering = (word(&p, 0) >> 8) & 15;
-            if word(&p, 0) & 15 != 10 || kind != 1 || !matches!(ordering, 1 | 2) {
-                return Err(Error::Unsupported); // AFBC, AFRC, ASTC and YUV planes
+            let afbc = if kind == 6 {
+                // 16x16 superblocks, no split blocks; tiled headers are 8x8 groups.
+                if (word(&p, 0) >> 8) & 7 != 0 || word(&p, 0) & (1 << 17) != 0 {
+                    return Err(Error::Unsupported);
+                }
+                let tiled = word(&p, 0) & (1 << 19) != 0;
+                Some(crate::gpu_afbc::Layout {
+                    header: pair(&p, 2),
+                    stride: word(&p, 4) / (16 * if tiled { 8 } else { 1 }),
+                    tiled,
+                    bpp: format_info(format).unwrap().0,
+                    body_offset: 0,
+                })
+            } else {
+                None
+            };
+            if word(&p, 0) & 15 != 10 || !(kind == 1 && matches!(ordering, 1 | 2) || afbc.is_some()) {
+                return Err(Error::Unsupported); // AFRC, ASTC and YUV planes
             }
             planes.push(Plane {
                 pointer: pair(&p, 2),
@@ -331,6 +349,7 @@ impl Texture {
                 width: (word(&p, 7) & 0xffff) + 1,
                 height: (word(&p, 7) >> 16) + 1,
                 tiled: ordering == 1,
+                afbc,
             });
         }
         let c = word(&sd, 0);
@@ -387,6 +406,15 @@ impl Texture {
             return Ok(None);
         }
         let bpp = format_info(self.format).unwrap().0 as u64;
+        if let Some(l) = p.afbc {
+            let mut b = [0u8; 16];
+            let mut read = |a: u64, out: &mut [u8]| env.read(a, out);
+            return match l.read_pixel(&mut read, x as u32, y as u32, &mut b[..bpp as usize]) {
+                Ok(()) => Ok(Some(decode(self.format, &b))),
+                Err(crate::gpu_afbc::Error::Memory(f)) => Err(Error::Memory(f)),
+                Err(crate::gpu_afbc::Error::Compressed) => Err(Error::Unsupported),
+            };
+        }
         let (x, y) = (x as u64, y as u64);
         const DUP: [u64; 16] = [
             0, 3, 12, 15, 48, 51, 60, 63, 192, 195, 204, 207, 240, 243, 252, 255,

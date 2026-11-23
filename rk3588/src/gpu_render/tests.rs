@@ -160,3 +160,39 @@ fn pre_frame_shader_loads_the_tile_buffer_before_draws() {
         }
     }
 }
+#[test]
+fn afbc_render_target_round_trips_through_its_headers() {
+    // A 32x16 clear into an AFBC target (block format 12): two superblocks, headers at
+    // 0x8000, payloads 0x400 after them; a partial clear keeps the other pixels.
+    let (m, mut r, mut regs) = fixture();
+    r.resize(0x10000, 0);
+    let put = |r: &mut Vec<u8>, at: usize, v: u32| r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut r, 32, 31 | (15 << 16)); // 32x16
+    put(&mut r, 36, 0);
+    put(&mut r, 40, 31 | (15 << 16));
+    put(&mut r, 132, 1 | (19 << 3) | (12 << 8) | (0x688 << 16));
+    put(&mut r, 160, 0x8000); // header
+    put(&mut r, 164, 0);
+    put(&mut r, 168, 2); // superblocks per row
+    put(&mut r, 172, 0x400); // body offset
+    regs[43] = 31 | (15 << 16);
+    fragment(&m, &mut r, &regs).unwrap();
+    let l = crate::gpu_afbc::Layout { header: 0x8000, stride: 2, tiled: false, bpp: 4, body_offset: 0x400 };
+    let mut read = |a: u64, out: &mut [u8]| m.read(&r, a, out, true);
+    let block = l.read_superblock(&mut read, 1, 0).unwrap();
+    assert!(block.chunks(4).all(|p| p == [0x11, 0x22, 0x33, 0xff]));
+    // Clear only x 20..23 to another colour: the rest of superblock 1 is kept.
+    put(&mut r, 36, 20);
+    put(&mut r, 40, 23 | (15 << 16));
+    for k in 0..4 {
+        put(&mut r, 176 + 4 * k, 0xff000000);
+    }
+    fragment(&m, &mut r, &regs).unwrap();
+    let mut read = |a: u64, out: &mut [u8]| m.read(&r, a, out, true);
+    let block = l.read_superblock(&mut read, 1, 0).unwrap();
+    for (n, p) in block.chunks(4).enumerate() {
+        let x = 16 + n % 16;
+        let expected: [u8; 4] = if (20..=23).contains(&x) { [0, 0, 0, 0xff] } else { [0x11, 0x22, 0x33, 0xff] };
+        assert_eq!(p, expected);
+    }
+}

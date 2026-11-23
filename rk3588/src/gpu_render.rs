@@ -48,6 +48,8 @@ pub struct Surface {
     pub row_stride: u64,
     pub tiled: bool,
     pub bpp: u64,
+    /// AFBC surfaces (16x16 superblocks, sparse payloads).
+    pub afbc: Option<crate::gpu_afbc::Layout>,
 }
 impl Surface {
     pub fn offset(&self, x: u32, y: u32) -> u64 {
@@ -333,16 +335,24 @@ pub fn fragment_frame(
         let format = (w1 >> 3) & 31;
         let write = if write_enable {
             let bpp = writeback_bytes(format).ok_or_else(unsupported)?;
-            if !matches!(block, 1 | 2) {
-                return Err(unsupported()); // AFBC writeback
+            // AFBC: no split or wide (32x8) blocks.
+            if !matches!(block, 1 | 2 | 12 | 13) || block >= 12 && word(&rt, 2) & 6 != 0 {
+                return Err(unsupported());
             }
             let s = Surface {
                 base: pair(&rt, 8),
                 row_stride: word(&rt, 10) as u64,
                 tiled: block == 1,
                 bpp,
+                afbc: (block >= 12).then(|| crate::gpu_afbc::Layout {
+                    header: pair(&rt, 8),
+                    stride: word(&rt, 10),
+                    tiled: block == 13,
+                    bpp: bpp as usize,
+                    body_offset: word(&rt, 11) as u64,
+                }),
             };
-            if !s.tiled && s.row_stride < width as u64 * bpp {
+            if !s.tiled && s.afbc.is_none() && s.row_stride < width as u64 * bpp {
                 return Err(Stop::InvalidStream);
             }
             writes.push(n);
@@ -380,7 +390,7 @@ pub fn fragment_frame(
             2 | 4 | 5 | 14 => 4,
             _ => return Err(unsupported()),
         };
-        if !matches!(block, 1 | 2) || (word(&ext, 0) >> 8) & 3 > 1 {
+        if !matches!(block, 1 | 2 | 12 | 13) || (word(&ext, 0) >> 8) & 3 > 1 {
             return Err(unsupported());
         }
         Some((
@@ -390,6 +400,13 @@ pub fn fragment_frame(
                 row_stride: word(&ext, 10) as u64,
                 tiled: block == 1,
                 bpp,
+                afbc: (block >= 12).then(|| crate::gpu_afbc::Layout {
+                    header: pair(&ext, 8),
+                    stride: word(&ext, 10),
+                    tiled: block == 13,
+                    bpp: bpp as usize,
+                    body_offset: word(&ext, 11) as u64,
+                }),
             },
         ))
     } else {
@@ -480,13 +497,17 @@ pub fn fragment_frame(
         let t = &fb.targets[*n];
         let s = t.write.unwrap();
         let mut px = [0u8; 4];
-        store(ram, &s, rows, x0, y0, w, h, |i, out| {
+        let f = |i: usize, out: &mut [u8]| {
             let bytes = t.pack(tb.color[*n][i], &mut px);
             out.copy_from_slice(&px[..bytes]);
-        });
+        };
+        match s.afbc {
+            Some(l) => afbc_store(m, ram, &l, x0, y0, w, h, f)?,
+            None => store(ram, &s, rows, x0, y0, w, h, f),
+        }
     }
     if let (Some((format, s)), Some(rows)) = (zs, zs_rows.as_ref()) {
-        store(ram, &s, rows, x0, y0, w, h, |i, out| {
+        let f = |i: usize, out: &mut [u8]| {
             let z = tb.depth[i].clamp(0., 1.);
             let st = tb.stencil[i] as u32;
             match format {
@@ -504,7 +525,11 @@ pub fn fragment_frame(
                     out.copy_from_slice(&old.to_le_bytes());
                 }
             }
-        });
+        };
+        match s.afbc {
+            Some(l) => afbc_store(m, ram, &l, x0, y0, w, h, f)?,
+            None => store(ram, &s, rows, x0, y0, w, h, f),
+        }
     }
     // A drawn tile is not a uniform clear: invalidate its checksum.
     let checksum = if frame.is_some_and(|f| !f.draws.is_empty()) || tb.touched {
@@ -538,6 +563,17 @@ fn rows(
     access: Access,
 ) -> Result<Vec<Vec<(usize, usize)>>, Stop> {
     let mut out = Vec::new();
+    if let Some(l) = s.afbc {
+        // Headers and payload slots of every superblock the box touches.
+        for sy in y0 / 16..=(y0 + h - 1) / 16 {
+            for sx in x0 / 16..=(x0 + w - 1) / 16 {
+                let (ha, _, ba, body) = l.encode(sx, sy, &vec![0u8; 256 * l.bpp]);
+                m.chunks(ram, ha, 16, access, true).map_err(Stop::Memory)?;
+                m.chunks(ram, ba, body.len(), access, true).map_err(Stop::Memory)?;
+            }
+        }
+        return Ok(out);
+    }
     if s.tiled {
         for ty in y0 / 16..=(y0 + h - 1) / 16 {
             let first = s.offset(x0 & !15, ty * 16);
@@ -565,6 +601,47 @@ fn rows(
     }
     Ok(out)
 }
+/// Write the box into an AFBC surface: each superblock it touches is read (outside the
+/// box), updated and written back uncompressed.
+#[allow(clippy::too_many_arguments)]
+fn afbc_store(
+    m: &AddressSpace,
+    ram: &mut [u8],
+    l: &crate::gpu_afbc::Layout,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    mut f: impl FnMut(usize, &mut [u8]),
+) -> Result<(), Stop> {
+    let bpp = l.bpp;
+    for sy in y0 / 16..=(y0 + h - 1) / 16 {
+        for sx in x0 / 16..=(x0 + w - 1) / 16 {
+            let full = sx * 16 >= x0 && sx * 16 + 15 < x0 + w && sy * 16 >= y0 && sy * 16 + 15 < y0 + h;
+            let mut pixels = if full {
+                vec![0u8; 256 * bpp]
+            } else {
+                let mut read = |a: u64, out: &mut [u8]| m.read(ram, a, out, true);
+                l.read_superblock(&mut read, sx, sy).unwrap_or_else(|_| vec![0u8; 256 * bpp])
+            };
+            for py in 0..16 {
+                for px in 0..16 {
+                    let (x, y) = (sx * 16 + px, sy * 16 + py);
+                    if x < x0 || x >= x0 + w || y < y0 || y >= y0 + h {
+                        continue;
+                    }
+                    let at = ((py * 16 + px) as usize) * bpp;
+                    f(((y - y0) * w + (x - x0)) as usize, &mut pixels[at..at + bpp]);
+                }
+            }
+            let (ha, header, ba, body) = l.encode(sx, sy, &pixels);
+            m.write(ram, ha, &header, true).map_err(Stop::Memory)?;
+            m.write(ram, ba, &body, true).map_err(Stop::Memory)?;
+        }
+    }
+    Ok(())
+}
+
 /// Physical address of byte `offset` within a validated row's spans.
 fn locate(spans: &[(usize, usize)], mut offset: usize) -> Option<usize> {
     for &(p, len) in spans {

@@ -14,6 +14,7 @@ pub mod gpu_tiler;
 pub mod gpu_raster;
 pub mod gpu_blend;
 pub mod gpu_texture;
+pub mod gpu_afbc;
 pub mod uart;
 pub mod display;
 pub mod xhci;
