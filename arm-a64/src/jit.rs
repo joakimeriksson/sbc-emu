@@ -1789,7 +1789,8 @@ impl Cpu {
     /// lives in `excl_addr`/`excl_armed`/`excl_val` as the interpreter keeps it. With cores
     /// running in parallel (`mt`) LDAR/STLR are the host's own and store-exclusive is a host
     /// compare-and-swap loop (LDAXR/STLXR, so ARMv8.0 hosts work) against what LDXR read.
-    /// Misses, page crossings and pairs go to the interpreter.
+    /// Misses, page crossings, misaligned addresses (an Alignment fault) and pairs go to the
+    /// interpreter.
     fn emit_excl(&self, e: &mut Emit, i: u32, pc: u64) -> bool {
         if self.ram.is_null() { return false; }
         let c = e.c;
@@ -1816,6 +1817,13 @@ impl Cpu {
         e.out.push(if rn == 31 { ldr_x(vreg, X_CPU, e.sp_slot) } else { ldr_x(vreg, X_CPU, e.reg_off(rn)) });
         let mut slow: Vec<usize> = Vec::new();
         let mut fail: Vec<usize> = Vec::new(); // store-exclusive without the reservation
+        if sz > 0 {
+            // misaligned: the interpreter raises the Alignment fault every form of these
+            // takes (also a store-exclusive without the reservation, so this comes first);
+            // the host's own LDAR/STLR, LDAXR/STLXR (with `mt`) would fault on it instead
+            e.out.push(0x9240_0000 | ((sz - 1) << 10) | (vreg << 5) | 16); // and x16, x13, #(size-1)
+            slow.push(e.out.len()); e.out.push(0xb500_0000 | 16); // cbnz x16, slow
+        }
         let ldr = |rt: u32| 0x3940_0000 | (sz << 30) | (tmp << 5) | rt; // ldr{b,h,,} Rt, [x14]
         let str_ = |rt: u32| 0x3900_0000 | (sz << 30) | (tmp << 5) | rt; // str{b,h,,} Rt, [x14]
         let ldar = |rt: u32| 0x08df_fc00 | (sz << 30) | (tmp << 5) | rt;
@@ -1830,11 +1838,6 @@ impl Cpu {
             fail.push(e.out.len()); e.out.push(0xb500_0000 | tmp); // cbnz x14, fail
         }
         self.emit_utlb(e, if load { 1 } else { 2 }, size, false, !load && o2, &mut slow, false, true);
-        if self.mt && !load && !o2 && sz > 0 {
-            // the host's exclusives need natural alignment (the interpreter stores plainly)
-            e.out.push(0x9240_0000 | ((sz - 1) << 10) | (vreg << 5) | 16); // and x16, x13, #(size-1)
-            slow.push(e.out.len()); e.out.push(0xb500_0000 | 16); // cbnz x16, slow
-        }
         let acquire = self.mt && (o2 || bit(i, 15));
         if load {
             e.out.push(if o2 || acquire { ldar(9) } else { ldr(9) });
@@ -1856,6 +1859,9 @@ impl Cpu {
                 let retry = e.out.len();
                 e.out.push(0x085f_fc00 | (sz << 30) | (tmp << 5) | 11);
                 e.out.push(0xca00_0000 | (10 << 16) | (11 << 5) | 12);
+                // only this store's bytes count (as in the interpreter's compare-and-swap) when
+                // the load-exclusive was wider: ubfx x12, x12, #0, #(8 << sz)
+                if sz < 3 { e.out.push(0xd340_0000 | (((8 << sz) - 1) << 10) | (12 << 5) | 12); }
                 let lost = e.out.len(); e.out.push(0xb500_0000 | 12);
                 e.out.push(0x0800_fc00 | (sz << 30) | (12 << 16) | (tmp << 5) | 9);
                 e.out.push(0x3500_0000 | ((((retry as i64 - e.out.len() as i64) as u32) & 0x7ffff) << 5) | 12);

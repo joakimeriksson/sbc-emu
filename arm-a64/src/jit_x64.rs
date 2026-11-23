@@ -1346,6 +1346,13 @@ impl E<'_> {
         self.ra_forget();
         self.a.load(true, RDX, m(CPU, if rn == 31 { self.sp_slot } else { o.x + 8 * rn as i32 }));
         let (mut slow, mut fail) = (Vec::new(), Vec::new());
+        if sz > 0 {
+            // misaligned: the interpreter raises the Alignment fault every form of these takes
+            // (also a store-exclusive without the reservation, so this comes first); with
+            // `mt` a host LOCK CMPXCHG or XCHG would otherwise split across cache lines
+            self.a.test_imm(false, RDX, size as i32 - 1);
+            slow.push(self.a.jcc(NE));
+        }
         if !load && !o2 {
             // the reservation must cover this 64-byte granule
             self.a.alu_mem_imm8(Alu::Cmp, 8, m(CPU, o.excl), 0);
@@ -1356,12 +1363,6 @@ impl E<'_> {
             fail.push(self.a.jcc(NE));
         }
         self.probe(cpu.el, if load { 1 } else { 2 }, size, false, !load && o2, &mut slow, false);
-        if self.mt && !load && sz > 0 {
-            // the host's locked accesses (LOCK CMPXCHG for STXR, XCHG for STLR) must not split
-            // across cache lines: misaligned ones go to the interpreter, which stores plainly
-            self.a.test_imm(false, RDX, size as i32 - 1);
-            slow.push(self.a.jcc(NE));
-        }
         let at = mx(RAMB, RAX, 0, 0);
         if load {
             self.a.load_zx(size, RCX, at);

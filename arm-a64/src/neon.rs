@@ -23,6 +23,75 @@ fn sat(x: i128, es: u32, signed: bool) -> (u64, bool) {
     if x < lo { ((lo as u64) & emask(es), true) } else if x > hi { ((hi as u64) & emask(es), true) } else { ((x as u64) & emask(es), false) }
 }
 
+/// Reserved and unallocated encodings of the integer three-same group (UNDEFINED, as on
+/// hardware: the JIT runs what the interpreter accepts natively, so an encoding taken here
+/// would reach the host CPU). `q` is the vector's Q bit.
+fn three_same_reserved(scalar: bool, q: bool, u: bool, size: u32, opc: u32) -> bool {
+    let d1 = size == 3 && !q; // a .1D vector
+    if scalar {
+        return match opc {
+            0b00001 | 0b00101 | 0b01001 | 0b01011 => false, // SQADD/SQSUB/SQSHL/SQRSHL (and U)
+            0b00110 | 0b00111 | 0b01000 | 0b01010 | 0b10000 | 0b10001 => size != 3,
+            0b10110 => size == 0 || size == 3, // SQDMULH / SQRDMULH
+            _ => true,
+        };
+    }
+    match opc {
+        0b00011 => false, // logic: size is part of the opcode
+        0b00001 | 0b00101 | 0b00110 | 0b00111 | 0b01000..=0b01011 | 0b10000 | 0b10001 => d1,
+        0b10111 => u || d1,                                   // ADDP
+        0b10011 => if u { size != 0 } else { size == 3 },     // PMUL (bytes) / MUL
+        0b10110 => size == 0 || size == 3,                    // SQDMULH / SQRDMULH
+        _ => size == 3, // HADD/RHADD/HSUB, MAX/MIN, ABD/ABA, MLA/MLS, MAXP/MINP: no 64-bit lanes
+    }
+}
+
+/// Reserved and unallocated encodings of the integer two-register-misc group.
+fn two_misc_reserved(scalar: bool, q: bool, u: bool, size: u32, opc: u32) -> bool {
+    let d1 = size == 3 && !q;
+    if scalar {
+        return match (opc, u) {
+            (0b00011 | 0b00111, _) => false, // SUQADD/USQADD, SQABS/SQNEG
+            (0b01000 | 0b01001 | 0b01011, _) | (0b01010, false) => size != 3, // compares with zero, ABS/NEG
+            (0b10010, true) | (0b10100, _) => size == 3, // SQXTUN, SQXTN/UQXTN
+            _ => true,
+        };
+    }
+    match (opc, u) {
+        (0b00000, false) => size == 3,            // REV64
+        (0b00000, true) => size >= 2,             // REV32
+        (0b00001, false) => size != 0,            // REV16
+        (0b00010 | 0b00100 | 0b00110, _) => size == 3, // [SU]ADDLP, CLS/CLZ, [SU]ADALP
+        (0b00101, false) => size != 0,            // CNT
+        (0b00101, true) => size >= 2,             // NOT, RBIT
+        (0b00011 | 0b00111 | 0b01000 | 0b01001 | 0b01011, _) | (0b01010, false) => d1,
+        (0b10010 | 0b10100, _) | (0b10011, true) => size == 3, // XTN/SQXTUN, SQXTN/UQXTN, SHLL
+        _ => true,
+    }
+}
+
+/// Reserved and unallocated encodings of the shift-by-immediate group (immh != 0).
+fn shift_imm_reserved(scalar: bool, q: bool, u: bool, immh: u32, opc: u32) -> bool {
+    let d1 = immh >= 8 && !q;
+    if scalar {
+        return match (opc, u) {
+            // SSHR/USHR, SSRA, SRSHR, SRSRA, SRI, SHL/SLI: 64-bit only
+            (0b00000 | 0b00010 | 0b00100 | 0b00110 | 0b01010, _) | (0b01000, true) => immh < 8,
+            (0b01100, true) | (0b01110, _) => false, // SQSHLU, SQSHL/UQSHL
+            // SQSHRUN/SQRSHRUN, SQSHRN/SQRSHRN/UQSHRN/UQRSHRN: to 8, 16 or 32 bits
+            (0b10000 | 0b10001, true) | (0b10010 | 0b10011, _) => immh >= 8,
+            (0b11100 | 0b11111, _) => immh < 4, // fixed-point conversions (half precision: no FP16)
+            _ => true,
+        };
+    }
+    match (opc, u) {
+        (0b00000 | 0b00010 | 0b00100 | 0b00110 | 0b01010 | 0b01110, _) | (0b01000 | 0b01100, true) => d1,
+        (0b10000..=0b10100, _) => immh >= 8, // narrowing and SSHLL/USHLL: no 128-bit elements
+        (0b11100 | 0b11111, _) => immh < 4 || d1,
+        _ => true,
+    }
+}
+
 fn shl_signed(a: u64, es: u32, sh: i64, unsigned: bool, round: bool) -> i128 {
     // shift by a signed amount (negative = right), with optional rounding, in wide arithmetic
     let v: i128 = if unsigned { a as i128 } else { sx(a, es) as i128 };
@@ -38,6 +107,8 @@ fn shl_signed(a: u64, es: u32, sh: i64, unsigned: bool, round: bool) -> i128 {
 
 impl Cpu {
     fn qc(&mut self, saturated: bool) { if saturated { self.fpsr |= 1 << 27; } }
+    /// An UNDEFINED encoding (an exception to the guest).
+    fn undef(&mut self) -> Option<Result<(), Trap>> { Some(Err(self.undefined())) }
 
     // ================================================================== dispatch
     pub(crate) fn neon(&mut self, i: u32) -> Result<Option<u64>, Trap> {
@@ -56,7 +127,8 @@ impl Cpu {
             else { None }
         } else if bits(i, 28, 24) == 0b01111 || (bit(i, 30) && bits(i, 28, 24) == 0b11111) {
             let scalar = bits(i, 28, 24) == 0b11111;
-            if bit(i, 10) && bits(i, 22, 19) != 0 { self.shift_imm(i, scalar) }
+            if bit(i, 10) && bit(i, 23) { self.undef() } // unallocated (shift by immediate has bit 23 clear)
+            else if bit(i, 10) && bits(i, 22, 19) != 0 { self.shift_imm(i, scalar) }
             else if !bit(i, 10) { self.by_element(i, scalar) }
             else { None }
         } else { None };
@@ -78,6 +150,7 @@ impl Cpu {
         if opc >= 0b11000 {
             return Some(self.three_same_fp(i, scalar));
         }
+        if three_same_reserved(scalar, q, u, size, opc) { return self.undef(); }
         if opc == 0b00011 {
             if scalar { return None; }
             let r = match (u, size) {
@@ -170,6 +243,10 @@ impl Cpu {
         let (n, m, d) = (self.v[rn], self.v[rm], self.v[rd]);
         let lanes = if scalar { 1 } else if q { 128 / es } else { 64 / es };
         if !scalar && !q && es == 64 { return Err(self.undefined()); }
+        // scalar: FMULX, FCMEQ, FRECPS/FRSQRTS, FABD, FCMGE/FCMGT, FACGE/FACGT only
+        if scalar && !matches!((u, opc, a_bit), (false, 0b11011 | 0b11100, false) | (false, 0b11111, _) | (true, 0b11010, true) | (true, 0b11100 | 0b11101, _)) {
+            return Err(self.undefined());
+        }
         let mut out = 0u128;
         let mut fp = self.fpu();
         for k in 0..lanes {
@@ -206,7 +283,8 @@ impl Cpu {
                 (true, 0b11110, false) if !scalar => { let (x, y) = pair(k); fp.max(es, x, y) }
                 (true, 0b11110, true) if !scalar => { let (x, y) = pair(k); fp.min(es, x, y) }
                 (true, 0b11111, false) => fp.div(es, a, b),
-                _ => return Err(Trap::Unimplemented(self.pc, i)),
+                // unallocated, or FMLAL/FMLSL (FEAT_FHM, not implemented or advertised)
+                _ => return Err(self.undefined()),
             };
             set_el(&mut out, es, k, v);
         }
@@ -220,8 +298,9 @@ impl Cpu {
         let q = bit(i, 30);
         let u = bit(i, 29);
         let es = 8u32 << bits(i, 23, 22);
-        if es == 64 { return None; }
         let opc = bits(i, 15, 12);
+        // no 128-bit results (PMULL .1Q is in `crypto`); SQDMLAL/SQDMLSL/SQDMULL from 16 or 32 bits
+        if es == 64 || (matches!(opc, 0b1001 | 0b1011 | 0b1101) && (u || es == 8)) { return self.undef(); }
         let (rd, rn, rm) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize, bits(i, 20, 16) as usize);
         let (n, m, d) = (self.v[rn], self.v[rm], self.v[rd]);
         let half = 64 / es;
@@ -269,7 +348,7 @@ impl Cpu {
                             for bb in 0..8 { if y & (1 << bb) != 0 { r ^= x << bb; } }
                             r as i128
                         }
-                        _ => return None,
+                        _ => return self.undef(),
                     };
                     set_el(&mut out, we, k, (v as u64) & emask(we));
                 }
@@ -296,6 +375,7 @@ impl Cpu {
         if fp {
             return Some(self.two_misc_fp(i, scalar));
         }
+        if two_misc_reserved(scalar, q, u, size, opc) { return self.undef(); }
         let mut out = 0u128;
         let mut satd = false;
         let ones = emask(es);
@@ -397,7 +477,7 @@ impl Cpu {
         if !a_bit && (opc == 0b10110 || opc == 0b10111) {
             let (wide, narrow) = if sz { (64, 32) } else { (32, 16) };
             if opc == 0b10110 {
-                if u && !sz { return Err(self.undefined()); }
+                if (u && !sz) || (scalar && !u) { return Err(self.undefined()); } // FCVTXN from doubles; no scalar FCVTN
                 if u { fp.rnd = Rnd::Odd; } // FCVTXN
                 let lanes = if scalar { 1 } else { 64 / narrow };
                 let off = if q && !scalar { lanes } else { 0 };
@@ -417,6 +497,10 @@ impl Cpu {
         }
         let lanes = if scalar { 1 } else if q { 128 / es } else { 64 / es };
         if !scalar && !q && es == 64 { return Err(self.undefined()); }
+        // scalar: compares with zero, conversions, FRECPE/FRSQRTE, FRECPX (no FABS/FNEG/FSQRT/FRINT*)
+        if scalar && !matches!((a_bit, opc, u), (true, 0b01100 | 0b01101, _) | (true, 0b01110, false) | (_, 0b11010 | 0b11011 | 0b11101, _) | (false, 0b11100, _) | (true, 0b11111, false)) {
+            return Err(self.undefined());
+        }
         let mut out = 0u128;
         let all = emask(es);
         let sign = 1u64 << (es - 1);
@@ -467,6 +551,8 @@ impl Cpu {
         let n = self.v[rn];
         if opc == 0b01100 || opc == 0b01111 {
             // FMAXNMV / FMINNMV / FMAXV / FMINV (single precision, Q=1): Reduce() pairs (0,1),(2,3)
+            // (U=0 is half precision, FEAT_FP16: not implemented or advertised; doubles reserved)
+            if !u || bit(i, 22) || !q { return self.undef(); }
             let es = 32;
             let mut fp = self.fpu();
             let mut op = |a: u64, b: u64| match (opc, bit(i, 23)) {
@@ -481,6 +567,8 @@ impl Cpu {
             self.v[rd] = r as u128;
             return Some(Ok(()));
         }
+        // [SU]ADDLV, [SU]MAXV, [SU]MINV, ADDV: of 8, 16 bits, or 32 bits from four lanes
+        if !matches!((opc, u), (0b00011 | 0b01010 | 0b11010, _) | (0b11011, false)) || size == 3 || (size == 2 && !q) { return self.undef(); }
         let es = 8u32 << size;
         let lanes = if q { 128 / es } else { 64 / es };
         let vals: Vec<i128> = (0..lanes).map(|k| if u { el(n, es, k) as i128 } else { sel(n, es, k) as i128 }).collect();
@@ -488,8 +576,7 @@ impl Cpu {
             0b11011 if !u => (vals.iter().sum(), es),
             0b00011 => (vals.iter().sum(), es * 2),
             0b01010 => (*vals.iter().max().unwrap(), es),
-            0b11010 => (*vals.iter().min().unwrap(), es),
-            _ => return None,
+            _ => (*vals.iter().min().unwrap(), es),
         };
         self.v[rd] = ((r as u64) & emask(out_es)) as u128;
         Some(Ok(()))
@@ -514,13 +601,13 @@ impl Cpu {
                 (0b01100, true) => fp.minnm(es, a, b),
                 (0b01111, false) => fp.max(es, a, b),
                 (0b01111, true) => fp.min(es, a, b),
-                _ => return None,
+                _ => return self.undef(),
             };
             self.fpu_done(fp);
             self.v[rd] = v as u128;
             return Some(Ok(()));
         }
-        None
+        self.undef() // ADDP of doublewords only; U=0 FP forms are half precision (no FEAT_FP16)
     }
 
     // ================================================================== copy / permute / table
@@ -531,6 +618,14 @@ impl Cpu {
         let (rd, rn) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize);
         if imm5 & 0xf == 0 { return Some(Err(self.undefined())); }
         let sz = imm5.trailing_zeros();
+        let reserved = match imm4 {
+            0b0000 | 0b0001 => sz == 3 && !q,       // DUP: no .1D
+            0b0011 => !q,                           // INS (general)
+            0b0101 => sz >= if q { 3 } else { 2 },  // SMOV: bytes, halfwords (to W or X), words to X
+            0b0111 => q != (sz == 3),               // UMOV: up to words to W, doublewords to X
+            _ => true,
+        };
+        if reserved { return self.undef(); }
         let es = 8u32 << sz;
         let idx = imm5 >> (sz + 1);
         let n = self.v[rn];
@@ -540,8 +635,7 @@ impl Cpu {
             0b0001 => { let x = self.xr(rn as u32); self.v[rd] = qmask(q, rep(x)); }
             0b0011 => { let x = self.xr(rn as u32); set_el(&mut self.v[rd], es, idx, x); }
             0b0101 => { let x = sx(el(n, es, idx), es) as u64; self.set_x(rd as u32, if q { x } else { x & 0xffff_ffff }); }
-            0b0111 => { let x = el(n, es, idx); self.set_x(rd as u32, x); }
-            _ => return None,
+            _ => { let x = el(n, es, idx); self.set_x(rd as u32, x); }
         }
         Some(Ok(()))
     }
@@ -550,7 +644,7 @@ impl Cpu {
         let imm5 = bits(i, 20, 16);
         let imm4 = bits(i, 14, 11);
         let (rd, rn) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize);
-        if imm5 & 0xf == 0 { return Some(Err(self.undefined())); }
+        if imm5 & 0xf == 0 || !bit(i, 30) { return Some(Err(self.undefined())); } // INS (element) is Q=1
         let sz = imm5.trailing_zeros();
         let es = 8u32 << sz;
         let x = el(self.v[rn], es, imm4 >> sz);
@@ -572,6 +666,7 @@ impl Cpu {
         let q = bit(i, 30);
         let es = 8u32 << bits(i, 23, 22);
         let opc = bits(i, 14, 12);
+        if opc & 3 == 0 || (es == 64 && !q) { return self.undef(); } // unallocated; no .1D
         let (rd, rn, rm) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize, bits(i, 20, 16) as usize);
         let (n, m) = (self.v[rn], self.v[rm]);
         let lanes = if q { 128 / es } else { 64 / es };
@@ -581,8 +676,7 @@ impl Cpu {
             let v = match opc {
                 0b001 | 0b101 => { let j = 2 * k + (opc >> 2); if j < lanes { el(n, es, j) } else { el(m, es, j - lanes) } }
                 0b010 | 0b110 => { let p = opc >> 2; if k % 2 == 0 { el(n, es, k + p) } else { el(m, es, k - 1 + p) } }
-                0b011 | 0b111 => { let base = if opc == 0b111 { half } else { 0 }; if k % 2 == 0 { el(n, es, base + k / 2) } else { el(m, es, base + k / 2) } }
-                _ => return None,
+                _ => { let base = if opc == 0b111 { half } else { 0 }; if k % 2 == 0 { el(n, es, base + k / 2) } else { el(m, es, base + k / 2) } }
             };
             set_el(&mut out, es, k, v);
         }
@@ -593,6 +687,7 @@ impl Cpu {
     fn ext(&mut self, i: u32) -> Option<Result<(), Trap>> {
         let q = bit(i, 30);
         let pos = bits(i, 14, 11) as usize;
+        if bits(i, 23, 22) != 0 || (!q && pos >= 8) { return self.undef(); } // op2 unallocated; index past an 8-byte vector
         let (rd, rn, rm) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize, bits(i, 20, 16) as usize);
         let w = if q { 16 } else { 8 };
         let mut b = [0u8; 32];
@@ -629,6 +724,7 @@ impl Cpu {
         let immh = bits(i, 22, 19);
         let immhb = bits(i, 22, 16);
         let opc = bits(i, 15, 11);
+        if shift_imm_reserved(scalar, bit(i, 30), u, immh, opc) { return self.undef(); }
         let (rd, rn) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize);
         let n = self.v[rn];
         let d = self.v[rd];
@@ -717,6 +813,16 @@ impl Cpu {
         let opc = bits(i, 15, 12);
         let (l, m_hi, h) = (bits(i, 21, 21), bits(i, 20, 20), bits(i, 11, 11));
         let (rd, rn) = (bits(i, 4, 0) as usize, bits(i, 9, 5) as usize);
+        // FMLA/FMLS/FMUL/FMULX: single or double (L=0, and no .1D); half precision needs FEAT_FP16
+        let fp_op = matches!((opc, u), (0b0001 | 0b0101 | 0b1001, false) | (0b1001, true));
+        if fp_op && (size < 2 || (size == 3 && (l == 1 || (!scalar && !bit(i, 30))))) { return self.undef(); }
+        // integer: of halfwords or words; the scalar forms are the saturating doubling ones only
+        let int_ok = match (opc, u) {
+            (0b0011 | 0b0111 | 0b1011 | 0b1100 | 0b1101, false) => Some(true),
+            (0b0010 | 0b0110 | 0b1010, _) | (0b1000, false) | (0b0000 | 0b0100, true) => Some(!scalar),
+            _ => None, // FP above; dot products, FCMLA, SQRDMLAH, FMLAL (not implemented or advertised)
+        };
+        if int_ok.is_some_and(|ok| !ok || size == 0 || size == 3) { return self.undef(); }
         let fp = matches!(opc, 0b0001 | 0b0101 | 0b1001) && size >= 2;
         let (es, idx, rm) = if fp {
             if size == 3 { (64, h, bits(i, 20, 16)) } else { (32, (h << 1) | l, bits(i, 20, 16)) }

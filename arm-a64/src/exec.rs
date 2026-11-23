@@ -1181,12 +1181,22 @@ impl Cpu {
         let rt = bits(i, 4, 0);
         let addr = self.xsp(rn);
         let size = 1u32 << size_log;
+        if o2 && o1 {
+            return Err(self.unimpl()); // CAS (LSE): not advertised
+        }
+        if o1 && !o2 && size_log < 2 {
+            return Err(self.undefined()); // CASP (LSE): not advertised
+        }
+        // exclusives (atomic) and acquire/release (ordered) accesses must be aligned to their
+        // whole size, whatever SCTLR.A says (no FEAT_LSE2): an Alignment fault, before any
+        // translation fault, also for a store-exclusive that would fail
+        let whole = if o1 { 2 * size } else { size };
+        if addr % whole as u64 != 0 {
+            return Err(self.abort(addr, !l, 0b100001, false));
+        }
         if o2 {
-            if o1 {
-                return Err(self.unimpl());
-            } // CAS (LSE): not advertised
-              // LDAR / STLR / LDLAR / STLLR: ordinary accesses on one core; with cores running in
-              // parallel the acquire/release order is a host fence
+            // LDAR / STLR / LDLAR / STLLR: ordinary accesses on one core; with cores running in
+            // parallel the acquire/release order is a host fence
             use std::sync::atomic::{fence, Ordering};
             if l {
                 let v = self.load(bus, addr, size, false)?;
@@ -1215,9 +1225,6 @@ impl Cpu {
             }
         } else {
             // LDXP / STXP (32- or 64-bit elements)
-            if size_log < 2 {
-                return Err(self.undefined());
-            }
             if l {
                 let a = self.load(bus, addr, size, false)?;
                 let b = self.load(bus, addr + size as u64, size, false)?;

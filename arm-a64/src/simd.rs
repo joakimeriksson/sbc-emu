@@ -160,7 +160,8 @@ impl Cpu {
         }
         if es == 16 { return Err(self.unimpl_fp(i)); }
         if bit(i, 21) && bits(i, 13, 10) == 0b1000 && bits(i, 15, 14) == 0 {
-            // FCMP / FCMPE (bit 4), against zero (bit 3)
+            // FCMP / FCMPE (bit 4), against zero (bit 3); opcode2 bits 2:0 are zero
+            if bits(i, 2, 0) != 0 { return Err(self.undefined()); }
             let a = get(self, rn);
             let b = if bit(i, 3) { 0 } else { get(self, rm) };
             let mut fp = self.fpu();
@@ -169,7 +170,8 @@ impl Cpu {
             return Ok(None);
         }
         if bit(i, 21) && bits(i, 12, 10) == 0b100 {
-            // FMOV (scalar, immediate)
+            // FMOV (scalar, immediate); imm5 (bits 9:5) is zero
+            if bits(i, 9, 5) != 0 { return Err(self.undefined()); }
             let v = vfp_imm(bits(i, 20, 13), double);
             self.v[rd as usize] = v as u128;
             return Ok(None);
@@ -265,6 +267,8 @@ impl Cpu {
         let q = bit(i, 30);
         let op = bit(i, 29);
         let cmode = bits(i, 15, 12);
+        // o2: FMOV (vector, immediate) of half precision (FEAT_FP16, not advertised), else unallocated
+        if bit(i, 11) { return Err(self.undefined()); }
         let rd = bits(i, 4, 0) as usize;
         let imm8 = ((bits(i, 18, 16) << 5) | bits(i, 9, 5)) as u64;
         let (imm64, kind): (u64, u8) = match cmode {
@@ -323,6 +327,7 @@ impl Cpu {
         let rn = bits(i, 9, 5);
         let rt = bits(i, 4, 0);
         let selem = (((opc & 1) << 1) | r) + 1;
+        if !post && rm != 0 { return Err(self.undefined()); } // the offset-free form has Rm = 0
         let (scale, index, replicate) = match opc >> 1 {
             0 => (0, ((q as u32) << 3) | (sbit << 2) | size, false),
             1 => { if size & 1 != 0 { return Err(self.undefined()); } (1, ((q as u32) << 2) | (sbit << 1) | (size >> 1), false) }
@@ -376,6 +381,8 @@ impl Cpu {
             0b0111 => (1, 1), 0b1000 => (1, 2), 0b1010 => (2, 1),
             _ => return Err(self.undefined()),
         };
+        // bits 21:16 are 0 without an offset, bit 21 with one; LD2..LD4/ST2..ST4 have no .1D
+        if bit(i, 21) || (!post && rm != 0) || (selem > 1 && size == 3 && !q) { return Err(self.undefined()); }
         let es = 8u32 << size;
         let ebytes = es / 8;
         let elems = (if q { 128 } else { 64 }) / es;
