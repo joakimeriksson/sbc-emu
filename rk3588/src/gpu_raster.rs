@@ -2,8 +2,8 @@
 //! stencil, fragment shaders in 2x2 quads, blending and occlusion queries.
 //!
 //! Positions are window x, y, z and 1/w (Mesa lowers the viewport transform into the
-//! vertex shader and clamps 1/w to +-2^15, so w is never zero). Triangles crossing w = 0
-//! are clipped in homogeneous space; the near and far planes are applied per fragment
+//! vertex shader and clamps 1/w to +-2^15, so w is never zero). Triangles and lines
+//! crossing w = 0 are clipped in homogeneous space; the near and far planes are applied per fragment
 //! through the descriptor's depth range, as on Mali. Varyings are interpolated with
 //! perspective-correct weights of the original primitive's vertices. Coordinates snap to
 //! 1/256 pixel so shared edges are covered exactly once (top-left rule).
