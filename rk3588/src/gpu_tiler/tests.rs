@@ -130,6 +130,41 @@ fn indexed_widths_signed_base_and_repeated_elements_execute_native_shader() {
     }
 }
 #[test]
+fn indirect_draws_start_at_their_first_index() {
+    // glDrawElementsIndirect: r54 is the whole index buffer, r39 its size, r35 firstIndex.
+    let (m, mut ram, mut r) = fixture();
+    for (n, value) in [9u32, 9, 9, 3, 1, 2].iter().enumerate() {
+        ram[0xc000 + n * 4..0xc000 + n * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    r[33] = 3;
+    r[35] = 3;
+    r[36] = (-1i32) as u32;
+    r[39] = 24;
+    r[54] = 0xc000;
+    let mut t = Tiler::default();
+    t.idvs(&m, &mut ram, &r, 0x0600004200000308, (0, 0)).unwrap();
+    let d = &t.frames[&key(&m, 0x8000)].draws[0];
+    assert_eq!(d.triangle(0), [[8., 14., 0.5, 1.], [2., 2., 0.5, 1.], [14., 2., 0.5, 1.]]);
+    // Past the end of the buffer: nothing drawn.
+    r[35] = 4;
+    let mut t = Tiler::default();
+    assert!(t.idvs(&m, &mut ram, &r, 0x0600004200000308, (0, 0)).is_err());
+    assert!(t.frames.is_empty());
+}
+#[test]
+fn a_draw_with_no_instances_draws_nothing() {
+    let (m, mut ram, mut r) = fixture();
+    r[34] = 0;
+    r[39] = 12;
+    r[54] = 0xc000;
+    ram[0x10000..0x10100].fill(0xa5);
+    let mut t = Tiler::default();
+    t.idvs(&m, &mut ram, &r, 0x0600004200000308, (0, 0)).unwrap();
+    assert_eq!(t.vertices, 0);
+    assert!(t.frames.values().all(|f| f.draws.iter().all(|d| d.primitives.is_empty())));
+    assert!(ram[0x10000..0x10100].iter().all(|&v| v == 0xa5));
+}
+#[test]
 fn array_first_ignores_stale_index_buffer() {
     let (m, mut ram, mut r) = fixture();
     // Start at vertex one and place the original triangle after a dummy.
@@ -175,7 +210,6 @@ fn invalid_index_ranges_and_instance_counts_publish_nothing() {
         (0xc002, 12, 1),    // unaligned uint32
         (0x1fffc, 12, 1),   // aligned but outside GPU RAM
         (u64::MAX - 3, 12, 1),
-        (0xc000, 12, 0),
         (0xc000, 12, 349_526), // aggregate vertex limit
         (0xc000, 12, u32::MAX),
     ] {

@@ -56,6 +56,8 @@ pub struct Fragment {
     pub point: [f32; 2],
     pub atest_datum: u32,
     pub sample_positions: u64,
+    /// The thread's lane in its 2x2 quad: x in bit 0, y in bit 1.
+    pub lane: u32,
 }
 impl Fragment {
     pub fn new(blend: [u32; 2]) -> Self {
@@ -382,11 +384,13 @@ fn icmp<T: PartialOrd>(cond: u32, x: T, y: T) -> Option<bool> {
         _ => return None,
     })
 }
+/// Result clamps (ISA.xml Clamp): NaN goes to the lower bound, and -0 to +0 for
+/// clamp_0_inf and clamp_0_1 (`f32::max`/`min` return the operand that is not NaN).
 fn clamp(mode: u32, v: f32) -> f32 {
     match mode {
-        1 => v.max(0.),
-        2 => v.clamp(-1., 1.),
-        3 => v.clamp(0., 1.),
+        1 => v.max(0.) + 0.,
+        2 => v.max(-1.).min(1.),
+        3 => v.max(0.).min(1.) + 0.,
         _ => v,
     }
 }
@@ -678,7 +682,10 @@ impl Shader {
                         _ => None,
                     },
                     3 => match n {
-                        1 | 3 => Some(0), // lane and core ID
+                        // lane ID (a fragment's place in its 2x2 quad; Mesa's fine
+                        // dFdx/dFdy pick their CLPER lanes from it), core ID
+                        1 => Some(self.fragment.as_ref().map_or(0, |f| f.lane)),
+                        3 => Some(0),
                         15 => Some(half(self.pc.wrapping_add(8))),
                         _ => None,
                     },

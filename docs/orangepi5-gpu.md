@@ -349,6 +349,7 @@ missing: AFBC/AFRC compressed surfaces (run Mesa with `PAN_MESA_DEBUG=noafbc` fo
 programs that render to textures), block-compressed and ASTC textures, blend shaders
 and logic operations, sRGB blending, multisampled rendering (draws are single-sampled
 at pixel centres), alpha-to-coverage, anisotropic filtering, explicit-gradient
-texturing, image load/store and atomics, non-power-of-two instance divisors' rounding
+texturing, seamless filtering across cube-map faces (each face is filtered on its own), the
+10-bit snorm/sint texture formats, sampler min/max reduction, image load/store and atomics, non-power-of-two instance divisors' rounding
 corner cases, incremental rendering/OOM recovery, cross-queue synchronization and GPU
 preemption. Vulkan (PanVK) is untested.

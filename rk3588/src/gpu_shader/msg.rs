@@ -50,6 +50,12 @@ pub(super) fn cube_face(second: bool, x: f32, y: f32, z: f32) -> u32 {
     }
 }
 
+/// The start of an access of `bytes` at `offset` into a window of `limit` bytes, if it
+/// fits; computed in 64 bits so no offset wraps on a 32-bit host (wasm32).
+fn window(offset: u64, bytes: usize, limit: usize) -> Option<usize> {
+    (offset.checked_add(bytes as u64)? <= limit as u64).then_some(offset as usize)
+}
+
 /// Message slots 0-2 and 7 exist; 3-6 are reserved.
 fn slot_ok(i: u64) -> bool {
     !matches!(bits(i, 30, 3), 3..=6)
@@ -247,14 +253,11 @@ impl Shader {
         let bytes: usize = [1, 2, 3, 4, 6, 8, 12, 16][size as usize];
         let mut data = [0u8; 16];
         if address >= OUTPUT_BASE {
-            let off = (address - OUTPUT_BASE) as usize;
             let out = env.output.as_ref().ok_or(None)?;
-            data[..bytes].copy_from_slice(out.get(off..off + bytes).ok_or(None)?);
+            let off = window(address - OUTPUT_BASE, bytes, out.len()).ok_or(None)?;
+            data[..bytes].copy_from_slice(&out[off..off + bytes]);
         } else if address >= TLS_BASE {
-            let off = (address - TLS_BASE) as usize;
-            if off + bytes > TLS_LIMIT {
-                return Err(None);
-            }
+            let off = window(address - TLS_BASE, bytes, TLS_LIMIT).ok_or(None)?;
             for (k, d) in data[..bytes].iter_mut().enumerate() {
                 *d = self.scratch.get(off + k).copied().unwrap_or(0);
             }
@@ -355,16 +358,11 @@ impl Shader {
             .take(bytes)
             .collect();
         if address >= OUTPUT_BASE {
-            let off = (address - OUTPUT_BASE) as usize;
             let out = env.output.as_mut().ok_or(None)?;
-            out.get_mut(off..off + bytes)
-                .ok_or(None)?
-                .copy_from_slice(&data);
+            let off = window(address - OUTPUT_BASE, bytes, out.len()).ok_or(None)?;
+            out[off..off + bytes].copy_from_slice(&data);
         } else if address >= TLS_BASE {
-            let off = (address - TLS_BASE) as usize;
-            if off + bytes > TLS_LIMIT {
-                return Err(None);
-            }
+            let off = window(address - TLS_BASE, bytes, TLS_LIMIT).ok_or(None)?;
             if self.scratch.len() < off + bytes {
                 self.scratch.resize(off + bytes, 0);
             }
@@ -460,8 +458,9 @@ impl Shader {
             .buffer(env.m, env.ram, handle >> 24, handle & 0xff_ffff)
             .map_err(memory)?;
         let mut data = [0u8; 16];
-        if offset + bytes as u64 <= len {
-            env.read(base + offset, &mut data[..bytes])
+        // Out of the buffer (or past the top of the address space): zeros.
+        if let Some(at) = base.checked_add(offset).filter(|_| offset + bytes as u64 <= len) {
+            env.read(at, &mut data[..bytes])
                 .map_err(|f| Some(super::Error::Memory(f)))?;
         }
         self.load_lanes(i, size, &data, bits(i, 33, 3) as usize)?;
@@ -671,22 +670,32 @@ impl Shader {
         let lod = match (op, lod_mode) {
             (0x125, _) => Lod::Fetch(offset_ms >> 24),
             (0x129, _) | (_, 0) => Lod::Explicit(0.),
-            (_, 4) => Lod::Explicit(fixed88(explicit.unwrap())),
+            // (VAR_TEX has no staging LOD: an explicit mode there is reserved)
+            (_, 4) => Lod::Explicit(fixed88(explicit.ok_or(None)?)),
             (_, 1 | 5) => {
                 let bias = explicit.map_or(0., fixed88);
                 let (mut dx, mut dy) = ([0f32; 3], [0f32; 3]);
                 if let Some(q) = quad {
-                    let me = q.tex[q.lane];
+                    // A cube's X carries the face in bits 29-31 over s (see the sampler):
+                    // differentiate s alone, as the sampler will read it.
+                    let coord = |lane: usize, n: usize| {
+                        let v = q.tex[lane][n];
+                        if dim == 3 && n == 0 {
+                            f32::from_bits((v.to_bits() & 0x1fff_ffff) | 0x2000_0000)
+                        } else {
+                            v
+                        }
+                    };
                     let x = q.lane ^ 1;
                     let y = q.lane ^ 2;
                     let sx = if q.lane & 1 == 0 { 1. } else { -1. };
                     let sy = if q.lane & 2 == 0 { 1. } else { -1. };
                     for n in 0..3 {
                         if q.active[x] {
-                            dx[n] = (q.tex[x][n] - me[n]) * sx;
+                            dx[n] = (coord(x, n) - coord(q.lane, n)) * sx;
                         }
                         if q.active[y] {
-                            dy[n] = (q.tex[y][n] - me[n]) * sy;
+                            dy[n] = (coord(y, n) - coord(q.lane, n)) * sy;
                         }
                     }
                 }

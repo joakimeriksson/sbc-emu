@@ -52,10 +52,23 @@ pub struct Blend {
     alpha: Function,
     mask: u32,
     constant: f32,
+    /// The descriptor's 16-bit constant field, for [`Blend::for_bits`].
+    raw_constant: u32,
     alpha_to_one: bool,
     rt: u8,
 }
 impl Blend {
+    /// The constant as Mesa packs it for a render target whose first channel has `bits`
+    /// bits (pack_blend_constant: unorm(c, bits) << (16 - bits)), so the field's maximum
+    /// is (2^bits - 1) << (16 - bits): 0xff00 for 8 bits, 0xffc0 for 10, 0xf800 for 5.
+    pub fn for_bits(self, bits: u32) -> Self {
+        let bits = bits.clamp(1, 16);
+        let max = ((1u32 << bits) - 1) << (16 - bits);
+        Self {
+            constant: (self.raw_constant as f32 / max as f32).min(1.),
+            ..self
+        }
+    }
     pub fn decode(words: [u32; 4]) -> Result<Self, ()> {
         // A disabled Off descriptor has no equation or conversion to decode.
         if words[0] & 0x200 == 0 && words[2] & 3 == 3 {
@@ -64,6 +77,7 @@ impl Blend {
                 alpha: Function(0x122),
                 mask: 0,
                 constant: 0.,
+                raw_constant: 0,
                 alpha_to_one: false,
                 rt: ((words[2] >> 16) & 15) as u8,
             });
@@ -75,7 +89,6 @@ impl Blend {
             || !matches!(words[2] & 3, 1 | 2)
             || words[3] & 0xffc0_0000 != 0
             || words[1] & 0x0f000000 != 0
-            || words[0] >> 16 > 0xff00
         {
             return Err(());
         }
@@ -88,12 +101,13 @@ impl Blend {
             rgb,
             alpha,
             mask: words[1] >> 28,
-            // Mesa scales the constant by the UNORM8 maximum, left-shifted
-            // into the 16-bit descriptor field (255 << 8), not by 65535.
-            constant: (words[0] >> 16) as f32 / 65280.,
+            constant: 0.,
+            raw_constant: words[0] >> 16,
             alpha_to_one: words[0] & 256 != 0,
             rt: ((words[2] >> 16) & 15) as u8,
-        })
+        }
+        // an 8-bit target until the render target is known
+        .for_bits(8))
     }
     /// Blend in floating point; `unorm` clamps sources, factors and results to [0, 1].
     pub fn apply_f(self, source: [f32; 4], dest: [f32; 4], unorm: bool) -> [f32; 4] {
@@ -216,8 +230,22 @@ mod tests {
         for bad in [0, 0x120, 0x40, 0x800] {
             assert!(Function::decode(bad).is_err());
         }
+        // Constants above 0xff00 are what Mesa packs for 10-bit targets: 1.0 is 0xffc0.
         let mut w = good;
-        w[0] |= 0xffff0000;
-        assert!(Blend::decode(w).is_err());
+        w[0] |= 0xffc0_0000;
+        let b = Blend::decode(w).unwrap();
+        assert_eq!(b.for_bits(10).constant, 1.);
+        assert_eq!(b.for_bits(8).constant, 1.);
+    }
+    #[test]
+    fn the_constant_follows_the_target_precision() {
+        // pack_blend_constant(1.0) for 4, 5, 8 and 10 bits
+        for (raw, bits) in [(0xf000u32, 4), (0xf800, 5), (0xff00, 8), (0xffc0, 10)] {
+            let b = Blend::decode([raw << 16 | 0x201, 0x50703703, 0x1a, 0xed000]).unwrap();
+            assert_eq!(b.for_bits(bits).constant, 1., "{bits} bits");
+        }
+        // 0.5 on a 5-bit target: unorm 15 -> 15/31
+        let b = Blend::decode([0x7800_0201, 0x50703703, 0x1a, 0xed000]).unwrap();
+        assert_eq!(b.for_bits(5).constant, 15. / 31.);
     }
 }

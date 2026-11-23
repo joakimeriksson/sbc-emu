@@ -102,6 +102,8 @@ struct Texture {
 #[derive(Default)]
 pub struct Cache {
     map: HashMap<(u64, (u32, u32), (u32, u32)), Rc<Texture>>,
+    /// Planes held by the cached textures (one texture may have up to 4096).
+    planes: usize,
 }
 
 /// Bytes per texel, component count and kind of a Mali format.
@@ -303,7 +305,10 @@ impl Texture {
         }
         let dim = (word(&td, 0) >> 4) & 3;
         let levels = ((word(&td, 2) >> 16) & 31) + 1;
-        let layers = (word(&td, 6) & 0xffff) + 1;
+        // A cube's Array size counts whole cubes, but its surfaces are one per face: Mesa
+        // (v7 and later) emits the six faces as consecutive layers, levels innermost.
+        let faces = if dim == 0 { 6 } else { 1 };
+        let layers = ((word(&td, 6) & 0xffff) + 1) * faces;
         let surfaces = pair(&td, 4);
         if surfaces & 31 != 0 || levels as u64 * layers as u64 > 4096 {
             return Err(Error::Unsupported);
@@ -311,7 +316,8 @@ impl Texture {
         let mut planes = Vec::with_capacity((levels * layers) as usize);
         for n in 0..(levels * layers) as u64 {
             let mut p = [0u8; 32];
-            env.read(surfaces + n * 32, &mut p).map_err(Error::Memory)?;
+            let at = surfaces.checked_add(n * 32).ok_or(Error::Unsupported)?;
+            env.read(at, &mut p).map_err(Error::Memory)?;
             let kind = (word(&p, 0) >> 4) & 15;
             let ordering = (word(&p, 0) >> 8) & 15;
             if word(&p, 0) & 15 != 10 || kind != 1 || !matches!(ordering, 1 | 2) {
@@ -396,8 +402,10 @@ impl Texture {
             return Ok(None);
         }
         let mut b = [0u8; 16];
-        env.read(p.pointer + offset, &mut b[..bpp as usize])
-            .map_err(Error::Memory)?;
+        let Some(at) = p.pointer.checked_add(offset) else {
+            return Ok(None);
+        };
+        env.read(at, &mut b[..bpp as usize]).map_err(Error::Memory)?;
         Ok(Some(decode(self.format, &b)))
     }
 
@@ -497,9 +505,13 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         Some(t) => t.clone(),
         None => {
             let t = Rc::new(Texture::load(env, resources, r.texture, r.sampler)?);
-            if env.textures.map.len() > 4096 {
+            // Bound the host memory by planes, not entries: 4096 entries of 4096 planes
+            // each would be hundreds of MB.
+            if env.textures.map.len() >= 4096 || env.textures.planes + t.planes.len() > 1 << 16 {
                 env.textures.map.clear();
+                env.textures.planes = 0;
             }
+            env.textures.planes += t.planes.len();
             env.textures.map.insert(key, t.clone());
             t
         }
@@ -518,9 +530,9 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
             return Err(Error::Unsupported);
         };
         let c = r.coords.map(|v| v as i32);
-        let x = c[0] + r.offset[0];
-        let y = if t.dim == 1 { 0 } else { c[1] + r.offset[1] };
-        let z = if t.dim == 3 { c[2] + r.offset[2] } else { 0 };
+        let x = c[0].wrapping_add(r.offset[0]);
+        let y = if t.dim == 1 { 0 } else { c[1].wrapping_add(r.offset[1]) };
+        let z = if t.dim == 3 { c[2].wrapping_add(r.offset[2]) } else { 0 };
         let v = t
             .texel(
                 env,
@@ -545,7 +557,7 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         // Cube: X holds the face in bits 29-31 and s in the low bits (Mesa
         // bi_emit_texc_cube_coord); faces are layers.
         let x = r.coords[0];
-        layer = layer * 6 + (x >> 29).min(5);
+        layer = layer.saturating_mul(6).saturating_add((x >> 29).min(5));
         c[0] = f32::from_bits((x & 0x1fff_ffff) | 0x2000_0000);
     }
     let (w0, h0, d0) = (t.width as f32, t.height as f32, t.depth as f32);
@@ -606,7 +618,16 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         } else {
             1
         };
-        let scale = |c: f32, size: u32| if t.normalized { c * size as f32 } else { c };
+        // Texel-space coordinates, kept where the integer neighbours (x0 + 1, ...) cannot
+        // overflow; anything this far out only selects wrapped or border texels anyway.
+        let scale = |c: f32, size: u32| {
+            let v = if t.normalized { c * size as f32 } else { c };
+            if v.is_finite() {
+                v.clamp(-16_777_216., 16_777_216.)
+            } else {
+                0.
+            }
+        };
         let u = scale(c[0], p.width) + r.offset[0] as f32;
         let v = if one_d {
             0.5
@@ -838,6 +859,58 @@ mod tests {
             bytes(sample2d(&m, &mut ram, resources, h, [0.25, 0.75]).unwrap()),
             [255, 0, 0, 255]
         );
+    }
+    #[test]
+    fn cube_maps_sample_the_requested_face() {
+        // One cube (Array size 1): six face surfaces, a 2x2 texture each, face f red = 40f.
+        let (m, resources, mut ram, _) = test_fixture();
+        set(&mut ram, 0x2040, (187 << 22) | 0x02); // texture, dimension cube
+        for face in 0..6u32 {
+            let plane = 0x2100 + face as usize * 32;
+            let texels = 0x4000 + face * 0x80;
+            let words = [(2 << 24) | (2 << 8) | 0x1a, 72, texels, 0, 64, 0, 128, 0x10001];
+            for (n, &w) in words.iter().enumerate() {
+                set(&mut ram, plane + n * 4, w);
+            }
+            for at in [0, 4, 64, 68] {
+                let at = texels as usize + at;
+                ram[at..at + 4].copy_from_slice(&[face as u8 * 40, 0, 0, 255]);
+            }
+        }
+        for face in 0..6u32 {
+            let mut code = crate::gpu_shader::Code::default();
+            let mut tlb = crate::gpu_shader::Tlb::default();
+            let mut textures = Cache::default();
+            let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+            // X: the face in bits 29-31 over s (Mesa bi_emit_texc_cube_coord)
+            let s = 0.5f32.to_bits();
+            let r = Request {
+                texture: (4, 0),
+                sampler: (3, 0),
+                dim: 3,
+                coords: [(face << 29) | (s & 0x1fff_ffff), 0.5f32.to_bits(), 0, 0],
+                integer: false,
+                layer: None,
+                reference: None,
+                offset: [0; 3],
+                lod: Lod::Explicit(0.),
+                gather: None,
+            };
+            let (v, _) = sample(&mut env, resources, &r).unwrap();
+            assert_eq!(bytes(v.map(f32::from_bits)), [face as u8 * 40, 0, 0, 255], "face {face}");
+        }
+    }
+    #[test]
+    fn far_out_coordinates_and_addresses_do_not_overflow() {
+        let (m, resources, mut ram, h) = test_fixture();
+        for uv in [[1e10, 0.5], [-1e30, 3e38], [f32::MAX, f32::MAX]] {
+            sample2d(&m, &mut ram, resources, h, uv).unwrap();
+        }
+        // a texel past the top of the address space (pointer + 68 wraps) reads as
+        // outside the texture
+        set(&mut ram, 0x2108, 0xffff_ffe0);
+        set(&mut ram, 0x210c, 0xffff_ffff);
+        assert_eq!(sample2d(&m, &mut ram, resources, h, [0.75, 0.75]), Ok([0.; 4]));
     }
     #[test]
     fn bilinear_centers_and_wrap_boundaries() {

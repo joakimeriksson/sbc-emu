@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn clamps_send_nan_to_the_lower_bound_and_minus_zero_to_plus_zero() {
+    // ISA.xml Clamp: clamp(NaN, 0, 1) = +0, clamp(NaN, -1, 1) = -1, clamp(-0, 0, 1) = +0
+    assert_eq!(clamp(3, f32::NAN).to_bits(), 0);
+    assert_eq!(clamp(1, f32::NAN).to_bits(), 0);
+    assert_eq!(clamp(2, f32::NAN), -1.);
+    assert_eq!(clamp(3, -0.).to_bits(), 0);
+    assert_eq!(clamp(1, -0.).to_bits(), 0);
+    assert_eq!([clamp(3, 2.), clamp(3, -2.), clamp(2, -2.), clamp(1, 7.)], [1., 0., -1., 7.]);
+    assert!(clamp(0, f32::NAN).is_nan());
+}
+
 mod base {
     use super::*;
     // Assembled with Mesa asm.py at 06efd8542f442e701685e26abe4d73c4ddf7b249.

@@ -222,8 +222,10 @@ impl Tiler {
         }
         let extended = (flags >> 22) & 3 == 2;
         let ids = draw_vertices(m, ram, r, flags)?;
+        // (no instances is a legal draw that draws nothing: glDrawElementsIndirect with
+        // instanceCount 0)
         let instances = r[34];
-        if instances == 0 || ids.len() as u64 * instances as u64 > DRAW_VERTICES as u64 {
+        if ids.len() as u64 * instances as u64 > DRAW_VERTICES as u64 {
             return Err(unsupported(6));
         }
         let ctx = reg(r, 40);
@@ -552,9 +554,13 @@ fn draw_vertices(
             3 => 4,
             _ => return Err(unsupported(6)),
         };
+        // r54 the index buffer, r39 its size in bytes, r35 the first index (Mesa's
+        // indirect draws load firstIndex there; direct draws pass 0 and offset r54)
         let bytes = r[33] as usize * width;
-        let address = reg(r, 54);
-        if address == 0 || address % width as u64 != 0 || bytes > r[39] as usize {
+        let skip = r[35] as u64 * width as u64;
+        let base = reg(r, 54);
+        let address = base.wrapping_add(skip);
+        if base == 0 || base % width as u64 != 0 || skip + bytes as u64 > r[39] as u64 {
             return Err(Stop::InvalidStream);
         }
         let mut indices = vec![0; bytes];

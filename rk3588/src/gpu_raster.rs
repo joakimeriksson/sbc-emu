@@ -825,6 +825,7 @@ impl Raster<'_, '_> {
                 frag_z: p.z,
                 frag_w: p.w,
                 point: p.point,
+                lane: k as u32,
                 ..Fragment::default()
             };
             f.sample_positions = self.fb.sample_positions;
@@ -888,6 +889,7 @@ impl Raster<'_, '_> {
                 }
                 let target = &self.fb.targets[rt];
                 let dst = self.tb.color[rt][i];
+                let blend = blend.for_bits(target.constant_bits());
                 self.tb.color[rt][i] = target.quantize(blend.apply_f(color, dst, true));
                 self.tb.touched = true;
             }

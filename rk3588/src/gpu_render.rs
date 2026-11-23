@@ -133,7 +133,24 @@ fn linear_to_srgb(c: f32) -> f32 {
         1.055 * c.powf(1. / 2.4) - 0.055
     }
 }
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
 impl Target {
+    /// Bits of the first channel of the format Mesa packs the blend constant for
+    /// (pack_blend_constant), by writeback format.
+    pub fn constant_bits(&self) -> u32 {
+        match self.format {
+            20 => 4,           // R4G4B4A4
+            21 | 28 | 29 => 5, // R5G6B5, R5G5B5A1, A1B5G5R5
+            24 | 25 => 10,     // R10G10B10A2, A2B10G10R10
+            _ => 8,
+        }
+    }
     pub fn quantize(&self, c: [f32; 4]) -> [f32; 4] {
         std::array::from_fn(|n| quantize(c[n], self.layout[n]))
     }
@@ -267,6 +284,13 @@ pub fn fragment_frame(
                 (v >> frac) as f32 / ((1u32 << int) - 1) as f32
             };
             shift += bits;
+        }
+        // Mesa packs an sRGB target's clear colour already encoded (pan_pack_color); the
+        // tile buffer holds linear values, encoded again at writeback.
+        if w1 & (1 << 14) != 0 {
+            for c in clear.iter_mut().take(3) {
+                *c = srgb_to_linear(*c);
+            }
         }
         let write_enable = w1 & 1 != 0;
         let block = (w1 >> 8) & 15;
