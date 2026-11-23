@@ -828,3 +828,40 @@ fn integer_conversions_round_in_the_instruction_s_mode() {
     // 65535 is past the largest half: infinity to nearest or up, 65504 toward zero or down.
     assert_eq!([0, 1, 2, 3].map(|rm| run(0x17, rm, 0xffff)), [0x7c00, 0x7c00, 0x7bff, 0x7bff]);
 }
+
+#[test]
+fn clper_takes_its_lane_within_the_subgroup_size() {
+    // CLPER.i32 r0 = r1 of the lane in u0 (inactive result umax), each lane's r1 = 100 +
+    // its lane ID; and MOV r2 = LANE_ID (special page 3, 0xe2).
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let run = |subgroup: u64, lane_op: u64, lane: u32| -> ([u32; 4], [u32; 4]) {
+        let clper = 0x00a0c00000000000u64 | (subgroup << 36) | (lane_op << 32) | (1 << 22) | (0xf << 16) | (0x80 << 8) | 1;
+        let id = 0x7e91c200000000e2u64;
+        let mut ram: Vec<u8> = [clper, id].iter().flat_map(|i| i.to_le_bytes()).collect();
+        let uniforms = [lane];
+        let (mut code, mut tlb, mut textures) = (Code::default(), Tlb::default(), crate::gpu_texture::Cache::default());
+        let mut env = Env::new(&m, &mut ram, &uniforms, &mut code, &mut tlb, &mut textures);
+        let mut lanes: [Shader; 4] = std::array::from_fn(|k| {
+            let mut s = Shader::new(0);
+            let mut f = Fragment::new([0, 0]);
+            f.lane = k as u32;
+            s.fragment = Some(f);
+            s.regs[1] = 100 + k as u32;
+            s
+        });
+        run_quad(&mut lanes, &mut env, 16).unwrap();
+        (std::array::from_fn(|k| lanes[k].regs[0]), std::array::from_fn(|k| lanes[k].regs[2]))
+    };
+    let x = u32::MAX;
+    assert_eq!(run(3, 0, 2), ([102; 4], [0, 1, 2, 3]));
+    // Mesa's derivatives use subgroup4: lane 5 is lane 1 of the quad.
+    assert_eq!(run(1, 0, 5).0, [101; 4]);
+    // Sixteen threads (Mesa's subgroup size): lanes 4-15 are outside the quad.
+    assert_eq!(run(3, 0, 5).0, [x; 4]);
+    // Pairs: lane 1 of each, the neighbour (xor), and accumulate out of the pair.
+    assert_eq!(run(0, 0, 1).0, [101, 101, 103, 103]);
+    assert_eq!(run(0, 0, 3).0, [101, 101, 103, 103]);
+    assert_eq!(run(0, 1, 1).0, [101, 100, 103, 102]);
+    assert_eq!(run(0, 2, 1).0, [101, x, 103, x]);
+    assert_eq!(run(1, 3, 1).0, [x, 100, 101, 102]);
+}

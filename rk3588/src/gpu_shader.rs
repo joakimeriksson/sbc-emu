@@ -1808,20 +1808,31 @@ impl Shader {
             0xfc00_fc00,
             0x7c00_7c00,
         ][bits(i, 22, 4) as usize];
+        // Subgroup size (bit 36: 2, 4, 8 or 16 threads): the lane is taken within the
+        // thread's subgroup; accumulate and shift that leave it read an inactive lane.
+        // The model runs fragment threads as 2x2 quads, lanes 0-3 of a 16-thread warp
+        // whose other lanes are inactive.
+        let size = match bits(i, 36, 4) {
+            s @ 0..=3 => 2u32 << s,
+            _ => return Err(None),
+        };
+        let lane = |me: u32| -> Option<usize> {
+            let base = me & !(size - 1);
+            let t = match bits(i, 32, 2) {
+                0 => base | (b & (size - 1)),
+                1 => base | ((me ^ b) & (size - 1)),
+                2 => me.wrapping_add(b),
+                _ => me.wrapping_sub(b),
+            };
+            (t >= base && t < base + size).then_some(t as usize)
+        };
         let Some(q) = quad else {
             // A lone thread is lane 0 of its subgroup; other lanes are inactive.
-            return if b == 0 { o.raw(0) } else { Ok(inactive) };
+            return if lane(0) == Some(0) { o.raw(0) } else { Ok(inactive) };
         };
-        let me = q.lane as u32;
-        let target = match bits(i, 32, 2) {
-            0 => b,
-            1 => me ^ b,
-            2 => me.wrapping_add(b),
-            _ => me.wrapping_sub(b),
-        } as usize;
-        if target >= 4 || !q.active[target] {
+        let Some(target) = lane(q.lane as u32).filter(|&t| t < 4 && q.active[t]) else {
             return Ok(inactive);
-        }
+        };
         if a_index >> 6 <= 1 {
             let r = a_index & 63;
             if !self.registers_available(r, 1) {
