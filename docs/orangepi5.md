@@ -97,7 +97,7 @@ Linux's own display driver then takes over, as on a real board: udev loads `rock
 - the GRF syscons;
 - the SCMI clocks and resets that the firmware provides over SMC.
 
-The emulated monitor's EDID (an HDMI sink with 2-channel audio) offers the three modes, preferring `--hdmi-mode`'s. Mode setting, vblank interrupts and page flips work; KMS clients such as Weston or `modetest` get the whole mode list. VOP2 composes its enabled Cluster and Esmart windows from linear ARGB/XRGB/ABGR/XBGR8888, RGB888 and RGB565 buffers, scaled to their display size. The VNC keyboard and pointer are the USB keyboard and tablet.
+The emulated monitor's EDID (an HDMI sink with 2-channel audio) offers the three modes, preferring `--hdmi-mode`'s. Mode setting, vblank interrupts and page flips work; KMS clients such as Weston or `modetest` get the whole mode list. VOP2 composes its enabled Cluster and Esmart windows from linear ARGB/XRGB/ABGR/XBGR8888, RGB888 and RGB565 buffers, scaled to their display size. Overlay planes go through VOP2's layer mixers as `rockchipdrm` sets them up: a format without alpha (XRGB) covers what is below, and one with alpha blends by the plane's pixel blend mode, pre-multiplied (the default) or coverage, and its global alpha. `tools/panthor-demo.py --planes --image <Armbian image>` shows such planes on the HDMI screen (`tests/gpu/rockchip-kms-planes.py`, KMS dumb buffers, no GPU). An XRGB plane on a Cluster window above another plane is mixed by its X byte, as Linux programs the Cluster mixers for every format. The VNC keyboard and pointer are the USB keyboard and tablet.
 
 Limits of the display chain:
 
