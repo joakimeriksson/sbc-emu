@@ -496,6 +496,34 @@ fn round(mode: u32, v: f32) -> f32 {
         _ => v.trunc(),
     }
 }
+/// `a * b + c` of binary16 values rounded once, to the nearest binary16 (ties to even), as
+/// an f32. (Through an f32 fused multiply-add it would round twice: to f32, then to f16.)
+fn fma_f16(a: f32, b: f32, c: f32) -> f32 {
+    if !(a.is_finite() && b.is_finite() && c.is_finite()) {
+        return half(pack_half(a.mul_add(b, c)));
+    }
+    // Every binary16 is a multiple of 2^-24, so the exact result is an integer number
+    // of 2^-48 (at most about 2^80).
+    let units = |v: f32| (v as f64 * (1u64 << 24) as f64) as i128;
+    let s = units(a) * units(b) + (units(c) << 24);
+    if s == 0 {
+        // An exact zero is -0 only for -0 + -0.
+        let product_negative = a.is_sign_negative() != b.is_sign_negative();
+        let both = (a == 0. || b == 0.) && product_negative && c.is_sign_negative();
+        return if both { -0. } else { 0. };
+    }
+    let mag = s.unsigned_abs();
+    // The result's unit in the last place: 2^k units (2^24, 2^-24, for subnormals).
+    let k = (127 - mag.leading_zeros()).saturating_sub(10).max(24);
+    let (mut q, rem, tie) = (mag >> k, mag & ((1 << k) - 1), 1u128 << (k - 1));
+    if rem > tie || rem == tie && q & 1 == 1 {
+        q += 1;
+    }
+    // Subnormals (k = 24) encode q itself; each step of k adds one to the exponent, and
+    // a carry into the next binade follows from the sum.
+    let bits = (((k - 24) as u128) << 10) + q;
+    half(bits.min(0x7c00) as u16 | if s < 0 { 0x8000 } else { 0 })
+}
 /// An exact value (an integer up to 2^32) as f32 in a rounding mode (Round mode: rte,
 /// rtp, rtn, rtz).
 fn to_f32_rounded(mode: u32, x: f64) -> f32 {
@@ -1261,10 +1289,7 @@ impl Shader {
             0x0b3 => {
                 let (a, b, c) = (o.v2f16(0)?, o.v2f16(1)?, o.v2f16(2)?);
                 let cl = bits(i, 32, 2);
-                f2h([
-                    clamp(cl, a[0].mul_add(b[0], c[0])),
-                    clamp(cl, a[1].mul_add(b[1], c[1])),
-                ])
+                f2h([clamp(cl, fma_f16(a[0], b[0], c[0])), clamp(cl, fma_f16(a[1], b[1], c[1]))])
             }
             0x0b4..=0x0b6 => self.shift(i, &o, op)?,
             0x0b8..=0x0ba => {

@@ -865,3 +865,33 @@ fn clper_takes_its_lane_within_the_subgroup_size() {
     assert_eq!(run(0, 2, 1).0, [101, x, 103, x]);
     assert_eq!(run(1, 3, 1).0, [x, 100, 101, 102]);
 }
+
+#[test]
+fn half_fma_rounds_once() {
+    let h = |v: f32| pack_half(v) as u32 * 0x10001;
+    let run = |a: f32, b: f32, c: f32| -> u32 {
+        // FMA.v2f16 r0 = u0 * u1 + u2
+        let i = 0x78b3c00000828180u64;
+        let mut ram = i.to_le_bytes().to_vec();
+        let m = AddressSpace { transtab: 0, transcfg: 2 };
+        let mut shader = Shader::new(0);
+        shader.run(&m, &mut ram, &[h(a), h(b), h(c)], 1).unwrap();
+        shader.regs[0] & 0xffff
+    };
+    // (1 + 2^-10) 2^-6 * (1 - 2^-10) 2^-5 + (1 + 2^-10) = 1 + 2^-10 + 2^-11 - 2^-31: just
+    // below the tie between 1 + 2^-10 and 1 + 2^-9. Through f32 it lands on the tie and
+    // went to the even 1 + 2^-9.
+    let (a, b, c) = ((1. + 2f32.powi(-10)) / 64., (1. - 2f32.powi(-10)) / 32., 1. + 2f32.powi(-10));
+    assert_eq!(run(a, b, c), 0x3c01);
+    assert_eq!(run(-a, b, -c), 0xbc01);
+    // Exact results, ties, subnormals, overflow, signed zeros and NaN.
+    assert_eq!(run(1.5, 2., 0.25), pack_half(3.25) as u32);
+    assert_eq!(run(1. + 2f32.powi(-10), 1., 2f32.powi(-11)), 0x3c02);
+    assert_eq!(run(2f32.powi(-14), 0.5, 0.), 0x0200);
+    assert_eq!(run(2f32.powi(-24), 0.5, 0.), 0);
+    assert_eq!(run(2f32.powi(-24), 0.75, 0.), 1);
+    assert_eq!(run(65504., 2., 0.), 0x7c00);
+    assert_eq!(run(-0., 1., -0.), 0x8000);
+    assert_eq!(run(1., -1., 1.), 0);
+    assert_eq!(run(f32::INFINITY, 0., 1.) & 0x7c00, 0x7c00);
+}
