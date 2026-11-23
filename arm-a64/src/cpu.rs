@@ -123,7 +123,7 @@ pub struct Cpu {
     /// entries but invalidated with one TLBI (Linux does that for huge pages), so a by-VA
     /// TLBI inside this range flushes everything.
     pub(crate) tlb_blocks: [(u64, u64); 2],
-    /// block JIT (AArch64 hosts); None = interpreter only
+    /// block JIT (AArch64 hosts, x86-64 Linux, WebAssembly); None = interpreter only
     pub jit: Option<Box<crate::jit::Jit>>,
     /// Physical pages any core of this machine has compiled code from (one bit each, shared by
     /// the cores, never cleared). IC IVAU on a page without its bit drops nothing anywhere, so it
