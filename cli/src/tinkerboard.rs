@@ -250,9 +250,12 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
         let blob = boot::prepare_device_tree(&dtb, ram as u64, cmdline, range)?;
         std::fs::write(path, blob).map_err(|e| e.to_string())?;
     }
-    let jit = !no_jit
-        && arm_a32::jit::available()
-        && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
+    let wanted = !no_jit && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
+    // `available` is false when the system refused the JIT executable memory
+    let jit = wanted && arm_a32::jit::available();
+    if wanted && arm_a32::jit::refused() {
+        eprintln!("[{tag}] warning: the system refuses writable and executable memory (SELinux deny_execmem, MemoryDenyWriteExecute?): no JIT, interpreting");
+    }
     let cores = if jit { "A32/T32 JIT" } else { "interpreter" };
     eprintln!("[{tag}] {} (cores: {cores}, one host thread)", profile.banner);
     serial_board::run(config, make_machine)

@@ -24,7 +24,8 @@
 //! Thumb code is compiled the same way (`jit_t32.rs`).
 //!
 //! In the browser (wasm32) the same blocks are compiled to WebAssembly instead
-//! (`jit_wasm.rs`).
+//! (`jit_wasm.rs`), and on x86-64 Linux hosts to x86-64 code (`jit_x64.rs`); both share the
+//! Thumb decoding and region scan in `jit_decode.rs`.
 use crate::cpu::Cpu;
 use crate::mmu::{utlb_table, Access, UT, U_EXEC, U_READ, U_WRITE};
 use emu_core::{Bus, Trap};
@@ -122,9 +123,88 @@ mod host {
     pub const AVAILABLE: bool = true;
 }
 
+/// x86-64 Linux: blocks are compiled by `jit_x64` into an RWX mapping (x86 keeps the
+/// instruction cache coherent with stores, so nothing needs synchronising).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod host {
+    use std::ffi::{c_int, c_void};
+    extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            off: i64,
+        ) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    }
+
+    /// Executable code buffer (bump allocated; reset as a whole).
+    pub struct CodeCache {
+        base: *mut u8,
+        size: usize,
+        used: usize,
+    }
+
+    impl CodeCache {
+        pub fn new(size: usize) -> Option<CodeCache> {
+            // PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS
+            // SAFETY: anonymous mapping chosen by the OS; failure is checked
+            let p = unsafe { mmap(std::ptr::null_mut(), size, 7, 0x0002 | 0x0020, -1, 0) };
+            if p as isize == -1 || p.is_null() {
+                return None;
+            }
+            Some(CodeCache {
+                base: p as *mut u8,
+                size,
+                used: 0,
+            })
+        }
+        pub fn reset(&mut self) {
+            self.used = 0;
+        }
+        /// AArch64 words have no use here (there is no native dispatcher).
+        pub fn write(&mut self, _words: &[u32]) -> Option<*const u8> {
+            None
+        }
+        /// Copy machine code in (16-byte aligned); returns its entry address.
+        pub fn write_bytes(&mut self, bytes: &[u8]) -> Option<*const u8> {
+            let off = self.used.next_multiple_of(16);
+            if off + bytes.len() > self.size {
+                return None;
+            }
+            // SAFETY: the range is inside the mapping, which is writable and executable
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len()) };
+            self.used = off + bytes.len();
+            Some(self.base.wrapping_add(off))
+        }
+    }
+
+    impl Drop for CodeCache {
+        fn drop(&mut self) {
+            // SAFETY: the mapping was created by `new` with this size
+            unsafe { munmap(self.base as *mut c_void, self.size) };
+        }
+    }
+
+    pub const AVAILABLE: bool = true;
+
+    /// Whether the system lets this process map writable and executable memory (SELinux
+    /// `deny_execmem`, PaX MPROTECT and systemd's `MemoryDenyWriteExecute` refuse it): one
+    /// mapping of the code cache's size, tried once.
+    pub fn usable() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| CodeCache::new(super::CODE_BYTES).is_some())
+    }
+}
+
 /// No native code buffer: the wasm32 build compiles through `jit_wasm` instead, other hosts
 /// interpret.
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
+#[cfg(not(any(
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+    all(target_arch = "x86_64", target_os = "linux")
+)))]
 mod host {
     pub struct CodeCache;
     impl CodeCache {
@@ -141,7 +221,16 @@ mod host {
 
 /// Whether this host can run compiled code.
 pub fn available() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    return host::usable();
+    #[allow(unreachable_code)]
     host::AVAILABLE
+}
+
+/// The host has a JIT backend but the system refused it executable memory: the cores
+/// interpret.
+pub fn refused() -> bool {
+    host::AVAILABLE && !available()
 }
 
 /// Physical pages of guest RAM that hold compiled code, shared by the cores of a machine.
@@ -339,13 +428,20 @@ impl Jit {
     /// (Re)write the dispatcher at the start of the code buffer.
     fn write_dispatcher(&mut self) {
         // wasm chains in `jit_run` instead
-        self.disp = if self.chain && !cfg!(target_arch = "wasm32") {
+        self.disp = if self.chain && cfg!(target_arch = "aarch64") {
             self.code
                 .write(&dispatcher(&ctx()))
                 .map_or(0, |p| p as usize)
         } else {
             0
         };
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if self.chain {
+            self.disp = self
+                .code
+                .write_bytes(&x64::dispatcher(&ctx()))
+                .map_or(0, |p| p as usize);
+        }
     }
 
     fn flush(&mut self) {
@@ -391,7 +487,8 @@ fn hot_slot(pc: u32) -> usize {
 }
 
 impl Cpu {
-    /// Compile hot ARM-state code (needs `set_ram` first and an AArch64 host). `watch`
+    /// Compile hot ARM-state code (needs `set_ram` first and an AArch64, x86-64 Linux or
+    /// wasm32 host). `watch`
     /// is shared by all cores of the machine. Returns whether the JIT is now on.
     pub fn enable_jit(&mut self, watch: Arc<CodeWatch>) -> bool {
         if self.ram.is_null() || !host::AVAILABLE {
@@ -618,6 +715,11 @@ impl Cpu {
         {
             let _ = pa;
             return self.compile_wasm(pc, privileged, thumb, code);
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let _ = pa;
+            return self.compile_x64(pc, privileged, thumb, code);
         }
         #[allow(unreachable_code)]
         let c = ctx();
@@ -2125,6 +2227,14 @@ mod t32;
 #[cfg(target_arch = "wasm32")]
 #[path = "jit_wasm.rs"]
 mod wasm;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "jit_x64.rs"]
+mod x64;
+
+#[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", target_os = "linux")))]
+#[path = "jit_decode.rs"]
+mod decode;
 
 /// Does this (conditional-space, interpreted) instruction always write the PC?
 fn writes_pc(insn: u32) -> bool {

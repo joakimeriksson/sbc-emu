@@ -102,6 +102,35 @@ as above, with the guest flags in wasm locals. In Node 26 on an M5:
 `node tools/wasm-a32-jit-diff.mjs` runs `arm-a32/tests/jit_diff.rs`'s random A32 and Thumb cases,
 straight-line and in loops, through the wasm backend against the interpreter.
 
+## The 32-bit Arm JIT on x86-64 hosts
+
+On x86-64 Linux, `arm-a32/src/jit_x64.rs` compiles the Orange Pi One's and the Tinker Board's
+A32/T32 code to x86-64. It translates the same regions and instructions as the WebAssembly backend
+(and so the same set as the native AArch64 one; VFP, NEON, exclusives and system instructions go
+to the interpreter one instruction at a time), with the Thumb decoding and region scan shared in
+`jit_decode.rs`. Guest registers stay in `Cpu::r` and are used as memory operands. The guest NZCV
+lives in r14 as an image of the host's EFLAGS bits (N = SF, Z = ZF, C = CF, V = OF): ADDS/ADCS
+keep the host flags as they are; x86 subtracts produce a borrow, so SUBS/SBCS/RSBS/RSCS complement
+CF first and SBC/RSC feed the inverted carry in as the borrow; logical operations with S take N and
+Z from the result and C from the shifter. Branches inside a region are direct jumps while the
+budget lasts, and region exits chain through a dispatcher like the AArch64 one. The encoder's
+output is checked against `llvm-mc` in its unit tests; `arm-a32/tests/jit_diff.rs` (random code,
+straight-line and in loops) and `jit_flags.rs` (every condition under every NZCV value, the
+add/subtract and shifter-carry edges) compare it with the interpreter.
+
+On an i9-12900F (pinned to the P-cores, the direct-boot fixtures; the interpreter one run, the JIT
+the best of three; the shell prompt comes after the same idle waits in both):
+
+| | Orange Pi One, interpreter | JIT | Tinker Board S, interpreter | JIT |
+|---|---|---|---|---|
+| kernel to the shell prompt | 37.0 s | 4.2 s | 108.3 s | 4.2 s |
+| BusyBox `while` loop, 200 000 rounds | 117.2 s | 4.8 s | 138.6 s | 5.3 s |
+| `md5sum /bin/busybox` 20 times | 6.1 s | 0.35 s | 5.9 s | 0.30 s |
+
+The unmodified Armbian images pass `scripts/orangepi-one-armbian.txt` (a Thumb-2 kernel, to the
+first-login wizard) and `scripts/tinkerboard-armbian.txt` in about 6.5 minutes each on the same
+host (about two of those minutes are systemd waiting for its random seed).
+
 ## The RV64 JIT (Orange Pi RV)
 
 `riscv64/src/jit.rs` drives a separate JIT for the RISC-V core with two code generators: RV64 to

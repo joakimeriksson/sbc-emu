@@ -12,6 +12,27 @@ pub const CODE: u32 = 0x1000;
 pub const DATA: u32 = 0x8000;
 pub const RAM: usize = 0x20000;
 
+/// Whether compiled code can run here; prints why `test` is skipped when not (no backend
+/// for this host, or the system refused the JIT executable memory).
+pub fn jit_ready(test: &str) -> bool {
+    if arm_a32::jit::available() {
+        return true;
+    }
+    let why = if arm_a32::jit::refused() { "the system refuses writable and executable memory" } else { "no JIT for this host" };
+    eprintln!("{test}: skipped ({why})");
+    false
+}
+
+/// Turn the JIT on for `cpu` (whose RAM is set); false, with a message, if it cannot map
+/// its code cache.
+pub fn try_enable_jit(cpu: &mut Cpu) -> bool {
+    if cpu.enable_jit(CodeWatch::new(0, RAM as u32)) {
+        return true;
+    }
+    eprintln!("skipped: the JIT could not map its code cache");
+    false
+}
+
 pub struct Rng(pub u64);
 impl Rng {
     pub fn next(&mut self) -> u32 {
