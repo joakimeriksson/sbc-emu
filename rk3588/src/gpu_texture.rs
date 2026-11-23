@@ -619,7 +619,9 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         // bi_emit_texc_cube_coord); faces are layers.
         let x = r.coords[0];
         // (the cube index clamps to the last cube before the face is added)
-        layer = layer.min(t.layers / 6 - 1) * 6 + (x >> 29).min(5);
+        // (the instruction's dimension, not the descriptor's: a non-cube texture has
+        // fewer than six layers, and the final clamp below keeps the layer in it)
+        layer = layer.min((t.layers / 6).max(1) - 1) * 6 + (x >> 29).min(5);
         c[0] = f32::from_bits((x & 0x1fff_ffff) | 0x2000_0000);
     }
     let (w0, h0, d0) = (t.width as f32, t.height as f32, t.depth as f32);
@@ -1040,6 +1042,34 @@ mod tests {
                     assert_eq!(bytes(v.map(f32::from_bits)), [red, 0, 0, 255], "cube {index} face {face} level {level}");
                 }
             }
+        }
+    }
+    #[test]
+    fn a_cube_sample_of_a_texture_with_fewer_than_six_layers_stays_in_it() {
+        // TEX with dimension cube on the fixture's one-layer 2D texture: face 5 of cube 3
+        // used to underflow the cube clamp (a host panic in debug builds).
+        let (m, resources, mut ram, _) = test_fixture();
+        for (face, index) in [(0u32, 0f32), (5, 0.), (5, 3.), (2, f32::NAN)] {
+            let mut code = crate::gpu_shader::Code::default();
+            let mut tlb = crate::gpu_shader::Tlb::default();
+            let mut textures = Cache::default();
+            let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+            let s = 0.25f32.to_bits();
+            let r = Request {
+                texture: (4, 0),
+                sampler: (3, 0),
+                dim: 3,
+                coords: [(face << 29) | (s & 0x1fff_ffff), 0.25f32.to_bits(), 0, 0],
+                integer: false,
+                layer: Some(index.to_bits()),
+                reference: None,
+                offset: [0; 3],
+                lod: Lod::Explicit(0.),
+                gather: None,
+            };
+            // The only layer: its texel at (0.25, 0.25) is red.
+            let (v, _) = sample(&mut env, resources, &r).unwrap();
+            assert_eq!(bytes(v.map(f32::from_bits)), [255, 0, 0, 255], "face {face} index {index}");
         }
     }
     #[test]
