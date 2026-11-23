@@ -27,8 +27,8 @@ impl Rng {
 
 /// Words that make interesting operands: special floats, small integers, halves.
 fn word(k: u64) -> u32 {
-    const SPECIAL: [u32; 24] = [
-        0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0xffc0_0001, 0x0000_0001, 0x8000_0001,
+    const SPECIAL: [u32; 26] = [
+        0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0xffc0_0001, 0x7f80_0001, 0xff80_0001, 0x0000_0001, 0x8000_0001,
         0x007f_ffff, 0x0080_0000, 0x4b00_0000, 0x4f00_0000, 0xcf00_0000, 0x3f00_0000, 1, 2, 31, 32, 0xffff, 0x8000, 0x7fff_ffff, 0xffff_ffff,
     ];
     let mut r = Rng(k.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);

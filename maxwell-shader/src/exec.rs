@@ -1518,6 +1518,8 @@ fn mufu<const N: usize>(x: [u32; N], md: Mod, op: Mufu) -> [u32; N] {
         Mufu::Rcp => f(v.map(|x| 1.0 / x)),
         Mufu::Rsq => f(v.map(|x| (1.0 / (x as f64).sqrt()) as f32)),
         Mufu::Sqrt => f(v.map(f32::sqrt)),
+        // (the high halves of doubles: left as the host makes them; the JIT computes them with
+        // the same code, so both agree, though a NaN's sign may differ between hosts)
         Mufu::Rcp64h => v.map(|x| ((1.0 / wide(x)).to_bits() >> 32) as u32),
         Mufu::Rsq64h => v.map(|x| ((1.0 / wide(x).sqrt()).to_bits() >> 32) as u32),
     }
