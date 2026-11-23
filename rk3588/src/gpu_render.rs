@@ -108,7 +108,7 @@ pub struct TileBuffer {
     pub color: Vec<Vec<[f32; 4]>>,
     pub depth: Vec<f32>,
     pub stencil: Vec<u8>,
-    /// Pixels a draw wrote, per render target.
+    /// Whether a draw wrote a pixel of any render target.
     pub touched: bool,
     /// A fragment worker's share: the rows y with (y / STRIPE) % parts == part, stored
     /// compacted from row `base` on (parts 1: every row).
@@ -118,7 +118,9 @@ pub struct TileBuffer {
 }
 /// Rows per stripe of a fragment worker (a multiple of the 2x2 quad).
 const STRIPE: u32 = 16;
-/// Host bytes of a tile buffer (per pixel 16 per written render target, depth and stencil).
+/// Host bytes of a tile buffer (per pixel 16 per written render target, depth and stencil),
+/// and at most what the spare storage keeps between jobs. (Fragment workers render their
+/// stripes in copies, so with workers a pass holds up to twice this at once.)
 const PASS_BYTES: usize = 64 << 20;
 /// Primitive and draw visits of a job rendered in passes (each pass visits all of them).
 const PASS_VISITS: usize = 1 << 26;
@@ -138,9 +140,13 @@ impl TileBuffer {
         (t.color, t.depth, t.stencil) = SPARE.take();
         t.color.resize_with(clears.len(), Vec::new);
         for (c, v) in t.color.iter_mut().zip(clears) {
-            c.clear();
-            if let Some(v) = v {
-                c.resize(count, *v);
+            match v {
+                Some(v) => {
+                    c.clear();
+                    c.resize(count, *v);
+                }
+                // (not just emptied: its storage would be kept for nothing)
+                None => *c = Vec::new(),
             }
         }
         t.depth.clear();
@@ -149,9 +155,15 @@ impl TileBuffer {
         t.stencil.resize(count, stencil);
         t
     }
-    /// Keep this buffer's storage for the next one.
+    /// Keep this buffer's storage for the next one, unless it holds more than PASS_BYTES
+    /// (storage grown by earlier, differently shaped buffers).
     fn recycle(self) {
-        SPARE.set((self.color, self.depth, self.stencil));
+        let bytes = self.color.iter().map(|c| c.capacity() * 16).sum::<usize>()
+            + self.depth.capacity() * 4
+            + self.stencil.capacity();
+        if bytes <= PASS_BYTES {
+            SPARE.set((self.color, self.depth, self.stencil));
+        }
     }
     pub fn new(x0: u32, y0: u32, w: u32, h: u32) -> Self {
         TileBuffer {
@@ -640,6 +652,10 @@ pub fn fragment_frame(
         let primitives: usize = frame.map_or(0, |f| f.draws.iter().map(|d| d.primitives.len()).sum());
         if passes > 1 && (primitives + draws).saturating_mul(passes) > pass_visits {
             return Err(limit("primitives times passes of rows"));
+        }
+        // Occlusion results are written after the pixels: check their addresses first.
+        if let Some(frame) = frame {
+            crate::gpu_raster::check_occlusion(m, ram, frame)?;
         }
         let mut budget = crate::gpu_raster::BUDGET.with(|b| b.get()).unwrap_or(crate::gpu_raster::FRAME_BUDGET);
         let mut counts = vec![0u64; draws];

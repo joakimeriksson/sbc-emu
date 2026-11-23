@@ -111,7 +111,7 @@ fn limit(what: &str) -> Stop {
 /// per thread.
 const DRAW_VERTICES: usize = 1 << 20;
 const FRAME_VERTICES: usize = 1 << 22;
-const FRAME_PRIMITIVES: usize = 1 << 22;
+const FRAME_PRIMITIVES: usize = 1 << 23;
 const FRAME_BYTES: usize = 256 << 20;
 const DRAW_BUDGET: usize = 1 << 28;
 const THREAD_BUDGET: usize = 1 << 16;
@@ -431,6 +431,9 @@ impl Tiler {
             draws: Vec::new(),
             vertices: 0,
         });
+        // (held bytes count lengths: no spare capacity)
+        primitives.shrink_to_fit();
+        point_sizes.shrink_to_fit();
         let draw = Draw {
             regs: *r,
             instruction,

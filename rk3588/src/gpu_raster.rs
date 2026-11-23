@@ -441,6 +441,16 @@ pub fn draw(
     Ok(())
 }
 
+/// Check that the draws' occlusion query results can be written.
+pub fn check_occlusion(m: &AddressSpace, ram: &[u8], frame: &Frame) -> Result<(), Stop> {
+    for draw in &frame.draws {
+        if let Some((address, _)) = State::occlusion(draw) {
+            m.chunks(ram, address, 8, crate::gpu_mmu::Access::Write, true).map_err(Stop::Memory)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write the draws' occlusion query results.
 pub fn occlusion(m: &AddressSpace, ram: &mut [u8], frame: &Frame, counts: &[u64]) -> Result<(), Stop> {
     for (draw, &count) in frame.draws.iter().zip(counts) {
@@ -831,7 +841,9 @@ impl Raster<'_, '_> {
             let t = ((cx - a[0]) * d[0] + (cy - a[1]) * d[1]) / len2;
             let dist = ((cx - a[0]) * d[1] - (cy - a[1]) * d[0]).abs() / len;
             let inside = (0. ..1.).contains(&t) && dist <= width / 2.;
-            // The position along the original segment (before clipping at w = 0).
+            // The position along the original segment (before clipping at w = 0). Exact
+            // at the ends; in between it is linear in screen space, where the segment's
+            // perspective would make it slightly nonlinear when one end was clipped.
             let u = ends[0] + (ends[1] - ends[0]) * t;
             Pixel {
                 covered: inside,
@@ -1097,6 +1109,7 @@ impl Raster<'_, '_> {
                 }
                 let Some(color) = f.color[slot] else { continue };
                 if self.tb.color[rt].is_empty() {
+                    self.tb.touched = true;
                     continue; // not written back
                 }
                 if color.iter().any(|v| v.is_nan()) {

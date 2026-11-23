@@ -262,3 +262,22 @@ fn the_tile_buffer_of_a_huge_box_stays_bounded() {
     let kept = spare_bytes();
     assert!(kept > 0 && kept <= PASS_BYTES, "{kept}");
 }
+#[test]
+fn the_spare_tile_storage_stays_within_a_pass() {
+    // Pass-sized buffers of eight targets where a different single one is written each
+    // job: the targets that are not written keep no storage, and the spare never holds
+    // more than PASS_BYTES.
+    let w = 8192u32;
+    let h = (PASS_BYTES / 21 / w as usize) as u32;
+    for k in 0..8 {
+        let clears: Vec<Option<[f32; 4]>> = (0..8).map(|n| (n == k).then_some([0.; 4])).collect();
+        TileBuffer::cleared(0, 0, w, h, &clears, 1., 0).recycle();
+        assert!(spare_bytes() <= PASS_BYTES, "{}", spare_bytes());
+    }
+    // Storage grown past PASS_BYTES by differently shaped buffers is not kept.
+    let tall = TileBuffer::cleared(0, 0, w, h, &[Some([0.; 4])], 1., 0);
+    let mut wide = TileBuffer::cleared(0, 0, w, h, &[None, Some([0.; 4])], 1., 0);
+    wide.color[0] = tall.color[0].clone();
+    wide.recycle();
+    assert!(spare_bytes() <= PASS_BYTES, "{}", spare_bytes());
+}

@@ -789,12 +789,14 @@ fn enlarge(ram: &mut [u8], r: &mut [u32; 256], f: &mut [u32; 256], (w, h): (u32,
         put(ram, 0xd0a8, &[w * 4]);
     }
 }
-/// Render two overlapping draws with depth and an occlusion counter into a 32x48 target,
-/// with `pass` forced: the target's bytes and the counter.
-fn passes(pass: Option<(usize, usize)>, tiled: bool) -> Result<(Vec<u8>, u64), Stop> {
+/// Render two overlapping draws with depth and an occlusion counter into a 32x48 target
+/// whose box starts at `min` (x | y << 16), with `pass` and the fragment workers (`bands`)
+/// forced: the target's bytes and the counter.
+fn passes_at(pass: Option<(usize, usize)>, tiled: bool, min: u32, bands: Option<(usize, u32)>) -> Result<(Vec<u8>, u64), Stop> {
     let (m, mut ram, mut r) = fixture();
     let mut f = coloured(&mut ram, &mut r);
     enlarge(&mut ram, &mut r, &mut f, (32, 48), tiled);
+    f[42] = min;
     put(&mut ram, 0x5400, &[7, 0, 0, 0, (1 << 29) | (1 << 27)]);
     r[52] = 0x5400;
     r[57] |= 3 << 14;
@@ -806,10 +808,29 @@ fn passes(pass: Option<(usize, usize)>, tiled: bool) -> Result<(Vec<u8>, u64), S
     ram[0x4008..0x400c].copy_from_slice(&0f32.to_le_bytes());
     draw(&mut t, &m, &mut ram, &mut r, 0.25, [half(0.) | half(1.) << 16, half(1.) << 16], 0x7108);
     crate::gpu_render::PASS.with(|p| p.set(pass));
+    crate::gpu_raster::BANDS.with(|p| p.set(bands));
     let result = t.fragment(&m, &mut ram, &f, (0, 0));
     crate::gpu_render::PASS.with(|p| p.set(None));
+    crate::gpu_raster::BANDS.with(|p| p.set(None));
     result?;
     Ok((ram[0xe000..0xe000 + 32 * 48 * 4].to_vec(), u64::from_le_bytes(ram[0x1f800..0x1f808].try_into().unwrap())))
+}
+fn passes(pass: Option<(usize, usize)>, tiled: bool) -> Result<(Vec<u8>, u64), Stop> {
+    passes_at(pass, tiled, 0, None)
+}
+#[test]
+fn passes_with_an_odd_box_start_and_fragment_workers_match_one_pass() {
+    for tiled in [false, true] {
+        for min in [0u32, (5 << 16) | 3, (17 << 16) | 1, 31 << 16] {
+            let whole = passes_at(None, tiled, min, Some((1, 16))).unwrap();
+            for pass in [Some((32 * 21 * 16, 1 << 20)), Some((32 * 21 * 32, 1 << 20))] {
+                for bands in [Some((1, 16)), Some((4, 4)), Some((2, 2))] {
+                    let p = passes_at(pass, tiled, min, bands).unwrap();
+                    assert_eq!(p, whole, "tiled {tiled} min {min:x} pass {pass:?} bands {bands:?}");
+                }
+            }
+        }
+    }
 }
 #[test]
 fn a_large_box_renders_in_passes_of_rows_with_the_same_result() {
@@ -836,6 +857,16 @@ fn a_large_box_renders_in_passes_of_rows_with_the_same_result() {
     // Every pass visits every primitive: too many visits is a job error, before any
     // pixel is written.
     assert!(matches!(passes(Some((32 * 21 * 16, 5)), false), Err(Stop::Unsupported { .. })));
+    // So is an occlusion query that cannot be written.
+    let (m, mut ram, mut r) = fixture();
+    let f = coloured(&mut ram, &mut r);
+    r[57] |= 3 << 14;
+    r[46] = 0x10_0000;
+    let mut t = Tiler::default();
+    draw(&mut t, &m, &mut ram, &mut r, 0.5, [0x3c00, 0x3c00 << 16], 0x7100);
+    let before = ram.clone();
+    assert!(matches!(t.fragment(&m, &mut ram, &f, (0, 0)), Err(Stop::Memory(_))));
+    assert_eq!(ram, before);
 }
 /// The lowest budget a fragment job of `frame` succeeds with (`frame` None: the tiler's).
 fn least_budget(job: impl Fn(u64) -> bool) -> u64 {
