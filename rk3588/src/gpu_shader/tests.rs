@@ -796,3 +796,35 @@ fn a_restarted_thread_does_not_see_the_previous_threads_registers() {
     s.restart(0x200, RegisterAllocation::Registers32);
     assert_eq!((s.pc, s.regs), (0x200, [0; 64]));
 }
+
+#[test]
+fn integer_conversions_round_in_the_instruction_s_mode() {
+    // S32_TO_F32, U32_TO_F32, V2S16_TO_V2F16, V2U16_TO_V2F16 (CVT 0x90, round mode at 30).
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let run = |sub: u64, rm: u64, u: u32| -> u32 {
+        // (the 16-bit forms read both halves: swizzle h01 at bit 36)
+        let swizzle = if sub & 0xf == 7 { 2 << 36 } else { 0 };
+        let i = 0x7890c00000000080u64 | (sub << 16) | (rm << 30) | swizzle;
+        let mut ram = i.to_le_bytes().to_vec();
+        let mut shader = Shader::new(0);
+        shader.run(&m, &mut ram, &[u], 1).unwrap();
+        shader.regs[0]
+    };
+    let f = |v: f32| v.to_bits();
+    // 2^24 + 1 lies between two floats: rte, rtp, rtn, rtz.
+    assert_eq!([0, 1, 2, 3].map(|rm| run(0x09, rm, 16777217)), [16777216., 16777218., 16777216., 16777216.].map(f));
+    assert_eq!(
+        [0, 1, 2, 3].map(|rm| run(0x09, rm, -16777217i32 as u32)),
+        [-16777216., -16777216., -16777218., -16777216.].map(f)
+    );
+    assert_eq!([0, 1, 3].map(|rm| run(0x19, rm, u32::MAX)), [4294967296., 4294967296., 4294967040.].map(f));
+    // 2049 lies between two halves (2048, 2050).
+    let h = |v: f32| pack_half(v) as u32;
+    let lanes = 2049u32 | ((-2049i16 as u16 as u32) << 16);
+    assert_eq!(run(0x07, 0, lanes), h(2048.) | h(-2048.) << 16);
+    assert_eq!(run(0x07, 1, lanes), h(2050.) | h(-2048.) << 16);
+    assert_eq!(run(0x07, 2, lanes), h(2048.) | h(-2050.) << 16);
+    assert_eq!(run(0x07, 3, lanes), h(2048.) | h(-2048.) << 16);
+    // 65535 is past the largest half: infinity to nearest or up, 65504 toward zero or down.
+    assert_eq!([0, 1, 2, 3].map(|rm| run(0x17, rm, 0xffff)), [0x7c00, 0x7c00, 0x7bff, 0x7bff]);
+}

@@ -496,6 +496,37 @@ fn round(mode: u32, v: f32) -> f32 {
         _ => v.trunc(),
     }
 }
+/// An exact value (an integer up to 2^32) as f32 in a rounding mode (Round mode: rte,
+/// rtp, rtn, rtz).
+fn to_f32_rounded(mode: u32, x: f64) -> f32 {
+    let r = x as f32; // nearest, ties to even
+    match mode {
+        1 if (r as f64) < x => r.next_up(),
+        2 if (r as f64) > x => r.next_down(),
+        3 if (r as f64).abs() > x.abs() => if x > 0. { r.next_down() } else { r.next_up() },
+        _ => r,
+    }
+}
+/// An f32 as binary16 in a rounding mode (overflow saturates to the largest finite value
+/// where the mode rounds toward it).
+fn to_f16_rounded(mode: u32, x: f32) -> u16 {
+    let h = pack_half(x);
+    if x.is_nan() || mode == 0 {
+        return h;
+    }
+    let back = half(h);
+    // One step of the magnitude toward zero or away from it.
+    let toward_zero = |h: u16| if h & 0x7fff == 0 { h } else { h - 1 };
+    let away = |h: u16| h + 1;
+    let up = |h: u16| if h & 0x8000 == 0 { away(h) } else if h == 0x8000 { 1 } else { toward_zero(h) };
+    let down = |h: u16| if h & 0x8000 != 0 { away(h) } else if h == 0 { 0x8001 } else { toward_zero(h) };
+    match mode {
+        1 if back < x => up(h),
+        2 if back > x => down(h),
+        3 if back.abs() > x.abs() => toward_zero(h),
+        _ => h,
+    }
+}
 /// `x * 2^e` without intermediate overflow.
 fn ldexp(x: f32, e: i32) -> f32 {
     (x as f64 * 2f64.powi(e.clamp(-400, 400))) as f32
@@ -1424,18 +1455,16 @@ impl Shader {
             0x04 => sext(swz_lo(o)?, 16) as u32,
             0x05 => (sext(swz_lo(o)?, 16) as f32).to_bits(),
             0x07 | 0x17 => {
+                // 16-bit integers are exact in f32; to binary16 in the rounding mode.
                 let h = o.v2i16w(0, sub == 0x07)?;
                 let c = |x: u32| {
-                    if sub == 0x07 {
-                        x as u16 as i16 as f32
-                    } else {
-                        x as f32
-                    }
+                    let v = if sub == 0x07 { x as u16 as i16 as f32 } else { x as f32 };
+                    to_f16_rounded(rm, v) as u32
                 };
-                f2h([round(rm, c(h[0])), round(rm, c(h[1]))])
+                pack2(c(h[0]), c(h[1]))
             }
-            0x09 => (o.i32w(0, true)? as i32 as f32).to_bits(),
-            0x19 => (o.i32w(0, false)? as f32).to_bits(),
+            0x09 => to_f32_rounded(rm, o.i32w(0, true)? as i32 as f64).to_bits(),
+            0x19 => to_f32_rounded(rm, o.i32w(0, false)? as f64).to_bits(),
             0x0a | 0x1a => {
                 let h = o.v2f16(0)?;
                 f32_to_int(h[0], rm, sub == 0x0a)
