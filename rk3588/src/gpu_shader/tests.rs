@@ -413,6 +413,19 @@ mod fragment_tests {
             assert_eq!(shader.regs, before);
         }
     }
+    #[test]
+    fn var_tex_with_an_explicit_lod_mode_is_rejected() {
+        // VAR_TEX_SINGLE (0x138) has no staging LOD: LOD mode 4 used to panic the host.
+        let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+        let i = (0x4128009413c02042u64 & !(0x1ff << 48) & !(7 << 13)) | (0x138 << 48) | (4 << 13);
+        ram[..8].copy_from_slice(&i.to_le_bytes());
+        let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+        shader.resources = resources;
+        shader.fragment = Some(Fragment::new([0x19, 237 << 12]));
+        shader.interpolation = Some(interpolation_fixture());
+        shader.regs[2] = h;
+        assert!(shader.run(&m, &mut ram, &[], 1).is_err());
+    }
     fn interpolation_fixture() -> Interpolation {
         let values = [0f32, 1., 0., 0., 0.5, 0.5, 0., 0., 1., 0., 0., 0.];
         Interpolation {
