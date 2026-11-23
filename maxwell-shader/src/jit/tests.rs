@@ -34,7 +34,7 @@ fn long_runs_are_cut() {
     let mut l = Lanes::<LANES>::new();
     l.start(&p, 0xffff, 0);
     for k in 0..255 {
-        l.gpr[k] = std::array::from_fn(|i| (k * 977 + i * 13) as u32 * 0x9e37_79b9);
+        l.gpr[k] = std::array::from_fn(|i| ((k * 977 + i * 13) as u32).wrapping_mul(0x9e37_79b9));
     }
     let (mut gpr, mut pred) = (l.gpr.clone(), l.pred);
     let frame = Frame::default();
