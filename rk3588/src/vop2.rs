@@ -13,6 +13,24 @@
 //! source colour pre-multiplied or not (the plane's "pixel blend mode": "Pre-multiplied" or
 //! "Coverage"), and the source and destination factors. A mixer Linux has not set up (its
 //! ALPHA_EN clear) lets the upper layer cover what is below.
+//!
+//! An overlay mixer works on the whole picture, not only under its upper window: outside it
+//! the source is empty (colour and alpha 0), so the mixer applies only its destination terms.
+//! For what Linux usually sets up that leaves the picture as it is, but with a bottom plane
+//! whose global alpha is below opaque (`Cd = Cs + (1 - As) Cd Agd`) the whole bottom plane is
+//! dimmed, not only the part under the upper window. The HDR0 mixer (0x6c0) comes last when
+//! Linux enables it (only for such a bottom plane): the mixed picture (its source) over the
+//! black background.
+//!
+//! The Cluster windows have no XRGB format: XRGB8888 and ARGB8888 are one format code, and
+//! no window register tells them apart. Whether the X byte counts as alpha is decided by the
+//! mixers alone, so an XRGB plane on a Cluster window above another plane is mixed by its X
+//! byte when the mixers say per-pixel alpha, as mainline Linux sets them up for every Cluster
+//! format ("Mix output data only have pixel alpha"). Rockchip's own kernel sets the Cluster
+//! mixer of a format without alpha to pass on the global alpha instead (its
+//! `vop2_setup_cluster_alpha`, `dst_pixel_alpha_en = is_alpha_support(format)`), and then the
+//! plane covers. Treating a Cluster window's alpha byte as opaque here would break ARGB
+//! planes on Cluster windows, which look the same to the hardware (issue #54).
 
 pub const BASE: u64 = 0xfdd9_0000;
 pub const SIZE: u64 = 0x4200;
@@ -46,6 +64,9 @@ const VACT: u64 = 0x54;
 const CLUSTER0_MIX: u64 = 0x610;
 /// The overlay mixers of layers 1 up, 0x10 apart (layer n uses MIX n-1 on VP0).
 const MIX0: u64 = 0x650;
+/// VP0's HDR mixer, after the overlay mixers: Linux sets it up only for a bottom plane with
+/// global alpha below opaque ("Transfer pixel alpha to hdr mix"), else writes 0.
+const HDR0_MIX: u64 = 0x6c0;
 
 /// A window: register base, whether it is a Cluster (else Esmart), its layer select ID and
 /// the position of its 2-bit field in OVL_PORT_SEL.
@@ -266,6 +287,22 @@ impl Vop2 {
             let cluster = WINDOWS[k].1.then(|| self.mixer(CLUSTER0_MIX + 0x10 * k as u64)).filter(|m| m.enabled && !m.passes_dst());
             // the lowest layer is drawn as is, the others through their overlay mixer
             let ovl = (n > 0 && layer > 0).then(|| self.mixer(MIX0 + 0x10 * u64::from(layer - 1))).filter(|m| m.enabled);
+            // the mixer also acts where the window is not, with an empty source: usually that
+            // keeps what is below, but not for a bottom plane with global alpha (Cd x Agd)
+            if let Some(m) = ovl.filter(|m| !m.empty_keeps_dst()) {
+                let (x0, y0) = (win.pos.0.min(w), win.pos.1.min(h));
+                let (x1, y1) = ((win.pos.0 + win.dst.0).min(w), (win.pos.1 + win.dst.1).min(h));
+                for y in 0..h {
+                    for x in 0..w {
+                        if (y0..y1).contains(&y) && (x0..x1).contains(&x) {
+                            continue;
+                        }
+                        let d = &mut out[((y * w + x) * 4) as usize..][..4];
+                        let m = m.mix_empty([d[0], d[1], d[2], d[3]]);
+                        d.copy_from_slice(&m);
+                    }
+                }
+            }
             for dy in 0..win.dst.1 {
                 let y = win.pos.1 + dy;
                 if y >= h {
@@ -306,6 +343,14 @@ impl Vop2 {
                 }
             }
         }
+        // the HDR mixer: the mixed layers over the (black) background
+        let hdr = self.mixer(HDR0_MIX);
+        if hdr.enabled {
+            for px in out.chunks_exact_mut(4) {
+                let m = hdr.mix([px[0], px[1], px[2], px[3]], [0; 4]);
+                px.copy_from_slice(&m);
+            }
+        }
         // (the 4th byte held the mixers' alpha; the monitor shows colour only)
         for px in out.chunks_exact_mut(4) {
             px[3] = 255;
@@ -320,6 +365,19 @@ impl Vop2 {
 /// pre-multiplied, 1: multiply it by its alpha), [1] alpha mode (1: inverted), [3:2] blend mode
 /// (0: global alpha, 1: per-pixel alpha, 2: per-pixel times global), [7:5] factor, [8] alpha
 /// enable (in SRC_COLOR), [23:16] global alpha. The global alphas are the colour registers'.
+///
+/// The colour mode and the factor are two separate multiplies. "Multiply by its alpha" uses
+/// the alpha the blend mode selects (pixel, global, or both), and the factor comes on top.
+/// Rockchip's kernel relies on that in `vop2_setup_cluster_alpha`: it sets a Cluster's win0
+/// to "not pre-multiplied" with blend mode "global" to get `Cd x Agd` ("global need to do
+/// Cd * Ad0, Ad0 = global"), and to "per-pixel times global" to get `Cd x Ad x Agd`; its
+/// Dolby Vision path says colour mode "not pre-multiplied" with factor one is "roughly
+/// equal" to "pre-multiplied" with factor 4 (source alpha). So for a plane without pixel
+/// alpha in "Coverage" mode with global alpha Ag, where Linux's `vop2_parse_alpha` sets
+/// blend "global", colour mode "not pre-multiplied" and factor "source global alpha", the
+/// colour is Cs x Ag x Ag and the result `Ag^2 Cs + (1 - Ag) Cd`, not DRM's
+/// `Ag Cs + (1 - Ag) Cd`: that is what the hardware does with those registers. In the
+/// default "Pre-multiplied" mode the colour is not multiplied and the result is DRM's.
 #[derive(Clone, Copy)]
 struct Mixer {
     enabled: bool,
@@ -367,10 +425,26 @@ impl Mixer {
 
     /// `src` mixed over `dst` (both r, g, b, alpha).
     fn mix(&self, src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+        self.blend(Some(src), dst)
+    }
+
+    /// What the mixer makes of `dst` where its upper layer has no window: an empty source,
+    /// colour and alpha 0 whatever the blend mode (its global alpha does not reach there).
+    fn mix_empty(&self, dst: [u8; 4]) -> [u8; 4] {
+        self.blend(None, dst)
+    }
+
+    fn blend(&self, src: Option<[u8; 4]>, dst: [u8; 4]) -> [u8; 4] {
         let [sc, dc, sa, da] = &self.ctrl;
         let [gs, gd] = self.glb;
-        let (ps, pd) = (u32::from(src[3]), u32::from(dst[3]));
-        let (a_s, a_d) = (sc.alpha(ps, gs), dc.alpha(pd, gd));
+        let pd = u32::from(dst[3]);
+        // (the source's colour alpha, and its alpha for the alpha output)
+        let (a_s, src_alpha) = match src {
+            Some(s) => (sc.alpha(u32::from(s[3]), gs), sa.alpha(u32::from(s[3]), gs)),
+            None => (0, 0),
+        };
+        let src = src.unwrap_or([0; 4]);
+        let a_d = dc.alpha(pd, gd);
         // colour factors: source (zero, one, dst alpha, 1 - dst alpha, src alpha, src global),
         // destination (zero, one, src alpha, 1 - src alpha, dst alpha, dst global)
         let fs = match sc.factor { 1 => 255, 2 => a_d, 3 => 255 - a_d, 4 => a_s, 5 => gs, _ => 0 };
@@ -383,8 +457,23 @@ impl Mixer {
         }
         // alpha factors: zero, one, src alpha, 1 - src alpha, src global
         let f = |c: &Ctrl| match c.factor { 1 => 255, 2 => a_s, 3 => 255 - a_s, 4 => gs, _ => 0 };
-        out[3] = (mul(sa.alpha(ps, gs), f(sa)) + mul(da.alpha(pd, gd), f(da))).min(255) as u8;
+        out[3] = (mul(src_alpha, f(sa)) + mul(da.alpha(pd, gd), f(da))).min(255) as u8;
         out
+    }
+
+    /// An empty source (`mix_empty`) leaves any destination unchanged: what Linux sets up for
+    /// every overlay mixer except the one above a bottom plane with global alpha.
+    fn empty_keeps_dst(&self) -> bool {
+        let [_, dc, _, da] = &self.ctrl;
+        let [gs, gd] = self.glb;
+        // the destination alpha is 255 whatever the pixel
+        let a_d_one = dc.blend == 0 && gd == 255;
+        // colour: Cd x (its alpha, if not pre-multiplied) x the destination factor (with the
+        // source alpha 0: one, 1 - src alpha, dst alpha, dst global), all 1
+        let colour = (!dc.mul_alpha || a_d_one) && match dc.factor { 1 | 3 => true, 4 => a_d_one, 5 => gd == 255, _ => false };
+        // alpha: the destination's pixel alpha times one, 1 - src alpha or src global
+        let alpha = !da.inverted && da.blend == 1 && match da.factor { 1 | 3 => true, 4 => gs == 255, _ => false };
+        colour && alpha
     }
 
     /// An all-zero source mixed over any destination gives the destination unchanged (a
@@ -644,6 +733,192 @@ mod tests {
         v.render(&ram, &mut out);
         assert_eq!(pixel(&out, 120, 120), [0x10, 0x20, 0x30, 255]);
         assert_eq!(pixel(&out, 10, 10), [0xff, 0xff, 0xff, 255]);
+    }
+
+    /// DRM's blend of one colour channel (all values 0..255): "Pre-multiplied" gives
+    /// `Ag Cs + (1 - Ag As) Cd`, "Coverage" gives `Ag As Cs + (1 - Ag As) Cd`.
+    fn drm_blend(premulti: bool, cs: u8, a_s: u8, ag: u8, cd: f64) -> f64 {
+        let (cs, a_s, ag) = (f64::from(cs), f64::from(a_s) / 255.0, f64::from(ag) / 255.0);
+        if premulti { ag * cs + (1.0 - ag * a_s) * cd } else { ag * a_s * cs + (1.0 - ag * a_s) * cd }
+    }
+
+    /// The pixel is grey `v` within 1 (8-bit rounding in the mixers).
+    fn assert_grey(px: [u8; 4], v: f64) {
+        for c in &px[..3] {
+            assert!((f64::from(*c) - v).abs() <= 1.0, "{px:?}, expected {v:.2}");
+        }
+    }
+
+    fn fill(ram: &mut [u8], addr: u32, pixels: usize, px: u32) {
+        for i in 0..pixels {
+            ram[addr as usize + 4 * i..][..4].copy_from_slice(&px.to_le_bytes());
+        }
+    }
+
+    /// Esmart1 full-screen (1280x720 at 0x10_0000) at the bottom, filled with `under`.
+    fn esmart1_bottom(v: &mut Vop2, ram: &mut [u8], under: u32) {
+        fill(ram, 0x10_0000, 1280 * 720, under);
+        let b = 0x1a00;
+        v.write(b + 0x14, 0x10_0000, 0);
+        v.write(b + 0x1c, 1280, 0);
+        v.write(b + 0x20, 719 << 16 | 1279, 0);
+        v.write(b + 0x24, 719 << 16 | 1279, 0);
+        v.write(b + 0x10, 1, 0);
+    }
+
+    /// Cluster1 as a 64x64 window at (100, 100), filled with `over` (format 0: ARGB8888 and
+    /// XRGB8888 alike), and Cluster0 off.
+    fn cluster1_overlay(v: &mut Vop2, ram: &mut [u8], over: u32) {
+        let ov = 0x60_0000u32;
+        fill(ram, ov, 64 * 64, over);
+        v.write(0x1000, 0, 0);
+        let b = 0x1200;
+        v.write(b + 0x100, 1, 0);
+        v.write(b + 0x10, ov, 0);
+        v.write(b + 0x18, 64, 0);
+        v.write(b + 0x20, 63 << 16 | 63, 0);
+        v.write(b + 0x24, 63 << 16 | 63, 0);
+        v.write(b + 0x28, 100 << 16 | 100, 0);
+        v.write(b, 1, 0);
+    }
+
+    /// Esmart1 at the bottom, Cluster1 above it, the mixers as mainline sets them up for a
+    /// Cluster plane at zpos 1: its Cluster mixer with the plane's global alpha `ag`, then MIX0
+    /// with per-pixel alpha ("Mix output data only have pixel alpha").
+    fn cluster_overlay_scene(ram: &mut [u8], premulti: bool, ag: u32, under: u32, over: u32) -> Vop2 {
+        let mut v = Vop2::default();
+        modeset(&mut v, 0x10_0000);
+        esmart1_bottom(&mut v, ram, under);
+        cluster1_overlay(&mut v, ram, over);
+        v.write(OVL_LAYER_SEL, 0x7654_2013, 0); // layer 0 Esmart1, layer 1 Cluster1
+        v.write(OVL_PORT_SEL, 0x7881, 0);
+        write_mixer(&mut v, CLUSTER0_MIX + 0x10, parse_alpha(false, false, false, true, 0, ag));
+        write_mixer(&mut v, MIX0, parse_alpha(premulti, true, true, true, 0xff, 0xff));
+        v
+    }
+
+    /// A Cluster window as an overlay plane: ARGB grey 0x40 at alpha 0x80 over white, with
+    /// and without the plane's global alpha, in both blend modes, as DRM defines them. The
+    /// exception is "Coverage" with global alpha: the Cluster mixer multiplies the colour by
+    /// Ag (to make it pre-multiplied), and MIX0, told the colour is not pre-multiplied,
+    /// multiplies it by its alpha As x Ag again: `Ag^2 As Cs + (1 - Ag As) Cd`. Rockchip's
+    /// kernel avoids that by telling MIX0 that Cluster data is always pre-multiplied.
+    #[test]
+    fn cluster_window_as_an_overlay_plane() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        for (premulti, ag) in [(true, 0xff), (false, 0xff), (true, 0x80), (false, 0x80)] {
+            let v = cluster_overlay_scene(&mut ram, premulti, ag, 0x00ff_ffff, 0x8040_4040);
+            v.render(&ram, &mut out);
+            let want = match (premulti, ag) {
+                (false, 0x80) => {
+                    let (g, a) = (128.0 / 255.0, 128.0 / 255.0);
+                    g * g * a * 64.0 + (1.0 - g * a) * 255.0
+                }
+                _ => drm_blend(premulti, 0x40, 0x80, ag as u8, 255.0),
+            };
+            assert_grey(pixel(&out, 120, 120), want);
+            assert_grey(pixel(&out, 10, 10), 255.0);
+            assert_grey(pixel(&out, 164, 120), 255.0);
+        }
+        // the docstring values of tests/gpu/rockchip-kms-planes.py, over white and grey 0x80
+        for (premulti, under, want) in [(true, 255, 191), (true, 128, 128), (false, 255, 159), (false, 128, 96)] {
+            let v = cluster_overlay_scene(&mut ram, premulti, 0xff, under * 0x1_0101, 0x8040_4040);
+            v.render(&ram, &mut out);
+            assert_grey(pixel(&out, 120, 120), f64::from(want));
+        }
+    }
+
+    /// An XRGB8888 plane on a Cluster window (issue #54): the hardware sees ARGB8888, and the
+    /// mixers decide. As mainline Linux sets them up (per-pixel alpha) an X byte of 0 adds the
+    /// plane to what is below (Cs + (1 - 0) Cd, saturated); as Rockchip's kernel sets up the
+    /// Cluster mixer for a format without alpha (the destination alpha is the global alpha,
+    /// not the pixel's), the plane covers.
+    #[test]
+    fn xrgb_on_a_cluster_overlay_follows_the_mixers() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = cluster_overlay_scene(&mut ram, true, 0xff, 0x0080_8080, 0x00ff_0000);
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [255, 128, 128, 255]);
+        // Rockchip's vop2_setup_cluster_alpha: dst_pixel_alpha_en = is_alpha_support(format),
+        // and its vop2_parse_alpha then sets the destination alpha's blend mode to global
+        let mut regs = parse_alpha(true, false, false, false, 0, 0xff);
+        regs[3] &= !(3 << 2);
+        write_mixer(&mut v, CLUSTER0_MIX + 0x10, regs);
+        v.render(&ram, &mut out);
+        assert_eq!(pixel(&out, 120, 120), [255, 0, 0, 255]);
+        // ... and an ARGB plane still blends by its alpha there
+        fill(&mut ram, 0x60_0000, 64 * 64, 0x8040_4040);
+        write_mixer(&mut v, CLUSTER0_MIX + 0x10, parse_alpha(true, false, false, true, 0, 0xff));
+        v.render(&ram, &mut out);
+        assert_grey(pixel(&out, 120, 120), drm_blend(true, 0x40, 0x80, 0xff, 128.0));
+    }
+
+    /// A bottom plane whose global alpha is below opaque (issue #51) is dimmed all over, not
+    /// only under the plane above it: Esmart1 white at alpha 0x80 over the black background,
+    /// with ARGB grey 0x40 at alpha 0x80 ("Pre-multiplied") on Esmart0 above it. Linux sets
+    /// MIX0 to `Cs + (1 - As) Cd Agd` and the HDR0 mixer to pass the result on.
+    #[test]
+    fn bottom_plane_with_global_alpha_is_dimmed_everywhere() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = two_planes(&mut ram, true, true, 0x00ff_ffff, 0x8040_4040);
+        esmart1_bottom(&mut v, &mut ram, 0x00ff_ffff);
+        v.write(0x1000, 0, 0); // Cluster0 off
+        v.write(OVL_LAYER_SEL, 0x7654_1023, 0); // layer 0 Esmart1, layer 1 Esmart0
+        // vop2_setup_alpha with bottom_layer_alpha_en: dst not pre-multiplied, Agd 0x80
+        write_mixer(&mut v, MIX0, parse_alpha(true, false, true, true, 0xff, 0x80));
+        write_mixer(&mut v, HDR0_MIX, parse_alpha(true, true, true, true, 0xff, 0xff));
+        v.render(&ram, &mut out);
+        let bottom = 255.0 * 128.0 / 255.0;
+        assert_grey(pixel(&out, 10, 10), bottom);
+        assert_grey(pixel(&out, 1279, 719), bottom);
+        assert_grey(pixel(&out, 99, 120), bottom);
+        assert_grey(pixel(&out, 120, 120), drm_blend(true, 0x40, 0x80, 0xff, bottom));
+
+        // the same picture with the bottom plane on Cluster0, whose own mixer applies the
+        // global alpha (Linux then sets MIX0 up as usual and leaves HDR0 off)
+        let mut v = two_planes(&mut ram, true, true, 0x00ff_ffff, 0x8040_4040);
+        write_mixer(&mut v, CLUSTER0_MIX, parse_alpha(false, false, false, true, 0, 0x80));
+        v.render(&ram, &mut out);
+        assert_grey(pixel(&out, 10, 10), bottom);
+        assert_grey(pixel(&out, 120, 120), drm_blend(true, 0x40, 0x80, 0xff, bottom));
+    }
+
+    /// "Coverage" with global alpha on a plane without pixel alpha: the colour is multiplied
+    /// by the global alpha for the colour mode and again for the factor (see `Mixer`), so
+    /// white at Ag = 0x80 over black gives 255 x (128/255)^2, not DRM's 128.
+    #[test]
+    fn coverage_with_global_alpha_and_no_pixel_alpha() {
+        let mut ram = vec![0u8; 8 << 20];
+        let mut out = Vec::new();
+        let mut v = two_planes(&mut ram, false, false, 0x0000_0000, 0x00ff_ffff);
+        write_mixer(&mut v, MIX0, parse_alpha(false, true, false, true, 0x80, 0xff));
+        v.render(&ram, &mut out);
+        assert_grey(pixel(&out, 120, 120), 255.0 * (128.0f64 / 255.0).powi(2));
+        assert_grey(pixel(&out, 10, 10), 0.0);
+    }
+
+    /// Skipping a mixer outside its window when an empty source keeps the destination is
+    /// exact; Linux's usual overlay set-up does, the one above a bottom plane with global
+    /// alpha does not.
+    #[test]
+    fn empty_source_skip_is_exact() {
+        assert!(Mixer::new(parse_alpha(true, true, true, true, 0xff, 0xff)).empty_keeps_dst());
+        assert!(Mixer::new(parse_alpha(false, true, false, true, 0x80, 0xff)).empty_keeps_dst());
+        assert!(!Mixer::new(parse_alpha(true, false, true, true, 0xff, 0x80)).empty_keeps_dst());
+        let mut regs = 0u32;
+        for _ in 0..4096 {
+            regs = regs.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let pick = |r: u32| r & 0x00ff_01ff;
+            let m = Mixer::new([pick(regs), pick(regs.rotate_left(7)) | 0x00ff_0000 * (regs >> 31), pick(regs.rotate_left(13)), pick(regs.rotate_left(19))]);
+            if m.empty_keeps_dst() {
+                for p in [[0, 0, 0, 0], [10, 20, 30, 40], [200, 100, 50, 255], [255, 255, 255, 0], [1, 128, 254, 127]] {
+                    assert_eq!(m.mix_empty(p), p, "{regs:08x}");
+                }
+            }
+        }
     }
 
     #[test]
