@@ -3,13 +3,13 @@
 //! registers, flags, memory and the instruction count must match.
 #[path = "common/jit_gen.rs"]
 mod jit_gen;
-use arm_a32::{CodeWatch, Cpu};
+use arm_a32::Cpu;
 use emu_core::{Bus, Core, FlatRam};
 use jit_gen::*;
 
 #[test]
 fn random_blocks_match_the_interpreter() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("random_blocks_match_the_interpreter") {
         return;
     }
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -24,7 +24,9 @@ fn random_blocks_match_the_interpreter() {
         run(&mut a, &mut ram_a);
         // SAFETY: ram_b outlives b
         unsafe { b.set_ram(ram_b.mem.as_mut_ptr(), 0, RAM as u32) };
-        assert!(b.enable_jit(CodeWatch::new(0, RAM as u32)));
+        if !try_enable_jit(&mut b) {
+            return;
+        }
         b.jit_set_hot(1);
         run(&mut b, &mut ram_b);
         let (compiled, _, _) = b.jit_stats().unwrap();
@@ -39,7 +41,7 @@ fn random_blocks_match_the_interpreter() {
 
 #[test]
 fn random_thumb_blocks_match_the_interpreter() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("random_thumb_blocks_match_the_interpreter") {
         return;
     }
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -83,7 +85,9 @@ fn random_thumb_blocks_match_the_interpreter() {
         run(&mut a, &mut ram_a);
         // SAFETY: ram_b outlives b
         unsafe { b.set_ram(ram_b.mem.as_mut_ptr(), 0, RAM as u32) };
-        assert!(b.enable_jit(CodeWatch::new(0, RAM as u32)));
+        if !try_enable_jit(&mut b) {
+            return;
+        }
         b.jit_set_hot(1);
         run(&mut b, &mut ram_b);
         let dis: Vec<String> = code.iter().map(|h| format!("{h:04x}")).collect();
@@ -105,7 +109,9 @@ fn thumb_repro() {
     let (mut b, mut ram_b) = setup_thumb(&mut Rng(seed), &code);
     run(&mut a, &mut ram_a);
     unsafe { b.set_ram(ram_b.mem.as_mut_ptr(), 0, RAM as u32) };
-    assert!(b.enable_jit(CodeWatch::new(0, RAM as u32)));
+    if !try_enable_jit(&mut b) {
+        return;
+    }
     b.jit_set_hot(1);
     run(&mut b, &mut ram_b);
     assert_eq!(a.r, b.r);
@@ -116,7 +122,7 @@ fn thumb_repro() {
 /// BX LR; ARM calls Thumb with BLX (immediate); POP {pc} and LDR pc switch state.
 #[test]
 fn interworking_calls() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("interworking_calls") {
         return;
     }
     let mut ram = FlatRam::new(0, RAM);
@@ -165,7 +171,9 @@ fn interworking_calls() {
     init(&mut b);
     run(&mut a, &mut ram);
     unsafe { b.set_ram(ram_b.mem.as_mut_ptr(), 0, RAM as u32) };
-    assert!(b.enable_jit(CodeWatch::new(0, RAM as u32)));
+    if !try_enable_jit(&mut b) {
+        return;
+    }
     b.jit_set_hot(1);
     run(&mut b, &mut ram_b);
     assert_eq!((a.r[0], a.r[1]), (5, 10));
@@ -178,7 +186,7 @@ fn interworking_calls() {
 /// regions loop inside one function while `chain_until` allows).
 #[test]
 fn random_loops_match_the_interpreter() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("random_loops_match_the_interpreter") {
         return;
     }
     let mut rng = Rng(0x6a09_e667_f3bc_c909);

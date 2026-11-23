@@ -189,6 +189,14 @@ mod host {
     }
 
     pub const AVAILABLE: bool = true;
+
+    /// Whether the system lets this process map writable and executable memory (SELinux
+    /// `deny_execmem`, PaX MPROTECT and systemd's `MemoryDenyWriteExecute` refuse it): one
+    /// mapping of the code cache's size, tried once.
+    pub fn usable() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| CodeCache::new(super::CODE_BYTES).is_some())
+    }
 }
 
 /// No native code buffer: the wasm32 build compiles through `jit_wasm` instead, other hosts
@@ -213,7 +221,16 @@ mod host {
 
 /// Whether this host can run compiled code.
 pub fn available() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    return host::usable();
+    #[allow(unreachable_code)]
     host::AVAILABLE
+}
+
+/// The host has a JIT backend but the system refused it executable memory: the cores
+/// interpret.
+pub fn refused() -> bool {
+    host::AVAILABLE && !available()
 }
 
 /// Physical pages of guest RAM that hold compiled code, shared by the cores of a machine.
@@ -639,11 +656,11 @@ impl Cpu {
         }
         #[allow(unused_mut)]
         let mut r = unsafe { f(self as *mut Cpu) };
-        // wasm and x86-64: chain in Rust (AArch64 code chains through its own dispatcher): the
-        // next block from the front cache while the budget lasts; 2 = the interpreter ran
-        // something the machine must look at, so no chaining
-        #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", target_os = "linux")))]
-        while r == 0 && self.instret < self.chain_until && self.chain_ok() {
+        // wasm: chain in Rust (native code chains through its own dispatcher): the next block
+        // from the front cache while the budget lasts; 2 = the interpreter ran something the
+        // machine must look at, so no chaining
+        #[cfg(target_arch = "wasm32")]
+        while r == 0 && self.instret < self.chain_until {
             let Some(g) = self.front_block() else { break };
             // SAFETY: as above
             r = unsafe { g(self as *mut Cpu) };
@@ -659,16 +676,9 @@ impl Cpu {
         }
     }
 
-    /// x86-64: whether blocks may chain (`SBC_JIT_CHAIN=0` turns it off, as natively).
-    #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", target_os = "linux")))]
-    #[inline(always)]
-    fn chain_ok(&self) -> bool {
-        cfg!(target_arch = "wasm32") || self.jit.as_ref().is_some_and(|j| j.chain)
-    }
-
-    /// wasm and x86-64: the compiled block for the current PC if the front cache has it (no IT
-    /// block, no pending invalidations, the fetch micro-TLB maps the page).
-    #[cfg(any(target_arch = "wasm32", all(target_arch = "x86_64", target_os = "linux")))]
+    /// wasm: the compiled block for the current PC if the front cache has it (no IT block, no
+    /// pending invalidations, the fetch micro-TLB maps the page).
+    #[cfg(target_arch = "wasm32")]
     #[inline(always)]
     fn front_block(&self) -> Option<BlockFn> {
         if self.cpsr & 0x0600_fc00 != 0 {

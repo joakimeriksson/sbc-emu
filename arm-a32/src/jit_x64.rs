@@ -5,10 +5,11 @@
 //! micro-TLB probes guard loads and stores. A compiled unit is a *region*: the entry basic
 //! block plus the blocks that constant branches on the same page reach (up to `MAX_BBS`),
 //! and a branch between them is a direct jump while `instret < chain_until`, so loops stay
-//! in host code. The function returns 0 to continue at `r[15]` (`jit_run` may chain into
-//! the next region), 1 for a trap in `jit_trap`, 2 to continue without chaining (the
-//! interpreter ran an instruction that needs the machine to look: a device access, a mode
-//! change).
+//! in host code. Exits to other regions go through `dispatcher`, which jumps into the next
+//! compiled region while the budget lasts (`SBC_JIT_CHAIN=0`: no dispatcher, every exit
+//! returns). The function returns 0 to continue at `r[15]`, 1 for a trap in `jit_trap`, 2
+//! when the interpreter ran an instruction that needs the machine to look (a device access,
+//! a mode change); `jit_run` does not chain any further on x86-64.
 //!
 //! Guest registers stay in `Cpu::r` (x86 instructions take them as memory operands). The
 //! guest's NZCV lives in r14 as an image of the host's EFLAGS bits: N = SF (bit 7), Z = ZF

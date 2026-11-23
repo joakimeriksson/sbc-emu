@@ -54,7 +54,10 @@ fn compare(words: &[u32], thumb: Option<&[u16]>, regs: &[(usize, u32)], nzcv: u3
     run(&mut a, &mut ram_a)?;
     // SAFETY: ram_b outlives b
     unsafe { b.set_ram(ram_b.mem.as_mut_ptr(), 0, RAM as u32) };
-    assert!(b.enable_jit(CodeWatch::new(0, RAM as u32)));
+    if !b.enable_jit(CodeWatch::new(0, RAM as u32)) {
+        eprintln!("skipped: the JIT could not map its code cache");
+        return Ok(());
+    }
     b.jit_set_hot(1);
     run(&mut b, &mut ram_b)?;
     if b.jit_stats().unwrap().0 == 0 {
@@ -69,11 +72,21 @@ fn compare(words: &[u32], thumb: Option<&[u16]>, regs: &[(usize, u32)], nzcv: u3
     Ok(())
 }
 
+/// Whether compiled code can run here; prints why `test` is skipped when not.
+fn jit_ready(test: &str) -> bool {
+    if arm_a32::jit::available() {
+        return true;
+    }
+    let why = if arm_a32::jit::refused() { "the system refuses writable and executable memory" } else { "no JIT for this host" };
+    eprintln!("{test}: skipped ({why})");
+    false
+}
+
 const EDGES: [u32; 9] = [0, 1, 2, 0x7fff_fffe, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0xffff_fffe, 0xffff_ffff];
 
 #[test]
 fn every_condition_under_every_flag_value() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("every_condition_under_every_flag_value") {
         return;
     }
     for nzcv in 0..16 {
@@ -95,7 +108,7 @@ fn every_condition_under_every_flag_value() {
 
 #[test]
 fn add_and_subtract_carry_and_overflow_at_the_edges() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("add_and_subtract_carry_and_overflow_at_the_edges") {
         return;
     }
     // ADDS, SUBS, RSBS, ADCS, SBCS, RSCS r0, r1, r2; CMP, CMN r1, r2
@@ -114,7 +127,7 @@ fn add_and_subtract_carry_and_overflow_at_the_edges() {
 
 #[test]
 fn shifter_carry_out_at_every_boundary() {
-    if !arm_a32::jit::available() {
+    if !jit_ready("shifter_carry_out_at_every_boundary") {
         return;
     }
     let values = [0x8000_0001u32, 0x4000_0000, 0xffff_ffff, 1, 0x1234_5678];
