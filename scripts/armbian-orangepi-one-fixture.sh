@@ -9,8 +9,14 @@ IMG=Armbian_26.8.1_Orangepione_trixie_current_6.18.44_minimal.img
 URL=${ARMBIAN_MIRROR:-https://dl.armbian.com}/orangepione/archive/$IMG.xz
 SHA=7babe415b7e55e0554572af24d0177d1f69b41388d0f3ab11357abbcd790a1a6
 mkdir -p "$OUT"
-[ -f "$OUT/$IMG.xz" ] || curl -fL --retry 3 -o "$OUT/$IMG.xz" "$URL"
+if [ ! -f "$OUT/$IMG.xz" ]; then
+  curl -fL --retry 3 -o "$OUT/$IMG.xz.part" "$URL"
+  mv "$OUT/$IMG.xz.part" "$OUT/$IMG.xz"
+fi
 actual=$(shasum -a 256 "$OUT/$IMG.xz" | cut -d' ' -f1)
-[ "$actual" = "$SHA" ] || { echo "$IMG.xz: sha256 $actual, expected $SHA" >&2; exit 1; }
-[ -f "$OUT/$IMG" ] || xz -dk "$OUT/$IMG.xz"
+[ "$actual" = "$SHA" ] || { echo "$IMG.xz: sha256 $actual, expected $SHA (delete it to fetch it again)" >&2; exit 1; }
+if [ ! -f "$OUT/$IMG" ]; then
+  xz -dc "$OUT/$IMG.xz" > "$OUT/$IMG.part"
+  mv "$OUT/$IMG.part" "$OUT/$IMG"
+fi
 echo "$OUT/$IMG"

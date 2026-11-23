@@ -295,7 +295,10 @@ pub(crate) fn run<B: SerialBoard>(
                     save_asked = true;
                     continue;
                 }
-                pending.push_back(1);
+                // Ctrl-A Ctrl-A sends one Ctrl-A; Ctrl-A and another key sends both
+                if b != 1 {
+                    pending.push_back(1);
+                }
             } else if b == 1 {
                 escape = true;
                 continue;

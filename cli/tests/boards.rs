@@ -18,6 +18,11 @@ fn lists_support_honestly_and_rejects_before_opening_images() {
     assert!(listing
         .lines()
         .any(|l| l.starts_with("orangepi-one") && l.contains("experimental")));
+    for board in ["pi4b", "orangepi5", "orangepi-one", "tinkerboard", "orangepi-rv", "esp32s31", "jetson-nano"] {
+        assert!(listing.lines().any(|l| l.split_whitespace().next() == Some(board)), "{board} missing: {listing}");
+    }
+    // recognised, but not a board that runs: not listed
+    assert!(!listing.contains("pi3b"), "{listing}");
     for (board, error) in [
         ("pi3b", "not implemented"),
         ("orangepi-pc", "unknown board"),
