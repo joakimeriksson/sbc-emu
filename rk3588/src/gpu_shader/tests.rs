@@ -787,3 +787,12 @@ fn mesas_log2_sequence_handles_zero_and_infinity() {
         assert!((log2(x) - x.log2()).abs() < 1e-5, "{x}");
     }
 }
+
+#[test]
+fn a_restarted_thread_does_not_see_the_previous_threads_registers() {
+    let mut s = Shader::with_allocation(0x100, RegisterAllocation::Registers64);
+    s.regs[3] = 0xdead_beef;
+    s.regs[63] = 7;
+    s.restart(0x200, RegisterAllocation::Registers32);
+    assert_eq!((s.pc, s.regs), (0x200, [0; 64]));
+}
