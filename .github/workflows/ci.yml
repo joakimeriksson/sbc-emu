@@ -53,3 +53,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the browser build
         run: cargo check --target wasm32-unknown-unknown -p sbc-emu-wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # the Jetson Nano's shader JIT: its WebAssembly code against the interpreter, in the build the page loads
+      - name: Shader JIT in the browser build
+        run: |
+          sh tools/wasm-build.sh
+          node tools/wasm-shader-jit-check.mjs 20000
