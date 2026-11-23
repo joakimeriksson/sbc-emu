@@ -307,5 +307,27 @@ fn linux_boot() {
     }
     let console = String::from_utf8_lossy(&m.soc.uart.out).into_owned();
     assert!(console.contains("orangepi-rv#"), "{}", &console[console.len().saturating_sub(300)..]);
-    eprintln!("50 points");
+    // then the devices a boot leaves idle, saved while they work: the Wi-Fi chip scanning, joining
+    // the access point and carrying DHCP and pings, and the NVMe SSD's queues
+    let mut typed: std::collections::VecDeque<u8> = concat!(
+        "ip link set wlan0 up; iw dev wlan0 scan trigger; sleep 2; iw dev wlan0 connect sbc-emu; sleep 2; ",
+        "udhcpc -i wlan0 -n -q -t 5 >/dev/null 2>&1; ping -c 2 10.0.2.2 | grep received; ",
+        "dd if=/dev/nvme0n1 of=/dev/null bs=64k count=256 2>/dev/null; echo DE\"\"VICES_DONE\n"
+    ).bytes().collect();
+    let mut point = 0;
+    while !String::from_utf8_lossy(&m.soc.uart.out).contains("DEVICES_DONE") {
+        assert!(point < 2000, "{}", String::from_utf8_lossy(&m.soc.uart.out[m.soc.uart.out.len().saturating_sub(500)..]));
+        // as a host types: what the UART takes
+        for _ in 0..20 {
+            while typed.front().is_some_and(|&b| m.serial_input(b)) { typed.pop_front(); }
+            run(&mut m, 100_000);
+        }
+        check(&mut m, make(), 2_000_000, &format!("devices, point {point}"));
+        point += 1;
+    }
+    let console = String::from_utf8_lossy(&m.soc.uart.out).into_owned();
+    assert!(console.contains("2 packets transmitted, 2 packets received"), "{}", &console[console.len().saturating_sub(500)..]);
+    let nvme = m.soc.pcie[1].nvme.as_ref().unwrap();
+    assert!(nvme.reads > 100, "{} NVMe reads", nvme.reads);
+    eprintln!("50 points, then {point} with Wi-Fi and NVMe");
 }

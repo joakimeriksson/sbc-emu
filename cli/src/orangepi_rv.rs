@@ -196,8 +196,13 @@ fn execute(args: &[String]) -> Result<(), String> {
     if ram < (128 << 20) || ram > (16 << 30) {
         return Err("--ram-mb must be between 128 and 16384".into());
     }
-    if !direct && can_boot && !boot::uboot_ram_ok(ram as u64) {
-        return Err("booting from the SD card needs --ram-mb 2048, 4096, 8192 or 16384: U-Boot knows only the board's DRAM sizes".into());
+    // (a restored machine boots from the card only when the guest reboots: checked then)
+    let uboot_ram = || -> Result<(), String> {
+        if boot::uboot_ram_ok(ram as u64) { return Ok(()); }
+        Err("booting from the SD card needs --ram-mb 2048, 4096, 8192 or 16384: U-Boot knows only the board's DRAM sizes".into())
+    };
+    if !direct && can_boot && !restore {
+        uboot_ram()?;
     }
     let config = RunConfig::from_args("orangepi-rv", args)?;
     // The microSD card survives guest reboots (one disk shared by the successive machines).
@@ -244,6 +249,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         } else if direct {
             boot::boot_linux(&mut m, &firmware, &kernel, &dtb, initrd.as_deref(), cmdline)?;
         } else {
+            uboot_ram()?;
             boot::boot_rom(&mut m)?;
         }
         for h in smp + 1..m.harts.len() {
@@ -258,8 +264,10 @@ fn execute(args: &[String]) -> Result<(), String> {
         std::fs::write(path, blob).map_err(|e| format!("{path}: {e}"))?;
     }
     eprintln!(
-        "[orangepi-rv] experimental StarFive JH7110: {smp} of 4 U74 harts (RV64GC, Sv39, {}), CLINT, PLIC, UART0, \
+        "[orangepi-rv] experimental StarFive JH7110: {} (RV64GC, Sv39, {}), CLINT, PLIC, UART0, \
          clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware, or the boot ROM, U-Boot SPL and U-Boot from --sd; other devices are stubs",
+        // a restored machine's harts are the snapshot's; --smp applies when the guest reboots
+        if restore { "the snapshot's U74 harts".to_string() } else { format!("{smp} of 4 U74 harts") },
         if jit { "JIT to AArch64" } else { "interpreter" }
     );
     serial_board::run(config, make_machine)

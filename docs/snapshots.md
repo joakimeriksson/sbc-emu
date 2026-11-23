@@ -19,7 +19,8 @@ Restore with the options the snapshot was made with: the same `--smp`, `--ram-mb
 depends on `--kernel`), `--net`, `--gpu`
 and disk **images** (`--sd`, `--emmc`, `--nvme`, `--usb-drive`; a snapshot holds only what was written over
 them). On the Orange Pi RV, `--spi-flash` too if it was given: what the flash holds is in the
-snapshot, whatever the file holds. Cores, RAM, devices, and the images' sizes are checked, their contents are not. The kernel is
+snapshot, whatever the file holds; the harts that run are the snapshot's, and `--smp` applies when
+the guest reboots. Cores, RAM, devices, and the images' sizes are checked, their contents are not. The kernel is
 in the snapshot's RAM; `--kernel` is only needed if the guest is to reboot. `--no-jit` and
 `--threads` may differ.
 
