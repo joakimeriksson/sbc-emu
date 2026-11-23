@@ -930,9 +930,11 @@ impl Machine {
             self.set_jit(false);
         }
         self.state[k] = CoreState::Run;
+        let turn = self.breakpoints.last_turn(self.cur);
         self.breakpoints.begin_step(k, self.cpus[k].r[15] as u64);
         let stop = self.run(1);
         self.breakpoints.end_step(k);
+        self.breakpoints.keep_turn(turn);
         if jit {
             self.set_jit(true);
         }
@@ -994,8 +996,9 @@ impl Machine {
             if self.soc.periph.power_off_requested() {
                 return Stop::PowerOff;
             }
+            let last = self.breakpoints.last_turn(self.cur);
             let Some(k) = (1..=NCPU)
-                .map(|offset| (self.cur + offset) % NCPU)
+                .map(|offset| (last + offset) % NCPU)
                 .find(|&k| self.state[k] == CoreState::Run && self.breakpoints.may_run(k))
             else {
                 return Stop::Idle(match self.next_event {

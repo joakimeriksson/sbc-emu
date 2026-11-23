@@ -780,9 +780,10 @@ impl Machine {
             }
             let round_start = self.now;
             self.round_end = if runnable == 1 { u64::MAX } else { round_start + quantum() };
-            let (last, n) = (self.cur, self.cpus.len());
+            let (last, n) = (self.breakpoints.last_turn(self.cur), self.cpus.len());
+            let watching = !self.cpus[0].watch.is_empty();
             for i in 0..n {
-                let k = self.breakpoints.turn(i, last, n);
+                let k = self.breakpoints.turn(i, last, n, watching);
                 if self.state[k] != CoreState::Run || !self.breakpoints.may_run(k) {
                     continue;
                 }
@@ -932,9 +933,11 @@ impl Machine {
         }
         self.state[k] = CoreState::Run;
         let jit_off = std::mem::replace(&mut self.cpus[k].jit_off, true);
+        let turn = self.breakpoints.last_turn(self.cur);
         self.breakpoints.begin_step(k, self.cpus[k].pc);
         let stop = self.run(1);
         self.breakpoints.end_step(k);
+        self.breakpoints.keep_turn(turn);
         self.cpus[k].jit_off = jit_off;
         (!matches!(stop, Stop::Budget | Stop::Idle(_))).then_some(stop)
     }

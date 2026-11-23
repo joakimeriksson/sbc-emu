@@ -15,19 +15,27 @@ pub struct Breakpoints {
     /// While a single step runs: the core it is for. The others stay powered and get no turn (they
     /// may wake up: from WFI by an interrupt, from WFE).
     pub only: Option<usize>,
+    /// Whose turn was last before a step, which takes no turn of its own (until the next run).
+    turn: Option<usize>,
 }
 
 impl Breakpoints {
     /// Whether core `k` may have a turn (see `only`).
     pub fn may_run(&self, k: usize) -> bool { self.only.is_none_or(|o| o == k) }
 
-    /// The core whose turn is the `i`th of a round of `n`: core `i`, but while breakpoints are set
-    /// counted from the one after `last`. Each stop ends a round, and a core that reaches a
-    /// breakpoint in every round would keep the others from theirs.
+    /// The core whose turn is the `i`th of a round of `n`: core `i`, but while breakpoints or watch
+    /// ranges (`watching`) are set counted from the one after `last`. Each stop ends a round, and a
+    /// core that stops in every round would keep the others from theirs.
     #[inline(always)]
-    pub fn turn(&self, i: usize, last: usize, n: usize) -> usize {
-        if self.at.is_empty() { i } else { (last + 1 + i) % n }
+    pub fn turn(&self, i: usize, last: usize, n: usize, watching: bool) -> usize {
+        if self.at.is_empty() && !watching { i } else { (last + 1 + i) % n }
     }
+
+    /// Whose turn was last, where the machine is at core `cur` now.
+    #[inline(always)]
+    pub fn last_turn(&mut self, cur: usize) -> usize { self.turn.take().unwrap_or(cur) }
+    /// A step is over: `last` (from `last_turn` before it) still had the last turn.
+    pub fn keep_turn(&mut self, last: usize) { self.turn = Some(last); }
 
     pub fn set(&mut self, addr: u64, insert: bool) {
         self.at.retain(|&a| a != addr);

@@ -1059,16 +1059,22 @@ mod tests {
         comes_by_again(&mut m, |m, n| Host::Esp32S31(m).run(n), (0, 1), sram + 0x1000, 11, 32);
     }
 
-    /// Several cores at one breakpoint all get their turn, though one reaches it in every round.
+    /// Cores that all reach one breakpoint, or write one watched word, all get their turn, though
+    /// one gets there in every round; also when the same core is stepped after each stop.
     #[track_caller]
-    fn all_are_reported<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, code: u64) {
+    fn all_are_reported<M: Target>(m: &mut M, run: fn(&mut M, u64) -> Stop, code: u64, data: u64) {
         for _ in 0..4 { let _ = run(m, 200_000); }
-        m.breakpoint(code + 8, true);
-        let mut seen = [0; 2];
-        for _ in 0..200 {
-            match run(m, 200_000) { Stop::Breakpoint(k) => seen[k] += 1, other => panic!("{other:?}") }
+        for (watch, step) in [(false, false), (false, true), (true, false), (true, true)] {
+            if watch { m.watchpoint(data, 4, 1, true) } else { m.breakpoint(code + 8, true) }
+            let mut seen = [0; 2];
+            for _ in 0..200 {
+                match run(m, 200_000) { Stop::Breakpoint(k) | Stop::Watchpoint(k, ..) => seen[k] += 1, other => panic!("{other:?}") }
+                // (off the end of a watched write or a breakpoint: a step that stops again is fine)
+                if step { let _ = m.step(1); }
+            }
+            if watch { m.watchpoint(data, 4, 1, false) } else { m.breakpoint(code + 8, false) }
+            assert!(seen.iter().all(|&n| n >= 50), "watch {watch} step {step}: {seen:?}");
         }
-        assert!(seen.iter().all(|&n| n >= 50), "{seen:?}");
     }
 
     #[test]
@@ -1077,34 +1083,47 @@ mod tests {
         place(&mut m.soc.ram, 0x20_0000, A64);
         for k in 0..2 {
             m.state[k] = rk3588::CoreState::Run;
-            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000);
         }
-        all_are_reported(&mut m, |m, n| Host::OrangePi5(m).run(n), 0x20_0000);
+        all_are_reported(&mut m, |m, n| Host::OrangePi5(m).run(n), 0x20_0000, 0x30_0000);
 
         let mut m = tegra210::Machine::with_cpus(128 << 20, 2).unwrap();
         place(&mut m.soc.ram, 0x20_0000, A64);
         for k in 0..2 {
             m.state[k] = tegra210::CoreState::Run;
-            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, tegra210::RAM_BASE + 0x20_0000, tegra210::RAM_BASE + 0x30_0000 + 64 * k as u64);
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, tegra210::RAM_BASE + 0x20_0000, tegra210::RAM_BASE + 0x30_0000);
         }
-        all_are_reported(&mut m, |m, n| Host::JetsonNano(m).run(n), tegra210::RAM_BASE + 0x20_0000);
+        all_are_reported(&mut m, |m, n| Host::JetsonNano(m).run(n), tegra210::RAM_BASE + 0x20_0000, tegra210::RAM_BASE + 0x30_0000);
 
         let mut m = bcm2711::Machine::with_cpus(65 << 20, 2);
         place(&mut m.soc.ram, 0x20_0000, A64);
         for k in 0..2 {
             m.state[k] = bcm2711::CoreState::Run;
-            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000 + 64 * k as u64);
+            (m.cpus[k].el, m.cpus[k].pc, m.cpus[k].x[2]) = (1, 0x20_0000, 0x30_0000);
         }
-        all_are_reported(&mut m, |m, n| Host::Pi4(m).run(n), 0x20_0000);
+        all_are_reported(&mut m, |m, n| Host::Pi4(m).run(n), 0x20_0000, 0x30_0000);
 
         let mut m = allwinner_h3::Machine::with_ram_size(128 << 20);
         let base = m.soc.ram.base as u32;
         place(&mut m.soc.ram.mem, 0x20_0000, A32);
         for k in 0..2 {
             m.state[k] = allwinner_h3::CoreState::Run;
-            (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000 + 64 * k as u32);
+            (m.cpus[k].r[15], m.cpus[k].r[2]) = (base + 0x20_0000, base + 0x30_0000);
         }
-        all_are_reported(&mut m, |m, n| Host::OrangePiOne(m).run(n), base as u64 + 0x20_0000);
+        all_are_reported(&mut m, |m, n| Host::OrangePiOne(m).run(n), base as u64 + 0x20_0000, base as u64 + 0x30_0000);
+
+        // (core 1 powered up as Linux does it: the power controller's state decides who is on)
+        use emu_core::Bus as _;
+        let mut m = rockchip_rk3288::Machine::with_ram_size(128 << 20);
+        place(&mut m.soc.ram.mem, 0x20_0000, A32);
+        m.soc.write32(rockchip_rk3288::SMP_MAILBOX + 8, 0x20_0000).unwrap();
+        m.soc.write32(rockchip_rk3288::SMP_MAILBOX + 4, rockchip_rk3288::BOOT_MAGIC).unwrap();
+        m.soc.write32(rockchip_rk3288::PMU_BASE + rockchip_rk3288::cru::PMU_PWRDN_CON, 0b1100).unwrap();
+        m.soc.write32(rockchip_rk3288::CRU_BASE + rockchip_rk3288::cru::SOFTRST_CON0, 0x2_0000).unwrap();
+        for k in 0..2 { (m.cpus[k].r[15], m.cpus[k].r[2]) = (0x20_0000, 0x30_0000); }
+        run_some(&mut m);
+        m.cpus[1].r[2] = 0x30_0000;
+        all_are_reported(&mut m, |m, n| Host::TinkerBoard(m).run(n), 0x20_0000, 0x30_0000);
     }
 
     /// A breakpoint reported before a chip reset stops the core that comes by after it.
