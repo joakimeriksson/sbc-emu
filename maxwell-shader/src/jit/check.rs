@@ -136,9 +136,10 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
     let tops = opcodes();
     let mut ops = BTreeMap::new();
     let was = ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let sep = separator(&mut r);
     for case in 0..cases {
         if case % 4 == 3 {
-            several(&mut r, &tops, case, was)?;
+            several(&mut r, &tops, sep, case, was)?;
             continue;
         }
         let n = 2 + (r.next() % 8) as usize;
@@ -187,11 +188,11 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
 }
 
 /// A program of two to four blocks with POPC between them, run whole with the JIT and without.
-fn several(r: &mut Rng, tops: &[Vec<u64>], case: usize, was: bool) -> Result<(), String> {
+fn several(r: &mut Rng, tops: &[Vec<u64>], sep: u64, case: usize, was: bool) -> Result<(), String> {
     let mut ins = Vec::new();
     for k in 0..2 + r.next() % 3 {
         if k > 0 {
-            ins.push(separator(r));
+            ins.push(sep);
         }
         for _ in 0..2 + r.next() % 6 {
             ins.push(random_inst(r, tops));
