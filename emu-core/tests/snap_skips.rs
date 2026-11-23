@@ -22,6 +22,7 @@ const APPROVED: &[(&str, &str, &str)] = &[
     ("rockchip-rk3288", "Vop", "log"),                      // debugging output
     ("rk3588", "Clock", "name"),                            // a constant of the board
     ("rk3588", "Gic", "ready"),                             // a cache, dropped by `after`
+    ("rk3588", "Gpu", "cost_ns"),                           // always 0 between steps: charged to the core after each one
     ("rk3588", "I2sTdm", "capture out"),                    // --audio-out, what was recorded
     ("rk3588", "Machine", "breakpoints dtb mt multi"),      // the debugger's; the boot's; threads and the choice to use them
     ("rk3588", "Pe", "cached"),                             // a cache, dropped by the Gic's `after`
