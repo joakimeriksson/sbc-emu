@@ -93,7 +93,13 @@ impl Dma {
                         const KEEP: u32 = 0x30ff_0000;
                         c.cs &= !(v & (END | INT));
                         c.cs = (c.cs & !KEEP) | (v & KEEP);
-                        if v & ACTIVE != 0 && c.conblk != 0 { c.cs |= ACTIVE; return Some(n); }
+                        // ACTIVE written to a channel that is already running (as Linux does when it clears
+                        // INT) leaves it running: the block is not loaded again
+                        let was_active = c.cs & ACTIVE != 0;
+                        if v & ACTIVE != 0 && c.conblk != 0 {
+                            c.cs |= ACTIVE;
+                            return (!was_active).then_some(n);
+                        }
                         if v & ACTIVE == 0 { c.cs &= !ACTIVE; }
                         None
                     }
@@ -120,5 +126,23 @@ impl Dma {
             for v in [&mut c.cs, &mut c.conblk, &mut c.ti, &mut c.src, &mut c.dst, &mut c.len, &mut c.stride, &mut c.next, &mut c.debug] { *v = r.u32()?; }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_written_to_a_running_channel_does_not_restart_it() {
+        let mut d = Dma::new();
+        d.write(0x204, 0x1000);
+        assert_eq!(d.write(0x200, ACTIVE), Some(2), "a stopped channel starts");
+        d.ch[2].cs |= INT;
+        // Linux's interrupt handler: INT to clear it, with ACTIVE kept set
+        assert_eq!(d.write(0x200, INT | ACTIVE), None, "a running one goes on where it is");
+        assert_eq!(d.ch[2].cs & (INT | ACTIVE), ACTIVE);
+        d.write(0x200, 0);
+        assert_eq!(d.write(0x200, ACTIVE), Some(2), "paused, it starts again");
     }
 }
