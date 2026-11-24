@@ -89,7 +89,7 @@ SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.m
 rm -rf "$OUT"
 mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/jetson-nano" "$OUT/assets/esp32s31"
 cp web/boards.html "$OUT/index.html"
-cp web/hello.html web/board.html web/gpu.html web/pi4.html web/sources.html web/worker.js "$OUT/"
+cp web/hello.html web/board.html web/gpu.html web/pi4.html web/sources.html web/worker.js web/film-thumbnail.jpg "$OUT/"
 cp web/wasm/sbc-emu.wasm "$OUT/wasm/"
 cp web/assets/hello.snap "$OUT/assets/"
 # GitHub Pages takes files up to 100 MB: the snapshot goes in parts, which a manifest lists
