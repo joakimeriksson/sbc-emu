@@ -256,7 +256,7 @@ fn execute(args: &[String], profile: &Profile) -> Result<(), String> {
     if wanted && arm_a32::jit::refused() {
         eprintln!("[{tag}] warning: the system refuses writable and executable memory (SELinux deny_execmem, MemoryDenyWriteExecute?): no JIT, interpreting");
     }
-    let cores = if jit { "A32/T32 JIT" } else { "interpreter" };
+    let cores = if jit { format!("A32/T32 {}", crate::cpu_backend(true)) } else { crate::cpu_backend(false).to_string() };
     eprintln!("[{tag}] {} (cores: {cores}, one host thread)", profile.banner);
     serial_board::run(config, make_machine)
 }
