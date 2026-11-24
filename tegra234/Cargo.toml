@@ -1,0 +1,11 @@
+[package]
+name = "tegra234"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA Tegra234 / Jetson Orin Nano direct Linux bring-up"
+
+[dependencies]
+arm-a64 = { path = "../arm-a64" }
+emu-core = { path = "../emu-core" }
+peripherals = { path = "../peripherals" }

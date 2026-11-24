@@ -12,4 +12,3 @@ peripherals = { path = "../peripherals" }
 sbc-net = { path = "../sbc-net" }
 maxwell = { path = "../maxwell" }
 maxwell-shader = { path = "../maxwell-shader" }
-miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

@@ -10,3 +10,4 @@ arm-a64 = { path = "../arm-a64" }
 v3d = { path = "../v3d" }
 sbc-net = { path = "../sbc-net" }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+peripherals = { path = "../peripherals" }

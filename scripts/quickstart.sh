@@ -4,7 +4,7 @@
 # Raspberry Pi packages (the board's fixture script), or for the ESP32-S31 its mask ROM and
 # Espressif's Linux flash image. Later runs reuse them. Ctrl-A x quits.
 #   scripts/quickstart.sh BOARD [sbc-emu run options...]
-#   BOARD: pi4b orangepi5 orangepi-one tinkerboard orangepi-rv jetson-nano esp32s31
+#   BOARD: pi4b orangepi5 orangepi-one tinkerboard orangepi-rv jetson-nano jetson-orin-nano-4gb esp32s31
 # The files go to the repository's cache/ (ignored by git); options with relative paths
 # (--screenshot, --sd, --restore) are relative to where you run it. Full operating systems
 # (Raspberry Pi OS, Armbian, Ubuntu, Debian) are in docs/getting-started.md.
@@ -17,7 +17,7 @@ usage() { sed -n 's/^#   //p' "$SELF" >&2; exit 2; }
 BOARD=$1
 shift
 case $BOARD in
-  pi4b|orangepi5|orangepi-one|tinkerboard|orangepi-rv|jetson-nano|esp32s31) ;;
+  pi4b|orangepi5|orangepi-one|tinkerboard|orangepi-rv|jetson-nano|jetson-orin-nano-4gb|esp32s31) ;;
   *) echo "unknown board '$BOARD'" >&2; usage ;;
 esac
 
@@ -102,6 +102,13 @@ open(sys.argv[2], "wb").write(t.extractfile("bin/busybox.static").read())' "$D/b
     fixture scripts/jetson-nano-fixture.sh cache/jetson-nano vmlinuz tegra210-p3450-0000.dtb initramfs.cpio.gz
     D=$C/jetson-nano
     exec "$BIN" run --board jetson-nano --kernel "$D/vmlinuz" --dtb "$D/tegra210-p3450-0000.dtb" \
+      --initrd "$D/initramfs.cpio.gz" "$@" ;;
+  jetson-orin-nano-4gb)
+    D=$C/jetson-orin-nano
+    if ! ready "$D/vmlinuz" || ! ready "$D/initramfs.cpio.gz"; then
+      (cd "$ROOT" && sh scripts/jetson-nano-fixture.sh "$D" orin)
+    fi
+    exec "$BIN" run --board jetson-orin-nano-4gb --kernel "$D/vmlinuz" \
       --initrd "$D/initramfs.cpio.gz" "$@" ;;
   esp32s31)
     # Espressif's mask ROM (esp-rom-elfs) and the flash image scripts/esp32s31-fixture.sh builds

@@ -168,6 +168,23 @@ impl Target for tegra210::Machine {
     fn describe(&self, c: usize) -> String { format!("CPU#{c} {:?} EL{}", self.state[c], self.cpus[c].el) }
 }
 
+impl Target for tegra234::Machine {
+    fn cores(&self) -> usize { 1 }
+    fn layout(&self) -> Layout { a64_layout() }
+    fn reg(&self, _core: usize, n: usize) -> Option<Vec<u8>> { a64_reg(&self.cpu, n) }
+    fn set_reg(&mut self, _core: usize, n: usize, bytes: &[u8]) -> bool {
+        a64_set_reg(&mut self.cpu, n, bytes).is_some()
+    }
+    fn read(&mut self, _core: usize, va: u64, len: usize) -> Option<Vec<u8>> { self.debug_read(va, len) }
+    fn write(&mut self, _core: usize, va: u64, data: &[u8]) -> bool { self.debug_write(va, data) }
+    fn breakpoint(&mut self, addr: u64, insert: bool) { self.debug_breakpoint(addr, insert) }
+    fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        self.debug_watch(addr, len, kind, insert)
+    }
+    fn step(&mut self, _core: usize) -> Option<Stop> { self.debug_step() }
+    fn describe(&self, _core: usize) -> String { format!("CPU#0 Cortex-A78AE EL{}", self.cpu.el) }
+}
+
 // ---------------------------------------------------------------- 32-bit Arm
 
 fn a32_layout() -> Layout {
