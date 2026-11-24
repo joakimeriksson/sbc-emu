@@ -12,7 +12,10 @@ access is `ldr rt, [x21, x14]`); the slow path after the block first refills the
 a shared stub and only then calls the interpreter; system instructions, exception generation and
 ERET call the interpreter and end the block. FP/SIMD instructions run natively only
 after the interpreter has proven it implements them (so extensions the emulated Cortex-A72 lacks
-stay undefined). Blocks are keyed by virtual and physical PC, EL, SPSel and FP enable, and are
+stay undefined); a reserved encoding the interpreter took would reach the host CPU as SIGILL, so
+`arm-a64/tests/simd_decode.rs` checks its FP/SIMD decode against LLVM's disassembler. Exclusives
+and acquire/release accesses at a misaligned address go to the interpreter, which raises the
+Alignment fault (the host's own LDAR/STLR and exclusives would raise SIGBUS). Blocks are keyed by virtual and physical PC, EL, SPSel and FP enable, and are
 discarded on `IC IVAU`/`IC IALLU` (CTR_EL0.DIC = 0 obliges software to issue them). Every CPU test
 runs with it too: `SBC_JIT=1 cargo test -p arm-a64`. `--no-jit` turns it off.
 

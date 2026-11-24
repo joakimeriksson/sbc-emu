@@ -7,7 +7,7 @@
 //! Half of them run with the MMU on and the data pages mapped scrambled, next to a second
 //! region whose pages compete for the same micro-TLB sets (refills, way-1 hits and misses).
 use arm_a64::{jit, Cpu};
-use emu_core::{Core, FlatRam, Trap};
+use emu_core::{Bus, Core, FlatRam, Trap};
 
 const RAM: usize = 4 << 20;
 const CODE: u64 = 0x8_0000;
@@ -174,16 +174,16 @@ fn insn(g: &mut G, k: usize, n: usize) -> u32 {
             }
         }
         34 => {
-            // byte-vector NEON: CMEQ, CMHS, vector logic, UMAXP/UMINP, SHRN (and neighbours)
-            // (valid encodings only: the interpreter takes some reserved ones, see `neon.rs`)
+            // byte-vector NEON: CMEQ, CMHS, vector logic, UMAXP/UMINP, SHRN (and neighbours);
+            // now and then a reserved form (.1D, UMAXP .2D): UNDEFINED, the case ends there
             let (q, size, d, n, m) = (g.bit(), g.below(4), g.below(8), g.below(8), g.below(8));
-            let q = if size == 3 { 1 } else { q };
+            let q = if size == 3 && g.below(8) != 0 { 1 } else { q };
             let regs = (m << 16) | (n << 5) | d;
             match g.below(6) {
                 0 => 0x2e20_8c00 | (q << 30) | (size << 22) | regs,
                 1 => 0x2e20_3c00 | (q << 30) | (size << 22) | regs,
                 2 => 0x0e20_1c00 | (q << 30) | (g.bit() << 29) | (g.below(4) << 22) | regs,
-                3 => 0x2e20_a400 | (q << 30) | (g.bit() << 11) | (size.min(2) << 22) | regs,
+                3 => 0x2e20_a400 | (q << 30) | (g.bit() << 11) | ((if g.below(8) == 0 { size } else { size.min(2) }) << 22) | regs,
                 4 => 0x0e20_9800 | (q << 30) | (size << 22) | (n << 5) | d,
                 _ => 0x0f00_8400 | (q << 30) | ((8 + g.below(8)) << 16) | (n << 5) | d,
             }
@@ -199,12 +199,32 @@ fn insn(g: &mut G, k: usize, n: usize) -> u32 {
                 _ => 0xd53b_4220 | rd,
             }
         }
+        35 => simd(g),
         31 => [0xd503_201f, 0xd503_3bbf, 0xd503_39bf, 0xd503_3fdf, 0x9e66_0000 | (g.below(8) << 5) | rd][g.below(5) as usize], // nop, dmb ish, dmb ishld, isb, fmov x, d
         _ => {
             // flag producers right before consumers
             let cmp = (sf << 31) | (1 << 30) | (1 << 29) | (0b01011 << 24) | (rm << 16) | (rn << 5) | 31;
             if g.bit() == 0 { cmp } else { (sf << 31) | (0b11010100 << 21) | (rm << 16) | (g.below(16) << 12) | (g.bit() << 10) | (rn << 5) | rd }
         }
+    }
+}
+
+/// Any FP/SIMD data-processing encoding (vector and scalar, FP and integer, to and from W/X
+/// registers 0..7): the AArch64 JIT emits what the interpreter accepts as itself. Encodings the
+/// interpreter does not implement are drawn again; reserved ones (UNDEFINED: the case ends
+/// there) are kept now and then.
+fn simd(g: &mut G) -> u32 {
+    thread_local! { static PROBE: std::cell::RefCell<(Cpu, FlatRam)> = std::cell::RefCell::new((Cpu::new(), FlatRam::new(0, 0x1000))); }
+    loop {
+        let grp = [0b01110u32, 0b01111, 0b11110, 0b11111][g.below(4) as usize];
+        let i = (g.below(4) << 29) | (grp << 24) | ((g.next() as u32 & 0x3fff) << 10) | (g.below(8) << 5) | g.below(8);
+        let undefined = PROBE.with(|p| {
+            let (c, ram) = &mut *p.borrow_mut();
+            (c.el, c.pc, c.sys.cpacr_el1, c.vbar[1]) = (1, 0, 3 << 20, 0x800);
+            ram.write32(0, i).unwrap();
+            match c.step(ram) { Ok(()) if c.pc == 4 => Some(false), Err(Trap::Exception(..)) => Some(true), _ => None }
+        });
+        match undefined { Some(false) => return i, Some(true) if g.below(8) == 0 => return i, _ => {} }
     }
 }
 
@@ -310,13 +330,15 @@ fn case(seed: u64) -> Case {
     x[19] = DATA + 0x8000;
     x[20] = 3;
     x[21] = g.below(64) as u64 * 8 + g.below(8) as u64;
-    x[23] = DATA + 0x40 * g.below(8) as u64;
+    // now and then misaligned: the exclusives and acquire/release accesses take an Alignment fault
+    x[23] = DATA + 0x40 * g.below(8) as u64 + if g.below(16) == 0 { [1, 2, 4, 6, 0xc, 0xe, 0xf][g.below(7) as usize] } else { 0 };
     x[24] = ALIAS + 0x1000 * g.below(16) as u64 + 8 * g.below(512) as u64;
     let mut v = [0u128; 32];
     for r in v.iter_mut() { *r = (g.next() as u128) << 64 | g.next() as u128; }
     // DATA and ALIAS where the MMU is off, and where it maps them
     let mem: Vec<u8> = (0..(TABLES - DATA as usize) / 8).flat_map(|_| g.next().to_le_bytes()).collect();
-    Case { code, x, nzcv: (g.below(16)) << 28, v, mem, mmu, mt: false }
+    // cores on host threads in a third of the cases: host atomics for the exclusives
+    Case { code, x, nzcv: (g.below(16)) << 28, v, mem, mmu, mt: seed % 3 == 2 }
 }
 
 fn run(c: &Case, jit: bool) -> (Cpu, FlatRam, Trap) {
@@ -423,28 +445,126 @@ fn reserved_smov_matches_the_interpreter() {
     }
 }
 
-/// With cores on host threads, a misaligned STLR is not a host XCHG (a split lock across
-/// cache lines): it goes to the interpreter, which stores plainly. Aligned ones stay native.
-/// x86-64 only: the AArch64 backend emits a host STLR there, which faults when misaligned.
-#[cfg(target_arch = "x86_64")]
+/// Exclusive and acquire/release accesses must be aligned to their whole size whatever SCTLR.A
+/// says (ARMv8.0: no FEAT_LSE2): at a misaligned address an Alignment fault, in the interpreter
+/// and through the JIT, with cores on host threads (`mt`) and without. With `mt` the AArch64
+/// backend's own LDAR/STLR, LDAXR/STLXR would raise SIGBUS on the host, the x86-64 one's XCHG and
+/// LOCK CMPXCHG would split across cache lines; misaligned ones go to the interpreter. Aligned
+/// ones stay native. Each runs in a loop; the store-exclusives after a load-exclusive of the
+/// same size from the granule (x21), so they hold the reservation (they fault even without it),
+/// and a plain store to the page (it fills the micro-TLB, which `mt`'s host CAS goes around).
 #[test]
-fn misaligned_stlr_on_host_threads_goes_to_the_interpreter() {
+fn misaligned_exclusives_and_acquire_release_fault_as_in_the_interpreter() {
     if !jit::available() { return; }
-    // loop: stlr x1, [x19]; subs x20, x20, #1; b.ne -8 (the random test uses other registers)
-    let code = [0xc89f_fe61u32, 0xf100_0694, 0x54ff_ffc1];
+    // (instruction on [x19], data x1/x3, status w2; bytes it accesses; compiled natively)
+    const FORMS: [(u32, u64, bool, &str); 17] = [
+        (0xc89f_fe61, 8, true, "stlr x"), (0x889f_fe61, 4, true, "stlr w"), (0x489f_fe61, 2, true, "stlrh"),
+        (0xc8df_fe61, 8, true, "ldar x"), (0x88df_fe61, 4, true, "ldar w"), (0x48df_fe61, 2, true, "ldarh"),
+        (0xc85f_fe61, 8, true, "ldaxr x"), (0xc85f_7e61, 8, true, "ldxr x"), (0x885f_7e61, 4, true, "ldxr w"),
+        (0x485f_fe61, 2, true, "ldaxrh"), (0xc802_7e61, 8, true, "stxr x"), (0xc802_fe61, 8, true, "stlxr x"),
+        (0x4802_7e61, 2, true, "stxrh"), (0x8802_fe61, 4, true, "stlxr w"),
+        (0xc87f_0e61, 16, false, "ldxp x"), (0xc822_0e61, 16, false, "stxp x"), (0x887f_8e61, 8, false, "ldaxp w"),
+    ];
+    const NOP: u32 = 0xd503_201f;
     // the fallback profile is global: off again when the test ends, also on a panic
     struct ProfileOff;
     impl Drop for ProfileOff { fn drop(&mut self) { jit::PROFILE.store(false, std::sync::atomic::Ordering::Relaxed); } }
     let _off = ProfileOff;
     jit::PROFILE.store(true, std::sync::atomic::Ordering::Relaxed);
-    for (off, slow) in [(0x43cu64, true), (0x440, false)] {
-        let c = fixed(&code, &[(19, DATA + off), (20, 500), (1, 0x1122_3344_5566_7788)], true);
-        let before = jit::profile_fallbacks().iter().find(|f| f.0 == code[0]).map_or(0, |f| f.1);
-        assert_eq!(fixed_differences(&c), None, "offset {off:#x}");
-        let n = jit::profile_fallbacks().iter().find(|f| f.0 == code[0]).map_or(0, |f| f.1) - before;
-        // the interpreter's own run is not counted (only compiled blocks' fallbacks are)
-        if slow { assert!(n >= 400, "misaligned STLR: {n} interpreter calls"); } else { assert!(n < 10, "aligned STLR: {n} interpreter calls"); }
+    let granule = DATA + 0x440;
+    let mut bad = Vec::new();
+    for (w, size, native, name) in FORMS {
+        // store-exclusives: str xzr, [x22]; ldxr{h,,} x5, [x21] (their size); then the access;
+        // subs x20, x20, #1; b.ne -16
+        let store_excl = w & 0x3fe0_0000 == 0x0800_0000;
+        let prefix = if store_excl { [0xf900_02df, (w & 0xc000_0000) | 0x085f_7ea5] } else { [NOP, NOP] };
+        let code = [prefix[0], prefix[1], w, 0xf100_0694, 0x54ff_ff81];
+        for mt in [false, true] {
+            // aligned; inside one 16-byte block (no fault on a host with FEAT_LSE2); across one
+            for addr in [granule, granule + 1, granule - 4, granule + 6, granule + 0xf, granule + 0xe] {
+                let misaligned = addr % size != 0;
+                let what = format!("{name} at granule + {}{} (mt {mt})", addr as i64 - granule as i64, if misaligned { ", misaligned" } else { "" });
+                let c = fixed(&code, &[(19, addr), (20, 500), (21, granule), (22, DATA + 0x800), (1, 0x1122_3344_5566_7788), (3, 0x99aa_bbcc_ddee_ff00)], mt);
+                let before = jit::profile_fallbacks().iter().find(|f| f.0 == w).map_or(0, |f| f.1);
+                let (i, iram, it) = run(&c, false);
+                let (j, jram, jt) = run(&c, true);
+                if let Some(d) = differences((&i, &iram, &it), (&j, &jram, &jt)) { bad.push(format!("{what}: {d}")); }
+                // the interpreter's own run is not counted (only compiled blocks' fallbacks are)
+                let n = jit::profile_fallbacks().iter().find(|f| f.0 == w).map_or(0, |f| f.1) - before;
+                let (ec, dfsc) = (i.esr[1] >> 26, i.esr[1] & 0x3f);
+                if misaligned && (ec != 0x25 || dfsc != 0x21 || i.far[1] != addr || i.elr[1] != CODE + 8) {
+                    bad.push(format!("{what}: no Alignment fault in the interpreter (ESR {:#x}, FAR {:#x})", i.esr[1], i.far[1]));
+                } else if !misaligned && (i.x[20] != 0 || i.elr[1] != 0) {
+                    bad.push(format!("{what}: the loop did not finish (x20 {}, ESR {:#x})", i.x[20], i.esr[1]));
+                } else if !misaligned && native && n >= 10 {
+                    bad.push(format!("{what}: {n} interpreter calls (not native)"));
+                }
+            }
+        }
     }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Reserved FP/SIMD encodings the interpreter used to execute, one of each kind (found by a
+/// sweep of the encoding space against LLVM's disassembler, see `simd_decode.rs`): the AArch64
+/// JIT, which emits what the interpreter accepts as itself, then ran them natively, and the host
+/// raised SIGILL (or, for the half-precision ones, computed something else). UNDEFINED now.
+const RESERVED_SIMD: &[u32] = &[
+    // the first ones found: UMAXP .2D, CMEQ .1D, CMHS .1D
+    0x6ee0_a420, 0x2ee0_8c20, 0x2ee0_3c20,
+    // FMOV (scalar, immediate) with imm5 set; FCMP with opcode2 bits 2:0 set
+    0x1e20_1020, 0x1e20_2021,
+    // scalar two-register misc
+    0x5e20_4820, 0x5e20_8820, 0x5e20_9820, 0x5e20_a820, 0x5e20_b820, 0x5ea0_f820, 0x5e21_2820, 0x5e21_6820,
+    0x5e21_8820, 0x5e21_9820, 0x7ea1_f820,
+    // scalar three same
+    0x5e20_0420, 0x5e20_1420, 0x5e20_2420, 0x5e20_3420, 0x5e20_3c20, 0x5e20_4420, 0x5e20_5420, 0x5e20_6420,
+    0x5e20_6c20, 0x5e20_7420, 0x5e20_7c20, 0x5e20_8420, 0x5e20_8c20, 0x5e20_9420, 0x5e20_9c20, 0x5e20_b420,
+    0x5e20_c420, 0x5e20_cc20, 0x5e20_d420, 0x7e20_dc20, 0x5e20_f420, 0x7e20_fc20,
+    // scalar by element
+    0x7f40_0020, 0x5fe0_1020, 0x5f40_2020, 0x7f40_4020, 0x5fe0_5020, 0x5f40_6020, 0x5f40_8020, 0x5fe0_9020,
+    0x5f40_a020,
+    // scalar shift by immediate
+    0x5f08_0420, 0x5f08_1420, 0x5f08_2420, 0x5f08_3420, 0x7f08_4420, 0x5f08_5420, 0x7f88_6420, 0x5f88_7420,
+    0x5f08_8420, 0x5f08_8c20, 0x5f88_9420, 0x5f88_9c20, 0x5fa0_e420, 0x5fa0_fc20,
+    // vector two-register misc
+    0x2e20_1820, 0x0ee0_2820, 0x0ee0_4820, 0x0ee0_6820, 0x0ee0_7820, 0x0ee0_8820, 0x0ee0_9820, 0x0ee0_a820,
+    0x0ee0_b820, 0x2ee1_3820,
+    // vector three different (SQDMLAL, SQDMLSL, SQDMULL of bytes)
+    0x0e20_9020, 0x0e20_b020, 0x0e20_d020,
+    // vector three same
+    0x0ee0_0420, 0x0ee0_0c20, 0x0ee0_1420, 0x0ee0_2420, 0x0ee0_2c20, 0x0ee0_3420, 0x0ee0_3c20, 0x0ee0_4420,
+    0x0ee0_4c20, 0x0ee0_5420, 0x0ee0_5c20, 0x0ee0_6420, 0x0ee0_6c20, 0x0ee0_7420, 0x0ee0_7c20, 0x0ee0_8420,
+    0x0ee0_8c20, 0x0ee0_9420, 0x0ee0_9c20, 0x0ee0_a420, 0x0ee0_ac20, 0x0e20_b420, 0x0ee0_bc20,
+    // across lanes (with the half-precision FMAXNMV/FMAXV, FEAT_FP16, which the host has)
+    0x0eb0_3820, 0x0eb0_a820, 0x0e30_c820, 0x0e30_f820, 0x0eb1_a820, 0x0eb1_b820,
+    // vector by element (doubles with L set, or of a .1D)
+    0x0fc0_1020, 0x0fc0_5020, 0x0fc0_9020,
+    // DUP (element, general) .1D, INS (general) with Q clear, SMOV to W from a word, UMOV to W from a doubleword
+    0x0e08_0420, 0x0e08_0c20, 0x0e01_1c20, 0x0e04_2c20, 0x0e08_3c20,
+    // EXT: an index past an 8-byte vector, op2 set; INS (element) with Q clear
+    0x2e00_4020, 0x2e40_0020, 0x2e01_0420,
+    // modified immediate with o2 set (and the half-precision FMOV); UZP1 .1D
+    0x0f00_0c20, 0x0f00_fc20, 0x0ec0_1820,
+    // vector shift by immediate (.1D; narrowing and widening from 64 bits; bit 23 set)
+    0x0f40_0420, 0x0f40_1420, 0x0f40_2420, 0x0f40_3420, 0x2f40_4420, 0x0f40_5420, 0x2f40_6420, 0x0f40_7420,
+    0x0f88_8420, 0x0f88_8c20, 0x0f88_9420, 0x0f88_9c20, 0x0f40_a420, 0x0f40_e420, 0x0f40_fc20, 0x0f88_0420,
+];
+
+#[test]
+fn reserved_simd_is_undefined_as_in_the_interpreter() {
+    if !jit::available() { return; }
+    let mut c = fixed(&[], &[], false);
+    let mut bad = Vec::new();
+    for &w in RESERVED_SIMD {
+        c.code = vec![w, 0xd420_0000];
+        let (i, iram, it) = run(&c, false);
+        let (j, jram, jt) = run(&c, true);
+        // EC 0 (unknown reason) at the instruction
+        if i.esr[1] >> 26 != 0 || i.elr[1] != CODE { bad.push(format!("{w:08x}: not UNDEFINED in the interpreter (ESR {:#x}, ELR {:#x})", i.esr[1], i.elr[1])); }
+        if let Some(d) = differences((&i, &iram, &it), (&j, &jram, &jt)) { bad.push(format!("{w:08x}: {d}")); }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 #[test]
