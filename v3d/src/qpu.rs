@@ -1375,7 +1375,7 @@ mod tests {
             tested += 1;
             if pre.flags { flagged += 1; }
             let mut t = Thread::new(0x1000, 0x2000, false);
-            let mut val = |r: u64| -> u32 { match r % 4 { 0 => SPECIAL[(r >> 8) as usize % SPECIAL.len()], 1 => (r >> 16) as u32 & 0x3f, _ => (r >> 20) as u32 } };
+            let val = |r: u64| -> u32 { match r % 4 { 0 => SPECIAL[(r >> 8) as usize % SPECIAL.len()], 1 => (r >> 16) as u32 & 0x3f, _ => (r >> 20) as u32 } };
             for k in 0..64 { for l in 0..LANES { t.rf[k][l] = val(rnd()); } }
             for k in 0..6 { for l in 0..LANES { t.acc[k][l] = val(rnd()); } }
             if matches!(i.add.op, AddOp::Stvpmv | AddOp::Stvpmd | AddOp::Stvpmp) {
