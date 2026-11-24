@@ -1,5 +1,5 @@
 # Jetson Nano: Debian 13's arm64 cloud image from the microSD card, with Debian's kernel and its
-# Tegra drivers (docs/jetson-nano-plan.md). First-boot answers come from the command line:
+# Tegra drivers (docs/jetson-nano.md). First-boot answers come from the command line:
 #   sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian
 #   sbc-emu run --board jetson-nano --kernel .../vmlinuz --dtb .../tegra210-p3450-0000.dtb \
 #     --initrd .../initramfs.cpio.gz --sd disk.raw --append "console=ttyS0,115200 root=card rw \

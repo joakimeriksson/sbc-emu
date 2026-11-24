@@ -2,7 +2,8 @@
 
 Several agents work on sbc-emu at the same time. Everything reaches `main` through a pull
 request; nobody pushes to `main` directly. GitHub cannot enforce this on this plan, so it is
-the rule here.
+the rule here. [CONTRIBUTING.md](CONTRIBUTING.md) has the rules for everyone; this file adds
+what agents working in parallel need.
 
 ## Branches and worktrees
 
@@ -41,14 +42,14 @@ Who is working where right now (update this table when you start or finish somet
 | Area | Crates / paths | Agent |
 |---|---|---|
 | Raspberry Pi 4: SoC, GPU (V3D), display, Ubuntu | `bcm2711/`, `v3d/`, `cli/src/vnc*.rs`, `web/` | Claude Code |
-| Multi-board foundation, Orange Pi 5 (RK3588S) and its Mali-G610 GPU (`docs/orangepi5.md`, `docs/orangepi5-gpu.md`) | `sbc-machine/`, `rk3588/`, `boards/` | Claude Code (taken over from Codex, 2026-11-19) |
+| Multi-board foundation, Orange Pi 5 (RK3588S) and its Mali-G610 GPU (`docs/orangepi5.md`, `docs/orangepi5-gpu.md`) | `sbc-machine/`, `rk3588/` | Claude Code |
 | Orange Pi One (H3), its Mali-400 GPU and the 32-bit core | `allwinner-h3/`, `mali400/`, `arm-a32/`, `cli/src/orangepi_one.rs` | Claude Code |
-| RK3288 / Tinker Board (plan: `docs/rk3288-tinker-board-plan.md`) | `rockchip-rk3288/` (storage, I²C, PMIC: `dwmmc.rs`, `i2c.rs`, `rk808.rs`), `cli/src/tinkerboard.rs`, the RK3288's display (`vop.rs`, `dsi.rs`), RGA, audio (`i2s.rs`, `peripherals/src/pl330.rs`), GPIO, and its browser page `web/tinker.html` (with `wasm/`); `arm-a32` changes (also its WebAssembly JIT, `jit_wasm.rs`) go through its owner | Claude Code (the Orange Pi One session, through a sub-agent on `claude/tinkerboard-*` branches) |
+| RK3288 / Tinker Board (`docs/tinkerboard.md`; plan: `docs/history/rk3288-tinker-board-plan.md`) | `rockchip-rk3288/` (storage, I²C, PMIC: `dwmmc.rs`, `i2c.rs`, `rk808.rs`), `cli/src/tinkerboard.rs`, the RK3288's display (`vop.rs`, `dsi.rs`), RGA, audio (`i2s.rs`, `peripherals/src/pl330.rs`), GPIO, and its browser page `web/tinker.html` (with `wasm/`); `arm-a32` changes (also its WebAssembly JIT, `jit_wasm.rs`) go through its owner | Claude Code (the Orange Pi One session, through a sub-agent on `claude/tinkerboard-*` branches) |
 | Shared device models (`peripherals/`: GIC, UART, I²C chips, timebase); used by the H3 and RK3288 machines, open to every board | `peripherals/` | Claude Code (the Orange Pi One session); changes affect the H3 and RK3288 boards |
-| Orange Pi RV (StarFive JH7110) and the RV64 core (and its JIT to AArch64 and WebAssembly, `riscv64/src/jit*.rs`) | `riscv64/`, `starfive-jh7110/`, `powervr/`, `tests/gpu/pvr/`, `cli/src/orangepi_rv.rs`, `docs/orangepi-rv.md` | Claude Code |
+| Orange Pi RV (StarFive JH7110) and the RV64 core (and its JIT to AArch64, x86-64 and WebAssembly, `riscv64/src/jit*.rs`) | `riscv64/`, `starfive-jh7110/`, `powervr/`, `tests/gpu/pvr/`, `cli/src/orangepi_rv.rs`, `docs/orangepi-rv.md` | Claude Code |
 | Mali-T760 (Midgard) GPU of the RK3288 (`docs/mali-t760.md`) | `midgard/`, its hookup in `rockchip-rk3288/src/machine.rs`, `scripts/mali-t760-*` | Claude Code (the Orange Pi One session) |
-| RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); the RV64 boards are in the Orange Pi RV row | `riscv-rv32/`, `espressif/` | Claude Code (taken over from OpenCode) |
-| NVIDIA Jetson Nano / Tegra X1 (plan: `docs/jetson-nano-plan.md`); the `ram_base` of `arm-a64` (RAM above physical 0) | `tegra210/`, its GPU `maxwell/`, `maxwell-shader/`, `maxwell-tex/` (`docs/jetson-nano-gpu.md`), `cli/src/jetson_nano.rs`, `scripts/jetson-nano-*`, its GPU demos (`demos/nano-gl/`, `tools/stub_library.py`) | Claude Code |
+| RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); the RV64 boards are in the Orange Pi RV row | `riscv-rv32/`, `espressif/` | Claude Code |
+| NVIDIA Jetson Nano / Tegra X1 (`docs/jetson-nano.md`; plan: `docs/history/jetson-nano-plan.md`); the `ram_base` of `arm-a64` (RAM above physical 0) | `tegra210/`, its GPU `maxwell/`, `maxwell-shader/`, `maxwell-tex/` (`docs/jetson-nano-gpu.md`), `cli/src/jetson_nano.rs`, `scripts/jetson-nano-*`, its GPU demos (`demos/nano-gl/`, `tools/stub_library.py`) | Claude Code |
 
 ## Never
 

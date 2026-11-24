@@ -2,7 +2,7 @@
 
 `--board orangepi-one`, experimental.
 
-A 32-bit machine on its own ARMv7 core (`arm-a32`, an interpreter with a block JIT to AArch64, see [below](#the-jit)): four Cortex-A7 cores with VFPv4 and NEON (started through PSCI CPU_ON, as U-Boot's secure monitor does on the board), the H3's GIC-400 with inter-processor interrupts, UART0
+A 32-bit machine on its own ARMv7 core (`arm-a32`, an interpreter with a block JIT to AArch64, x86-64 and WebAssembly, see [below](#the-jit)): four Cortex-A7 cores with VFPv4 and NEON (started through PSCI CPU_ON, as U-Boot's secure monitor does on the board), the H3's GIC-400 with inter-processor interrupts, UART0
 (DesignWare), CCU, timers and the architectural timers. It boots an unmodified Alpine Linux
 kernel (6.18 `linux-lts`, armv7) with the unmodified mainline `sun8i-h3-orangepi-one.dtb`:
 like U-Boot on the real board, the emulator fills in `/chosen` and `/memory` and adds a
@@ -113,6 +113,9 @@ Known gaps: multisampling is not modelled, and the timing model is a rough cycle
 
 `arm-a32/src/jit.rs` (ARM state) and `jit_t32.rs` (Thumb). On AArch64 hosts (macOS, Linux)
 hot blocks are translated to host code; `--no-jit` or `SBC_JIT=0` runs the interpreter alone.
+On x86-64 Linux (`jit_x64.rs`) and in the browser (`jit_wasm.rs`) the same instructions are
+compiled per region; see [jit.md](jit.md#the-32-bit-arm-jit-on-x86-64-linux-hosts). This section
+describes the AArch64 backend.
 
 - A32 and A64 share the NZCV layout, the condition codes and the add/subtract carry and
   overflow rules, so the guest flags live in the host flags inside a block: `ADDS`, `SUBS`,
@@ -154,4 +157,4 @@ starts before it is compiled (default 8).
 | Debian Thumb-2 userland: `scripts/orangepi-one-thumb.txt` | 22.4 s | 1.3 s |
 | Armbian 26.8.1 (Thumb-2 kernel and userland) to the first-run wizard: `scripts/orangepi-one-armbian.txt` | 22 min | 5.4 min |
 
-Design notes, fixture hashes and the bugs found during bring-up: [multi-board-foundation.md](multi-board-foundation.md#orange-pi-one-allwinner-h3-2026-11-15).
+Design notes, fixture hashes and the bugs found during bring-up: [history/multi-board-foundation.md](history/multi-board-foundation.md#orange-pi-one-allwinner-h3-2026-11-15). Debugging with gdb: [debugging.md](debugging.md).

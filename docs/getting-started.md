@@ -12,8 +12,11 @@ You need [Rust](https://rustup.rs) and, for the guests, `curl`, `tar`, `gzip`, `
 `shasum` and `python3` (all there on macOS with the Xcode command line tools; on Linux, install
 `cpio` and `binutils` if they are missing). The full operating systems below also need `xz`
 (macOS: `brew install xz`; Debian and Ubuntu: `xz-utils`).
-sbc-emu runs on macOS and Linux. Its JITs, which make it fast, generate AArch64 code, so it is
-fastest on Apple silicon and other AArch64 machines; on x86-64 it interprets, which is slower.
+sbc-emu runs on macOS and Linux (not Windows). Its JITs, which make it fast, generate AArch64
+code on Apple silicon and AArch64 Linux, and x86-64 code on x86-64 Linux; on an Intel Mac it
+interprets, which is about ten times slower. Prebuilt binaries for macOS (Apple silicon) and
+Linux x86-64 are on the [releases page](https://github.com/joakimeriksson/sbc-emu/releases);
+`scripts/quickstart.sh` builds its own with `cargo build --release`.
 
 ```sh
 git clone https://github.com/joakimeriksson/sbc-emu
@@ -89,7 +92,7 @@ sbc-emu run --board tinkerboard --sd cache/tinker-board-armbian/Armbian_26.8.1_T
 
 Armbian's login is on the serial console, in your terminal. The first login is Armbian's
 first-run wizard (the Orange Pi 5 image logs root in by itself and then starts it): it asks for a
-root password and offers to create a user (Ctrl-C skips that). Add `--vnc :1` for HDMI. More, including the GPUs: [orangepi5.md](orangepi5.md), [orangepi-one.md](orangepi-one.md), [mali-t760.md](mali-t760.md).
+root password and offers to create a user (Ctrl-C skips that). Add `--vnc :1` for HDMI. More, including the GPUs: [orangepi5.md](orangepi5.md), [orangepi-one.md](orangepi-one.md), [tinkerboard.md](tinkerboard.md), [mali-t760.md](mali-t760.md).
 
 ### Orange Pi RV: Ubuntu 24.04
 
@@ -120,7 +123,7 @@ sbc-emu run --board jetson-nano --kernel $D/vmlinuz --dtb $D/tegra210-p3450-0000
 
 Log in as `root` / `nano` (the password is set on the command line). The GPU demos (kmscube,
 glmark2 on nouveau and Mesa): [jetson-nano-gpu.md](jetson-nano-gpu.md). More:
-[jetson-nano-plan.md](jetson-nano-plan.md).
+[jetson-nano.md](jetson-nano.md).
 
 ### ESP32-S31: build the image yourself
 
