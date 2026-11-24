@@ -448,6 +448,24 @@ impl Texture {
         Ok(Some(decode(self.format, &b)))
     }
 
+    /// The sampler's border colour as a texel would be returned: RGBA (not in the
+    /// format's component order), sRGB-decoded for an sRGB format (clamped to [0, 1]
+    /// first, as an sRGB texel always is), then swizzled.
+    fn finish_border(&self) -> [u32; 4] {
+        let integer = matches!(self.kind(), Kind::Uint | Kind::Sint);
+        let one = if integer { 1 } else { 1f32.to_bits() };
+        let mut c = self.border;
+        if self.srgb && !self.srgb_override && !integer {
+            for x in c.iter_mut().take(3) {
+                *x = srgb_to_linear(f32::from_bits(*x).clamp(0., 1.)).to_bits();
+            }
+        }
+        std::array::from_fn(|k| match self.swizzle[k] {
+            4 => 0,
+            5 => one,
+            m => c[m as usize],
+        })
+    }
     /// Apply the component order, sRGB decoding and the descriptor swizzle.
     fn finish(&self, v: [u32; 4]) -> [u32; 4] {
         let integer = matches!(self.kind(), Kind::Uint | Kind::Sint);
@@ -556,13 +574,17 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         }
     };
     let float = !matches!(t.kind(), Kind::Uint | Kind::Sint);
-    let mut layer = r.layer.map_or(0, |l| {
-        if l > 0xffff {
-            f32::from_bits(l).round().max(0.) as u32
-        } else {
-            l
+    // The array index: an integer for texel fetches, otherwise the float coordinate as
+    // Mesa passes it on Valhall (bi_emit_tex_valhall; only Bifrost's TEXC converts it),
+    // taken as clamp(RNE(r), 0, layers - 1) (GLES 3.2 section 8.14.2; NaN is layer 0).
+    let mut layer = match r.layer {
+        None => 0,
+        Some(l) if r.integer => l,
+        Some(l) => {
+            let v = f32::from_bits(l).round_ties_even();
+            if v > 0. { v.min(u32::MAX as f32) as u32 } else { 0 }
         }
-    });
+    };
     if r.integer {
         // TEX_FETCH: integer texel coordinates, no filtering or wrapping.
         let Lod::Fetch(level) = r.lod else {
@@ -596,7 +618,10 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         // Cube: X holds the face in bits 29-31 and s in the low bits (Mesa
         // bi_emit_texc_cube_coord); faces are layers.
         let x = r.coords[0];
-        layer = layer.saturating_mul(6).saturating_add((x >> 29).min(5));
+        // (the cube index clamps to the last cube before the face is added)
+        // (the instruction's dimension, not the descriptor's: a non-cube texture has
+        // fewer than six layers, and the final clamp below keeps the layer in it)
+        layer = layer.min((t.layers / 6).max(1) - 1) * 6 + (x >> 29).min(5);
         c[0] = f32::from_bits((x & 0x1fff_ffff) | 0x2000_0000);
     }
     let (w0, h0, d0) = (t.width as f32, t.height as f32, t.depth as f32);
@@ -645,7 +670,7 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
         [((lod + 0.5).floor().clamp(0., top) as u32, 1.), (0, 0.)]
     };
     let layer = layer.min(t.layers - 1);
-    let border = t.border;
+    let border = t.finish_border();
     let mut acc = [0f64; 4];
     for &(level, weight) in &levels {
         if weight == 0. {
@@ -697,9 +722,13 @@ pub fn sample(env: &mut Env, resources: Resources, r: &Request) -> Result<([u32;
                 _ => Ok(border),
             }
         };
+        // The reference and the depth are clamped to [0, 1] for fixed-point depth only;
+        // a float depth texture (Z32F) compares them as they are.
+        let fixed = !matches!(t.kind(), Kind::Float);
+        let unit = |v: f32| if fixed { v.clamp(0., 1.) } else { v };
         let shadow = |v: [u32; 4]| -> f64 {
-            let value = f32::from_bits(v[0]).clamp(0., 1.);
-            compare(t.compare, r.reference.unwrap_or(0.).clamp(0., 1.), value) as u32 as f64
+            let value = unit(f32::from_bits(v[0]));
+            compare(t.compare, unit(r.reference.unwrap_or(0.)), value) as u32 as f64
         };
         if let Some(component) = r.gather {
             let (x, y) = ((u - 0.5).floor() as i32, (v - 0.5).floor() as i32);
@@ -857,6 +886,35 @@ pub(crate) fn test_fixture() -> (crate::gpu_mmu::AddressSpace, Resources, Vec<u8
     (m, Resources(0x1020), ram, (4 << 27) | (3 << 11))
 }
 
+/// Make the fixture's texture `cubes` cube maps of `levels` levels (2x2, 1x1, ...) with
+/// nearest mipmapping. Each surface is one colour: red = 20 x layer + 5 x level + 5, where
+/// layer = 6 x cube + face (Mesa's order: faces as layers, levels innermost).
+#[cfg(test)]
+pub(crate) fn cube_fixture(ram: &mut [u8], cubes: u32, levels: u32) {
+    let set = |ram: &mut [u8], at: usize, v: u32| ram[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    set(ram, 0x2040, (187 << 22) | 0x02); // texture, dimension cube
+    set(ram, 0x2048, 0x688 | ((levels - 1) << 16));
+    set(ram, 0x2058, cubes - 1);
+    let ctl = u32::from_le_bytes(ram[0x2000..0x2004].try_into().unwrap());
+    set(ram, 0x2000, (ctl & !(3 << 30)) | (2 << 30)); // nearest mipmap
+    for layer in 0..6 * cubes {
+        for level in 0..levels {
+            let n = layer * levels + level;
+            let plane = 0x2100 + n as usize * 32;
+            let texels = 0x4000 + n * 0x80;
+            let size = if level == 0 { 0x10001 } else { 0 };
+            let words = [(2 << 24) | (2 << 8) | 0x1a, 72, texels, 0, 64, 0, 128, size];
+            for (k, &w) in words.iter().enumerate() {
+                set(ram, plane + k * 4, w);
+            }
+            for at in [0, 4, 64, 68] {
+                let at = texels as usize + at;
+                ram[at..at + 4].copy_from_slice(&[(20 * layer + 5 * level + 5) as u8, 0, 0, 255]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,6 +1008,68 @@ mod tests {
             };
             let (v, _) = sample(&mut env, resources, &r).unwrap();
             assert_eq!(bytes(v.map(f32::from_bits)), [face as u8 * 40, 0, 0, 255], "face {face}");
+        }
+    }
+    #[test]
+    fn cube_arrays_and_levels_select_their_surface() {
+        // Two cubes of two levels: 24 surfaces. The cube index is a float coordinate,
+        // rounded to nearest even (1.5 is 2) and clamped to the last cube before the face
+        // is added.
+        let (m, resources, mut ram, _) = test_fixture();
+        cube_fixture(&mut ram, 2, 2);
+        for (index, cube) in [(0f32, 0u32), (1., 1), (0.5, 0), (1.5, 1), (7., 1)] {
+            for face in 0..6u32 {
+                for level in 0..2u32 {
+                    let mut code = crate::gpu_shader::Code::default();
+                    let mut tlb = crate::gpu_shader::Tlb::default();
+                    let mut textures = Cache::default();
+                    let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+                    let s = 0.5f32.to_bits();
+                    let r = Request {
+                        texture: (4, 0),
+                        sampler: (3, 0),
+                        dim: 3,
+                        coords: [(face << 29) | (s & 0x1fff_ffff), 0.5f32.to_bits(), 0, 0],
+                        integer: false,
+                        layer: Some(index.to_bits()),
+                        reference: None,
+                        offset: [0; 3],
+                        lod: Lod::Explicit(level as f32),
+                        gather: None,
+                    };
+                    let (v, _) = sample(&mut env, resources, &r).unwrap();
+                    let red = (20 * (6 * cube + face) + 5 * level + 5) as u8;
+                    assert_eq!(bytes(v.map(f32::from_bits)), [red, 0, 0, 255], "cube {index} face {face} level {level}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn a_cube_sample_of_a_texture_with_fewer_than_six_layers_stays_in_it() {
+        // TEX with dimension cube on the fixture's one-layer 2D texture: face 5 of cube 3
+        // used to underflow the cube clamp (a host panic in debug builds).
+        let (m, resources, mut ram, _) = test_fixture();
+        for (face, index) in [(0u32, 0f32), (5, 0.), (5, 3.), (2, f32::NAN)] {
+            let mut code = crate::gpu_shader::Code::default();
+            let mut tlb = crate::gpu_shader::Tlb::default();
+            let mut textures = Cache::default();
+            let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+            let s = 0.25f32.to_bits();
+            let r = Request {
+                texture: (4, 0),
+                sampler: (3, 0),
+                dim: 3,
+                coords: [(face << 29) | (s & 0x1fff_ffff), 0.25f32.to_bits(), 0, 0],
+                integer: false,
+                layer: Some(index.to_bits()),
+                reference: None,
+                offset: [0; 3],
+                lod: Lod::Explicit(0.),
+                gather: None,
+            };
+            // The only layer: its texel at (0.25, 0.25) is red.
+            let (v, _) = sample(&mut env, resources, &r).unwrap();
+            assert_eq!(bytes(v.map(f32::from_bits)), [255, 0, 0, 255], "face {face} index {index}");
         }
     }
     #[test]
@@ -1103,6 +1223,123 @@ mod tests {
             )
             .is_err());
         }
+    }
+    /// Sample the fixture's texture with an array index and a depth reference.
+    fn sample_at(ram: &mut [u8], uv: [f32; 2], layer: Option<u32>, reference: Option<f32>) -> [f32; 4] {
+        let (m, resources, _, _) = test_fixture();
+        let (mut code, mut tlb, mut textures) = (crate::gpu_shader::Code::default(), crate::gpu_shader::Tlb::default(), Cache::default());
+        let mut env = Env::new(&m, ram, &[], &mut code, &mut tlb, &mut textures);
+        let r = Request {
+            texture: (4, 0),
+            sampler: (3, 0),
+            dim: 1,
+            coords: [uv[0].to_bits(), uv[1].to_bits(), 0, 0],
+            integer: false,
+            layer,
+            reference,
+            offset: [0; 3],
+            lod: Lod::Explicit(0.),
+            gather: None,
+        };
+        sample(&mut env, resources, &r).unwrap().0.map(f32::from_bits)
+    }
+    /// Fetch texel (x, y) of level 0 of the fixture's texture in `layer` (TEX_FETCH).
+    fn fetch_at(ram: &mut [u8], xy: [u32; 2], layer: u32) -> [f32; 4] {
+        let (m, resources, _, _) = test_fixture();
+        let (mut code, mut tlb, mut textures) = (crate::gpu_shader::Code::default(), crate::gpu_shader::Tlb::default(), Cache::default());
+        let mut env = Env::new(&m, ram, &[], &mut code, &mut tlb, &mut textures);
+        let r = Request {
+            texture: (4, 0),
+            sampler: (3, 0),
+            dim: 1,
+            coords: [xy[0], xy[1], 0, 0],
+            integer: true,
+            layer: Some(layer),
+            reference: None,
+            offset: [0; 3],
+            lod: Lod::Fetch(0),
+            gather: None,
+        };
+        sample(&mut env, resources, &r).unwrap().0.map(f32::from_bits)
+    }
+    #[test]
+    fn array_indices_are_rounded_floats_for_sampling_and_integers_for_fetches() {
+        // Four layers, layer k red = 40 k + 10 (layer 0 at 0x3000 keeps its own texels;
+        // layers 1-3 at 0x3800, 0x3880, 0x3900).
+        let (_, _, mut ram, _) = test_fixture();
+        set(&mut ram, 0x2058, 3);
+        for k in 1..4u32 {
+            let texels = 0x3780 + 0x80 * k;
+            let plane = [(2 << 24) | (2 << 8) | 0x1a, 72, texels, 0, 64, 0, 128, 0x10001];
+            for (n, &w) in plane.iter().enumerate() {
+                set(&mut ram, 0x2100 + 32 * k as usize + n * 4, w);
+            }
+            ram[texels as usize..texels as usize + 0x80].fill(0);
+            ram[texels as usize..texels as usize + 4].copy_from_slice(&[40 * k as u8 + 10, 0, 0, 255]);
+        }
+        let layer = |ram: &mut Vec<u8>, v: f32| -> u8 {
+            let red = bytes(sample_at(ram, [0.25, 0.25], Some(v.to_bits()), None))[0];
+            if red == 255 { 0 } else { (red - 10) / 40 }
+        };
+        // Sampling: the coordinate is a float, rounded to nearest even and clamped.
+        for (v, expected) in [
+            (0., 0),
+            (1., 1),
+            (0.5, 0),
+            (1.5, 2),
+            (2.5, 2),
+            (2.4, 2),
+            (3.5, 3),
+            (1e9, 3),
+            (-1., 0),
+            (-0.6, 0),
+            (f32::NAN, 0),
+            (f32::INFINITY, 3),
+        ] {
+            assert_eq!(layer(&mut ram, v), expected, "{v}");
+        }
+        // Fetches: an integer, clamped (0x10000 is not float bits).
+        let red = |v: [f32; 4]| bytes(v)[0];
+        assert_eq!(red(fetch_at(&mut ram, [0, 0], 2)), 90);
+        assert_eq!(red(fetch_at(&mut ram, [0, 0], 0x10000)), 130);
+        assert_eq!(red(fetch_at(&mut ram, [0, 0], 0)), 255);
+    }
+    #[test]
+    fn float_depth_compares_without_clamping() {
+        // An R32F (Z32F) texture holding 1.5 and -0.5, compare LESS (reference < depth).
+        let (_, _, mut ram, _) = test_fixture();
+        set(&mut ram, 0x2040, (167 << 22) | 0x22);
+        set(&mut ram, 0x2004, 0x1fff0000 | (1 << 13));
+        set(&mut ram, 0x2110, 8);
+        ram[0x3000..0x3004].copy_from_slice(&1.5f32.to_le_bytes());
+        ram[0x3008..0x300c].copy_from_slice(&(-0.5f32).to_le_bytes());
+        // 1.2 < 1.5 passes for a float depth; clamped both would be 1 < 1, failing.
+        assert_eq!(sample_at(&mut ram, [0.25, 0.25], None, Some(1.2))[0], 1.);
+        assert_eq!(sample_at(&mut ram, [0.25, 0.25], None, Some(1.7))[0], 0.);
+        // -0.7 < -0.5 passes; clamped both would be 0 < 0.
+        assert_eq!(sample_at(&mut ram, [0.25, 0.75], None, Some(-0.7))[0], 1.);
+        // A unorm depth still clamps the reference: 1.2 is 1, and 1 < 1 fails.
+        set(&mut ram, 0x2040, (187 << 22) | 0x22);
+        ram[0x3000..0x3004].copy_from_slice(&[255, 0, 0, 255]);
+        assert_eq!(sample_at(&mut ram, [0.25, 0.25], None, Some(1.2))[0], 0.);
+    }
+    #[test]
+    fn border_colours_are_srgb_decoded_and_swizzled() {
+        // Clamp to border (wrap mode 11) with an sRGB format and a swizzle; the border is
+        // given in RGBA, not in the format's component order.
+        let (_, _, mut ram, _) = test_fixture();
+        let ctl = word(&ram[0x2000..], 0) & !(0xff << 12);
+        set(&mut ram, 0x2000, ctl | (11 << 12) | (11 << 16));
+        let border = [0.5f32, 0.25, 0.75, 0.5];
+        for (n, v) in border.iter().enumerate() {
+            set(&mut ram, 0x2010 + n * 4, v.to_bits());
+        }
+        assert_eq!(sample_at(&mut ram, [-4., 0.5], None, None), border);
+        set(&mut ram, 0x2040, (187 << 22) | (1 << 30) | 0x22); // sRGB
+        let decoded = sample_at(&mut ram, [-4., 0.5], None, None);
+        assert_eq!(decoded, [srgb_to_linear(0.5), srgb_to_linear(0.25), srgb_to_linear(0.75), 0.5]);
+        set(&mut ram, 0x2048, 2 | (1 << 3) | (4 << 6) | (5 << 9)); // B, G, 0, 1
+        assert_eq!(sample_at(&mut ram, [-4., 0.5], None, None), [decoded[2], decoded[1], 0., 1.]);
     }
     #[test]
     fn formats_orders_and_srgb_decode() {

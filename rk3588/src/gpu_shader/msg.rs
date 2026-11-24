@@ -800,16 +800,23 @@ impl Shader {
         };
         let (texel, float) =
             crate::gpu_texture::sample(env, self.resources, &request).map_err(memory)?;
-        let mask = if var_tex { 15 } else { bits(i, 22, 4) };
-        let values: Vec<u32> = (0..4)
-            .filter(|n| mask & (1 << n) != 0)
-            .map(|n| texel[n])
-            .collect();
         let wide = if var_tex {
             bits(i, 24, 2) & 1 == 1
         } else {
             i & (1 << 46) != 0
         };
+        // VAR_TEX has no write mask: it writes the first components that fill its staging
+        // registers. (Mesa 25.0 fuses VAR_TEX only before v9, always for four components;
+        // the staging count is the instruction's to give.)
+        let mask = if var_tex {
+            (1 << (write_count * if wide { 1 } else { 2 }).min(4)) - 1
+        } else {
+            bits(i, 22, 4)
+        };
+        let values: Vec<u32> = (0..4)
+            .filter(|n| mask & (1 << n) != 0)
+            .map(|n| texel[n])
+            .collect();
         let format = match (wide, bits(i, 26, 2)) {
             (true, 0 | 1) => 2,
             (false, 0 | 1) => 3,

@@ -426,6 +426,79 @@ mod fragment_tests {
         shader.regs[2] = h;
         assert!(shader.run(&m, &mut ram, &[], 1).is_err());
     }
+    #[test]
+    fn var_tex_writes_as_many_components_as_its_staging_registers_hold() {
+        // VAR_TEX_SINGLE, LOD 0, coordinates from the varying at offset 0: f32 (width 1)
+        // with 1-4 registers, f16 (width 0) with 1-2.
+        let run = |wide: bool, count: u64| -> Option<[u32; 6]> {
+            let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+            let i = (0x4128000413c02042u64 & !(0x1ff << 48) & !(7 << 13) & !(3 << 24))
+                | (0x138 << 48)
+                | ((count - 1) << 36)
+                | (u64::from(wide) << 24);
+            let mut shader = Shader::with_allocation(0, RegisterAllocation::Registers32);
+            shader.resources = resources;
+            shader.fragment = Some(Fragment::new([0x19, 237 << 12]));
+            shader.interpolation = Some(interpolation_fixture());
+            shader.regs[..6].fill(0xdeadbeef);
+            shader.regs[6] = h;
+            ram[..8].copy_from_slice(&(i & !0xff | 6).to_le_bytes());
+            ram[8..16].copy_from_slice(&0x7800c00000000000u64.to_le_bytes());
+            shader.run(&m, &mut ram, &[], 2).ok()?;
+            Some(std::array::from_fn(|n| shader.regs[n]))
+        };
+        let full = run(true, 4).unwrap();
+        for count in 1..4 {
+            let mut expected = [0xdeadbeef; 6];
+            expected[..count].copy_from_slice(&full[..count]);
+            assert_eq!(run(true, count as u64), Some(expected), "{count}");
+        }
+        let half = run(false, 2).unwrap();
+        let h = |v: u32| pack_half(f32::from_bits(v)) as u32;
+        assert_eq!(half[..2], [h(full[0]) | h(full[1]) << 16, h(full[2]) | h(full[3]) << 16]);
+        assert_eq!(run(false, 1).unwrap()[..2], [half[0], 0xdeadbeef]);
+        // More registers than four components fill: reserved.
+        assert_eq!(run(false, 3), None);
+        assert_eq!(run(true, 5), None);
+    }
+    #[test]
+    fn implicit_lod_on_a_cube_face_differentiates_s_without_the_face() {
+        // TEX_SINGLE, cube, implicit LOD, coordinates in r4 (face 2 over s) and r5 (t),
+        // four f32 results from r0; a 2x2 quad whose s steps by `ds` per pixel. The
+        // texture is two levels (2x2, 1x1) of one cube.
+        let run = |ds: f32| -> [u32; 4] {
+            let (m, resources, mut ram, h) = crate::gpu_texture::test_fixture();
+            crate::gpu_texture::cube_fixture(&mut ram, 1, 2);
+            let mut i = 0x4128009413c02042u64
+                & !((15 << 22) | (7 << 36) | (1 << 46) | (63 << 16) | (63 << 40) | (7 << 13) | (3 << 28) | (7 << 33));
+            i |= (15 << 22) | (3 << 36) | (1 << 46) | (4 << 40) | (1 << 13) | (3 << 28) | (2 << 33);
+            ram[..8].copy_from_slice(&i.to_le_bytes());
+            ram[8..16].copy_from_slice(&0x7800c00000000000u64.to_le_bytes());
+            let (mut code, mut tlb, mut textures) = (Code::default(), Tlb::default(), crate::gpu_texture::Cache::default());
+            let mut env = Env::new(&m, &mut ram, &[], &mut code, &mut tlb, &mut textures);
+            let mut lanes: [Shader; 4] = std::array::from_fn(|k| {
+                let mut s = Shader::with_allocation(0, RegisterAllocation::Registers32);
+                s.resources = resources;
+                let mut f = Fragment::new([0, 0]);
+                f.lane = k as u32;
+                s.fragment = Some(f);
+                let sv = 0.25 + ds * (k & 1) as f32;
+                s.regs[2] = h;
+                s.regs[4] = (2 << 29) | (sv.to_bits() & 0x1fff_ffff);
+                s.regs[5] = (0.25 + 0.01 * (k >> 1) as f32).to_bits();
+                s
+            });
+            run_quad(&mut lanes, &mut env, 16).unwrap();
+            std::array::from_fn(|k| lanes[0].regs[k])
+        };
+        // Face 2 is layer 2: level 0 red 45, level 1 red 50.
+        let red = |v: u8| [f32::from(v) / 255., 0., 0., 1.].map(f32::to_bits);
+        // s steps by half a texel of level 0 per pixel: level 0. (With the face bits the
+        // difference would be about 2^63 and select the last level.)
+        assert_eq!(run(0.25), red(45));
+        // Two texels per pixel: level 1.
+        assert_eq!(run(1.), red(50));
+    }
     fn interpolation_fixture() -> Interpolation {
         let values = [0f32, 1., 0., 0., 0.5, 0.5, 0., 0., 1., 0., 0., 0.];
         Interpolation {
@@ -795,4 +868,103 @@ fn a_restarted_thread_does_not_see_the_previous_threads_registers() {
     s.regs[63] = 7;
     s.restart(0x200, RegisterAllocation::Registers32);
     assert_eq!((s.pc, s.regs), (0x200, [0; 64]));
+}
+
+#[test]
+fn integer_conversions_round_in_the_instruction_s_mode() {
+    // S32_TO_F32, U32_TO_F32, V2S16_TO_V2F16, V2U16_TO_V2F16 (CVT 0x90, round mode at 30).
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let run = |sub: u64, rm: u64, u: u32| -> u32 {
+        // (the 16-bit forms read both halves: swizzle h01 at bit 36)
+        let swizzle = if sub & 0xf == 7 { 2 << 36 } else { 0 };
+        let i = 0x7890c00000000080u64 | (sub << 16) | (rm << 30) | swizzle;
+        let mut ram = i.to_le_bytes().to_vec();
+        let mut shader = Shader::new(0);
+        shader.run(&m, &mut ram, &[u], 1).unwrap();
+        shader.regs[0]
+    };
+    let f = |v: f32| v.to_bits();
+    // 2^24 + 1 lies between two floats: rte, rtp, rtn, rtz.
+    assert_eq!([0, 1, 2, 3].map(|rm| run(0x09, rm, 16777217)), [16777216., 16777218., 16777216., 16777216.].map(f));
+    assert_eq!(
+        [0, 1, 2, 3].map(|rm| run(0x09, rm, -16777217i32 as u32)),
+        [-16777216., -16777216., -16777218., -16777216.].map(f)
+    );
+    assert_eq!([0, 1, 3].map(|rm| run(0x19, rm, u32::MAX)), [4294967296., 4294967296., 4294967040.].map(f));
+    // 2049 lies between two halves (2048, 2050).
+    let h = |v: f32| pack_half(v) as u32;
+    let lanes = 2049u32 | ((-2049i16 as u16 as u32) << 16);
+    assert_eq!(run(0x07, 0, lanes), h(2048.) | h(-2048.) << 16);
+    assert_eq!(run(0x07, 1, lanes), h(2050.) | h(-2048.) << 16);
+    assert_eq!(run(0x07, 2, lanes), h(2048.) | h(-2050.) << 16);
+    assert_eq!(run(0x07, 3, lanes), h(2048.) | h(-2048.) << 16);
+    // 65535 is past the largest half: infinity to nearest or up, 65504 toward zero or down.
+    assert_eq!([0, 1, 2, 3].map(|rm| run(0x17, rm, 0xffff)), [0x7c00, 0x7c00, 0x7bff, 0x7bff]);
+}
+
+#[test]
+fn clper_takes_its_lane_within_the_subgroup_size() {
+    // CLPER.i32 r0 = r1 of the lane in u0 (inactive result umax), each lane's r1 = 100 +
+    // its lane ID; and MOV r2 = LANE_ID (special page 3, 0xe2).
+    let m = AddressSpace { transtab: 0, transcfg: 2 };
+    let run = |subgroup: u64, lane_op: u64, lane: u32| -> ([u32; 4], [u32; 4]) {
+        let clper = 0x00a0c00000000000u64 | (subgroup << 36) | (lane_op << 32) | (1 << 22) | (0xf << 16) | (0x80 << 8) | 1;
+        let id = 0x7e91c200000000e2u64;
+        let mut ram: Vec<u8> = [clper, id].iter().flat_map(|i| i.to_le_bytes()).collect();
+        let uniforms = [lane];
+        let (mut code, mut tlb, mut textures) = (Code::default(), Tlb::default(), crate::gpu_texture::Cache::default());
+        let mut env = Env::new(&m, &mut ram, &uniforms, &mut code, &mut tlb, &mut textures);
+        let mut lanes: [Shader; 4] = std::array::from_fn(|k| {
+            let mut s = Shader::new(0);
+            let mut f = Fragment::new([0, 0]);
+            f.lane = k as u32;
+            s.fragment = Some(f);
+            s.regs[1] = 100 + k as u32;
+            s
+        });
+        run_quad(&mut lanes, &mut env, 16).unwrap();
+        (std::array::from_fn(|k| lanes[k].regs[0]), std::array::from_fn(|k| lanes[k].regs[2]))
+    };
+    let x = u32::MAX;
+    assert_eq!(run(3, 0, 2), ([102; 4], [0, 1, 2, 3]));
+    // Mesa's derivatives use subgroup4: lane 5 is lane 1 of the quad.
+    assert_eq!(run(1, 0, 5).0, [101; 4]);
+    // Sixteen threads (Mesa's subgroup size): lanes 4-15 are outside the quad.
+    assert_eq!(run(3, 0, 5).0, [x; 4]);
+    // Pairs: lane 1 of each, the neighbour (xor), and accumulate out of the pair.
+    assert_eq!(run(0, 0, 1).0, [101, 101, 103, 103]);
+    assert_eq!(run(0, 0, 3).0, [101, 101, 103, 103]);
+    assert_eq!(run(0, 1, 1).0, [101, 100, 103, 102]);
+    assert_eq!(run(0, 2, 1).0, [101, x, 103, x]);
+    assert_eq!(run(1, 3, 1).0, [x, 100, 101, 102]);
+}
+
+#[test]
+fn half_fma_rounds_once() {
+    let h = |v: f32| pack_half(v) as u32 * 0x10001;
+    let run = |a: f32, b: f32, c: f32| -> u32 {
+        // FMA.v2f16 r0 = u0 * u1 + u2
+        let i = 0x78b3c00000828180u64;
+        let mut ram = i.to_le_bytes().to_vec();
+        let m = AddressSpace { transtab: 0, transcfg: 2 };
+        let mut shader = Shader::new(0);
+        shader.run(&m, &mut ram, &[h(a), h(b), h(c)], 1).unwrap();
+        shader.regs[0] & 0xffff
+    };
+    // (1 + 2^-10) 2^-6 * (1 - 2^-10) 2^-5 + (1 + 2^-10) = 1 + 2^-10 + 2^-11 - 2^-31: just
+    // below the tie between 1 + 2^-10 and 1 + 2^-9. Through f32 it lands on the tie and
+    // went to the even 1 + 2^-9.
+    let (a, b, c) = ((1. + 2f32.powi(-10)) / 64., (1. - 2f32.powi(-10)) / 32., 1. + 2f32.powi(-10));
+    assert_eq!(run(a, b, c), 0x3c01);
+    assert_eq!(run(-a, b, -c), 0xbc01);
+    // Exact results, ties, subnormals, overflow, signed zeros and NaN.
+    assert_eq!(run(1.5, 2., 0.25), pack_half(3.25) as u32);
+    assert_eq!(run(1. + 2f32.powi(-10), 1., 2f32.powi(-11)), 0x3c02);
+    assert_eq!(run(2f32.powi(-14), 0.5, 0.), 0x0200);
+    assert_eq!(run(2f32.powi(-24), 0.5, 0.), 0);
+    assert_eq!(run(2f32.powi(-24), 0.75, 0.), 1);
+    assert_eq!(run(65504., 2., 0.), 0x7c00);
+    assert_eq!(run(-0., 1., -0.), 0x8000);
+    assert_eq!(run(1., -1., 1.), 0);
+    assert_eq!(run(f32::INFINITY, 0., 1.) & 0x7c00, 0x7c00);
 }

@@ -496,6 +496,65 @@ fn round(mode: u32, v: f32) -> f32 {
         _ => v.trunc(),
     }
 }
+/// `a * b + c` of binary16 values rounded once, to the nearest binary16 (ties to even), as
+/// an f32. (Through an f32 fused multiply-add it would round twice: to f32, then to f16.)
+fn fma_f16(a: f32, b: f32, c: f32) -> f32 {
+    if !(a.is_finite() && b.is_finite() && c.is_finite()) {
+        return half(pack_half(a.mul_add(b, c)));
+    }
+    // Every binary16 is a multiple of 2^-24, so the exact result is an integer number
+    // of 2^-48 (at most about 2^80).
+    let units = |v: f32| (v as f64 * (1u64 << 24) as f64) as i128;
+    let s = units(a) * units(b) + (units(c) << 24);
+    if s == 0 {
+        // An exact zero is -0 only for -0 + -0.
+        let product_negative = a.is_sign_negative() != b.is_sign_negative();
+        let both = (a == 0. || b == 0.) && product_negative && c.is_sign_negative();
+        return if both { -0. } else { 0. };
+    }
+    let mag = s.unsigned_abs();
+    // The result's unit in the last place: 2^k units (2^24, 2^-24, for subnormals).
+    let k = (127 - mag.leading_zeros()).saturating_sub(10).max(24);
+    let (mut q, rem, tie) = (mag >> k, mag & ((1 << k) - 1), 1u128 << (k - 1));
+    if rem > tie || rem == tie && q & 1 == 1 {
+        q += 1;
+    }
+    // Subnormals (k = 24) encode q itself; each step of k adds one to the exponent, and
+    // a carry into the next binade follows from the sum.
+    let bits = (((k - 24) as u128) << 10) + q;
+    half(bits.min(0x7c00) as u16 | if s < 0 { 0x8000 } else { 0 })
+}
+/// An exact value (an integer up to 2^32) as f32 in a rounding mode (Round mode: rte,
+/// rtp, rtn, rtz).
+fn to_f32_rounded(mode: u32, x: f64) -> f32 {
+    let r = x as f32; // nearest, ties to even
+    match mode {
+        1 if (r as f64) < x => r.next_up(),
+        2 if (r as f64) > x => r.next_down(),
+        3 if (r as f64).abs() > x.abs() => if x > 0. { r.next_down() } else { r.next_up() },
+        _ => r,
+    }
+}
+/// An f32 as binary16 in a rounding mode (overflow saturates to the largest finite value
+/// where the mode rounds toward it).
+fn to_f16_rounded(mode: u32, x: f32) -> u16 {
+    let h = pack_half(x);
+    if x.is_nan() || mode == 0 {
+        return h;
+    }
+    let back = half(h);
+    // One step of the magnitude toward zero or away from it.
+    let toward_zero = |h: u16| if h & 0x7fff == 0 { h } else { h - 1 };
+    let away = |h: u16| h + 1;
+    let up = |h: u16| if h & 0x8000 == 0 { away(h) } else if h == 0x8000 { 1 } else { toward_zero(h) };
+    let down = |h: u16| if h & 0x8000 != 0 { away(h) } else if h == 0 { 0x8001 } else { toward_zero(h) };
+    match mode {
+        1 if back < x => up(h),
+        2 if back > x => down(h),
+        3 if back.abs() > x.abs() => toward_zero(h),
+        _ => h,
+    }
+}
 /// `x * 2^e` without intermediate overflow.
 fn ldexp(x: f32, e: i32) -> f32 {
     (x as f64 * 2f64.powi(e.clamp(-400, 400))) as f32
@@ -1230,10 +1289,7 @@ impl Shader {
             0x0b3 => {
                 let (a, b, c) = (o.v2f16(0)?, o.v2f16(1)?, o.v2f16(2)?);
                 let cl = bits(i, 32, 2);
-                f2h([
-                    clamp(cl, a[0].mul_add(b[0], c[0])),
-                    clamp(cl, a[1].mul_add(b[1], c[1])),
-                ])
+                f2h([clamp(cl, fma_f16(a[0], b[0], c[0])), clamp(cl, fma_f16(a[1], b[1], c[1]))])
             }
             0x0b4..=0x0b6 => self.shift(i, &o, op)?,
             0x0b8..=0x0ba => {
@@ -1424,18 +1480,16 @@ impl Shader {
             0x04 => sext(swz_lo(o)?, 16) as u32,
             0x05 => (sext(swz_lo(o)?, 16) as f32).to_bits(),
             0x07 | 0x17 => {
+                // 16-bit integers are exact in f32; to binary16 in the rounding mode.
                 let h = o.v2i16w(0, sub == 0x07)?;
                 let c = |x: u32| {
-                    if sub == 0x07 {
-                        x as u16 as i16 as f32
-                    } else {
-                        x as f32
-                    }
+                    let v = if sub == 0x07 { x as u16 as i16 as f32 } else { x as f32 };
+                    to_f16_rounded(rm, v) as u32
                 };
-                f2h([round(rm, c(h[0])), round(rm, c(h[1]))])
+                pack2(c(h[0]), c(h[1]))
             }
-            0x09 => (o.i32w(0, true)? as i32 as f32).to_bits(),
-            0x19 => (o.i32w(0, false)? as f32).to_bits(),
+            0x09 => to_f32_rounded(rm, o.i32w(0, true)? as i32 as f64).to_bits(),
+            0x19 => to_f32_rounded(rm, o.i32w(0, false)? as f64).to_bits(),
             0x0a | 0x1a => {
                 let h = o.v2f16(0)?;
                 f32_to_int(h[0], rm, sub == 0x0a)
@@ -1779,20 +1833,31 @@ impl Shader {
             0xfc00_fc00,
             0x7c00_7c00,
         ][bits(i, 22, 4) as usize];
+        // Subgroup size (bit 36: 2, 4, 8 or 16 threads): the lane is taken within the
+        // thread's subgroup; accumulate and shift that leave it read an inactive lane.
+        // The model runs fragment threads as 2x2 quads, lanes 0-3 of a 16-thread warp
+        // whose other lanes are inactive.
+        let size = match bits(i, 36, 4) {
+            s @ 0..=3 => 2u32 << s,
+            _ => return Err(None),
+        };
+        let lane = |me: u32| -> Option<usize> {
+            let base = me & !(size - 1);
+            let t = match bits(i, 32, 2) {
+                0 => base | (b & (size - 1)),
+                1 => base | ((me ^ b) & (size - 1)),
+                2 => me.wrapping_add(b),
+                _ => me.wrapping_sub(b),
+            };
+            (t >= base && t < base + size).then_some(t as usize)
+        };
         let Some(q) = quad else {
             // A lone thread is lane 0 of its subgroup; other lanes are inactive.
-            return if b == 0 { o.raw(0) } else { Ok(inactive) };
+            return if lane(0) == Some(0) { o.raw(0) } else { Ok(inactive) };
         };
-        let me = q.lane as u32;
-        let target = match bits(i, 32, 2) {
-            0 => b,
-            1 => me ^ b,
-            2 => me.wrapping_add(b),
-            _ => me.wrapping_sub(b),
-        } as usize;
-        if target >= 4 || !q.active[target] {
+        let Some(target) = lane(q.lane as u32).filter(|&t| t < 4 && q.active[t]) else {
             return Ok(inactive);
-        }
+        };
         if a_index >> 6 <= 1 {
             let r = a_index & 63;
             if !self.registers_available(r, 1) {
