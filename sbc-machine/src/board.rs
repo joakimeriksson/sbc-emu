@@ -40,7 +40,7 @@ impl Board {
             Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (4x Cortex-A12): Armbian from SD or eMMC, or a kernel and initramfs; HDMI, Mali-T760 GPU",
             Self::OrangePiRv => "experimental: Orange Pi RV / StarFive JH7110 (4x RV64GC U74): U-Boot from SPI flash or SD to Ubuntu, or OpenSBI and a kernel; Ethernet, Wi-Fi, NVMe, PowerVR GPU",
             Self::Esp32S31 => "experimental: ESP32-S31-Function-CoreBoard-1 (2x RV32IMAC): the mask ROM and Espressif's Linux flash image",
-            Self::JetsonOrinNano => "experimental: NVIDIA Jetson Orin Nano 4GB / Tegra234 (one Cortex-A78AE enabled): direct Linux boot over serial",
+            Self::JetsonOrinNano => "experimental: NVIDIA Jetson Orin Nano 4GB / Tegra234 (6x Cortex-A78AE): direct Linux boot over serial",
             Self::JetsonNano => "experimental: NVIDIA Jetson Nano / Tegra X1 (4x Cortex-A57): a kernel and initramfs, Debian's root on the microSD card; Ethernet, USB, HDMI, Maxwell GPU",
         }
     }

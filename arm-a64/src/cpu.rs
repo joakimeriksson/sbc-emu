@@ -64,7 +64,7 @@ impl CpuProfile {
     /// Cortex-A76 r4p0 (the RK3588's big cores), with the same reduced feature set as the A55.
     pub const CORTEX_A76: Self = Self { midr: 0x414f_d0b0, gic_sysregs: true };
     /// Cortex-A78AE identity with the core's implemented ISA feature set.
-    pub const CORTEX_A78AE: Self = Self { midr: 0x410f_d420, gic_sysregs: true };
+    pub const CORTEX_A78AE: Self = Self { midr: 0x410f_d421, gic_sysregs: true };
 }
 
 pub struct Cpu {

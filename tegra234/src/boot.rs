@@ -1,5 +1,8 @@
 //! A minimal Tegra234 device tree for direct Linux boot.
-use crate::{Machine, GICD, GICD_SIZE, GICR, GICR_SIZE, RAM_BASE, UART, UART_SIZE, UART_SPI};
+use crate::{
+    Machine, AFFINITIES, GICD, GICD_SIZE, GICR, GICR_SIZE, RAM_BASE, UART, UARTA, UARTA_SPI,
+    UART_SIZE, UART_SPI,
+};
 use emu_core::{arm64_image::kernel_image, fdt::Fdt};
 
 const KERNEL_REGION: u64 = 0x0020_0000;
@@ -18,7 +21,7 @@ fn range(base: u64, bytes: u64) -> [u32; 4] {
     [base_hi, base_lo, size_hi, size_lo]
 }
 
-fn device_tree(ram_bytes: u64, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec<u8> {
+fn device_tree(ram_bytes: u64, cores: usize, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec<u8> {
     let mut dt = Fdt::default();
     dt.begin("");
     dt.str("model", "Jetson Orin Nano 4GB (sbc-emu direct boot)");
@@ -29,6 +32,7 @@ fn device_tree(ram_bytes: u64, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec
 
     dt.begin("aliases");
     dt.str("serial0", "/serial@31d0000");
+    dt.str("serial1", "/serial@3100000");
     dt.end();
 
     dt.begin("chosen");
@@ -48,11 +52,28 @@ fn device_tree(ram_bytes: u64, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec
     dt.begin("cpus");
     dt.cells("#address-cells", &[1]);
     dt.cells("#size-cells", &[0]);
-    dt.begin("cpu@0");
-    dt.str("device_type", "cpu");
-    dt.str("compatible", "arm,cortex-a78ae");
-    dt.cells("reg", &[0]);
-    dt.str("enable-method", "psci");
+    for (core, affinity) in AFFINITIES[..cores].iter().enumerate() {
+        dt.begin(&format!("cpu@{affinity:x}"));
+        dt.str("device_type", "cpu");
+        dt.str("compatible", "arm,cortex-a78ae");
+        dt.cells("reg", &[*affinity as u32]);
+        dt.cells("phandle", &[10 + core as u32]);
+        dt.str("enable-method", "psci");
+        dt.end();
+    }
+    dt.begin("cpu-map");
+    for (cluster, members) in [0..cores.min(4), 4..cores].iter().enumerate() {
+        if members.is_empty() {
+            continue;
+        }
+        dt.begin(&format!("cluster{cluster}"));
+        for (index, core) in members.clone().enumerate() {
+            dt.begin(&format!("core{index}"));
+            dt.cells("cpu", &[10 + core as u32]);
+            dt.end();
+        }
+        dt.end();
+    }
     dt.end();
     dt.end();
 
@@ -85,6 +106,17 @@ fn device_tree(ram_bytes: u64, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec
     dt.cells("reg", &range(UART, UART_SIZE));
     dt.cells("interrupts", &[0, UART_SPI, 4]);
     dt.cells("current-speed", &[115200]);
+    dt.end();
+
+    // The Tegra 8250 driver uses PIO and a fixed reference clock for bring-up.
+    dt.begin("serial@3100000");
+    dt.strs(
+        "compatible",
+        &["nvidia,tegra234-uart", "nvidia,tegra20-uart"],
+    );
+    dt.cells("reg", &range(UARTA, UART_SIZE));
+    dt.cells("interrupts", &[0, UARTA_SPI, 4]);
+    dt.cells("clock-frequency", &[1_843_200]);
     dt.end();
 
     dt.end();
@@ -121,7 +153,7 @@ pub fn boot_linux(
             Ok((RAM_BASE + INITRD_OFFSET, RAM_BASE + end))
         })
         .transpose()?;
-    let dtb = device_tree(ram_bytes, cmdline, initrd_range);
+    let dtb = device_tree(ram_bytes, machine.cpus.len(), cmdline, initrd_range);
     if dtb.len() as u64 > INITRD_OFFSET - DTB_OFFSET {
         return Err("device tree exceeds 2 MiB".into());
     }
@@ -135,7 +167,7 @@ pub fn boot_linux(
         ram[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
-    let cpu = &mut machine.cpu;
+    let cpu = &mut machine.cpus[0];
     cpu.el = 1;
     cpu.spsel = true;
     cpu.daif = 0x3c0;

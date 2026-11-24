@@ -210,8 +210,16 @@ pub(crate) fn ram_bytes(args: &[String], default_mb: usize) -> Result<usize, Str
 /// Run a freshly made machine on the host terminal until the script completes, the
 /// guest powers off, the user quits (Ctrl-A x) or a limit is reached.
 pub(crate) fn run<B: SerialBoard>(
+    config: RunConfig,
+    make_machine: impl Fn() -> Result<B, String>,
+) -> Result<(), String> {
+    run_with_io(config, make_machine, |_| Ok(()))
+}
+
+pub(crate) fn run_with_io<B: SerialBoard>(
     mut config: RunConfig,
     make_machine: impl Fn() -> Result<B, String>,
+    mut poll_io: impl FnMut(&mut B) -> Result<(), String>,
 ) -> Result<(), String> {
     let tag = config.tag;
     let mut m = make_machine()?;
@@ -281,6 +289,9 @@ pub(crate) fn run<B: SerialBoard>(
         anchor = anchored(m.now());
     }
     let result = 'run: loop {
+        if let Err(error) = poll_io(&mut m) {
+            break Err(error);
+        }
         let mut input = std::mem::take(&mut idle_input);
         while let Ok(b) = rx.try_recv() {
             input.push(b);

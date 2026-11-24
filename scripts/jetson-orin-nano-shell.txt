@@ -3,13 +3,17 @@ wait-serial TEGRA234_BOOT_OK
 serial printf 'ARCH_%s' "$(uname -m)"; echo\r
 wait-serial ARCH_aarch64
 serial printf 'CPUS_%s' "$(nproc)"; echo\r
-wait-serial CPUS_1
+wait-serial CPUS_6
 serial awk '/MemTotal/ { printf "MEM_%s%d", "GB", ($2 + 524288)/1048576 }' /proc/meminfo; echo\r
 wait-serial MEM_GB4
 serial cat /proc/device-tree/model; echo\r
 wait-serial Jetson Orin Nano 4GB (sbc-emu direct boot)
-serial awk '/arch_timer/ && $2 > 0 { print "TIMER_" "OK" }' /proc/interrupts\r
+serial awk '/arch_timer/ { for (i=2;i<=7;i++) if (!$i) exit 1; print "TIMER_" "OK" }' /proc/interrupts\r
 wait-serial TIMER_OK
 serial awk '/uart-pl011/ && $2 > 0 { print "UART_" "OK" }' /proc/interrupts\r
 wait-serial UART_OK
+serial awk '/^IPI1:/ { for (i=2;i<=7;i++) if (!$i) exit 1; print "IPI_" "OK" }' /proc/interrupts\r
+wait-serial IPI_OK
+serial p=/sys/devices/system/cpu/cpu5/online; echo 0 > $p && echo 1 > $p && grep -qx 1 $p && echo HOTPLUG_$(nproc)\r
+wait-serial HOTPLUG_6
 quit

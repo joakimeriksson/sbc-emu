@@ -84,12 +84,18 @@ echo "TEGRA210_BOOT_OK: arm64 Linux BusyBox shell"
 exec /bin/busybox setsid -c /bin/sh
 INIT
 else
+    wildcards=
+    tar --version 2>/dev/null | grep -q 'GNU tar' && wildcards=--wildcards
+    tar -xzf "$OUT/downloads/$KERNEL_APK" -C "$work/rootfs" $wildcards \
+        'lib/modules/*/modules.*' \
+        'lib/modules/*/kernel/drivers/tty/serial/8250/8250_tegra.ko.gz'
     cat > "$work/rootfs/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sysfs /sys
 exec </dev/console >/dev/console 2>&1
+/bin/busybox modprobe 8250_tegra
 export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin PS1='jetson-orin-nano# '
 echo "TEGRA234_BOOT_OK: arm64 Linux BusyBox shell"
 exec /bin/busybox setsid -c /bin/sh
