@@ -8,7 +8,14 @@ overlay planes straddle the middle, left to right:
   C  the same pixels, "Coverage":                        As Cs + (1 - As) Cd = 159 / 96.
 A fourth plane D (XRGB8888 red, X byte 0) sits low on the grey, on an overlay plane of the
 Cluster kind when there is one (the lowest overlay zpos): Linux mixes Cluster windows by pixel
-alpha whatever the format, so it shows what the hardware is told to do with the X byte."""
+alpha whatever the format, so it shows what the hardware is told to do with the X byte.
+
+With KMS_SCENE=bottom-alpha, after that the primary plane, C and D are turned off, and A's
+Esmart plane is moved to zpos 0 with the white/grey picture at plane alpha 0x8000 (half),
+over the black background; only B is above it. The bottom plane is dimmed all over
+(128 / 64), and B gives Cs + (1 - As) Agd Cd = 128 / 96.
+
+tools/panthor-demo.py --planes checks these values in the screenshot."""
 import ctypes as C, fcntl, mmap, os, struct, time
 
 drm = C.CDLL('libdrm.so.2')
@@ -91,7 +98,7 @@ rc = function('drmModeSetCrtc', I, [I, U32, U32, U32, U32, C.POINTER(U32), I, C.
 assert rc == 0, 'drmModeSetCrtc failed: %d' % rc
 
 pr = function('drmModeGetPlaneResources', C.POINTER(PlaneRes), [I])(fd).contents
-overlays = []
+overlays, primary_plane = [], None
 for i in range(pr.count_planes):
     pid = pr.planes[i]
     pl = function('drmModeGetPlane', C.POINTER(Plane), [I, U32])(fd, pid).contents
@@ -99,17 +106,22 @@ for i in range(pr.count_planes):
     kind = {0: 'overlay', 1: 'primary', 2: 'cursor'}.get(pp['type'][1], '?')
     zpos = pp.get('zpos', (0, -1, {}))[1]
     print('plane %d: %s, zpos %d, CRTCs 0x%x, blend modes %s' % (pid, kind, zpos, pl.possible_crtcs, sorted(pp.get('pixel blend mode', (0, 0, {}))[2])), flush=True)
+    # (on rk3588 only the Esmart windows take linear NV12, the Cluster windows do not)
+    esmart = 0x3231564e in [pl.formats[k] for k in range(pl.count_formats)]
     if kind == 'overlay' and pl.possible_crtcs & 1:
-        overlays.append((zpos, pid, pp))
+        overlays.append((zpos, pid, pp, esmart))
+    if kind == 'primary' and pl.possible_crtcs & 1:
+        primary_plane = pid
 overlays.sort()
 assert len(overlays) >= 4, 'need four overlay planes, have %d' % len(overlays)
 
 set_plane = function('drmModeSetPlane', I, [I, U32, U32, U32, U32, I, I, U32, U32, U32, U32, U32, U32])
+set_property = function('drmModeObjectSetProperty', I, [I, U32, U32, U32, C.c_uint64])
 def show(plane, fb, x, y, w, h, blend=None):
-    zpos, pid, pp = plane
+    zpos, pid, pp, _ = plane
     if blend:
         prop, _, enums = pp['pixel blend mode']
-        assert function('drmModeObjectSetProperty', I, [I, U32, U32, U32, C.c_uint64])(fd, pid, OBJECT_PLANE, prop, enums[blend]) == 0
+        assert set_property(fd, pid, OBJECT_PLANE, prop, enums[blend]) == 0
     rc = set_plane(fd, pid, crtc, fb, 0, x, y, w, h, 0, 0, w << 16, h << 16)
     assert rc == 0, 'drmModeSetPlane %d failed: %d' % (pid, rc)
     print('plane %d (zpos %d): %dx%d at (%d, %d)%s' % (pid, zpos, w, h, x, y, ', ' + blend if blend else ''), flush=True)
@@ -122,6 +134,19 @@ show(overlays[0], red, W // 16, H - H // 6 - 20, pw, H // 6)
 show(overlays[-3], red, W // 16, py, pw, ph)
 show(overlays[-2], grey, W // 2 - pw // 2, py, pw, ph, 'Pre-multiplied')
 show(overlays[-1], grey, W - W // 16 - pw, py, pw, ph, 'Coverage')
+if os.environ.get('KMS_SCENE') == 'bottom-alpha':
+    # Then the primary, D and C off, and A's Esmart plane moved to zpos 0 with the white/grey
+    # picture at half plane alpha; Linux sets up MIX0 as Cs + (1 - As) Cd Agd and the HDR0
+    # mixer. (A's window is already on a layer: rockchipdrm 6.18 mis-selects a window that
+    # its saved OVL_LAYER_SEL does not hold yet when it goes to layer 0.)
+    if primary_plane is None or not overlays[-3][3]:
+        raise SystemExit('KMS_SCENE=bottom-alpha needs a primary plane on CRTC 0 and an Esmart window for plane A')
+    for plane in (primary_plane, overlays[0][1], overlays[-1][1]):
+        assert set_plane(fd, plane, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) == 0, 'disabling plane %d failed' % plane
+    bottom = overlays[-3]
+    assert set_property(fd, bottom[1], OBJECT_PLANE, bottom[2]['zpos'][0], 0) == 0
+    assert set_property(fd, bottom[1], OBJECT_PLANE, bottom[2]['alpha'][0], 0x8000) == 0
+    show(bottom, primary, 0, 0, W, H)
 print('KMS_PLANES_OK %dx%d' % (W, H), flush=True)
 time.sleep(float(os.environ.get('KMS_HOLD', '3')))
 print('KMS_END', flush=True)
