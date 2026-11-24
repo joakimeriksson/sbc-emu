@@ -1,5 +1,10 @@
 # Emulated CYW43455 (BCM4345 rev 6) over SDIO for stock `brcmfmac` — device-side spec
 
+> A developer's specification, written while the model was built (it is implemented in
+> `bcm2711/src/wifi.rs` and `peripherals/src/bcm43455/`). The "local files" below were read-only
+> copies of the Linux sources in an ignored `cache/` directory; they are not in the repository, and
+> the tree paths name them in Linux's source.
+
 Target: Raspberry Pi kernel `rpi-6.18.y`, unmodified `brcmfmac` + mmc core, up to `wlan0`
 registered, brought up and accepting an `escan` request.
 

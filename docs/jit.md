@@ -1,5 +1,21 @@
 # The JIT
 
+Each CPU core is an interpreter with a block JIT that compiles hot code for the host. The JIT is
+on by default; `--no-jit` runs the interpreter alone, and `?jit=0` does the same
+on a browser page.
+
+| Core | AArch64 (macOS, Linux) | x86-64 Linux | WebAssembly (browser) |
+|---|---|---|---|
+| `arm-a64` (Pi 4, Orange Pi 5, Jetson Nano) | `jit.rs` | `jit_x64.rs` | `jit_wasm.rs` |
+| `arm-a32` (Orange Pi One, Tinker Board) | `jit.rs`, `jit_t32.rs` | `jit_x64.rs` | `jit_wasm.rs` |
+| `riscv64` (Orange Pi RV) | `jit_a64.rs` | `jit_x64.rs` | `jit_wasm.rs` |
+| `riscv-rv32` (ESP32-S31) | `jit.rs` | `jit/x64.rs` | `jit.rs` |
+
+On x86-64 macOS no backend is built and the cores interpret. The Jetson Nano's GPU shaders have a
+JIT of their own, to WebAssembly in the browser only ([jetson-nano-gpu.md](jetson-nano-gpu.md#shader-jit-browser)).
+
+## The A64 JIT on AArch64 hosts
+
 `arm-a64/src/jit.rs`. Guest and host share the A64 instruction set, so integer and FP/SIMD
 data-processing instructions are emitted as themselves with guest registers renamed to the host
 registers that cache them — the host computes exactly the architected result, flags included.
@@ -144,7 +160,7 @@ as above, with the guest flags in wasm locals. In Node 26 on an M5:
 `node tools/wasm-a32-jit-diff.mjs` runs `arm-a32/tests/jit_diff.rs`'s random A32 and Thumb cases,
 straight-line and in loops, through the wasm backend against the interpreter.
 
-## The 32-bit Arm JIT on x86-64 hosts
+## The 32-bit Arm JIT on x86-64 Linux hosts
 
 On x86-64 Linux, `arm-a32/src/jit_x64.rs` compiles the Orange Pi One's and the Tinker Board's
 A32/T32 code to x86-64. It translates the same regions and instructions as the WebAssembly backend
@@ -175,11 +191,26 @@ host (about two of those minutes are systemd waiting for its random seed).
 
 ## The RV64 JIT (Orange Pi RV)
 
-`riscv64/src/jit.rs` drives a separate JIT for the RISC-V core with two code generators: RV64 to
-AArch64 (`jit_a64.rs`) and RV64 to WebAssembly (`jit_wasm.rs`). Its regions are keyed by physical
+`riscv64/src/jit.rs` drives a separate JIT for the RISC-V core with three code generators: RV64 to
+AArch64 (`jit_a64.rs`), RV64 to x86-64 on Linux (`jit_x64.rs`, which follows the AArch64 one
+instruction for instruction) and RV64 to WebAssembly (`jit_wasm.rs`). Its regions are keyed by physical
 address and shared by the four harts, stay valid until `fence.i` (then are compared with the bytes
 they were compiled from), and probe a per-mode micro-TLB for loads and stores. Natively, regions
 are linked through a per-hart jump cache and keep the guest registers they use most in host
 registers. Four busy shell loops run 16 times faster than in the interpreter (about 2.2 G RISC-V
 instructions per second on an M5). The design, its tests and timings are in
 [orangepi-rv.md](orangepi-rv.md#the-jit).
+
+## The RV32 JIT (ESP32-S31)
+
+`riscv-rv32/src/jit.rs`. The RV32 core runs decoded blocks (`block.rs`) in every privilege mode
+and compiles hot ones, in regions of the blocks their branches reach on the same virtual page, to
+AArch64 (macOS, Linux), to x86-64 on Linux (`jit/x64.rs`, the AArch64 backend's code shape
+instruction for instruction) and to WebAssembly in the browser. Integer, multiply/divide,
+bit-manipulation and control-transfer instructions become host code; loads and stores call
+helpers that do the interpreter's translation and bus access exactly, and everything else calls
+the interpreter for one instruction. The block interpreter stays the reference:
+`riscv-rv32/tests/blocks_differential.rs` runs random programs (self-modifying code, device
+accesses, traps, interrupts) with compiled blocks and stepping, and compares the whole state.
+`RV32_JIT=0` turns it off. The ESP32-S31's time goes mostly to its device models, so the JIT
+changes less there than on the other boards ([esp32s31.md](esp32s31.md)).
