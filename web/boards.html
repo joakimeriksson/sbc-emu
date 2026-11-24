@@ -143,6 +143,7 @@
     :root { --mm: 1.45px; }
     .wrap { padding: 0 16px; }
     nav.top { gap: 14px; font-size: 17px; }
+    nav.top a.wide { display: none; }
     .tally { grid-template-columns: auto 1fr; }
     .bench { padding: 32px 10px 18px; }
     .lineup { gap: 20px 14px; }
@@ -248,8 +249,8 @@
       <b>sbc-emu</b>
     </a>
     <nav class="top" aria-label="Site">
-      <a href="#boards">Boards</a>
-      <a href="#cores">Cores</a>
+      <a class="wide" href="#boards">Boards</a>
+      <a class="wide" href="#cores">Cores</a>
       <a href="https://github.com/joakimeriksson/sbc-emu/releases/latest">Download</a>
       <a href="https://github.com/joakimeriksson/sbc-emu">GitHub</a>
     </nav>
@@ -449,7 +450,7 @@
 
   <footer>
     <p>The demos run on your computer: the emulator is WebAssembly in a Web Worker, and no server runs the boards. sbc-emu is open source under the BSD 3-Clause licence: <a href="https://github.com/joakimeriksson/sbc-emu">source on GitHub</a>. <a href="sources.html">What runs in the demos, and its licences</a>.</p>
-    <p>To run the boards on your own computer, with full operating system images and faster than in the browser: <a href="https://github.com/joakimeriksson/sbc-emu/releases/latest">download sbc-emu 0.1.0</a> for macOS (Apple silicon) or Linux (x86-64), or build it from source, then follow <a href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/getting-started.md">Getting started</a>.</p>
+    <p>To run the boards on your own computer, faster than in the browser: <a href="https://github.com/joakimeriksson/sbc-emu/releases/latest">download the latest release</a> for macOS (Apple silicon) or Linux (x86-64), or build it from source, then follow <a href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/getting-started.md">Getting started</a>.</p>
     <p>Raspberry Pi, Orange Pi, ASUS, Tinker Board, Broadcom, Allwinner, Rockchip, StarFive, SiFive, NVIDIA, Jetson, Tegra, Arm and Espressif are trademarks of their owners. sbc-emu is an independent project, not affiliated with or endorsed by any of them. The board drawings are simplified outlines.</p>
   </footer>
 </div>
