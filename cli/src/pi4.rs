@@ -193,6 +193,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     let mut monitor_line: Option<String> = None;
     let mut paused = false;
     let mut reset_req = false;
+    // the run ended at --timeout or --max-insns (not by a quit)
+    let mut limit = false;
     let result = loop {
         // input: Ctrl-A x quits, Ctrl-A c opens/closes the monitor, Ctrl-A Ctrl-A sends Ctrl-A
         let mut quit = false;
@@ -257,7 +259,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             }
         }
 
-        if timeout.is_some_and(|t| started.elapsed() >= t) { break Stop::Budget; }
+        if timeout.is_some_and(|t| started.elapsed() >= t) { limit = true; break Stop::Budget; }
         // action script: one step at a time
         if script_wait_until.is_none_or(|t| Instant::now() >= t) {
             script_wait_until = None;
@@ -350,7 +352,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             }
         }
         let budget = 2_000_000u64.min(max.saturating_sub(m.instret()));
-        if budget == 0 { break Stop::Budget; }
+        if budget == 0 { limit = true; break Stop::Budget; }
         // (what the guest asked for in a step happens though the monitor has paused it)
         if paused && !reset_req && owed.is_none() {
             // paused from the monitor: only keys move; the pause does not count as guest time
@@ -452,7 +454,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         let names: Vec<String> = m.cpu().sys.unknown.iter().map(|k| format!("S{}_{}_C{}_C{}_{}", k >> 14, (k >> 11) & 7, (k >> 7) & 15, (k >> 3) & 15, k & 7)).collect();
         eprintln!("[sbc-emu] unmodelled system registers: {}", names.join(" "));
     }
-    match result { Stop::Budget => ExitCode::SUCCESS, _ => ExitCode::FAILURE }
+    // --timeout, --max-insns and the guest powering off end a run normally, unless a --script is
+    // still running; a quit (Ctrl-A x, the script's or the monitor's, a debugger's kill) always does
+    let unfinished = (limit || matches!(result, Stop::PowerOff)).then(|| script.front()).flatten();
+    if let Some(step) = unfinished { eprintln!("[sbc-emu] the script did not complete (at: {step})"); }
+    match result { Stop::Budget | Stop::PowerOff if unfinished.is_none() => ExitCode::SUCCESS, _ => ExitCode::FAILURE }
 }
 
 fn flush(m: &mut Machine, out: &mut std::io::Stdout, raw: bool) {
