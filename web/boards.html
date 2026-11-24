@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sbc-emu</title>
+<title>sbc-emu: single-board computers emulated in Rust</title>
 <meta name="description" content="Seven single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. All of them boot in your browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -44,8 +44,12 @@
   nav.top a:hover { color: var(--gold); }
 
   /* hero */
-  .intro { padding: 56px 0 34px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 30rem); gap: 28px 56px; align-items: end; }
-  h1 { font: 800 clamp(52px, 8.6vw, 128px)/.86 var(--display); letter-spacing: -.012em; margin: 0; text-wrap: balance; max-width: 10ch; }
+  .intro { padding: 56px 0 34px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 30rem); gap: 28px 56px; align-items: center; }
+  h1 { font: 800 clamp(40px, 5.6vw, 84px)/.92 var(--display); letter-spacing: -.01em; margin: 0; text-wrap: balance; max-width: 15ch; }
+  .film { display: block; margin: 0 0 24px; text-decoration: none; color: var(--silk-2); font: 600 18px/1.25 var(--display); letter-spacing: .03em; }
+  .film img { display: block; width: 100%; height: auto; margin-bottom: 10px; border: 1px solid var(--edge); border-radius: 6px; }
+  .film:hover { color: var(--gold); }
+  .film:hover img { border-color: var(--gold); }
   .intro p { margin: 0; color: var(--silk-2); font-size: 19px; }
   .actions { display: flex; flex-wrap: wrap; gap: 12px 22px; align-items: center; margin-top: 28px; }
   .pad-btn { display: inline-flex; align-items: center; gap: 10px; font: 700 22px/1 var(--display); letter-spacing: .04em; color: var(--mask); background: var(--gold);
@@ -258,15 +262,15 @@
 
   <section class="intro">
     <div>
-      <h1>Real boards, emulated to the register</h1>
+      <h1>Raspberry Pi 4, Orange Pi, Jetson Nano and more, emulated in Rust</h1>
       <div class="actions">
         <a class="pad-btn" href="hello.html"><span class="via" aria-hidden="true"></span>Power on a Raspberry Pi 4</a>
         <a class="quiet" href="gpu.html">3D on its GPU</a>
         <a class="quiet" href="#boards">See all seven boards</a>
-        <a class="quiet" href="https://www.youtube.com/watch?v=LDYEcrK_I24">Watch the film (70 s, YouTube)</a>
       </div>
     </div>
     <div>
+      <a class="film" href="https://www.youtube.com/watch?v=LDYEcrK_I24"><img src="film-thumbnail.jpg" width="960" height="540" alt="The sbc-emu film: an emulated Raspberry Pi 4 showing glmark2’s jellyfish, with the names of the seven boards">The 0.1.0 announcement film, 70 seconds, on YouTube</a>
       <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. All seven boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
       <dl class="tally">
         <dt>7</dt><dd>boards</dd>

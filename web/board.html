@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sbc-emu board</title>
+<title>sbc-emu</title>
 <meta name="description" content="A single-board computer booting Linux in your browser, on an emulator compiled to WebAssembly.">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
@@ -116,7 +116,7 @@ const BOARDS = {
 const $ = (id) => document.getElementById(id);
 const id = new URLSearchParams(location.search).get('b') || 'orangepi-one';
 const board = BOARDS[id] || BOARDS['orangepi-one'];
-document.title = `sbc-emu ${board.name}`;
+document.title = `${board.name} in your browser – sbc-emu`;
 $('name').textContent = `an ${board.name}`.replace(/^an ([^AEIOU])/, 'a $1');
 $('lede').textContent = board.lede;
 $('powernote').textContent = board.note;
