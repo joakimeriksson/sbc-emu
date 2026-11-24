@@ -123,7 +123,7 @@ jobs:
             --title "sbc-emu ${{ steps.notes.outputs.version }}" --notes-file notes.md \
             dist/*.tar.gz dist/SHA256SUMS
       - name: Dry run (no release)
-        if: github.event_name != 'push'
+        if: ${{ !(github.event_name == 'push' && github.ref_type == 'tag') }}
         run: |
           echo "dry run: would create a draft release with:"
           ls -l dist
