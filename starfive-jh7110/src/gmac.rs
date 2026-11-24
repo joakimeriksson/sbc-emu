@@ -256,7 +256,7 @@ impl Gmac {
                     }
                     if flags & LD != 0 && !self.tx_partial.is_empty() {
                         self.tx_out.push(std::mem::take(&mut self.tx_partial));
-                        self.tx_frames += 1;
+                        self.tx_frames = self.tx_frames.wrapping_add(1);
                     }
                     Self::put_word(ram, d + 12, flags & (FD | LD));
                 } else {
@@ -296,7 +296,7 @@ impl Gmac {
                 Self::put_word(ram, d + 8, 0);
                 Self::put_word(ram, d + 12, FD | LD | len as u32);
                 self.rx_queue.pop_front();
-                self.rx_frames += 1;
+                self.rx_frames = self.rx_frames.wrapping_add(1);
                 self.rx_index = (self.rx_index + 1) % count;
                 let s = self.r(CH_STATUS) | RI;
                 self.set(CH_STATUS, s);
@@ -458,4 +458,25 @@ mod tests {
 
 // Snapshots
 emu_core::snap_struct!(Yt8531 { regs, ext, page, cable, latched_low });
-emu_core::snap_struct!(Gmac { tx_index, rx_index, tx_partial, tx_out, rx_queue, tx_frames, rx_frames } fixed { regs } fitted { phy: "a PHY" });
+emu_core::snap_struct!(Gmac { tx_index, rx_index, tx_partial, tx_out, rx_queue, tx_frames, rx_frames } fixed { regs } fitted { phy: "a PHY" }
+after |g| {
+    // a descriptor ring has at most 1024 entries (the ring length is 10 bits)
+    if g.tx_index >= 1024 || g.rx_index >= 1024 {
+        return Err(emu_core::snap::SnapError(format!("Ethernet DMA descriptors {} and {} of at most 1024", g.tx_index, g.rx_index)));
+    }
+    Ok(())
+});
+
+#[cfg(test)]
+mod snapshot_tests {
+    /// A descriptor index past the longest ring is refused on restore (its increment would
+    /// overflow).
+    #[test]
+    fn a_snapshot_with_an_impossible_ring_index_is_refused() {
+        let mut m = crate::Machine::new(8 << 20);
+        (m.soc.gmac0.tx_index, m.soc.gmac0.rx_index) = (1023, 7);
+        crate::Machine::new(8 << 20).restore(&m.save().unwrap()).unwrap();
+        assert!(crate::machine::refused(|m| m.soc.gmac0.tx_index = u32::MAX).contains("Ethernet DMA"));
+        assert!(crate::machine::refused(|m| m.soc.gmac1.rx_index = 1024).contains("Ethernet DMA"));
+    }
+}

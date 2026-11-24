@@ -406,7 +406,7 @@ impl Bcm43456 {
         let flags = u32::from_le_bytes(p[8..12].try_into().unwrap());
         let set = flags & 2 != 0;
         let data = &p[16..];
-        self.ioctls += 1;
+        self.ioctls = self.ioctls.wrapping_add(1);
         let r = self.ioctl(cmd, set, data, len);
         let (status, mut out) = match r { Ok(v) => (0i32, v), Err(e) => (e, Vec::new()) };
         if self.trace {
@@ -658,7 +658,7 @@ impl Bcm43456 {
                 self.pmk.copy_from_slice(&sbc_net::crypto::pbkdf2_sha1(pass.as_bytes(), NETWORKS[idx].0.as_bytes(), 4096, 32));
                 let seed = sbc_net::crypto::sha1(&[&self.pmk[..], &self.mac[..], &self.replay.to_le_bytes()[..]].concat());
                 for i in 0..32 { self.anonce[i] = seed[i % 20] ^ (i as u8); }
-                self.replay += 1;
+                self.replay = self.replay.wrapping_add(1);
                 let m1 = self.eapol_key(0x008a, self.anonce, &[], None);
                 self.wpa = Wpa::AwaitM2;
                 self.send_eapol(m1);
@@ -730,7 +730,7 @@ impl Bcm43456 {
             let mut kek = [0u8; 16];
             kek.copy_from_slice(&ptk[16..32]);
             let wrapped = sbc_net::crypto::aes_key_wrap(&kek, &kd);
-            self.replay += 1;
+            self.replay = self.replay.wrapping_add(1);
             let m3 = self.eapol_key(0x13ca, self.anonce, &wrapped, Some(&ptk[..16]));
             self.wpa = Wpa::AwaitM4;
             if self.trace { eprintln!("[wifi] WPA2 message 2 verified, sending message 3"); }
@@ -815,7 +815,7 @@ emu_core::snap_struct!(Bcm43456 {
 } fixed { ram } skip { trace } after |c| {
     if c.net >= NETWORKS.len() { return Err(emu_core::snap::SnapError(format!("Wi-Fi network {} of {}", c.net, NETWORKS.len()))); }
     if c.rx_cur.as_ref().is_some_and(|(f, pos)| *pos > f.len()) { return Err(emu_core::snap::SnapError("a Wi-Fi frame read past its end".into())); }
-    Ok(())
+    crate::machine::check_time(c.now, "the Wi-Fi chip")
 });
 
 #[cfg(test)]
@@ -823,7 +823,8 @@ mod tests {
     use super::*;
     use emu_core::snap::Snap;
 
-    /// The chip comes back as it was; a frame read past its end (a hand-made snapshot) is refused.
+    /// The chip comes back as it was; a frame read past its end, or a clock no guest reaches (a
+    /// hand-made snapshot), is refused.
     #[test]
     fn snapshots() {
         let mut c = Bcm43456::new();
@@ -843,5 +844,10 @@ mod tests {
         let mut w = emu_core::snap::W::default();
         c.save(&mut w);
         assert!(Bcm43456::new().load(&mut emu_core::snap::R::new(&w.0)).is_err());
+        c.rx_cur = None;
+        c.now = u64::MAX;
+        let mut w = emu_core::snap::W::default();
+        c.save(&mut w);
+        assert!(Bcm43456::new().load(&mut emu_core::snap::R::new(&w.0)).unwrap_err().0.contains("virtual time"));
     }
 }

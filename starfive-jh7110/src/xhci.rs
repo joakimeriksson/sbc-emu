@@ -592,7 +592,7 @@ impl Xhci {
         }
         if td.is_empty() { return None; }
         if self.trace { eprintln!("[xhci] slot {slot} dci {dci} TD {:?}", td.iter().map(|t| (t.ty(), t.len(), t.param)).collect::<Vec<_>>()); }
-        self.transfers += 1;
+        self.transfers = self.transfers.wrapping_add(1);
         let ev = |x: &mut Self, ram: &mut [u8], t: &Trb, cc: u32, residue: usize| {
             let ed = if t.ty() == T_EVENT_DATA { 1 << 2 } else { 0 };
             let param = t.addr;
@@ -661,7 +661,7 @@ impl Xhci {
             let epn = (dci / 2) as u8;
             if dci % 2 == 1 {
                 let want: usize = td.iter().map(buf_len).sum();
-                let Some(got) = dev.data_in(epn, want) else { self.transfers -= 1; return Some(false) };
+                let Some(got) = dev.data_in(epn, want) else { self.transfers = self.transfers.wrapping_sub(1); return Some(false) };
                 self.scatter(ram, &td, &got);
                 complete(self, ram, &td, got.len());
             } else {
@@ -728,4 +728,27 @@ emu_core::snap_struct!(Port { sc, pmsc, dev });
 emu_core::snap_struct!(Xhci {
     usbcmd, usbsts, dnctrl, config, crcr, cmd_deq, cmd_ccs, crr, dcbaap, ports, iman, imod, irq_hold, erstsz, erstba, erdp,
     ev_seg, ev_idx, ev_pcs, slots, now, next_poll, transfers,
-} skip { trace });
+} skip { trace } after |x| {
+    // ERSTSZ and a segment's size are 16 bits: the event ring's producer stays below them
+    if x.erstsz > 0xffff || x.ev_seg > 0xffff || x.ev_idx > 0xffff {
+        return Err(emu_core::snap::SnapError(format!("the xHCI event ring at segment {} entry {} of {}", x.ev_seg, x.ev_idx, x.erstsz)));
+    }
+    crate::machine::check_time(x.now, "the xHCI")
+});
+
+#[cfg(test)]
+mod tests {
+    /// An event ring position past what ERSTSZ and a segment's size allow, or a clock no guest
+    /// reaches, is refused on restore (the producer's increments would overflow).
+    #[test]
+    fn a_snapshot_with_an_impossible_event_ring_is_refused() {
+        fn xhci(m: &mut crate::Machine) -> &mut super::Xhci { m.soc.pcie[0].xhci.as_mut().unwrap() }
+        let mut m = crate::Machine::new(8 << 20);
+        (xhci(&mut m).erstsz, xhci(&mut m).ev_seg, xhci(&mut m).ev_idx) = (2, 1, 0xffff);
+        crate::Machine::new(8 << 20).restore(&m.save().unwrap()).unwrap();
+        assert!(crate::machine::refused(|m| xhci(m).ev_idx = u32::MAX).contains("event ring"));
+        assert!(crate::machine::refused(|m| xhci(m).ev_seg = u32::MAX).contains("event ring"));
+        assert!(crate::machine::refused(|m| xhci(m).erstsz = 0x1_0000).contains("event ring"));
+        assert!(crate::machine::refused(|m| xhci(m).now = u64::MAX).contains("virtual time"));
+    }
+}

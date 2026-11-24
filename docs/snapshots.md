@@ -21,7 +21,13 @@ and disk **images** (`--sd`, `--emmc`, `--nvme`, `--usb-drive`; a snapshot holds
 them). On the Orange Pi RV, `--spi-flash` too if it was given: what the flash holds is in the
 snapshot, whatever the file holds; the harts that run are the snapshot's, and `--smp` applies when
 the guest reboots. Cores, RAM, devices, and the images' sizes are checked, their contents are not. The kernel is
-in the snapshot's RAM; `--kernel` is only needed if the guest is to reboot. `--no-jit` and
+in the snapshot's RAM; `--kernel` is only needed if the guest is to reboot. A reboot boots from the
+options the restore was given, not the ones the snapshot was made with. On the Orange Pi RV, a
+snapshot of a `--kernel` boot restored with `--sd` but without `--kernel` reboots from the boot ROM
+and the card's U-Boot, not the kernel it was started with (with `--spi-flash`, the boot ROM loads
+from the flash; with a `--ram-mb` other than 2048, 4096, 8192 or 16384, which U-Boot does not know,
+the reboot stops with an error). Give the same boot options when restoring for reboots to behave
+the same. `--no-jit` and
 `--threads` may differ.
 
 On one thread and interpreted (`--no-jit`), a restored run is the uninterrupted one, to the

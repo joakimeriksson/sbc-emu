@@ -401,7 +401,7 @@ impl Nvme {
                 if let Some(d) = self.disk.as_mut() {
                     d.read(slba, &mut data);
                 }
-                self.reads += 1;
+                self.reads = self.reads.wrapping_add(1);
                 if self.to_guest(cmd, &data, ram, base) { (0, 0) } else { (0x6, 0) }
             }
             0x01 => match self.from_guest(cmd, (nlb * 512) as usize, ram, base) {
@@ -409,7 +409,7 @@ impl Nvme {
                     if let Some(d) = self.disk.as_mut() {
                         d.write(slba, &data);
                     }
-                    self.writes += 1;
+                    self.writes = self.writes.wrapping_add(1);
                     (0, 0)
                 }
                 None => (0x6, 0),

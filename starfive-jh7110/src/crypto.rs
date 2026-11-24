@@ -76,7 +76,7 @@ impl Sec {
                     let words = (((v >> 16) & 0x3f) + 1) as usize;
                     self.execute((v >> 8) & 0xf, words);
                     self.done = true;
-                    self.ops += 1;
+                    self.ops = self.ops.wrapping_add(1);
                 }
             }
             CASR => {}

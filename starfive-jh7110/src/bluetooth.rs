@@ -90,7 +90,7 @@ impl Bluetooth {
     }
 
     fn command(&mut self, op: u16, p: &[u8]) {
-        self.commands += 1;
+        self.commands = self.commands.wrapping_add(1);
         if self.trace { eprintln!("[bt] command {op:#06x} {p:02x?}"); }
         let ok = |v: &[u8]| { let mut r = vec![0u8]; r.extend_from_slice(v); r };
         let r: Vec<u8> = match op {

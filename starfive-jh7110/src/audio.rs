@@ -382,7 +382,7 @@ impl AxiDmac {
 
     fn finish_block(&mut self, k: usize, ram: &mut [u8], ram_base: u64, sinks: &mut Sinks) {
         let Some(b) = self.ch[k].block.take() else { return };
-        self.transfers += 1;
+        self.transfers = self.transfers.wrapping_add(1);
         self.ch[k].regs[(CH_LLP / 8) as usize] = b.next;
         self.raise(k, IRQ_BLOCK_TRF);
         if b.last {
@@ -407,7 +407,8 @@ impl AxiDmac {
             }
             let rate = sinks.rate(b.dar, b.width);
             let c = &mut self.ch[k];
-            c.owed += elapsed * rate as u64;
+            // saturating: time since `last` may be anything a snapshot holds (or the clock jumped)
+            c.owed = c.owed.saturating_add(elapsed.saturating_mul(rate as u64));
             let due = c.owed / 1_000_000_000;
             c.owed %= 1_000_000_000;
             let n = due.min(b.items - b.done);
@@ -433,8 +434,20 @@ impl AxiDmac {
 }
 
 // Snapshots. What was recorded for `--audio-out` is the host's.
-emu_core::snap_struct!(Block { sar, dar, items, done, width, last, next });
-emu_core::snap_struct!(Chan { regs, enabled, block, intstatus, owed });
+// A block and a channel as `fetch` and `update` leave them; only a hand-made file has others
+// (the transfer's arithmetic would overflow on them).
+emu_core::snap_struct!(Block { sar, dar, items, done, width, last, next } after |b| {
+    // BLOCK_TS + 1 items (BLOCK_TS is 22 bits) of 1 to 128 bytes, `done` of them moved
+    if !(1..=1 << 22).contains(&b.items) || b.done > b.items || !b.width.is_power_of_two() || b.width > 128 {
+        return Err(emu_core::snap::SnapError(format!("an audio DMA block of {} items of {} bytes, {} done", b.items, b.width, b.done)));
+    }
+    Ok(())
+});
+emu_core::snap_struct!(Chan { regs, enabled, block, intstatus, owed } after |c| {
+    // less than one sample owed (in 1/1e9 of a sample)
+    if c.owed >= 1_000_000_000 { return Err(emu_core::snap::SnapError(format!("an audio DMA channel owing {} samples", c.owed / 1_000_000_000))); }
+    Ok(())
+});
 emu_core::snap_struct!(Pwmdac { ctrl } skip { capture });
 emu_core::snap_struct!(I2s {} fixed { regs } skip { capture });
 emu_core::snap_struct!(AxiDmac { cfg, ch, last, transfers });
@@ -508,5 +521,51 @@ mod tests {
         d.write(DMAC_CHEN, 0x101, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
         d.update(20_000_000, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
         assert_eq!(dac.capture.frames, 960);
+    }
+
+    /// A block with more items moved than it has (or other arithmetic a guest could not set up)
+    /// is refused on restore, not played: `items - done` would underflow.
+    #[test]
+    fn a_snapshot_with_an_impossible_dma_block_is_refused() {
+        let block = Block { sar: BASE, dar: PWMDAC_BASE, items: 480, done: 0, width: 4, last: true, next: 0 };
+        let with = |b: Block| move |m: &mut crate::Machine| {
+            m.soc.dmac.ch[0].enabled = true;
+            m.soc.dmac.ch[0].block = Some(b);
+        };
+        // the block as `fetch` makes it restores
+        let mut m = crate::Machine::new(8 << 20);
+        with(block)(&mut m);
+        let mut back = crate::Machine::new(8 << 20);
+        back.restore(&m.save().unwrap()).unwrap();
+        assert_eq!(back.soc.dmac.ch[0].block.unwrap().items, 480);
+        for (k, bad) in [
+            Block { done: 481, ..block },
+            Block { items: 0, ..block },
+            Block { items: (1 << 22) + 1, done: 0, ..block },
+            Block { width: 3, ..block },
+            Block { width: 1 << 40, ..block },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(crate::machine::refused(with(bad)).contains("audio DMA block"), "case {k}");
+        }
+        assert!(crate::machine::refused(|m| m.soc.dmac.ch[1].owed = u64::MAX).contains("owing"));
+    }
+
+    /// A transfer to the DAC that last moved at time 0, updated at the latest time a snapshot
+    /// may hold: the samples owed saturate rather than overflow, and the block completes.
+    #[test]
+    fn a_dac_transfer_after_a_long_gap_does_not_overflow() {
+        let mut ram = vec![0u8; 0x10000];
+        let mut dac = Pwmdac::default();
+        dac.write(4, 1 | (1 << 4), 48000);
+        let mut i2s = I2s::default();
+        let mut d = AxiDmac::default();
+        d.ch[0].enabled = true;
+        d.ch[0].block = Some(Block { sar: BASE + 0x1000, dar: PWMDAC_BASE, items: 480, done: 0, width: 4, last: true, next: 0 });
+        d.update(crate::machine::MAX_TIME_NS, &mut ram, BASE, &mut Sinks { dac: &mut dac, dac_rate: 48000, i2s: &mut i2s, i2s_rate: 48000 });
+        assert_eq!(dac.capture.frames, 480);
+        assert!(!d.ch[0].enabled && d.ch[0].block.is_none());
     }
 }

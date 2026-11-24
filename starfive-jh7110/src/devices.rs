@@ -330,6 +330,25 @@ mod tests {
         assert!(!p.asserted(ctx));
     }
 
+    /// An interrupt pending from a source the PLIC does not have is refused on restore (claiming
+    /// it would index past the priorities).
+    #[test]
+    fn a_snapshot_with_a_source_beyond_the_plic_is_refused() {
+        let mut p = Plic::default();
+        p.set_level(PLIC_SOURCES - 1, true);
+        let mut m = crate::Machine::new(8 << 20);
+        m.soc.plic = p;
+        crate::Machine::new(8 << 20).restore(&m.save().unwrap()).unwrap();
+        for w in 0..3 {
+            let e = crate::machine::refused(|m| match w {
+                0 => m.soc.plic.pending[WORDS - 1] |= 1 << 31,
+                1 => m.soc.plic.active[WORDS - 1] |= 1 << (PLIC_SOURCES % 32),
+                _ => m.soc.plic.level[WORDS - 1] = u32::MAX,
+            });
+            assert!(e.contains("PLIC"), "case {w}: {e}");
+        }
+    }
+
     #[test]
     fn crg_reset_status_inverts_assert() {
         let mut c = Crg::new(0x400, 0x2f8, 0x308, 4);
@@ -396,7 +415,7 @@ impl TempSensor {
         let start = v & 4 != 0 && self.ctrl & 4 == 0 && v & 1 != 0 && v & 2 == 0;
         self.ctrl = v;
         if start {
-            self.conversions += 1;
+            self.conversions = self.conversions.wrapping_add(1);
         }
         start
     }
@@ -471,7 +490,18 @@ impl Trng {
 
 // Snapshots. A clock generator's register offsets and banks are the board's.
 emu_core::snap_struct!(Clint { msip, mtimecmp });
-emu_core::snap_struct!(Plic { priority, pending, active, level, enable, threshold });
+emu_core::snap_struct!(Plic { priority, pending, active, level, enable, threshold } after |p| {
+    // only the sources there are can be pending, claimed or high (`best` looks up the priority
+    // of a pending one)
+    let none_above = |words: &[u32; WORDS]| words.iter().enumerate().all(|(w, &v)| {
+        let first = w * 32;
+        first + 32 <= PLIC_SOURCES || v >> (PLIC_SOURCES - first) == 0
+    });
+    if ![&p.pending, &p.active, &p.level].into_iter().all(none_above) {
+        return Err(emu_core::snap::SnapError(format!("a PLIC interrupt source beyond its {PLIC_SOURCES}")));
+    }
+    Ok(())
+});
 emu_core::snap_struct!(Crg {} fixed { regs } skip { assert_off, status_off, banks });
 emu_core::snap_struct!(Regs {} fixed { regs });
 emu_core::snap_struct!(Pmu { regs, on });

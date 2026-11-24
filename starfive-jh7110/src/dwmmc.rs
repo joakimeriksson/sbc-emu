@@ -607,7 +607,14 @@ impl emu_core::snap::Snap for Box<dyn SdioCard> {
 
 emu_core::snap_struct!(PioWrite { lba, bytes, data });
 emu_core::snap_struct!(DwMmc { card, sdio_rca, sdio_selected, sdio_target, regs, rintsts, idsts, fifo, pio_write }
-    fitted { sdio: "the Wi-Fi module" } skip { base, irq, fifo_depth, trace });
+    fitted { sdio: "the Wi-Fi module" } skip { base, irq, fifo_depth, trace }
+    after |m| {
+        // a CMD53's function is 3 bits and its address 17
+        if m.sdio_target.is_some_and(|(func, addr, _)| func > 7 || addr > 0x1_ffff) {
+            return Err(emu_core::snap::SnapError("an SDIO write to a function or address CMD53 cannot name".into()));
+        }
+        Ok(())
+    });
 
 #[cfg(test)]
 mod tests {
@@ -704,4 +711,14 @@ mod tests {
         assert_eq!(mmc.read(CDETECT as u64) & 1, 1, "no card");
     }
 
+    /// An SDIO write to a function or address no CMD53 names is refused on restore (the
+    /// address arithmetic would overflow when its data arrives).
+    #[test]
+    fn a_snapshot_with_an_impossible_sdio_target_is_refused() {
+        let mut m = crate::Machine::new(8 << 20);
+        m.soc.sdio0.sdio_target = Some((1, 0x1_ffff, true));
+        crate::Machine::new(8 << 20).restore(&m.save().unwrap()).unwrap();
+        assert!(crate::machine::refused(|m| m.soc.sdio0.sdio_target = Some((0, u32::MAX, true))).contains("SDIO"));
+        assert!(crate::machine::refused(|m| m.soc.sdio0.sdio_target = Some((8, 0, true))).contains("SDIO"));
+    }
 }

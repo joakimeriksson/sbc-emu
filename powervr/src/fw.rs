@@ -147,7 +147,7 @@ impl Firmware {
         self.wr(ram, CONNECTION_CTL, 2);
         self.wr(ram, self.sysdata.wrapping_add(SYSDATA_POW_STATE), POW_IDLE);
         self.running = true;
-        self.boots += 1;
+        self.boots = self.boots.wrapping_add(1);
         // firmware_started last: it is what the driver waits for
         self.wr(ram, SYSINIT + SYSINIT_FIRMWARE_STARTED, 1);
         if self.trace {
@@ -184,7 +184,7 @@ impl Firmware {
             self.wr(ram, self.kccb_ctl.wrapping_add(CCB_READ_OFFSET), next);
             let n = self.rd(ram, self.osdata.wrapping_add(OSDATA_KCCB_CMDS_EXECUTED));
             self.wr(ram, self.osdata.wrapping_add(OSDATA_KCCB_CMDS_EXECUTED), n.wrapping_add(1));
-            self.commands += 1;
+            self.commands = self.commands.wrapping_add(1);
             any = true;
             if next == rd {
                 self.ring_fault("kernel command ring with a zero wrap mask");
@@ -203,7 +203,7 @@ impl Firmware {
         if self.trace || self.gpu_faults == 0 {
             eprintln!("[gpu fw] {msg}");
         }
-        self.gpu_faults += 1;
+        self.gpu_faults = self.gpu_faults.wrapping_add(1);
     }
 
     /// One kernel command; returns its return-slot flags.
@@ -302,12 +302,12 @@ impl Firmware {
                     self.trace = self.job_trace();
                     crate::cdm::run(self, ram, &mut vm, body);
                     self.trace = trace;
-                    self.jobs += 1;
+                    self.jobs = self.jobs.wrapping_add(1);
                 }
                 // a partial render: only needed when the parameter buffer runs out, which it
                 // never does here; its fences and updates are the commands around it
                 CCB_CMD_FRAG_PR => {
-                    self.jobs += 1;
+                    self.jobs = self.jobs.wrapping_add(1);
                 }
                 CCB_CMD_GEOM | CCB_CMD_FRAG | CCB_CMD_TQ_3D => {
                     let words: Vec<u32> = (0..size / 4).map(|i| self.rd(ram, body.wrapping_add(4 * i))).collect();
@@ -331,9 +331,9 @@ impl Firmware {
                         if trace || self.gpu_faults == 0 {
                             eprintln!("[gpu gfx] job {ty:#x}: {e}");
                         }
-                        self.gpu_faults += 1;
+                        self.gpu_faults = self.gpu_faults.wrapping_add(1);
                     }
-                    self.jobs += 1;
+                    self.jobs = self.jobs.wrapping_add(1);
                 }
                 _ => {}
             }
