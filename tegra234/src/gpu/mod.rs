@@ -5,6 +5,10 @@
 
 use std::collections::HashMap;
 
+mod copy;
+mod host;
+mod mmu;
+
 pub const BAR0: u64 = 0x1700_0000;
 pub const BAR1: u64 = 0x1800_0000;
 pub const SIZE: u64 = 0x0100_0000;
@@ -24,6 +28,7 @@ const RING_CONNECTIVITY_PASS: u32 = 1;
 
 pub struct Gpu {
     regs: HashMap<u64, u32>,
+    host: host::Host,
     ring_started: bool,
     trace: bool,
 }
@@ -32,6 +37,7 @@ impl Default for Gpu {
     fn default() -> Self {
         Self {
             regs: HashMap::new(),
+            host: host::Host::default(),
             ring_started: false,
             trace: std::env::var_os("SBC_TRACE_GPU").is_some(),
         }
@@ -54,7 +60,7 @@ impl Gpu {
         value
     }
 
-    pub fn write(&mut self, offset: u64, value: u32) {
+    pub fn write(&mut self, offset: u64, value: u32, ram: &mut [u8]) {
         if self.trace {
             eprintln!("[gpu] write {offset:06x} <- {value:08x}");
         }
@@ -62,6 +68,17 @@ impl Gpu {
             RING_COMMAND => {
                 if value & RING_COMMAND_MASK == RING_ENUMERATE_AND_START {
                     self.ring_started = true;
+                }
+            }
+            host::SUBMIT => self.host.submit(
+                self.regs.get(&host::BASE_LO).copied().unwrap_or(0),
+                self.regs.get(&host::BASE_HI).copied().unwrap_or(0),
+                value & 0xffff,
+                ram,
+            ),
+            host::DOORBELL => {
+                if self.host.ring(value, ram).is_none() && self.trace {
+                    eprintln!("[gpu] doorbell {value:#x} could not complete");
                 }
             }
             0 | PTIMER_TIME_0 | PTIMER_TIME_1 | RING_START_RESULTS => {}
@@ -73,6 +90,11 @@ impl Gpu {
 
     pub fn reset(&mut self) {
         self.regs.clear();
+        self.host = host::Host::default();
         self.ring_started = false;
+    }
+
+    pub fn submissions(&self) -> u64 {
+        self.host.submissions
     }
 }

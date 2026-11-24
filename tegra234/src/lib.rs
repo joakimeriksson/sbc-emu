@@ -12,6 +12,9 @@ use peripherals::{gicv3::Gic, pl011::Pl011};
 use uart::UartA;
 
 pub const RAM_BASE: u64 = 0x8000_0000;
+pub const DISPLAY_SIZE: (u32, u32) = (640, 360);
+const FRAMEBUFFER: u64 = 0x8ff0_0000;
+const FRAMEBUFFER_RESERVATION: u64 = 1 << 20;
 const APB_MISC: u64 = 0x0010_0000;
 const APB_STRAPS: u64 = 0x0010_f000;
 const CHIP_ID_A01: u32 = 0x0001_2310;
@@ -105,7 +108,7 @@ impl Soc {
                 firmware.hsp.ring_ccplex();
             }
         } else if self.gpu_bar0_accessible(addr) {
-            self.gpu.write(addr - gpu::BAR0, value);
+            self.gpu.write(addr - gpu::BAR0, value, &mut self.ram);
         } else {
             return Err(Fault::Unmapped);
         }
@@ -228,6 +231,7 @@ pub struct Machine {
     breakpoint: emu_core::debug::Breakpoints,
     exception_streak: Vec<u32>,
     pub interrupts: u64,
+    display: bool,
 }
 
 impl Machine {
@@ -284,6 +288,7 @@ impl Machine {
             breakpoint: Default::default(),
             exception_streak: vec![0; cores],
             interrupts: 0,
+            display: false,
         })
     }
 
@@ -294,6 +299,32 @@ impl Machine {
     pub fn enable_gpu(&mut self) {
         self.enable_bpmp();
         self.soc.gpu_node = true;
+    }
+
+    pub fn enable_display(&mut self) {
+        self.display = true;
+    }
+
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        self.display.then_some(DISPLAY_SIZE)
+    }
+
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let (width, height) = self.display_size()?;
+        let start = (FRAMEBUFFER - RAM_BASE) as usize;
+        let size = (width * height * 4) as usize;
+        out.resize(size, 0);
+        for (output, input) in out
+            .chunks_exact_mut(4)
+            .zip(self.soc.ram[start..start + size].chunks_exact(4))
+        {
+            output.copy_from_slice(&[input[2], input[1], input[0], 255]);
+        }
+        Some((width, height))
+    }
+
+    pub fn gpu_submissions(&self) -> u64 {
+        self.soc.gpu.submissions()
     }
 
     pub fn set_jit(&mut self, enabled: bool) -> bool {

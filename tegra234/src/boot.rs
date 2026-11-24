@@ -46,12 +46,43 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
         dt.cells("linux,initrd-start", &address(start));
         dt.cells("linux,initrd-end", &address(end));
     }
+    if let Some((width, height)) = machine.display_size() {
+        dt.cells("#address-cells", &[2]);
+        dt.cells("#size-cells", &[2]);
+        dt.empty("ranges");
+        dt.begin(&format!("framebuffer@{:x}", crate::FRAMEBUFFER));
+        dt.str("compatible", "simple-framebuffer");
+        dt.cells(
+            "reg",
+            &range(crate::FRAMEBUFFER, u64::from(width * height * 4)),
+        );
+        dt.cells("width", &[width]);
+        dt.cells("height", &[height]);
+        dt.cells("stride", &[width * 4]);
+        dt.str("format", "x8r8g8b8");
+        dt.end();
+    }
     dt.end();
 
     dt.begin("memory@80000000");
     dt.str("device_type", "memory");
     dt.cells("reg", &range(RAM_BASE, ram_bytes));
     dt.end();
+
+    if machine.display_size().is_some() {
+        dt.begin("reserved-memory");
+        dt.cells("#address-cells", &[2]);
+        dt.cells("#size-cells", &[2]);
+        dt.empty("ranges");
+        dt.begin(&format!("framebuffer@{:x}", crate::FRAMEBUFFER));
+        dt.cells(
+            "reg",
+            &range(crate::FRAMEBUFFER, crate::FRAMEBUFFER_RESERVATION),
+        );
+        dt.empty("no-map");
+        dt.end();
+        dt.end();
+    }
 
     dt.begin("cpus");
     dt.cells("#address-cells", &[1]);
@@ -304,6 +335,9 @@ pub fn boot_linux(
                 .ok_or("initrd size overflows")?;
             if end > ram_bytes {
                 return Err("initrd does not fit in RAM");
+            }
+            if machine.display_size().is_some() && RAM_BASE + end > crate::FRAMEBUFFER {
+                return Err("initrd overlaps the framebuffer");
             }
             Ok((RAM_BASE + INITRD_OFFSET, RAM_BASE + end))
         })

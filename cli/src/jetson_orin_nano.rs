@@ -1,5 +1,8 @@
 //! Jetson Orin Nano direct Linux boot through the headless serial runner.
-use crate::serial_board::{self, RunConfig, SerialBoard};
+use crate::{
+    serial_board::{self, RunConfig, SerialBoard},
+    vnc::Screen,
+};
 use sbc_machine::Machine as HostMachine;
 use std::process::ExitCode;
 use tegra234::{boot, Machine};
@@ -19,6 +22,11 @@ impl SerialBoard for Machine {
         Machine::instret(self)
     }
 
+    fn screen(&mut self) -> Option<&mut dyn Screen> {
+        Machine::display_size(self)?;
+        Some(self)
+    }
+
     fn report(&self, tag: &str) {
         eprintln!(
             "[{tag}] pc={:#x} el={} insns={} virtual={:.3}s irqs={}",
@@ -28,6 +36,30 @@ impl SerialBoard for Machine {
             self.now() as f64 / 1e9,
             self.interrupts,
         );
+        if self.gpu_submissions() > 0 {
+            eprintln!(
+                "[{tag}] GPU: {} completed GPFIFO entries",
+                self.gpu_submissions()
+            );
+        }
+    }
+}
+
+impl Screen for Machine {
+    fn shown_size(&self) -> Option<(u32, u32)> {
+        self.display_size()
+    }
+
+    fn display_size(&self) -> (u32, u32) {
+        tegra234::DISPLAY_SIZE
+    }
+
+    fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        Machine::render(self, out)
+    }
+
+    fn name(&self) -> &'static str {
+        "sbc-emu: Jetson Orin Nano"
     }
 }
 
@@ -44,9 +76,23 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 fn execute(args: &[String]) -> Result<(), String> {
     serial_board::validate_options(
         args,
-        &["--smp", "--rover-uart", "--uart-driver", "--bpmp", "--gpu"],
+        &[
+            "--smp",
+            "--rover-uart",
+            "--uart-driver",
+            "--bpmp",
+            "--gpu",
+            "--vnc",
+            "--screenshot",
+        ],
     )?;
     let config = RunConfig::from_args(TAG, args)?;
+    let display = config.vnc.is_some()
+        || config.screenshot.is_some()
+        || config
+            .script
+            .iter()
+            .any(|line| line.starts_with("screenshot "));
     let cores = crate::arg(args, "--smp")
         .map_or(Ok(tegra234::AFFINITIES.len()), str::parse::<usize>)
         .map_err(|_| "invalid --smp")?;
@@ -80,6 +126,9 @@ fn execute(args: &[String]) -> Result<(), String> {
         config,
         || {
             let mut machine = Machine::with_uart_mode(ram, cores, high_speed_uart)?;
+            if display {
+                machine.enable_display();
+            }
             if gpu {
                 machine.enable_gpu();
             } else if bpmp {

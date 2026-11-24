@@ -113,6 +113,38 @@ register model. BAR0 exposes the GPU identity, PTIMER and the privileged-ring
 startup handshake. BPMP controls register access and resets the register state.
 Set `SBC_TRACE_GPU=1` to trace BAR0 accesses using the same switch as Tegra210.
 
+### VNC copy-engine demo
+
+The freestanding arm64 demo powers GA10B on through BPMP, builds a copy
+channel and maps its buffers through the five-level GMMU. Each frame submits
+Ampere C7B5 DMA copies over GPFIFO to compose a moving rover on a 640 × 360
+framebuffer. The guest checks the GPU's semaphore, USERD progress and
+framebuffer contents before advancing. The emulator scans out the framebuffer
+through the standard VNC server. [NVIDIA Ampere Copy B class](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc7b5.h)
+
+```sh
+cargo build --release -p sbc-emu
+sh demos/orin-copy/build.sh
+target/release/sbc-emu run --board jetson-orin-nano-4gb --smp 1 --ram-mb 256 \
+  --gpu on --kernel cache/jetson-orin-nano/copy-demo.Image --vnc :7,password=orin
+```
+
+Connect a VNC viewer to `127.0.0.1:5907` with password `orin`. The demo
+keeps animating until the emulator exits. The opt-in display also provides
+a Linux simple-framebuffer at `0x8ff00000`.
+
+```sh
+python3 demos/orin-copy/rfb-smoke.py --output cache/jetson-orin-nano/copy-demo-vnc.png
+```
+
+The smoke client handshakes with the same VNC server over `--vnc stdio`,
+decodes full and incremental RFB updates, and checks that the rover moved.
+The first copy runlist is provisionally placed at BAR0 offset `0x800000`
+for bare-metal bring-up. The copy model covers pitch-linear 4 KiB mappings,
+multiline blits and one-word semaphore writes. The demo uses the copy engine
+and a simple framebuffer. Linux driver submission, shader execution and
+Tegra234 display-controller emulation remain separate milestones.
+
 ### Driver binding
 
 The probe fixture stages NVIDIA's R36.4.4 `nvgpu` and its dependencies in a
@@ -143,7 +175,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Milestone | Acceptance check |
 |---|---|
 | Power-on | The unmodified driver discovers GA10B's engines and finishes power-on, including firmware mailbox handshakes and the required host1x syncpoints. |
-| Memory and submission | A real guest channel submits a copy through the GA10B GMMU and runlist. Verify data and fence completion across page boundaries and recover from a fault. |
+| Memory and submission | Extend the demonstrated bare-metal copy channel to the Linux driver, with data and fence checks across page boundaries and recoverable faults. |
 | Compute | Execute a known-answer Ampere shader, then run a CUDA kernel in the guest and compare its output with a CPU reference. |
 | Graphics | Run the existing GLES 2, 3 and 3.2 scenes on GA10B and compare images with Mesa software rendering. Exercise the display separately for the Jetson demo workloads. |
 | Browser | Run the same shader and rendering checks on the WASM build with matching results. |

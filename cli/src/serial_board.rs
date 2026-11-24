@@ -150,7 +150,7 @@ pub(crate) struct RunConfig {
     pub max_insns: u64,
     /// Screenshot at the end of the run (`--screenshot`).
     pub screenshot: Option<String>,
-    /// VNC server for the display (`--vnc :N`).
+    /// VNC server for the display (`--vnc :N` or `--vnc stdio`).
     pub vnc: Option<String>,
     /// What the board plays (`--audio-out FILE.wav`, or raw PCM to any other path).
     pub audio_out: Option<String>,
@@ -223,7 +223,9 @@ pub(crate) fn run_with_io<B: SerialBoard>(
 ) -> Result<(), String> {
     let tag = config.tag;
     let mut m = make_machine()?;
+    let vnc_stdio = config.vnc.as_deref() == Some("stdio");
     let mut vnc = match config.vnc.as_deref() {
+        Some("stdio") => Some(Vnc::stdio().map_err(|e| format!("--vnc stdio: {e}"))?),
         Some(spec) => Some(Vnc::listen(spec).map_err(|e| format!("--vnc {spec}: {e}"))?),
         None => None,
     };
@@ -241,21 +243,27 @@ pub(crate) fn run_with_io<B: SerialBoard>(
         Some(port) => Some(Gdb::listen(port).map_err(|e| format!("--gdb {port}: {e}"))?),
         None => None,
     };
-    let _terminal = crate::terminal::RawTty::enable();
+    let _terminal = (!vnc_stdio).then(crate::terminal::RawTty::enable);
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut b = [0];
-        while let Ok(1) = stdin.read(&mut b) {
-            if tx.send(b[0]).is_err() {
-                break;
+    if !vnc_stdio {
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut b = [0];
+            while let Ok(1) = stdin.read(&mut b) {
+                if tx.send(b[0]).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
     let script = &mut config.script;
     let mut idle_input = Vec::new();
     let mut pending = VecDeque::new();
-    let mut output = std::io::stdout();
+    let mut output: Box<dyn Write> = if vnc_stdio {
+        Box::new(std::io::stderr())
+    } else {
+        Box::new(std::io::stdout())
+    };
     let mut serial = String::new();
     // how much of `serial` the current wait-serial has searched without a match (searching
     // all of it again on every pass made long boots quadratic)
@@ -451,6 +459,13 @@ pub(crate) fn run_with_io<B: SerialBoard>(
         }
         if let (Some(v), Some(screen)) = (vnc.as_mut(), m.screen()) {
             v.poll(screen);
+            if v.stdio_disconnected() {
+                break if script.is_empty() {
+                    Ok(())
+                } else {
+                    Err("VNC client disconnected before the script completed".into())
+                };
+            }
         }
         if let Some(g) = gdb.as_mut() {
             let p = g.poll(&mut m);
