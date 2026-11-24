@@ -1,6 +1,8 @@
 //! Tegra234 direct-boot machine for early Linux bring-up.
 pub mod boot;
+mod bpmp;
 pub mod gpu;
+mod hsp;
 mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -9,6 +11,9 @@ use peripherals::{gicv3::Gic, pl011::Pl011};
 use uart::UartA;
 
 pub const RAM_BASE: u64 = 0x8000_0000;
+const APB_MISC: u64 = 0x0010_0000;
+const APB_STRAPS: u64 = 0x0010_f000;
+const CHIP_ID_A01: u32 = 0x0001_2310;
 const GICD: u64 = 0x0f40_0000;
 const GICD_SIZE: u64 = 0x1_0000;
 const GICR: u64 = 0x0f44_0000;
@@ -20,12 +25,19 @@ const UARTA: u64 = 0x0310_0000;
 const UARTA_SPI: u32 = 112;
 const COUNTER_HZ: u64 = 31_250_000;
 
+#[derive(Default)]
+struct Firmware {
+    hsp: hsp::Hsp,
+    bpmp: bpmp::Bpmp,
+}
+
 struct Soc {
     ram: Vec<u8>,
     gic: Gic,
     uart: Pl011,
     uarta: UartA,
     gpu: gpu::Gpu,
+    firmware: Option<Firmware>,
     now: u64,
     interrupts_changed: bool,
 }
@@ -41,18 +53,33 @@ impl Soc {
             self.gic.dist_read(addr - GICD)
         } else if (GICR..GICR + GICR_SIZE).contains(&addr) {
             self.gic.redist_read(addr - GICR)
+        } else if addr == APB_MISC + 4 {
+            CHIP_ID_A01
+        } else if addr == APB_STRAPS {
+            0
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
             self.uart.read(addr - UART)
         } else if (UARTA..UARTA + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
             self.uarta.read(addr - UARTA, self.now)
-        } else if addr == uart::FIXTURE_RESET {
+        } else if addr == uart::FIXTURE_RESET && self.firmware.is_none() {
             self.uarta
                 .reset_asserted()
                 .map(u32::from)
                 .ok_or(Fault::Unmapped)?
-        } else if (gpu::BAR0..gpu::BAR0 + gpu::SIZE).contains(&addr) {
+        } else if (hsp::BASE..hsp::BASE + hsp::SIZE).contains(&addr) {
+            self.firmware
+                .as_ref()
+                .ok_or(Fault::Unmapped)?
+                .hsp
+                .read(addr - hsp::BASE)
+        } else if (gpu::BAR0..gpu::BAR0 + gpu::SIZE).contains(&addr)
+            && self
+                .firmware
+                .as_ref()
+                .is_none_or(|firmware| firmware.bpmp.gpu_available())
+        {
             self.gpu
                 .read(addr - gpu::BAR0, self.now)
                 .ok_or(Fault::Unmapped)?
@@ -70,8 +97,15 @@ impl Soc {
             self.uart.write(addr - UART, value);
         } else if (UARTA..UARTA + UART_SIZE).contains(&addr) {
             self.uarta.write(addr - UARTA, value, self.now);
-        } else if addr == uart::FIXTURE_RESET && self.uarta.high_speed() {
+        } else if addr == uart::FIXTURE_RESET && self.uarta.high_speed() && self.firmware.is_none()
+        {
             self.uarta.set_reset(value & 1 != 0);
+        } else if (hsp::BASE..hsp::BASE + hsp::SIZE).contains(&addr) {
+            let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
+            if firmware.hsp.write(addr - hsp::BASE, value) && firmware.bpmp.service(&mut self.uarta)
+            {
+                firmware.hsp.ring_ccplex();
+            }
         } else {
             return Err(Fault::Unmapped);
         }
@@ -79,10 +113,18 @@ impl Soc {
         Ok(())
     }
 
+    fn sram_offset(addr: u64, size: usize) -> Option<usize> {
+        let offset = addr.checked_sub(bpmp::SRAM)?;
+        (offset.checked_add(size as u64)? <= bpmp::SRAM_SIZE).then_some(offset as usize)
+    }
+
     fn read<const N: usize>(&mut self, addr: u64) -> Result<[u8; N], Fault> {
         let mut bytes = [0; N];
         if let Some(offset) = self.ram_offset(addr, N) {
             bytes.copy_from_slice(&self.ram[offset..offset + N]);
+        } else if let Some(offset) = Self::sram_offset(addr, N) {
+            let firmware = self.firmware.as_ref().ok_or(Fault::Unmapped)?;
+            bytes.copy_from_slice(&firmware.bpmp.sram[offset..offset + N]);
         } else if N == 8 && addr.is_multiple_of(8) {
             bytes[..4].copy_from_slice(&self.device_read(addr)?.to_le_bytes());
             bytes[4..].copy_from_slice(&self.device_read(addr + 4)?.to_le_bytes());
@@ -99,6 +141,9 @@ impl Soc {
     fn write<const N: usize>(&mut self, addr: u64, bytes: [u8; N]) -> Result<(), Fault> {
         if let Some(offset) = self.ram_offset(addr, N) {
             self.ram[offset..offset + N].copy_from_slice(&bytes);
+        } else if let Some(offset) = Self::sram_offset(addr, N) {
+            let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
+            firmware.bpmp.sram[offset..offset + N].copy_from_slice(&bytes);
         } else if N == 8 && addr.is_multiple_of(8) {
             self.device_write(addr, u32::from_le_bytes(bytes[..4].try_into().unwrap()))?;
             self.device_write(addr + 4, u32::from_le_bytes(bytes[4..].try_into().unwrap()))?;
@@ -199,6 +244,7 @@ impl Machine {
             uart: Pl011::new(),
             uarta: UartA::new(high_speed_uart),
             gpu: gpu::Gpu,
+            firmware: None,
             now: 0,
             interrupts_changed: true,
         };
@@ -230,6 +276,10 @@ impl Machine {
             exception_streak: vec![0; cores],
             interrupts: 0,
         })
+    }
+
+    pub fn enable_bpmp(&mut self) {
+        self.soc.firmware = Some(Firmware::default());
     }
 
     pub fn set_jit(&mut self, enabled: bool) -> bool {
@@ -297,6 +347,11 @@ impl Machine {
     }
 
     fn update_interrupts(&mut self) {
+        if let Some(firmware) = &self.soc.firmware {
+            self.soc
+                .gic
+                .set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
+        }
         self.soc
             .gic
             .set_line((UART_SPI + 32) as usize, self.soc.uart.irq());
@@ -617,6 +672,138 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BpmpClient {
+        tx: u64,
+        rx: u64,
+        trigger: u64,
+        pending: u64,
+        count: u32,
+    }
+
+    impl BpmpClient {
+        fn new(soc: &mut Soc, channel: u64) -> Self {
+            let dim = soc.read32(hsp::BASE + 0x380).unwrap();
+            assert_ne!(dim & 15, 0); // The Linux mailbox core requires a nonempty controller.
+            let bank = (1 + (dim & 15) / 2 + ((dim >> 4) & 15) + ((dim >> 8) & 15)) as u64;
+            let ccplex = hsp::BASE + bank * 0x10000 + 0x100;
+            let bpmp_db = ccplex + 0x200;
+            assert_ne!(soc.read32(bpmp_db + 4).unwrap() & (1 << 17), 0);
+            soc.write32(ccplex + 4, 1 << hsp::BPMP_MASTER).unwrap();
+            let offset = channel * 256;
+            let tx = bpmp::SRAM + bpmp::TX_POOL as u64 + offset;
+            let rx = bpmp::SRAM + bpmp::RX_POOL as u64 + offset;
+
+            // Publish SYNC, see the remote ACK, then publish ESTABLISHED.
+            soc.write32(tx + 4, 1).unwrap();
+            soc.write32(bpmp_db, 1).unwrap();
+            assert_eq!(soc.read32(rx + 4).unwrap(), 2);
+            assert_eq!(soc.read32(ccplex + 12).unwrap(), 1 << hsp::BPMP_MASTER);
+            soc.write32(ccplex + 12, 1 << hsp::BPMP_MASTER).unwrap();
+            soc.write32(tx + 4, 0).unwrap();
+            soc.write32(bpmp_db, 1).unwrap();
+            assert_eq!(soc.read32(rx + 4).unwrap(), 0);
+            Self {
+                tx,
+                rx,
+                trigger: bpmp_db,
+                pending: ccplex + 12,
+                count: 0,
+            }
+        }
+
+        fn call(&mut self, soc: &mut Soc, mrq: u32, words: &[u32], irq: bool) -> i32 {
+            soc.write32(self.tx + 128, mrq).unwrap();
+            soc.write32(self.tx + 132, 1 | if irq { 2 } else { 0 })
+                .unwrap();
+            for (index, value) in words.iter().enumerate() {
+                soc.write32(self.tx + 136 + 4 * index as u64, *value)
+                    .unwrap();
+            }
+
+            self.count = self.count.wrapping_add(1);
+            soc.write32(self.tx, self.count).unwrap();
+            soc.write32(self.trigger, 1).unwrap();
+            assert_eq!(soc.read32(self.tx + 64).unwrap(), self.count);
+            assert_eq!(soc.read32(self.rx).unwrap(), self.count);
+            assert_eq!(
+                soc.read32(self.pending).unwrap(),
+                if irq { 1 << hsp::BPMP_MASTER } else { 0 }
+            );
+            soc.write32(self.pending, 1 << hsp::BPMP_MASTER).unwrap();
+            let status = soc.read32(self.rx + 128).unwrap() as i32;
+            soc.write32(self.rx + 64, self.count).unwrap();
+            status
+        }
+    }
+
+    #[test]
+    fn bpmp_routes_atomic_and_threaded_messages_through_hsp_and_ivc() {
+        let mut machine = Machine::with_uart_mode(256 << 20, 1, true).unwrap();
+        machine.enable_bpmp();
+        let mut atomic = BpmpClient::new(&mut machine.soc, 3);
+
+        // Restart the receive queue and check that its doorbell reaches the GIC.
+        let receive_state = bpmp::SRAM + bpmp::TX_POOL as u64 + 13 * 256 + 4;
+        let intid = hsp::SPI + 32;
+        let gic_pending = GICD + 0x200 + u64::from(intid / 32) * 4;
+        let gic_mask = 1 << (intid % 32);
+        machine.soc.write32(receive_state, 1).unwrap();
+        machine.soc.write32(atomic.trigger, 1).unwrap();
+        machine.update_interrupts();
+        assert_ne!(machine.soc.read32(gic_pending).unwrap() & gic_mask, 0);
+        machine
+            .soc
+            .write32(atomic.pending, 1 << hsp::BPMP_MASTER)
+            .unwrap();
+        machine.soc.write32(receive_state, 0).unwrap();
+        machine.soc.write32(atomic.trigger, 1).unwrap();
+        machine.update_interrupts();
+        assert_eq!(machine.soc.read32(gic_pending).unwrap() & gic_mask, 0);
+
+        let soc = &mut machine.soc;
+        assert_eq!(atomic.call(soc, 0, &[41], false), 0);
+        assert_eq!(soc.read32(atomic.rx + 136).unwrap(), 82);
+        assert_eq!(atomic.call(soc, 23, &[71], false), 0);
+        assert_eq!(soc.read32(atomic.rx + 136).unwrap(), 0);
+        assert_eq!(atomic.call(soc, 71, &[], false), 0);
+        assert_eq!(soc.read32(atomic.rx + 136).unwrap().to_le_bytes(), *b"sbc-");
+
+        let mut threaded = BpmpClient::new(soc, 0);
+        // Program UART A for a 9600-baud clock and verify the same rate is returned.
+        assert_eq!(
+            threaded.call(soc, 22, &[(2 << 24) | bpmp::CLK_UARTA, 0, 153_600, 0], true),
+            0
+        );
+        assert_eq!(soc.read64(threaded.rx + 136).unwrap(), 153_600);
+        assert_eq!(
+            threaded.call(soc, 22, &[(1 << 24) | bpmp::CLK_UARTA], true),
+            0
+        );
+        assert_eq!(soc.read64(threaded.rx + 136).unwrap(), 153_600);
+
+        // Check that the firmware reset changes the physical UART block state.
+        soc.write32(UARTA + 0x0c, 3).unwrap();
+        assert_eq!(atomic.call(soc, 20, &[1, bpmp::RESET_UARTA], false), 0);
+        assert_eq!(soc.read32(UARTA + 0x0c).unwrap(), 0);
+        assert!(!soc.uarta.push_rx(b'a', 0));
+        assert_eq!(atomic.call(soc, 20, &[2, bpmp::RESET_UARTA], false), 0);
+        assert!(soc.uarta.push_rx(b'a', 0));
+        assert_eq!(soc.read32(UARTA).unwrap(), b'a' as u32);
+        assert_eq!(atomic.call(soc, 0xffff, &[], false), -3);
+
+        // The GPU register aperture is available exactly while its domain is on
+        // and the firmware has released its reset.
+        assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
+        assert_eq!(threaded.call(soc, 66, &[1, 35, 1], true), 0);
+        assert_eq!(soc.read32(gpu::BAR0), Ok(0x17b0_00a1));
+        assert_eq!(atomic.call(soc, 20, &[1, 19], false), 0);
+        assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
+        assert_eq!(atomic.call(soc, 20, &[2, 19], false), 0);
+        assert_eq!(soc.read32(gpu::BAR0), Ok(0x17b0_00a1));
+        assert_eq!(threaded.call(soc, 66, &[1, 35, 0], true), 0);
+        assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
+    }
 
     #[test]
     fn guest_reads_ampere_identity_and_virtual_timer() {

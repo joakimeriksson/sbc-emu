@@ -42,7 +42,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--smp", "--rover-uart", "--uart-driver"])?;
+    serial_board::validate_options(args, &["--smp", "--rover-uart", "--uart-driver", "--bpmp"])?;
     let config = RunConfig::from_args(TAG, args)?;
     let cores = crate::arg(args, "--smp")
         .map_or(Ok(tegra234::AFFINITIES.len()), str::parse::<usize>)
@@ -51,6 +51,11 @@ fn execute(args: &[String]) -> Result<(), String> {
         None | Some("8250") => false,
         Some("tegra") => true,
         Some(_) => return Err("--uart-driver expects 8250 or tegra".into()),
+    };
+    let bpmp = match crate::arg(args, "--bpmp") {
+        None | Some("off") => false,
+        Some("on") => true,
+        Some(_) => return Err("--bpmp expects on or off".into()),
     };
     let ram = serial_board::ram_bytes(args, 4096)?;
     let read = |path: &str| std::fs::read(path).map_err(|err| format!("{path}: {err}"));
@@ -65,6 +70,9 @@ fn execute(args: &[String]) -> Result<(), String> {
         config,
         || {
             let mut machine = Machine::with_uart_mode(ram, cores, high_speed_uart)?;
+            if bpmp {
+                machine.enable_bpmp();
+            }
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
                 eprintln!(

@@ -78,12 +78,19 @@ impl UartA {
         }
     }
 
+    pub fn set_clock_rate(&mut self, rate: u64) {
+        if let Self::HighSpeed(uart) = self {
+            uart.clock_rate = Some(rate);
+        }
+    }
+
     pub fn set_reset(&mut self, asserted: bool) {
         if let Self::HighSpeed(uart) = self {
             if asserted && !uart.reset_asserted {
                 let out = std::mem::take(&mut uart.out);
                 *uart = HighSpeed {
                     out,
+                    clock_rate: uart.clock_rate,
                     ..Default::default()
                 };
             }
@@ -97,6 +104,7 @@ pub(super) struct HighSpeed {
     out: Vec<u8>,
     rx: VecDeque<u8>,
     last_rx: u64,
+    clock_rate: Option<u64>,
     divisor: u16,
     ier: u8,
     lcr: u8,
@@ -135,10 +143,9 @@ impl HighSpeed {
             + 1
             + u64::from(self.lcr & 4 != 0);
         let ticks = bits * 4 * 16 * u64::from(self.divisor.max(1));
-        Some(
-            self.last_rx
-                .saturating_add((ticks * 1_000_000_000).div_ceil(u64::from(CLOCK_HZ))),
-        )
+        Some(self.last_rx.saturating_add(
+            (ticks * 1_000_000_000).div_ceil(self.clock_rate.unwrap_or(u64::from(CLOCK_HZ))),
+        ))
     }
 
     fn interrupt_id(&self, now: u64) -> u8 {

@@ -52,10 +52,9 @@ Use `--uart-driver tegra` with a kernel built with `CONFIG_SERIAL_TEGRA`.
 It binds the same MMIO port to Linux's Tegra PIO driver at `/dev/ttyTHS1`,
 the device expected by the Waveshare ROS driver.
 
-The bring-up device tree provides a 115200-baud clock and a simple reset
-register at `0x70000000`. The driver can warn when it tries its initial 9600
-baud setting. Configure the port at 115200 baud before sending data. The kit's
-factory device tree obtains its programmable clock and reset from BPMP.
+By default, the bring-up device tree provides a 115200-baud clock and a simple
+reset register at `0x70000000`. The driver can warn when it tries its initial
+9600-baud setting. Configure the port at 115200 baud before sending data.
 
 The Debian kernel pinned by the Orange Pi 5 fixture has the driver built in.
 Use that kernel with the Orin initramfs to run the same byte comparison through
@@ -71,19 +70,56 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb \
   --script scripts/jetson-orin-nano-uart.txt --timeout 60
 ```
 
+## HSP and BPMP
+
+Pass `--bpmp on` to expose the HSP TOP0 doorbells and BPMP shared-memory
+queues in SYSRAM. With `--uart-driver tegra`, the device tree then points UART A
+to BPMP for its programmable clock and reset. The guest kernel needs the
+Tegra HSP mailbox, SRAM, and BPMP drivers for this configuration.
+
+The firmware model follows the [Linux BPMP transport](https://github.com/torvalds/linux/blob/master/drivers/firmware/tegra/bpmp-tegra186.c)
+and [BPMP ABI](https://github.com/torvalds/linux/blob/master/include/soc/tegra/bpmp-abi.h).
+It implements IVC reset and request/reply handling, firmware identification, and
+the clock, reset, and power-domain requests for the modeled devices. Run
+`cargo test -p tegra234` to exercise atomic and threaded requests over the SoC
+bus, including UART clock and reset changes and GPU power gating. The Debian
+fixture can boot with the generated nodes but lacks the HSP mailbox driver.
+
+### NVIDIA kernel smoke test
+
+Use NVIDIA's [Jetson Linux R36.4.4](https://developer.nvidia.com/embedded/jetson-linux-r3644)
+arm64 `nvidia-l4t-kernel` package version `5.15.148-tegra-36.4.4-20250616085344`.
+Its SHA-256 is `f26ccf85c64f9d4c36001b0d04df8c8bdd370aa173ebdcacb4f4fc3995420500`.
+Extract `boot/Image` to `cache/jetson-r3644/Image`, then use the Alpine initramfs
+from the Orin fixture.
+
+```sh
+target/release/sbc-emu run --board jetson-orin-nano-4gb \
+  --bpmp on --uart-driver tegra --rover-uart loopback \
+  --kernel cache/jetson-r3644/Image \
+  --initrd cache/jetson-orin-nano/initramfs.cpio.gz \
+  --script scripts/jetson-orin-nano-uart.txt --timeout 60
+```
+
+The kernel reports `tegra-bpmp bpmp: firmware: sbc-emu-tegra234` and registers
+`ttyTHS1`. The script verifies the short and burst byte comparisons through
+that device at 115200 baud.
+
 ## Ampere GPU bring-up
 
 Like `tegra210/src/gpu/` for the original Jetson Nano, `tegra234/src/gpu/`
 contains the GPU's register model. The first slice exposes the GA10B identity
 and PTIMER at BAR0 (`0x17000000`). A guest-CPU test reads these registers
-through Tegra234's MMIO bus. The generated device tree leaves driver binding
-for a later stage.
+through Tegra234's MMIO bus. When BPMP is enabled, the GPU power domain and
+reset control access to those registers. The generated device tree does not
+yet expose a GPU node for driver binding.
 
-The driver target is the Orin `nvgpu` module from a pinned Jetson Linux
-release. To reach its probe and first submission, the next milestones are:
+Use the Orin `nvgpu` module from [Jetson Linux R36.4.4](https://developer.nvidia.com/embedded/jetson-linux-r3644)
+as the baseline for driver bring-up. The remaining milestones are:
 
-1. Model the BPMP clock, reset, and GPU power-domain requests and record which
-   initialization registers the pinned driver touches.
+1. Add the GA10B device-tree node using the R36.4.4 P3767-0004 device tree and
+   stage `nvgpu` with its `host1x`, `mc-utils`, and `nvmap` dependencies. Use the
+   vendor probe to identify the registers and firmware handshakes it needs.
 2. Implement BAR1 and GMMU translation, GPU interrupts, firmware handshakes,
    and a channel/runlist path. Verify a command submission and a memory copy
    with data and completion checks.

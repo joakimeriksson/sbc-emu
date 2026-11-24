@@ -25,6 +25,7 @@ fn device_tree(
     ram_bytes: u64,
     cores: usize,
     high_speed_uart: bool,
+    bpmp: bool,
     cmdline: &str,
     initrd: Option<(u64, u64)>,
 ) -> Vec<u8> {
@@ -114,7 +115,27 @@ fn device_tree(
     dt.cells("current-speed", &[115200]);
     dt.end();
 
-    if high_speed_uart {
+    dt.begin("misc@100000");
+    dt.str("compatible", "nvidia,tegra234-misc");
+    dt.cells(
+        "reg",
+        &[
+            0,
+            crate::APB_MISC as u32,
+            0,
+            0xf000,
+            0,
+            crate::APB_STRAPS as u32,
+            0,
+            0x1000,
+        ],
+    );
+    dt.end();
+
+    if bpmp {
+        bpmp_nodes(&mut dt);
+    }
+    if high_speed_uart && !bpmp {
         dt.begin("uarta-clock-parent");
         dt.str("compatible", "fixed-clock");
         dt.cells("#clock-cells", &[0]);
@@ -145,8 +166,13 @@ fn device_tree(
     dt.cells("interrupts", &[0, UARTA_SPI, 4]);
     if high_speed_uart {
         dt.str("compatible", "nvidia,tegra194-hsuart");
-        dt.cells("clocks", &[2]);
-        dt.cells("resets", &[3, 0]);
+        if bpmp {
+            dt.cells("clocks", &[BPMP_HANDLE, crate::bpmp::CLK_UARTA]);
+            dt.cells("resets", &[BPMP_HANDLE, crate::bpmp::RESET_UARTA]);
+        } else {
+            dt.cells("clocks", &[2]);
+            dt.cells("resets", &[3, 0]);
+        }
         dt.str("reset-names", "serial");
     } else {
         dt.strs(
@@ -159,6 +185,59 @@ fn device_tree(
 
     dt.end();
     dt.finish()
+}
+
+const HSP_HANDLE: u32 = 20;
+const TX_HANDLE: u32 = 21;
+const RX_HANDLE: u32 = 22;
+const BPMP_HANDLE: u32 = 23;
+
+fn bpmp_nodes(dt: &mut Fdt) {
+    use crate::{bpmp, hsp};
+    dt.begin("mailbox@3c00000");
+    dt.strs(
+        "compatible",
+        &["nvidia,tegra234-hsp", "nvidia,tegra194-hsp"],
+    );
+    dt.cells("reg", &range(hsp::BASE, hsp::SIZE));
+    dt.cells("interrupts", &[0, hsp::SPI, 4]);
+    dt.str("interrupt-names", "doorbell");
+    dt.cells("#mbox-cells", &[2]);
+    dt.cells("phandle", &[HSP_HANDLE]);
+    dt.end();
+
+    dt.begin("sram@40000000");
+    dt.strs("compatible", &["nvidia,tegra234-sysram", "mmio-sram"]);
+    dt.cells("reg", &range(bpmp::SRAM, bpmp::SRAM_SIZE));
+    dt.cells("#address-cells", &[1]);
+    dt.cells("#size-cells", &[1]);
+    dt.cells("ranges", &[0, 0, bpmp::SRAM as u32, bpmp::SRAM_SIZE as u32]);
+    dt.empty("no-memory-wc");
+    for (offset, handle, name) in [
+        (bpmp::TX_POOL, TX_HANDLE, "cpu-bpmp-tx"),
+        (bpmp::RX_POOL, RX_HANDLE, "cpu-bpmp-rx"),
+    ] {
+        dt.begin(&format!("sram@{offset:x}"));
+        dt.cells("reg", &[offset as u32, bpmp::POOL_SIZE as u32]);
+        dt.str("label", name);
+        dt.empty("pool");
+        dt.cells("phandle", &[handle]);
+        dt.end();
+    }
+    dt.end();
+
+    dt.begin("bpmp");
+    dt.strs(
+        "compatible",
+        &["nvidia,tegra234-bpmp", "nvidia,tegra186-bpmp"],
+    );
+    dt.cells("mboxes", &[HSP_HANDLE, 0, hsp::BPMP_MASTER]);
+    dt.cells("shmem", &[TX_HANDLE, RX_HANDLE]);
+    dt.cells("#clock-cells", &[1]);
+    dt.cells("#reset-cells", &[1]);
+    dt.cells("#power-domain-cells", &[1]);
+    dt.cells("phandle", &[BPMP_HANDLE]);
+    dt.end();
 }
 
 pub fn boot_linux(
@@ -195,6 +274,7 @@ pub fn boot_linux(
         ram_bytes,
         machine.cpus.len(),
         machine.soc.uarta.high_speed(),
+        machine.soc.firmware.is_some(),
         cmdline,
         initrd_range,
     );
