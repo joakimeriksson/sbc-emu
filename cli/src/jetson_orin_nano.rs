@@ -42,7 +42,10 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--smp", "--rover-uart", "--uart-driver", "--bpmp"])?;
+    serial_board::validate_options(
+        args,
+        &["--smp", "--rover-uart", "--uart-driver", "--bpmp", "--gpu"],
+    )?;
     let config = RunConfig::from_args(TAG, args)?;
     let cores = crate::arg(args, "--smp")
         .map_or(Ok(tegra234::AFFINITIES.len()), str::parse::<usize>)
@@ -52,8 +55,15 @@ fn execute(args: &[String]) -> Result<(), String> {
         Some("tegra") => true,
         Some(_) => return Err("--uart-driver expects 8250 or tegra".into()),
     };
-    let bpmp = match crate::arg(args, "--bpmp") {
+    let gpu = match crate::arg(args, "--gpu") {
         None | Some("off") => false,
+        Some("on") => true,
+        Some(_) => return Err("--gpu expects on or off".into()),
+    };
+    let bpmp = match crate::arg(args, "--bpmp") {
+        None => gpu,
+        Some("off") if gpu => return Err("--gpu on requires BPMP".into()),
+        Some("off") => false,
         Some("on") => true,
         Some(_) => return Err("--bpmp expects on or off".into()),
     };
@@ -70,7 +80,9 @@ fn execute(args: &[String]) -> Result<(), String> {
         config,
         || {
             let mut machine = Machine::with_uart_mode(ram, cores, high_speed_uart)?;
-            if bpmp {
+            if gpu {
+                machine.enable_gpu();
+            } else if bpmp {
                 machine.enable_bpmp();
             }
             let jit = machine.set_jit(!no_jit);

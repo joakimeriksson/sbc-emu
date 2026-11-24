@@ -21,14 +21,11 @@ fn range(base: u64, bytes: u64) -> [u32; 4] {
     [base_hi, base_lo, size_hi, size_lo]
 }
 
-fn device_tree(
-    ram_bytes: u64,
-    cores: usize,
-    high_speed_uart: bool,
-    bpmp: bool,
-    cmdline: &str,
-    initrd: Option<(u64, u64)>,
-) -> Vec<u8> {
+fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec<u8> {
+    let ram_bytes = machine.soc.ram.len() as u64;
+    let cores = machine.cpus.len();
+    let high_speed_uart = machine.soc.uarta.high_speed();
+    let bpmp = machine.soc.firmware.is_some();
     let mut dt = Fdt::default();
     dt.begin("");
     dt.str("model", "Jetson Orin Nano 4GB (sbc-emu direct boot)");
@@ -135,6 +132,9 @@ fn device_tree(
     if bpmp {
         bpmp_nodes(&mut dt);
     }
+    if machine.soc.gpu_node {
+        gpu_node(&mut dt);
+    }
     if high_speed_uart && !bpmp {
         dt.begin("uarta-clock-parent");
         dt.str("compatible", "fixed-clock");
@@ -240,6 +240,44 @@ fn bpmp_nodes(dt: &mut Fdt) {
     dt.end();
 }
 
+fn gpu_node(dt: &mut Fdt) {
+    use crate::{bpmp, gpu};
+
+    dt.begin("gpu@17000000");
+    dt.str("compatible", "nvidia,ga10b");
+    dt.cells(
+        "reg",
+        &[
+            range(gpu::BAR0, gpu::SIZE),
+            range(gpu::BAR1, gpu::SIZE),
+            range(gpu::FUSE, gpu::FUSE_SIZE),
+        ]
+        .concat(),
+    );
+    dt.cells("interrupts", &gpu::SPIS.map(|spi| [0, spi, 4]).concat());
+    dt.strs(
+        "interrupt-names",
+        &["stall0", "stall1", "stall2", "nonstall"],
+    );
+    dt.cells("power-domains", &[BPMP_HANDLE, bpmp::GPU]);
+    dt.cells(
+        "clocks",
+        &[
+            BPMP_HANDLE,
+            bpmp::CLK_GPUSYS,
+            BPMP_HANDLE,
+            bpmp::CLK_GPC0,
+            BPMP_HANDLE,
+            bpmp::CLK_GPC1,
+        ],
+    );
+    dt.strs("clock-names", &["sysclk", "gpc0clk", "gpc1clk"]);
+    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_GPU]);
+    dt.cells("nvidia,bpmp", &[BPMP_HANDLE]);
+    dt.empty("dma-coherent");
+    dt.end();
+}
+
 pub fn boot_linux(
     machine: &mut Machine,
     kernel: &[u8],
@@ -270,14 +308,7 @@ pub fn boot_linux(
             Ok((RAM_BASE + INITRD_OFFSET, RAM_BASE + end))
         })
         .transpose()?;
-    let dtb = device_tree(
-        ram_bytes,
-        machine.cpus.len(),
-        machine.soc.uarta.high_speed(),
-        machine.soc.firmware.is_some(),
-        cmdline,
-        initrd_range,
-    );
+    let dtb = device_tree(machine, cmdline, initrd_range);
     if dtb.len() as u64 > INITRD_OFFSET - DTB_OFFSET {
         return Err("device tree exceeds 2 MiB".into());
     }

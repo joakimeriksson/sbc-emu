@@ -9,12 +9,12 @@ pub const POOL_SIZE: u64 = 0x1000;
 
 pub const CLK_UARTA: u32 = 155;
 const CLK_PLLP_OUT0: u32 = 102;
-const CLK_GPC0: u32 = 41;
-const CLK_GPC1: u32 = 236;
-const CLK_GPUSYS: u32 = 304;
+pub const CLK_GPC0: u32 = 41;
+pub const CLK_GPC1: u32 = 236;
+pub const CLK_GPUSYS: u32 = 304;
 pub const RESET_UARTA: u32 = 100;
-const RESET_GPU: u32 = 19;
-const GPU: u32 = 35;
+pub const RESET_GPU: u32 = 19;
+pub const GPU: u32 = 35;
 
 const CHANNEL_STRIDE: usize = 256;
 const FRAME: usize = 128;
@@ -126,7 +126,7 @@ impl Bpmp {
     }
 
     /// Handle a CCPLEX doorbell and return whether the firmware rang a doorbell back.
-    pub fn service(&mut self, uarta: &mut crate::uart::UartA) -> bool {
+    pub fn service(&mut self, uarta: &mut crate::uart::UartA, gpu: &mut crate::gpu::Gpu) -> bool {
         let mut ring = false;
         // Three threaded transmit queues, the atomic transmit queue, and the receive queue.
         for channel in [0, 1, 2, 3, 13] {
@@ -142,13 +142,19 @@ impl Bpmp {
             } else if guest_state == ESTABLISHED && peer_state == ACK {
                 put(&mut self.sram, rx + STATE, ESTABLISHED);
             } else if channel != 13 && guest_state == ESTABLISHED && peer_state == ESTABLISHED {
-                ring |= self.service_message(tx, rx, uarta);
+                ring |= self.service_message(tx, rx, uarta, gpu);
             }
         }
         ring
     }
 
-    fn service_message(&mut self, tx: usize, rx: usize, uarta: &mut crate::uart::UartA) -> bool {
+    fn service_message(
+        &mut self,
+        tx: usize,
+        rx: usize,
+        uarta: &mut crate::uart::UartA,
+        gpu: &mut crate::gpu::Gpu,
+    ) -> bool {
         let tx_read = word(&self.sram, tx + RX_COUNT);
         let rx_write = word(&self.sram, rx + TX_COUNT);
         if word(&self.sram, tx + TX_COUNT).wrapping_sub(tx_read) != 1 {
@@ -161,13 +167,19 @@ impl Bpmp {
             return false;
         }
         let mut response = [0; FRAME];
-        if word(&request, 0) == MRQ_RESET
-            && word(&request, 12) == RESET_UARTA
-            && matches!(word(&request, 8), RESET_ASSERT | RESET_MODULE)
-        {
-            uarta.set_reset(true);
+        let mrq = word(&request, 0);
+        let gpu_was_available = self.gpu_available();
+        if mrq == MRQ_RESET {
+            match (word(&request, 8), word(&request, 12)) {
+                (RESET_ASSERT | RESET_MODULE, RESET_UARTA) => uarta.set_reset(true),
+                (RESET_MODULE, RESET_GPU) => gpu.reset(),
+                _ => {}
+            }
         }
-        let status = self.handle(word(&request, 0), &request[8..], &mut response[8..]);
+        let status = self.handle(mrq, &request[8..], &mut response[8..]);
+        if gpu_was_available && !self.gpu_available() {
+            gpu.reset();
+        }
         uarta.set_reset(self.uart_reset());
         uarta.set_clock_rate(self.uart_rate());
         put(&mut response, 0, status as u32);

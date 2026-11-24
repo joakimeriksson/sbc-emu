@@ -107,28 +107,52 @@ that device at 115200 baud.
 
 ## Ampere GPU bring-up
 
-Like `tegra210/src/gpu/` for the original Jetson Nano, `tegra234/src/gpu/`
-contains the GPU's register model. The first slice exposes the GA10B identity
-and PTIMER at BAR0 (`0x17000000`). A guest-CPU test reads these registers
-through Tegra234's MMIO bus. When BPMP is enabled, the GPU power domain and
-reset control access to those registers. The generated device tree does not
-yet expose a GPU node for driver binding.
+`--gpu on` enables BPMP and exposes the GA10B node derived from NVIDIA's
+P3767-0004 device tree. Like `tegra210/src/gpu/`, `tegra234/src/gpu/` owns the
+register model. BAR0 exposes the GPU identity, PTIMER and the privileged-ring
+startup handshake. BPMP controls register access and resets the register state.
+Set `SBC_TRACE_GPU=1` to trace BAR0 accesses using the same switch as Tegra210.
 
-Use the Orin `nvgpu` module from [Jetson Linux R36.4.4](https://developer.nvidia.com/embedded/jetson-linux-r3644)
-as the baseline for driver bring-up. The remaining milestones are:
+### Driver binding
 
-1. Add the GA10B device-tree node using the R36.4.4 P3767-0004 device tree and
-   stage `nvgpu` with its `host1x`, `mc-utils`, and `nvmap` dependencies. Use the
-   vendor probe to identify the registers and firmware handshakes it needs.
-2. Implement BAR1 and GMMU translation, GPU interrupts, firmware handshakes,
-   and a channel/runlist path. Verify a command submission and a memory copy
-   with data and completion checks.
-3. Add Ampere shader and compute execution against a known-answer workload.
-   Validate the userspace stack with a CUDA kernel on the emulated GPU.
+The probe fixture stages NVIDIA's R36.4.4 `nvgpu` and its dependencies in a
+second initramfs archive. The script verifies the `gk20a` driver symlink and
+the `/dev/nvgpu/igpu0/power` character device. Building the fixture needs
+`bsdtar` with Zstandard support, `cpio`, and `shasum`.
 
-[NVIDIA GA10B device resources](https://developer.nvidia.com/docs/drive/drive-os/6.0.8/public/drive-os-linux-sdk/common/topics/util_setup/nvgpu_device_tree.html) and the
-[GA10B HAL setup](https://github.com/OE4T/linux-nvgpu/blob/patches-rel-36/drivers/gpu/nvgpu/hal/init/hal_ga10b.c)
-describe the MMIO windows, firmware dependencies, and shared NVIDIA blocks.
+```sh
+sh scripts/jetson-nano-fixture.sh cache/jetson-orin-nano orin
+sh scripts/jetson-orin-nano-gpu-fixture.sh
+target/release/sbc-emu run --board jetson-orin-nano-4gb --gpu on \
+  --kernel cache/jetson-r3644/Image \
+  --initrd cache/jetson-r3644/probe-initramfs.cpio.gz \
+  --script scripts/jetson-orin-nano-gpu-probe.txt --timeout 60
+```
+
+The current model binds the driver with host1x syncpoints disabled. A write
+of `1` to the power device reaches BAR0 and completes privileged-ring startup.
+The driver reports a missing engine discovery table, and a subsequent write
+to the unmapped SoC address `0x01f20010` stalls power-on initialization.
+
+### Jetson GPU parity
+
+Use the [Tegra210 GPU test suite](jetson-nano-gpu.md#tests) as the coverage
+baseline. The current mainline [nouveau platform driver](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/nouveau/nouveau_platform.c)
+does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 driver](https://developer.nvidia.com/embedded/jetson-linux-r3644).
+
+| Milestone | Acceptance check |
+|---|---|
+| Power-on | The unmodified driver discovers GA10B's engines and finishes power-on, including firmware mailbox handshakes and the required host1x syncpoints. |
+| Memory and submission | A real guest channel submits a copy through the GA10B GMMU and runlist. Verify data and fence completion across page boundaries and recover from a fault. |
+| Compute | Execute a known-answer Ampere shader, then run a CUDA kernel in the guest and compare its output with a CPU reference. |
+| Graphics | Run the existing GLES 2, 3 and 3.2 scenes on GA10B and compare images with Mesa software rendering. Exercise the display separately for the Jetson demo workloads. |
+| Browser | Run the same shader and rendering checks on the WASM build with matching results. |
+
+Keep GA10B register, firmware, runlist and shader decoding in the corresponding
+Orin or Ampere modules. Reuse the Maxwell renderer and texture code where the
+engine semantics agree. The [NVIDIA GA10B resource list](https://developer.nvidia.com/docs/drive/drive-os/6.0.8/public/drive-os-linux-sdk/common/topics/util_setup/nvgpu_device_tree.html)
+and [GA10B HAL setup](https://github.com/OE4T/linux-nvgpu/blob/patches-rel-36/drivers/gpu/nvgpu/hal/init/hal_ga10b.c)
+describe the hardware interfaces the driver uses.
 
 The CPU affinities follow an
 [Orin Nano Linux boot log](https://forums.developer.nvidia.com/t/orin-nano/385080).

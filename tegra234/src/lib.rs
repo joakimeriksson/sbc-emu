@@ -3,6 +3,7 @@ pub mod boot;
 mod bpmp;
 pub mod gpu;
 mod hsp;
+mod mc;
 mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -37,6 +38,7 @@ struct Soc {
     uart: Pl011,
     uarta: UartA,
     gpu: gpu::Gpu,
+    gpu_node: bool,
     firmware: Option<Firmware>,
     now: u64,
     interrupts_changed: bool,
@@ -57,6 +59,8 @@ impl Soc {
             CHIP_ID_A01
         } else if addr == APB_STRAPS {
             0
+        } else if let Some(value) = mc::read(addr) {
+            value
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
             self.uart.read(addr - UART)
@@ -74,15 +78,8 @@ impl Soc {
                 .ok_or(Fault::Unmapped)?
                 .hsp
                 .read(addr - hsp::BASE)
-        } else if (gpu::BAR0..gpu::BAR0 + gpu::SIZE).contains(&addr)
-            && self
-                .firmware
-                .as_ref()
-                .is_none_or(|firmware| firmware.bpmp.gpu_available())
-        {
-            self.gpu
-                .read(addr - gpu::BAR0, self.now)
-                .ok_or(Fault::Unmapped)?
+        } else if self.gpu_bar0_accessible(addr) {
+            self.gpu.read(addr - gpu::BAR0, self.now)
         } else {
             return Err(Fault::Unmapped);
         })
@@ -102,15 +99,26 @@ impl Soc {
             self.uarta.set_reset(value & 1 != 0);
         } else if (hsp::BASE..hsp::BASE + hsp::SIZE).contains(&addr) {
             let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
-            if firmware.hsp.write(addr - hsp::BASE, value) && firmware.bpmp.service(&mut self.uarta)
+            if firmware.hsp.write(addr - hsp::BASE, value)
+                && firmware.bpmp.service(&mut self.uarta, &mut self.gpu)
             {
                 firmware.hsp.ring_ccplex();
             }
+        } else if self.gpu_bar0_accessible(addr) {
+            self.gpu.write(addr - gpu::BAR0, value);
         } else {
             return Err(Fault::Unmapped);
         }
         self.interrupts_changed = true;
         Ok(())
+    }
+
+    fn gpu_bar0_accessible(&self, addr: u64) -> bool {
+        (gpu::BAR0..gpu::BAR0 + gpu::SIZE).contains(&addr)
+            && self
+                .firmware
+                .as_ref()
+                .is_none_or(|firmware| firmware.bpmp.gpu_available())
     }
 
     fn sram_offset(addr: u64, size: usize) -> Option<usize> {
@@ -243,7 +251,8 @@ impl Machine {
             gic: Gic::with_affinities(&AFFINITIES[..cores]),
             uart: Pl011::new(),
             uarta: UartA::new(high_speed_uart),
-            gpu: gpu::Gpu,
+            gpu: gpu::Gpu::default(),
+            gpu_node: false,
             firmware: None,
             now: 0,
             interrupts_changed: true,
@@ -279,7 +288,12 @@ impl Machine {
     }
 
     pub fn enable_bpmp(&mut self) {
-        self.soc.firmware = Some(Firmware::default());
+        self.soc.firmware.get_or_insert_with(Firmware::default);
+    }
+
+    pub fn enable_gpu(&mut self) {
+        self.enable_bpmp();
+        self.soc.gpu_node = true;
     }
 
     pub fn set_jit(&mut self, enabled: bool) -> bool {
@@ -797,10 +811,20 @@ mod tests {
         assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
         assert_eq!(threaded.call(soc, 66, &[1, 35, 1], true), 0);
         assert_eq!(soc.read32(gpu::BAR0), Ok(0x17b0_00a1));
+        let ring_command = gpu::BAR0 + 0x12004c;
+        let ring_result = gpu::BAR0 + 0x120050;
+        assert_eq!(soc.read32(ring_result), Ok(0));
+        soc.write32(ring_command, 4).unwrap();
+        assert_eq!(soc.read32(ring_command), Ok(0));
+        assert_eq!(soc.read32(ring_result), Ok(1));
         assert_eq!(atomic.call(soc, 20, &[1, 19], false), 0);
         assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
         assert_eq!(atomic.call(soc, 20, &[2, 19], false), 0);
         assert_eq!(soc.read32(gpu::BAR0), Ok(0x17b0_00a1));
+        assert_eq!(soc.read32(ring_result), Ok(0));
+        soc.write32(ring_command, 4).unwrap();
+        assert_eq!(atomic.call(soc, 20, &[3, 19], false), 0);
+        assert_eq!(soc.read32(ring_result), Ok(0));
         assert_eq!(threaded.call(soc, 66, &[1, 35, 0], true), 0);
         assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
     }
