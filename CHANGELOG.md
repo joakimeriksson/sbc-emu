@@ -8,7 +8,7 @@ options, snapshot formats and crate interfaces.
 Numbers such as (#21) are pull requests in this repository. Work from before 2026-11-20 was merged
 in an earlier repository whose history was rewritten; it is summarised here without numbers.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-24
 
 The first release: seven boards, four CPU cores with JITs, and the same machines in the browser.
 
