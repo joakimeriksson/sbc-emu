@@ -101,8 +101,10 @@ The first release: seven boards, four CPU cores with JITs, and the same machines
   from.
 - Exit status of `sbc-emu run` is the same on every board: 0 when the run ends by a quit, or when
   the guest powers off or `--timeout` / `--max-insns` runs out with no `--script` still running;
-  1 on an error or an unfinished `--script`; 2 on a usage error. (Before, the Raspberry Pi 4
-  exited 0 and the other boards 1 when `--timeout` ran out.)
+  1 on an error (a bad option for the board included) or an unfinished `--script`; 2 on an
+  unknown command or board. Before, when `--timeout` ran out, the Raspberry Pi 4 exited 0 (even
+  with an unfinished `--script`) and the other boards 1 (even without one); and the Raspberry
+  Pi 4 exited 1 when the guest powered off, where it now exits 0 as the other boards do.
 - VNC server (`--vnc :N`), port forwarding (`--hostfwd`), virtual network with NAT, WAV audio
   capture (`--audio-out`), screenshots (`--screenshot`).
 - Shared SD card model keeps the last partition and the guest's writes on odd-sized images
@@ -117,9 +119,10 @@ The first release: seven boards, four CPU cores with JITs, and the same machines
 - Snapshots are not available on the Jetson Nano and the ESP32-S31.
 - `--threads multi` is not repeatable run to run.
 - Orange Pi 5: an XRGB buffer on a Cluster overlay plane is blended by its X byte, as the
-  registers mainline Linux writes say; not checked against a real board (#54). The Mali-G610
-  model ignores the Attribute offset-enable bit, does not filter cube faces seamlessly, and
-  CLPER does not cover lanes 4-15 of a 16-lane subgroup (#58).
+  registers mainline Linux writes say; not checked against a real board (documented and pinned
+  by a test in #65). The Mali-G610 model ignores the Attribute offset-enable bit, does not filter
+  cube faces seamlessly, and CLPER does not cover lanes 4-15 of a 16-lane subgroup (listed in
+  #68).
 - The browser build is single-threaded and slower than the native one.
 - Raspberry Pi 4: Firefox (Ubuntu snap) drops some glyphs on text-heavy pages.
 

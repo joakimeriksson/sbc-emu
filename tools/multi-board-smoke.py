@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Check Pi adapter boot, serial and reset in both execution modes.
 
-Uses read-only direct-boot fixtures and writes logs only to --output. The CLI's
-timeout returns success, so guest/script milestones are checked independently.
+Uses read-only direct-boot fixtures and writes logs only to --output. The script
+ends in quit (exit status 0); the CLI also exits 0 when --timeout runs out with no
+script left, so guest/script milestones are checked independently.
 """
 import argparse
 import hashlib

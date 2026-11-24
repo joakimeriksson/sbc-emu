@@ -21,9 +21,11 @@ fn main() {
     if let Some(commit) = git(&["rev-parse", "--short=10", "HEAD"]) {
         println!("cargo:rustc-env=SBC_EMU_COMMIT={commit}");
     }
-    // rebuild when HEAD moves (a commit, a checkout). Only files that exist: cargo reruns the
-    // script on every build for a missing one (a branch in packed-refs).
-    let mut watch = vec!["HEAD".to_string(), "packed-refs".to_string()];
+    // rebuild when HEAD moves. logs/HEAD (the reflog) grows on every commit, checkout and reset,
+    // also when the branch lives only in packed-refs, where a commit then writes a loose ref file
+    // that was not there to watch. Only files that exist: cargo reruns the script on every build
+    // for a missing one.
+    let mut watch = vec!["logs/HEAD".to_string(), "HEAD".to_string(), "packed-refs".to_string()];
     watch.extend(git(&["symbolic-ref", "-q", "HEAD"]));
     for f in watch {
         if let Some(path) = git(&["rev-parse", "--git-path", &f]) {

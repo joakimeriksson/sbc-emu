@@ -55,7 +55,7 @@ jobs:
         run: |
           name=sbc-emu-${{ steps.version.outputs.version }}-${{ matrix.target }}
           mkdir -p "dist/$name/riscv-rv32" "dist/$name/espressif/esp-periph"
-          cp target/dist/sbc-emu LICENSE README.md CHANGELOG.md "dist/$name/"
+          cp target/dist/sbc-emu LICENSE THIRD-PARTY-LICENSES README.md CHANGELOG.md "dist/$name/"
           cp riscv-rv32/LICENSE "dist/$name/riscv-rv32/"
           cp espressif/LICENSE "dist/$name/espressif/"
           cp espressif/esp-periph/LICENSE-ADC "dist/$name/espressif/esp-periph/"
@@ -89,7 +89,7 @@ jobs:
       - name: Release notes (the version's CHANGELOG.md section)
         id: notes
         run: |
-          version=$(ls dist | sed -n 's/^sbc-emu-\([0-9][^-]*\)-.*\.tar\.gz$/\1/p' | head -1)
+          version=$(ls dist | sed -nE 's/^sbc-emu-(.+)-(aarch64-apple-darwin|x86_64-unknown-linux-gnu)\.tar\.gz$/\1/p' | head -1)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           # from the version's heading to the next version's heading (or the link list)
           awk -v v="$version" '
@@ -108,8 +108,9 @@ jobs:
 
           ### Downloads
 
-          Each archive holds the \`sbc-emu\` binary, the licenses, README.md and CHANGELOG.md; SHA256SUMS
-          has their checksums (\`sha256sum -c SHA256SUMS\`). The binaries are unsigned: on macOS, after
+          Each archive holds the \`sbc-emu\` binary, the licenses, README.md and CHANGELOG.md. SHA256SUMS
+          has their checksums: \`sha256sum -c --ignore-missing SHA256SUMS\` (on macOS,
+          \`shasum -a 256 -c --ignore-missing SHA256SUMS\`). The binaries are unsigned: on macOS, after
           downloading with a browser, \`xattr -d com.apple.quarantine sbc-emu\`. Guest operating systems
           are not included; the fetch scripts and \`scripts/quickstart.sh\` are in the source tree.
           EOF
