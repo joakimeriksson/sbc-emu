@@ -421,8 +421,15 @@ pub(crate) fn run<B: SerialBoard>(
                 eprintln!("\r[{tag}] no snapshot: {e}\r");
             }
         }
+        // --timeout and --max-insns end a run normally, unless a --script is still running
         if config.timeout.is_some_and(|t| start.elapsed() >= t) {
-            break Err("host timeout before completion".into());
+            break match script.front() {
+                None => {
+                    eprintln!("\r\n[{tag}] --timeout reached\r");
+                    Ok(())
+                }
+                Some(step) => Err(format!("host timeout before the script completed (at: {step})")),
+            };
         }
         if m.instret() >= config.max_insns {
             break if script.is_empty() {

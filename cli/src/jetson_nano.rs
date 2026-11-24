@@ -119,14 +119,24 @@ fn execute(args: &[String]) -> Result<(), String> {
     };
     let no_jit = args.iter().any(|a| a == "--no-jit") || std::env::var("SBC_JIT").is_ok_and(|v| v == "0");
     let log_stubs = std::env::var("SBC_STUB_LOG").is_ok_and(|v| v == "1");
+    // the banner, once: with the first machine, which tells whether the JIT came up
+    let announced = std::cell::Cell::new(false);
     let make_machine = || -> Result<Machine, String> {
         let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let mut m = Machine::with_clock(ram, smp, unix)?;
         m.soc.log_stub_pages = log_stubs;
-        if no_jit {
+        let jit = if no_jit {
             m.set_jit(false);
+            false
         } else {
-            m.enable_jit();
+            m.enable_jit()
+        };
+        if !announced.replace(true) {
+            eprintln!(
+                "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
+                 fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive), HDMI, the GM20B GPU; PSCI by the host; other devices are read-back stubs",
+                crate::cpu_backend(jit)
+            );
         }
         if let Some(d) = disk.clone() {
             m.insert_sd(Box::new(d));
@@ -144,10 +154,5 @@ fn execute(args: &[String]) -> Result<(), String> {
         boot::boot_linux(&mut m, &kernel, &dtb, initrd.as_deref(), &cmdline)?;
         Ok(m)
     };
-    eprintln!(
-        "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
-         fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive), HDMI, the GM20B GPU; PSCI by the host; other devices are read-back stubs",
-        if no_jit { "interpreter" } else { "JIT" }
-    );
     serial_board::run(config, make_machine)
 }

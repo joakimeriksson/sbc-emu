@@ -215,7 +215,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     let usb_drive = arg(args, "--usb-drive");
     // --nvme IMAGE: an NVMe SSD in the M.2 slot (copy-on-write; each boot starts from the image)
     let nvme = arg(args, "--nvme");
-    // the RV64 JIT (AArch64 hosts): on unless --no-jit or SBC_JIT=0
+    // the RV64 JIT (AArch64 and x86-64 Linux hosts): on unless --no-jit or SBC_JIT=0
     let jit = riscv64::jit::AVAILABLE && !args.iter().any(|a| a == "--no-jit") && std::env::var("SBC_JIT").map_or(true, |v| v != "0");
     // the machine restored into is not booted first; when the guest reboots, a new one is
     let restored = std::cell::Cell::new(false);
@@ -268,7 +268,7 @@ fn execute(args: &[String]) -> Result<(), String> {
          clock/reset generators, microSD (DW MMC), Gigabit Ethernet (GMAC0 + YT8531C), HDMI (DC8200 + Inno HDMI), USB 3.0 (PCIe + VL805 xHCI: keyboard, tablet, --usb-drive), M.2 NVMe (--nvme), Wi-Fi and Bluetooth (AP6256), audio (PWM DAC and HDMI I2S, --audio-out), I2C, PKA; OpenSBI from --firmware, or the boot ROM, U-Boot SPL and U-Boot from --sd; other devices are stubs",
         // a restored machine's harts are the snapshot's; --smp applies when the guest reboots
         if restore { "the snapshot's U74 harts".to_string() } else { format!("{smp} of 4 U74 harts") },
-        if jit { "JIT to AArch64" } else { "interpreter" }
+        crate::cpu_backend(jit)
     );
     serial_board::run(config, make_machine)
 }

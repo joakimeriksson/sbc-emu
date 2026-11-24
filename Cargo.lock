@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "allwinner-h3"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arm-a32",
  "emu-core",
@@ -21,14 +21,14 @@ dependencies = [
 
 [[package]]
 name = "arm-a32"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
 
 [[package]]
 name = "arm-a64"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arm-a32",
  "emu-core",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "bcm2711"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arm-a64",
  "emu-core",
@@ -68,21 +68,21 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "emu-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "miniz_oxide",
 ]
 
 [[package]]
 name = "esp-periph"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "esp32sim-emu-core",
 ]
 
 [[package]]
 name = "esp-soc"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "esp-periph",
  "esp32sim-emu-core",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "esp32s31"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "esp-periph",
  "esp-soc",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "esp32sim-emu-core"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "lzma-rs"
@@ -114,14 +114,14 @@ dependencies = [
 
 [[package]]
 name = "mali400"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
 
 [[package]]
 name = "maxwell"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "maxwell-shader",
  "maxwell-tex",
@@ -129,15 +129,15 @@ dependencies = [
 
 [[package]]
 name = "maxwell-shader"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "maxwell-tex"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "midgard"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "peripherals"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
  "sbc-net",
@@ -161,28 +161,28 @@ dependencies = [
 
 [[package]]
 name = "powervr"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
 
 [[package]]
 name = "riscv-rv32"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "esp32sim-emu-core",
 ]
 
 [[package]]
 name = "riscv64"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
 
 [[package]]
 name = "rk3588"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arm-a64",
  "emu-core",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "rockchip-rk3288"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arm-a32",
  "emu-core",
@@ -210,7 +210,7 @@ checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
 
 [[package]]
 name = "sbc-emu"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "allwinner-h3",
  "arm-a32",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-emu-wasm"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "allwinner-h3",
  "arm-a32",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "sbc-machine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "allwinner-h3",
  "bcm2711",
@@ -270,14 +270,14 @@ dependencies = [
 
 [[package]]
 name = "sbc-net"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
 
 [[package]]
 name = "starfive-jh7110"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
  "peripherals",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "tegra210"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arm-a64",
  "emu-core",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "v3d"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "emu-core",
 ]

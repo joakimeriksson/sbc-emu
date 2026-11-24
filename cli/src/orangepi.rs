@@ -67,7 +67,7 @@ fn execute(args:&[String])->Result<(),String> {
         None=>(!args.iter().any(|a|a=="--no-display")).then_some(rk3588::display::Mode::MODES[0]),
     };
     let gpu=arg(args,"--gpu").unwrap_or("none");
-    if !["none","probe"].contains(&gpu) {return Err("--gpu accepts none or probe (experimental, no rendering)".into());}
+    if !["none","probe"].contains(&gpu) {return Err("--gpu accepts none (the default) or probe: the experimental Mali-G610 for Panthor and Mesa's Panfrost (GLES rendering, kmscube and glmark2 on HDMI)".into());}
     let net=arg(args,"--net").unwrap_or("nat");
     if !["none","local","nat"].contains(&net) {return Err("--net must be none, local or nat".into());}
     let kernel=arg(args,"--kernel").map(std::fs::read).transpose().map_err(|e|e.to_string())?;

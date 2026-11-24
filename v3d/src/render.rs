@@ -21,7 +21,6 @@ struct RtCfg { bpp: u32, ty: u32, clamp: u32, clear: [u32; 4] }
 #[derive(Clone)]
 struct TileBuf {
     w: u32,
-    h: u32,
     ns: u32,
     color: [Vec<[u32; 4]>; 4],
     z: Vec<f32>,
@@ -31,7 +30,7 @@ struct TileBuf {
 impl TileBuf {
     fn new(w: u32, h: u32, ns: u32) -> TileBuf {
         let n = (w * h * ns) as usize;
-        TileBuf { w, h, ns, color: [vec![[0; 4]; n], vec![[0; 4]; n], vec![[0; 4]; n], vec![[0; 4]; n]], z: vec![1.0; n], s: vec![0; n] }
+        TileBuf { w, ns, color: [vec![[0; 4]; n], vec![[0; 4]; n], vec![[0; 4]; n], vec![[0; 4]; n]], z: vec![1.0; n], s: vec![0; n] }
     }
     #[inline] fn idx(&self, x: u32, y: u32, s: u32) -> usize { ((y * self.w + x) * self.ns + s) as usize }
 }
@@ -591,8 +590,7 @@ impl<'r> Render<'r> {
             }
             y += 2;
         }
-        let pv = if d.cfg.direct3d_provoking_vertex { 0 } else { 2 };
-        let geo = Geo { v: [v[0], v[1], v[2]], prov, pv, offset, kind: 3, point: None };
+        let geo = Geo { v: [v[0], v[1], v[2]], prov, offset, kind: 3, point: None };
         self.shade(d, p, &geo, &quads, m, code);
     }
 
@@ -634,8 +632,7 @@ impl<'r> Render<'r> {
             }
             y += 2;
         }
-        let pv = if d.cfg.direct3d_provoking_vertex { 0 } else { 1 };
-        let geo = Geo { v: [a, b, b], prov, pv, offset: 0.0, kind: 2, point: None };
+        let geo = Geo { v: [a, b, b], prov, offset: 0.0, kind: 2, point: None };
         self.shade(d, p, &geo, &quads, m, code);
     }
 
@@ -662,7 +659,7 @@ impl<'r> Render<'r> {
             }
             y += 2;
         }
-        let geo = Geo { v: [v, v, v], prov: &v.vary, pv: 0, offset: 0.0, kind: 1, point: Some((l, t, s)) };
+        let geo = Geo { v: [v, v, v], prov: &v.vary, offset: 0.0, kind: 1, point: Some((l, t, s)) };
         self.shade(d, p, &geo, &quads, m, code);
     }
 
@@ -752,7 +749,6 @@ struct Quad { x: u32, y: u32, cov: [u8; 4], bary: [[f32; 3]; 4] }
 struct Geo<'g> {
     v: [&'g RVert; 3],
     prov: &'g [u32],
-    pv: usize,
     offset: f32,
     kind: u8,
     point: Option<(f32, f32, f32)>,

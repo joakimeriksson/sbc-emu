@@ -198,7 +198,7 @@ pub fn texture(m: &mut Gmem, _t: &Thread, kind: TmuKind, cfg: &[u32], req: &TmuR
     let gather = p2 & (1 << 7) != 0;
     let gather_comp = (p2 >> 5) & 3;
     let disable_autolod = p2 & 2 != 0;
-    let sx4 = |v: u32| ((v << 28) as i32 >> 28);
+    let sx4 = |v: u32| (v << 28) as i32 >> 28;
     let (off_s, off_t, off_r) = (sx4((p2 >> 8) & 0xf), sx4((p2 >> 12) & 0xf), sx4((p2 >> 16) & 0xf));
     let one_d = req.t.is_none() && kind != TmuKind::TexCube;
     let is_3d = req.r.is_some() && kind != TmuKind::TexCube;
