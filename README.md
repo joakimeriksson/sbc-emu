@@ -11,6 +11,12 @@ All seven boards boot there, on your own computer: the Raspberry Pi 4, the Orang
 Tinker Board S, the Orange Pi 5 and the RISC-V Orange Pi RV in seconds, the Jetson Nano in about 15,
 and the ESP32-S31 through its whole boot chain in about 10.
 
+**The film:** [seven boards in 70 seconds](https://www.youtube.com/watch?v=LDYEcrK_I24). Every screen in
+it was recorded from an emulated board, the 3D scene was drawn by the emulated Jetson Nano's GPU, and
+the music was played by MilkyTracker on the emulated Raspberry Pi 4.
+
+<a href="https://www.youtube.com/watch?v=LDYEcrK_I24"><img src="docs/img/film-thumbnail.jpg" alt="The sbc-emu film on YouTube: an emulated Raspberry Pi 4 showing glmark2's jellyfish, with the seven board names" width="480"></a>
+
 <table>
 <tr>
 <td><img src="docs/img/glmark2-1080p.png" alt="glmark2 scenes rendered on the emulated V3D GPU" width="280"></td>
