@@ -3,15 +3,16 @@
 > **Historical record, archived 2026-11-19.** The proposal and review below describe
 > the repository on 2026-11-15, before Orange Pi 5 implementation. Their pending
 > approvals, ownership notes and integration gates are historical, not current
-> working instructions. Follow [AGENTS.md](../AGENTS.md) for current workflow.
+> working instructions. Follow [AGENTS.md](../../AGENTS.md) for current workflow.
 >
 > The foundation landed in [PR #1](https://github.com/joakimeriksson/sbc-emu/pull/1);
 > Orange Pi boot and GPU support have since advanced through
 > [PR #65](https://github.com/joakimeriksson/sbc-emu/pull/65). See
 > [the foundation implementation record](multi-board-foundation.md),
-> [Orange Pi 5 support](orangepi5.md) and [GPU capabilities](orangepi5-gpu.md).
+> [Orange Pi 5 support](../orangepi5.md) and [GPU capabilities](../orangepi5-gpu.md).
 > The original proposal and both agents' review text are preserved below;
-> this archive does not assert a new joint approval.
+> this archive does not assert a new joint approval. For how the boards share code
+> today, see [architecture.md](../architecture.md).
 
 Date: 2026-11-15
 Status: Claude review reconciled by Codex; final joint acceptance pending.
@@ -24,8 +25,8 @@ Keep Raspberry Pi 4 working while adding the original Orange Pi 5 (RK3588S) as a
 separate machine. Use that second implementation to establish useful shared boundaries.
 Do the smallest refactoring needed for its first native serial Linux boot.
 
-Follow the own-Rust-core architecture in [decisions.md](decisions.md), especially D1
-and D2. The older [master plan](../SBC-EMUPLAN.md) contains superseded QEMU assumptions.
+Follow the own-Rust-core architecture in [decisions.md](../decisions.md), especially D1
+and D2. The older [master plan](SBC-EMUPLAN.md) contains superseded QEMU assumptions.
 This proposal advances Orange Pi 5 alongside Pi 4; it does not imply support for
 other Orange Pi variants or full RK3588 boards.
 

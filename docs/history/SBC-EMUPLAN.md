@@ -1,12 +1,19 @@
 # SBC-EMU implementation plan for coding agents
 
+> **Historical record.** This is the project's first plan, written on 2026-11-13 before any
+> code. It proposed building on QEMU; sbc-emu instead has its own CPU cores and device models
+> ([decisions.md](../decisions.md), D1), so its binding rules 1 and 7, its scope for v0.1 and much
+> of its structure no longer apply. It is kept as a record of where the project started. For what
+> sbc-emu is and does today, see the [README](../../README.md) and
+> [how the boards share code](../architecture.md).
+
 **Status:** proposed implementation specification; no SBC-EMU implementation or successful board test is implied by this document.  
 **Date:** 2026-11-13. **Repository / executable:** `sbc-emu`.  
 **Mission:** Real boards. Virtual hardware. A standalone, local-first, open-source SBC emulator that complements esp32sim and Cooja-NG.
 
 ## 1. Decisions and scope
 
-Continue the design in the referenced *Raspberry Pi Emulators Comparison* conversation: QEMU CPU/SoC emulation, C device models, Rust orchestration, declarative boards, real Linux interfaces, independent executables connected through versioned protocols. Preserve the priority order: Raspberry Pi 4B and 3B; then Pi 5 and Zero 2 W; Compute Modules; Orange Pi and Radxa. This is an engineering priority, not a claim about measured sales rankings.
+The proposed design: QEMU CPU/SoC emulation, C device models, Rust orchestration, declarative boards, real Linux interfaces, independent executables connected through versioned protocols. Preserve the priority order: Raspberry Pi 4B and 3B; then Pi 5 and Zero 2 W; Compute Modules; Orange Pi and Radxa. This is an engineering priority, not a claim about measured sales rankings.
 
 Build a useful headless tool before attempting complete silicon fidelity. The first public MVP must boot tested Linux images on Pi 4B and 3B, provide storage and W0 networking, and demonstrate GPIO, I²C and SPI through normal guest Linux interfaces. Integration contracts start early; exact cross-emulator time coordination is a separate gate.
 
@@ -37,7 +44,7 @@ The following observations were checked against primary sources when preparing t
 - QEMU instruction counting is not cycle accuracy and is incompatible with multithreaded TCG. It does not supply a ready distributed simulator scheduler. [QEMU instruction counting](https://www.qemu.org/docs/master/devel/tcg-icount.html)
 - esp32sim's ESP32-C6 documentation describes Cooja integration through NDJSON `hello`, `step {t,in}`, `stop` and `done {t,wake,out}`, with nanosecond time. Treat this as a compatibility lead; inspect both implementations before freezing an adapter. [esp32sim C6 integration](https://github.com/mikroverk/esp32sim/blob/main/docs/esp32c6.md), [Cooja-NG repository](https://github.com/mikroverk/cooja-ng)
 
-The earlier conversation's checklist rendering is not test evidence. No QEMU, kernel, image, Cooja-NG or esp32sim commit is invented here. Issue S00 must select and record actual commits, licenses, build hashes and protocol fixtures. The Cooja external-nodes design file was not retrieved during this review; exact handshake fields and current coordinator behavior remain to be inspected in S02.
+No QEMU, kernel, image, Cooja-NG or esp32sim commit is invented here. Issue S00 must select and record actual commits, licenses, build hashes and protocol fixtures. The Cooja external-nodes design file was not retrieved during this review; exact handshake fields and current coordinator behavior remain to be inspected in S02.
 
 ## 3. Execution modes and truthful capabilities
 
