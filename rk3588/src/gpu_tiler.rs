@@ -45,6 +45,14 @@ pub struct Draw {
     pub varyings: Option<(usize, Arc<[u8]>)>,
 }
 impl Draw {
+    /// Host memory this draw keeps until its frame is rendered.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Draw>()
+            + self.positions.len() * 16
+            + self.point_sizes.len() * 4
+            + self.primitives.len() * 16
+            + self.varyings.as_ref().map_or(0, |v| v.1.len())
+    }
     /// The three positions of triangle `n`.
     pub fn triangle(&self, n: usize) -> [[f32; 4]; 3] {
         let p = self.primitives[n];
@@ -69,6 +77,9 @@ pub struct Tiler {
     frames: BTreeMap<Key, Frame>,
     vertices: usize,
     heaps: BTreeMap<Key, Heap>,
+    /// Primitives and host bytes held by the unrendered frames (derived from `frames`).
+    primitives: usize,
+    bytes: usize,
 }
 fn word(b: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(b[n * 4..n * 4 + 4].try_into().unwrap())
@@ -85,37 +96,54 @@ fn key(m: &AddressSpace, va: u64) -> Key {
 fn unsupported(opcode: u8) -> Stop {
     Stop::Unsupported { pc: 0, opcode }
 }
+/// A draw over one of the host bounds below: a job error the guest sees as a queue fault.
+#[track_caller]
+fn limit(what: &str) -> Stop {
+    if std::env::var_os("SBC_MALI_DEBUG").is_some() {
+        eprintln!("[mali] draw refused at {}: {what}", std::panic::Location::caller());
+    }
+    unsupported(6)
+}
 
-/// Host work bounds: vertices per draw and per unrendered frame, shader instructions per
-/// draw and per thread.
+/// Host work bounds: vertices per draw; shaded vertices, primitives and host bytes held by
+/// all unrendered frames together (positions, primitives, varyings, each draw's state;
+/// also a bound for the browser's 4 GiB address space); shader instructions per draw and
+/// per thread.
 const DRAW_VERTICES: usize = 1 << 20;
 const FRAME_VERTICES: usize = 1 << 22;
+const FRAME_PRIMITIVES: usize = 1 << 23;
+const FRAME_BYTES: usize = 256 << 20;
 const DRAW_BUDGET: usize = 1 << 28;
 const THREAD_BUDGET: usize = 1 << 16;
 
 impl Tiler {
+    /// Drop the unrendered frames `which` selects.
+    fn drop_frames(&mut self, which: impl Fn(&Frame) -> bool) {
+        let keys: Vec<Key> = self.frames.iter().filter(|(_, f)| which(f)).map(|(k, _)| *k).collect();
+        for k in keys {
+            self.remove(&k);
+        }
+    }
+    fn remove(&mut self, k: &Key) -> Option<Frame> {
+        let f = self.frames.remove(k)?;
+        self.vertices -= f.vertices;
+        self.primitives -= f.draws.iter().map(|d| d.primitives.len()).sum::<usize>();
+        self.bytes -= f.draws.iter().map(Draw::bytes).sum::<usize>();
+        Some(f)
+    }
+    /// Recount what the unrendered frames hold (after loading a snapshot).
+    fn recount(&mut self) {
+        let draws = || self.frames.values().flat_map(|f| &f.draws);
+        self.vertices = self.frames.values().map(|f| f.vertices).sum();
+        self.primitives = draws().map(|d| d.primitives.len()).sum();
+        self.bytes = draws().map(Draw::bytes).sum();
+    }
     pub fn clear_group(&mut self, group: u32) {
-        let vertices = &mut self.vertices;
-        self.frames.retain(|_, f| {
-            if f.owner.0 == group {
-                *vertices -= f.vertices;
-                false
-            } else {
-                true
-            }
-        });
+        self.drop_frames(|f| f.owner.0 == group);
         self.heaps.retain(|_, h| h.owner.0 != group);
     }
     pub fn clear_queue(&mut self, owner: Owner) {
-        let vertices = &mut self.vertices;
-        self.frames.retain(|_, f| {
-            if f.owner == owner {
-                *vertices -= f.vertices;
-                false
-            } else {
-                true
-            }
-        });
+        self.drop_frames(|f| f.owner == owner);
         self.heaps.retain(|_, h| h.owner != owner);
     }
     pub fn heap_operation(
@@ -197,9 +225,7 @@ impl Tiler {
                 started.elapsed().as_secs_f64() * 1e3
             );
         }
-        if let Some(f) = self.frames.remove(&k) {
-            self.vertices -= f.vertices;
-        }
+        self.remove(&k);
         Ok(())
     }
     pub fn idvs(
@@ -248,14 +274,6 @@ impl Tiler {
             return Err(Stop::InvalidStream);
         }
         let k = key(m, ctx);
-        if self.frames.len() >= 64 && !self.frames.contains_key(&k) {
-            return Err(unsupported(6));
-        }
-        if let Some(frame) = self.frames.get(&k) {
-            if frame.owner != owner || frame.draws.len() >= 1 << 16 {
-                return Err(unsupported(6));
-            }
-        }
         let mut tiler = [0; 128];
         m.read(ram, ctx, &mut tiler, true).map_err(Stop::Memory)?;
         let width = (word(&tiler, 3) & 65535) + 1;
@@ -264,11 +282,6 @@ impl Tiler {
             return Err(unsupported(6));
         }
         let first_provoking = word(&tiler, 2) & (1 << 18) != 0;
-        if let Some(frame) = self.frames.get(&k) {
-            if frame.width != width || frame.height != height {
-                return Err(unsupported(6));
-            }
-        }
         let mut heap = [0; 32];
         m.read(ram, pair(&tiler, 6), &mut heap, true)
             .map_err(Stop::Memory)?;
@@ -308,8 +321,42 @@ impl Tiler {
             order.push(s);
         }
         let shaded = unique.len() * instances as usize;
+        if shaded == 0 {
+            // Nothing to shade or draw (no instances, no vertices): no frame either.
+            return Ok(());
+        }
+        // Primitives (at most one per index and instance) before any shading, so the
+        // limits apply before the large allocations.
+        let mut primitives = Vec::new();
+        for instance in 0..instances as usize {
+            let base = (instance * unique.len()) as u32;
+            for run in order.split(|&s| s == u32::MAX) {
+                assemble(mode, run, base, first_provoking, &mut primitives);
+            }
+        }
+        if self.frames.len() >= 64 && !self.frames.contains_key(&k) {
+            return Err(limit("64 unrendered frames"));
+        }
+        if let Some(frame) = self.frames.get(&k) {
+            if frame.owner != owner || frame.width != width || frame.height != height {
+                return Err(unsupported(6));
+            }
+            if frame.draws.len() >= 1 << 16 {
+                return Err(limit("65536 draws in a frame"));
+            }
+        }
+        let stride = if secondary { r[48] as usize } else { 0 };
+        let bytes = std::mem::size_of::<Draw>()
+            + shaded * (16 + if extended && kind == POINTS { 4 } else { 0 } + stride)
+            + primitives.len() * 16;
         if self.vertices + shaded > FRAME_VERTICES {
-            return Err(unsupported(6));
+            return Err(limit("shaded vertices of the unrendered frames"));
+        }
+        if self.primitives + primitives.len() > FRAME_PRIMITIVES {
+            return Err(limit("primitives of the unrendered frames"));
+        }
+        if self.bytes + bytes > FRAME_BYTES {
+            return Err(limit("host memory of the unrendered frames"));
         }
         let record = if extended { 32 } else { 16 };
         let mut positions_raw = vec![0u8; shaded * record];
@@ -337,8 +384,8 @@ impl Tiler {
             &mut budget,
         )?;
         let varyings = if secondary {
-            let stride = r[48] as usize;
-            let mut data = vec![0u8; shaded * stride];
+            // (allocated in place: Arc::from(Vec) would hold two copies at once)
+            let mut data: Arc<[u8]> = std::iter::repeat_n(0u8, shaded * stride).collect();
             run_stage(
                 m,
                 ram,
@@ -353,10 +400,10 @@ impl Tiler {
                 &unique,
                 instances,
                 index_scale,
-                (&mut data, (stride as u32, index_scale)),
+                (Arc::get_mut(&mut data).unwrap(), (stride as u32, index_scale)),
                 &mut budget,
             )?;
-            Some((stride, Arc::from(data)))
+            Some((stride, data))
         } else {
             None
         };
@@ -376,13 +423,6 @@ impl Tiler {
                 &positions[..positions.len().min(16)]
             );
         }
-        let mut primitives = Vec::new();
-        for instance in 0..instances as usize {
-            let base = (instance * unique.len()) as u32;
-            for run in order.split(|&s| s == u32::MAX) {
-                assemble(mode, run, base, first_provoking, &mut primitives);
-            }
-        }
         let frame = self.frames.entry(k).or_insert_with(|| Frame {
             owner,
             width,
@@ -391,7 +431,10 @@ impl Tiler {
             draws: Vec::new(),
             vertices: 0,
         });
-        frame.draws.push(Draw {
+        // (held bytes count lengths: no spare capacity)
+        primitives.shrink_to_fit();
+        point_sizes.shrink_to_fit();
+        let draw = Draw {
             regs: *r,
             instruction,
             kind,
@@ -399,7 +442,10 @@ impl Tiler {
             point_sizes,
             primitives,
             varyings,
-        });
+        };
+        self.primitives += draw.primitives.len();
+        self.bytes += draw.bytes();
+        frame.draws.push(draw);
         frame.vertices += shaded;
         self.vertices += shaded;
         Ok(())
@@ -632,6 +678,9 @@ emu_core::snap_struct!(Tiler {
     frames,
     vertices,
     heaps
+} skip { primitives, bytes } after |t| {
+    t.recount();
+    Ok(())
 });
 
 #[cfg(test)]

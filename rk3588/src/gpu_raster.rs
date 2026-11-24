@@ -2,8 +2,8 @@
 //! stencil, fragment shaders in 2x2 quads, blending and occlusion queries.
 //!
 //! Positions are window x, y, z and 1/w (Mesa lowers the viewport transform into the
-//! vertex shader and clamps 1/w to +-2^15, so w is never zero). Triangles crossing w = 0
-//! are clipped in homogeneous space; the near and far planes are applied per fragment
+//! vertex shader and clamps 1/w to +-2^15, so w is never zero). Triangles and lines
+//! crossing w = 0 are clipped in homogeneous space; the near and far planes are applied per fragment
 //! through the descriptor's depth range, as on Mali. Varyings are interpolated with
 //! perspective-correct weights of the original primitive's vertices. Coordinates snap to
 //! 1/256 pixel so shared edges are covered exactly once (top-left rule).
@@ -30,9 +30,11 @@ fn bad() -> Stop {
     Stop::Unsupported { pc: 0, opcode: 7 }
 }
 
-/// Shader instructions per fragment thread and per frame.
+/// Shader instructions per fragment thread, and per fragment job: the shader instructions
+/// of all its draws and pre-/post-frame shaders plus one for every 2x2 quad visited (so
+/// that coverage tests without a fragment shader are bounded too).
 const THREAD_BUDGET: usize = 1 << 16;
-const FRAME_BUDGET: u64 = 1 << 34;
+pub(crate) const FRAME_BUDGET: u64 = 1 << 34;
 
 /// Depth/stencil descriptor state.
 #[derive(Clone, Copy, Default)]
@@ -339,6 +341,53 @@ fn clip(pos: [[f32; 4]; 3]) -> Vec<Tri> {
     tris
 }
 
+/// Clip a line against w > 0 like `clip`: its window end points and where they lie on the
+/// original segment (0 at the first vertex, 1 at the second). `None` when nothing is in
+/// front of the eye or a position is not finite.
+fn clip_line(a: [f32; 4], b: [f32; 4]) -> Option<([f64; 4], [f64; 4], [f64; 2])> {
+    if !a.iter().chain(&b).all(|v| v.is_finite()) {
+        return None;
+    }
+    let (a, b) = (a.map(|v| v as f64), b.map(|v| v as f64));
+    if a[3] > 0. && b[3] > 0. {
+        return Some((a, b, [0., 1.]));
+    }
+    if a[3] <= 0. && b[3] <= 0. {
+        return None;
+    }
+    const EPS: f64 = 1e-5;
+    let h = |p: [f64; 4]| {
+        let w = 1. / p[3];
+        [p[0] * w, p[1] * w, p[2] * w, w]
+    };
+    let (ha, hb) = (h(a), h(b));
+    let t = (EPS - ha[3]) / (hb[3] - ha[3]);
+    let cut: [f64; 4] = std::array::from_fn(|n| ha[n] + (hb[n] - ha[n]) * t);
+    let cut = [cut[0] / cut[3], cut[1] / cut[3], cut[2] / cut[3], 1. / cut[3]];
+    if !cut.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(if a[3] > 0. { (a, cut, [0., t]) } else { (cut, b, [t, 1.]) })
+}
+
+/// The x extent of a convex polygon between two rows y = `lo` and y = `hi`.
+fn slab(poly: &[[f64; 2]; 4], lo: f64, hi: f64) -> Option<(f64, f64)> {
+    let (mut xa, mut xb) = (f64::INFINITY, f64::NEG_INFINITY);
+    for k in 0..4 {
+        let (p, q) = (poly[k], poly[(k + 1) % 4]);
+        if p[1] >= lo && p[1] <= hi {
+            (xa, xb) = (xa.min(p[0]), xb.max(p[0]));
+        }
+        for y in [lo, hi] {
+            if (p[1] - y) * (q[1] - y) < 0. {
+                let x = p[0] + (q[0] - p[0]) * (y - p[1]) / (q[1] - p[1]);
+                (xa, xb) = (xa.min(x), xb.max(x));
+            }
+        }
+    }
+    (xa <= xb).then_some((xa, xb))
+}
+
 fn edge(a: [f64; 4], b: [f64; 4], x: f64, y: f64) -> f64 {
     (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
 }
@@ -370,19 +419,41 @@ struct Raster<'a, 'b> {
     frame: Option<[u32; 2]>,
 }
 
+/// Rasterize a frame's draws into `tb`, spending from the job's `budget` and adding each
+/// draw's samples that passed to `counts`.
 pub fn draw(
     m: &AddressSpace,
     ram: &mut [u8],
     fb: &Fb,
     tb: &mut TileBuffer,
     frame: &Frame,
+    budget: &mut u64,
+    counts: &mut [u64],
 ) -> Result<(), Stop> {
     let (workers, min_rows) = BANDS.with(|b| b.get()).unwrap_or((workers(), 16));
-    let occlusion = match draw_parallel(m, ram, fb, tb, frame, workers, min_rows) {
+    let occlusion = match draw_parallel(m, ram, fb, tb, frame, workers, min_rows, budget) {
         Some(counts) => counts,
-        None => render(m, Ram::Rw(ram), fb, tb, frame)?.into_iter().map(|(c, _)| c).collect(),
+        None => render(m, Ram::Rw(ram), fb, tb, frame, budget)?,
     };
-    for (draw, count) in frame.draws.iter().zip(occlusion) {
+    for (total, count) in counts.iter_mut().zip(occlusion) {
+        *total += count;
+    }
+    Ok(())
+}
+
+/// Check that the draws' occlusion query results can be written.
+pub fn check_occlusion(m: &AddressSpace, ram: &[u8], frame: &Frame) -> Result<(), Stop> {
+    for draw in &frame.draws {
+        if let Some((address, _)) = State::occlusion(draw) {
+            m.chunks(ram, address, 8, crate::gpu_mmu::Access::Write, true).map_err(Stop::Memory)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write the draws' occlusion query results.
+pub fn occlusion(m: &AddressSpace, ram: &mut [u8], frame: &Frame, counts: &[u64]) -> Result<(), Stop> {
+    for (draw, &count) in frame.draws.iter().zip(counts) {
         let Some((address, mode)) = State::occlusion(draw) else { continue };
         let mut b = [0u8; 8];
         m.read(ram, address, &mut b, true).map_err(Stop::Memory)?;
@@ -393,9 +464,16 @@ pub fn draw(
     Ok(())
 }
 
-/// Rasterize every draw of a frame into `tb`. Returns each draw's occlusion count and
-/// the shader instructions it spent.
-fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &Frame) -> Result<Vec<(u64, u64)>, Stop> {
+/// Rasterize every draw of a frame into `tb`, spending from `budget`. Returns each draw's
+/// occlusion count.
+fn render(
+    m: &AddressSpace,
+    mut ram: Ram,
+    fb: &Fb,
+    tb: &mut TileBuffer,
+    frame: &Frame,
+    budget: &mut u64,
+) -> Result<Vec<u64>, Stop> {
     let mut code = Code::default();
     let mut tlb = Tlb::default();
     let mut textures = crate::gpu_texture::Cache::default();
@@ -408,9 +486,10 @@ fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &
             Ram::Ro(r) => Ram::Ro(r),
         };
         let env = Env::with_ram(m, view, uniforms, &mut code, &mut tlb, &mut textures);
-        let mut r = Raster { env, fb, tb, budget: FRAME_BUDGET, occlusion: 0, lanes: None, frame: None };
+        let mut r = Raster { env, fb, tb, budget: *budget, occlusion: 0, lanes: None, frame: None };
         r.draw(draw, &st)?;
-        occlusion.push((r.occlusion, FRAME_BUDGET - r.budget));
+        *budget = r.budget;
+        occlusion.push(r.occlusion);
     }
     Ok(occlusion)
 }
@@ -418,9 +497,10 @@ fn render(m: &AddressSpace, mut ram: Ram, fb: &Fb, tb: &mut TileBuffer, frame: &
 /// Fragment workers: interleaved stripes of rows rendered at once, each into its own
 /// copy of the tile buffer with read-only guest memory. The parallel result is kept only
 /// when it is the serial one: when any worker fails (a shader that stores to memory, a
-/// fault, a host panic) or the workers together spend more of a draw's instruction
-/// budget than one serial pass may, the job is rendered serially instead (`None`), so
-/// faults, budgets and the GPU time charged do not depend on the number of workers.
+/// fault, a host panic) or the workers together spend more of the job's budget than one
+/// serial pass may, the job is rendered serially instead (`None`), so faults, budgets and
+/// the GPU time charged do not depend on the number of workers.
+#[allow(clippy::too_many_arguments)]
 fn draw_parallel(
     m: &AddressSpace,
     ram: &[u8],
@@ -429,37 +509,41 @@ fn draw_parallel(
     frame: &Frame,
     workers: usize,
     min_rows: u32,
+    budget: &mut u64,
 ) -> Option<Vec<u64>> {
     if workers < 2 || tb.h < 2 * min_rows || frame.draws.is_empty() {
         return None;
     }
     let mut bands: Vec<TileBuffer> = (0..workers as u32).map(|k| tb.stripes(k, workers as u32)).collect();
-    let results: Vec<Option<(Vec<(u64, u64)>, u64)>> = std::thread::scope(|s| {
+    let available = *budget;
+    let results: Vec<Option<(Vec<u64>, u64, u64)>> = std::thread::scope(|s| {
         let handles: Vec<_> = bands
             .iter_mut()
             .map(|band| {
                 s.spawn(move || {
-                    let r = render(m, Ram::Ro(ram), fb, band, frame).ok();
-                    r.map(|counts| (counts, crate::gpu::take_work()))
+                    let mut left = available;
+                    let r = render(m, Ram::Ro(ram), fb, band, frame, &mut left).ok();
+                    r.map(|counts| (counts, available - left, crate::gpu::take_work()))
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().ok().flatten()).collect()
     });
     let mut total = vec![0u64; frame.draws.len()];
-    let mut spent = vec![0u64; frame.draws.len()];
+    let mut spent = 0u64;
     let mut work = 0u64;
     for r in results {
-        let (counts, ps) = r?;
-        for (n, (c, i)) in counts.into_iter().enumerate() {
+        let (counts, used, ps) = r?;
+        for (n, c) in counts.into_iter().enumerate() {
             total[n] += c;
-            spent[n] += i;
         }
+        spent = spent.saturating_add(used);
         work = work.saturating_add(ps);
     }
-    if spent.iter().any(|&s| s > FRAME_BUDGET) {
+    if spent > available {
         return None;
     }
+    *budget -= spent;
     for band in &bands {
         tb.merge(band);
     }
@@ -470,6 +554,8 @@ fn draw_parallel(
 thread_local! {
     /// Tests: force (workers, minimum rows per band).
     pub(crate) static BANDS: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
+    /// Tests: force a fragment job's budget.
+    pub(crate) static BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Fragment worker threads (`SBC_MALI_THREADS`, default half the host's cores, at most
@@ -492,6 +578,7 @@ pub fn frame_shader(
     fb: &Fb,
     tb: &mut TileBuffer,
     dcd: u64,
+    budget: &mut u64,
 ) -> Result<(), Stop> {
     let mut b = [0u8; 128];
     m.read(ram, dcd, &mut b, true).map_err(Stop::Memory)?;
@@ -510,7 +597,7 @@ pub fn frame_shader(
         env,
         fb,
         tb,
-        budget: FRAME_BUDGET,
+        budget: *budget,
         occlusion: 0,
         lanes: None,
         frame: Some([fb.width, fb.height]),
@@ -523,7 +610,9 @@ pub fn frame_shader(
         w: 1.,
         point: [0.; 2],
     };
-    r.quads(&st, &None, [0; 3], 0, true, bounds, pixel)
+    r.quads(&st, &None, [0; 3], 0, true, bounds, pixel)?;
+    *budget = r.budget;
+    Ok(())
 }
 
 impl Raster<'_, '_> {
@@ -550,29 +639,23 @@ impl Raster<'_, '_> {
                     let p = pos[0].map(|x| x as f64);
                     let r = size as f64 / 2.;
                     let corners = [[p[0] - r, p[1] - r], [p[0] + r, p[1] + r]];
-                    self.rect(st, &varyings, v, provoking, p, corners, None, true)?;
+                    self.rect(st, &varyings, v, provoking, p, corners)?;
                 }
                 LINES => {
-                    if pos[0][3] <= 0. || pos[1][3] <= 0. {
-                        continue;
-                    }
-                    let a = pos[0].map(|x| x as f64);
-                    let b = pos[1].map(|x| x as f64);
+                    let Some(line) = clip_line(pos[0], pos[1]) else { continue };
                     let width = st.point_size.max(1.) as f64;
-                    let lo = [a[0].min(b[0]) - width, a[1].min(b[1]) - width];
-                    let hi = [a[0].max(b[0]) + width, a[1].max(b[1]) + width];
-                    self.rect(
-                        st,
-                        &varyings,
-                        v,
-                        provoking,
-                        a,
-                        [lo, hi],
-                        Some((a, b, width)),
-                        true,
-                    )?;
+                    self.line(st, &varyings, v, provoking, line, width)?;
                 }
                 _ => {
+                    // Rendered in passes of rows (gpu_render.rs): skip triangles wholly
+                    // above or below this one cheaply.
+                    if pos.iter().all(|p| p[3] > 0. && p[1].is_finite()) {
+                        let lo = pos.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+                        let hi = pos.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+                        if hi < self.tb.y0 as f32 - 1. || lo > (self.tb.y0 + self.tb.h) as f32 + 1. {
+                            continue;
+                        }
+                    }
                     for t in clip(pos) {
                         self.triangle(st, &varyings, v, provoking, &t)?;
                     }
@@ -694,7 +777,7 @@ impl Raster<'_, '_> {
         )
     }
 
-    /// Points (square sprites) and lines (rectangles around the segment).
+    /// Points: square sprites.
     #[allow(clippy::too_many_arguments)]
     fn rect(
         &mut self,
@@ -704,59 +787,85 @@ impl Raster<'_, '_> {
         provoking: usize,
         center: [f64; 4],
         corners: [[f64; 2]; 2],
-        line: Option<([f64; 4], [f64; 4], f64)>,
-        front: bool,
     ) -> Result<(), Stop> {
         let Some(b) = self.bounds(st, corners[0], corners[1]) else {
             return Ok(());
         };
         let pixel = |x: u32, y: u32| -> Pixel {
             let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
-            match line {
-                None => {
-                    let size = corners[1][0] - corners[0][0];
-                    let inside = cx >= corners[0][0]
-                        && cx < corners[1][0]
-                        && cy >= corners[0][1]
-                        && cy < corners[1][1];
-                    Pixel {
-                        covered: inside,
-                        passed: inside,
-                        weights: [1., 0., 0.],
-                        z: center[2] as f32,
-                        w: (1. / center[3]) as f32,
-                        point: [
-                            ((cx - corners[0][0]) / size) as f32,
-                            ((cy - corners[0][1]) / size) as f32,
-                        ],
-                    }
-                }
-                Some((a, b, width)) => {
-                    let d = [b[0] - a[0], b[1] - a[1]];
-                    let len2 = d[0] * d[0] + d[1] * d[1];
-                    let t = if len2 > 0. {
-                        ((cx - a[0]) * d[0] + (cy - a[1]) * d[1]) / len2
-                    } else {
-                        0.
-                    };
-                    let dist = if len2 > 0. {
-                        ((cx - a[0]) * d[1] - (cy - a[1]) * d[0]).abs() / len2.sqrt()
-                    } else {
-                        f64::MAX
-                    };
-                    let inside = (0. ..1.).contains(&t) && dist <= width / 2.;
-                    Pixel {
-                        covered: inside,
-                        passed: inside,
-                        weights: [1. - t, t, 0.],
-                        z: (a[2] + (b[2] - a[2]) * t) as f32,
-                        w: 1.,
-                        point: [0.; 2],
-                    }
-                }
+            let size = corners[1][0] - corners[0][0];
+            let inside = cx >= corners[0][0] && cx < corners[1][0] && cy >= corners[0][1] && cy < corners[1][1];
+            Pixel {
+                covered: inside,
+                passed: inside,
+                weights: [1., 0., 0.],
+                z: center[2] as f32,
+                w: (1. / center[3]) as f32,
+                point: [((cx - corners[0][0]) / size) as f32, ((cy - corners[0][1]) / size) as f32],
             }
         };
-        self.quads(st, varyings, vertices, provoking, front, b, pixel)
+        self.quads(st, varyings, vertices, provoking, true, b, pixel)
+    }
+
+    /// Lines: the rectangle `width` wide around the segment, visited one quad row at a
+    /// time over the columns that row of the rectangle spans.
+    fn line(
+        &mut self,
+        st: &State,
+        varyings: &Option<(usize, std::sync::Arc<[u8]>)>,
+        vertices: [usize; 3],
+        provoking: usize,
+        (a, b, ends): ([f64; 4], [f64; 4], [f64; 2]),
+        width: f64,
+    ) -> Result<(), Stop> {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let len2 = d[0] * d[0] + d[1] * d[1];
+        if !(len2 > 0.) || !len2.is_finite() {
+            return Ok(());
+        }
+        let len = len2.sqrt();
+        let n = [-d[1] / len * width / 2., d[0] / len * width / 2.];
+        let corners = [
+            [a[0] + n[0], a[1] + n[1]],
+            [b[0] + n[0], b[1] + n[1]],
+            [b[0] - n[0], b[1] - n[1]],
+            [a[0] - n[0], a[1] - n[1]],
+        ];
+        let lo = [0, 1].map(|k| corners.iter().map(|c| c[k]).fold(f64::MAX, f64::min));
+        let hi = [0, 1].map(|k| corners.iter().map(|c| c[k]).fold(f64::MIN, f64::max));
+        let Some([_, y0, _, y1]) = self.bounds(st, lo, hi) else {
+            return Ok(());
+        };
+        let pixel = |x: u32, y: u32| -> Pixel {
+            let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let t = ((cx - a[0]) * d[0] + (cy - a[1]) * d[1]) / len2;
+            let dist = ((cx - a[0]) * d[1] - (cy - a[1]) * d[0]).abs() / len;
+            let inside = (0. ..1.).contains(&t) && dist <= width / 2.;
+            // The position along the original segment (before clipping at w = 0). Exact
+            // at the ends; in between it is linear in screen space, where the segment's
+            // perspective would make it slightly nonlinear when one end was clipped.
+            let u = ends[0] + (ends[1] - ends[0]) * t;
+            Pixel {
+                covered: inside,
+                passed: inside,
+                weights: [1. - u, u, 0.],
+                z: (a[2] + (b[2] - a[2]) * t) as f32,
+                w: 1.,
+                point: [0.; 2],
+            }
+        };
+        let mut qy = y0 & !1;
+        while qy <= y1 {
+            // Pixel centres of this quad row: y + 0.5 in [qy + 0.5, qy + 1.5].
+            if let Some((xa, xb)) = slab(&corners, qy as f64 + 0.5, qy as f64 + 1.5) {
+                let rows = self.bounds(st, [xa - 1., qy.max(y0) as f64], [xb + 1., (qy + 1).min(y1) as f64]);
+                if let Some(b) = rows {
+                    self.quads(st, varyings, vertices, provoking, true, b, &pixel)?;
+                }
+            }
+            qy += 2;
+        }
+        Ok(())
     }
 
     /// Visit the 2x2 quads of a box: coverage, early depth/stencil, the fragment shader
@@ -781,6 +890,7 @@ impl Raster<'_, '_> {
             }
             let mut qx = x0 & !1;
             while qx <= x1 {
+                self.budget = self.budget.checked_sub(1).ok_or_else(|| bad())?;
                 let mut px = [Pixel::default(); 4];
                 let mut any = false;
                 for (k, p) in px.iter_mut().enumerate() {
@@ -998,6 +1108,10 @@ impl Raster<'_, '_> {
                     continue;
                 }
                 let Some(color) = f.color[slot] else { continue };
+                if self.tb.color[rt].is_empty() {
+                    self.tb.touched = true;
+                    continue; // not written back
+                }
                 if color.iter().any(|v| v.is_nan()) {
                     continue;
                 }
@@ -1062,6 +1176,31 @@ mod tests {
             clip([[0., 0., 0.5, 1.], [1., 0., 0.5, 1.], [0., 1., 0.5, 1.]]).len(),
             1
         );
+    }
+    #[test]
+    fn lines_are_clipped_at_w_zero_and_keep_their_place_on_the_segment() {
+        let a = [0., 0., 0.5, 1.];
+        assert_eq!(clip_line(a, [10., 0., 0.5, 1.]), Some((a.map(|v| v as f64), [10., 0., 0.5, 1.], [0., 1.])));
+        // The second vertex is behind the eye (w = -1): cut where w reaches 1e-5, about
+        // half way in clip space.
+        let (p, q, ends) = clip_line(a, [10., 0., 0.5, -1.]).unwrap();
+        assert_eq!((p, ends[0]), (a.map(|v| v as f64), 0.));
+        assert!((ends[1] - 0.5).abs() < 1e-4 && ends[1] < 0.5);
+        assert!(q[3] > 0. && q.iter().all(|v| v.is_finite()));
+        // The same line given the other way round.
+        let (p2, _, ends2) = clip_line([10., 0., 0.5, -1.], a).unwrap();
+        assert!(p2.iter().zip(&q).all(|(x, y)| (x - y).abs() <= 1e-6 * y.abs().max(1.)));
+        assert!((ends2[0] - (1. - ends[1])).abs() < 1e-12 && ends2[1] == 1.);
+        assert_eq!(clip_line([0., 0., 0.5, -1.], [1., 0., 0.5, -2.]), None);
+        assert_eq!(clip_line([f32::NAN, 0., 0.5, 1.], a), None);
+        assert_eq!(clip_line(a, [0., f32::INFINITY, 0.5, 1.]), None);
+    }
+    #[test]
+    fn a_rotated_rectangle_spans_its_columns_row_by_row() {
+        let square = [[1., 0.], [2., 1.], [1., 2.], [0., 1.]];
+        assert_eq!(slab(&square, 0.5, 0.75), Some((0.25, 1.75)));
+        assert_eq!(slab(&square, -1., 3.), Some((0., 2.)));
+        assert_eq!(slab(&square, 2.5, 3.), None);
     }
     #[test]
     fn stencil_operations_wrap_and_saturate() {

@@ -693,3 +693,252 @@ fn a_frame_that_falls_back_to_serial_is_charged_once() {
     assert!(serial.0.chunks(4).any(|p| p == [0, 255, 0, 255]));
     assert_eq!(render(Some((4, 4))), serial);
 }
+#[test]
+fn primitives_count_against_the_frame_limit_not_only_vertices() {
+    // A million identical indices shade one vertex but make a million points.
+    let (m, mut ram, mut r) = fixture();
+    ram.resize(0x20000 + (1 << 20), 0);
+    r[33] = 1 << 20;
+    r[39] = 1 << 20;
+    r[54] = 0x20000;
+    let mut t = Tiler::default();
+    for _ in 0..FRAME_PRIMITIVES >> 20 {
+        t.idvs(&m, &mut ram, &r, 0x0600004200000101, (0, 0)).unwrap();
+    }
+    assert_eq!((t.vertices, t.primitives), (FRAME_PRIMITIVES >> 20, FRAME_PRIMITIVES));
+    assert!(matches!(
+        t.idvs(&m, &mut ram, &r, 0x0600004200000101, (0, 0)),
+        Err(Stop::Unsupported { .. })
+    ));
+    assert_eq!(t.frames[&key(&m, 0x8000)].draws.len(), FRAME_PRIMITIVES >> 20);
+    // Rendering the frame (here: dropping its queue) gives the room back.
+    t.clear_queue((0, 0));
+    assert_eq!((t.vertices, t.primitives, t.bytes), (0, 0, 0));
+    t.idvs(&m, &mut ram, &r, 0x0600004200000101, (0, 0)).unwrap();
+}
+#[test]
+fn varyings_and_held_bytes_are_bounded_before_allocating() {
+    // 2^20 vertices with 1 KiB varying records would be a 1 GiB allocation: refused
+    // before any shading or allocation.
+    let (m, mut ram, mut r) = with_varyings();
+    r[48] = 1024;
+    r[34] = 349_525;
+    let mut t = Tiler::default();
+    assert!(matches!(
+        t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0)),
+        Err(Stop::Unsupported { .. })
+    ));
+    assert!(t.frames.is_empty());
+    assert_eq!((t.vertices, t.primitives, t.bytes), (0, 0, 0));
+    // The bound is on all unrendered frames together: a small draw does not fit in the
+    // last few bytes either.
+    r[48] = 16;
+    r[34] = 1;
+    t.bytes = FRAME_BYTES - 1000;
+    assert!(t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0)).is_err());
+    t.bytes = 0;
+    t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0)).unwrap();
+    let held = t.bytes;
+    assert!(held >= std::mem::size_of::<Draw>() + 3 * (16 + 16) + 16);
+    // Each draw's state counts, so empty draws cannot pile up without bound.
+    t.idvs(&m, &mut ram, &r, 0x0600004200040008, (0, 0)).unwrap();
+    assert_eq!(t.bytes, 2 * held);
+    // A snapshot keeps the frames; the totals are counted again when it is loaded.
+    let mut w = emu_core::snap::W(Vec::new());
+    emu_core::snap::Snap::save(&t, &mut w);
+    let mut loaded = Tiler::default();
+    emu_core::snap::Snap::load(&mut loaded, &mut emu_core::snap::R::new(&w.0)).unwrap();
+    assert_eq!((loaded.vertices, loaded.primitives, loaded.bytes), (t.vertices, t.primitives, t.bytes));
+    t.clear_group(0);
+    assert_eq!((t.vertices, t.primitives, t.bytes), (0, 0, 0));
+}
+#[test]
+fn draws_with_no_instances_make_no_frame_and_do_not_count() {
+    let (m, mut ram, mut r) = fixture();
+    let mut t = Tiler::default();
+    r[34] = 0;
+    t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0)).unwrap();
+    assert!(t.frames.is_empty());
+    // A full frame still takes draws that draw nothing (a GPU-culled indirect loop).
+    r[34] = 1;
+    t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0)).unwrap();
+    let frame = t.frames.get_mut(&key(&m, 0x8000)).unwrap();
+    frame.draws.resize_with(1 << 16, Draw::default);
+    assert!(matches!(
+        t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0)),
+        Err(Stop::Unsupported { .. })
+    ));
+    r[34] = 0;
+    for _ in 0..4 {
+        t.idvs(&m, &mut ram, &r, 0x0600004200000008, (0, 0)).unwrap();
+    }
+    assert_eq!(t.frames[&key(&m, 0x8000)].draws.len(), 1 << 16);
+}
+/// The coloured fixture enlarged to `w` x `h`, writing linear or u-interleaved.
+fn enlarge(ram: &mut [u8], r: &mut [u32; 256], f: &mut [u32; 256], (w, h): (u32, u32), tiled: bool) {
+    let size = (w - 1) | ((h - 1) << 16);
+    put(ram, 0xd020, &[size, 0, size]);
+    put(ram, 0x800c, &[size]);
+    put(ram, 0x7000, &[(w / 2) as f32, (h / 2) as f32, (w / 2) as f32, (h / 2) as f32].map(f32::to_bits));
+    r[43] = size;
+    f[43] = size;
+    if tiled {
+        put(ram, 0xd084, &[1 | (19 << 3) | (1 << 8) | (0x688 << 16)]);
+        put(ram, 0xd0a8, &[w / 16 * 256 * 4]);
+    } else {
+        put(ram, 0xd0a8, &[w * 4]);
+    }
+}
+/// Render two overlapping draws with depth and an occlusion counter into a 32x48 target
+/// whose box starts at `min` (x | y << 16), with `pass` and the fragment workers (`bands`)
+/// forced: the target's bytes and the counter.
+fn passes_at(pass: Option<(usize, usize)>, tiled: bool, min: u32, bands: Option<(usize, u32)>) -> Result<(Vec<u8>, u64), Stop> {
+    let (m, mut ram, mut r) = fixture();
+    let mut f = coloured(&mut ram, &mut r);
+    enlarge(&mut ram, &mut r, &mut f, (32, 48), tiled);
+    f[42] = min;
+    put(&mut ram, 0x5400, &[7, 0, 0, 0, (1 << 29) | (1 << 27)]);
+    r[52] = 0x5400;
+    r[57] |= 3 << 14;
+    r[46] = 0x1f800;
+    let mut t = Tiler::default();
+    let half = |v: f32| crate::gpu_shader::f32_to_f16(v) as u32;
+    draw(&mut t, &m, &mut ram, &mut r, 0.75, [half(1.), half(1.) << 16], 0x7100);
+    // The second (nearer) triangle covers the left half of the first.
+    ram[0x4008..0x400c].copy_from_slice(&0f32.to_le_bytes());
+    draw(&mut t, &m, &mut ram, &mut r, 0.25, [half(0.) | half(1.) << 16, half(1.) << 16], 0x7108);
+    crate::gpu_render::PASS.with(|p| p.set(pass));
+    crate::gpu_raster::BANDS.with(|p| p.set(bands));
+    let result = t.fragment(&m, &mut ram, &f, (0, 0));
+    crate::gpu_render::PASS.with(|p| p.set(None));
+    crate::gpu_raster::BANDS.with(|p| p.set(None));
+    result?;
+    Ok((ram[0xe000..0xe000 + 32 * 48 * 4].to_vec(), u64::from_le_bytes(ram[0x1f800..0x1f808].try_into().unwrap())))
+}
+fn passes(pass: Option<(usize, usize)>, tiled: bool) -> Result<(Vec<u8>, u64), Stop> {
+    passes_at(pass, tiled, 0, None)
+}
+#[test]
+fn passes_with_an_odd_box_start_and_fragment_workers_match_one_pass() {
+    for tiled in [false, true] {
+        for min in [0u32, (5 << 16) | 3, (17 << 16) | 1, 31 << 16] {
+            let whole = passes_at(None, tiled, min, Some((1, 16))).unwrap();
+            for pass in [Some((32 * 21 * 16, 1 << 20)), Some((32 * 21 * 32, 1 << 20))] {
+                for bands in [Some((1, 16)), Some((4, 4)), Some((2, 2))] {
+                    let p = passes_at(pass, tiled, min, bands).unwrap();
+                    assert_eq!(p, whole, "tiled {tiled} min {min:x} pass {pass:?} bands {bands:?}");
+                }
+            }
+        }
+    }
+}
+#[test]
+fn a_large_box_renders_in_passes_of_rows_with_the_same_result() {
+    let whole = passes(None, false).unwrap();
+    assert!(whole.1 > 0);
+    assert!(whole.0.chunks(4).any(|p| p == [255, 0, 0, 255]));
+    assert!(whole.0.chunks(4).any(|p| p == [0, 255, 0, 255]));
+    // 16 rows of 32 pixels with one target: three passes.
+    let pass = Some((32 * 21 * 16, 1 << 20));
+    assert_eq!(passes(pass, false).unwrap(), whole);
+    // U-interleaved writeback, whole and in passes, holds the same pixels.
+    let s = crate::gpu_render::Surface { base: 0, row_stride: 2 * 256 * 4, tiled: true, bpp: 4, afbc: None };
+    for p in [None, pass] {
+        let (tiled, count) = passes(p, true).unwrap();
+        assert_eq!(count, whole.1);
+        for y in 0..48 {
+            for x in 0..32 {
+                let at = s.offset(x, y) as usize;
+                let linear = (y * 32 + x) as usize * 4;
+                assert_eq!(tiled[at..at + 4], whole.0[linear..linear + 4], "{x},{y}");
+            }
+        }
+    }
+    // Every pass visits every primitive: too many visits is a job error, before any
+    // pixel is written.
+    assert!(matches!(passes(Some((32 * 21 * 16, 5)), false), Err(Stop::Unsupported { .. })));
+    // So is an occlusion query that cannot be written.
+    let (m, mut ram, mut r) = fixture();
+    let f = coloured(&mut ram, &mut r);
+    r[57] |= 3 << 14;
+    r[46] = 0x10_0000;
+    let mut t = Tiler::default();
+    draw(&mut t, &m, &mut ram, &mut r, 0.5, [0x3c00, 0x3c00 << 16], 0x7100);
+    let before = ram.clone();
+    assert!(matches!(t.fragment(&m, &mut ram, &f, (0, 0)), Err(Stop::Memory(_))));
+    assert_eq!(ram, before);
+}
+/// The lowest budget a fragment job of `frame` succeeds with (`frame` None: the tiler's).
+fn least_budget(job: impl Fn(u64) -> bool) -> u64 {
+    let (mut lo, mut hi) = (0u64, 1 << 24);
+    assert!(job(hi));
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if job(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+#[test]
+fn the_fragment_budget_is_for_the_whole_job() {
+    for bands in [Some((1, 16)), Some((4, 4))] {
+        let budget = |draws: usize| {
+            least_budget(|b| {
+                let (m, mut ram, mut r) = fixture();
+                let f = coloured(&mut ram, &mut r);
+                let mut t = Tiler::default();
+                let half = |v: f32| crate::gpu_shader::f32_to_f16(v) as u32;
+                for _ in 0..draws {
+                    draw(&mut t, &m, &mut ram, &mut r, 0.5, [half(1.), half(1.) << 16], 0x7100);
+                }
+                crate::gpu_raster::BANDS.with(|c| c.set(bands));
+                crate::gpu_raster::BUDGET.with(|c| c.set(Some(b)));
+                let ok = t.fragment(&m, &mut ram, &f, (0, 0)).is_ok();
+                crate::gpu_raster::BUDGET.with(|c| c.set(None));
+                crate::gpu_raster::BANDS.with(|c| c.set(None));
+                ok
+            })
+        };
+        let one = budget(1);
+        assert!(one > 0);
+        assert_eq!(budget(3), 3 * one);
+    }
+}
+/// A frame of one line from `a` to `b` (window x, y, z, 1/w) without a fragment shader.
+fn line_frame(a: [f32; 4], b: [f32; 4]) -> Frame {
+    let mut regs = [0u32; 256];
+    regs[43] = 0xf000f;
+    regs[45] = 1f32.to_bits();
+    regs[60] = 1f32.to_bits();
+    let draw = Draw { regs, kind: LINES, positions: vec![a, b], primitives: vec![[0, 1, 1, 1]], ..Draw::default() };
+    Frame { draws: vec![draw], ..Frame::default() }
+}
+fn line_budget(a: [f32; 4], b: [f32; 4]) -> u64 {
+    least_budget(|budget| {
+        let (m, mut ram, mut r) = fixture();
+        let f = coloured(&mut ram, &mut r);
+        crate::gpu_raster::BANDS.with(|c| c.set(Some((1, 16))));
+        crate::gpu_raster::BUDGET.with(|c| c.set(Some(budget)));
+        let ok = crate::gpu_render::fragment_frame(&m, &mut ram, &f, Some(&line_frame(a, b))).is_ok();
+        crate::gpu_raster::BUDGET.with(|c| c.set(None));
+        crate::gpu_raster::BANDS.with(|c| c.set(None));
+        ok
+    })
+}
+#[test]
+fn lines_visit_only_the_quads_near_them() {
+    // Not finite: nothing is visited (the bounding box used to be the whole buffer).
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(line_budget([bad, 0., 0.5, 1.], [16., 16., 0.5, 1.]), 0);
+        assert_eq!(line_budget([0., 0., 0.5, 1.], [16., bad, 0.5, 1.]), 0);
+    }
+    // A diagonal across the 16x16 buffer (8x8 quads): the quads along it, not all 64.
+    let diagonal = line_budget([0., 0., 0.5, 1.], [16., 16., 0.5, 1.]);
+    assert!((8..=32).contains(&diagonal), "{diagonal}");
+    // A line crossing w = 0 is clipped there, not dropped; one wholly behind is dropped.
+    assert!(line_budget([2., 8., 0.5, 1.], [14., 8., 0.5, -1.]) > 0);
+    assert_eq!(line_budget([2., 8., 0.5, -1.], [14., 8., 0.5, -1.]), 0);
+}
