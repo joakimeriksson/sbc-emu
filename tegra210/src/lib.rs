@@ -4,7 +4,7 @@
 //! 3.0 (XUSB), the display controllers with HDMI, the SMMU, host1x, and RAM at 0x8000_0000. Direct Linux boot with the stock device tree; PSCI is answered by the host (the
 //! role of the secure monitor on a real Nano). Device addresses no model claims behave
 //! as read-back registers, and their pages are logged, so drivers probe without faults.
-//! Plan: docs/jetson-nano-plan.md.
+//! Docs: docs/jetson-nano.md (plan: docs/history/jetson-nano-plan.md).
 pub mod apbdma;
 pub mod boot;
 pub mod car;

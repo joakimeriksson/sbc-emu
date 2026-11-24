@@ -122,6 +122,8 @@ them with its own DRM driver.
 | HDMI | **Xunlong's kernel:** StarFive's DRM driver binds the DC8200 and the Inno HDMI. The connector is `connected`, with the monitor's EDID offering 1280x720, 1920x1080 and 640x480. The HDMI PHY is programmed for 74.25 MHz; `fb0` carries the kernel console (160x45) at 1280x720 with vblank interrupts. Output goes to VNC (`--vnc :N`), `--screenshot` and the script's `screenshot FILE` | `scripts/orangepi-rv-hdmi.txt`, `scripts/orangepi-rv-board.txt` |
 | GPU | The PowerVR BXE-4-32 with the open stack: mainline Linux's `powervr` driver in a kernel built with it (`scripts/orangepi-rv-gpu.sh`), and Mesa's PowerVR Vulkan driver. The driver probes the GPU node the firmware adds, loads the firmware file and boots the firmware, which the emulator plays. Runtime PM suspends and resumes the GPU. Mesa finds `PowerVR B-Series BXE-4-32 MC1`. A Vulkan compute dispatch (4096 invocations) gives correct results. Offscreen rendering clears and draws a colour-interpolated triangle, read back exactly. Debian's `vkcube --wsi display` shows the textured, lit cube on HDMI through KMS. Every pixel comes from Mesa's own shader programs, run on the emulated PDS and USC | `scripts/orangepi-rv-gpu.txt`, `scripts/orangepi-rv-gpu-vkcube.txt` |
 | Board devices | Xunlong's kernel: the AXP15060 regulators (`hdmi_1p8`, `hdmi_0p9`, `vcc_3v3`, `cpu_vdd`, …) on I2C5; the 24C04 board EEPROM; the temperature sensor; the crypto engine's PKA, which verifies the kernel's X.509 certificates with RSA | `scripts/orangepi-rv-board.txt` |
+| [Snapshots](snapshots.md) | the harts, every device, the disks' written sectors and the SPI flash's contents: `--restore`, script `save`, Ctrl-A s | `starfive-jh7110/tests/snapshot.rs` |
+| Debugging | `--gdb PORT` ([debugging.md](debugging.md)) | `tools/gdb-check.py` |
 
 The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`, about 25 s wall):
 - microSD read/write;
@@ -197,7 +199,7 @@ The whole board in one run, on Xunlong's kernel (`scripts/orangepi-rv-board.txt`
 
 `web/board.html?b=orangepi-rv` boots the board in a browser tab: the WebAssembly build of the same
 machine (`wasm/`, `sbc_boot_opirv`) with OpenSBI, Alpine's mainline kernel and device tree and a
-small initramfs (`scripts/orangepi-rv-fixture.sh` writes it to `web/initramfs.cpio.gz`: Ethernet
+small initramfs (`scripts/orangepi-rv-fixture.sh` writes it to `cache/orangepi-rv/web/initramfs.cpio.gz`: Ethernet
 and USB HID modules, no Wi-Fi, audio or SD), to a shell on the serial console. The browser's
 network is isolated (DHCP, DNS and local services: `udhcpc` and `ping 10.0.2.2` work).
 
@@ -292,4 +294,4 @@ stores and AMOs, and updating device interrupt lines only after a device access 
 - **Distribution images:** Ubuntu 24.04.5 boots (above). Its own SD-card firmware (`loader1`/`loader2`, U-Boot 2025.10) cannot start on this board: its FIT has configurations for the VisionFive 2, Mars, Star64 and DeepComputing boards only, so SPL stops with error -38, as it would on a real Orange Pi RV; the board's flash firmware boots the image instead. Ubuntu 25.10 and later need the RVA23 profile, which the U74 lacks. Xunlong's Debian images (Google Drive, which refused the download with "quota exceeded") have not been tried.
 - **Speed:** all harts share one host thread (no `--threads multi` as on the Raspberry Pi 4 and the
   Orange Pi 5), and they take turns every 1,000 instructions. The browser's JIT keeps guest
-  registers in memory and goes through the driver at every region exit; x86-64 hosts interpret.
+  registers in memory and goes through the driver at every region exit; x86-64 macOS hosts interpret.

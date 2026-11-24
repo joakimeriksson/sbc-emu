@@ -1,4 +1,4 @@
-# Jetson Nano bring-up check (docs/jetson-nano-plan.md): the BusyBox shell on the serial
+# Jetson Nano bring-up check (docs/jetson-nano.md): the BusyBox shell on the serial
 # console, all four cores online, each on its own Tegra timer, the board's model, 4 GiB. Each
 # value is waited for: a prompt alone is not enough. (The quotes keep the echoed command line
 # from matching.)

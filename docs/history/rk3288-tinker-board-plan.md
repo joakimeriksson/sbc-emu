@@ -1,11 +1,16 @@
 # Plan: Rockchip RK3288 and the ASUS Tinker Board
 
+> **Historical record.** The development plan the Tinker Board was built from, with its milestones,
+> the notes on what each one took, and the state on 2026-11-20. It is kept for those notes; the
+> current user documentation is [tinkerboard.md](../tinkerboard.md), and the JIT has gained an
+> x86-64 backend since ([jit.md](../jit.md)).
+
 Status (2026-11-20): M0–M4, M7 (HDMI) and M8 (Mali-T760) done, M9 for the JIT
 only. See "State"
 below. M4 (Armbian from an unmodified SD image to a root shell) was reached on 2026-11-17, M3
 (four cores) on 2026-11-15. It follows the project's own-core
 decision (pure Rust, no QEMU, `docs/decisions.md` D1) and the multi-board foundation in
-`docs/multi-board-foundation.md`; where they disagree, that document governs the shared crates
+`docs/history/multi-board-foundation.md`; where they disagree, that document governs the shared crates
 and this one only the RK3288.
 
 ## Why this board

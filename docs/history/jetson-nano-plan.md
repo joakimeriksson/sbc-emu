@@ -1,5 +1,9 @@
 # NVIDIA Jetson Nano (Tegra X1): plan and status
 
+> **Historical record.** The development plan and status log of the Jetson Nano, kept for its
+> notes on the hardware and the milestones. The current user documentation is
+> [jetson-nano.md](../jetson-nano.md); the GPU's is [jetson-nano-gpu.md](../jetson-nano-gpu.md).
+
 The Jetson Nano Developer Kit (P3450) has NVIDIA's Tegra X1 (T210): four Cortex-A57 cores,
 a Maxwell GPU (GM20B, 128 cores), 4 GiB of LPDDR4, a microSD card, four USB 3 ports behind
 Tegra's XUSB controller, Gigabit Ethernet (a Realtek RTL8111 on PCIe) and HDMI. The same SoC
@@ -38,8 +42,8 @@ card needs, PCIe and the SMMU.
 
 ```sh
 sh scripts/jetson-nano-debian-fixture.sh cache/jetson-nano/debian   # Debian's kernel + an initramfs
-# the card: debian-13-nocloud-arm64-20261116-2664.tar.xz from cloud.debian.org/images/cloud/trixie/
-# (SHA-512 9e2f3958...), unpacked to disk.raw; the command line is in scripts/jetson-nano-debian.txt
+sh scripts/jetson-nano-card-fixture.sh                                # Debian's arm64 image -> disk.raw
+# the command line is in scripts/jetson-nano-debian.txt
 ```
 
 **Ethernet works**: the PCIe controller and the RTL8111H, through Debian's `pci-tegra` and `r8169`
@@ -55,7 +59,7 @@ Debian 13 over the emulator's network (`--net nat`, the default; `local`, `none`
 
 **The GPU works**: nouveau drives the GM20B, and Debian's Mesa (25.0.7, unmodified) renders OpenGL ES
 3.2 with it: kmscube and every glmark2 scene on HDMI, and the GL test scenes match llvmpipe. See
-[jetson-nano-gpu.md](jetson-nano-gpu.md).
+[jetson-nano-gpu.md](../jetson-nano-gpu.md).
 
 ### What is modelled (`tegra210/`)
 
@@ -99,10 +103,10 @@ PSCI is answered by the host, in place of the Nano's secure monitor (TF-A).
    port.
 4. **Display** (done): the SMMU, host1x, the display controllers, SOR/HDMI; `tegra-drm`. Not yet:
    YUV overlays, HDMI audio, DisplayPort, VIC.
-5. **GPU** (done): GM20B through nouveau and Mesa; see [jetson-nano-gpu.md](jetson-nano-gpu.md).
+5. **GPU** (done): GM20B through nouveau and Mesa; see [jetson-nano-gpu.md](../jetson-nano-gpu.md).
 6. **Browser** (a first page): `web/board.html?b=jetson-nano` boots the kernel and initramfs above to
    shells on the serial console and on HDMI (`tools/wasm-build.sh`; check: `tools/wasm-smoke-nano.mjs`, 12 s
-   to the shell in Node on an M-series Mac). The GPU demos are a page of their own, [below the GPU's documentation](jetson-nano-gpu.md#demos-in-the-browser).
+   to the shell in Node on an M-series Mac). The GPU demos are a page of their own, [below the GPU's documentation](../jetson-nano-gpu.md#demos-in-the-browser).
 
 Stretch: NVIDIA's JetPack 4.6 image, booted from its `/boot/extlinux/extlinux.conf`: the
 bootloader's hand-off (EEPROM board ID, DT overlays, carve-outs, command line), the vendor

@@ -18,7 +18,7 @@ the browser (WebAssembly). The [3D demo page](../web/gpu.html) runs its GPU demo
 | Ethernet | GENET v5 + UniMAC MDIO + BCM54213PE PHY on a virtual 10.0.2.0/24 network (DHCP, DNS, user-mode NAT to the host's network) | busybox: DHCP lease, ping, DNS, `wget` of a real web page |
 | Wi-Fi | CYW43455 on SDIO for the stock `brcmfmac`: real firmware download, emulated FullMAC host interface | `wlan0`, NetworkManager scan lists `sbc-emu`, `nmcli dev wifi connect`, DHCP and ping over Wi-Fi |
 | GPIO / I²C / SPI | BCM2711 GPIO (LED on GPIO17, button on GPIO27), BSC I²C1 + BME280, SPI0 + MCP3008 on CE0 | stock drivers: `gpioset`/`gpioget` (libgpiod), IIO sysfs reads the host-set temperature/pressure/humidity and ADC voltages exactly |
-| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 19 s on four cores in turns, 13.5 s with a host thread per core (`--threads multi`); faster than QEMU's TCG on every workload [below](#compared-with-qemus-raspi4b); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
+| Speed | A64→A64 block JIT on AArch64 hosts (native integer, branches, loads/stores, FP/NEON; interpreter fallback), A64→x86-64 on x86-64 Linux hosts ([jit.md](jit.md)) | Raspberry Pi OS cold boot to `login:` 248 s (interpreter) → 19 s on four cores in turns, 13.5 s with a host thread per core (`--threads multi`); faster than QEMU's TCG on every workload [below](#compared-with-qemus-raspi4b); all CPU tests pass with and without it. Browser: WebAssembly region JIT (`?jit=0` turns it off), Pi OS `login:` 313 s → 160 s, verified against the interpreter |
 | Floating point | exact Arm semantics: FPCR rounding modes, flush-to-zero, default NaN, all FPSR exception flags, Arm's estimate tables | `diff_fp.rs`: 18,800 random cases bit-exact against the host CPU (interpreter and JIT) |
 | More peripherals | DMA controller, hardware RNG, thermal sensor, PM watchdog and power domains, system timer, mini UART | stock drivers bind: `/dev/hwrng`, `/sys/class/thermal`, `/dev/watchdog` (expiry reboots), `ttyS0`, `dma0chan*` |
 | Debugging, display | GDB remote stub (`--gdb PORT`, one thread per core, breakpoints and watchpoints), monitor (Ctrl-A c: registers, memory, stop/cont, savevm/loadvm, screendump), VNC server (`--vnc :N`) | lldb: kernel breakpoint, step, memory read, detach; a VNC client sees the console and types into it |
@@ -234,8 +234,8 @@ WPA2-PSK networks); only the PCM's DREQ paces DMA (the other peripherals complet
 (not VSEL, VRINT, VMAXNM or CRC32; the ID registers say so) and the 32-bit core's VFP is not bit-exact
 (no flush-to-zero, no cumulative exception flags);
 no LSE instructions, crypto only with `--cpu-crypto` (the BCM2711's A72 has neither; the ID
-registers say so); the native JIT needs an AArch64 host and is still well below a real Pi 4
-core; the browser build is about 3× slower than native and single-threaded.
+registers say so); without a JIT on x86-64 macOS (interpreter only); the native JIT is still well below a real
+Pi 4 core; the browser build is about 3× slower than native and single-threaded.
 
 ## Compared with QEMU's `raspi4b`
 

@@ -3,7 +3,7 @@ name = "sbc-emu-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "sbc-emu in the browser: C ABI over the Pi 4B, Tinker Board, Orange Pi One and Orange Pi RV machines, driven by web/worker.js"
+description = "sbc-emu in the browser: C ABI over the seven boards' machines (Pi 4B, Orange Pi 5, Orange Pi One, Tinker Board, Orange Pi RV, Jetson Nano, ESP32-S31), driven by web/worker.js"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

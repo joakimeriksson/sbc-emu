@@ -330,7 +330,7 @@ async function start(os, ramMb, jit, file) {
       imageUrl = 'assets/tinker-armbian.img';
       const head = await fetch(imageUrl, { method: 'HEAD' });
       const size = Number(head.headers.get('Content-Length'));
-      if (!head.ok || !size) throw new Error('SD image assets/tinker-armbian.img not found (see docs/rk3288-tinker-board-plan.md: the browser)');
+      if (!head.ok || !size) throw new Error('SD image assets/tinker-armbian.img not found (see docs/tinkerboard.md: in the browser)');
       postMessage({ type: 'status', text: `U-Boot: reading armbianEnv.txt, zImage and the device tree from the SD card (${(size / 2 ** 30).toFixed(2)} GiB image)…` });
       if (ex.sbc_boot_tinker_sd(ramMb, Date.now() / 1000, size / 512) !== 0) throw new Error('SD boot failed (no Armbian /boot on the card?)');
     } else {

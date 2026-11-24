@@ -301,6 +301,7 @@ timing uses `performance.now()` through the `sbc_host_now_ms` import.
 
 ```sh
 cp -c cache/os/raspios-gpu.img cache/os/raspios-gpu-demo.img   # frozen: the snapshot refers to it
+                                                                # (-c clones on macOS; on Linux: cp --reflink=auto)
 sbc-emu run --sd cache/os/raspios-gpu-demo.img --hdmi-mode 1024x768 --script scripts/gpu-demo-snapshot.txt
 ln -s ../../cache/os/raspios-gpu-demo.img web/assets/raspios-gpu.img
 tools/wasm-build.sh && tools/serve.py     # http://127.0.0.1:8791/gpu.html  (?demo=cube starts one at once)

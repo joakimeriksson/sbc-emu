@@ -1,6 +1,9 @@
-# Orange Pi 5 experimental direct boot
+# Orange Pi 5 (Rockchip RK3588S)
 
-The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer, the USB 3.0 host carries a keyboard, a tablet and an optional USB stick, and the M.2 slot can hold an NVMe SSD (see below). [Snapshots](snapshots.md) (`--restore`, script `save`, Ctrl-A s) hold all of it. Wireless is not implemented.
+`--board orangepi5`, experimental. It boots Armbian's unmodified SD image, or a kernel and
+initramfs directly (`scripts/quickstart.sh orangepi5`).
+
+The `orangepi5` board models the RK3588S's eight cores (four Cortex-A55 and four Cortex-A76, reduced to the features the emulator implements), the GICv3 distributor with one redistributor per core, UART2 and the 24 MHz timer. Firmware services (PSCI, including CPU_ON for the secondary cores) are handled by the host; Linux receives a generated reduced device tree. Direct boot supports an optional microSD image through the RK3588S DesignWare MMC controller in PIO mode. The RK3588 GMAC1 Ethernet controller and YT8531 PHY connect to the virtual network. HDMI shows the firmware's framebuffer and then Linux's own display driver on VOP2, the Mali-G610 GPU runs Mesa's Panfrost driver ([orangepi5-gpu.md](orangepi5-gpu.md)), the USB 3.0 host carries a keyboard, a tablet and an optional USB stick, and the M.2 slot can hold an NVMe SSD (see below). [Snapshots](snapshots.md) (`--restore`, script `save`, Ctrl-A s) hold all of it, and `--gdb PORT` debugs the guest ([debugging.md](debugging.md)). Wireless is not implemented.
 
 ## Cores
 

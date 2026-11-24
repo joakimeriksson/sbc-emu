@@ -3,15 +3,16 @@
 > **Historical record, archived 2026-11-19.** The proposal and review below describe
 > the repository on 2026-11-15, before Orange Pi 5 implementation. Their pending
 > approvals, ownership notes and integration gates are historical, not current
-> working instructions. Follow [AGENTS.md](../AGENTS.md) for current workflow.
+> working instructions. Follow [AGENTS.md](../../AGENTS.md) for current workflow.
 >
 > The foundation landed in [PR #1](https://github.com/joakimeriksson/sbc-emu/pull/1);
 > Orange Pi boot and GPU support have since advanced through
 > [PR #65](https://github.com/joakimeriksson/sbc-emu/pull/65). See
 > [the foundation implementation record](multi-board-foundation.md),
-> [Orange Pi 5 support](orangepi5.md) and [GPU capabilities](orangepi5-gpu.md).
+> [Orange Pi 5 support](../orangepi5.md) and [GPU capabilities](../orangepi5-gpu.md).
 > The original proposal and both agents' review text are preserved below;
-> this archive does not assert a new joint approval.
+> this archive does not assert a new joint approval. For how the boards share code
+> today, see [architecture.md](../architecture.md).
 
 Date: 2026-11-15
 Status: design preparation only; no executable API or Orange Pi support added.
@@ -20,7 +21,7 @@ Parent: [minimal refactoring plan](multi-board-refactoring-plan.md).
 ## Safe parallel work boundary
 
 Pi development continues in the existing checkout. This preparation owns only
-`docs/multi-board-refactoring-plan.md` and this file. Reviewers should append their
+`docs/history/multi-board-refactoring-plan.md` and this file. Reviewers should append their
 responses rather than replacing the other agent's review.
 
 At inspection, HEAD was `bc40b1f`; local CPU edits existed in `arm-a64/src/jit.rs`,

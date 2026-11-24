@@ -1,7 +1,13 @@
 # Multi-board foundation: first implementation slice
 
+> **Historical record.** The development record of the first multi-board work (2026-11-15) and of
+> the Orange Pi One's bring-up, kept for its design notes, fixture hashes and the bugs found on
+> the way. Branch names, hand-offs and approvals in it are history, not current instructions, and
+> some statements (for example that `arm-a32` is interpreter-only) are no longer true. For the
+> current design see [how the boards share code](../architecture.md); for the Orange Pi One,
+> [orangepi-one.md](../orangepi-one.md).
+
 Implemented 2026-11-15 on branch `codex/multi-board-foundation`, based on `dafb3c2`.
-Worktree: `/private/tmp/sbc-emu-multi-board`.
 
 ## Scope and deliberate transition
 
@@ -26,8 +32,7 @@ other script facilities remain in the Pi adapter. Their existing behavior is ret
 The CPU, SoC, scheduler, threaded runner, snapshot format and browser wiring are
 unchanged. Orange Pi hardware is not implemented.
 
-The user's instruction to proceed authorized this implementation slice. Claude's
-earlier review supported the overall direction; it has not reviewed this implementation
+Claude's earlier review supported the overall direction; it has not reviewed this implementation
 or the borrowed-view adjustment, and no joint approval is claimed.
 
 ## Validation
@@ -56,7 +61,6 @@ Direct-boot fixtures used (read-only from the active checkout's cache):
 
 Smoke commands, fixture hashes and logs are in this worktree's
 `out/multi-board-smoke/report.json`, `single.log` and `multi.log`.
-Workspace test output is `/private/tmp/sbc-multi-tests-unrestricted.log`.
 These logs are local artifacts, not checked-in fixtures.
 
 Full Raspberry Pi OS/Ubuntu image boots, browser runtime/GPU benchmarks and shipped
