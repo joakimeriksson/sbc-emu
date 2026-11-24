@@ -67,16 +67,21 @@ cargo build --release              # the binary is target/release/sbc-emu
 target/release/sbc-emu boards list
 ```
 
+The guests are not in the binary: they come from the fixture scripts in a clone of this
+repository (`scripts/*-fixture.sh`). With a release binary, clone the repository for them and
+run `sbc-emu run ...` as in [getting started](docs/getting-started.md); `scripts/quickstart.sh`
+builds sbc-emu from source.
+
 | Host | |
 |---|---|
 | macOS on Apple silicon | JIT for every board |
 | Linux on AArch64 or x86-64 | JIT for every board |
-| macOS on Intel | interpreter only: works, about ten times slower |
+| macOS on Intel | interpreter only, about ten times slower; untested (not in CI) |
 | Windows | not supported |
 | A web browser | all seven boards, with JITs to WebAssembly |
 
 To build the browser site locally (it needs `rustup target add wasm32-unknown-unknown` once,
-and Node):
+Node and `xz`):
 
 ```sh
 tools/site-build.sh && python3 -m http.server -d out/site 8792

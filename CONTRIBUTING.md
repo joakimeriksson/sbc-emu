@@ -19,9 +19,10 @@ through a pull request; nobody pushes to `main` directly.
 - `cargo test --workspace`
 - `cargo build --release`
 - the browser build: `rustup target add wasm32-unknown-unknown` once, then
-  `"$(rustup which cargo)" check --target wasm32-unknown-unknown -p sbc-emu-wasm`
+  `RUSTC="$(rustup which rustc)" "$(rustup which cargo)" check --target wasm32-unknown-unknown -p sbc-emu-wasm`
+  (the `RUSTC` matters when another `rustc`, such as Homebrew's, is first on `PATH`)
 - for a change to a board, its boot scripts (`scripts/*.txt`, run with `sbc-emu run ... --script`;
-  each script's header has the command); for a change to a GPU, its test scenes (for the
+  the board's page or [getting-started.md](docs/getting-started.md) has the command); for a change to a GPU, its test scenes (for the
   Raspberry Pi 4, `scripts/gpu-gltest.txt` with `tools/gpu_server.py`, and
   `tests/gpu/run-snap-mesa.sh`; each board's GPU page names its own)
 
@@ -51,7 +52,8 @@ A change to a shared crate (`emu-core`, a CPU core, `peripherals`, `sbc-net`, `s
 
 sbc-emu is BSD 3-Clause ([LICENSE](LICENSE)). By contributing you agree that your contribution
 is licensed under it, except in `riscv-rv32/` and `espressif/`, which keep esp32sim's MIT
-license ([README](README.md#license)).
+license, and the SAR ADC calibration tables in `espressif/esp-periph`, which are Apache-2.0
+([LICENSE-ADC](espressif/esp-periph/LICENSE-ADC); see the [README](README.md#license)).
 
 ## Coding agents
 

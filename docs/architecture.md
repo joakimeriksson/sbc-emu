@@ -6,9 +6,9 @@ terminal, a VNC viewer or a web page. Nothing is borrowed from QEMU ([decisions.
 D1).
 
 ```
-               cli (sbc-emu)                       wasm + web/ (the browser)
-                     \                                  /
-                  sbc-machine: the board catalogue, a common view of the machines
+  cli (sbc-emu) -- sbc-machine: the board catalogue,        wasm + web/ (the browser)
+        |          a common view of the machines                     |
+        +------------------------------+-------------------------------+
                                        |
   bcm2711  rk3588  allwinner-h3  rockchip-rk3288  starfive-jh7110  tegra210  espressif/esp32s31
      |        |          |              |                 |            |              |
@@ -61,7 +61,8 @@ xHCI, the Orange Pi RV's NVMe) are reused by others as they are needed.
 subnet with DHCP, DNS, ARP, ICMP and NTP, user-mode NAT to the host's network, and an 802.11
 access point (from esp32sim).
 
-**`sbc-machine`** is the host's view of the boards: the catalogue (`Board`, the IDs and the
+**`sbc-machine`** is the command line's view of the boards (the browser build drives the
+machines directly): the catalogue (`Board`, the IDs and the
 descriptions `sbc-emu boards list` prints) and `Machine`, an enum that borrows any board's
 machine for what the host does the same way on all of them (run, idle, serial input and
 output).
@@ -93,7 +94,8 @@ run a host thread per core (`--threads multi`): faster, and no longer repeatable
 3. A runner in `cli` on `serial_board.rs`, a fixture script that fetches a pinned guest, a
    `scripts/BOARD-shell.txt` check, and a case in `scripts/quickstart.sh`.
 4. Snapshots: `emu_core::snap` for every device, and a test like `rk3588/tests/snapshot.rs`.
-5. The browser: a boot function in `wasm/` and an entry in `web/board.html`.
+5. The browser: a boot function in `wasm/`, its boot branch in `web/worker.js` and an entry in
+   `web/board.html`.
 
 The development record of the first multi-board step is in
 [history/multi-board-foundation.md](history/multi-board-foundation.md).

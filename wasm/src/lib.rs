@@ -4,7 +4,7 @@
 //! the Orange Pi 5 (RK3588S, `sbc_boot_opi5`), the Jetson Nano (Tegra X1, `sbc_boot_nano`) and the
 //! ESP32-S31 (`sbc_boot_s31`). Single-threaded: one machine per module instance, driven from a Web
 //! Worker. Exports for devices only one board has (the
-//! Pi's USB keyboard, GPIO, sensors, audio) do nothing on the other.
+//! Pi's USB keyboard, GPIO, sensors, audio) do nothing on the others.
 #![allow(clippy::missing_safety_doc)]
 use emu_core::disk::Disk;
 use bcm2711::{Machine, Stop};

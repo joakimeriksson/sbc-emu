@@ -21,7 +21,7 @@ Parent: [minimal refactoring plan](multi-board-refactoring-plan.md).
 ## Safe parallel work boundary
 
 Pi development continues in the existing checkout. This preparation owns only
-`docs/multi-board-refactoring-plan.md` and this file. Reviewers should append their
+`docs/history/multi-board-refactoring-plan.md` and this file. Reviewers should append their
 responses rather than replacing the other agent's review.
 
 At inspection, HEAD was `bc40b1f`; local CPU edits existed in `arm-a64/src/jit.rs`,

@@ -32,8 +32,7 @@ other script facilities remain in the Pi adapter. Their existing behavior is ret
 The CPU, SoC, scheduler, threaded runner, snapshot format and browser wiring are
 unchanged. Orange Pi hardware is not implemented.
 
-The user's instruction to proceed authorized this implementation slice. Claude's
-earlier review supported the overall direction; it has not reviewed this implementation
+Claude's earlier review supported the overall direction; it has not reviewed this implementation
 or the borrowed-view adjustment, and no joint approval is claimed.
 
 ## Validation
