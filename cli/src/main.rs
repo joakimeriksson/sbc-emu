@@ -3,6 +3,7 @@
 //!   sbc-emu boards list
 //!   sbc-emu mkinitramfs --busybox PATH -o OUT.cpio
 //!   sbc-emu run [--board pi4b] --kernel Image [--initrd X.cpio] [--append ARGS] [--max-insns N]
+//!   sbc-emu --version
 mod cpio;
 mod disk;
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,9 +31,35 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
+/// `sbc-emu 0.1.0`, with the git commit when built from a checkout (`sbc-emu 0.1.0 (1a2b3c4d5e)`)
+fn version() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    match option_env!("SBC_EMU_COMMIT") {
+        Some(commit) => format!("sbc-emu {v} ({commit})"),
+        None => format!("sbc-emu {v}"),
+    }
+}
+
+/// How a board's guest CPUs run, for its banner: the JIT names the host code it emits.
+pub(crate) fn cpu_backend(jit: bool) -> &'static str {
+    if !jit {
+        "interpreter"
+    } else if cfg!(target_arch = "x86_64") {
+        "JIT to x86-64"
+    } else if cfg!(target_arch = "wasm32") {
+        "JIT to WebAssembly"
+    } else {
+        "JIT to AArch64"
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--version" | "-V" | "version") => {
+            println!("{}", version());
+            ExitCode::SUCCESS
+        }
         Some("boards") => {
             for board in Board::ALL.into_iter().filter(|b| b.require_implemented().is_ok()) {
                 println!("{:<13} {}", board.id(), board.description());
@@ -76,7 +103,10 @@ fn sd(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs [--board pi4b|orangepi5] --busybox PATH -o OUT.cpio\n  sbc-emu run [--board pi4b] --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N[,password=PW]] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--hdmi-mode WxH] [--no-gpu] [--sd-persist]\n  sbc-emu run [--board pi4b] --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)\n  sbc-emu run --board orangepi5 --kernel FILE [--initrd FILE] | --sd IMAGE  [--gdb PORT [--gdb-wait]] ...\n  sbc-emu run --board orangepi-one|tinkerboard --kernel FILE --dtb FILE [--initrd FILE] | --sd IMAGE  (tinkerboard: or --emmc IMAGE)  ...\n  sbc-emu run --board orangepi-rv --firmware FILE --kernel FILE --dtb FILE [--initrd FILE] | --sd IMAGE | --spi-flash FILE [--sd IMAGE]  ...\n  sbc-emu run --board jetson-nano --kernel FILE --dtb FILE [--initrd FILE] [--sd IMAGE]  ...\n  sbc-emu run --board esp32s31 --rom ROM.elf --flash FLASH.bin [--gdb PORT [--gdb-wait]] ...\n\nscripts/quickstart.sh BOARD boots any board in one command; docs/getting-started.md has the details.");
+    eprintln!("{}\nusage:\n  sbc-emu boards list\n  sbc-emu sd ls|cat IMAGE [PATH]\n  sbc-emu mkinitramfs [--board pi4b|orangepi5] --busybox PATH -o OUT.cpio\n  sbc-emu run [--board pi4b] --kernel Image [--initrd FILE] [--append ARGS] [--max-insns N] [--timeout SECS] [--screenshot OUT.png] [--shell serial|fb] [--input serial|usb] [--script FILE] [--restore SNAPSHOT] [--net nat|local|none] [--no-jit] [--gpio-log] [--ram-mb N] [--no-display] [--smp N] [--gdb PORT [--gdb-wait]] [--serial1 FILE] [--hostfwd tcp::HOSTPORT-:GUESTPORT] [--cpu-crypto] [--vnc :N[,password=PW]] [--threads single|multi] [--seed N] [--usb-drive IMAGE] [--otg-keyboard] [--audio-out FILE.wav] [--camera] [--no-bluetooth] [--display kms|fb] [--hdmi-mode WxH] [--no-gpu] [--sd-persist]\n  sbc-emu run [--board pi4b] --sd IMAGE.img [same options]   (boots like the firmware: config.txt, cmdline.txt, kernel8.img)\n  sbc-emu run --board orangepi5 --kernel FILE [--initrd FILE] | --sd IMAGE  [--gdb PORT [--gdb-wait]] ...\n  sbc-emu run --board orangepi-one|tinkerboard --kernel FILE --dtb FILE [--initrd FILE] | --sd IMAGE  (tinkerboard: or --emmc IMAGE)  ...\n  sbc-emu run --board orangepi-rv --firmware FILE --kernel FILE --dtb FILE [--initrd FILE] | --sd IMAGE | --spi-flash FILE [--sd IMAGE]  ...\n  sbc-emu run --board jetson-nano --kernel FILE --dtb FILE [--initrd FILE] [--sd IMAGE]  ...\n  sbc-emu run --board esp32s31 --rom ROM.elf --flash FLASH.bin [--gdb PORT [--gdb-wait]] ...\n  sbc-emu --version   (or -V, version)\n\n\
+exit status of run: 0 when it ends by a quit (the --script's 'quit', Ctrl-A x, the monitor's quit, a debugger's kill); 0 when the guest \
+powers off or --timeout / --max-insns runs out, but 1 if a --script has not completed by then; 1 on an error; 2 on a usage error.\n\n\
+scripts/quickstart.sh BOARD boots any board in one command; docs/getting-started.md has the details.", version());
     ExitCode::from(2)
 }
 

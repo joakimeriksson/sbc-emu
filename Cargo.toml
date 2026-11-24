@@ -3,13 +3,19 @@ resolver = "2"
 members = ["emu-core", "arm-a64", "arm-a32", "riscv-rv32", "espressif/emu-core", "espressif/esp-periph", "espressif/esp-soc", "espressif/esp32s31", "v3d", "mali400", "midgard", "peripherals", "bcm2711", "allwinner-h3", "rockchip-rk3288","sbc-net", "cli", "wasm", "sbc-machine", "rk3588", "riscv64", "starfive-jh7110", "powervr", "tegra210", "maxwell", "maxwell-tex", "maxwell-shader"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 
 [profile.release]
 opt-level = 3
 debug = 1
+
+# the release binaries (.github/workflows/release.yml): the release build without debug info
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = true
 
 [profile.wasm]
 inherits = "release"
