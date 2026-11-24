@@ -95,7 +95,9 @@ else
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sysfs /sys
 exec </dev/console >/dev/console 2>&1
-/bin/busybox modprobe 8250_tegra
+if [ -d "/lib/modules/$(uname -r)" ]; then
+    /bin/busybox modprobe 8250_tegra
+fi
 export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin PS1='jetson-orin-nano# '
 echo "TEGRA234_BOOT_OK: arm64 Linux BusyBox shell"
 exec /bin/busybox setsid -c /bin/sh

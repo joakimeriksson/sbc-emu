@@ -21,7 +21,13 @@ fn range(base: u64, bytes: u64) -> [u32; 4] {
     [base_hi, base_lo, size_hi, size_lo]
 }
 
-fn device_tree(ram_bytes: u64, cores: usize, cmdline: &str, initrd: Option<(u64, u64)>) -> Vec<u8> {
+fn device_tree(
+    ram_bytes: u64,
+    cores: usize,
+    high_speed_uart: bool,
+    cmdline: &str,
+    initrd: Option<(u64, u64)>,
+) -> Vec<u8> {
     let mut dt = Fdt::default();
     dt.begin("");
     dt.str("model", "Jetson Orin Nano 4GB (sbc-emu direct boot)");
@@ -108,15 +114,47 @@ fn device_tree(ram_bytes: u64, cores: usize, cmdline: &str, initrd: Option<(u64,
     dt.cells("current-speed", &[115200]);
     dt.end();
 
-    // The Tegra 8250 driver uses PIO and a fixed reference clock for bring-up.
+    if high_speed_uart {
+        dt.begin("uarta-clock-parent");
+        dt.str("compatible", "fixed-clock");
+        dt.cells("#clock-cells", &[0]);
+        dt.cells("phandle", &[4]);
+        dt.cells("clock-frequency", &[crate::uart::CLOCK_HZ]);
+        dt.end();
+
+        // serial-tegra computes its termios baud bounds from the parent.
+        dt.begin("uarta-clock");
+        dt.str("compatible", "fixed-factor-clock");
+        dt.cells("#clock-cells", &[0]);
+        dt.cells("phandle", &[2]);
+        dt.cells("clocks", &[4]);
+        dt.cells("clock-mult", &[1]);
+        dt.cells("clock-div", &[1]);
+        dt.end();
+
+        dt.begin("reset-controller@70000000");
+        dt.str("compatible", "snps,dw-high-reset");
+        dt.cells("reg", &range(crate::uart::FIXTURE_RESET, 4));
+        dt.cells("#reset-cells", &[1]);
+        dt.cells("phandle", &[3]);
+        dt.end();
+    }
+
     dt.begin("serial@3100000");
-    dt.strs(
-        "compatible",
-        &["nvidia,tegra234-uart", "nvidia,tegra20-uart"],
-    );
     dt.cells("reg", &range(UARTA, UART_SIZE));
     dt.cells("interrupts", &[0, UARTA_SPI, 4]);
-    dt.cells("clock-frequency", &[1_843_200]);
+    if high_speed_uart {
+        dt.str("compatible", "nvidia,tegra194-hsuart");
+        dt.cells("clocks", &[2]);
+        dt.cells("resets", &[3, 0]);
+        dt.str("reset-names", "serial");
+    } else {
+        dt.strs(
+            "compatible",
+            &["nvidia,tegra234-uart", "nvidia,tegra20-uart"],
+        );
+        dt.cells("clock-frequency", &[crate::uart::CLOCK_HZ]);
+    }
     dt.end();
 
     dt.end();
@@ -153,7 +191,13 @@ pub fn boot_linux(
             Ok((RAM_BASE + INITRD_OFFSET, RAM_BASE + end))
         })
         .transpose()?;
-    let dtb = device_tree(ram_bytes, machine.cpus.len(), cmdline, initrd_range);
+    let dtb = device_tree(
+        ram_bytes,
+        machine.cpus.len(),
+        machine.soc.uarta.high_speed(),
+        cmdline,
+        initrd_range,
+    );
     if dtb.len() as u64 > INITRD_OFFSET - DTB_OFFSET {
         return Err("device tree exceeds 2 MiB".into());
     }

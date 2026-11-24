@@ -42,11 +42,16 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--smp", "--rover-uart"])?;
+    serial_board::validate_options(args, &["--smp", "--rover-uart", "--uart-driver"])?;
     let config = RunConfig::from_args(TAG, args)?;
     let cores = crate::arg(args, "--smp")
         .map_or(Ok(tegra234::AFFINITIES.len()), str::parse::<usize>)
         .map_err(|_| "invalid --smp")?;
+    let high_speed_uart = match crate::arg(args, "--uart-driver") {
+        None | Some("8250") => false,
+        Some("tegra") => true,
+        Some(_) => return Err("--uart-driver expects 8250 or tegra".into()),
+    };
     let ram = serial_board::ram_bytes(args, 4096)?;
     let read = |path: &str| std::fs::read(path).map_err(|err| format!("{path}: {err}"));
     let kernel = read(crate::arg(args, "--kernel").ok_or("expected --kernel IMAGE")?)?;
@@ -59,7 +64,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     serial_board::run_with_io(
         config,
         || {
-            let mut machine = Machine::new(ram, cores)?;
+            let mut machine = Machine::with_uart_mode(ram, cores, high_speed_uart)?;
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
                 eprintln!(

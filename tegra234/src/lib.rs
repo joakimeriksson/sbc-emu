@@ -1,9 +1,12 @@
 //! Tegra234 direct-boot machine for early Linux bring-up.
 pub mod boot;
+pub mod gpu;
+mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
-use peripherals::{gicv3::Gic, pl011::Pl011, Uart};
+use peripherals::{gicv3::Gic, pl011::Pl011};
+use uart::UartA;
 
 pub const RAM_BASE: u64 = 0x8000_0000;
 const GICD: u64 = 0x0f40_0000;
@@ -21,7 +24,9 @@ struct Soc {
     ram: Vec<u8>,
     gic: Gic,
     uart: Pl011,
-    uarta: Uart,
+    uarta: UartA,
+    gpu: gpu::Gpu,
+    now: u64,
     interrupts_changed: bool,
 }
 
@@ -41,7 +46,16 @@ impl Soc {
             self.uart.read(addr - UART)
         } else if (UARTA..UARTA + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
-            self.uarta.read(addr - UARTA)
+            self.uarta.read(addr - UARTA, self.now)
+        } else if addr == uart::FIXTURE_RESET {
+            self.uarta
+                .reset_asserted()
+                .map(u32::from)
+                .ok_or(Fault::Unmapped)?
+        } else if (gpu::BAR0..gpu::BAR0 + gpu::SIZE).contains(&addr) {
+            self.gpu
+                .read(addr - gpu::BAR0, self.now)
+                .ok_or(Fault::Unmapped)?
         } else {
             return Err(Fault::Unmapped);
         })
@@ -55,7 +69,9 @@ impl Soc {
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.uart.write(addr - UART, value);
         } else if (UARTA..UARTA + UART_SIZE).contains(&addr) {
-            self.uarta.write(addr - UARTA, value);
+            self.uarta.write(addr - UARTA, value, self.now);
+        } else if addr == uart::FIXTURE_RESET && self.uarta.high_speed() {
+            self.uarta.set_reset(value & 1 != 0);
         } else {
             return Err(Fault::Unmapped);
         }
@@ -163,6 +179,14 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(ram_bytes: usize, cores: usize) -> Result<Self, String> {
+        Self::with_uart_mode(ram_bytes, cores, false)
+    }
+
+    pub fn with_uart_mode(
+        ram_bytes: usize,
+        cores: usize,
+        high_speed_uart: bool,
+    ) -> Result<Self, String> {
         if !(256 << 20..=4096usize << 20).contains(&ram_bytes) {
             return Err("Orin Nano direct boot needs 256–4096 MiB of RAM".into());
         }
@@ -173,7 +197,9 @@ impl Machine {
             ram: vec![0; ram_bytes],
             gic: Gic::with_affinities(&AFFINITIES[..cores]),
             uart: Pl011::new(),
-            uarta: Uart::default(),
+            uarta: UartA::new(high_speed_uart),
+            gpu: gpu::Gpu,
+            now: 0,
             interrupts_changed: true,
         };
         let code_pages = Cpu::code_page_map(ram_bytes as u64);
@@ -244,16 +270,16 @@ impl Machine {
 
     /// Deliver a byte to the rover's UART, retaining it at the peer on backpressure.
     pub fn rover_uart_input(&mut self, byte: u8) -> bool {
-        let accepted = self.soc.uarta.push_rx(byte);
+        let accepted = self.soc.uarta.push_rx(byte, self.now);
         self.soc.interrupts_changed |= accepted;
         accepted
     }
 
     pub fn take_rover_uart_output(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.soc.uarta.out)
+        self.soc.uarta.take_output()
     }
 
-    fn next_timer(&self) -> Option<u64> {
+    fn next_event(&self) -> Option<u64> {
         self.cpus
             .iter()
             .zip(&self.state)
@@ -266,6 +292,7 @@ impl Machine {
             // 31.25 MHz is one count per 32 ns.
             .map(|(timer, offset)| timer.cval.wrapping_add(offset).saturating_mul(32))
             .filter(|&deadline| deadline > self.now)
+            .chain(self.soc.uarta.next_event(self.now))
             .min()
     }
 
@@ -275,7 +302,7 @@ impl Machine {
             .set_line((UART_SPI + 32) as usize, self.soc.uart.irq());
         self.soc
             .gic
-            .set_line((UARTA_SPI + 32) as usize, self.soc.uarta.irq());
+            .set_line((UARTA_SPI + 32) as usize, self.soc.uarta.irq(self.now));
         for (core, (cpu, state)) in self.cpus.iter_mut().zip(&mut self.state).enumerate() {
             if *state == CoreState::Off {
                 continue;
@@ -344,13 +371,13 @@ impl Machine {
                 });
             let Some(core) = next else {
                 let deadline = self
-                    .next_timer()
+                    .next_event()
                     .unwrap_or(self.now.saturating_add(10_000_000));
                 return Stop::Idle(deadline);
             };
             self.switch_to(core);
             let slice_end = self.now.saturating_add(QUANTUM_NS);
-            let mut deadline = self.next_timer().unwrap_or(u64::MAX);
+            let mut deadline = self.next_event().unwrap_or(u64::MAX);
             while self.state[core] == CoreState::Running
                 && self.now < slice_end
                 && remaining != 0
@@ -361,7 +388,7 @@ impl Machine {
                     || self.now >= deadline
                 {
                     self.update_interrupts();
-                    deadline = self.next_timer().unwrap_or(u64::MAX);
+                    deadline = self.next_event().unwrap_or(u64::MAX);
                 }
                 let cpu = &mut self.cpus[core];
                 if self.breakpoint.hit(core, cpu.pc) {
@@ -384,6 +411,7 @@ impl Machine {
     fn execute(&mut self, core: usize, interpreting: bool) -> Option<Stop> {
         let jit_off = self.cpus[core].jit_off;
         self.cpus[core].jit_off |= interpreting;
+        self.soc.now = self.now;
         let result = self.cpus[core].step(&mut self.soc);
         let watch_hit = self.cpus[core].watch_hit.take();
         self.cpus[core].jit_off = jit_off;
@@ -583,5 +611,37 @@ impl Machine {
             cpu.jit_invalidate(u64::MAX);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_reads_ampere_identity_and_virtual_timer() {
+        let mut machine = Machine::new(256 << 20, 1).unwrap();
+        for (offset, word) in [
+            0xd2a2_e001, // movz x1, #0x1700, lsl #16
+            0xb940_0020, // ldr  w0, [x1]
+            0xf292_8001, // movk x1, #0x9400
+            0xb940_0022, // ldr  w2, [x1]
+            0xb940_1023, // ldr  w3, [x1, #16]
+            0xd440_0000, // hlt  #0
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            machine
+                .soc
+                .write32(RAM_BASE + (offset * 4) as u64, word)
+                .unwrap();
+        }
+        machine.cpus[0].pc = RAM_BASE;
+        machine.idle_until(1 << 32);
+        assert_eq!(machine.run(12), Stop::Hlt(0));
+        assert_eq!(machine.cpus[0].x[0], 0x17b0_00a1);
+        assert_eq!(machine.cpus[0].x[2], 3);
+        assert_eq!(machine.cpus[0].x[3], 1);
     }
 }
