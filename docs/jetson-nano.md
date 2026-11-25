@@ -143,9 +143,17 @@ follows the host's clock, and runs are not repeatable. A GPU submission runs on 
 the core that hands it over and keeps the lock while it runs: the other cores go on until they
 touch a device. A debugger's breakpoints, watchpoints and single steps run on one thread.
 
-YOLOv8n on the CPU (ncnn, four threads; `demos/jetson-yolo-cam`) takes PLACEHOLDER_CPU; on the GPU (NVK) PLACEHOLDER_NVK.
-The guest's own per-frame times differ more than that: with one thread its clock counts
-instructions, not the host's seconds.
+YOLOv8n on the CPU (ncnn, four threads; `demos/jetson-yolo-cam`), host seconds per frame on an
+Apple M-series Mac shared with other jobs: 2.6 with one thread, 0.8 with a thread per core. On the GPU (NVK) both take about
+2.5 s: the GPU's work is the frame. Detections are the same. The demo's own times are guest
+time, which with one thread counts instructions (1 ns each) and with a thread per core follows
+the host's clock.
+
+Which driver the GL tests (`scripts/jetson-nano-gl.txt`) get depends on the order in which
+nouveau and `tegra-drm` probe at boot. When `tegra-drm`'s render node comes second
+(`renderD129`), Mesa takes its `tegra` driver, which fails three GLES 2 scenes and hangs in GLES
+3's `wr_staging`; this happens in either mode, and in most boots with `--threads multi`. With
+nouveau's node (renderer `NV12B`) the results are the same in both modes.
 
 ## Not there yet
 
