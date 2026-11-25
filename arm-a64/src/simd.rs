@@ -408,7 +408,7 @@ impl Cpu {
         }
         if l { for (k, v) in regs.into_iter().enumerate() { self.v[((rt + k as u32) % 32) as usize] = v; } }
         if post {
-            let inc = if rm == 31 { addr - base } else { self.xr(rm) };
+            let inc = if rm == 31 { addr.wrapping_sub(base) } else { self.xr(rm) }; // (the access may wrap past 2^64)
             self.set_xsp(rn, base.wrapping_add(inc));
         }
         Ok(())

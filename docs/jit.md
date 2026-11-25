@@ -64,7 +64,11 @@ only one-register LD1/ST1 were native: ncnn's YOLOv8n on the Jetson Nano's CPU (
 [x8], #64` in every kernel) handed 491 M instructions to the interpreter in 12 frames, 89 M after
 (the rest are system instructions, and structure accesses across a page); a frame took about 2.8 s
 of host time and now takes 0.46 s (the guest's own clock, 1 ns per instruction, says 0.29 s in both).
-`arm-a64/tests/jit_neon_ldst.rs` checks every encoding of both groups against the interpreter.
+`arm-a64/tests/jit_neon_ldst.rs` checks every encoding of both groups against the interpreter
+(also at EL0, under V-register pressure, next to a read-only page and with a reservation held).
+Neither the interpreter nor the JIT checks SCTLR.A alignment or big-endian data accesses (SCTLR.EE,
+E0E) on ordinary loads and stores; supporting either means a compile-time condition in `emit_ldst`
+and `emit_vstruct` too (they emit the host's little-endian accesses with no alignment check).
 
 Blocks average about 5 guest instructions; a chain now runs about 100 before it returns to the
 machine loop. A chain stops at the budget/deadline and whenever an interpreted instruction may need
