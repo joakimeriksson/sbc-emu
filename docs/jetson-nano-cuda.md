@@ -49,7 +49,7 @@ Prepare the card once, in Debian, with the files served from the host (the guest
 10.0.2.2); the command line is in `scripts/jetson-nano-l4t-prepare.txt`:
 
 ```sh
-python3 -m http.server 8800 -d cache/l4t/serve &
+python3 -m http.server 8800 --bind 127.0.0.1 -d cache/l4t/serve &   # the guest's 10.0.2.2 is the host's localhost
 sbc-emu run --board jetson-nano ... --sd cache/l4t/disk.raw --sd-persist --script scripts/jetson-nano-l4t-prepare.txt
 ```
 

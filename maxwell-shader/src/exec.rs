@@ -918,7 +918,7 @@ pub fn run<const N: usize, H: Host<N>>(
                 l.putp(pd, m, c_out);
                 l.put(d, m, r);
             }
-            Op::Vadd { d, a, a_bits, a_sel, a_signed, b, b_bits, b_sel, b_signed, c, op, cc } => {
+            Op::Vadd { d, a, a_bits, a_sel, a_signed, b, b_bits, b_sel, b_signed, c, op, d_signed, cc } => {
                 let part = |v: u32, bits: u8, sel: u8, signed: bool| -> i64 {
                     let v = v >> (8 * sel as u32);
                     match (bits, signed) {
@@ -931,10 +931,9 @@ pub fn run<const N: usize, H: Host<N>>(
                     }
                 };
                 let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]);
-                let signed = a_signed || b_signed;
                 let r = std::array::from_fn(|i| {
                     let s = part(u[i], a_bits, a_sel, a_signed) + part(v[i], b_bits, b_sel, b_signed);
-                    let c = if signed { w[i] as i32 as i64 } else { w[i] as i64 };
+                    let c = if d_signed { w[i] as i32 as i64 } else { w[i] as i64 };
                     match op {
                         0 => w[i] & 0xffff | (s as u32) << 16,
                         1 => w[i] & 0xffff_0000 | s as u32 & 0xffff,

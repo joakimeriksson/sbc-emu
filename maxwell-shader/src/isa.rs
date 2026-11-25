@@ -405,7 +405,8 @@ pub enum Op {
     /// VADD (video add): an 8/16-bit part of a (`a_bits`, at byte `a_sel`) plus an 8/16/32-bit
     /// part of b, then with c: 0..=3 merged into its high half, low half, byte 0, byte 2; 4 added;
     /// 5 min; 6 max; 7 alone.
-    Vadd { d: Reg, a: Reg, a_bits: u8, a_sel: u8, a_signed: bool, b: Src, b_bits: u8, b_sel: u8, b_signed: bool, c: Reg, op: u8, cc: bool },
+    /// `d_signed`: c and the result are signed (for accumulate, min and max).
+    Vadd { d: Reg, a: Reg, a_bits: u8, a_sel: u8, a_signed: bool, b: Src, b_bits: u8, b_sel: u8, b_signed: bool, c: Reg, op: u8, d_signed: bool, cc: bool },
     /// P2R: predicates P0..P6 (or the condition code) where `b`'s low byte has bits, into byte
     /// `byte` of a copy of a.
     P2r { d: Reg, a: Reg, b: Src, cc: bool, byte: u8 },

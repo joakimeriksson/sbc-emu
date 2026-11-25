@@ -269,6 +269,7 @@ fn decode_op(addr: u32, w: W) -> Option<Op> {
             b_signed: w.b(49),
             c: w.rc(),
             op: w.f(51, 3) as u8,
+            d_signed: w.b(54),
             cc: w.b(47),
         });
     }
@@ -580,10 +581,11 @@ fn two_source(w: W, form: Form, sel: u32) -> Option<Op> {
         },
         0xce8 => Op::P2r { d, a, b: ib, cc: w.b(40), byte: w.f(41, 2) as u8 },
         0xcf0 => Op::R2p { a, b: ib, cc: w.b(40), byte: w.f(41, 2) as u8 },
-        0xc88 if form == Form::Reg => Op::Fchk {
+        // (register, constant and float immediate forms)
+        0xc88 => Op::Fchk {
             pd: w.f(0, 3) as u8,
             a,
-            b: ib,
+            b: fb,
             abs_a: w.b(46),
             neg_a: w.b(48),
             abs_b: w.b(49),

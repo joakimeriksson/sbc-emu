@@ -46,9 +46,10 @@ pub trait Memory {
         None
     }
 
-    /// The same memory for `n` threads that read and write it at once (a compute launch's
-    /// workgroups, which write different bytes). None: one thread.
-    fn split_mut(&mut self, _n: usize) -> Option<Vec<Box<dyn Memory + Send + '_>>> {
-        None
+    /// The same memory for `n` threads at once (a compute launch's workgroups): `run` gets a view
+    /// for each; a view sees its own writes, and they all reach memory when `run` returns, in the
+    /// views' order (bytes several views wrote end up as the last one's). false: one thread only.
+    fn split(&mut self, _n: usize, _run: &mut dyn FnMut(Vec<Box<dyn Memory + Send + '_>>)) -> bool {
+        false
     }
 }

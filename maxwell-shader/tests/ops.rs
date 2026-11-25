@@ -896,3 +896,22 @@ fn vadd_p2r_r2p_fchk() {
     let l = exec(&[fchk, p2r], &[(0, x), (1, y)]);
     assert_eq!(l.gpr[2], [0, 1, 1, 1], "6/3 is fast; /0, a subnormal and infinity are not");
 }
+
+/// FCHK's constant and immediate forms decode; VADD's MIN compares with c as the destination's
+/// type (bit 54: signed).
+#[test]
+fn fchk_forms_and_vadd_destination_sign() {
+    for top in [0x5c88u64, 0x4c88, 0x3888] {
+        let p = Program::decode(&assemble(&[word(top, &[(0, 3, 0), (8, 8, 0), (20, 8, 1)])])).unwrap();
+        assert!(p.any(|o| matches!(o, Op::Fchk { .. })), "{top:#x}: {p}");
+    }
+    // VADD.S32 MIN r2 = min(r0.b0 (u8) + r1 (u32), r3): b's register form, 32 bits (bits 28-30 = 6)
+    let vmin = |signed_dest: u64| {
+        word(0x2000, &[(0, 8, 2), (8, 8, 0), (20, 8, 1), (28, 3, 6), (50, 1, 1), (51, 3, 5), (54, 1, signed_dest), (39, 8, 3)])
+    };
+    let regs = [(0, [1, 1, 1, 1]), (1, [0, 0, 0, 0]), (3, [0xffff_ffff, 5, 0, 0x8000_0000])];
+    let signed = exec(&[vmin(1)], &regs);
+    assert_eq!(signed.gpr[2], [0xffff_ffff, 1, 0, 0x8000_0000], "c as a signed destination: -1 < 1");
+    let unsigned = exec(&[vmin(0)], &regs);
+    assert_eq!(unsigned.gpr[2], [1, 1, 0, 1], "c as an unsigned destination");
+}

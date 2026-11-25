@@ -291,8 +291,11 @@ impl Gpu {
                         eprintln!("[chan] {} inst {:#x} -> {v:#x}", (o >> 3) & 0x1ff, c.inst);
                     }
                     if v >> 31 != 0 {
+                        let id = (o as u32 >> 3) & 0x1ff;
                         if (c.bound ^ v) & 0x0fff_ffff != 0 {
-                            self.host.forget((o as u32 >> 3) & 0x1ff);
+                            self.host.forget(id);
+                        } else {
+                            self.host.rebound(id, smmu, ram);
                         }
                         c.bound = v;
                     }

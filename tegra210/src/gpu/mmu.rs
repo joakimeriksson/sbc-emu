@@ -137,46 +137,59 @@ impl maxwell::Memory for View<'_> {
     fn share(&self) -> Option<Box<dyn maxwell::Memory + Send + '_>> {
         Some(Box::new(Reader { ram: self.ram, smmu: self.smmu, mmu: Mmu::default(), space: self.space }))
     }
-    fn split_mut(&mut self, n: usize) -> Option<Vec<Box<dyn maxwell::Memory + Send + '_>>> {
-        let (ram, len) = (self.ram.as_mut_ptr(), self.ram.len());
-        let (smmu, space) = (self.smmu, self.space);
-        Some((0..n).map(|_| Box::new(Writer { ram, len, smmu, mmu: Mmu::default(), space, _ram: std::marker::PhantomData }) as Box<dyn maxwell::Memory + Send + '_>).collect())
+    fn split(&mut self, n: usize, run: &mut dyn FnMut(Vec<Box<dyn maxwell::Memory + Send + '_>>)) -> bool {
+        let mut logs: Vec<Log> = (0..n).map(|_| Log::default()).collect();
+        {
+            let (ram, smmu, space) = (&*self.ram, self.smmu, self.space);
+            run(logs.iter_mut().map(|log| Box::new(Overlay { ram, smmu, mmu: Mmu::default(), space, log }) as Box<dyn maxwell::Memory + Send + '_>).collect());
+        }
+        for log in logs {
+            for (page, (bytes, written)) in log.pages {
+                for (k, w) in written.iter().enumerate().filter(|(_, w)| **w != 0) {
+                    for b in (0..64).filter(|b| w >> b & 1 != 0) {
+                        let i = 64 * k + b;
+                        self.ram[page + i] = bytes[i];
+                    }
+                }
+            }
+            if let Some((va, write)) = log.fault {
+                self.note(va, write);
+            }
+        }
+        true
     }
 }
 
-/// Memory as a channel sees it, for one of several threads that read and write it at once (the
-/// workgroups of a compute launch): RAM is shared with the others through a pointer.
-struct Writer<'a> {
-    ram: *mut u8,
-    len: usize,
+/// What one view of a split wrote: each page it wrote, copied on the first write, with a bit
+/// for every byte written; and the first address that did not translate.
+#[derive(Default)]
+struct Log {
+    pages: std::collections::HashMap<usize, (Box<[u8; 0x1000]>, Box<[u64; 64]>)>,
+    fault: Option<(u64, bool)>,
+}
+
+/// Memory as one of several threads sees it during a split: RAM as it was, read-only and shared,
+/// under the thread's own writes.
+struct Overlay<'a> {
+    ram: &'a [u8],
     smmu: &'a Smmu,
     mmu: Mmu,
     space: Space,
-    _ram: std::marker::PhantomData<&'a mut [u8]>,
+    log: &'a mut Log,
 }
 
-// SAFETY: the views of one split borrow the RAM mutably for as long as they live; their threads
-// write different bytes (workgroups that write the same bytes race on the GPU as well), and page
-// tables, which every view reads, are not written by shaders.
-unsafe impl Send for Writer<'_> {}
-
-impl Writer<'_> {
-    fn ram(&self) -> &[u8] {
-        // SAFETY: see the type
-        unsafe { std::slice::from_raw_parts(self.ram, self.len) }
-    }
-}
-
-impl maxwell::Memory for Writer<'_> {
+impl maxwell::Memory for Overlay<'_> {
     fn read(&self, mut va: u64, mut out: &mut [u8]) {
-        let ram = self.ram();
         while !out.is_empty() {
             let n = (0x1000 - (va & 0xfff) as usize).min(out.len());
             let (part, rest) = out.split_at_mut(n);
-            match self.mmu.translate(self.space, va, self.smmu, ram) {
+            match self.mmu.translate(self.space, va, self.smmu, self.ram) {
                 Some(p) => {
-                    let o = p.offset + (va & 0xfff) as usize;
-                    part.copy_from_slice(&ram[o..o + n]);
+                    let o = (va & 0xfff) as usize;
+                    match self.log.pages.get(&p.offset) {
+                        Some((bytes, _)) => part.copy_from_slice(&bytes[o..o + n]),
+                        None => part.copy_from_slice(&self.ram[p.offset + o..p.offset + o + n]),
+                    }
                 }
                 None => part.fill(0),
             }
@@ -187,11 +200,22 @@ impl maxwell::Memory for Writer<'_> {
     fn write(&mut self, mut va: u64, mut data: &[u8]) {
         while !data.is_empty() {
             let n = (0x1000 - (va & 0xfff) as usize).min(data.len());
-            if let Some(p) = self.mmu.translate(self.space, va, self.smmu, self.ram()).filter(|p| p.write) {
-                let o = p.offset + (va & 0xfff) as usize;
-                if o + n <= self.len {
-                    // SAFETY: in bounds; see the type
-                    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ram.add(o), n) };
+            match self.mmu.translate(self.space, va, self.smmu, self.ram) {
+                Some(p) if p.write && p.offset + 0x1000 <= self.ram.len() => {
+                    let ram = self.ram;
+                    let (bytes, written) = self.log.pages.entry(p.offset).or_insert_with(|| {
+                        let mut page = Box::new([0u8; 0x1000]);
+                        page.copy_from_slice(&ram[p.offset..p.offset + 0x1000]);
+                        (page, Box::new([0u64; 64]))
+                    });
+                    let o = (va & 0xfff) as usize;
+                    bytes[o..o + n].copy_from_slice(&data[..n]);
+                    for i in o..o + n {
+                        written[i / 64] |= 1 << (i % 64);
+                    }
+                }
+                _ => {
+                    self.log.fault.get_or_insert((va, true));
                 }
             }
             data = &data[n..];
@@ -282,6 +306,38 @@ impl View<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_views_see_their_writes_and_meet_in_order() {
+        use maxwell::Memory;
+        let mut ram = vec![0u8; 0x10_0000];
+        let put = |ram: &mut [u8], o: usize, v: u64| ram[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        let pa = |o: u64| RAM_BASE + o;
+        // va 0x0400_5000 -> RAM 0x5000 (writable), va 0x0400_6000 unmapped
+        put(&mut ram, 0x1200, pa(0x2000) | 3 | 1 << 11);
+        put(&mut ram, 0x2008, pa(0x10000) << 24 | 1 << 32);
+        put(&mut ram, 0x10000 + 8 * 5, pa(0x5000) >> 8 | 1);
+        ram[0x5000..0x5010].fill(0xaa);
+        let smmu = Smmu::default();
+        let s = space(pa(0x1000), &smmu, &ram);
+        let mmu = Mmu::default();
+        let mut v = View { ram: &mut ram, smmu: &smmu, mmu: &mmu, space: s, fault: Cell::new(None) };
+        let split = v.split(2, &mut |mut views| {
+            // view 0 writes bytes 0..4, view 1 bytes 2..6: each reads its own, not the other's
+            views[0].write(0x0400_5000, &[1, 1, 1, 1]);
+            views[1].write(0x0400_5002, &[2, 2, 2, 2]);
+            let mut b = [0; 8];
+            views[0].read(0x0400_5000, &mut b);
+            assert_eq!(b, [1, 1, 1, 1, 0xaa, 0xaa, 0xaa, 0xaa]);
+            views[1].read(0x0400_5000, &mut b);
+            assert_eq!(b, [0xaa, 0xaa, 2, 2, 2, 2, 0xaa, 0xaa]);
+            views[1].write(0x0400_6000, &[9]);
+        });
+        assert!(split);
+        // written bytes only, the later view last; a fault of a view reaches the view it came from
+        assert_eq!(v.ram[0x5000..0x5008], [1, 1, 2, 2, 2, 2, 0xaa, 0xaa]);
+        assert_eq!(v.fault.get(), Some((0x0400_6000, true)));
+    }
 
     #[test]
     fn small_and_big_pages() {

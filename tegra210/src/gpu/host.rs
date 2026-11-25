@@ -45,6 +45,9 @@ struct State {
     syncpt_payload: u32,
     /// the semaphore wait last reported (SBC_TRACE_SYNCPT)
     reported: Option<(u64, u32)>,
+    /// where the channel's USERD is and the GP_GET the host last wrote there: a channel bound
+    /// again to its instance block is the same channel only if GP_GET is still that
+    gp_get: Option<(u64, u32)>,
     /// a host1x sync point wait that has to be retried: (point, threshold)
     syncpt_wait: Option<(usize, u32)>,
     /// the rest of the segment being executed: (address, words)
@@ -57,15 +60,18 @@ struct State {
 
 pub struct Host {
     channels: HashMap<u32, State>,
-    /// the 3D/compute state of each graphics context: channels that share a context (CUDA's
-    /// streams of one context) share it, as the engine's context holds it on the hardware
-    engines: HashMap<u64, maxwell::Engine>,
+    /// the 3D/compute state of each graphics context, by (address space, the context's address
+    /// in it): channels that share a context (CUDA's streams of one context) share it, as the
+    /// engine's context holds it on the hardware
+    engines: HashMap<(u64, u64), maxwell::Engine>,
+    /// the context each channel last ran with
+    contexts: HashMap<u32, (u64, u64)>,
     trace: bool,
 }
 
 impl Default for Host {
     fn default() -> Self {
-        Self { channels: HashMap::new(), engines: HashMap::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
+        Self { channels: HashMap::new(), engines: HashMap::new(), contexts: HashMap::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
     }
 }
 
@@ -78,16 +84,37 @@ impl Host {
             }
         }
         self.channels.remove(&id);
+        // a context no channel uses any more goes with its last channel
+        if let Some(context) = self.contexts.remove(&id) {
+            if !self.contexts.values().any(|&c| c == context) {
+                self.engines.remove(&context);
+            }
+        }
+    }
+
+    /// A channel bound again to its instance block: the same channel (nvgpu after power gating)
+    /// if its USERD's GP_GET is what the host last wrote there; a new one gets a fresh state.
+    pub fn rebound(&mut self, id: u32, smmu: &crate::smmu::Smmu, ram: &[u8]) {
+        let same = self.channels.get(&id).is_none_or(|s| s.gp_get.is_none_or(|(userd, get)| mmu::read32(userd + 0x88, smmu, ram) == Some(get)));
+        if !same {
+            self.forget(id);
+        }
     }
 
     /// `points`: host1x's sync point values (the channels' increments are applied to them too).
     pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64, points: &mut [u32]) -> Done {
-        // the graphics context the instance block names (words 132, 133); none: the channel's own
+        // the graphics context the instance block names (words 132, 133) in its address space;
+        // none: the channel's own
         let word = |k: u64| mmu::read32(inst + 4 * k, view.smmu, view.ram).unwrap_or(0);
         let context = match (word(132) & !0xfff) as u64 | ((word(133) & 0xff) as u64) << 32 {
-            0 => u64::MAX - id as u64,
-            c => c,
+            0 => (u64::MAX, id as u64),
+            c => (view.space.directory, c),
         };
+        if let Some(old) = self.contexts.insert(id, context).filter(|&o| o != context) {
+            if !self.contexts.values().any(|&c| c == old) {
+                self.engines.remove(&old);
+            }
+        }
         let shared = self.engines.entry(context).or_default();
         let s = self.channels.entry(id).or_default();
         std::mem::swap(&mut s.engine, shared);
@@ -155,6 +182,7 @@ impl Host {
             let (lo, hi) = (view.read32(base + 8 * get as u64), view.read32(base + 8 * get as u64 + 4));
             let next = (get + 1) & (entries - 1);
             mmu::write32(userd + 0x88, next, view.smmu, view.ram);
+            s.gp_get = Some((userd, next));
             let (at, words) = ((lo & !3) as u64 | ((hi & 0xff) as u64) << 32, hi >> 10 & 0x1f_ffff);
             if trace || std::env::var_os("SBC_TRACE_SEM").is_some() {
                 eprintln!("[gpfifo] channel {id}: entry {get} at {at:#x}, {words} words");
@@ -262,6 +290,11 @@ impl State {
                             _ => old,
                         };
                         view.write32(at, new);
+                        if v & 1 << 24 == 0 {
+                            // RELEASE_SIZE 16 bytes: with the time stamp, as a release
+                            view.write32(at + 4, 0);
+                            view.write(at + 8, &now.to_le_bytes());
+                        }
                         if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] host reduce {at:#x}: {old:#x} -> {new:#x} (op {v:#x})"); }
                     }
                     1 => self.waiting = Some((at, payload, Test::Equal)),
