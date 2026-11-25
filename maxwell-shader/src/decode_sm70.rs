@@ -372,6 +372,24 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
     let s = alu(w)?;
     let d = if uniform { w.ureg(16) } else { w.reg(16) };
     let ftz = w.b(80);
+    // IMAD.WIDE: d:d+1 = a * b + c:c+1, the product 64 bits (CUDA's address arithmetic). The low
+    // word goes to SCRATCH with its carry, the high word adds it, then the low word moves to d (so
+    // that d may be a or b).
+    if (base, uniform) == (0x025, false) {
+        let signed = w.b(73);
+        let c_hi = match s.c {
+            Src::Reg(r) if r == RZ => Src::Reg(RZ),
+            Src::Reg(r) => Src::Reg(r + 1),
+            Src::Cb(b, off) => Src::Cb(b, off + 4),
+            Src::Imm(v) => Src::Imm(if signed && v >> 31 != 0 { u32::MAX } else { 0 }),
+            _ => return None,
+        };
+        let imad = |d, c, hi| Op::IMad { d, a: s.a, b: s.b, c, sa: signed, sb: signed, hi, neg_ab: false, neg_c: s.cm.neg, sat: false, x: hi, cc: !hi };
+        if d == RZ {
+            return one(Op::Nop);
+        }
+        return Some(vec![imad(SCRATCH, s.c, false), imad(d + 1, c_hi, true), Op::Mov { d, b: Src::Reg(SCRATCH), lanes: 15 }]);
+    }
     let op = match (base, uniform) {
         // MOV
         (0x002, false) => Op::Mov { d, b: s.b, lanes: w.f(72, 4) as u8 },
@@ -946,6 +964,16 @@ mod tests {
         assert_eq!(lut_swap_bc(0xf0 & 0xcc), 0xf0 & 0xaa);
         assert_eq!(lut_swap_bc(0xcc ^ 0xaa), 0xcc ^ 0xaa);
         assert_eq!(lut_swap_bc(0xaa), 0xcc);
+    }
+
+    /// CUDA's address arithmetic, from the PTX JIT's vector add: IMAD.WIDE R2, R6, R7, c[0x0][0x160]
+    /// (a 64-bit pointer in the constant buffer plus a 32 x 32-bit product).
+    #[test]
+    fn imad_wide_is_a_64_bit_multiply_add() {
+        let raw = 0x000fc800078e0207_0000580006027625u128;
+        let ops: Vec<Op> = decode(0, raw).into_iter().map(|i| i.op).collect();
+        let imad = |d, c, hi| Op::IMad { d, a: 6, b: Src::Reg(7), c, sa: true, sb: true, hi, neg_ab: false, neg_c: false, sat: false, x: hi, cc: !hi };
+        assert_eq!(ops, vec![imad(SCRATCH, Src::Cb(0, 0x160), false), imad(3, Src::Cb(0, 0x164), true), Op::Mov { d: 2, b: Src::Reg(SCRATCH), lanes: 15 }]);
     }
 
     /// NVIDIA's GLES compute shader of gltest: v[i] = group * 1000 + s[63 - tid], s[tid] =

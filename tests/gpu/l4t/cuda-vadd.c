@@ -19,6 +19,7 @@ static void *sym(const char *n) { void *p = dlsym(h, n); if (!p) { printf("missi
 #define CK(call) do { CUresult r_ = (call); printf("%-40s -> %d\n", #call, r_); fflush(stdout); if (r_) return 10 + r_ % 200; } while (0)
 int main(void) {
     h = dlopen("libcuda.so.1.1", RTLD_NOW);
+    if (!h) h = dlopen("libcuda.so.1", RTLD_NOW); /* JetPack 6's file name */
     if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
     CUresult (*cuInit)(unsigned) = sym("cuInit");
     CUresult (*cuDriverGetVersion)(int *) = sym("cuDriverGetVersion");
