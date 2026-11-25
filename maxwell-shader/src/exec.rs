@@ -918,6 +918,83 @@ pub fn run<const N: usize, H: Host<N>>(
                 l.putp(pd, m, c_out);
                 l.put(d, m, r);
             }
+            Op::Vadd { d, a, a_bits, a_sel, a_signed, b, b_bits, b_sel, b_signed, c, op, cc } => {
+                let part = |v: u32, bits: u8, sel: u8, signed: bool| -> i64 {
+                    let v = v >> (8 * sel as u32);
+                    match (bits, signed) {
+                        (8, false) => (v & 0xff) as i64,
+                        (8, true) => v as u8 as i8 as i64,
+                        (16, false) => (v & 0xffff) as i64,
+                        (16, true) => v as u16 as i16 as i64,
+                        (_, false) => v as i64,
+                        (_, true) => v as i32 as i64,
+                    }
+                };
+                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]);
+                let signed = a_signed || b_signed;
+                let r = std::array::from_fn(|i| {
+                    let s = part(u[i], a_bits, a_sel, a_signed) + part(v[i], b_bits, b_sel, b_signed);
+                    let c = if signed { w[i] as i32 as i64 } else { w[i] as i64 };
+                    match op {
+                        0 => w[i] & 0xffff | (s as u32) << 16,
+                        1 => w[i] & 0xffff_0000 | s as u32 & 0xffff,
+                        2 => w[i] & !0xff | s as u32 & 0xff,
+                        3 => w[i] & !0xff_0000 | (s as u32 & 0xff) << 16,
+                        4 => (s + c) as u32,
+                        5 => s.min(c) as u32,
+                        6 => s.max(c) as u32,
+                        _ => s as u32,
+                    }
+                });
+                if cc {
+                    l.flags_i(m, r);
+                }
+                l.put(d, m, r);
+            }
+            Op::P2r { d, a, b, cc, byte } => {
+                let (u, v) = (l.gpr[a as usize], l.src(h, b));
+                let sh = 8 * (byte as u32 & 3);
+                let flags = [l.zero, l.sign, l.carry, l.overflow];
+                let r = std::array::from_fn(|i| {
+                    let bits: u32 = if cc {
+                        (0..4).map(|k| (flags[k] >> i & 1) << k).sum()
+                    } else {
+                        (0..7).map(|k| (l.pred[k] >> i & 1) << k).sum()
+                    };
+                    let mask = (v[i] & 0xff) << sh;
+                    u[i] & !mask | (bits << sh) & mask
+                });
+                l.put(d, m, r);
+            }
+            Op::R2p { a, b, cc, byte } => {
+                let (u, v) = (l.gpr[a as usize], l.src(h, b));
+                let sh = 8 * (byte as u32 & 3);
+                for k in 0..if cc { 4 } else { 7 } {
+                    let sel = mask::<N>(|i| v[i] >> k & 1 != 0) & m;
+                    let set = mask::<N>(|i| u[i] >> (sh + k) & 1 != 0);
+                    let r = if cc {
+                        match k {
+                            0 => &mut l.zero,
+                            1 => &mut l.sign,
+                            2 => &mut l.carry,
+                            _ => &mut l.overflow,
+                        }
+                    } else {
+                        &mut l.pred[k as usize]
+                    };
+                    *r = *r & !sel | set & sel;
+                }
+            }
+            Op::Fchk { pd, a, b, abs_a, neg_a, abs_b, neg_b } => {
+                let (u, v) = (l.gpr[a as usize], l.src(h, b));
+                let _ = (abs_a, neg_a, abs_b, neg_b); // signs do not change the check
+                let slow = mask::<N>(|i| {
+                    let (ex, ey) = ((u[i] >> 23 & 0xff) as i32, (v[i] >> 23 & 0xff) as i32);
+                    let x_zero = u[i] & 0x7fff_ffff == 0;
+                    ey == 0 || ey >= 0xfd || ex == 0xff || (ex == 0 && !x_zero) || (!x_zero && ((ex - ey) >= 126 || (ex - ey) <= -125))
+                });
+                l.putp(pd, m, slow);
+            }
             Op::IMul { d, a, b, sa, sb, hi, cc } => {
                 let (u, v) = (l.gpr[a as usize], l.src(h, b));
                 let r = std::array::from_fn(|i| {

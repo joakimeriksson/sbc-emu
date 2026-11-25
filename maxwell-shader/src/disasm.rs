@@ -376,6 +376,10 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
         Op::IScAdd { d, a, b, shift, neg_a, neg_b, cc: c } => {
             format!("iscadd{} {} {} {} {shift}", cc(c), R(d), neg(r(a), neg_a), neg(b, neg_b))
         }
+        Op::Vadd { d, a, b, c, op, .. } => format!("vadd.op{op} {} {} {} {}", R(d), R(a), i(b), R(c)),
+        Op::P2r { d, a, b, cc: c, byte } => format!("p2r{} {} {} {} b{byte}", dot(c, ".cc"), R(d), R(a), i(b)),
+        Op::R2p { a, b, cc: c, byte } => format!("r2p{} {} {} b{byte}", dot(c, ".cc"), R(a), i(b)),
+        Op::Fchk { pd, a, b, .. } => format!("fchk.divide p{pd} {} {}", R(a), i(b)),
         Op::Lea { d, a, b, hi, shift, neg_a, x, cc: c, pd } => format!(
             "lea{}{}{} p{pd} {} {} {}{} {shift}",
             dot(hi.is_some(), ".hi"),

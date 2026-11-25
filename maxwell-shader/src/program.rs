@@ -188,6 +188,8 @@ fn highest_reg(op: &Op) -> u32 {
         | Op::IAdd3 { d, .. }
         | Op::IScAdd { d, .. }
         | Op::Lea { d, .. }
+        | Op::Vadd { d, .. }
+        | Op::P2r { d, .. }
         | Op::IMul { d, .. }
         | Op::IMad { d, .. }
         | Op::Xmad { d, .. }

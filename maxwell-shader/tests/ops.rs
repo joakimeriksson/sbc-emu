@@ -866,3 +866,33 @@ fn lea_builds_64_bit_addresses() {
         assert!(p.any(|o| matches!(o, Op::Lea { .. })), "{w:#x}: {p}");
     }
 }
+
+/// The video add, predicate packing and division check NVIDIA's compiler uses (the words are
+/// TensorRT's): VADD.UD.U16.U16.MRG_16H puts a.h0 + b.h0 in c's high half; P2R packs
+/// predicates under a mask; R2P unpacks them; FCHK flags divisions that need the exact path.
+#[test]
+fn vadd_p2r_r2p_fchk() {
+    let mut r = Rng(3);
+    for _ in 0..500 {
+        let v: [[u32; 4]; 3] = std::array::from_fn(|_| r.lanes());
+        // VADD r8 = merge(r8.l, r2.h0 + r3.h0)  (0x2044044040370208: d r8, a r2, b r3, c r8)
+        let l = exec(&[0x2044_0440_4037_0208], &[(2, v[0]), (3, v[1]), (8, v[2])]);
+        for i in 0..4 {
+            let want = v[2][i] & 0xffff | (v[0][i].wrapping_add(v[1][i]) & 0xffff) << 16;
+            assert_eq!(l.gpr[8][i], want);
+        }
+    }
+    // R2P from r0 byte 0 into P0..P6 (mask 0x7f), then P2R RZ with mask 0x3c into r104
+    let r2p = word(0x38f0, &[(8, 8, 0), (20, 19, 0x7f)]);
+    let l = exec(&[r2p, 0x38e8_0000_03c7_ff68], &[(0, [0x5a, 0x7f, 0x01, 0x24])]);
+    for (i, p) in [0x5au32, 0x7f, 0x01, 0x24].into_iter().enumerate() {
+        assert_eq!(l.gpr[104][i], p & 0x3c, "lane {i}");
+    }
+    // FCHK.DIVIDE P0, r0, r1 then P2R r2 (mask 1)
+    let fchk = word(0x5c88, &[(0, 3, 0), (8, 8, 0), (20, 8, 1)]);
+    let p2r = word(0x38e8, &[(0, 8, 2), (8, 8, 255), (20, 19, 1)]);
+    let x = [6.0f32, 1.0, 1.0e-40, f32::INFINITY].map(f32::to_bits);
+    let y = [3.0f32, 0.0, 2.0, 1.0].map(f32::to_bits);
+    let l = exec(&[fchk, p2r], &[(0, x), (1, y)]);
+    assert_eq!(l.gpr[2], [0, 1, 1, 1], "6/3 is fast; /0, a subnormal and infinity are not");
+}
