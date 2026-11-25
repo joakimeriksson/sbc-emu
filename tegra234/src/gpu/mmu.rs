@@ -1,4 +1,4 @@
-//! GA10B's five-level GMMU, with 4 KiB pitch-linear system-memory pages.
+//! GA10B's five-level GMMU with 4 KiB and 64 KiB system-memory pages.
 use crate::RAM_BASE;
 
 pub(super) fn physical(ram: &[u8], address: u64, len: usize) -> Option<usize> {
@@ -31,27 +31,32 @@ impl<'a> View<'a> {
     }
 
     pub fn translate(&self, address: u64, write: bool) -> Option<u64> {
-        if address >= 1 << 48 {
+        if address >= 1 << 49 {
             return None;
         }
         let mut table = self.root;
-        for (shift, mask, stride, half) in [
-            (47, 1, 8, 0),
-            (38, 511, 8, 0),
-            (29, 511, 8, 0),
-            (21, 255, 16, 8), // The upper half of the dual PDE points to small pages.
-        ] {
-            let entry = self.pte(table + ((address >> shift) & mask) * stride + half)?;
+        for (shift, mask) in [(47, 3), (38, 511), (29, 511)] {
+            let entry = self.pte(table + ((address >> shift) & mask) * 8)?;
             if entry & 6 < 4 {
                 return None;
             }
-            table = (entry << 4) & 0xff_ffff_ff00;
+            table = (entry << 4) & 0xff_ffff_f000;
         }
-        let entry = self.pte(table + (address >> 12 & 511) * 8)?;
+        let dual = table + (address >> 21 & 255) * 16;
+        let big = self.pte(dual)?;
+        let small = self.pte(dual + 8)?;
+        let (table, shift) = match (small & 6, big & 6) {
+            (4 | 6, 0) => ((small << 4) & 0xff_ffff_f000, 12),
+            (0, 4 | 6) => ((big << 4) & 0xff_ffff_ff00, 16),
+            _ => return None,
+        };
+        let index_mask = (1 << (21 - shift)) - 1;
+        let entry = self.pte(table + (address >> shift & index_mask) * 8)?;
         if entry & 1 == 0 || entry & 6 < 4 || (write && entry & 0x40 != 0) {
             return None;
         }
-        Some(((entry << 4) & 0xff_ffff_f000) | (address & 4095))
+        let page_mask = (1 << shift) - 1;
+        Some(((entry << 4) & 0xff_ffff_f000 & !page_mask) | (address & page_mask))
     }
 
     pub fn load(&self, address: u64) -> Option<u32> {
@@ -120,5 +125,33 @@ impl<'a> View<'a> {
             len -= n;
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn big_page_tables_use_the_low_half_of_the_dual_pde() {
+        let mut ram = vec![0; 0x40000];
+        let encode = |physical: u64, flags: u64| ((physical >> 4) | flags).to_le_bytes();
+        ram[0..8].copy_from_slice(&encode(RAM_BASE + 0x1000, 4));
+        ram[0x1000..0x1008].copy_from_slice(&encode(RAM_BASE + 0x2000, 4));
+        ram[0x2000..0x2008].copy_from_slice(&encode(RAM_BASE + 0x3000, 4));
+        // The large-page table is 256-byte aligned, with 32 entries.
+        ram[0x3000..0x3008].copy_from_slice(&encode(RAM_BASE + 0x4100, 4));
+        ram[0x4100..0x4108].copy_from_slice(&encode(RAM_BASE + 0x20000, 5));
+        ram[0x4108..0x4110].copy_from_slice(&encode(RAM_BASE + 0x10000, 5));
+        let mut view = View {
+            ram: &mut ram,
+            root: RAM_BASE,
+        };
+        view.write(0xfffe, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(&view.ram[0x2fffe..0x30000], &[1, 2]);
+        assert_eq!(&view.ram[0x10000..0x10002], &[3, 4]);
+        view.ram[0x4108..0x4110].copy_from_slice(&encode(RAM_BASE + 0x10000, 0x45));
+        assert_eq!(view.translate(0x10000, false), Some(RAM_BASE + 0x10000));
+        assert_eq!(view.translate(0x10000, true), None);
     }
 }

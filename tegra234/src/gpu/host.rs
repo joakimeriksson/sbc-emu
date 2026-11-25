@@ -63,6 +63,7 @@ struct Channel {
     compute: compute::Compute,
     threed: threed::ThreeD,
     semaphore: [u32; 4],
+    legacy_semaphore: [u32; 3],
 }
 
 impl Host {
@@ -177,6 +178,10 @@ impl Channel {
             let header = memory.load(base + u64::from(index) * 4)?;
             index += 1;
             let mode = header >> 29;
+            // DMA_NOP is a zero word. SET_SUB_DEV_MASK can select this device.
+            if header == 0 || (mode == 0 && header >> 16 == 1 && header & 0x10 != 0) {
+                continue;
+            }
             let count = header >> 16 & 0x1fff;
             let sub = (header >> 13 & 7) as usize;
             let mut method = (header & 0x1fff) * 4;
@@ -211,6 +216,23 @@ impl Channel {
     ) -> Option<()> {
         match method {
             0 => self.classes[sub] = data & 0xffff,
+            0x08 | 0x24 => {} // Host NOP and framebuffer flush.
+            0x10..=0x18 => self.legacy_semaphore[((method - 0x10) / 4) as usize] = data,
+            0x1c if data & !0x0110_101f == 0 => {
+                let [hi, lo, payload] = self.legacy_semaphore;
+                let address = (u64::from(hi & 0xff) << 32) | u64::from(lo & !3);
+                match data & 0x1f {
+                    1 => (memory.load(address)? == payload).then_some(())?,
+                    2 => memory.release(
+                        address,
+                        payload,
+                        (data & (1 << 24) == 0).then_some(self.compute.timestamp),
+                    )?,
+                    4 => (memory.load(address)?.wrapping_sub(payload) as i32 >= 0).then_some(())?,
+                    8 => (memory.load(address)? & payload != 0).then_some(())?,
+                    _ => return None,
+                }
+            }
             0x20 => *nonstall = true,
             // MEM_OP_D barriers and L2/TLB operations complete immediately.
             // GPU memory accesses use the current page tables and guest RAM.
