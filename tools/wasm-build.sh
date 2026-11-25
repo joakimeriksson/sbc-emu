@@ -48,6 +48,11 @@ if [ -f cache/jetson-nano/debian/initramfs.cpio.gz ]; then
   # and its GPU demos (scripts/jetson-nano-gpu-demo-fixture.sh) for web/board.html?b=jetson-nano-gpu
   if [ -f cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz ]; then cp cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz web/assets/jetson-nano/; fi
 fi
+# the Jetson Orin Nano's rover demo (demos/orin-copy/build.sh)
+if [ -f cache/jetson-orin-nano/copy-demo.Image ]; then
+  mkdir -p web/assets/jetson-orin-nano-4gb
+  cp cache/jetson-orin-nano/copy-demo.Image web/assets/jetson-orin-nano-4gb/
+fi
 # the ESP32-S31's demo (scripts/esp32s31-fixture.sh) for web/board.html?b=esp32s31
 if [ -f cache/esp32s31/images/s31_full_flash.bin ]; then
   mkdir -p web/assets/esp32s31

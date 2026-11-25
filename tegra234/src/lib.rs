@@ -261,7 +261,7 @@ impl Machine {
         cores: usize,
         high_speed_uart: bool,
     ) -> Result<Self, String> {
-        if !(256 << 20..=4096usize << 20).contains(&ram_bytes) {
+        if !(256 << 20..=4096u64 << 20).contains(&(ram_bytes as u64)) {
             return Err("Orin Nano direct boot needs 256–4096 MiB of RAM".into());
         }
         if !(1..=AFFINITIES.len()).contains(&cores) {
@@ -365,8 +365,12 @@ impl Machine {
         self.cpus.iter().map(|cpu| cpu.instret).sum()
     }
 
+    pub fn serial_room(&self) -> bool {
+        self.soc.uart.rx_room()
+    }
+
     pub fn serial_input(&mut self, byte: u8) -> bool {
-        if !self.soc.uart.rx_room() {
+        if !self.serial_room() {
             return false;
         }
         self.soc.uart.push_rx(byte);

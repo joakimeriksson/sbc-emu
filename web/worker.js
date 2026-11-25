@@ -1,5 +1,5 @@
 // Runs the emulator off the main thread.
-// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'jetson-nano'|'jetson-nano-gpu'|'esp32s31', ramMb},
+// In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'jetson-nano'|'jetson-nano-gpu'|'jetson-orin-nano-gpu'|'esp32s31', ramMb},
 //      {type:'start', os:'sd-file', file, ramMb} (a Raspberry Pi SD image the visitor chose: .img, .img.xz, .img.gz),
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
@@ -276,6 +276,16 @@ async function start(os, ramMb, jit, file) {
     if (ex.sbc_boot_opi5(ramMb, copyIn(kernel), kernel.length, copyIn(initrd), initrd.length, 0, 0) !== 0) throw new Error('boot setup failed');
     if (jit) ex.sbc_jit(1);
     frameEvery = 100;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
+  if (os === 'jetson-orin-nano-gpu') {
+    postMessage({ type: 'status', text: 'loading the Jetson Orin rover demo…' });
+    const image = await fetchBytes('assets/jetson-orin-nano-4gb/copy-demo.Image', false);
+    if (ex.sbc_boot_orin_gpu_demo(copyIn(image), image.length) !== 0) throw new Error('boot setup failed');
+    ex.sbc_jit(jit ? 1 : 0);
+    frameEvery = 66;
     postMessage({ type: 'status', text: 'booting…' });
     loop();
     return;

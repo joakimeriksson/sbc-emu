@@ -1,8 +1,8 @@
 //! C ABI over the emulated boards for the browser (no wasm-bindgen; see web/worker.js): the
 //! Pi 4B (`sbc_boot`, `sbc_boot_sd`), the Tinker Board S (RK3288, `sbc_boot_tinker*`), the Orange
 //! Pi One (Allwinner H3, `sbc_boot_opi1`), the Orange Pi RV (StarFive JH7110, `sbc_boot_opirv`),
-//! the Orange Pi 5 (RK3588S, `sbc_boot_opi5`), the Jetson Nano (Tegra X1, `sbc_boot_nano`) and the
-//! ESP32-S31 (`sbc_boot_s31`). Single-threaded: one machine per module instance, driven from a Web
+//! the Orange Pi 5 (RK3588S, `sbc_boot_opi5`), the Jetson Nano (Tegra X1, `sbc_boot_nano`), the
+//! Jetson Orin Nano (Tegra234, `sbc_boot_orin_gpu_demo`) and the ESP32-S31 (`sbc_boot_s31`). Single-threaded: one machine per module instance, driven from a Web
 //! Worker. Exports for devices only one board has (the
 //! Pi's USB keyboard, GPIO, sensors, audio) do nothing on the others.
 #![allow(clippy::missing_safety_doc)]
@@ -64,6 +64,7 @@ enum Board {
     OrangePi5(Box<rk3588::Machine>, Opi5Boot),
     /// The Jetson Nano with what it was booted from, and its clock's time then (Unix seconds).
     JetsonNano(Box<tegra210::Machine>, DirectBoot, f64),
+    JetsonOrinNano(Box<tegra234::Machine>),
     /// The ESP32-S31-Function-CoreBoard-1, booting from its mask ROM and flash image, with the
     /// serial input not yet taken by UART0 (it refuses input until Linux has set it up).
     Esp32S31(Box<esp32s31::Machine>, std::collections::VecDeque<u8>),
@@ -86,16 +87,16 @@ struct TinkerBoot {
 
 impl Board {
     fn run(&mut self, budget: u64) -> Stop {
-        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget), Board::OrangePi5(m, _) => m.run(budget), Board::JetsonNano(m, ..) => m.run(budget), Board::Esp32S31(m, rx) => s31_run(m, rx, budget) }
+        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget), Board::OrangePi5(m, _) => m.run(budget), Board::JetsonNano(m, ..) => m.run(budget), Board::JetsonOrinNano(m) => m.run(budget), Board::Esp32S31(m, rx) => s31_run(m, rx, budget) }
     }
     fn now(&self) -> u64 {
-        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now(), Board::OrangePi5(m, _) => m.now(), Board::JetsonNano(m, ..) => m.now(), Board::Esp32S31(m, _) => { use esp_soc::SocBus as _; m.bus.cycles() * 25 / 8 } }
+        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now(), Board::OrangePi5(m, _) => m.now(), Board::JetsonNano(m, ..) => m.now(), Board::JetsonOrinNano(m) => m.now(), Board::Esp32S31(m, _) => { use esp_soc::SocBus as _; m.bus.cycles() * 25 / 8 } }
     }
     fn idle_until(&mut self, t: u64) {
-        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t), Board::OrangePi5(m, _) => m.idle_until(t), Board::JetsonNano(m, ..) => m.idle_until(t), Board::Esp32S31(..) => {} }
+        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t), Board::OrangePi5(m, _) => m.idle_until(t), Board::JetsonNano(m, ..) => m.idle_until(t), Board::JetsonOrinNano(m) => m.idle_until(t), Board::Esp32S31(..) => {} }
     }
     fn instret(&self) -> u64 {
-        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret(), Board::OrangePi5(m, _) => m.instret(), Board::JetsonNano(m, ..) => m.instret(), Board::Esp32S31(m, _) => m.cores.iter().map(|c| c.insn_count).sum() }
+        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret(), Board::OrangePi5(m, _) => m.instret(), Board::JetsonNano(m, ..) => m.instret(), Board::JetsonOrinNano(m) => m.instret(), Board::Esp32S31(m, _) => m.cores.iter().map(|c| c.insn_count).sum() }
     }
 }
 
@@ -410,6 +411,19 @@ pub unsafe extern "C" fn sbc_boot_nano(ram_mb: u32, unix: f64, k: *const u8, kle
     0
 }
 
+/// Boot the Orin GPU demo Image in a single-core Tegra234 with 256 MiB of RAM.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_orin_gpu_demo(k: *const u8, klen: usize) -> i32 {
+    if klen == 0 { return -1; }
+    let kernel = std::slice::from_raw_parts(k, klen);
+    let Ok(mut m) = tegra234::Machine::new(256 << 20, 1) else { return -1 };
+    m.enable_gpu();
+    m.enable_display();
+    if tegra234::boot::boot_linux(&mut m, kernel, None, tegra234::boot::DEFAULT_CMDLINE).is_err() { return -1; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::JetsonOrinNano(Box::new(m)), Some(0.0))));
+    0
+}
+
 /// ESP32-S31-Function-CoreBoard-1 (`esp32s31/examples/s31_linux.rs`): the mask ROM ELF and the
 /// flash image as `esptool write-flash 0x0` writes it; the chip boots from its ROM. Returns 0 on
 /// success.
@@ -447,10 +461,10 @@ fn s31_run(m: &mut esp32s31::Machine, rx: &mut std::collections::VecDeque<u8>, b
 }
 
 /// Which board is running: 0 none, 1 the Pi 4, 2 the Tinker Board, 3 the Orange Pi One, 4 the
-/// Orange Pi RV, 5 the Orange Pi 5, 6 the ESP32-S31, 7 the Jetson Nano.
+/// Orange Pi RV, 5 the Orange Pi 5, 6 the ESP32-S31, 7 the Jetson Nano, 8 the Jetson Orin Nano.
 #[no_mangle]
 pub extern "C" fn sbc_board() -> u32 {
-    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4, Board::OrangePi5(..) => 5, Board::Esp32S31(..) => 6, Board::JetsonNano(..) => 7 }).unwrap_or(0)
+    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4, Board::OrangePi5(..) => 5, Board::Esp32S31(..) => 6, Board::JetsonNano(..) => 7, Board::JetsonOrinNano(_) => 8 }).unwrap_or(0)
 }
 
 /// Turn the Jetson Nano's shader JIT on (1) or off (0) (maxwell-shader/src/jit); returns whether
@@ -504,6 +518,7 @@ pub extern "C" fn sbc_jit(on: u32) -> u32 {
         Board::OrangePiOne(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiRv(m, ..) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePi5(m, _) => if on != 0 { m.enable_jit() as u32 } else { for c in &mut m.cpus { c.jit = None; } 0 },
+        Board::JetsonOrinNano(m) => m.set_jit(on != 0) as u32,
         Board::JetsonNano(m, ..) => if on != 0 { m.enable_jit() as u32 } else { for c in &mut m.cpus { c.jit = None; } 0 },
         Board::Esp32S31(m, _) => { for c in &mut m.cores { c.blocks.jit_on = on != 0 && riscv_rv32::jit::AVAILABLE; } (on != 0 && riscv_rv32::jit::AVAILABLE) as u32 }
     }).unwrap_or(0)
@@ -531,6 +546,7 @@ pub extern "C" fn sbc_jit_hot(n: u32) {
         Board::OrangePiOne(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiRv(m, ..) => m.set_jit_hot(n),
         Board::OrangePi5(m, _) => for c in &mut m.cpus { if let Some(j) = c.jit.as_deref_mut() { j.hot = n.max(1); } },
+        Board::JetsonOrinNano(m) => for c in &mut m.cpus { if let Some(j) = c.jit.as_deref_mut() { j.hot = n.max(1); } },
         Board::JetsonNano(m, ..) => for c in &mut m.cpus { if let Some(j) = c.jit.as_deref_mut() { j.hot = n.max(1); } },
         Board::Esp32S31(m, _) => for c in &mut m.cores { c.blocks.jit_hot = n.clamp(1, u16::MAX as u32) as u16; },
     });
@@ -565,6 +581,7 @@ pub extern "C" fn sbc_jit_blocks() -> f64 {
         Board::OrangePiOne(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiRv(m, ..) => m.jit_compiled() as f64,
         Board::OrangePi5(m, _) => m.cpus.iter().filter_map(|c| c.jit.as_ref()).map(|j| j.compiled as f64).sum(),
+        Board::JetsonOrinNano(m) => m.cpus.iter().filter_map(|c| c.jit.as_ref()).map(|j| j.compiled as f64).sum(),
         Board::JetsonNano(m, ..) => m.cpus.iter().filter_map(|c| c.jit.as_ref()).map(|j| j.compiled as f64).sum(),
         Board::Esp32S31(m, _) => m.cores.iter().map(|c| c.blocks.compiled as f64).sum(),
     }).unwrap_or(0.0)
@@ -655,7 +672,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                         Board::OrangePiRv(old, fw, how) => opirv_restart(old, fw, how),
                         Board::OrangePi5(old, how) => opi5_restart(old, how),
                         Board::JetsonNano(old, how, unix) => nano_restart(old, how, *unix),
-                        Board::Esp32S31(..) => None,
+                        Board::JetsonOrinNano(_) | Board::Esp32S31(..) => None,
                     };
                     match restarted {
                         Some(m) => s.m = m,
@@ -773,6 +790,7 @@ pub extern "C" fn sbc_uart_in(b: u32) {
         Board::OrangePiOne(m, _) => { m.serial_input(b as u8); }
         Board::OrangePiRv(m, ..) => { m.serial_input(b as u8); }
         Board::OrangePi5(m, _) => { m.serial_input(b as u8); }
+        Board::JetsonOrinNano(m) => { m.serial_input(b as u8); }
         Board::JetsonNano(m, ..) => { m.serial_input(b as u8); }
         Board::Esp32S31(_, rx) => rx.push_back(b as u8),
     });
@@ -786,6 +804,7 @@ pub extern "C" fn sbc_uart_room() -> i32 {
         Board::OrangePiOne(m, _) => m.soc.uart.rx_room() as i32,
         Board::OrangePiRv(m, ..) => m.soc.uart.rx_room() as i32,
         Board::OrangePi5(m, _) => m.soc.uart.rx_room() as i32,
+        Board::JetsonOrinNano(m) => m.serial_room() as i32,
         Board::JetsonNano(m, ..) => m.soc.uart.rx_room() as i32,
         Board::Esp32S31(_, rx) => (rx.len() < 64) as i32,
     }).unwrap_or(0)
@@ -801,6 +820,7 @@ pub extern "C" fn sbc_uart_take() -> usize {
             Board::OrangePiOne(m, _) => m.take_serial_output(),
             Board::OrangePiRv(m, ..) => m.take_serial_output(),
             Board::OrangePi5(m, _) => std::mem::take(&mut m.soc.uart.out),
+            Board::JetsonOrinNano(m) => m.take_serial_output(),
             Board::JetsonNano(m, ..) => std::mem::take(&mut m.soc.uart.out),
             Board::Esp32S31(m, _) => std::mem::take(&mut m.console.uart0),
         };
@@ -820,6 +840,7 @@ pub extern "C" fn sbc_fb_render() -> *const u8 {
             Board::OrangePiOne(m, _) => m.soc.render(&mut s.fb),
             Board::OrangePiRv(m, ..) => m.soc.render(&mut s.fb),
             Board::OrangePi5(m, _) => m.soc.render(&mut s.fb),
+            Board::JetsonOrinNano(m) => m.render(&mut s.fb),
             Board::JetsonNano(m, ..) => m.render(&mut s.fb),
             Board::Esp32S31(..) => None,
         };
@@ -858,6 +879,7 @@ pub extern "C" fn sbc_stop_pc() -> f64 {
             Board::OrangePiOne(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
             Board::OrangePiRv(m, ..) => m.harts.iter().map(|h| h.pc).next().unwrap_or(0) as f64,
             Board::OrangePi5(m, _) => m.cpu().pc as f64,
+            Board::JetsonOrinNano(m) => m.cpus[m.current_core()].pc as f64,
             Board::JetsonNano(m, ..) => m.cpu().pc as f64,
             Board::Esp32S31(m, _) => m.cores[0].pc as f64,
         },

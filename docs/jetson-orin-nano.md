@@ -142,8 +142,20 @@ decodes full and incremental RFB updates, and checks that the rover moved.
 The first copy runlist is provisionally placed at BAR0 offset `0x800000`
 for bare-metal bring-up. The copy model covers pitch-linear 4 KiB mappings,
 multiline blits and one-word semaphore writes. The demo uses the copy engine
-and a simple framebuffer. Linux driver submission, shader execution and
-Tegra234 display-controller emulation remain separate milestones.
+and a simple framebuffer.
+
+To run the same image in the site worker, build the demo and stage a local
+WebAssembly build. Open `board.html?b=jetson-orin-nano-gpu` on the local site.
+
+```sh
+sh demos/orin-copy/build.sh
+tools/wasm-build.sh
+node tests/gpu/orin/wasm-smoke.mjs
+python3 -m http.server -d web 8791
+```
+
+The Node test runs the site worker with the AArch64 JIT and checks the rover's
+motion in the 640 × 360 RGBA frames it sends to the page.
 
 ### Driver binding
 
@@ -197,7 +209,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | The Linux fixture checks a known-answer Ampere shader. The CUDA userspace path and broader shader coverage remain pending. |
 | Graphics | The stock driver submits clipped and masked C797 color clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
-| Browser | Run the same shader and rendering checks on the WASM build with matching results. |
+| Browser | The site worker runs the standalone rover copy demo. Linux graphics and compute checks in WebAssembly remain pending. |
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
 Orin or Ampere modules. Reuse the Maxwell renderer and texture code where the

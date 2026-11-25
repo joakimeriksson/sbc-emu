@@ -105,6 +105,13 @@ const BOARDS = {
     stop: true,
     try: ['gpu-demo cubes', 'gpu-demo planet', 'gpu-demo swarm', 'gpu-demo fur', 'gpu-demo tunnel', 'gpu-demo shadow', 'gpu-demo', 'dmesg | grep -i nouveau'],
   },
+  'jetson-orin-nano-gpu': {
+    name: 'Jetson Orin Nano 4GB', title: 'Jetson Orin Nano rover demo', os: 'jetson-orin-nano-gpu',
+    ramMb: 256, screen: true, screenFirst: true, stop: true,
+    lede: 'Watch the emulated Jetson Orin Nano’s Ampere GPU move a rover sprite using the GA10B copy engine.',
+    note: 'The demo boots a standalone ARM64 image using 256 MiB of guest RAM.',
+    tm: 'NVIDIA, Jetson and Tegra are trademarks of NVIDIA Corporation. sbc-emu is not affiliated with NVIDIA.',
+  },
   'esp32s31': {
     name: 'ESP32-S31 Function CoreBoard', os: 'esp32s31', ramMb: 0,
     lede: 'A microcontroller running Linux: Espressif’s official flash image boots through the chip’s own mask ROM, U-Boot, OpenSBI and U-Boot again to Linux, on an emulated ESP32-S31 with two 32-bit RISC-V cores and 16 MB of RAM. Nothing runs on a server.',
