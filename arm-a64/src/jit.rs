@@ -1298,6 +1298,8 @@ impl Cpu {
                 e.pending_native += 1;
             } else if ld1_as_ldr(i).is_some_and(|w| self.emit_ldst(&mut e, w, pc)) {
                 // LD1/ST1 of one register: the same access as LDR/STR of a Q or D register
+            } else if self.emit_vstruct(&mut e, i, pc) {
+                // the other structure loads and stores (several registers, lanes, LDnR, Xm)
             } else if self.emit_excl(&mut e, i, pc) {
                 // exclusive and acquire/release accesses, CLREX
             } else if self.emit_ldst(&mut e, i, pc) {
@@ -1645,6 +1647,101 @@ impl Cpu {
         // ---- the slow path (the interpreter) goes after the block's last exit; the fast path
         // falls through, and counts this instruction at compile time like any native one
         let refill = (retry, (if load { 1 } else { 2 }) | (unpriv as u64) << 2 | (span as u64) << 8);
+        e.slow_paths.push(SlowPath { sites: slow, way1, spill, reload, i, pc, pending, done: e.out.len(), refill });
+        e.pending_native += 1;
+        e.unpin();
+        true
+    }
+
+    /// AdvSIMD structure loads and stores: LD1-LD4/ST1-ST4 (multiple structures), and one lane
+    /// or replicated (LD1-LD4/ST1-ST4 single structure, LD1R-LD4R), with no offset or
+    /// post-indexed by the size or by Xm. One micro-TLB probe covers the whole access (up to 64
+    /// bytes; a page crossing misses, see `emit_utlb`); then, with x14 the host address:
+    /// LD1/ST1 of whole registers are LDR/LDP (STR/STP) of Q or D registers on the cache
+    /// registers, the rest the host's own instruction, on the cache register itself when it
+    /// names one register, else on scratch v0..v3 (copied in for stores and lane loads, out
+    /// for loads). The slow path is the interpreter, which also takes the encodings it calls
+    /// UNDEFINED. No alignment checks: the interpreter makes none for these either.
+    fn emit_vstruct(&self, e: &mut Emit, i: u32, pc: u64) -> bool {
+        if self.ram.is_null() || bit(i, 31) || (self.sys.cpacr_el1 >> 20) & 3 != 3 { return false; }
+        let (q, post, load, rm, rn, rt) = (bit(i, 30), bit(i, 23), bit(i, 22), bits(i, 20, 16), bits(i, 9, 5), bits(i, 4, 0));
+        if !post && rm != 0 { return false; }
+        // registers named, bytes accessed, whole registers by LDR/LDP, a lane load (merges)
+        let (nregs, span, whole, lane) = match bits(i, 29, 24) {
+            0b001100 => {
+                let (rpt, selem) = match bits(i, 15, 12) {
+                    0b0000 => (1, 4), 0b0010 => (4, 1), 0b0100 => (1, 3), 0b0110 => (3, 1),
+                    0b0111 => (1, 1), 0b1000 => (1, 2), 0b1010 => (2, 1),
+                    _ => return false,
+                };
+                if bit(i, 21) || (selem > 1 && bits(i, 11, 10) == 3 && !q) { return false; }
+                (rpt * selem, rpt * selem * if q { 16 } else { 8 }, selem == 1, false)
+            }
+            0b001101 => {
+                let (opc, s, size) = (bits(i, 15, 13), bit(i, 12), bits(i, 11, 10));
+                let selem = (((opc & 1) << 1) | bit(i, 21) as u32) + 1;
+                let scale = match opc >> 1 {
+                    0 => 0,
+                    1 => { if size & 1 != 0 { return false; } 1 }
+                    2 => match size { 0 => 2, 1 if !s => 3, _ => return false },
+                    _ => { if !load || s { return false; } size }
+                };
+                (selem, selem << scale, false, opc >> 1 != 3 && load)
+            }
+            _ => return false,
+        };
+        if !load && self.jit.as_ref().is_some_and(|j| j.verify) { return false; } // verify mode logs stores in the interpreter
+        let pending = e.pending_native;
+        // ---- the cache registers, all allocated before the first branch to the slow path
+        let base = e.get(rn, R::Sp);
+        let idx = if post && rm != 31 { e.get(rm, R::Zr) } else { 31 };
+        let regs: Vec<u32> = (0..nregs).map(|k| {
+            let g = (rt + k) % 32;
+            if load && !lane { e.vdef(g) } else { e.vget(g) }
+        }).collect();
+        let spill = e.spill_code();
+        let reload = e.reload_code();
+        let retry = e.out.len();
+        e.out.push(0x9100_0000 | (base << 5) | 13); // mov x13, base: the VA
+        let mut slow: Vec<usize> = Vec::new();
+        let way1 = self.emit_utlb(e, if load { 1 } else { 2 }, span, false, !load, &mut slow, true, true);
+        let tmp = 14u32;
+        if whole {
+            // LD1/ST1 of 1-4 registers: on a little-endian machine the bytes of consecutive
+            // LDR/STR Qt (Dt for 64-bit vectors), whatever the arrangement
+            let (one, two) = match (q, load) {
+                (true, true) => (0x3dc0_0000u32, 0xad40_0000u32), (true, false) => (0x3d80_0000, 0xad00_0000),
+                (false, true) => (0xfd40_0000, 0x6d40_0000), (false, false) => (0xfd00_0000, 0x6d00_0000),
+            };
+            let mut k = 0;
+            while k < nregs as usize {
+                if k + 1 < nregs as usize {
+                    e.out.push(two | ((k as u32) << 15) | (regs[k + 1] << 10) | (tmp << 5) | regs[k]); // ldp/stp, [x14, #k * size]
+                    k += 2;
+                } else {
+                    e.out.push(one | ((k as u32) << 10) | (tmp << 5) | regs[k]); // ldr/str, [x14, #k * size]
+                    k += 1;
+                }
+            }
+        } else {
+            // the host's own instruction: no offset (post-index and Rm cleared), base x14
+            let host = (i & !((1 << 23) | (0x1f << 16) | 0x3ff)) | (tmp << 5);
+            let mov = |d: u32, n: u32| 0x4ea0_1c00 | (n << 16) | (n << 5) | d; // orr vd.16b, vn.16b, vn.16b
+            if nregs == 1 {
+                e.out.push(host | regs[0]);
+            } else {
+                if !load || lane { for (k, &h) in regs.iter().enumerate() { e.out.push(mov(k as u32, h)); } }
+                e.out.push(host); // {v0..}
+                if load { for (k, &h) in regs.iter().enumerate() { e.out.push(mov(h, k as u32)); } }
+            }
+        }
+        if load { for k in 0..nregs { e.vdirty((rt + k) % 32); } }
+        // ---- post-index: by the bytes accessed or by Xm
+        if post {
+            e.out.push(if rm == 31 { 0x9100_0000 | (span << 10) | (base << 5) | base } else { 0x8b00_0000 | (idx << 16) | (base << 5) | base });
+            e.dirty(rn, R::Sp);
+        }
+        let refill = (retry, (if load { 1 } else { 2 }) | (span as u64) << 8);
         e.slow_paths.push(SlowPath { sites: slow, way1, spill, reload, i, pc, pending, done: e.out.len(), refill });
         e.pending_native += 1;
         e.unpin();

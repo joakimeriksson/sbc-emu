@@ -55,6 +55,17 @@ with `--no-display`; single runs, some next to other jobs, so ±10%):
 | main on 20 November 2026 (the Orange Pi 5 work since; the next row's baseline, measured next to it) | 24.1 s (16.4 s) |
 | FPSR live in the host register across blocks (each `MRS`/`MSR FPSR` costs 3–4 ns on Apple cores; blocks with FP saved and restored it at every boundary); micro-TLB entries hold PA − VA and the set index is the page number's low bits, so pages P and P + 1 never share a set and a page-crossing access needs no separate check (about 10 host instructions per load instead of 17); a miss refills the entry through a shared stub (`h_tlb`, no interpreter) and retries; interpreter calls through a shared stub (a call site went from ~37 instructions to ~6); blocks continue past short forward conditional branches; direct branches into another page linked too, behind a check that the fetch micro-TLB still maps the target page to the same physical page (42% of dispatcher entries in python3) | 19.0 s (13.5 s) |
 
+AdvSIMD structure loads and stores run natively too: LD1-LD4/ST1-ST4 of one to four registers,
+of one lane, and LD1R-LD4R, with no offset or post-indexed by the size or by Xm. One micro-TLB
+probe covers the whole access (up to 64 bytes; one that crosses a page goes to the interpreter);
+LD1/ST1 of whole registers become LDR/LDP (STR/STP) of Q or D registers on the cache registers, the
+others the host's own instruction (through scratch v0-v3 when they name several registers). Before,
+only one-register LD1/ST1 were native: ncnn's YOLOv8n on the Jetson Nano's CPU (`ld1 {v0.4s-v3.4s},
+[x8], #64` in every kernel) handed 491 M instructions to the interpreter in 12 frames, 89 M after
+(the rest are system instructions, and structure accesses across a page); a frame took 3.1 s of host
+time and now takes 0.45 s (the guest's own clock, 1 ns per instruction, says 0.29 s in both).
+`arm-a64/tests/jit_neon_ldst.rs` checks every encoding of both groups against the interpreter.
+
 Blocks average about 5 guest instructions; a chain now runs about 100 before it returns to the
 machine loop. A chain stops at the budget/deadline and whenever an interpreted instruction may need
 the machine's attention (`chain_stop`: device access, MSR, cache/TLB maintenance, exceptions, ERET).
