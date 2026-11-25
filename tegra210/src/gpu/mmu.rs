@@ -137,6 +137,67 @@ impl maxwell::Memory for View<'_> {
     fn share(&self) -> Option<Box<dyn maxwell::Memory + Send + '_>> {
         Some(Box::new(Reader { ram: self.ram, smmu: self.smmu, mmu: Mmu::default(), space: self.space }))
     }
+    fn split_mut(&mut self, n: usize) -> Option<Vec<Box<dyn maxwell::Memory + Send + '_>>> {
+        let (ram, len) = (self.ram.as_mut_ptr(), self.ram.len());
+        let (smmu, space) = (self.smmu, self.space);
+        Some((0..n).map(|_| Box::new(Writer { ram, len, smmu, mmu: Mmu::default(), space, _ram: std::marker::PhantomData }) as Box<dyn maxwell::Memory + Send + '_>).collect())
+    }
+}
+
+/// Memory as a channel sees it, for one of several threads that read and write it at once (the
+/// workgroups of a compute launch): RAM is shared with the others through a pointer.
+struct Writer<'a> {
+    ram: *mut u8,
+    len: usize,
+    smmu: &'a Smmu,
+    mmu: Mmu,
+    space: Space,
+    _ram: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+// SAFETY: the views of one split borrow the RAM mutably for as long as they live; their threads
+// write different bytes (workgroups that write the same bytes race on the GPU as well), and page
+// tables, which every view reads, are not written by shaders.
+unsafe impl Send for Writer<'_> {}
+
+impl Writer<'_> {
+    fn ram(&self) -> &[u8] {
+        // SAFETY: see the type
+        unsafe { std::slice::from_raw_parts(self.ram, self.len) }
+    }
+}
+
+impl maxwell::Memory for Writer<'_> {
+    fn read(&self, mut va: u64, mut out: &mut [u8]) {
+        let ram = self.ram();
+        while !out.is_empty() {
+            let n = (0x1000 - (va & 0xfff) as usize).min(out.len());
+            let (part, rest) = out.split_at_mut(n);
+            match self.mmu.translate(self.space, va, self.smmu, ram) {
+                Some(p) => {
+                    let o = p.offset + (va & 0xfff) as usize;
+                    part.copy_from_slice(&ram[o..o + n]);
+                }
+                None => part.fill(0),
+            }
+            out = rest;
+            va = va.wrapping_add(n as u64);
+        }
+    }
+    fn write(&mut self, mut va: u64, mut data: &[u8]) {
+        while !data.is_empty() {
+            let n = (0x1000 - (va & 0xfff) as usize).min(data.len());
+            if let Some(p) = self.mmu.translate(self.space, va, self.smmu, self.ram()).filter(|p| p.write) {
+                let o = p.offset + (va & 0xfff) as usize;
+                if o + n <= self.len {
+                    // SAFETY: in bounds; see the type
+                    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ram.add(o), n) };
+                }
+            }
+            data = &data[n..];
+            va = va.wrapping_add(n as u64);
+        }
+    }
 }
 
 /// Memory as a channel sees it, for reading on another thread.
