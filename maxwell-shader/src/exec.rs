@@ -571,7 +571,17 @@ pub fn run<const N: usize, H: Host<N>>(
     fuel: &mut u64,
 ) -> Exit {
     let code = &p.code[..];
-    let fault = |pc: u32| Exit::Fault(p.words.get(pc as usize).or(p.words.last()).map_or(0, |w| w.0));
+    let fault = |pc: u32| {
+        if std::env::var_os("SBC_SHADER_FAULT").is_some() {
+            let w = p.words.get(pc as usize).copied();
+            eprintln!("[shader fault] at {:#x} word {:#018x} {:?}", w.map_or(0, |w| w.0), w.map_or(0, |w| w.1), p.code.get(pc as usize).map(|i| &i.op));
+            if w.is_none() {
+                let prev = (pc as usize).checked_sub(1).and_then(|k| p.words.get(k).map(|w| (w.0, w.1, p.code[k].op, p.code[k].pred)));
+                eprintln!("[shader fault]   pc index {pc} of {} entry {:#x}; before: {prev:x?}", p.code.len(), p.words.get(p.entry as usize).map_or(0, |w| w.0));
+            }
+        }
+        Exit::Fault(p.words.get(pc as usize).or(p.words.last()).map_or(0, |w| w.0))
+    };
     let jit = if N == crate::jit::LANES { p.jit() } else { None };
     loop {
         if *fuel == 0 {
@@ -879,6 +889,33 @@ pub fn run<const N: usize, H: Host<N>>(
                     });
                     l.flags_co(m, c, 0);
                 }
+                l.put(d, m, r);
+            }
+            Op::Lea { d, a, b, hi, shift, neg_a, x, cc, pd } => {
+                let (lo, v) = (l.gpr[a as usize], l.src(h, b));
+                let up = hi.map(|c| l.gpr[c as usize]);
+                let sh = shift as u32 & 31;
+                let mut c_out = 0;
+                let r = std::array::from_fn(|i| {
+                    let wide = match up {
+                        Some(c) => (c[i] as u64) << 32 | lo[i] as u64,
+                        None => lo[i] as u64,
+                    };
+                    let wide = if neg_a { wide.wrapping_neg() } else { wide };
+                    let s = match up {
+                        Some(_) => (wide << sh >> 32) as u32,
+                        None => (wide << sh) as u32,
+                    };
+                    let cin = if x { (l.carry >> i & 1) as u64 } else { 0 };
+                    let t = s as u64 + v[i] as u64 + cin;
+                    c_out |= ((t >> 32 != 0) as u32) << i;
+                    t as u32
+                });
+                if cc {
+                    l.flags_i(m, r);
+                    l.flags_co(m, c_out, 0);
+                }
+                l.putp(pd, m, c_out);
                 l.put(d, m, r);
             }
             Op::IMul { d, a, b, sa, sb, hi, cc } => {

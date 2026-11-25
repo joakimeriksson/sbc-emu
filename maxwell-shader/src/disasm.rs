@@ -376,6 +376,16 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
         Op::IScAdd { d, a, b, shift, neg_a, neg_b, cc: c } => {
             format!("iscadd{} {} {} {} {shift}", cc(c), R(d), neg(r(a), neg_a), neg(b, neg_b))
         }
+        Op::Lea { d, a, b, hi, shift, neg_a, x, cc: c, pd } => format!(
+            "lea{}{}{} p{pd} {} {} {}{} {shift}",
+            dot(hi.is_some(), ".hi"),
+            dot(x, ".x"),
+            cc(c),
+            R(d),
+            neg(r(a), neg_a),
+            i(b),
+            hi.map_or(String::new(), |c| format!(" {}", R(c)))
+        ),
         Op::IMul { d, a, b, sa, sb, hi, .. } => {
             format!("imul.{}{}{} {} {} {}", sign(sa), sign(sb), dot(hi, ".hi"), R(d), R(a), i(b))
         }

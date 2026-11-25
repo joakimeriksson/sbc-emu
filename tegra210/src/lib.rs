@@ -134,6 +134,13 @@ pub struct Soc {
 }
 
 impl Soc {
+    /// The host1x sync points the GPU's channels incremented.
+    fn gpu_syncpts(&mut self) {
+        for point in std::mem::take(&mut self.gpu.syncpts) {
+            self.host1x.increment(point);
+        }
+    }
+
     fn ram_offset(&self, addr: u64, size: usize) -> Option<usize> {
         let off = addr.checked_sub(RAM_BASE)?;
         (off + size as u64 <= self.ram.len() as u64).then_some(off as usize)
@@ -186,7 +193,10 @@ impl Soc {
             self.gpu.read(word - gpu::BAR0)
         } else if at(gpu::BAR1, gpu::SIZE) {
             self.gpu.tick(self.now);
-            self.gpu.bar1_read(word - gpu::BAR1, &self.smmu, &mut self.ram)
+            self.gpu.points.copy_from_slice(&self.host1x.points);
+            let v = self.gpu.bar1_read(word - gpu::BAR1, &self.smmu, &mut self.ram);
+            self.gpu_syncpts();
+            v
         } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
             self.dc[k].read(word - dc::BASE[k])
         } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {
@@ -262,10 +272,14 @@ impl Soc {
             self.host1x.write(word - host1x::BASE, value, &self.smmu, &dma);
         } else if at(gpu::BAR0, gpu::SIZE) {
             self.gpu.tick(self.now);
+            self.gpu.points.copy_from_slice(&self.host1x.points);
             self.gpu.write(word - gpu::BAR0, value, &self.smmu, &mut self.ram);
+            self.gpu_syncpts();
         } else if at(gpu::BAR1, gpu::SIZE) {
             self.gpu.tick(self.now);
+            self.gpu.points.copy_from_slice(&self.host1x.points);
             self.gpu.bar1_write(word - gpu::BAR1, value, &self.smmu, &mut self.ram);
+            self.gpu_syncpts();
         } else if let Some(k) = dc::BASE.iter().position(|&b| at(b, dc::SIZE)) {
             self.dc[k].write(word - dc::BASE[k], value, self.now);
         } else if let Some(k) = sor::BASE.iter().position(|&b| at(b, sor::SIZE)) {
@@ -368,12 +382,12 @@ impl Soc {
             }
             self.gic.set_level(irq, d.irq());
         }
-        for point in std::mem::take(&mut self.gpu.syncpts) {
-            self.host1x.increment(point);
-        }
+        self.gpu_syncpts();
         self.gic.set_level(host1x::IRQ, self.host1x.irq());
         self.gpu.tick(self.now);
+        self.gpu.points.copy_from_slice(&self.host1x.points);
         self.gpu.poll(&self.smmu, &mut self.ram);
+        self.gpu_syncpts();
         self.gic.set_level(gpu::IRQ, self.gpu.irq());
         self.pump_network();
         self.pcie.update();

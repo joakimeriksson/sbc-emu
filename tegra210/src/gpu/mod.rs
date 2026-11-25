@@ -45,6 +45,9 @@ struct Channel {
     /// the instance block's register value (bit 31: bound)
     inst: u32,
     enabled: bool,
+    /// the instance block of the last bind (unbinding writes 0; binding the same block again
+    /// is the same channel)
+    bound: u32,
 }
 
 pub struct Gpu {
@@ -66,6 +69,8 @@ pub struct Gpu {
     pub submissions: u64,
     /// host1x sync points the channels incremented, for the SoC to apply
     pub syncpts: Vec<usize>,
+    /// host1x's sync point values, as the SoC last gave them (channels wait on them)
+    pub points: Vec<u32>,
     /// host time spent executing them
     pub busy: std::time::Duration,
     /// a channel waits for a semaphore; when to look again
@@ -147,6 +152,7 @@ impl Default for Gpu {
             trace: std::env::var_os("SBC_TRACE_GPU").is_some(),
             submissions: 0,
             syncpts: Vec::new(),
+            points: vec![0; crate::host1x::POINTS],
             busy: Default::default(),
             waiting: false,
             retry: 0,
@@ -277,8 +283,18 @@ impl Gpu {
             0x80_0000..=0x80_0fff => {
                 let c = &mut self.channels[(o as usize >> 3) & 0x1ff];
                 if o & 4 == 0 {
-                    if c.inst != v {
-                        self.host.forget((o as u32 >> 3) & 0x1ff);
+                    // a channel bound to another instance block is a new one; unbinding, and binding
+                    // the same block again (nvgpu does it when the GPU comes back from power gating),
+                    // keeps what the channel's context holds: its subchannels' classes, a half-run
+                    // push buffer, a semaphore it waits for
+                    if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+                        eprintln!("[chan] {} inst {:#x} -> {v:#x}", (o >> 3) & 0x1ff, c.inst);
+                    }
+                    if v >> 31 != 0 {
+                        if (c.bound ^ v) & 0x0fff_ffff != 0 {
+                            self.host.forget((o as u32 >> 3) & 0x1ff);
+                        }
+                        c.bound = v;
                     }
                     c.inst = v;
                 } else {
@@ -399,7 +415,12 @@ impl Gpu {
                 let inst = ((c.inst & 0x0fff_ffff) as u64) << 12;
                 let space = mmu::space(inst, smmu, ram);
                 let mut view = mmu::View { ram, smmu, mmu: &self.mmu, space, fault: Default::default() };
-                let done = self.host.run_channel(id, inst, &mut view, now);
+                let done = self.host.run_channel(id, inst, &mut view, now, &mut self.points);
+                if let Some((va, write)) = view.fault.get() {
+                    if std::env::var_os("SBC_SHADER_FAULT").is_some() {
+                        eprintln!("[gpu] channel {id}: unmapped {} at {va:#x}", if write { "write" } else { "read" });
+                    }
+                }
                 self.submissions += done.entries;
                 self.syncpts.extend(&done.syncpts);
                 waiting |= done.waiting;

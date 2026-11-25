@@ -122,6 +122,7 @@ impl Compute {
             // a semaphore
             0x1b0c => {
                 let at = self.address(0x1b00);
+                if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] compute report {at:#x} = {:#x} (op {v:#x})", self.r(0x1b08)); }
                 if v & 3 == 0 && v >> 28 & 1 != 0 {
                     mem.write(at, &self.r(0x1b08).to_le_bytes());
                 } else if v & 1 == 0 {
@@ -148,6 +149,7 @@ impl Compute {
             self.run(&launch, &program, pipe, mem);
         }
         for (at, payload, short) in launch.releases {
+            if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] qmd release {at:#x} = {payload:#x}"); }
             mem.write(at, &payload.to_le_bytes());
             if !short {
                 mem.write(at + 8, &now.to_le_bytes());

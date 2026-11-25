@@ -833,3 +833,36 @@ fn endless_pushes() {
     let e = run(&p, &mut l, &mut Mem::default(), &mut fuel);
     assert!(matches!(e, Exit::Fault(_)), "{e:?}");
 }
+
+/// LEA and LEA.HI (NVIDIA's compiler builds 64-bit addresses with them): (r5:r4) = (r3:r2) +
+/// ((r1:r0) << s), the carry through CC; the constant form of LEA.HI; the words TensorRT's
+/// kernels use decode.
+#[test]
+fn lea_builds_64_bit_addresses() {
+    let mut r = Rng(11);
+    for _ in 0..2000 {
+        let v: [[u32; 4]; 4] = std::array::from_fn(|_| r.lanes());
+        let regs = [(0, v[0]), (1, v[1]), (2, v[2]), (3, v[3])];
+        let s = (r.next() & 7) as u64;
+        let l = exec(
+            &[
+                word(0x5bd7, &[(0, 8, 4), (8, 8, 0), (20, 8, 2), (39, 5, s), (47, 1, 1)]),
+                word(0x5bdf, &[(0, 8, 5), (8, 8, 0), (20, 8, 3), (39, 8, 1), (28, 5, s), (38, 1, 1)]),
+                // LEA.HI with c[0][0x144] (the test's constant is index << 16 | offset)
+                word(0x1800 | s << 3, &[(0, 8, 6), (8, 8, 0), (20, 14, 0x144 >> 2), (39, 8, 1)]),
+            ],
+            &regs,
+        );
+        for i in 0..4 {
+            let x = v[0][i] as u64 | (v[1][i] as u64) << 32;
+            let base = v[2][i] as u64 | (v[3][i] as u64) << 32;
+            let got = l.gpr[4][i] as u64 | (l.gpr[5][i] as u64) << 32;
+            assert_eq!(got, base.wrapping_add(x << s), "shift {s}");
+            assert_eq!(l.gpr[6][i], 0x144u32.wrapping_add((x << s >> 32) as u32));
+        }
+    }
+    for w in [0x5bd7_8100_00e7_130eu64, 0x5bd7_8100_00b7_110b, 0x5bd7_8100_0107_1510, 0x4bd7_8100_05e7_0f09] {
+        let p = Program::decode(&assemble(&[w])).unwrap();
+        assert!(p.any(|o| matches!(o, Op::Lea { .. })), "{w:#x}: {p}");
+    }
+}

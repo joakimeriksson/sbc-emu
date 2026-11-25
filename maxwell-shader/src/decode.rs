@@ -243,6 +243,20 @@ fn decode_op(addr: u32, w: W) -> Option<Op> {
         _ => {}
     }
 
+    // LEA.HI with a constant: its own layout
+    if top & 0xfc00 == 0x1800 {
+        return Some(Op::Lea {
+            d: w.d(),
+            a: w.a(),
+            b: w.cb(),
+            hi: Some(w.rc()),
+            shift: w.f(51, 5) as u8,
+            neg_a: w.b(56),
+            x: w.b(57),
+            cc: w.b(47),
+            pd: w.f(48, 3) as u8,
+        });
+    }
     // Three-source operations: which of the sources is the constant is in the opcode.
     if let Some(op) = three_source(w, top) {
         return Some(op);
@@ -534,6 +548,19 @@ fn two_source(w: W, form: Form, sel: u32) -> Option<Op> {
             x: w.b(43),
             sat: w.b(50),
             cc,
+        },
+        // LEA (the low three bits of the selector are the predicate written)
+        0xbd0 => Op::Lea { d, a, b: ib, hi: None, shift: w.f(39, 5) as u8, neg_a: w.b(45), x: w.b(46), cc, pd: w.f(48, 3) as u8 },
+        0xbd8 if form == Form::Reg => Op::Lea {
+            d,
+            a,
+            b: ib,
+            hi: Some(w.rc()),
+            shift: w.f(28, 5) as u8,
+            neg_a: w.b(37),
+            x: w.b(38),
+            cc,
+            pd: w.f(48, 3) as u8,
         },
         0xc18 => Op::IScAdd {
             d,

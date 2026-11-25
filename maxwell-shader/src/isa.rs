@@ -399,6 +399,9 @@ pub enum Op {
     /// `shift`: 0 plain, 1 (a + b) >> 16, 2 (a + b) << 16; `half`: 0 word, 1 H0, 2 H1 per source.
     IAdd3 { d: Reg, a: Reg, b: Src, c: Reg, neg: [bool; 3], half: [u8; 3], shift: u8, x: bool, cc: bool },
     IScAdd { d: Reg, a: Reg, b: Src, shift: u8, neg_a: bool, neg_b: bool, cc: bool },
+    /// LEA: d = (a << shift) + b; LEA.HI (`hi`: the high word's register c): d = the high word of
+    /// (c:a << shift) + b. X adds the carry; the carry out goes to CC (with `cc`) and to `pd`.
+    Lea { d: Reg, a: Reg, b: Src, hi: Option<Reg>, shift: u8, neg_a: bool, x: bool, cc: bool, pd: u8 },
     IMul { d: Reg, a: Reg, b: Src, sa: bool, sb: bool, hi: bool, cc: bool },
     IMad { d: Reg, a: Reg, b: Src, c: Src, sa: bool, sb: bool, hi: bool, neg_ab: bool, neg_c: bool, sat: bool, x: bool, cc: bool },
     Xmad { d: Reg, a: Reg, b: Src, c: Src, ha: bool, hb: bool, sa: bool, sb: bool, psl: bool, mrg: bool, mode: u8, x: bool, cc: bool },
