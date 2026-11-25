@@ -13,6 +13,8 @@ use crate::isa::*;
 
 /// Where uniform registers live among the general ones.
 pub const UNIFORM_BASE: u8 = 192;
+/// Two general registers the decoder uses to put an address together (below the uniform ones).
+pub const SCRATCH: Reg = UNIFORM_BASE - 2;
 /// Bytes per instruction.
 pub const SIZE: u32 = 16;
 
@@ -135,6 +137,18 @@ fn lut_swap_bc(lut: u8) -> u8 {
 pub fn decode(addr: u32, raw: u128) -> Vec<Inst> {
     let w = W(raw);
     let pred = w.pred(12, 15);
+    // @G BRA C, target: a branch on two predicates. Lanes without G go on to the next
+    // instruction; the others branch where C holds.
+    let cond = w.pred(87, 90);
+    if w.opcode() == 0x947 && !w.b(32) && (cond.idx != 7 || cond.not) {
+        let mut out = Vec::new();
+        if pred.idx != 7 || pred.not {
+            let skip = Pred { idx: pred.idx, not: !pred.not };
+            out.push(Inst { pred: skip, op: Op::Bra { t: addr + SIZE, cond: 15, all: false } });
+        }
+        out.push(Inst { pred: cond, op: Op::Bra { t: rel(addr, w), cond: 15, all: false } });
+        return out;
+    }
     let ops = decode_ops(addr, w).unwrap_or_else(|| vec![Op::Invalid(raw as u64)]);
     ops.into_iter().map(|op| Inst { pred, op }).collect()
 }
@@ -150,6 +164,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         0x918 => return one(Op::Nop),
         // Convergence-barrier bookkeeping, warp synchronization, dependency waits.
         0x355 | 0x356 | 0x956 | 0xf55 | 0x148 | 0x948 | 0x91a => return one(Op::Nop),
+        // BREAK leaves a convergence barrier; the SSY/SYNC model needs nothing for that.
+        0x942 => return one(Op::Nop),
         0x947 => {
             if w.b(32) {
                 return None;
@@ -196,18 +212,62 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             let ty = mem_ty(w.f(73, 3))?;
             return one(Op::Ldc { d: w.reg(16), idx: w.f(54, 5) as u8, a: w.reg(24), off: w.sf(38, 16), ty, mode: w.f(78, 2) as u8 });
         }
+        // (0x38x: the same without a uniform register)
+        0x381 | 0x386 | 0x383 | 0x387 | 0x384 | 0x388 => {
+            let ty = mem_ty(w.f(73, 3))?;
+            let (a, off, data, d) = (w.reg(24), w.sf(40, 24), w.reg(32), w.reg(16));
+            let wide = w.b(72);
+            // shared accesses scale their register (.X4, .X8, .X16 in bits 78..80)
+            let stride = if matches!(opcode, 0x384 | 0x388) { w.f(78, 2) } else { 0 };
+            let mut ops = Vec::new();
+            let a = if stride != 0 && a != RZ {
+                let shift = [0, 2, 3, 4][stride as usize];
+                ops.push(Op::IScAdd { d: SCRATCH, a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false });
+                SCRATCH
+            } else {
+                a
+            };
+            ops.push(match opcode {
+                0x381 => Op::Ld { d, a, off, ty, wide },
+                0x386 => Op::St { r: data, a, off, ty, wide },
+                0x383 => Op::Ldl { d, a, off, ty },
+                0x387 => Op::Stl { r: data, a, off, ty },
+                0x384 => Op::Lds { d, a, off, ty },
+                _ => Op::Sts { r: data, a, off, ty },
+            });
+            return Some(ops);
+        }
         0x981 | 0x986 | 0x983 | 0x987 | 0x984 | 0x988 => {
             let ty = mem_ty(w.f(73, 3))?;
             let a = w.reg(24);
             let off = w.sf(40, 24);
+            // With a 64-bit address register a global access names a memory descriptor there
+            // (desc[URn], a cache policy); with a 32-bit one the uniform register pair is the
+            // base the register adds to: [R.U32+UR]. Local and shared uniform parts are not
+            // modelled.
             let uniform = if matches!(opcode, 0x981 | 0x983 | 0x984) { w.ureg(32) } else { w.ureg(64) };
-            if w.b(91) && uniform != RZ {
-                return None;
-            }
             let data = w.reg(32);
             let d = w.reg(16);
             let wide = w.b(90);
-            return one(match opcode {
+            let global = matches!(opcode, 0x981 | 0x986);
+            if w.b(91) && uniform != RZ && !(global && wide) {
+                if !global {
+                    return None;
+                }
+                let add = |d: Reg, a: Reg, b: Reg, x: bool| Op::IAdd3 { d, a, b: Src::Reg(b), c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x, cc: true };
+                let a = SCRATCH;
+                let access = if opcode == 0x981 { Op::Ld { d, a, off, ty, wide: true } } else { Op::St { r: data, a, off, ty, wide: true } };
+                return Some(vec![add(SCRATCH, w.reg(24), uniform, false), add(SCRATCH + 1, RZ, uniform + 1, true), access]);
+            }
+            // Shared accesses scale their register: .X4, .X8, .X16 (bits 78..80).
+            let stride = if matches!(opcode, 0x984 | 0x988) { w.f(78, 2) } else { 0 };
+            let (a, mut ops) = if stride != 0 && a != RZ {
+                let shift = [0, 2, 3, 4][stride as usize];
+                (SCRATCH, vec![Op::IScAdd { d: SCRATCH, a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false }])
+            } else {
+                (a, Vec::new())
+            };
+            ops.push(match opcode {
                 0x981 => Op::Ld { d, a, off, ty, wide },
                 0x986 => Op::St { r: data, a, off, ty, wide },
                 0x983 => Op::Ldl { d, a, off, ty },
@@ -215,6 +275,7 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
                 0x984 => Op::Lds { d, a, off, ty },
                 _ => Op::Sts { r: data, a, off, ty },
             });
+            return Some(ops);
         }
         0x321 => {
             return one(Op::Ald {
@@ -402,8 +463,14 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         }
         (0x019, _) => {
             let ty = w.f(73, 2);
+            // SHF.L without .HI: the low word, a plain shift (Maxwell's SHF.L gives the high one)
+            if !w.b(76) && !w.b(80) {
+                return one(Op::Shl { d, a: s.a, b: s.b, wrap: w.b(75), x: false, cc: false });
+            }
             Op::Shf { d, lo: s.a, hi: reg_of(s.c)?, b: s.b, right: w.b(76), high: w.b(80), wrap: w.b(75), wide: ty < 2, signed: ty == 0 || ty == 2, cc: false }
         }
+        // F2FP.PACK_AB (bits 72.. 0: two F32 into F16)
+        (0x03e, false) if w.f(72, 3) == 0 => Op::PackHalves { d, a: s.a, b: s.b, rnd: w.rnd(78) },
         (0x007, _) => Op::Sel { d, a: s.a, b: s.b, p: w.pred(87, 90) },
         // FSEL: SEL of floats
         (0x008, false) => {
@@ -413,9 +480,20 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             Op::Sel { d, a: s.a, b: s.b, p: w.pred(87, 90) }
         }
         (0x016, _) => Op::Prmt { d, a: s.a, b: s.b, c: s.c, mode: w.f(72, 3) as u8 },
+        // LEA.HI: b + the high word of (c:a) << shift
+        (0x011, _) if w.b(80) => {
+            if w.b(74) || w.b(72) || s.b == Src::Reg(d) {
+                return None; // .X, a negated intermediate, or a destination that is b
+            }
+            let shift = w.f(75, 5);
+            return Some(vec![
+                Op::Shf { d, lo: s.a, hi: reg_of(s.c)?, b: Src::Imm(shift), right: false, high: true, wrap: false, wide: true, signed: false, cc: false },
+                Op::IAdd3 { d, a: d, b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: false, cc: false },
+            ]);
+        }
         (0x011, _) => {
-            if w.b(80) || w.b(74) {
-                return None; // LEA.HI and LEA.X
+            if w.b(74) {
+                return None; // LEA.X
             }
             Op::IScAdd { d, a: s.a, b: s.b, shift: w.f(75, 5) as u8, neg_a: w.b(72), neg_b: false, cc: false }
         }
@@ -477,6 +555,7 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
 
 fn half(w: W) -> Option<Op> {
     let form = w.f(9, 3);
+    let op9 = w.opcode() & 0x1ff;
     let m = |abs, neg| Mod { abs: w.b(abs), neg: w.b(neg) };
     let cb = || Src::Cb(w.f(54, 5) as u8, w.f(38, 16));
     // (source, modifiers, swizzle) of the 32-bit slot and of the slot at bits 64..72
@@ -496,9 +575,9 @@ fn half(w: W) -> Option<Op> {
     let a = w.reg(24);
     let srcs = HalfSrcs { a, b: b.0, c: c.0, swz: [w.f(74, 2) as u8, b.2, c.2], m: [m(73, 72), b.1, c.1] };
     let (d, ftz, sat, f32) = (w.reg(16), w.b(80), w.b(77), w.b(78));
-    let op9 = w.opcode() & 0x1ff;
-    if w.b(85) {
-        return None; // bfloat16
+    // bfloat16: bit 65 for HSETP2 (whose second predicate is at 84..87), else bit 85
+    if w.b(if op9 == 0x034 { 65 } else { 85 }) {
+        return None;
     }
     // HADD2, HMUL2 and HSETP2 take their second operand from b, or from c in forms 2, 3 and 7.
     let s2 = if matches!(form, 2 | 3 | 7) {
@@ -832,5 +911,67 @@ mod tests {
         assert_eq!(lut_swap_bc(0xf0 & 0xcc), 0xf0 & 0xaa);
         assert_eq!(lut_swap_bc(0xcc ^ 0xaa), 0xcc ^ 0xaa);
         assert_eq!(lut_swap_bc(0xaa), 0xcc);
+    }
+
+    /// NVIDIA's GLES compute shader of gltest: v[i] = group * 1000 + s[63 - tid], s[tid] =
+    /// i * i + c[2][0x20], through shared memory and a barrier, stored at c[0][0xc20] + 4 i.
+    #[test]
+    fn a_compute_shader_with_shared_memory_and_uniform_addresses() {
+        const CODE: &[u64] = &[0x00000002ff007c0c, 0x000fda000bf05070, 0x0000012000000947, 0x000fea0003800000, 0xffffffff00007956, 0x000fe80000000000, 0x0000000000017f55, 0x000fe80000100000, 0x0000000001027f55, 0x000fe80000100000, 0x0000000002037f55, 0x000fe80000100000, 0x0000000003047f55, 0x000fe80000100000, 0x0000000004057f55, 0x000fe80000100000, 0x0000000005067f55, 0x000fe80000100000, 0x0000000006077f55, 0x000fe80000100000, 0x0000000007087f55, 0x000fe80000100000, 0x0000000008097f55, 0x000fe80000100000, 0x00000000090a7f55, 0x000fe80000100000, 0x000000000a0b7f55, 0x000fe80000100000, 0x000000000b0c7f55, 0x000fe80000100000, 0x000000000c0d7f55, 0x000fe80000100000, 0x000000000d0e7f55, 0x000fe80000100000, 0x000000000e0f7f55, 0x000fe80000100000, 0x000000000f007956, 0x000fe80000000000, 0x0000000100027882, 0x000fe40000000000, 0x0000000000047919, 0x000e280000002100, 0x0000000000057919, 0x000e620000002500, 0x0000003f04027810, 0x001fe40007ffe1ff, 0x0000000405007211, 0x002fc800078e30ff, 0x0000000200037819, 0x040fe200000006ff, 0x0080080000017624, 0x000fc600078e0200, 0x00030a0003007a0c, 0x000fe40003f06070, 0x0000000104007388, 0x000fe80000004800, 0x0000000000007b1d, 0x000fec0000000000, 0x0000000002027984, 0x000e240000004800, 0x000003e805007824, 0x001fe200078e0202, 0x000000000000094d, 0x000fec0003800000, 0x0003080000047ab9, 0x000fe40000000a00, 0x0000000003007986, 0x000fe2000810a904, 0x000000000000794d, 0x000fea0003800000];
+
+        struct H {
+            group: u32,
+            tid: [u32; 16],
+            shared: Vec<u8>,
+            out: std::collections::BTreeMap<u64, u32>,
+        }
+        impl crate::Host<16> for H {
+            fn cbuf(&self, index: u32, offset: u32) -> u32 {
+                match (index, offset) {
+                    (0, 0xc20) => 0x1000,
+                    (0, 0xc24) => 0x1,
+                    (0, 0xc28) => 1024,
+                    (2, 0x20) => 7,
+                    _ => 0,
+                }
+            }
+            fn sysval(&mut self, sys: u8) -> [u32; 16] {
+                match sys {
+                    0x21 => self.tid,
+                    0x25 => [self.group; 16],
+                    _ => [0; 16],
+                }
+            }
+            fn store(&mut self, addr: u64, data: &[u8]) {
+                self.out.insert(addr, u32::from_le_bytes(data.try_into().unwrap()));
+            }
+            fn shared(&mut self) -> &mut [u8] {
+                &mut self.shared
+            }
+        }
+        let p = Program::decode_sm70_at(0, &mut |a| CODE.get(a as usize / 8).copied()).unwrap();
+        assert!(p.insts().iter().all(|i| !matches!(i.op, Op::Invalid(_))));
+        let mut h = H { group: 1, tid: [0; 16], shared: vec![0; 256], out: Default::default() };
+        let mut lanes: Vec<crate::Lanes<16>> = (0..4).map(|_| crate::Lanes::new()).collect();
+        for l in &mut lanes {
+            l.start(&p, 0xffff, 0);
+        }
+        let mut left = [true; 4];
+        while left.iter().any(|&x| x) {
+            for b in 0..4 {
+                if left[b] {
+                    h.tid = std::array::from_fn(|l| (16 * b + l) as u32);
+                    let mut fuel = 1_000_000;
+                    match crate::run(&p, &mut lanes[b], &mut h, &mut fuel) {
+                        crate::Exit::Done => left[b] = false,
+                        crate::Exit::Barrier => {}
+                        e => panic!("{e:?}"),
+                    }
+                }
+            }
+        }
+        // thread 0 of group 1 is item 64: s[63] = (64 + 63)^2 + 7
+        assert_eq!(h.out.get(&(0x1_0000_1000 + 4 * 64)), Some(&(1000 + 127 * 127 + 7)), "{:x?}", h.out.iter().take(4).collect::<Vec<_>>());
+        assert_eq!(h.out.len(), 64);
     }
 }

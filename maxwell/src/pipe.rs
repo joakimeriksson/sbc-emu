@@ -269,11 +269,15 @@ impl Pipe {
         if let Some(p) = self.programs.get(&(base + entry as u64)) {
             return p.clone();
         }
-        let made = Program::decode_at(entry, &mut |a| {
+        let mut fetch = |a: u32| {
             let mut b = [0; 8];
             mem.read(base + a as u64, &mut b);
             Some(u64::from_le_bytes(b))
-        });
+        };
+        let made = if self.sm70 { Program::decode_sm70_at(entry, &mut fetch) } else { Program::decode_at(entry, &mut fetch) };
+        if let (true, Ok(p)) = (self.sm70, &made) {
+            report_sm70(p, base, mem);
+        }
         let p = match made {
             Ok(p) => {
                 static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
@@ -314,21 +318,8 @@ impl Pipe {
                 // addresses inside a program count from its first instruction's block
                 if sm70 {
                     let made = Program::decode_sm70_at(start + 0x80, &mut fetch);
-                    if let (Ok(p), Some(dir)) = (&made, std::env::var_os("SBC_DUMP_SHADERS")) {
-                        // the header and the code as far as it was decoded, for a disassembler
-                        let end = p.words().iter().map(|w| w.0 + 16).max().unwrap_or(0x80);
-                        let mut bytes = vec![0; end as usize];
-                        mem.read(base + start as u64, &mut bytes);
-                        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{:x}.bin", base + start as u64)), bytes);
-                    }
                     if let Ok(p) = &made {
-                        // instructions the SM70 decoder does not know, whole, for a disassembler
-                        for (inst, &(at, _)) in p.insts().iter().zip(p.words()) {
-                            if let maxwell_shader::isa::Op::Invalid(_) = inst.op {
-                                let (lo, hi) = (fetch(at).unwrap_or(0), fetch(at + 8).unwrap_or(0));
-                                eprintln!("[maxwell] sm70 unknown at {:#x}+{at:#x}: {hi:016x}{lo:016x}", base + start as u64);
-                            }
-                        }
+                        report_sm70(p, base + start as u64, mem);
                     }
                     made
                 } else {
@@ -346,6 +337,28 @@ impl Pipe {
         };
         self.shaders.insert(base + start as u64, s.clone());
         s
+    }
+}
+
+/// SM70 code at `base`: instructions the decoder does not know, whole, for a disassembler; and
+/// with SBC_DUMP_SHADERS=DIR the code as far as it was decoded (a graphics shader's header first).
+fn report_sm70(p: &Program, base: u64, mem: &dyn Memory) {
+    let read = |at: u64| {
+        let mut b = [0; 8];
+        mem.read(at, &mut b);
+        u64::from_le_bytes(b)
+    };
+    for (inst, &(at, _)) in p.insts().iter().zip(p.words()) {
+        if let maxwell_shader::isa::Op::Invalid(_) = inst.op {
+            let (lo, hi) = (read(base + at as u64), read(base + at as u64 + 8));
+            eprintln!("[maxwell] sm70 unknown at {base:#x}+{at:#x}: {hi:016x}{lo:016x}");
+        }
+    }
+    if let Some(dir) = std::env::var_os("SBC_DUMP_SHADERS") {
+        let end = p.words().iter().map(|w| w.0 + 16).max().unwrap_or(0);
+        let mut bytes = vec![0; end as usize];
+        mem.read(base, &mut bytes);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{base:x}.bin")), bytes);
     }
 }
 
@@ -653,11 +666,11 @@ const FUEL: u64 = 4_000_000;
 
 impl Work {
     /// Compute's resources.
-    pub fn compute(pipe: &mut Pipe, cbufs: [Cbuf; 18], tic: u64, tsc: u64, tex_cb: u32) -> Self {
+    pub fn compute(pipe: &mut Pipe, cbufs: [Cbuf; 18], tic: u64, tsc: u64, tex_cb: u32, linked: bool) -> Self {
         if std::mem::take(&mut pipe.cbufs_changed) {
             pipe.constant_generation += 1;
         }
-        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb, linked: false }
+        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb, linked }
     }
 }
 

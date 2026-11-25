@@ -153,6 +153,7 @@ impl Host {
         let get_offset = mmu::physical(ram, get_addr, 4)?;
         let mut memory = mmu::View::from_instance(ram, channel.instance)?;
         channel.threed.begin();
+        channel.compute.begin();
         for _ in 0..entries {
             if get == put {
                 return Some(());

@@ -1,9 +1,9 @@
-//! Ampere Compute B (C7C0), using QMD v3.0 dispatch descriptors.
-//! Register and descriptor layouts follow NVIDIA's clc7c0 and clc7c0qmd headers.
-use super::{
-    mmu::View,
-    sass::{self, CONSTANT_BINDINGS, ConstantBuffer},
-};
+//! Ampere Compute B (C7C0). Launches are QMD v3 descriptors, given by address
+//! (SEND_SIGNALING_PCAS2_B) or written through the push buffer (the inline QMD that CUDA uses).
+//! The work runs on the Tegra210 compute engine (`maxwell::compute`) with its SM70 switch on:
+//! the descriptor layout follows NVIDIA's clc7c0qmd.h and programs are Volta-and-later code,
+//! run by the same interpreter as the graphics shaders, with shared memory and barriers.
+use super::mmu::{Guest, View};
 
 pub(super) const CLASS: u32 = 0xc7c0;
 const QMD_ADDRESS: u32 = 0x2b4;
@@ -12,113 +12,52 @@ const INLINE_ADDRESS_A: u32 = 0x318;
 const INLINE_ADDRESS_B: u32 = 0x31c;
 const INLINE_DATA: u32 = 0x320;
 const INLINE_LAST_WORD: u32 = INLINE_DATA + 63 * 4;
-const RELEASE_ENABLE: u32 = 1 << 23;
-const RELEASE_MEMBAR: u32 = 1 << 19;
-const RELEASE_SIZE: u32 = 3 << 30;
-const REPORT_SEMAPHORE_A: u32 = 0x1b00;
-const REPORT_SEMAPHORE_D: u32 = 0x1b0c;
-const REPORT_ONE_WORD: u32 = 1 << 28;
-const MAX_WORKGROUP_SIZE: u32 = 1024;
-const MAX_LAUNCH_THREADS: u32 = 16384;
 
-#[derive(Default)]
 pub(super) struct Compute {
+    engine: maxwell::compute::Compute,
+    pipe: maxwell::pipe::Pipe,
     qmd_address: Option<u64>,
     inline_address: [u32; 2],
-    report: [u32; 3],
-    upload: maxwell::inline::Inline,
     pub timestamp: u64,
 }
 
-struct Launch {
-    program: u64,
-    groups: [u32; 3],
-    threads: [u32; 3],
-    constants: [Option<ConstantBuffer>; CONSTANT_BINDINGS],
-    release: [Option<(u64, u32, bool)>; 2],
-}
-
-impl Launch {
-    fn read(memory: &View, address: u64) -> Option<Self> {
-        let word = |index: u64| memory.load(address + index * 4);
-        let version_and_x = word(18)?;
-        if version_and_x & 0xff != 0x30 {
-            return None;
+impl Default for Compute {
+    fn default() -> Self {
+        let mut engine = maxwell::compute::Compute::default();
+        engine.sm70 = true;
+        let mut pipe = maxwell::pipe::Pipe::default();
+        pipe.sm70 = true;
+        Self {
+            engine,
+            pipe,
+            qmd_address: None,
+            inline_address: [0; 2],
+            timestamp: 0,
         }
-        let yz = word(19)?;
-        let program = u64::from(word(48)?) | u64::from(word(49)? & 0x1ffff) << 32;
-        if program & 15 != 0 {
-            return None;
-        }
-        let valid = word(20)?;
-        let mut constants = [None; CONSTANT_BINDINGS];
-        for (index, entry) in constants.iter_mut().enumerate() {
-            if valid & (1 << index) != 0 {
-                let descriptor = 32 + index as u64 * 2;
-                let low = word(descriptor)?;
-                let high = word(descriptor + 1)?;
-                *entry = Some(ConstantBuffer {
-                    address: u64::from(low) | u64::from(high & 0x1ffff) << 32,
-                    size: (high >> 19) << 4,
-                });
-            }
-        }
-        let mut release = [None; 2];
-        for (index, entry) in release.iter_mut().enumerate() {
-            let offset = 24 + index as u64 * 4;
-            let flags = word(offset + 1)?;
-            if flags & RELEASE_ENABLE != 0 {
-                let format = flags >> 30;
-                if format > 1
-                    || flags & !(RELEASE_ENABLE | RELEASE_MEMBAR | RELEASE_SIZE | 0xff) != 0
-                {
-                    return None;
-                }
-                let address = u64::from(word(offset)?) | u64::from(flags & 0xff) << 32;
-                *entry = Some((address, word(offset + 2)?, format == 0));
-            }
-        }
-        Some(Self {
-            program,
-            release,
-            constants,
-            groups: [word(12)?, word(13)? & 0xffff, word(14)? & 0xffff],
-            threads: [version_and_x >> 16, yz & 0xffff, yz >> 16],
-        })
-    }
-
-    fn run(&self, memory: &mut View, timestamp: u64) -> Option<()> {
-        let count = |dimensions: [u32; 3]| dimensions.into_iter().try_fold(1_u32, u32::checked_mul);
-        let threads = count(self.threads)?;
-        if threads > MAX_WORKGROUP_SIZE
-            || threads.checked_mul(count(self.groups)?)? > MAX_LAUNCH_THREADS
-        {
-            return None;
-        }
-        let coordinates = |n: u32, [x, y, _]: [u32; 3]| [n % x, n / x % y, n / x / y];
-        let shader = sass::Program::read(memory, self.program)?;
-        for group in 0..count(self.groups)? {
-            let group = coordinates(group, self.groups);
-            for local in 0..threads {
-                shader.run(
-                    memory,
-                    coordinates(local, self.threads),
-                    group,
-                    &self.constants,
-                )?;
-            }
-        }
-        for (address, payload, timed) in self.release.into_iter().flatten() {
-            memory.release(address, payload, timed.then_some(timestamp))?;
-        }
-        Some(())
     }
 }
 
 impl Compute {
+    /// A new submission: guest memory may have changed under cached programs.
+    pub fn begin(&mut self) {
+        self.pipe.invalidate();
+    }
+
+    fn launch(&mut self, qmd: u64, memory: &mut View) -> Option<()> {
+        let mut guest = Guest::new(memory);
+        self.engine
+            .launch_at(qmd, &mut self.pipe, &mut guest, self.timestamp);
+        if let Some((address, write)) = guest.first_fault.get() {
+            eprintln!(
+                "[gpu] compute launch at {qmd:#x}: GPU page fault, {} {address:#x}",
+                if write { "write" } else { "read" }
+            );
+        }
+        guest.ok()
+    }
+
     pub fn method(&mut self, method: u32, data: u32, memory: &mut View) -> Option<()> {
         match method {
-            0x100 | 0x110 => {} // NOP and WAIT_FOR_IDLE on the synchronous engine.
             INLINE_ADDRESS_A => self.inline_address[0] = data,
             INLINE_ADDRESS_B => self.inline_address[1] = data,
             INLINE_DATA..=INLINE_LAST_WORD => {
@@ -130,49 +69,18 @@ impl Compute {
                 memory.store(address + u64::from(method - INLINE_DATA), data)?;
                 // Writing the final word submits the descriptor to the scheduler.
                 if method == INLINE_LAST_WORD {
-                    Launch::read(memory, address)?.run(memory, self.timestamp)?;
+                    self.launch(address, memory)?;
                 }
             }
             QMD_ADDRESS => self.qmd_address = Some(u64::from(data) << 8),
-            SIGNAL_PCAS2 if matches!(data, 2 | 3) => {
-                Launch::read(memory, self.qmd_address?)?.run(memory, self.timestamp)?;
+            SIGNAL_PCAS2 if matches!(data, 2 | 3) => self.launch(self.qmd_address?, memory)?,
+            SIGNAL_PCAS2 => {}
+            _ => {
+                let mut guest = Guest::new(memory);
+                self.engine
+                    .method(method, data, &mut self.pipe, &mut guest, self.timestamp);
+                guest.ok()?;
             }
-            // State for features outside the scalar path. The in-order interpreter
-            // has no shader caches, texture access, or asynchronous work distributor.
-            0x200..=0x208
-            | 0x248
-            | 0x2a0
-            | 0x2a4
-            | 0x2e4..=0x2ec
-            | 0x310
-            | 0x790
-            | 0x794
-            | 0x7b0
-            | 0x7b4
-            | 0x155c..=0x1564
-            | 0x1574..=0x157c => {}
-            0x21c | 0x1698 => {} // Unified guest memory needs no cache invalidation.
-            0x510 | 0x3400..=0x3408 => {} // Firmware and MME shadow setup.
-            0x25f8 | 0x25fc => {} // Trap handler setup, unused by supported instructions.
-            0x23c if data == 1 => {} // Software-reserved initialization method.
-            0x1b0 if data & !0x51 != 0 || data & 1 == 0 => return None,
-            method if maxwell::inline::Inline::owns(method) => {
-                self.upload
-                    .upload(method, data, |address, bytes| memory.write(address, bytes))?;
-            }
-            REPORT_SEMAPHORE_A..=0x1b08 => {
-                self.report[((method - REPORT_SEMAPHORE_A) / 4) as usize] = data;
-            }
-            REPORT_SEMAPHORE_D if data & !(REPORT_ONE_WORD | 4) == 0 => {
-                let [hi, lo, payload] = self.report;
-                let address = (u64::from(hi & 0xff) << 32) | u64::from(lo);
-                memory.release(
-                    address,
-                    payload,
-                    (data & REPORT_ONE_WORD == 0).then_some(self.timestamp),
-                )?;
-            }
-            _ => return None,
         }
         Some(())
     }

@@ -92,10 +92,12 @@ fi
 "$emulator" run --board jetson-orin-nano-4gb --gpu on \
     --kernel "$fixture/Image" --initrd "$work/initramfs.cpio.gz" \
     --script "$work/cuda.txt" --timeout 60 > "$work/boot.log" 2>&1 || {
+        cp "$work/boot.log" "$fixture/cuda-boot.log"
         tail -80 "$work/boot.log"
         exit 1
     }
 rg '^cuInit=0[[:space:]]*$|^CUDA (device: Orin|compute capability: 8\.7)[[:space:]]*$|^cu(CtxCreate=0|MemAlloc=0|MemcpyHtoD=0|MemcpyDtoH=0 data=0xfeedcafe|LaunchKernel=0|CtxSynchronize=0)[[:space:]]*$|^CUDA kernel output=0x24681357 status=0[[:space:]]*$' "$work/boot.log"
+cp "$work/boot.log" "$fixture/cuda-boot.log"
 rg '^CUDA_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
     tail -50 "$work/boot.log"
     exit 1

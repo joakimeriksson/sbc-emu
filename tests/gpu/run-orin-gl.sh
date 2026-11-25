@@ -120,7 +120,7 @@ sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/gl.txt"
 vendors=/usr/share/glvnd/egl_vendor.d
 for suite in $suites; do
-    printf 'serial cd /tmp; mkdir -p gpu-%s sw-%s; LD_LIBRARY_PATH=/lib:/%s __EGL_VENDOR_LIBRARY_FILENAMES=%s/10_nvidia.json /%s run gpu-%s '"${SBC_GL_SCENE:-}"' 2>&1 | grep -v "done$"; echo "GL_GPU_" "%s=$?"\\r\n' \
+    printf 'serial cd /tmp; mkdir -p gpu-%s sw-%s; LD_LIBRARY_PATH=/lib:/%s __EGL_VENDOR_LIBRARY_FILENAMES=%s/10_nvidia.json /%s run gpu-%s '"${SBC_GL_SCENE:-}"' 2>&1; echo "GL_GPU_" "%s=$?"\\r\n' \
         "$suite" "$suite" "$multiarch" "$vendors" "$suite" "$suite" "$suite" >> "$work/gl.txt"
     printf 'wait-serial GL_GPU_ %s=\n' "$suite" >> "$work/gl.txt"
     printf 'serial LD_LIBRARY_PATH=/lib:/%s __EGL_VENDOR_LIBRARY_FILENAMES=%s/50_mesa.json LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe /%s run sw-%s '"${SBC_GL_SCENE:-}"' > sw.log 2>&1 || tail -3 sw.log; /%s cmp gpu-%s sw-%s; echo "GL_CMP_" "%s=$?"\\r\n' \
@@ -137,9 +137,11 @@ printf 'quit\n' >> "$work/gl.txt"
 "$emulator" run --board jetson-orin-nano-4gb --gpu on --kernel "$fixture/Image" \
     --initrd "$work/initramfs.cpio.gz" --script "$work/gl.txt" --timeout "${SBC_GL_TIMEOUT:-1800}" \
     > "$work/boot.log" 2>&1 || {
+        cp "$work/boot.log" "$fixture/gl-boot.log"
         tail -60 "$work/boot.log"
         exit 1
     }
+cp "$work/boot.log" "$fixture/gl-boot.log"
 tr -d '\r' < "$work/boot.log" | grep -E ' (PASS|FAIL) |scenes differ|^GL_(GPU|CMP)_|\[maxwell\]' | tee "${SBC_GL_LOG:-/dev/null}"
 if [ -n "${SBC_GL_DUMP:-}" ]; then
     out=${SBC_GL_OUT:-$fixture/gl-out}

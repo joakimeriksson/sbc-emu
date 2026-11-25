@@ -401,6 +401,8 @@ pub enum Op {
     /// Per-lane add/subtract; `ops` holds 2 bits per lane of the quad, lane 0 on top.
     FSwzAdd { d: Reg, a: Reg, b: Reg, ops: u8, ftz: bool, cc: bool, rnd: Rnd },
     Mufu { d: Reg, a: Reg, m: Mod, op: Mufu, sat: bool },
+    /// Two floats into one register as halves: `a` high, `b` low (SM70 F2FP.PACK_AB).
+    PackHalves { d: Reg, a: Reg, b: Src, rnd: Rnd },
     /// Two half floats at once; `f32`: one single-precision result from the low half.
     Half { d: Reg, op: HalfOp, s: HalfSrcs, f32: bool, sat: bool, ftz: bool, p: Pred },
     /// Compare two pairs of halves: `pd` gets the low half's result and `pn` the high's,

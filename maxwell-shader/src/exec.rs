@@ -857,6 +857,11 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
                 l.putp(pn, m, bool_op(bop, hi, q));
             }
         }
+        Op::PackHalves { d, a, b, rnd } => {
+            let (x, y) = (l.gpr[a as usize], l.src(h, b));
+            let half = |v: u32| fp::f32_to_half(f32::from_bits(v), rnd) as u32;
+            l.put(d, m, std::array::from_fn(|i| half(y[i]) | half(x[i]) << 16));
+        }
         Op::Mufu { d, a, m: md, op, sat } => {
             let x = l.gpr[a as usize];
             let v = mufu(x, md, op);
