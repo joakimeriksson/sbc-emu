@@ -123,6 +123,7 @@ impl Gpu {
         value: u32,
         ram: &mut [u8],
         host1x: &mut crate::host1x::Host1x,
+        now: u64,
     ) {
         if self.trace
             && !gr::Gr::firmware_data_port(offset)
@@ -164,7 +165,12 @@ impl Gpu {
                 ram,
             ),
             host::DOORBELL | host::LEGACY_DEMO_DOORBELL => {
-                if self.host.ring(value, ram, host1x).is_none() && self.trace {
+                if self
+                    .host
+                    .ring(value, ram, host1x, self.trace, now)
+                    .is_none()
+                    && self.trace
+                {
                     eprintln!("[gpu] doorbell {value:#x} could not complete");
                 }
             }

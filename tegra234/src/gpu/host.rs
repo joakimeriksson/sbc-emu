@@ -102,9 +102,18 @@ impl Host {
         }
     }
 
-    pub fn ring(&mut self, token: u32, ram: &mut [u8], host1x: &mut Host1x) -> Option<()> {
+    pub fn ring(
+        &mut self,
+        token: u32,
+        ram: &mut [u8],
+        host1x: &mut Host1x,
+        trace: bool,
+        now: u64,
+    ) -> Option<()> {
         let runlist = (token >> 16 & 0x7f) as usize;
         let channel = self.channels.get_mut(runlist)?.get_mut(&(token & 0xfff))?;
+        channel.compute.timestamp = now;
+        channel.copy.timestamp = now;
         let lo = mmu::word(ram, channel.instance + 0x48)?;
         let hi = mmu::word(ram, channel.instance + 0x4c)?;
         let base = u64::from(lo & !7) | u64::from(hi & 0xff) << 32;
@@ -112,6 +121,11 @@ impl Host {
         let get_addr = channel.userd.checked_add(GP_GET)?;
         let mut get = mmu::word(ram, get_addr)?;
         let put = mmu::word(ram, channel.userd.checked_add(GP_PUT)?)?;
+        if trace {
+            eprintln!(
+                "[gpu] GPFIFO {token:#x}: base={base:#x} get={get} put={put} entries={entries}"
+            );
+        }
         if get >= entries || put >= entries {
             return None;
         }
@@ -126,6 +140,9 @@ impl Host {
             let hi = memory.load(entry + 4)?;
             let address = u64::from(lo & !3) | u64::from(hi & 0xff) << 32;
             let words = hi >> 10 & 0x1f_ffff;
+            if trace {
+                eprintln!("[gpu] GPFIFO {token:#x}[{get}]: address={address:#x} words={words}");
+            }
             if words > MAX_WORDS {
                 return None;
             }
@@ -135,6 +152,7 @@ impl Host {
                 words,
                 &mut self.nonstall_pending,
                 host1x,
+                trace,
             )?;
             get = (get + 1) & (entries - 1);
             memory.ram[get_offset..get_offset + 4].copy_from_slice(&get.to_le_bytes());
@@ -152,6 +170,7 @@ impl Channel {
         words: u32,
         nonstall: &mut bool,
         host1x: &mut Host1x,
+        trace: bool,
     ) -> Option<()> {
         let mut index = 0;
         while index < words {
@@ -162,7 +181,7 @@ impl Channel {
             let sub = (header >> 13 & 7) as usize;
             let mut method = (header & 0x1fff) * 4;
             if mode == 4 {
-                self.method(memory, sub, method, count, nonstall, host1x)?;
+                self.method(memory, sub, method, count, nonstall, host1x, trace)?;
                 continue;
             }
             if !matches!(mode, 1 | 3 | 5) || count > words - index {
@@ -171,7 +190,7 @@ impl Channel {
             for n in 0..count {
                 let data = memory.load(base + u64::from(index) * 4)?;
                 index += 1;
-                self.method(memory, sub, method, data, nonstall, host1x)?;
+                self.method(memory, sub, method, data, nonstall, host1x, trace)?;
                 if mode == 1 || (mode == 5 && n == 0) {
                     method += 4;
                 }
@@ -188,10 +207,14 @@ impl Channel {
         data: u32,
         nonstall: &mut bool,
         host1x: &mut Host1x,
+        trace: bool,
     ) -> Option<()> {
         match method {
             0 => self.classes[sub] = data & 0xffff,
             0x20 => *nonstall = true,
+            // MEM_OP_D barriers and L2/TLB operations complete immediately.
+            // GPU memory accesses use the current page tables and guest RAM.
+            0x34 if matches!(data >> 27, 0x05 | 0x09 | 0x0e | 0x10 | 0x15) => {}
             0x5c..=0x68 => self.semaphore[((method - 0x5c) / 4) as usize] = data,
             0x6c if matches!(data, 1 | 0x10_0001) => {
                 // nvgpu appends a host-class semaphore release to retire the job.
@@ -203,12 +226,19 @@ impl Channel {
                     memory.store(address, payload)?;
                 }
             }
-            _ => match self.classes[sub] {
-                copy::CLASS => self.copy.method(method, data, memory)?,
-                compute::CLASS => self.compute.method(method, data, memory)?,
-                threed::CLASS => self.threed.method(method, data, memory)?,
-                _ => return None,
-            },
+            _ => {
+                let class = self.classes[sub];
+                let result = match class {
+                    copy::CLASS => self.copy.method(method, data, memory),
+                    compute::CLASS => self.compute.method(method, data, memory),
+                    threed::CLASS => self.threed.method(method, data, memory),
+                    _ => None,
+                };
+                if trace && result.is_none() {
+                    eprintln!("[gpu] class {class:#x}, method {method:#x}, value {data:#x} failed");
+                }
+                return result;
+            }
         }
         Some(())
     }

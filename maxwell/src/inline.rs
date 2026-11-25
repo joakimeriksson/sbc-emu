@@ -84,6 +84,13 @@ impl Inline {
     }
 
     pub fn method(&mut self, m: u32, v: u32, mem: &mut dyn Memory) {
+        self.upload(m, v, |address, data| {
+            mem.write(address, data);
+            Some(())
+        });
+    }
+
+    pub fn upload(&mut self, m: u32, v: u32, write: impl FnMut(u64, &[u8]) -> Option<()>) -> Option<()> {
         let m = m as usize;
         if m != DATA {
             self.regs[(m - 0x100) / 4] = v;
@@ -99,29 +106,37 @@ impl Inline {
             DATA if self.expected > 0 => {
                 self.data.extend_from_slice(&v.to_le_bytes());
                 if self.data.len() >= self.expected {
-                    self.flush(mem);
+                    self.flush(write)?;
                 }
             }
             _ => {}
         }
+        Some(())
     }
 
-    fn flush(&mut self, mem: &mut dyn Memory) {
+    fn flush(&mut self, mut write: impl FnMut(u64, &[u8]) -> Option<()>) -> Option<()> {
         let base = (self.r(ADDRESS) & 0xff) << 32 | self.r(ADDRESS + 4);
         let (length, lines) = (self.r(LINE_LENGTH), self.r(LINES));
         let pitch = self.r(LAUNCH) & 1 != 0;
         let b = self.r(BLOCK) as u32;
         let block = Block { width: self.r(WIDTH), height: self.r(HEIGHT), gobs_w: b & 15, gobs_h: b >> 4 & 15, gobs_d: b >> 8 & 15 };
+        let mut written = Some(());
         for y in 0..lines {
             let line = &self.data[(y * length) as usize..((y + 1) * length) as usize];
             if pitch {
-                mem.write(base.wrapping_add(y.wrapping_mul(self.r(PITCH))), line);
+                written = write(base.wrapping_add(y.wrapping_mul(self.r(PITCH))), line);
             } else {
-                block.pieces(self.r(ORIGIN_X), self.r(ORIGIN_Y).wrapping_add(y), self.r(LAYER), length, |o, at, n| mem.write(base.wrapping_add(o), &line[at..at + n]));
+                block.pieces(self.r(ORIGIN_X), self.r(ORIGIN_Y).wrapping_add(y), self.r(LAYER), length, |o, at, n| {
+                    written = written.and_then(|_| write(base.wrapping_add(o), &line[at..at + n]));
+                });
+            }
+            if written.is_none() {
+                break;
             }
         }
         self.expected = 0;
         self.data.clear();
+        written
     }
 }
 

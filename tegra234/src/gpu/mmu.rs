@@ -70,6 +70,43 @@ impl<'a> View<'a> {
         Some(())
     }
 
+    /// A four-word semaphore writes its timestamp before publishing the payload.
+    pub fn release(&mut self, address: u64, payload: u32, timestamp: Option<u64>) -> Option<()> {
+        if let Some(timestamp) = timestamp {
+            self.store(address + 4, 0)?;
+            self.store(address + 8, timestamp as u32)?;
+            self.store(address + 12, (timestamp >> 32) as u32)?;
+        }
+        self.store(address, payload)
+    }
+
+    pub fn write(&mut self, mut dst: u64, mut bytes: &[u8]) -> Option<()> {
+        while !bytes.is_empty() {
+            let n = bytes.len().min(4096 - (dst as usize & 4095));
+            let offset = physical(self.ram, self.translate(dst, true)?, n)?;
+            self.ram[offset..offset + n].copy_from_slice(&bytes[..n]);
+            dst += n as u64;
+            bytes = &bytes[n..];
+        }
+        Some(())
+    }
+
+    pub fn fill(&mut self, mut dst: u64, mut len: usize, pattern: &[u8]) -> Option<()> {
+        if !dst.is_multiple_of(pattern.len() as u64) {
+            return None;
+        }
+        while len > 0 {
+            let n = len.min(4096 - (dst as usize & 4095));
+            let offset = physical(self.ram, self.translate(dst, true)?, n)?;
+            for element in self.ram[offset..offset + n].chunks_exact_mut(pattern.len()) {
+                element.copy_from_slice(pattern);
+            }
+            dst += n as u64;
+            len -= n;
+        }
+        Some(())
+    }
+
     pub fn copy(&mut self, mut src: u64, mut dst: u64, mut len: usize) -> Option<()> {
         while len > 0 {
             let n = len

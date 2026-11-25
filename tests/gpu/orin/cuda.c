@@ -2,10 +2,10 @@ extern int printf(const char *, ...);
 extern void *dlopen(const char *, int);
 extern void *dlsym(void *, const char *);
 extern char *dlerror(void);
+extern int strcmp(const char *, const char *);
 
 // CUDA Driver API. Resolve the ABI from JetPack's original shared library.
-int main(int argc, char **argv) {
-    (void)argv;
+int main(void) {
     void *lib = dlopen("libcuda.so.1", 2);
     if (!lib) {
         printf("CUDA library: %s\n", dlerror());
@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     status = get_name(name, sizeof(name), 0);
     if (!status)
         printf("CUDA device: %s\n", name);
-    if (status)
+    if (status || strcmp(name, "Orin") != 0)
         return 5;
     int (*get_attr)(int *, int, int) = dlsym(lib, "cuDeviceGetAttribute");
     int major = 0, minor = 0;
@@ -38,9 +38,6 @@ int main(int argc, char **argv) {
     printf("CUDA compute capability: %d.%d\n", major, minor);
     if (major != 8 || minor != 7)
         return 7;
-    if (argc == 1)
-        return 0;
-
     int (*create)(void **, unsigned, int) = dlsym(lib, "cuCtxCreate_v2");
     int (*destroy)(void *) = dlsym(lib, "cuCtxDestroy_v2");
     int (*alloc)(unsigned long *, unsigned long) = dlsym(lib, "cuMemAlloc_v2");

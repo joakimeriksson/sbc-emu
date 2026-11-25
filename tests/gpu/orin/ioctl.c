@@ -17,6 +17,7 @@ enum {
     SOURCE_OFFSET = PAGE_BYTES - 4,
     DESTINATION_OFFSET = 3 * PAGE_BYTES - 4,
     SEMAPHORE_OFFSET = 0x300,
+    FILL_OFFSET = 0x380,
     QMD_OFFSET = 0x400,
     SASS_OFFSET = 0x800,
     COMPUTE_INPUT = 0xa00,
@@ -160,12 +161,20 @@ static int copy_probe(int channel, volatile uint32_t *words, uint64_t va)
     words[DESTINATION_OFFSET / 4] = 0;
     words[DESTINATION_OFFSET / 4 + 1] = 0;
     words[SEMAPHORE_OFFSET / 4] = 0;
+    const uint64_t fill = va + FILL_OFFSET;
+    for (unsigned i = 0; i < 5; ++i)
+        words[FILL_OFFSET / 4 + i] = 0x54637281;
     // Use the same pitch-linear copy and completion semaphore as the VNC demo.
     const uint32_t push[] = {
         packet(0, 1), 0xc7b5,
         packet(0x400, 8),
         source >> 32, source, dest >> 32, dest, 8, 8, 8, 1,
         packet(0x300, 1), 0x386,
+        packet(0x708, 1), 0x30004, // Remap one 32-bit component to CONST_A.
+        packet(0x700, 1), 0xabcdefab,
+        packet(0x408, 2), fill >> 32, fill,
+        packet(0x418, 2), 4, 1,
+        packet(0x300, 1), 0x586,
         packet(0x240, 3), fence >> 32, fence, 1,
         packet(0x300, 1), 8,
     };
@@ -178,6 +187,10 @@ static int copy_probe(int channel, volatile uint32_t *words, uint64_t va)
         return 15;
     if (words[DESTINATION_OFFSET / 4] != 0x1ebad123 || words[DESTINATION_OFFSET / 4 + 1] != 0xa2c4056f)
         return 16;
+    for (unsigned i = 0; i < 5; ++i) {
+        if (words[FILL_OFFSET / 4 + i] != (i < 4 ? 0xabcdefab : 0x54637281))
+            return 23;
+    }
     return 0;
 }
 
@@ -229,12 +242,6 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         {0x0000000400007986, 0x000fe2000c10e93f}, // STG.E [R0.64+UZR], R4
         {0x000000000000794d, 0x000fea0003800000}, // EXIT
     };
-    for (unsigned i = 0; i < sizeof(shader) / sizeof(shader[0]); ++i) {
-        for (unsigned half = 0; half < 2; ++half) {
-            words[SASS_OFFSET / 4 + 4 * i + 2 * half] = shader[i][half];
-            words[SASS_OFFSET / 4 + 4 * i + 2 * half + 1] = shader[i][half] >> 32;
-        }
-    }
     const uint32_t inputs[] = {3, 42, 0xabcdef01, 0xfffffff8};
     for (unsigned i = 0; i < 4; ++i) {
         words[COMPUTE_INPUT / 4 + i] = inputs[i];
@@ -254,10 +261,26 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
     const uint64_t array_target = va + ARRAY_TARGET;
     for (unsigned i = 0; i < 256; ++i)
         words[ARRAY_TARGET / 4 + i] = 0x12345678;
-    const uint32_t push[] = {
+    const uint32_t upload[] = {
         packet(0, 1), 0xc7c0,
+        packet(0x180, 4), sizeof(shader), 1, program >> 32, program,
+        packet(0x1b0, 1), 0x41,
+        (3U << 29) | ((sizeof(shader) / 4) << 16) | (0x1b4 >> 2),
+    };
+    unsigned n = 0;
+    for (unsigned i = 0; i < sizeof(upload) / sizeof(upload[0]); ++i)
+        words[n++] = upload[i];
+    for (unsigned i = 0; i < sizeof(shader) / sizeof(shader[0]); ++i) {
+        for (unsigned half = 0; half < 2; ++half) {
+            words[n++] = shader[i][half];
+            words[n++] = shader[i][half] >> 32;
+        }
+    }
+    const uint64_t report = va + SEMAPHORE_OFFSET;
+    const uint32_t push[] = {
         packet(0x2b4, 1), (va + QMD_OFFSET) >> 8,
         packet(0x2c0, 1), 3,
+        packet(0x1b00, 4), report >> 32, report, 0x13542413, 0,
         packet(0, 1), 0xc797,
         packet(0x800, 7), target >> 32, target, 64, 4, 0xd5, 1 << 12, 1,
         packet(0xff4, 2), (4 << 16) | 1, (3 << 16) | 1,
@@ -290,10 +313,14 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         packet(0x19d0, 1), 2,
     };
     for (unsigned i = 0; i < sizeof(push) / sizeof(push[0]); ++i)
-        words[i] = push[i];
-    int result = submit_work(channel, va, sizeof(push) / sizeof(push[0]));
+        words[n++] = push[i];
+    int result = submit_work(channel, va, n);
     if (result)
         return result;
+    if (words[SEMAPHORE_OFFSET / 4] != 0x13542413
+        || words[SEMAPHORE_OFFSET / 4 + 1]
+        || !(words[SEMAPHORE_OFFSET / 4 + 2] | words[SEMAPHORE_OFFSET / 4 + 3]))
+        return 24;
     for (unsigned i = 0; i < 4; ++i) {
         if (words[COMPUTE_OUTPUT / 4 + i] != inputs[i] + 17 * (i + 1)
             || words[COMPUTE_OUTPUT / 4 + 4 + i] != 0x9e3779b9)

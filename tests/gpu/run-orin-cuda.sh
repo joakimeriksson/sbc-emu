@@ -79,12 +79,7 @@ cat "$fixture/probe-initramfs.cpio.gz" "$work/cuda.cpio.gz" > "$work/initramfs.c
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
     -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/cuda.txt"
-if [ "${SBC_ORIN_CUDA_CONTEXT:-0}" = 1 ]; then
-    argument=' --context'
-else
-    argument=''
-fi
-printf 'serial /cuda-probe%s; echo "CUDA_PROBE_" "STATUS=$?"\\r\n' "$argument" >> "$work/cuda.txt"
+printf 'serial /cuda-probe; echo "CUDA_PROBE_" "STATUS=$?"\\r\n' >> "$work/cuda.txt"
 printf 'wait-serial CUDA_PROBE_ STATUS=\nquit\n' >> "$work/cuda.txt"
 
 "$emulator" run --board jetson-orin-nano-4gb --gpu on \
@@ -93,7 +88,7 @@ printf 'wait-serial CUDA_PROBE_ STATUS=\nquit\n' >> "$work/cuda.txt"
         tail -80 "$work/boot.log"
         exit 1
     }
-rg '^cuInit=0[[:space:]]*$|^CUDA (device: Orin|compute capability: 8\.7)[[:space:]]*$' "$work/boot.log"
+rg '^cuInit=0[[:space:]]*$|^CUDA (device: Orin|compute capability: 8\.7)[[:space:]]*$|^cu(CtxCreate=0|MemAlloc=0|MemcpyHtoD=0|MemcpyDtoH=0 data=0xfeedcafe)[[:space:]]*$' "$work/boot.log"
 rg '^CUDA_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
     tail -50 "$work/boot.log"
     exit 1

@@ -308,6 +308,7 @@ version = "0.1.0"
 dependencies = [
  "arm-a64",
  "emu-core",
+ "maxwell",
  "maxwell-tex",
  "peripherals",
 ]

@@ -133,8 +133,13 @@ impl Soc {
         } else if self.gpu_node && host1x::contains(addr) {
             self.host1x.write(addr, value);
         } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
-            self.gpu
-                .write(addr - gpu::BAR0, value, &mut self.ram, &mut self.host1x);
+            self.gpu.write(
+                addr - gpu::BAR0,
+                value,
+                &mut self.ram,
+                &mut self.host1x,
+                self.now,
+            );
         } else if self.gpu_bar_accessible(addr, gpu::BAR1) {
             self.gpu.bar1_write(addr - gpu::BAR1, value, &mut self.ram);
         } else {
@@ -970,52 +975,52 @@ mod tests {
         let mut gpu = gpu::Gpu::default();
         let mut ram = [];
         let mut host1x = host1x::Host1x::default();
-        gpu.write(0x110100, 2, &mut ram, &mut host1x);
+        gpu.write(0x110100, 2, &mut ram, &mut host1x, 0);
         assert_eq!(gpu.read(0x11165c, 0), 2);
         assert!(!gpu.stall_irq());
 
-        gpu.write(0x111668, 0x11, &mut ram, &mut host1x);
-        gpu.write(0x110180, 1 << 24, &mut ram, &mut host1x);
-        gpu.write(0x110184, 0x0123_4567, &mut ram, &mut host1x);
-        gpu.write(0x110184, 0x89ab_cdef, &mut ram, &mut host1x);
-        gpu.write(0x110180, 1 << 25, &mut ram, &mut host1x);
+        gpu.write(0x111668, 0x11, &mut ram, &mut host1x, 0);
+        gpu.write(0x110180, 1 << 24, &mut ram, &mut host1x, 0);
+        gpu.write(0x110184, 0x0123_4567, &mut ram, &mut host1x, 0);
+        gpu.write(0x110184, 0x89ab_cdef, &mut ram, &mut host1x, 0);
+        gpu.write(0x110180, 1 << 25, &mut ram, &mut host1x, 0);
         assert_eq!(gpu.read(0x110184, 0), 0x0123_4567);
         assert_eq!(gpu.read(0x110184, 0), 0x89ab_cdef);
-        gpu.write(0x1101c0, 1 << 24, &mut ram, &mut host1x);
-        gpu.write(0x1101c4, 1, &mut ram, &mut host1x);
-        gpu.write(0x1101c0, 0x7ffc, &mut ram, &mut host1x);
-        gpu.write(0x1101c4, 2, &mut ram, &mut host1x);
-        gpu.write(0x110100, 2, &mut ram, &mut host1x);
+        gpu.write(0x1101c0, 1 << 24, &mut ram, &mut host1x, 0);
+        gpu.write(0x1101c4, 1, &mut ram, &mut host1x, 0);
+        gpu.write(0x1101c0, 0x7ffc, &mut ram, &mut host1x, 0);
+        gpu.write(0x1101c4, 2, &mut ram, &mut host1x, 0);
+        gpu.write(0x110100, 2, &mut ram, &mut host1x, 0);
         assert_eq!(gpu.read(0x11165c, 0), 3);
         assert!(!gpu.stall_irq());
 
-        gpu.write(0xb81210, 1 << 27, &mut ram, &mut host1x);
-        gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x);
+        gpu.write(0xb81210, 1 << 27, &mut ram, &mut host1x, 0);
+        gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x, 0);
         assert!(gpu.stall_irq());
-        gpu.write(0xb81610, 1 << 2, &mut ram, &mut host1x);
+        gpu.write(0xb81610, 1 << 2, &mut ram, &mut host1x, 0);
         assert!(!gpu.stall_irq());
         assert_eq!(gpu.read(0xb81600, 0), 1 << 2);
         assert_eq!(gpu.read(0xb81010, 0), 1 << 27);
-        gpu.write(0x110004, 1 << 6, &mut ram, &mut host1x);
-        gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x);
+        gpu.write(0x110004, 1 << 6, &mut ram, &mut host1x, 0);
+        gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x, 0);
         assert!(!gpu.stall_irq());
 
         assert_eq!(gpu.read(0x110c84, 0), 0x8800);
-        gpu.write(0x110ac0, (1 << 25) | 0x800, &mut ram, &mut host1x);
+        gpu.write(0x110ac0, (1 << 25) | 0x800, &mut ram, &mut host1x, 0);
         for word in [0x1802, 0, 0x8000, 0x0800, 0x8800, 0x0100_0800] {
             assert_eq!(gpu.read(0x110ac4, 0), word);
         }
-        gpu.write(0x110c84, 0x8818, &mut ram, &mut host1x);
-        gpu.write(0x110ac0, 1 << 24, &mut ram, &mut host1x);
-        gpu.write(0x110ac4, 0x2a01_040e, &mut ram, &mut host1x);
-        gpu.write(0x110c00, 0x8004, &mut ram, &mut host1x);
+        gpu.write(0x110c84, 0x8818, &mut ram, &mut host1x, 0);
+        gpu.write(0x110ac0, 1 << 24, &mut ram, &mut host1x, 0);
+        gpu.write(0x110ac4, 0x2a01_040e, &mut ram, &mut host1x, 0);
+        gpu.write(0x110c00, 0x8004, &mut ram, &mut host1x, 0);
         assert!(gpu.stall_irq());
         assert_eq!(gpu.read(0x110c04, 0), 0x8004);
         assert_eq!(gpu.read(0x110c80, 0), 0x881c);
-        gpu.write(0x110ac0, 0x818, &mut ram, &mut host1x);
+        gpu.write(0x110ac0, 0x818, &mut ram, &mut host1x, 0);
         assert_eq!(gpu.read(0x110ac4, 0), 0x2a00_040e);
 
-        gpu.write(0x1103c0, 1, &mut ram, &mut host1x);
+        gpu.write(0x1103c0, 1, &mut ram, &mut host1x, 0);
         assert_eq!(gpu.read(0x11165c, 0), 0);
         assert!(!gpu.stall_irq());
         assert_eq!(gpu.read(0x110c80, 0), 0);
