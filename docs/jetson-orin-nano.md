@@ -162,16 +162,19 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb --gpu on \
 ```
 
 Use `scripts/jetson-orin-nano-gpu-power.txt` in the same command to exercise
-runtime power-on and print the kernel's result. The driver now initializes the
-internal GPU-to-memory links and discovers the modeled graphics and copy engines,
-which share one runlist and one push-buffer DMA descriptor. It completes the
-GMMU and framebuffer flush sequence, resets the graphics cluster, uploads FECS
-and GPCCS firmware, and receives the modeled context-size replies. [NVIDIA's internal memory-link sequence](https://github.com/OE4T/linux-nvgpu/blob/patches-rel-36/drivers/gpu/nvgpu/hal/mssnvlink/mssnvlink_ga10b.c)
+runtime power-on. NVIDIA's R36.4.4 driver returns `NVGPU_POWER_ STATUS=0` and the
+fixture opens `/dev/nvgpu/igpu0/ctrl`. Run `sh tests/gpu/run-orin-ioctl.sh`
+after building the fixture to check GPU characteristics, allocate a GPU
+address space and bind a Linux channel to it.
 
-Power-on currently returns an error at GSP scheduler bootstrap because the GSP
-Falcon data-memory capacity and firmware protocol remain to be modeled. Host1x
-syncpoints are still disabled. The FECS size values reserve guest buffers for
-the modeled topology. Graphics context execution remains open.
+The GPU model exposes separate graphics and asynchronous copy runlists and
+maps BAR1 through the GA10B page tables. It models Falcon firmware uploads,
+the GSP startup interrupt, and the scheduler messages for context binding,
+engine registration and initial domain creation. FECS also acknowledges the
+driver's initial context bind and save requests. These are firmware protocol
+models. The next coverage target is a command buffer submitted through Linux
+with completion verified in the guest. Host1x syncpoints and Ampere shader
+execution remain unimplemented.
 
 ### Jetson GPU parity
 
@@ -181,8 +184,8 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 
 | Milestone | Acceptance check |
 |---|---|
-| Power-on | The unmodified driver discovers GA10B's engines and finishes power-on, including firmware mailbox handshakes and the required host1x syncpoints. |
-| Memory and submission | Extend the demonstrated bare-metal copy channel to the Linux driver, with data and fence checks across page boundaries and recoverable faults. |
+| Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. Host1x syncpoints are still pending. |
+| Memory and submission | The Linux driver allocates an address space and binds a channel. A Linux copy submission with data, fence and fault checks is still pending. |
 | Compute | Execute a known-answer Ampere shader, then run a CUDA kernel in the guest and compare its output with a CPU reference. |
 | Graphics | Run the existing GLES 2, 3 and 3.2 scenes on GA10B and compare images with Mesa software rendering. Exercise the display separately for the Jetson demo workloads. |
 | Browser | Run the same shader and rendering checks on the WASM build with matching results. |

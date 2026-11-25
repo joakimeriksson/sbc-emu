@@ -12,19 +12,19 @@ const GPCS: u32 = 1;
 pub(super) const TPCS_PER_GPC: u32 = 2;
 pub(super) const LTCS: u32 = 1;
 
-// One graphics engine and one copy engine share the modeled runlist. These
-// rows describe the simulator's layout, including its chosen MMIO offsets.
-const fn engine(kind: u32, fault: u32, pri: u32, reset: u32, slot: u32) -> [u32; 3] {
+// Use separate runlists so the scheduler can dispatch the copy engine
+// independently of graphics.
+const fn engine(kind: u32, fault: u32, pri: u32, reset: u32, runlist: u64, slot: u32) -> [u32; 3] {
     [
         CHAIN | kind << 24 | fault,
         CHAIN | ENGINE | pri | reset,
-        host::RUNLIST as u32 | slot,
+        runlist as u32 | slot,
     ]
 }
 
 const DEVICES: [[u32; 3]; 2] = [
-    engine(GRAPHICS, 0, 0x400000, 12, 0),
-    engine(LOGICAL_COPY, 1, 0x104000, 6, 1),
+    engine(GRAPHICS, 0, 0x400000, 12, host::GR_RUNLIST, 0),
+    engine(LOGICAL_COPY, 1, 0x104000, 6, host::RUNLIST, 0),
 ];
 
 pub(super) fn read(offset: u64) -> Option<u32> {

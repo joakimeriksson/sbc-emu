@@ -8,6 +8,7 @@ use std::collections::HashMap;
 mod copy;
 mod fb;
 mod gr;
+mod gsp;
 mod host;
 mod mmu;
 mod top;
@@ -17,10 +18,24 @@ pub const BAR1: u64 = 0x1800_0000;
 pub const SIZE: u64 = 0x0100_0000;
 pub const FUSE: u64 = 0x03b4_1000;
 pub const FUSE_SIZE: u64 = 0x1000;
-pub const SPIS: [u32; 4] = [68, 70, 71, 67];
+pub const SPIS: [u32; 4] = [68, 70, GSP_STALL_SPI, 67];
+pub(crate) const GSP_STALL_SPI: u32 = 71;
+
+const GSP_LEAF: u32 = 1 << (155 - 128);
+const GSP_SUBTREE: u32 = 1 << 2;
+const INTR_LEAF_STATUS: u64 = 0xb81010;
+const INTR_LEAF_ENABLE_SET: u64 = 0xb81210;
+const INTR_LEAF_ENABLE_CLEAR: u64 = 0xb81410;
+const INTR_TOP_STATUS: u64 = 0xb81600;
+const INTR_TOP_ENABLE_SET: u64 = 0xb81608;
+const INTR_TOP_ENABLE_CLEAR: u64 = 0xb81610;
 
 /// PMC_BOOT_0 encodes architecture 0x17, implementation 0xb and revision A1.
 const BOOT0: u32 = 0x17b0_00a1;
+const BAR1_BIND: u64 = 0x001704;
+const BAR1_STATUS: u64 = 0x001710;
+const BAR1_BIND_VALID: u32 = 1 << 31;
+const BAR1_INSTANCE_MASK: u32 = 0x0fff_ffff;
 const PTIMER_TIME_0: u64 = 0x009400;
 const PTIMER_TIME_1: u64 = 0x009410;
 const RING_COMMAND: u64 = 0x12004c;
@@ -33,8 +48,11 @@ pub struct Gpu {
     regs: HashMap<u64, u32>,
     fb: fb::Fb,
     gr: gr::Gr,
+    gsp: gsp::Gsp,
     host: host::Host,
     ring_started: bool,
+    gsp_leaf_enabled: bool,
+    gsp_subtree_enabled: bool,
     trace: bool,
 }
 
@@ -44,17 +62,23 @@ impl Default for Gpu {
             regs: HashMap::new(),
             fb: fb::Fb::default(),
             gr: gr::Gr::default(),
+            gsp: gsp::Gsp::default(),
             host: host::Host::default(),
             ring_started: false,
+            gsp_leaf_enabled: false,
+            gsp_subtree_enabled: false,
             trace: std::env::var_os("SBC_TRACE_GPU").is_some(),
         }
     }
 }
 
 impl Gpu {
-    pub fn read(&self, offset: u64, now: u64) -> u32 {
+    pub fn read(&mut self, offset: u64, now: u64) -> u32 {
         let value = match offset {
             0 => BOOT0,
+            INTR_LEAF_STATUS => u32::from(self.gsp.irq()) * GSP_LEAF,
+            INTR_TOP_STATUS => u32::from(self.gsp_pending()) * GSP_SUBTREE,
+            BAR1_STATUS => 0, // BAR1 binds complete synchronously.
             PTIMER_TIME_0 => now as u32,
             PTIMER_TIME_1 => (now >> 32) as u32,
             RING_COMMAND => 0, // The supported command completes on write.
@@ -65,6 +89,7 @@ impl Gpu {
                 .or_else(|| top::read(offset))
                 .or_else(|| host::read_config(offset))
                 .or_else(|| self.gr.read(offset))
+                .or_else(|| self.gsp.read(offset))
                 .unwrap_or_else(|| self.regs.get(&offset).copied().unwrap_or(0)),
         };
         if self.trace && !matches!(offset, PTIMER_TIME_0 | PTIMER_TIME_1) {
@@ -74,13 +99,24 @@ impl Gpu {
     }
 
     pub fn write(&mut self, offset: u64, value: u32, ram: &mut [u8]) {
-        if self.trace && !gr::Gr::firmware_data_port(offset) {
+        if self.trace
+            && !gr::Gr::firmware_data_port(offset)
+            && !gsp::Gsp::firmware_data_port(offset)
+        {
             eprintln!("[gpu] write {offset:06x} <- {value:08x}");
         }
-        if self.fb.write(offset, value) || self.gr.write(offset, value) {
+        if self.fb.write(offset, value)
+            || self.gr.write(offset, value)
+            || self.gsp.write(offset, value)
+        {
             return;
         }
         match offset {
+            INTR_LEAF_ENABLE_SET => self.gsp_leaf_enabled |= value & GSP_LEAF != 0,
+            INTR_LEAF_ENABLE_CLEAR => self.gsp_leaf_enabled &= value & GSP_LEAF == 0,
+            INTR_TOP_ENABLE_SET => self.gsp_subtree_enabled |= value & GSP_SUBTREE != 0,
+            INTR_TOP_ENABLE_CLEAR => self.gsp_subtree_enabled &= value & GSP_SUBTREE == 0,
+            INTR_LEAF_STATUS | INTR_TOP_STATUS => {}
             RING_COMMAND => {
                 if value & RING_COMMAND_MASK == RING_ENUMERATE_AND_START {
                     self.ring_started = true;
@@ -97,7 +133,7 @@ impl Gpu {
                     eprintln!("[gpu] doorbell {value:#x} could not complete");
                 }
             }
-            0 | PTIMER_TIME_0 | PTIMER_TIME_1 | RING_START_RESULTS => {}
+            0 | BAR1_STATUS | PTIMER_TIME_0 | PTIMER_TIME_1 | RING_START_RESULTS => {}
             _ if top::read(offset).is_none() && host::read_config(offset).is_none() => {
                 self.regs.insert(offset, value);
             }
@@ -105,12 +141,44 @@ impl Gpu {
         }
     }
 
+    fn bar1_view<'a>(&self, ram: &'a mut [u8]) -> Option<mmu::View<'a>> {
+        let bind = self.regs.get(&BAR1_BIND).copied()?;
+        if bind & BAR1_BIND_VALID == 0 {
+            return None;
+        }
+        let instance = u64::from(bind & BAR1_INSTANCE_MASK) << 12;
+        mmu::View::from_instance(ram, instance)
+    }
+
+    pub fn bar1_read(&self, offset: u64, ram: &mut [u8]) -> u32 {
+        self.bar1_view(ram)
+            .and_then(|view| view.load(offset))
+            .unwrap_or(0)
+    }
+
+    pub fn bar1_write(&self, offset: u64, value: u32, ram: &mut [u8]) {
+        if let Some(mut view) = self.bar1_view(ram) {
+            view.store(offset, value);
+        }
+    }
+
+    fn gsp_pending(&self) -> bool {
+        self.gsp.irq() && self.gsp_leaf_enabled
+    }
+
+    pub fn stall_irq(&self) -> bool {
+        self.gsp_pending() && self.gsp_subtree_enabled
+    }
+
     pub fn reset(&mut self) {
         self.regs.clear();
         self.fb = fb::Fb::default();
         self.gr = gr::Gr::default();
+        self.gsp = gsp::Gsp::default();
         self.host = host::Host::default();
         self.ring_started = false;
+        self.gsp_leaf_enabled = false;
+        self.gsp_subtree_enabled = false;
     }
 
     pub fn submissions(&self) -> u64 {

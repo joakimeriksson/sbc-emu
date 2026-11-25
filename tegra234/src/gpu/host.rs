@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 // BAR0 apertures for the modeled copy runlist and the TU104-style doorbell.
 pub(super) const RUNLIST: u64 = 0x800000;
+pub(super) const GR_RUNLIST: u64 = 0x804000;
 pub(super) const BASE_LO: u64 = RUNLIST + 0x80;
 pub(super) const BASE_HI: u64 = RUNLIST + 0x84;
 pub(super) const SUBMIT: u64 = RUNLIST + 0x88;
@@ -17,14 +18,22 @@ const CHANNEL_RAM: u32 = 0x900000;
 const VALID: u32 = 1 << 31;
 
 pub(super) fn read_config(offset: u64) -> Option<u32> {
+    if (GR_RUNLIST..GR_RUNLIST + 0x1000).contains(&offset) {
+        return Some(match offset - GR_RUNLIST {
+            0x04 => CHANNEL_RAM + 0x10000,
+            0x08 => 1 << 16, // runlist ID 1
+            0x10 => VALID | PBDMA,
+            0x14 | 0x204 | 0x228 => 0,
+            _ => return None,
+        });
+    }
     Some(match offset.checked_sub(RUNLIST)? {
-        0x08 => 0, // runlist ID 0
         0x04 => CHANNEL_RAM,
-        0x10 => VALID | PBDMA, // PBDMA 0, BAR0 base in bits 25:10
-        0x14 => 0,             // no second PBDMA
-        0x204 | 0x228 => 0,    // graphics interrupt and engine ID 0
-        0x244 => 1 << 16,      // copy engine interrupt ID 1
-        0x268 => 1 << 24,      // copy engine ID 1
+        0x08 => 0, // runlist ID 0
+        0x10 => VALID | PBDMA,
+        0x14 => 0,        // no second PBDMA
+        0x204 => 1 << 16, // copy engine interrupt ID 1
+        0x228 => 1 << 24, // copy engine ID 1
         _ => return None,
     })
 }
@@ -88,9 +97,6 @@ impl Host {
         let hi = mmu::word(ram, channel.instance + 0x4c)?;
         let base = u64::from(lo & !7) | u64::from(hi & 0xff) << 32;
         let entries = 1u32.checked_shl(hi >> 16 & 0x1f)?;
-        let root_lo = mmu::word(ram, channel.instance + 0x200)?;
-        let root_hi = mmu::word(ram, channel.instance + 0x204)?;
-        let root = u64::from(root_lo & !0xfff) | u64::from(root_hi & 0xff) << 32;
         let get_addr = channel.userd.checked_add(GP_GET)?;
         let mut get = mmu::word(ram, get_addr)?;
         let put = mmu::word(ram, channel.userd.checked_add(GP_PUT)?)?;
@@ -98,7 +104,7 @@ impl Host {
             return None;
         }
         let get_offset = mmu::physical(ram, get_addr, 4)?;
-        let mut memory = mmu::View { ram, root };
+        let mut memory = mmu::View::from_instance(ram, channel.instance)?;
         for _ in 0..MAX_ENTRIES {
             if get == put {
                 return Some(());

@@ -9,6 +9,8 @@ const RESET_RELEASED: u32 = 1;
 const GPC0_TPCS: u64 = 0x502608;
 const GPC0_ZCULL_BANKS: u64 = 0x500920;
 const GPC0_PES0_TPC_MASK: u64 = 0x500c30;
+const FE_POWER_MODE: u64 = 0x404170;
+const FE_POWER_MODE_REQUEST: u32 = 1 << 4;
 const FECS_CPUCTL: u64 = 0x409100;
 const FECS_IMEM_DATA: u64 = 0x409184;
 const FECS_DMEM_DATA: u64 = 0x4091c4;
@@ -20,6 +22,10 @@ const GPCCS_IMEM_DATA: u64 = 0x41a184;
 const GPCCS_DMEM_DATA: u64 = 0x41a1c4;
 const CPU_START: u32 = 1 << 1;
 const UCODE_INIT_COMPLETE: u32 = 1;
+const BIND_CHANNEL_CONTEXT: u32 = 0x03;
+const SAVE_GOLDEN_CONTEXT: u32 = 0x09;
+const CONTEXT_BOUND: u32 = 1 << 4;
+const CONTEXT_SAVED: u32 = 1;
 const DISCOVER_CONTEXT_SIZE: u32 = 0x10;
 const DISCOVER_ZCULL_SIZE: u32 = 0x16;
 const DISCOVER_PREEMPT_SIZE: u32 = 0x1a;
@@ -37,6 +43,8 @@ pub(super) struct Gr {
     fecs_started: bool,
     mailbox0: u32,
     method_data: u32,
+    fe_power_mode: u32,
+    context_instance: Option<u32>,
 }
 
 impl Gr {
@@ -53,6 +61,7 @@ impl Gr {
             GPC0_TPCS => Some(TPCS_PER_GPC | TPCS_PER_GPC << 16),
             GPC0_ZCULL_BANKS => Some(TPCS_PER_GPC),
             GPC0_PES0_TPC_MASK => Some((1 << TPCS_PER_GPC) - 1),
+            FE_POWER_MODE => Some(self.fe_power_mode),
             FECS_MAILBOX0 => Some(self.mailbox0),
             FECS_METHOD_DATA => Some(self.method_data),
             _ => None,
@@ -68,6 +77,7 @@ impl Gr {
                 self.released = value & RESET_RELEASED;
             }
             GPC0_RESET_STATUS | GPC0_TPCS | GPC0_ZCULL_BANKS | GPC0_PES0_TPC_MASK => {}
+            FE_POWER_MODE => self.fe_power_mode = value & !FE_POWER_MODE_REQUEST,
             GPCCS_IMEM_DATA => self.gpccs_uploaded = true,
             FECS_IMEM_DATA => self.fecs_uploaded = true,
             GPCCS_DMEM_DATA | FECS_DMEM_DATA => {}
@@ -85,6 +95,13 @@ impl Gr {
             }
             FECS_METHOD_DATA => self.method_data = value,
             FECS_METHOD_PUSH if self.fecs_started && self.gpccs_started => match value & 0xfff {
+                BIND_CHANNEL_CONTEXT if self.method_data & (1 << 31) != 0 => {
+                    self.context_instance = Some(self.method_data);
+                    self.mailbox0 |= CONTEXT_BOUND;
+                }
+                SAVE_GOLDEN_CONTEXT if self.context_instance.is_some() => {
+                    self.mailbox0 |= CONTEXT_SAVED;
+                }
                 DISCOVER_CONTEXT_SIZE | DISCOVER_PREEMPT_SIZE => self.mailbox0 = CONTEXT_BYTES,
                 DISCOVER_ZCULL_SIZE => self.mailbox0 = ZCULL_BYTES,
                 DISCOVER_PM_SIZE => self.mailbox0 = PM_BYTES,

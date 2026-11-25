@@ -13,10 +13,17 @@ pub(super) fn word(ram: &[u8], address: u64) -> Option<u32> {
 
 pub(super) struct View<'a> {
     pub ram: &'a mut [u8],
-    pub root: u64,
+    root: u64,
 }
 
-impl View<'_> {
+impl<'a> View<'a> {
+    pub fn from_instance(ram: &'a mut [u8], instance: u64) -> Option<Self> {
+        let lo = word(ram, instance.checked_add(0x200)?)?;
+        let hi = word(ram, instance.checked_add(0x204)?)?;
+        let root = u64::from(lo & !0xfff) | u64::from(hi & 0xff) << 32;
+        Some(Self { ram, root })
+    }
+
     fn pte(&self, address: u64) -> Option<u64> {
         let lo = word(self.ram, address)? as u64;
         let hi = word(self.ram, address + 4)? as u64;

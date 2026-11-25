@@ -85,8 +85,10 @@ impl Soc {
                 .ok_or(Fault::Unmapped)?
                 .hsp
                 .read(addr - hsp::BASE)
-        } else if self.gpu_bar0_accessible(addr) {
+        } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
             self.gpu.read(addr - gpu::BAR0, self.now)
+        } else if self.gpu_bar_accessible(addr, gpu::BAR1) {
+            self.gpu.bar1_read(addr - gpu::BAR1, &mut self.ram)
         } else {
             return Err(Fault::Unmapped);
         })
@@ -113,8 +115,10 @@ impl Soc {
             }
         } else if self.mss_nvlink.write(addr, value) {
             return Ok(());
-        } else if self.gpu_bar0_accessible(addr) {
+        } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
             self.gpu.write(addr - gpu::BAR0, value, &mut self.ram);
+        } else if self.gpu_bar_accessible(addr, gpu::BAR1) {
+            self.gpu.bar1_write(addr - gpu::BAR1, value, &mut self.ram);
         } else {
             return Err(Fault::Unmapped);
         }
@@ -122,8 +126,8 @@ impl Soc {
         Ok(())
     }
 
-    fn gpu_bar0_accessible(&self, addr: u64) -> bool {
-        (gpu::BAR0..gpu::BAR0 + gpu::SIZE).contains(&addr)
+    fn gpu_bar_accessible(&self, addr: u64, base: u64) -> bool {
+        (base..base + gpu::SIZE).contains(&addr)
             && self
                 .firmware
                 .as_ref()
@@ -410,6 +414,9 @@ impl Machine {
         self.soc
             .gic
             .set_line((UARTA_SPI + 32) as usize, self.soc.uarta.irq(self.now));
+        self.soc
+            .gic
+            .set_line((gpu::GSP_STALL_SPI + 32) as usize, self.soc.gpu.stall_irq());
         for (core, (cpu, state)) in self.cpus.iter_mut().zip(&mut self.state).enumerate() {
             if *state == CoreState::Off {
                 continue;
@@ -877,7 +884,11 @@ mod tests {
         assert_eq!(discovery, (6 << 20) | 2);
         let runlist = u64::from(soc.read32(reg(0x022808)).unwrap() & !0x3);
         assert_eq!(soc.read32(reg(runlist + 0x10)).unwrap(), 0x8004_0000);
-        assert_eq!(soc.read32(reg(runlist + 0x268)).unwrap() >> 24, 1);
+        assert_eq!(soc.read32(reg(runlist + 0x08)).unwrap() >> 16, 1);
+        let copy_runlist = u64::from(soc.read32(reg(0x022814)).unwrap() & !0x3);
+        assert_ne!(runlist, copy_runlist);
+        assert_eq!(soc.read32(reg(copy_runlist + 0x228)).unwrap() >> 24, 1);
+        assert_eq!(soc.read32(reg(copy_runlist + 0x08)).unwrap() >> 16, 0);
 
         for base in [0x01f2_0000, 0x01e0_0000] {
             soc.write32(base + 0x10, 1).unwrap();
@@ -900,8 +911,111 @@ mod tests {
         assert_eq!(soc.read32(reg(0x409800)).unwrap(), 1);
         soc.write32(reg(0x409504), 0x10).unwrap();
         assert_eq!(soc.read32(reg(0x409800)).unwrap(), 0x20_000);
+
+        soc.write32(reg(0x404170), 0x12).unwrap();
+        assert_eq!(soc.read32(reg(0x404170)), Ok(2));
+        soc.write32(reg(0x409504), 0x09).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)), Ok(0x20_000));
+        soc.write32(reg(0x409500), 0xb008_0200).unwrap();
+        soc.write32(reg(0x409504), 0x03).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)), Ok(0x20_010));
+        soc.write32(reg(0x409800), 0).unwrap();
+        soc.write32(reg(0x409504), 0x09).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)), Ok(1));
         soc.write32(reg(0x41a610), 0).unwrap();
         assert_eq!(soc.read32(reg(0x409800)).unwrap(), 0);
+    }
+
+    #[test]
+    fn ga10b_gsp_boot_and_scheduler_messages_raise_stall_interrupts() {
+        let mut gpu = gpu::Gpu::default();
+        let mut ram = [];
+        gpu.write(0x110100, 2, &mut ram);
+        assert_eq!(gpu.read(0x11165c, 0), 2);
+        assert!(!gpu.stall_irq());
+
+        gpu.write(0x111668, 0x11, &mut ram);
+        gpu.write(0x110180, 1 << 24, &mut ram);
+        gpu.write(0x110184, 0x0123_4567, &mut ram);
+        gpu.write(0x110184, 0x89ab_cdef, &mut ram);
+        gpu.write(0x110180, 1 << 25, &mut ram);
+        assert_eq!(gpu.read(0x110184, 0), 0x0123_4567);
+        assert_eq!(gpu.read(0x110184, 0), 0x89ab_cdef);
+        gpu.write(0x1101c0, 1 << 24, &mut ram);
+        gpu.write(0x1101c4, 1, &mut ram);
+        gpu.write(0x1101c0, 0x7ffc, &mut ram);
+        gpu.write(0x1101c4, 2, &mut ram);
+        gpu.write(0x110100, 2, &mut ram);
+        assert_eq!(gpu.read(0x11165c, 0), 3);
+        assert!(!gpu.stall_irq());
+
+        gpu.write(0xb81210, 1 << 27, &mut ram);
+        gpu.write(0xb81608, 1 << 2, &mut ram);
+        assert!(gpu.stall_irq());
+        gpu.write(0xb81610, 1 << 2, &mut ram);
+        assert!(!gpu.stall_irq());
+        assert_eq!(gpu.read(0xb81600, 0), 1 << 2);
+        assert_eq!(gpu.read(0xb81010, 0), 1 << 27);
+        gpu.write(0x110004, 1 << 6, &mut ram);
+        gpu.write(0xb81608, 1 << 2, &mut ram);
+        assert!(!gpu.stall_irq());
+
+        assert_eq!(gpu.read(0x110c84, 0), 0x8800);
+        gpu.write(0x110ac0, (1 << 25) | 0x800, &mut ram);
+        for word in [0x1802, 0, 0x8000, 0x0800, 0x8800, 0x0100_0800] {
+            assert_eq!(gpu.read(0x110ac4, 0), word);
+        }
+        gpu.write(0x110c84, 0x8818, &mut ram);
+        gpu.write(0x110ac0, 1 << 24, &mut ram);
+        gpu.write(0x110ac4, 0x2a01_040e, &mut ram);
+        gpu.write(0x110c00, 0x8004, &mut ram);
+        assert!(gpu.stall_irq());
+        assert_eq!(gpu.read(0x110c04, 0), 0x8004);
+        assert_eq!(gpu.read(0x110c80, 0), 0x881c);
+        gpu.write(0x110ac0, 0x818, &mut ram);
+        assert_eq!(gpu.read(0x110ac4, 0), 0x2a00_040e);
+
+        gpu.write(0x1103c0, 1, &mut ram);
+        assert_eq!(gpu.read(0x11165c, 0), 0);
+        assert!(!gpu.stall_irq());
+        assert_eq!(gpu.read(0x110c80, 0), 0);
+    }
+
+    #[test]
+    fn ga10b_bar1_walks_bound_gpu_page_tables() {
+        let mut machine = Machine::new(256 << 20, 1).unwrap();
+        let soc = &mut machine.soc;
+        let instance = RAM_BASE + 0x1000;
+        let root = RAM_BASE + 0x2000;
+        let page = RAM_BASE + 0x9000;
+        let bind = gpu::BAR0 + 0x1704;
+        let bar = gpu::BAR1 + 0x1024;
+
+        soc.write64(instance + 0x200, root).unwrap();
+        for (entry, next) in [
+            (root, root + 0x1000),
+            (root + 0x1000, root + 0x2000),
+            (root + 0x2000, root + 0x3000),
+            (root + 0x3008, root + 0x4000),
+        ] {
+            soc.write64(entry, (next >> 4) | 4).unwrap();
+        }
+        soc.write64(root + 0x4008, (page >> 4) | 5).unwrap();
+        soc.write32(page + 0x24, 0x1234_5678).unwrap();
+
+        assert_eq!(soc.read32(bar), Ok(0));
+        soc.write32(bind, (1 << 31) | (instance >> 12) as u32)
+            .unwrap();
+        assert_eq!(soc.read32(gpu::BAR0 + 0x1710), Ok(0));
+        assert_eq!(soc.read32(bar), Ok(0x1234_5678));
+        soc.write8(bar + 1, 0xab).unwrap();
+        assert_eq!(soc.read32(page + 0x24), Ok(0x1234_ab78));
+
+        soc.write64(root + 0x4008, (page >> 4) | 0x45).unwrap();
+        soc.write32(bar, 0).unwrap();
+        assert_eq!(soc.read32(page + 0x24), Ok(0x1234_ab78));
+        soc.gpu.reset();
+        assert_eq!(soc.read32(bar), Ok(0));
     }
 
     #[test]
