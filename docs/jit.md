@@ -62,8 +62,8 @@ LD1/ST1 of whole registers become LDR/LDP (STR/STP) of Q or D registers on the c
 others the host's own instruction (through scratch v0-v3 when they name several registers). Before,
 only one-register LD1/ST1 were native: ncnn's YOLOv8n on the Jetson Nano's CPU (`ld1 {v0.4s-v3.4s},
 [x8], #64` in every kernel) handed 491 M instructions to the interpreter in 12 frames, 89 M after
-(the rest are system instructions, and structure accesses across a page); a frame took 3.1 s of host
-time and now takes 0.45 s (the guest's own clock, 1 ns per instruction, says 0.29 s in both).
+(the rest are system instructions, and structure accesses across a page); a frame took about 2.8 s
+of host time and now takes 0.46 s (the guest's own clock, 1 ns per instruction, says 0.29 s in both).
 `arm-a64/tests/jit_neon_ldst.rs` checks every encoding of both groups against the interpreter.
 
 Blocks average about 5 guest instructions; a chain now runs about 100 before it returns to the
