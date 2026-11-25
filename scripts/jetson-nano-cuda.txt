@@ -1,0 +1,15 @@
+# CUDA on the Jetson Nano with NVIDIA's own driver: L4T's kernel and nvgpu, libcuda 10.2, a PTX
+# vector add JIT-compiled by NVIDIA and run on the emulated GM20B (docs/jetson-nano-cuda.md). The
+# card is prepared by scripts/jetson-nano-l4t-prepare.txt; its root is mounted read-only.
+#   S=cache/l4t/serve
+#   sbc-emu run --board jetson-nano --kernel $S/Image --dtb $S/tegra210-p3448-0000-p3449-0000-b00.dtb \
+#     --sd cache/l4t/disk.raw --hdmi-mode off --append "console=ttyS0,115200 root=/dev/mmcblk0p1 rootwait ro \
+#     init=/bin/sh nowatchdog clk_ignore_unused initcall_blacklist=tegra_pcie_init_driver" \
+#     --script scripts/jetson-nano-cuda.txt --timeout 600
+wait-serial job control turned off
+sleep 1
+serial sh /opt/l4t/cuda.sh 2>&1\r
+wait-serial CUDA_DEVICE NVIDIA Tegra X1, compute 5.3, 2 SMs
+wait-serial CUDA_VADD OK
+wait-serial CUDA-END
+quit

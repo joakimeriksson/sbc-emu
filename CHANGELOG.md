@@ -8,6 +8,23 @@ options, snapshot formats and crate interfaces.
 Numbers such as (#21) are pull requests in this repository. Work from before 2026-11-20 was merged
 in an earlier repository whose history was rewritten; it is summarised here without numbers.
 
+## [Unreleased]
+
+### Added
+
+- Jetson Nano: NVIDIA's own GPU stack. L4T R32.7.3's kernel with `nvgpu`, CUDA 10.2 and
+  TensorRT 8.2 run with Debian's root; YOLOv8n through TensorRT finds what ONNX Runtime finds
+  (docs/jetson-nano-cuda.md, `scripts/jetson-nano-l4t-fixture.sh`). Mesa's OpenCL and NVK run it
+  too.
+- Maxwell GPU: compute workgroups in 32-lane warps on several host threads (Mesa's OpenCL YOLOv8n
+  54 -> 6.5 s per image); LEA, VADD, P2R, R2P and FCHK in the shader core.
+
+### Fixed
+
+- arm-a64: SEV/SEVL set an event register that the next WFE consumes (a `SEVL; WFE` lock with one
+  core running slept forever).
+- Jetson Nano GPU: copies on an unbound subchannel 4 (NVK's) reach the copy engine.
+
 ## [0.1.0] - 2026-11-24
 
 The first release: seven boards, four CPU cores with JITs, and the same machines in the browser.

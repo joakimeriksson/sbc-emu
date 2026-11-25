@@ -1,0 +1,12 @@
+# YOLOv8n through TensorRT 8.2 on the Jetson Nano (NVIDIA's kernels on the emulated GM20B): the
+# engine is built (about ten minutes), one inference runs, and its detections are those of ONNX
+# Runtime on the host (tests/gpu/l4t/yolo-input.py prints them). The card and command line are
+# scripts/jetson-nano-cuda.txt's, with --timeout 3000.
+wait-serial job control turned off
+sleep 1
+serial sh /opt/l4t/trt.sh 2>&1\r
+wait-serial PASSED TensorRT.trtexec
+wait-serial DET person 0.87 [669,394,140,485]
+wait-serial DET bus 0.87 [19,230,774,526]
+wait-serial TRT-END
+quit
