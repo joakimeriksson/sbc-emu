@@ -44,8 +44,10 @@ struct Token {
 const MAX_DEPTH: usize = 4096;
 
 /// Registers and control state of N lanes. Lane n of a quad is at x = n & 1, y = n >> 1 & 1;
-/// with more than 4 lanes, every four lanes form a quad.
+/// with more than 4 lanes, every four lanes form a quad. (Aligned to a cache line, as lanes run on
+/// several threads at once.)
 #[derive(Clone)]
+#[repr(align(128))]
 pub struct Lanes<const N: usize> {
     /// General registers by lane. Register 255 must stay zero.
     pub gpr: Box<[[u32; N]; 256]>,
@@ -481,27 +483,47 @@ fn flo(x: u32, signed: bool, shift: bool) -> u32 {
     }
 }
 
-fn prmt(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
-    let src = (a as u64 | (c as u64) << 32).to_le_bytes();
-    let s = (sel & 3) as usize;
-    let r: [u8; 4] = match mode {
-        0 => std::array::from_fn(|i| {
-            let n = sel >> (4 * i) & 15;
-            let b = src[(n & 7) as usize];
-            if n & 8 != 0 {
-                (b as i8 >> 7) as u8
-            } else {
-                b
+/// PRMT: bytes of `a` (0..3) and `c` (4..7) picked by `sel` and the mode. Shifts on the
+/// 64-bit pair, without a byte array: the interpreter runs it for every lane.
+#[inline(always)]
+pub fn prmt(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
+    let x = a as u64 | (c as u64) << 32;
+    let s = sel & 3;
+    // the source's byte n
+    let byte = |n: u32| (x >> (8 * n)) as u32 & 0xff;
+    match mode {
+        // each result byte by a nibble: bits 0..2 the source byte, bit 3 its sign in all bits
+        0 => {
+            let mut r = 0;
+            for i in 0..4 {
+                let n = sel >> (4 * i);
+                let b = (x >> (8 * (n & 7))) as u32;
+                let b = if n & 8 != 0 { ((b as u8 as i8) >> 7) as u8 as u32 } else { b & 0xff };
+                r |= b << (8 * i);
             }
-        }),
-        1 => std::array::from_fn(|i| src[i + s]),
-        2 => std::array::from_fn(|i| src[if i >= s { i - s } else { 8 + i - s }]),
-        3 => [src[s]; 4],
-        4 => std::array::from_fn(|i| src[i.max(s)]),
-        5 => std::array::from_fn(|i| src[i.min(s)]),
-        _ => std::array::from_fn(|i| src[(i & 1) + (s & 1) * 2]),
-    };
-    u32::from_le_bytes(r)
+            r
+        }
+        // forward: bytes s..s + 4
+        1 => (x >> (8 * s)) as u32,
+        // backward: byte i is source byte i - s, wrapping around the eight
+        2 => x.rotate_left(8 * s) as u32,
+        // byte s in all four
+        3 => byte(s) * 0x0101_0101,
+        // edge clamps: byte i is source byte max(i, s) or min(i, s)
+        4 => {
+            let keep = !0u32 << (8 * s);
+            a & keep | byte(s) * 0x0101_0101 & !keep
+        }
+        5 => {
+            let keep = if s == 3 { !0 } else { !(!0u32 << (8 * (s + 1))) };
+            a & keep | byte(s) * 0x0101_0101 & !keep
+        }
+        // half s & 1 in both halves
+        _ => {
+            let h = a >> (16 * (s & 1)) & 0xffff;
+            h | h << 16
+        }
+    }
 }
 
 fn shift(v: u32, n: u32, wrap: bool) -> Option<(u32, u32)> {
@@ -1207,7 +1229,25 @@ pub fn run<const N: usize, H: Host<N>>(
             }
             Op::Prmt { d, a, b, c, mode } => {
                 let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-                l.put(d, m, std::array::from_fn(|i| prmt(u[i], v[i], w[i], mode)));
+                // (the mode is known here, so each arm is a loop of shifts)
+                let mut r = [0u32; N];
+                macro_rules! each {
+                    ($mode:expr) => {
+                        for i in 0..N {
+                            r[i] = prmt(u[i], v[i], w[i], $mode);
+                        }
+                    };
+                }
+                match mode {
+                    0 => each!(0),
+                    1 => each!(1),
+                    2 => each!(2),
+                    3 => each!(3),
+                    4 => each!(4),
+                    5 => each!(5),
+                    _ => each!(6),
+                }
+                l.put(d, m, r);
             }
             Op::Sel { d, a, b, p } => {
                 let t = l.p(p);
@@ -2201,5 +2241,61 @@ fn surface<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prmt;
+
+    /// PRMT byte by byte, as the PTX manual describes it.
+    fn reference(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
+        let src = (a as u64 | (c as u64) << 32).to_le_bytes();
+        let s = (sel & 3) as usize;
+        let r: [u8; 4] = match mode {
+            0 => std::array::from_fn(|i| {
+                let n = sel >> (4 * i) & 15;
+                let b = src[(n & 7) as usize];
+                if n & 8 != 0 {
+                    (b as i8 >> 7) as u8
+                } else {
+                    b
+                }
+            }),
+            1 => std::array::from_fn(|i| src[i + s]),
+            2 => std::array::from_fn(|i| src[if i >= s { i - s } else { 8 + i - s }]),
+            3 => [src[s]; 4],
+            4 => std::array::from_fn(|i| src[i.max(s)]),
+            5 => std::array::from_fn(|i| src[i.min(s)]),
+            _ => std::array::from_fn(|i| src[(i & 1) + (s & 1) * 2]),
+        };
+        u32::from_le_bytes(r)
+    }
+
+    #[test]
+    fn prmt_matches_the_bytewise_definition() {
+        let (a, c) = (0x8382_0180, 0x8786_8584);
+        assert_eq!(prmt(a, 0x3210, c, 0), a);
+        assert_eq!(prmt(a, 0x7654, c, 0), c);
+        assert_eq!(prmt(a, 0x9810, c, 0), 0x00ff_0180, "sign bytes");
+        assert_eq!(prmt(a, 0x1, c, 1), 0x8483_8201);
+        assert_eq!(prmt(a, 0x1, c, 2), 0x8201_8087);
+        assert_eq!(prmt(a, 0x2, c, 3), 0x8282_8282);
+        assert_eq!(prmt(a, 0x2, c, 4), 0x8382_8282);
+        assert_eq!(prmt(a, 0x1, c, 5), 0x0101_0180);
+        assert_eq!(prmt(a, 0x1, c, 6), 0x8382_8382);
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let (a, c, sel) = (next() as u32, next() as u32, next() as u32);
+            for mode in 0..8 {
+                assert_eq!(prmt(a, sel, c, mode), reference(a, sel, c, mode), "{a:#x} {sel:#x} {c:#x} mode {mode}");
+            }
+        }
     }
 }

@@ -122,23 +122,29 @@ pub struct Spaces(pub [u32; 4]);
 impl Spaces {
     /// The physical address behind 34-bit `iova`; None is a fault.
     pub fn walk(&self, iova: u64, write: bool, dma: &dyn Memory) -> Option<u64> {
+        self.walk_with(iova, write, &|pa| dma.bytes(pa, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())))
+    }
+
+    /// The same, reading the tables' words (by physical address) with `read32`.
+    pub fn walk_with(&self, iova: u64, write: bool, read32: &dyn Fn(u64) -> Option<u32>) -> Option<u64> {
         if iova >> 34 != 0 {
             return None;
         }
-        walk(self.0[(iova >> 32) as usize], iova & 0xffff_ffff, write, dma)
+        walk_with(self.0[(iova >> 32) as usize], iova & 0xffff_ffff, write, read32)
     }
 }
 
 /// Walk the page table of directory entry `ptb`.
 pub fn walk(ptb: u32, iova: u64, write: bool, dma: &dyn Memory) -> Option<u64> {
+    walk_with(ptb, iova, write, &|pa| dma.bytes(pa, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())))
+}
+
+fn walk_with(ptb: u32, iova: u64, write: bool, read32: &dyn Fn(u64) -> Option<u32>) -> Option<u64> {
     let need = if write { WRITABLE } else { READABLE };
     if ptb & need == 0 || iova >> 32 != 0 {
         return None;
     }
-    let entry = |table: u32, index: u64| {
-        let b = dma.bytes(((table & PFN) as u64) << 12 | index << 2, 4)?;
-        Some(u32::from_le_bytes(b.try_into().unwrap()))
-    };
+    let entry = |table: u32, index: u64| read32(((table & PFN) as u64) << 12 | index << 2);
     let pde = entry(ptb, iova >> 22 & 0x3ff)?;
     if pde & need == 0 {
         return None;

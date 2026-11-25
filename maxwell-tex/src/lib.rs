@@ -47,8 +47,9 @@ pub trait Memory {
     }
 
     /// The same memory for `n` threads at once (a compute launch's workgroups): `run` gets a view
-    /// for each; a view sees its own writes, and they all reach memory when `run` returns, in the
-    /// views' order (bytes several views wrote end up as the last one's). false: one thread only.
+    /// for each, and each view sees what all of them wrote. Writes are atomic per word (bytes
+    /// several views write at once end up as one of theirs; nothing tears within a word written
+    /// whole). false: one thread only.
     fn split(&mut self, _n: usize, _run: &mut dyn FnMut(Vec<Box<dyn Memory + Send + '_>>)) -> bool {
         false
     }
