@@ -1688,7 +1688,7 @@ impl Cpu {
                 let v = if bit(i, 31) { (pc & !0xfff).wrapping_add(imm << 12) } else { pc.wrapping_add(imm) };
                 if let Some(d) = e.def(i & 31, How::Zr) { e.a.mov_imm(d, v); e.dirty(i & 31, How::Zr); }
                 e.pending += 1;
-            } else if mask & 4 != 0 && ((i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
+            } else if mask & 4 != 0 && ((i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2..=5))
                 || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6)))
             {
                 // NOP and the hints that are NOPs here, DSB/DMB/ISB: with cores on parallel host

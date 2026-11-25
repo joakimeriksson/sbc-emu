@@ -1012,6 +1012,13 @@ impl Machine {
             0x8400_0008 => return Some(Stop::PowerOff),
             0x8400_0009 => return Some(Stop::Reset),
             0x8400_000a => if supported(x[1] as u32) { 0 } else { NOT_SUPPORTED },
+            // NVIDIA's SiP call for a "secure PMC" (L4T's kernel): PMC register reads and writes
+            // through the secure monitor (PMC_READ 0xaa, PMC_WRITE 0xbb; offsets from the PMC base)
+            0xc2ff_fe00 => match x[1] {
+                0xaa => { self.cpus[k].x[1] = u64::from(self.soc.pmc.read(x[2])); 0 }
+                0xbb => { self.soc.pmc.write(x[2], x[3] as u32); 0 }
+                _ => NOT_SUPPORTED,
+            },
             _ => NOT_SUPPORTED,
         };
         self.cpus[k].x[0] = ret;
