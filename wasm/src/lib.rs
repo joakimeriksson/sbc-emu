@@ -415,11 +415,24 @@ pub unsafe extern "C" fn sbc_boot_nano(ram_mb: u32, unix: f64, k: *const u8, kle
 #[no_mangle]
 pub unsafe extern "C" fn sbc_boot_orin_gpu_demo(k: *const u8, klen: usize) -> i32 {
     if klen == 0 { return -1; }
+    orin_boot(256, std::slice::from_raw_parts(k, klen), None, true)
+}
+
+/// Boot a Tegra234 Linux Image and an optional initramfs with the GPU enabled.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_orin(ram_mb: u32, k: *const u8, klen: usize, i: *const u8, ilen: usize) -> i32 {
+    if klen == 0 { return -1; }
     let kernel = std::slice::from_raw_parts(k, klen);
-    let Ok(mut m) = tegra234::Machine::new(256 << 20, 1) else { return -1 };
+    let initrd = (ilen != 0).then(|| std::slice::from_raw_parts(i, ilen));
+    orin_boot(ram_mb, kernel, initrd, false)
+}
+
+fn orin_boot(ram_mb: u32, kernel: &[u8], initrd: Option<&[u8]>, display: bool) -> i32 {
+    let Ok(ram_bytes) = usize::try_from(u64::from(ram_mb) << 20) else { return -1 };
+    let Ok(mut m) = tegra234::Machine::new(ram_bytes, 1) else { return -1 };
     m.enable_gpu();
-    m.enable_display();
-    if tegra234::boot::boot_linux(&mut m, kernel, None, tegra234::boot::DEFAULT_CMDLINE).is_err() { return -1; }
+    if display { m.enable_display(); }
+    if tegra234::boot::boot_linux(&mut m, kernel, initrd, tegra234::boot::DEFAULT_CMDLINE).is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State::new(Board::JetsonOrinNano(Box::new(m)), Some(0.0))));
     0
 }

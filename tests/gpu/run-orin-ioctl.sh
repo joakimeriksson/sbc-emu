@@ -30,6 +30,11 @@ wait-serial NVGPU_IRQS_ END
 quit
 SCRIPT
 
+if [ "${SBC_ORIN_WASM:-0}" = 1 ]; then
+    node tests/gpu/orin/wasm-linux.mjs "$fixture/Image" "$work/initramfs.cpio.gz" "$work/ioctl.txt"
+    exit
+fi
+
 "$emulator" run --board jetson-orin-nano-4gb --gpu on \
     --kernel "$fixture/Image" --initrd "$work/initramfs.cpio.gz" \
     --script "$work/ioctl.txt" --timeout 60 >"$work/boot.log" 2>&1 || {

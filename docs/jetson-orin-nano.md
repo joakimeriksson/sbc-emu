@@ -155,7 +155,9 @@ python3 -m http.server -d web 8791
 ```
 
 The Node test runs the site worker with the AArch64 JIT and checks the rover's
-motion in the 640 × 360 RGBA frames it sends to the page.
+motion in the 640 × 360 RGBA frames it sends to the page. With the NVIDIA
+fixture prepared, run `SBC_ORIN_WASM=1 sh tests/gpu/run-orin-ioctl.sh` to
+boot Linux and run the same GPU tests in WebAssembly.
 
 ### Driver binding
 
@@ -212,7 +214,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | The Linux fixture checks a known-answer Ampere shader. The CUDA userspace path and broader shader coverage remain pending. |
 | Graphics | The stock driver submits clipped, masked and layered C797 color clears and block-linear depth/stencil clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
-| Browser | The site worker runs the standalone rover copy demo. Linux graphics and compute checks in WebAssembly remain pending. |
+| Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests also pass in the WebAssembly build. |
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
 Orin or Ampere modules. Reuse the Maxwell renderer and texture code where the
