@@ -267,7 +267,12 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         // Clear only green in an adjacent block-linear target.
         packet(0x800, 7), tiled_target >> 32, tiled_target, 16, 8, 0xd5, 0, 1,
         packet(0xff4, 2), (6 << 16) | 5, (4 << 16) | 1,
+        packet(0xd6c, 2), (12 << 16) | 6, 4 << 16,
+        packet(0xe00, 3), 1, (10 << 16) | 4, (6 << 16) | 2,
+        packet(0xc00, 2), (4 << 16) | 7, (3 << 16) | 2,
+        packet(0x10f8, 1), (1 << 4) | (1 << 8) | (1 << 12),
         packet(0x19d0, 1), 0x08,
+        packet(0x10f8, 1), 0,
         // Map draw output one to color target slot three and select only array layer one.
         packet(0x8c0, 9), array_target >> 32, array_target, 16, 8, 0xd5, 0, 2, 128, 0,
         packet(0x121c, 1), 2 | (3 << 7),
@@ -280,6 +285,8 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         packet(0x19d0, 1), 1,
         packet(0xff4, 2), (4 << 16) | 8, (3 << 16) | 3,
         packet(0xda0, 1), 0xa5,
+        packet(0x139c, 1), 0x0f,
+        packet(0x10f8, 1), 1,
         packet(0x19d0, 1), 2,
     };
     for (unsigned i = 0; i < sizeof(push) / sizeof(push[0]); ++i)
@@ -304,13 +311,13 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
             // A single 64-byte by 8-row GOB.
             const unsigned offset = (x / 8) * 256 + (y / 2) * 64
                 + (x / 4 % 2) * 32 + (y % 2) * 16 + (x % 4) * 4;
-            const uint32_t expected = x >= 5 && x < 11 && y >= 1 && y < 5
+            const uint32_t expected = x >= 7 && x < 10 && y >= 2 && y < 4
                 ? 0x10208040 : 0x10203040;
             if (words[(TILED_TARGET + offset) / 4] != expected)
                 return 20;
             const uint32_t depth = x >= 5 && x < 11 && y >= 1 && y < 5
                 ? 0x80000000 : 0x11223300;
-            const uint32_t stencil = x >= 8 && x < 12 && y >= 3 && y < 6 ? 0xa5 : 0x44;
+            const uint32_t stencil = x >= 8 && x < 12 && y >= 3 && y < 6 ? 0x45 : 0x44;
             if (words[(ZETA_TARGET + offset) / 4] != (depth | stencil))
                 return 21;
             const uint32_t array_pixel = x >= 5 && x < 11 && y >= 1 && y < 5

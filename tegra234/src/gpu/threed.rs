@@ -8,16 +8,25 @@ const TARGET_BASE: u32 = 0x800;
 const TARGET_STRIDE: u32 = 0x40;
 const SCREEN_HORIZONTAL: u32 = 0xff4;
 const SCREEN_VERTICAL: u32 = 0xff8;
+const VIEWPORT_CLIP: u32 = 0xc00;
+const CLEAR_RECT: u32 = 0xd6c;
 const CLEAR_COLOR: u32 = 0xd80;
 const CLEAR_DEPTH: u32 = 0xd90;
 const CLEAR_STENCIL: u32 = 0xda0;
 const ZETA_BASE: u32 = 0xfe0;
 const ZETA_SIZE: u32 = 0x1228;
+const SCISSOR_ENABLE: u32 = 0xe00;
+const SCISSOR_RECT: u32 = 0xe04;
+const STENCIL_MASK: u32 = 0x139c;
 const ZETA_ENABLE: u32 = 0x1538;
 const ZETA_BASE_LAYER: u32 = 0x179c;
 const CLEAR_CONTROL: u32 = 0x10f8;
 const TARGET_CONTROL: u32 = 0x121c;
 const CLEAR_SURFACE: u32 = 0x19d0;
+const RESPECT_STENCIL_MASK: u32 = 1;
+const USE_CLEAR_RECT: u32 = 1 << 4;
+const USE_SCISSOR: u32 = 1 << 8;
+const USE_VIEWPORT: u32 = 1 << 12;
 
 #[derive(Default)]
 pub(super) struct ThreeD {
@@ -27,9 +36,14 @@ pub(super) struct ThreeD {
     zeta_enabled: bool,
     zeta_base_layer: u32,
     screen: [u32; 2],
+    viewport: [u32; 2],
+    rect: [u32; 2],
+    scissor_enabled: bool,
+    scissor: [u32; 2],
     color: [u32; 4],
     depth: f32,
     stencil: u8,
+    stencil_mask: u8,
     target_control: u32,
     clear_control: u32,
 }
@@ -46,6 +60,11 @@ impl ThreeD {
             SCREEN_HORIZONTAL | SCREEN_VERTICAL => {
                 self.screen[((method - SCREEN_HORIZONTAL) / 4) as usize] = value;
             }
+            VIEWPORT_CLIP..=0xc04 => self.viewport[((method - VIEWPORT_CLIP) / 4) as usize] = value,
+            CLEAR_RECT..=0xd70 => self.rect[((method - CLEAR_RECT) / 4) as usize] = value,
+            SCISSOR_ENABLE => self.scissor_enabled = value & 1 != 0,
+            SCISSOR_RECT..=0xe08 => self.scissor[((method - SCISSOR_RECT) / 4) as usize] = value,
+            STENCIL_MASK => self.stencil_mask = value as u8,
             CLEAR_COLOR..=0xd8c => self.color[((method - CLEAR_COLOR) / 4) as usize] = value,
             CLEAR_DEPTH => self.depth = f32::from_bits(value),
             CLEAR_STENCIL => self.stencil = value as u8,
@@ -62,7 +81,11 @@ impl ThreeD {
     }
 
     fn clear(&self, request: u32, memory: &mut View) -> Option<()> {
-        if request >> 26 != 0 || self.clear_control != 0 {
+        if request >> 26 != 0
+            || self.clear_control
+                & !(RESPECT_STENCIL_MASK | USE_CLEAR_RECT | USE_SCISSOR | USE_VIEWPORT)
+                != 0
+        {
             return None;
         }
         let layer = request >> 10 & 0xffff;
@@ -154,7 +177,12 @@ impl ThreeD {
             mask = format.with_depth(mask, u32::MAX);
         }
         if request & 2 != 0 {
-            mask = format.with_stencil(mask, u8::MAX, u8::MAX);
+            let write_mask = if self.clear_control & RESPECT_STENCIL_MASK != 0 {
+                self.stencil_mask
+            } else {
+                u8::MAX
+            };
+            mask = format.with_stencil(mask, u8::MAX, write_mask);
         }
         self.fill(
             &surface,
@@ -173,10 +201,30 @@ impl ThreeD {
         mask: u32,
         memory: &mut View,
     ) -> Option<()> {
-        let [horizontal, vertical] = self.screen;
-        let (x, y) = (horizontal & 0xffff, vertical & 0xffff);
-        let x_end = (x + (horizontal >> 16)).min(target.width);
-        let y_end = (y + (vertical >> 16)).min(target.height);
+        let bounds = |axis: usize, size: u32| {
+            let range = |packed: u32| (packed & 0xffff, packed >> 16);
+            let (mut start, length) = range(self.screen[axis]);
+            let mut end = (start + length).min(size);
+            let mut clip = |near: u32, far: u32| {
+                start = start.max(near);
+                end = end.min(far);
+            };
+            if self.clear_control & USE_CLEAR_RECT != 0 {
+                let (near, far) = range(self.rect[axis]);
+                clip(near, far);
+            }
+            if self.clear_control & USE_SCISSOR != 0 && self.scissor_enabled {
+                let (near, far) = range(self.scissor[axis]);
+                clip(near, far);
+            }
+            if self.clear_control & USE_VIEWPORT != 0 {
+                let (near, length) = range(self.viewport[axis]);
+                clip(near, near + length);
+            }
+            (start, end)
+        };
+        let (x, x_end) = bounds(0, target.width);
+        let (y, y_end) = bounds(1, target.height);
         if u64::from(x_end.saturating_sub(x)) * u64::from(y_end.saturating_sub(y)) > 16_777_216 {
             return None;
         }

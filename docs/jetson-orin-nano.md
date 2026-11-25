@@ -189,7 +189,9 @@ words with CPU expectations. It
 also checks clipped and channel-masked Ampere C797 color clears in both
 pitch-linear and block-linear render targets. It checks that array-layer and
 attachment selection preserve neighboring layers, and verifies independent
-depth and stencil clears in a packed Z24S8 target.
+depth and stencil clears in a packed Z24S8 target. Further checks cover the
+intersection of the clear rectangle, scissor and viewport, and confirm that
+a stencil write mask preserves the other bits.
 
 The GPU model exposes separate graphics and asynchronous copy runlists and
 maps BAR1 through the GA10B page tables. It models Falcon firmware uploads,
@@ -214,7 +216,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | The Linux fixture checks a known-answer Ampere shader. The CUDA userspace path and broader shader coverage remain pending. |
-| Graphics | The stock driver submits clipped, masked and layered C797 color clears and block-linear depth/stencil clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
+| Graphics | The stock driver submits clipped, masked and layered C797 color clears and masked block-linear depth/stencil clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
 | Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests also pass in the WebAssembly build. |
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
