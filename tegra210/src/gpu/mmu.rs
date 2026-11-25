@@ -307,6 +307,43 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
+    /// A warp's load of consecutive elements (lane i at the first lane's address + i * n, all in
+    /// one page, from a word boundary): the words at once, then each lane's part. False if the
+    /// addresses are not such a run.
+    #[inline]
+    fn read_run(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) -> bool {
+        if mask == 0 {
+            return true;
+        }
+        let (first, last) = (mask.trailing_zeros() as usize, 31 - mask.leading_zeros() as usize);
+        let base = at[first];
+        let o = (base & 0xfff) as usize;
+        let span = (last - first + 1) * n;
+        if base % 4 != 0 || o + span > 0x1000 || last >= at.len() || last >= out.len() {
+            return false;
+        }
+        if (first..=last).any(|i| mask >> i & 1 != 0 && at[i] != base.wrapping_add(((i - first) * n) as u64)) {
+            return false;
+        }
+        let Some(p) = self.page(base, false) else { return false };
+        let words = span.div_ceil(4);
+        let start = (p + o) / 4;
+        let Some(src) = self.ram.get(start..start + words) else { return false };
+        // (16 bytes past the last lane's, so that every lane copies 16)
+        let mut buf = [0u8; 32 * 16 + 16];
+        for (k, w) in src.iter().enumerate() {
+            buf[4 * k..4 * k + 4].copy_from_slice(&w.load(Relaxed).to_le_bytes());
+        }
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let at = (i - first) * n;
+            out[i] = buf[at..at + 16].try_into().unwrap();
+        }
+        true
+    }
+
     /// The RAM offset of the page of `va` (all of it in RAM), if it may be read (written).
     #[inline(always)]
     fn page(&self, va: u64, write: bool) -> Option<usize> {
@@ -325,6 +362,9 @@ impl Shared<'_> {
 
 impl maxwell::Memory for Shared<'_> {
     fn read_lanes(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) {
+        if self.read_run(at, mask, n, out) {
+            return;
+        }
         let mut m = mask;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -499,6 +539,19 @@ mod tests {
             views[0].read(0x0400_5005, &mut b[..3]);
             assert_eq!(b[..3], [2, 0xaa, 3]);
             views[1].write(0x0400_6000, &[9]);
+            // a warp's loads, as a run of consecutive elements or not, are each lane's
+            let bytes: Vec<u8> = (0..64).map(|k| k as u8 * 3 + 1).collect();
+            views[0].write(0x0400_5100, &bytes);
+            for (n, step, mask) in [(2usize, 2u64, !0u32), (4, 4, 0xffff_00f0), (2, 6, !0), (1, 1, 0x8000_0001), (4, 4, !0)] {
+                let at: Vec<u64> = (0..32).map(|i| 0x0400_5100 + 0x10 + i as u64 * step).collect();
+                let mut out = vec![[0u8; 16]; 32];
+                views[1].read_lanes(&at, mask, n, &mut out);
+                for i in (0..32).filter(|i| mask >> i & 1 != 0) {
+                    let mut one = [0u8; 16];
+                    views[1].read(at[i], &mut one[..n]);
+                    assert_eq!(out[i][..n], one[..n], "n {n} step {step} lane {i}");
+                }
+            }
         });
         assert!(split);
         assert_eq!(v.ram[0x5000..0x5009], [1, 1, 2, 2, 2, 2, 0xaa, 3, 0xaa]);

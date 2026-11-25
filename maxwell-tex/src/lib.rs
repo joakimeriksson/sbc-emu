@@ -42,7 +42,7 @@ pub trait Memory {
     fn write(&mut self, addr: u64, data: &[u8]);
 
     /// `n` bytes (at most 16) at `at[i]` into `out[i]`, for each lane `i` of `mask` (a warp's
-    /// load). The default reads lane by lane.
+    /// load; what `out[i]` holds past `n` bytes is not defined). The default reads lane by lane.
     fn read_lanes(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) {
         let mut m = mask;
         while m != 0 {

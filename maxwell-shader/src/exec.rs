@@ -2041,7 +2041,10 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
         }
         Op::Ld { d, a, off, ty, wide } => {
             // the warp's addresses, then one call for all of them
-            let at: [u64; N] = std::array::from_fn(|i| global(l, a, off, wide, i));
+            let mut at = [0u64; N];
+            for (i, x) in at.iter_mut().enumerate() {
+                *x = global(l, a, off, wide, i);
+            }
             let mut buf = [[0u8; 16]; N];
             h.load_lanes(&at, m, ty.bytes(), &mut buf);
             for i in lanes(m) {
@@ -2050,7 +2053,10 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
         }
         Op::St { r, a, off, ty, wide } => {
             let m = m & !quiet;
-            let at: [u64; N] = std::array::from_fn(|i| global(l, a, off, wide, i));
+            let mut at = [0u64; N];
+            for (i, x) in at.iter_mut().enumerate() {
+                *x = global(l, a, off, wide, i);
+            }
             let buf: [[u8; 16]; N] = std::array::from_fn(|i| if m >> i & 1 != 0 { data(l, r, ty, i) } else { [0; 16] });
             h.store_lanes(&at, m, ty.bytes(), &buf);
         }
