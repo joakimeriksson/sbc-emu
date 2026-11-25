@@ -22,7 +22,14 @@ pub enum Group {
     Host1x = 0x250,
     Vic = 0x284,
     Gpu = 0xaac,
+    Sdmmc1a = 0xa94,
+    Sdmmc2a = 0xa98,
+    Sdmmc3a = 0xa9c,
+    Sdmmc4a = 0xaa0,
 }
+
+/// The SD/MMC controllers' groups, by controller.
+pub const SDMMC: [Group; 4] = [Group::Sdmmc1a, Group::Sdmmc2a, Group::Sdmmc3a, Group::Sdmmc4a];
 
 const PFN: u32 = 0x3f_ffff;
 const READABLE: u32 = 1 << 31;
@@ -36,7 +43,12 @@ pub struct Smmu {
 
 impl Default for Smmu {
     fn default() -> Self {
-        Self { regs: vec![0; SIZE as usize / 4], ptb: [0; 128] }
+        let mut regs = vec![0; SIZE as usize / 4];
+        // CONFIG is secure-only on Tegra210: the boot firmware turns translation on (L4T's
+        // kernel relies on that; mainline writes it again). Clients stay untranslated until
+        // their group's register enables an address space.
+        regs[CONFIG / 4] = 1;
+        Self { regs, ptb: [0; 128] }
     }
 }
 
@@ -61,16 +73,23 @@ impl Smmu {
         }
     }
 
-    /// The page directory (physical) of the group's address space; None: not translated.
+    /// The page directory (physical) of the group's first address space; None: not translated.
     pub fn directory(&self, group: Group) -> Option<u32> {
-        let asid = self.regs[group as usize / 4];
-        (self.regs[CONFIG / 4] & 1 != 0 && asid & 1 << 31 != 0).then(|| self.ptb[asid as usize & 127])
+        self.spaces(group).map(|s| s.0[0])
+    }
+
+    /// The group's address spaces; None: not translated. A group's register holds an ASID per
+    /// 4 GiB window of the 34-bit addresses its clients send (bits 33:32 choose; mainline Linux
+    /// fills in the first, L4T's kernel all four).
+    pub fn spaces(&self, group: Group) -> Option<Spaces> {
+        let r = self.regs[group as usize / 4];
+        (self.regs[CONFIG / 4] & 1 != 0 && r & 1 << 31 != 0).then(|| Spaces(std::array::from_fn(|k| self.ptb[(r >> (8 * k)) as usize & 127])))
     }
 
     /// The physical address behind `iova` for a client of `group`; None is a fault.
     pub fn translate(&self, group: Group, iova: u64, write: bool, dma: &dyn Memory) -> Option<u64> {
-        match self.directory(group) {
-            Some(d) => walk(d, iova, write, dma),
+        match self.spaces(group) {
+            Some(s) => s.walk(iova, write, dma),
             None => Some(iova),
         }
     }
@@ -93,6 +112,20 @@ impl Smmu {
         let mut b = [0; 4];
         self.read_bytes(group, iova, &mut b, dma);
         u32::from_le_bytes(b)
+    }
+}
+
+/// A group's four address spaces (their page directory entries), by 4 GiB window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spaces(pub [u32; 4]);
+
+impl Spaces {
+    /// The physical address behind 34-bit `iova`; None is a fault.
+    pub fn walk(&self, iova: u64, write: bool, dma: &dyn Memory) -> Option<u64> {
+        if iova >> 34 != 0 {
+            return None;
+        }
+        walk(self.0[(iova >> 32) as usize], iova & 0xffff_ffff, write, dma)
     }
 }
 
@@ -121,6 +154,24 @@ pub fn walk(ptb: u32, iova: u64, write: bool, dma: &dyn Memory) -> Option<u64> {
 mod tests {
     use super::*;
     use peripherals::dma::Dma;
+
+    /// L4T fills a group's register with four ASIDs, one per 4 GiB window.
+    #[test]
+    fn four_windows_per_group() {
+        const BASE: u64 = 0x8000_0000;
+        let mut ram = vec![0u8; 0x10000];
+        let put = |ram: &mut [u8], o: usize, v: u32| ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        // ASID 7: directory at +0x1000 with a 4 MiB page at iova 0 -> +0x0 (phys BASE)
+        put(&mut ram, 0x1000, 3 << 30 | (BASE as u32) >> 12);
+        let mut s = Smmu::default();
+        s.write(PTB_ASID as u64, 7);
+        s.write(PTB_DATA as u64, 3 << 30 | (BASE as u32 + 0x1000) >> 12);
+        s.write(Group::Gpu as u64, 1 << 31 | 7 << 8);
+        let d = Dma { ram: &mut ram, base: BASE };
+        assert_eq!(s.translate(Group::Gpu, 0x1_0000_1234, false, &d), Some(BASE + 0x1234), "window 1 is ASID 7");
+        assert_eq!(s.translate(Group::Gpu, 0x0_0000_1234, false, &d), None, "window 0 (ASID 0) maps nothing");
+        assert_eq!(s.translate(Group::Gpu, 0x4_0000_0000, false, &d), None, "beyond 34 bits");
+    }
 
     #[test]
     fn two_levels_and_per_group_spaces() {

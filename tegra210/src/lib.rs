@@ -319,6 +319,7 @@ impl Soc {
         if (SDMMC..SDMMC + 4 * sdhci::SIZE).contains(&word) {
             let k = (word - SDMMC) / sdhci::SIZE;
             // SDHCI registers are 8, 16 and 32 bits wide, and commands start from part of a word
+            self.sd[k as usize].iommu = self.smmu.spaces(smmu::SDMMC[k as usize]);
             let mut dma = sdhci::Dma { ram: &mut self.ram, base: RAM_BASE };
             self.sd[k as usize].write(addr - SDMMC - k * sdhci::SIZE, value as u32, size, &mut dma);
             return Ok(());
@@ -366,6 +367,9 @@ impl Soc {
                 (0..n).for_each(|_| self.host1x.increment(point));
             }
             self.gic.set_level(irq, d.irq());
+        }
+        for point in std::mem::take(&mut self.gpu.syncpts) {
+            self.host1x.increment(point);
         }
         self.gic.set_level(host1x::IRQ, self.host1x.irq());
         self.gpu.tick(self.now);
@@ -1014,6 +1018,8 @@ impl Machine {
             0x8400_000a => if supported(x[1] as u32) { 0 } else { NOT_SUPPORTED },
             // NVIDIA's SiP call for a "secure PMC" (L4T's kernel): PMC register reads and writes
             // through the secure monitor (PMC_READ 0xaa, PMC_WRITE 0xbb; offsets from the PMC base)
+            // L4T: program the protected video region (TE_SMC_PROGRAM_VPR); nothing is protected here
+            0x8200_0003 => 0,
             0xc2ff_fe00 => match x[1] {
                 0xaa => { self.cpus[k].x[1] = u64::from(self.soc.pmc.read(x[2])); 0 }
                 0xbb => { self.soc.pmc.write(x[2], x[3] as u32); 0 }
@@ -1205,6 +1211,6 @@ mod tests {
             got.extend_from_slice(&m.soc.read(SDMMC + 0x20, size).unwrap().to_le_bytes()[..size]);
         }
         assert_eq!(got, (0..12).collect::<Vec<u8>>());
-        assert_eq!(m.soc.read(SDMMC + 0xfe, 2).unwrap(), 2, "a register's upper half");
+        assert_eq!(m.soc.read(SDMMC + 0xfe, 2).unwrap(), 3, "a register's upper half (SDHCI 4.00)");
     }
 }

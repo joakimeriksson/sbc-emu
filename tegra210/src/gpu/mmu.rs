@@ -1,7 +1,7 @@
 //! The GPU's memory management unit: per-address-space page directories (8 bytes per 128 MiB, or
 //! 64 MiB with 64 KiB big pages) whose entries point at a big and a small (4 KiB) page table.
 //! Physical addresses with bit 34 set go through the SMMU.
-use crate::smmu::{self, Group, Smmu};
+use crate::smmu::{Group, Smmu};
 use crate::RAM_BASE;
 use std::cell::Cell;
 
@@ -46,8 +46,7 @@ impl Default for Mmu {
 /// Offset in RAM of a GPU physical address.
 pub fn physical(pa: u64, smmu: &Smmu, ram: &[u8]) -> Option<usize> {
     let pa = if pa >> 34 & 1 != 0 {
-        let dir = smmu.directory(Group::Gpu)?;
-        smmu::walk(dir, pa & 0x3_ffff_ffff, false, &peripherals::dma::Ram { ram, base: RAM_BASE })?
+        smmu.spaces(Group::Gpu)?.walk(pa & 0x3_ffff_ffff, false, &peripherals::dma::Ram { ram, base: RAM_BASE })?
     } else {
         pa
     };

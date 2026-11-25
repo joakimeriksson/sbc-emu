@@ -24,6 +24,10 @@ const CAPS: usize = 0x40 / 4;
 const CAPS1: usize = 0x44 / 4;
 const ADMA_LO: usize = 0x58 / 4;
 const ADMA_HI: usize = 0x5c / 4;
+/// Auto CMD error status (low half) and HOST_CONTROL2 (high half)
+const ACMD_CTRL2: usize = 0x3c / 4;
+const V4_MODE: u32 = 1 << 12;
+const ADDR_64: u32 = 1 << 13;
 const VERSION: usize = 0xfc / 4;
 const DLLCAL_STATUS: usize = 0x1bc / 4;
 const AUTO_CAL_STATUS: usize = 0x1ec / 4;
@@ -61,11 +65,14 @@ pub struct Sdhci {
     open: bool,
     pub blocks_read: u64,
     pub blocks_written: u64,
+    /// the page directory of the SMMU address space the controller's DMA goes through (L4T's
+    /// kernel puts it behind the SMMU; mainline does not); set by the SoC before each access
+    pub iommu: Option<crate::smmu::Spaces>,
 }
 
 impl Default for Sdhci {
     fn default() -> Self {
-        let mut s = Self { card: SdCard::new(None), regs: [0; SIZE as usize / 4], xfer: Xfer::None, buf: Vec::new(), pos: 0, lba: 0, left: 0, open: false, blocks_read: 0, blocks_written: 0 };
+        let mut s = Self { card: SdCard::new(None), regs: [0; SIZE as usize / 4], xfer: Xfer::None, buf: Vec::new(), pos: 0, lba: 0, left: 0, open: false, blocks_read: 0, blocks_written: 0, iommu: None };
         s.card.trace = std::env::var_os("SBC_MMC_TRACE").is_some();
         s.reset();
         s
@@ -79,7 +86,7 @@ impl Sdhci {
         // the clock controller (the driver does not trust the field on Tegra)
         self.regs[CAPS] = 1 << 28 | 1 << 24 | 1 << 21 | 1 << 19 | 208 << 8 | 1 << 7 | 12;
         self.regs[CAPS1] = 0;
-        self.regs[VERSION] = 2 << 16; // SDHCI 3.00
+        self.regs[VERSION] = 3 << 16; // SDHCI 4.00 (mainline Linux does not enable v4 mode on Tegra210)
         self.xfer = Xfer::None;
     }
 
@@ -243,7 +250,11 @@ impl Sdhci {
         }
         let select = self.regs[CTRL] >> 3 & 3;
         if mode & 1 != 0 && select >= 2 {
-            self.adma(select == 3, dma);
+            // HOST_CONTROL2: in v4 mode 64-bit addressing takes 16-byte descriptors (L4T's
+            // driver); without it ADMA2 64-bit (DMA select 3) takes 12-byte ones
+            let ctrl2 = self.regs[ACMD_CTRL2] >> 16;
+            let v4_64 = ctrl2 & V4_MODE != 0 && ctrl2 & ADDR_64 != 0;
+            self.adma(if v4_64 { 16 } else if select == 3 { 12 } else { 8 }, dma);
         } else {
             self.raise(if self.xfer == Xfer::Read { INT_BUF_RD } else { INT_BUF_WR });
         }
@@ -264,14 +275,38 @@ impl Sdhci {
         self.pos = 0;
     }
 
+    /// The physical address of DMA address `a`.
+    fn pa(&self, dma: &Dma, a: u64, write: bool) -> Option<u64> {
+        match self.iommu {
+            Some(s) => s.walk(a, write, dma),
+            None => Some(a),
+        }
+    }
+
+    /// `len` bytes at DMA address `a` as physical pieces.
+    fn pieces(&self, dma: &Dma, a: u64, len: usize) -> Option<Vec<(u64, usize)>> {
+        if self.iommu.is_none() {
+            return Some(vec![(a, len)]);
+        }
+        let write = self.xfer == Xfer::Read;
+        let (mut out, mut o) = (Vec::new(), 0);
+        while o < len {
+            let at = a + o as u64;
+            let n = (0x1000 - (at & 0xfff) as usize).min(len - o);
+            out.push((self.pa(dma, at, write)?, n));
+            o += n;
+        }
+        Some(out)
+    }
+
     /// Move the whole transfer through the ADMA2 descriptor table.
-    fn adma(&mut self, wide: bool, dma: &mut Dma) {
+    fn adma(&mut self, step: usize, dma: &mut Dma) {
+        let wide = step > 8;
         let mut d = self.regs[ADMA_LO] as u64 | if wide { (self.regs[ADMA_HI] as u64) << 32 } else { 0 };
-        let step = if wide { 12 } else { 8 };
         let (mut finished, mut moved) = (false, false);
         // a table is at most as long as RAM; a loop of links ends here
         'table: for _ in 0..1 << 20 {
-            let Some(raw) = dma.slice(d, step).map(|s| s.to_vec()) else { break };
+            let Some(raw) = self.pa(dma, d, false).and_then(|pa| dma.slice(pa, step)).map(|s| s.to_vec()) else { break };
             let attr = raw[0];
             let len = match u16::from_le_bytes([raw[2], raw[3]]) { 0 => 0x1_0000, n => n as usize };
             let lo = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as u64;
@@ -281,24 +316,28 @@ impl Sdhci {
             }
             match attr >> 4 & 3 {
                 2 => {
-                    let Some(mem) = dma.slice(addr, len) else { break };
-                    // (the length of an open-ended transfer is the table's)
-                    let mut o = 0;
-                    while o < len && !finished {
-                        if !self.more() {
-                            return;
-                        }
-                        moved = true;
-                        let n = (self.buf.len() - self.pos).min(len - o);
-                        if self.xfer == Xfer::Read {
-                            mem[o..o + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-                        } else {
-                            self.buf[self.pos..self.pos + n].copy_from_slice(&mem[o..o + n]);
-                        }
-                        self.pos += n;
-                        o += n;
-                        if self.pos == self.buf.len() {
-                            finished = self.block_done();
+                    // the segment, page by page when it goes through the SMMU
+                    let Some(pieces) = self.pieces(dma, addr, len) else { break };
+                    for (pa, plen) in pieces {
+                        let Some(mem) = dma.slice(pa, plen) else { break 'table };
+                        // (the length of an open-ended transfer is the table's)
+                        let mut o = 0;
+                        while o < plen && !finished {
+                            if !self.more() {
+                                return;
+                            }
+                            moved = true;
+                            let n = (self.buf.len() - self.pos).min(plen - o);
+                            if self.xfer == Xfer::Read {
+                                mem[o..o + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                            } else {
+                                self.buf[self.pos..self.pos + n].copy_from_slice(&mem[o..o + n]);
+                            }
+                            self.pos += n;
+                            o += n;
+                            if self.pos == self.buf.len() {
+                                finished = self.block_done();
+                            }
                         }
                     }
                 }
@@ -469,6 +508,33 @@ mod tests {
             s.card.read_blocks(100, &mut out);
             assert_eq!((out[0], out[512], out[1024], out[1535]), (5, 6, 7, 7));
         }
+    }
+
+    /// L4T's driver: v4 mode with 64-bit addressing (16-byte descriptors), the controller behind
+    /// the SMMU, a segment that spans two pages mapped apart.
+    #[test]
+    fn v4_descriptors_through_the_smmu() {
+        let (mut s, mut ram) = ready();
+        let put = |ram: &mut [u8], o: usize, v: u32| ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        // directory at +0x1000 -> table at +0x2000; iova 0x10000 -> +0x6000, 0x11000 -> +0x3000,
+        // the descriptor table at iova 0x20000 -> +0x5000
+        put(&mut ram, 0x1000, 3 << 30 | 1 << 28 | (BASE as u32 + 0x2000) >> 12);
+        put(&mut ram, 0x2000 + 0x10 * 4, 3 << 30 | (BASE as u32 + 0x6000) >> 12);
+        put(&mut ram, 0x2000 + 0x11 * 4, 3 << 30 | (BASE as u32 + 0x3000) >> 12);
+        put(&mut ram, 0x2000 + 0x20 * 4, 3 << 30 | (BASE as u32 + 0x5000) >> 12);
+        // one 16-byte descriptor: valid, end, transfer; 1024 bytes at iova 0x10e00
+        ram[0x5000..0x5004].copy_from_slice(&[0x23, 0, 0, 4]);
+        put(&mut ram, 0x5004, 0x10e00);
+        s.iommu = Some(crate::smmu::Spaces([3 << 30 | (BASE as u32 + 0x1000) >> 12; 4]));
+        let mut d = Dma { ram: &mut ram, base: BASE };
+        s.write(0x3c, (V4_MODE | ADDR_64) << 16, 4, &mut d);
+        s.write(0x58, 0x20000, 4, &mut d);
+        s.write(0x5c, 0, 4, &mut d);
+        s.write(0x28, 2 << 3, 1, &mut d); // ADMA2
+        start(&mut s, &mut d, 18, 0, 2, 1 | 1 << 1 | 1 << 4 | 1 << 5);
+        assert_eq!(s.read(0x30) & 0xffff_0003, 3, "command and transfer done, no ADMA error");
+        assert_eq!(d.ram[0x6e00..0x7000], [0; 512], "block 0 lands in the first page");
+        assert_eq!(d.ram[0x3000..0x3200], [1; 512], "block 1 in the second page, mapped apart");
     }
 
     #[test]

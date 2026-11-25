@@ -12,6 +12,8 @@ pub struct Done {
     pub waiting: bool,
     /// a semaphore it waited for came
     pub resumed: bool,
+    /// host1x sync points the channel incremented (nvgpu's job tracking on L4T)
+    pub syncpts: Vec<usize>,
 }
 
 /// How a semaphore is compared.
@@ -206,6 +208,15 @@ impl State {
                 }
             }
             0x20 => done.nonstall = true,
+            0x70 => {} // SYNCPOINTA: a wait's threshold
+            // SYNCPOINTB: increment the host1x sync point (once the work before it is done, which
+            // it is: the engines run at once); a wait passes, for the same reason
+            0x74 => {
+                if v & 3 == 1 {
+                    self.engine.end(view);
+                    done.syncpts.push((v >> 8 & 0xff) as usize);
+                }
+            }
             _ => {}
         }
     }
