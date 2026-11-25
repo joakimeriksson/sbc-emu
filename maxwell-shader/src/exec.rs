@@ -437,6 +437,29 @@ fn cmpi<const N: usize>(cond: ICond, signed: bool, a: &[u32; N], b: &[u32; N]) -
     m
 }
 
+/// Source `k` of a packed half-float operation as two floats (low and high result lane).
+fn halves<const N: usize, H: Host<N>>(l: &Lanes<N>, h: &H, s: &HalfSrcs, k: usize, ftz: bool) -> [[f32; N]; 2] {
+    let raw = match k {
+        0 => l.gpr[s.a as usize],
+        1 => l.src(h, s.b),
+        _ => l.src(h, s.c),
+    };
+    let m = s.m[k];
+    let f = |x: f32| {
+        let x = if ftz && x != 0.0 && x.abs() < 6.103_515_6e-5 { 0.0f32.copysign(x) } else { x };
+        let x = if m.abs { x.abs() } else { x };
+        if m.neg { -x } else { x }
+    };
+    let half = |v: u32, high: bool| fp::half_to_f32(if high { (v >> 16) as u16 } else { v as u16 });
+    let pick = |v: u32, lane: usize| match s.swz[k] {
+        1 => f32::from_bits(v),
+        2 => half(v, false),
+        3 => half(v, true),
+        _ => half(v, lane == 1),
+    };
+    [raw.map(|v| f(pick(v, 0))), raw.map(|v| f(pick(v, 1)))]
+}
+
 #[inline(always)]
 fn bool_op(op: BoolOp, a: u32, b: u32) -> u32 {
     match op {
@@ -793,6 +816,46 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
                 l.flags_f(m, v);
             }
             l.putf(d, m, v);
+        }
+        Op::Half { d, op, s, f32, sat, ftz, p } => {
+            let ([x0, x1], [y0, y1], [z0, z1]) = (halves(l, h, &s, 0, ftz), halves(l, h, &s, 1, ftz), halves(l, h, &s, 2, ftz));
+            let sel = l.p(p);
+            let calc = |x: f32, y: f32, z: f32, lane: usize| -> f32 {
+                let r = match op {
+                    HalfOp::Add => x + y,
+                    HalfOp::Mul => x * y,
+                    HalfOp::Fma => x.mul_add(y, z),
+                    HalfOp::MnMx if sel >> lane & 1 != 0 => fp::min(x, y),
+                    HalfOp::MnMx => fp::max(x, y),
+                };
+                if sat { fp::sat(r) } else { r }
+            };
+            let v = std::array::from_fn(|i| {
+                let lo = calc(x0[i], y0[i], z0[i], i);
+                if f32 {
+                    return lo.to_bits();
+                }
+                let hi = calc(x1[i], y1[i], z1[i], i);
+                let pack = |v: f32| {
+                    let h = fp::f32_to_half(v, Rnd::N);
+                    if ftz && h & 0x7c00 == 0 { h & 0x8000 } else { h }
+                };
+                pack(lo) as u32 | (pack(hi) as u32) << 16
+            });
+            l.put(d, m, v);
+        }
+        Op::HSetP { pd, pn, s, cond, ftz, bop, p, hand } => {
+            let ([x0, x1], [y0, y1]) = (halves(l, h, &s, 0, ftz), halves(l, h, &s, 1, ftz));
+            let lo = cmp32(cond, &x0, &y0);
+            let hi = cmp32(cond, &x1, &y1);
+            let q = l.p(p);
+            if hand {
+                l.putp(pd, m, bool_op(bop, lo & hi, q));
+                l.putp(pn, m, bool_op(bop, !(lo & hi), q));
+            } else {
+                l.putp(pd, m, bool_op(bop, lo, q));
+                l.putp(pn, m, bool_op(bop, hi, q));
+            }
         }
         Op::Mufu { d, a, m: md, op, sat } => {
             let x = l.gpr[a as usize];
@@ -2223,6 +2286,16 @@ fn texture<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, t: &
         let fixed = |x: u32| f32::from_bits(x) as f64 * 256.0;
         r[0] = r[0].map(|x| fixed(x).clamp(-32768.0, 32767.0) as i32 as u32 & 0xffff);
         r[1] = r[1].map(|x| fixed(x).clamp(0.0, 65535.0) as u32);
+    }
+    if t.f16 {
+        // two components to a register: the first pair in d0, the second in d1
+        let wanted: Vec<[u32; N]> = (0..4).filter(|c| t.mask >> c & 1 != 0).map(|c| r[c]).collect();
+        let half = |v: u32| fp::f32_to_half(f32::from_bits(v), Rnd::N) as u32;
+        for (k, pair) in wanted.chunks(2).enumerate() {
+            let v = std::array::from_fn(|i| half(pair[0][i]) | pair.get(1).map_or(0, |p| half(p[i]) << 16));
+            l.put(if k == 0 { t.d0 } else { t.d1 }, m, v);
+        }
+        return;
     }
     let mut n = 0;
     for (c, v) in r.iter().enumerate() {

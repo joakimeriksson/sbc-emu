@@ -260,7 +260,7 @@ const CHUNK: usize = 4096;
 /// Set up the primitives of `g` from `first` to `last`.
 pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup, first: usize, last: usize) -> Scene {
     let culls = (0..8).fold(0, |m, k| m | (t.r(0x1940) >> (4 * k) & 1) << k);
-    // a lower-left window origin: y flips, and with it the winding
+    // a lower-left window origin: y flips
     let flip = t.window_flip().map(|h| h as f32);
     let (scale_y, offset_y) = match flip {
         Some(h) => (-t.f(0xa04), h - t.f(0xa10)),
@@ -278,7 +278,9 @@ pub fn setup(t: &Threed, g: &mut Geometry, s: &Setup, first: usize, last: usize)
             transform: t.r(0x192c) & 1 != 0,
         },
         cull: (t.r(0x1918) & 1 != 0).then(|| t.r(0x1920)),
-        front_negative: (t.r(0x191c) == 0x900) != flip.is_some(),
+        // FRONT_FACE is for y down; SET_WINDOW_ORIGIN's lower-left origin (here a flip
+        // of window y) and its FLIP_Y (which moves nothing) each say y is up
+        front_negative: (t.r(0x191c) == 0x900) != (flip.is_some() != (t.r(0x13ac) & 0x10 != 0)),
         mode_front: t.r(0xdac),
         mode_back: t.r(0xdb0),
         // glPolygonOffset, for point, line and filled polygons

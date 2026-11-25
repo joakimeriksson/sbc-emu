@@ -29,6 +29,9 @@ impl Default for ThreeD {
     fn default() -> Self {
         let mut engine = maxwell::threed::Threed::default();
         engine.pipe.sm70 = true;
+        // Reset state the NVIDIA driver relies on and never sets:
+        // SET_BLEND_SEPARATE_FOR_ALPHA (it always programs the alpha factors)
+        engine.regs[0x133c / 4] = 1;
         Self {
             engine,
             mme: Default::default(),

@@ -177,7 +177,7 @@ impl Worker {
         for (w, b) in words.iter_mut().zip(&work.cbufs) {
             w.bind(*b, work.constants);
         }
-        let common = Common { mem, words, textures: &mut self.textures, samplers: &mut self.samplers, cache: &mut self.cache, tic: work.tic, tsc: work.tsc, tex_cb: work.tex_cb, stored: false };
+        let common = Common { mem, words, textures: &mut self.textures, samplers: &mut self.samplers, cache: &mut self.cache, tic: work.tic, tsc: work.tsc, tex_cb: work.tex_cb, linked: work.linked, stored: false };
         (&mut self.lanes, common)
     }
 }
@@ -193,6 +193,8 @@ pub struct Work {
     tic: u64,
     tsc: u64,
     tex_cb: u32,
+    /// SET_SAMPLER_BINDING VIA_HEADER_BINDING: a texture's sampler has its number
+    linked: bool,
 }
 
 pub struct Pipe {
@@ -311,7 +313,24 @@ impl Pipe {
                 };
                 // addresses inside a program count from its first instruction's block
                 if sm70 {
-                    Program::decode_sm70_at(start + 0x80, &mut fetch)
+                    let made = Program::decode_sm70_at(start + 0x80, &mut fetch);
+                    if let (Ok(p), Some(dir)) = (&made, std::env::var_os("SBC_DUMP_SHADERS")) {
+                        // the header and the code as far as it was decoded, for a disassembler
+                        let end = p.words().iter().map(|w| w.0 + 16).max().unwrap_or(0x80);
+                        let mut bytes = vec![0; end as usize];
+                        mem.read(base + start as u64, &mut bytes);
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{:x}.bin", base + start as u64)), bytes);
+                    }
+                    if let Ok(p) = &made {
+                        // instructions the SM70 decoder does not know, whole, for a disassembler
+                        for (inst, &(at, _)) in p.insts().iter().zip(p.words()) {
+                            if let maxwell_shader::isa::Op::Invalid(_) = inst.op {
+                                let (lo, hi) = (fetch(at).unwrap_or(0), fetch(at + 8).unwrap_or(0));
+                                eprintln!("[maxwell] sm70 unknown at {:#x}+{at:#x}: {hi:016x}{lo:016x}", base + start as u64);
+                            }
+                        }
+                    }
+                    made
                 } else {
                     Program::decode_at(start + 0x50, &mut fetch)
                 }
@@ -340,10 +359,20 @@ pub struct Common<'a> {
     pub tic: u64,
     pub tsc: u64,
     pub tex_cb: u32,
+    pub linked: bool,
     pub stored: bool,
 }
 
 impl Common<'_> {
+    /// A bound texture's handle.
+    fn bound(&self, w: u32) -> u32 {
+        if self.tex_cb == u32::MAX {
+            self.cbuf(w >> 14, 4 * (w & 0x3fff))
+        } else {
+            self.cbuf(self.tex_cb, 4 * w)
+        }
+    }
+
     #[inline(always)]
     pub fn cbuf(&self, index: u32, offset: u32) -> u32 {
         self.words.get(index as usize).map_or(0, |w| w.get(offset, &*self.mem))
@@ -391,7 +420,7 @@ impl Common<'_> {
                 }
                 Handle::Bindless(h) => self.quad(op, q, h[first], active, &mut out),
                 Handle::Bound(w) => {
-                    let h = self.cbuf(self.tex_cb, 4 * w);
+                    let h = self.bound(w);
                     self.quad(op, q, h, active, &mut out);
                 }
             }
@@ -436,7 +465,7 @@ impl Common<'_> {
                 put(r);
             }
             _ => {
-                let smp = self.sampler_at(handle >> 20);
+                let smp = self.sampler_at(if self.linked { handle & 0xfffff } else { handle >> 20 });
                 let lod = match op.lod_mode {
                     _ if op.kind == TexKind::Grad => {
                         let g = |v: &[[f32; N]; 2]| -> [[f32; 4]; 3] { std::array::from_fn(|c| std::array::from_fn(|k| v.get(c).map_or(0.0, |v| v[4 * q + k]))) };
@@ -473,7 +502,7 @@ impl Common<'_> {
     fn surface<const N: usize>(&mut self, op: &SurfOp<N>, l: usize) -> (Arc<Texture>, [i32; 3], u32) {
         let h = match op.handle {
             Handle::Bindless(h) => h[l],
-            Handle::Bound(w) => self.cbuf(self.tex_cb, 4 * w),
+            Handle::Bound(w) => self.bound(w),
         };
         let t = self.texture_at(h & 0xf_ffff);
         let c = |k: usize| op.coord[k][l] as i32;
@@ -628,7 +657,7 @@ impl Work {
         if std::mem::take(&mut pipe.cbufs_changed) {
             pipe.constant_generation += 1;
         }
-        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb }
+        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb, linked: false }
     }
 }
 
@@ -641,7 +670,9 @@ pub fn work(t: &Threed, s: usize) -> Work {
         constants: t.pipe.constant_generation,
         tic: t.address(0x1574),
         tsc: t.address(0x155c),
-        tex_cb: t.r(0x2608),
+        // SM70 bound textures name their constant buffer: `index` is buffer << 14 | word
+        tex_cb: if t.pipe.sm70 { u32::MAX } else { t.r(0x2608) },
+        linked: t.r(0x1234) & 1 != 0,
     }
 }
 

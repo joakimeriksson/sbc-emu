@@ -276,6 +276,31 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         _ => {}
     }
 
+    // Packed half floats: like the ALU forms, with a swizzle per source and the third
+    // slot's modifiers in bits 83 and 84.
+    if matches!(opcode & 0x1ff, 0x030..=0x035 | 0x037 | 0x040) {
+        return half(w).map(|op| vec![op]);
+    }
+    match opcode {
+        // R2P PR, R.Bn, mask: predicates from the bits of a register's byte n (bits 76..78).
+        0x804 => {
+            let (a, mask, byte) = (w.reg(24), w.f(32, 7), w.f(76, 2));
+            return Some(
+                (0..7)
+                    .filter(|i| mask >> i & 1 != 0)
+                    .map(|i| Op::Lop { d: RZ, a, b: Src::Imm(1 << (8 * byte + i)), not_a: false, not_b: false, op: 0, x: false, cc: false, test: 3, pd: i as u8 })
+                    .collect(),
+            );
+        }
+        0x822 => {
+            return one(Op::FSwzAdd { d: w.reg(16), a: w.reg(24), b: w.reg(64), ops: w.f(32, 8) as u8, ftz: w.b(80), cc: false, rnd: w.rnd(78) });
+        }
+        0xb60 | 0x361 | 0xb66 | 0x367 | 0xb63 | 0x364 | 0xb69 | 0x36a | 0xb6c | 0x36d | 0xb6f | 0x370 => {
+            return texture(w).map(|t| vec![Op::Tex(t)]);
+        }
+        _ => {}
+    }
+
     // ALU instructions: the low 9 bits name the operation, bits 9..12 the operand form.
     let op9 = opcode & 0x1ff;
     let uniform = op9 >= 0x80 && op9 < 0x100;
@@ -326,6 +351,14 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             if w.b(73) {
                 return None; // F16
             }
+            // SM70 has no RRO: SIN and COS take turns, the compiler having divided by 2 pi
+            if matches!(op, Mufu::Sin | Mufu::Cos) {
+                let turn = std::f32::consts::TAU.to_bits();
+                return Some(vec![
+                    Op::FMul { d, a, b: Src::Imm(turn), neg: false, fmz: Fmz::default(), sat: false, cc: false, rnd: Rnd::N, scale: 1.0 },
+                    Op::Mufu { d, a: d, m: s.bm, op, sat: false },
+                ]);
+            }
             Op::Mufu { d, a, m: s.bm, op, sat: false }
         }
         // IADD3 (.X adds the carry); the carry and overflow predicates become the carry flag.
@@ -372,6 +405,13 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             Op::Shf { d, lo: s.a, hi: reg_of(s.c)?, b: s.b, right: w.b(76), high: w.b(80), wrap: w.b(75), wide: ty < 2, signed: ty == 0 || ty == 2, cc: false }
         }
         (0x007, _) => Op::Sel { d, a: s.a, b: s.b, p: w.pred(87, 90) },
+        // FSEL: SEL of floats
+        (0x008, false) => {
+            if s.am != Mod::default() || s.bm != Mod::default() {
+                return None;
+            }
+            Op::Sel { d, a: s.a, b: s.b, p: w.pred(87, 90) }
+        }
         (0x016, _) => Op::Prmt { d, a: s.a, b: s.b, c: s.c, mode: w.f(72, 3) as u8 },
         (0x011, _) => {
             if w.b(80) || w.b(74) {
@@ -419,7 +459,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             ftz,
             cc: false,
         },
-        (0x106 | 0x112, false) => Op::I2F {
+        // I2FP: the ALU pipe's integer to float, with I2F's fields
+        (0x106 | 0x112 | 0x045, false) => Op::I2F {
             d,
             b: s.b,
             m: Mod::default(),
@@ -432,6 +473,249 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         _ => return None,
     };
     one(op)
+}
+
+fn half(w: W) -> Option<Op> {
+    let form = w.f(9, 3);
+    let m = |abs, neg| Mod { abs: w.b(abs), neg: w.b(neg) };
+    let cb = || Src::Cb(w.f(54, 5) as u8, w.f(38, 16));
+    // (source, modifiers, swizzle) of the 32-bit slot and of the slot at bits 64..72
+    let wide = |src: Src| (src, m(62, 63), w.f(60, 2) as u8);
+    let low = || (Src::Reg(w.reg(64)), m(83, 84), w.f(81, 2) as u8);
+    let imm = |src: Src| (src, Mod::default(), 0);
+    let (b, c) = match form {
+        1 => (wide(Src::Reg(w.reg(32))), low()),
+        2 => (low(), imm(Src::Imm(w.f(32, 32)))),
+        3 if !w.b(91) => (low(), wide(cb())),
+        4 => (imm(Src::Imm(w.f(32, 32))), low()),
+        5 if !w.b(91) => (wide(cb()), low()),
+        6 => (wide(Src::Reg(w.ureg(32))), low()),
+        7 => (low(), wide(Src::Reg(w.ureg(32)))),
+        _ => return None,
+    };
+    let a = w.reg(24);
+    let srcs = HalfSrcs { a, b: b.0, c: c.0, swz: [w.f(74, 2) as u8, b.2, c.2], m: [m(73, 72), b.1, c.1] };
+    let (d, ftz, sat, f32) = (w.reg(16), w.b(80), w.b(77), w.b(78));
+    let op9 = w.opcode() & 0x1ff;
+    if w.b(85) {
+        return None; // bfloat16
+    }
+    // HADD2, HMUL2 and HSETP2 take their second operand from b, or from c in forms 2, 3 and 7.
+    let s2 = if matches!(form, 2 | 3 | 7) {
+        HalfSrcs { b: srcs.c, swz: [srcs.swz[0], srcs.swz[2], 0], m: [srcs.m[0], srcs.m[2], Mod::default()], ..srcs }
+    } else {
+        srcs
+    };
+    Some(match op9 {
+        0x030 | 0x032 | 0x037 => {
+            let op = if op9 == 0x030 { HalfOp::Add } else { HalfOp::Mul };
+            Op::Half { d, op, s: s2, f32, sat, ftz, p: PT }
+        }
+        0x031 | 0x035 => Op::Half { d, op: HalfOp::Fma, s: srcs, f32, sat, ftz, p: PT },
+        0x040 => Op::Half { d, op: HalfOp::MnMx, s: srcs, f32: false, sat: false, ftz, p: w.pred(87, 90) },
+        0x034 => Op::HSetP { pd: w.pdst(81), pn: w.pdst(84), s: s2, cond: w.f(76, 4) as u8, ftz, bop: w.bop(69)?, p: w.pred(87, 90), hand: w.b(71) },
+        _ => return None,
+    })
+}
+
+/// The texture instructions: sampling, fetches, gathers, queries and gradients. Their sources
+/// are two register vectors (bits 24 and 32) as Mesa's NAK packs them; the bound forms name a
+/// texture handle in a constant buffer, which goes in `index` as buffer << 14 | word.
+fn texture(w: W) -> Option<Tex> {
+    let opcode = w.opcode();
+    let bindless = opcode & 0x800 == 0;
+    let kind = match opcode & 0x7ff {
+        0x360 | 0x361 => TexKind::Sample,
+        0x366 | 0x367 => TexKind::Fetch,
+        0x363 | 0x364 => TexKind::Gather,
+        0x369 | 0x36a => TexKind::QueryLod,
+        0x36c | 0x36d => TexKind::Grad,
+        _ => TexKind::Query,
+    };
+    let (dim, array) = match w.f(61, 3) {
+        0 => (TexDim::D1, false),
+        1 => (TexDim::D2, false),
+        2 => (TexDim::D3, false),
+        3 => (TexDim::Cube, false),
+        4 => (TexDim::D1, true),
+        5 => (TexDim::D2, true),
+        7 => (TexDim::Cube, true),
+        _ => return None,
+    };
+    let index = if bindless { 0 } else { (w.f(54, 5) << 14 | w.f(40, 14)) as u16 };
+    let mut t = Tex {
+        kind,
+        dim,
+        array,
+        mask: w.f(72, 4) as u8,
+        d0: w.reg(16),
+        d1: w.reg(64),
+        scalar: true,
+        handle: RZ,
+        bindless,
+        index,
+        coord: [RZ; 3],
+        layer: RZ,
+        lod_mode: LodMode::Auto,
+        lod: RZ,
+        shadow: false,
+        dref: RZ,
+        ms: false,
+        sample: RZ,
+        offset: RZ,
+        offset_kind: OffsetKind::None,
+        deriv: RZ,
+        comp: 0,
+        ndv: w.b(77),
+        f16: w.b(79),
+        live_only: false,
+    };
+    if kind == TexKind::Query {
+        t.dim = TexDim::D2;
+        t.array = false;
+        t.ndv = false;
+        t.f16 = false;
+        t.comp = [1, 2, 5, 0][w.f(62, 2) as usize];
+        if bindless {
+            return None;
+        }
+        t.lod = w.reg(24);
+        t.lod_mode = LodMode::Level;
+        return Some(t);
+    }
+    let coords = match dim {
+        TexDim::D1 => 1,
+        TexDim::D2 => 2,
+        TexDim::D3 | TexDim::Cube => 3,
+    };
+    // The logical sources in order, then where they live.
+    let mut first: Vec<u8> = Vec::new(); // what goes in the first vector
+    let mut second: Vec<u8> = Vec::new();
+    const LAYER: u8 = 10;
+    const HANDLE: u8 = 11;
+    const LOD: u8 = 12;
+    const OFFSET: u8 = 13;
+    const OFFSET2: u8 = 14;
+    const DREF: u8 = 15;
+    const SAMPLE: u8 = 16;
+    if kind == TexKind::Grad {
+        if bindless {
+            first.push(HANDLE);
+        }
+        first.extend(0..coords as u8);
+        if array || w.b(76) {
+            first.push(LAYER);
+            if w.b(76) {
+                t.offset_kind = OffsetKind::NibblesHigh;
+            }
+        }
+        t.ndv = true;
+    } else {
+        if array {
+            first.push(LAYER);
+        }
+        first.extend(0..coords as u8);
+        if bindless {
+            second.push(HANDLE);
+        }
+        match kind {
+            TexKind::Sample => {
+                t.lod_mode = match w.f(87, 3) {
+                    0 | 4 => LodMode::Auto,
+                    1 => LodMode::Zero,
+                    2 | 5 => LodMode::Bias,
+                    3 => LodMode::Level,
+                    _ => return None,
+                };
+                if matches!(t.lod_mode, LodMode::Bias | LodMode::Level) {
+                    second.push(LOD);
+                }
+                if w.b(76) {
+                    second.push(OFFSET);
+                    t.offset_kind = OffsetKind::Nibbles;
+                }
+                t.shadow = w.b(78);
+            }
+            TexKind::Fetch => {
+                t.ndv = false;
+                t.lod_mode = match w.f(87, 3) {
+                    1 => LodMode::Zero,
+                    3 => LodMode::Level,
+                    _ => return None,
+                };
+                if t.lod_mode == LodMode::Level {
+                    second.push(LOD);
+                }
+                if w.b(76) {
+                    second.push(OFFSET);
+                    t.offset_kind = OffsetKind::Nibbles;
+                }
+                t.ms = w.b(78);
+            }
+            TexKind::Gather => {
+                t.lod_mode = LodMode::Zero;
+                t.comp = w.f(87, 2) as u8;
+                match w.f(76, 2) {
+                    1 => {
+                        second.push(OFFSET);
+                        t.offset_kind = OffsetKind::Bytes;
+                    }
+                    2 => {
+                        second.extend([OFFSET, OFFSET2]);
+                        t.offset_kind = OffsetKind::PerTexel;
+                    }
+                    _ => {}
+                }
+                t.shadow = w.b(78);
+            }
+            _ => {}
+        }
+        if t.shadow {
+            second.push(DREF);
+        }
+        if t.ms {
+            second.push(SAMPLE);
+        }
+    }
+    // Short lists go across both vectors (bit 60).
+    let rebalanced = w.b(60) && second.is_empty() && kind != TexKind::Grad;
+    let place = |list: &[u8], a: Reg, t: &mut Tex| {
+        for (n, &what) in list.iter().enumerate() {
+            let r = crate::decode::reg_at(a, n as u32);
+            match what {
+                0..=2 => t.coord[what as usize] = r,
+                LAYER => {
+                    if array {
+                        t.layer = r
+                    } else {
+                        t.offset = r
+                    }
+                }
+                HANDLE => t.handle = r,
+                LOD => t.lod = r,
+                OFFSET => t.offset = r,
+                OFFSET2 => {}
+                DREF => t.dref = r,
+                _ => t.sample = r,
+            }
+        }
+    };
+    let (ra, rb) = (w.reg(24), w.reg(32));
+    if rebalanced {
+        let split = match first.len() {
+            4 | 3 => 2,
+            _ => 1,
+        };
+        place(&first[..split], ra, &mut t);
+        place(&first[split..], rb, &mut t);
+    } else {
+        place(&first, ra, &mut t);
+        place(&second, rb, &mut t);
+    }
+    if kind == TexKind::Grad {
+        t.deriv = rb;
+    }
+    Some(t)
 }
 
 /// PLOP3 into one or two predicates, from three. The internal form has PSETP (two operations on

@@ -257,6 +257,7 @@ fn highest_reg(op: &Op) -> u32 {
         | Op::FSet { d, .. }
         | Op::FSwzAdd { d, .. }
         | Op::Mufu { d, .. }
+        | Op::Half { d, .. }
         | Op::Rro { d, .. }
         | Op::DSet { d, .. }
         | Op::IAdd { d, .. }
