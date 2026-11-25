@@ -100,7 +100,7 @@ fi
 
 "$emulator" run --board jetson-orin-nano-4gb --gpu on \
     --kernel "$fixture/Image" --initrd "$work/initramfs.cpio.gz" \
-    --script "$work/cuda.txt" --timeout 180 > "$work/boot.log" 2>&1 || {
+    --script "$work/cuda.txt" --timeout ${SBC_CUDA_TIMEOUT:-180} > "$work/boot.log" 2>&1 || {
         cp "$work/boot.log" "$fixture/cuda-boot.log"
         tail -80 "$work/boot.log"
         exit 1

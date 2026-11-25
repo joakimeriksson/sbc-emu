@@ -21,6 +21,7 @@ const FECS_DMEM_DATA: u64 = 0x4091c4;
 const FECS_METHOD_DATA: u64 = 0x409500;
 const FECS_METHOD_PUSH: u64 = 0x409504;
 const FECS_MAILBOX0: u64 = 0x409800;
+const FECS_MAILBOX1: u64 = 0x409804;
 const GPCCS_CPUCTL: u64 = 0x41a100;
 const GPCCS_IMEM_DATA: u64 = 0x41a184;
 const GPCCS_DMEM_DATA: u64 = 0x41a1c4;
@@ -34,6 +35,10 @@ const DISCOVER_CONTEXT_SIZE: u32 = 0x10;
 const DISCOVER_ZCULL_SIZE: u32 = 0x16;
 const DISCOVER_PREEMPT_SIZE: u32 = 0x1a;
 const DISCOVER_PM_SIZE: u32 = 0x25;
+/// Context switching stopped and started again (nvgpu around L2 and other global changes); the
+/// driver waits for 1 in mailbox 1.
+const STOP_CTXSW: u32 = 0x38;
+const START_CTXSW: u32 = 0x39;
 const CONTEXT_BYTES: u32 = 0x20_000;
 const ZCULL_BYTES: u32 = 0x1000;
 // Reserve space for the R36 netlist's aligned SYS, FBP and GPC HWPM register lists.
@@ -47,6 +52,7 @@ pub(super) struct Gr {
     gpccs_started: bool,
     fecs_started: bool,
     mailbox0: u32,
+    mailbox1: u32,
     method_data: u32,
     fe_power_mode: u32,
     context_instance: Option<u32>,
@@ -69,6 +75,7 @@ impl Gr {
             GPC0_PES0_TPC_MASK => Some((1 << TPCS_PER_GPC) - 1),
             FE_POWER_MODE => Some(self.fe_power_mode),
             FECS_MAILBOX0 => Some(self.mailbox0),
+            FECS_MAILBOX1 => Some(self.mailbox1),
             FECS_METHOD_DATA => Some(self.method_data),
             _ => None,
         }
@@ -111,10 +118,12 @@ impl Gr {
                 DISCOVER_CONTEXT_SIZE | DISCOVER_PREEMPT_SIZE => self.mailbox0 = CONTEXT_BYTES,
                 DISCOVER_ZCULL_SIZE => self.mailbox0 = ZCULL_BYTES,
                 DISCOVER_PM_SIZE => self.mailbox0 = PM_BYTES,
+                STOP_CTXSW | START_CTXSW => self.mailbox1 = 1,
                 _ => {}
             },
             FECS_METHOD_PUSH => {}
             FECS_MAILBOX0 => self.mailbox0 = value,
+            FECS_MAILBOX1 => self.mailbox1 = value,
             _ => return false,
         }
         true

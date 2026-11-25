@@ -59,6 +59,8 @@ pub(super) struct Host {
     channels: [HashMap<u32, Channel>; 2],
     pub submissions: u64,
     pub nonstall_pending: bool,
+    /// The instance block of the channel the graphics engine last ran: FECS's current context.
+    pub gr_instance: Option<u64>,
 }
 
 #[derive(Default)]
@@ -136,6 +138,9 @@ impl Host {
     ) -> Option<()> {
         let runlist = (token >> 16 & 0x7f) as usize;
         let channel = self.channels.get_mut(runlist)?.get_mut(&(token & 0xfff))?;
+        if runlist == 1 {
+            self.gr_instance = Some(channel.instance);
+        }
         channel.compute.timestamp = now;
         channel.copy.timestamp = now;
         channel.threed.timestamp = now;

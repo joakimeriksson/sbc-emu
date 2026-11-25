@@ -19,6 +19,7 @@ mod top;
 mod twod;
 
 pub const BAR0: u64 = 0x1700_0000;
+const FECS_CURRENT_CTX: u64 = 0x409b00;
 pub const BAR1: u64 = 0x1800_0000;
 pub const SIZE: u64 = 0x0100_0000;
 pub const FUSE: u64 = 0x03b4_1000;
@@ -103,6 +104,9 @@ impl Gpu {
             PTIMER_TIME_1 => (now >> 32) as u32,
             RING_COMMAND => 0, // The supported command completes on write.
             RING_START_RESULTS => u32::from(self.ring_started) * RING_CONNECTIVITY_PASS,
+            // gr_fecs_current_ctx: the resident context (pointer in 4 KiB units, valid bit 31), so
+            // that nvgpu reads and writes a running channel's context registers directly
+            FECS_CURRENT_CTX => self.host.gr_instance.map_or(0, |i| (i >> 12) as u32 & 0x0fff_ffff | 1 << 31),
             _ => self
                 .fb
                 .read(offset)
