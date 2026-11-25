@@ -23,6 +23,8 @@ enum {
     COMPUTE_OUTPUT = 0xa40,
     COLOR_TARGET = 0xc00,
     TILED_TARGET = PAGE_BYTES,
+    ZETA_TARGET = PAGE_BYTES + 512,
+    ARRAY_TARGET = PAGE_BYTES + 1024,
     NVMAP_HEAP_IOVMM = 1U << 30,
     NVMAP_WRITE_COMBINE = 1,
     NVMAP_TEST_TAG = 1U << 16,
@@ -235,6 +237,12 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
     const uint64_t tiled_target = va + TILED_TARGET;
     for (unsigned i = 0; i < 128; ++i)
         words[TILED_TARGET / 4 + i] = 0x10203040;
+    const uint64_t zeta = va + ZETA_TARGET;
+    for (unsigned i = 0; i < 128; ++i)
+        words[ZETA_TARGET / 4 + i] = 0x11223344;
+    const uint64_t array_target = va + ARRAY_TARGET;
+    for (unsigned i = 0; i < 256; ++i)
+        words[ARRAY_TARGET / 4 + i] = 0x12345678;
     const uint32_t push[] = {
         packet(0, 1), 0xc7c0,
         packet(0x2b4, 1), (va + QMD_OFFSET) >> 8,
@@ -249,6 +257,19 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         packet(0x800, 7), tiled_target >> 32, tiled_target, 16, 8, 0xd5, 0, 1,
         packet(0xff4, 2), (6 << 16) | 5, (4 << 16) | 1,
         packet(0x19d0, 1), 0x08,
+        // Map draw output one to color target slot three and select only array layer one.
+        packet(0x8c0, 9), array_target >> 32, array_target, 16, 8, 0xd5, 0, 2, 128, 0,
+        packet(0x121c, 1), 2 | (3 << 7),
+        packet(0x19d0, 1), 0x3c | (1 << 6) | (1 << 10),
+        // Z24S8 uses the low byte for stencil. Clear each field in a different rectangle.
+        packet(0xfe0, 4), zeta >> 32, zeta, 0x14, 0,
+        packet(0x1228, 3), 16, 8, 1,
+        packet(0x1538, 1), 1,
+        packet(0xd90, 1), 0x3f000000,
+        packet(0x19d0, 1), 1,
+        packet(0xff4, 2), (4 << 16) | 8, (3 << 16) | 3,
+        packet(0xda0, 1), 0xa5,
+        packet(0x19d0, 1), 2,
     };
     for (unsigned i = 0; i < sizeof(push) / sizeof(push[0]); ++i)
         words[i] = push[i];
@@ -276,6 +297,16 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
                 ? 0x10208040 : 0x10203040;
             if (words[(TILED_TARGET + offset) / 4] != expected)
                 return 20;
+            const uint32_t depth = x >= 5 && x < 11 && y >= 1 && y < 5
+                ? 0x80000000 : 0x11223300;
+            const uint32_t stencil = x >= 8 && x < 12 && y >= 3 && y < 6 ? 0xa5 : 0x44;
+            if (words[(ZETA_TARGET + offset) / 4] != (depth | stencil))
+                return 21;
+            const uint32_t array_pixel = x >= 5 && x < 11 && y >= 1 && y < 5
+                ? 0xff0080ff : 0x12345678;
+            if (words[(ARRAY_TARGET + offset) / 4] != 0x12345678
+                || words[(ARRAY_TARGET + 512 + offset) / 4] != array_pixel)
+                return 22;
         }
     }
     return 0;

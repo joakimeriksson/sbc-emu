@@ -184,7 +184,9 @@ counters for delivery of Host1x syncpoint threshold interrupts. On the
 graphics runlist it dispatches a small, predicated Ampere shader and compares
 the four results and surrounding guard words with CPU expectations. It
 also checks clipped and channel-masked Ampere C797 color clears in both
-pitch-linear and block-linear render targets.
+pitch-linear and block-linear render targets. It checks that array-layer and
+attachment selection preserve neighboring layers, and verifies independent
+depth and stencil clears in a packed Z24S8 target.
 
 The GPU model exposes separate graphics and asynchronous copy runlists and
 maps BAR1 through the GA10B page tables. It models Falcon firmware uploads,
@@ -194,8 +196,9 @@ driver's initial context bind and save requests. These are firmware protocol
 models. The Tegra234 Host1x model supports CPU and GPU syncpoint increments
 and threshold interrupts. The Ampere Compute B model dispatches QMD 3.0
 workgroups with per-thread registers and predicates, global loads and stores,
-and a small set of scalar instructions. The C797 clear path shares format
-and layout code with the Tegra210 renderer.
+and a small set of scalar instructions. The C797 clear path shares color and
+depth/stencil formats and surface layout code with the Tegra210 renderer.
+[NVIDIA Ampere 3D class](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clc797.h)
 
 ### Jetson GPU parity
 
@@ -208,7 +211,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | The Linux fixture checks a known-answer Ampere shader. The CUDA userspace path and broader shader coverage remain pending. |
-| Graphics | The stock driver submits clipped and masked C797 color clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
+| Graphics | The stock driver submits clipped, masked and layered C797 color clears and block-linear depth/stencil clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
 | Browser | The site worker runs the standalone rover copy demo. Linux graphics and compute checks in WebAssembly remain pending. |
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
