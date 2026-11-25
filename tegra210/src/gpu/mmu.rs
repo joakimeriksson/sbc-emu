@@ -145,10 +145,14 @@ impl maxwell::Memory for View<'_> {
         }
         for log in logs {
             for (page, (bytes, written)) in log.pages {
-                for (k, w) in written.iter().enumerate().filter(|(_, w)| **w != 0) {
-                    for b in (0..64).filter(|b| w >> b & 1 != 0) {
-                        let i = 64 * k + b;
-                        self.ram[page + i] = bytes[i];
+                for (k, &w) in written.iter().enumerate() {
+                    let at = 64 * k;
+                    if w == !0 {
+                        self.ram[page + at..page + at + 64].copy_from_slice(&bytes[at..at + 64]);
+                    } else if w != 0 {
+                        for b in (0..64).filter(|b| w >> b & 1 != 0) {
+                            self.ram[page + at + b] = bytes[at + b];
+                        }
                     }
                 }
             }
@@ -164,8 +168,37 @@ impl maxwell::Memory for View<'_> {
 /// for every byte written; and the first address that did not translate.
 #[derive(Default)]
 struct Log {
-    pages: std::collections::HashMap<usize, (Box<[u8; 0x1000]>, Box<[u64; 64]>)>,
+    pages: std::collections::HashMap<usize, (Box<[u8; 0x1000]>, Box<[u64; 64]>), std::hash::BuildHasherDefault<PageHash>>,
     fault: Option<(u64, bool)>,
+}
+
+/// Page offsets hash by their page number (every shader access looks one up).
+#[derive(Default)]
+struct PageHash(u64);
+
+impl std::hash::Hasher for PageHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8 | b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = ((n >> 12) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// Mark bytes `o..o + n` of a page written.
+fn mark(written: &mut [u64; 64], o: usize, n: usize) {
+    let (mut i, end) = (o, o + n);
+    while i < end {
+        let (k, b) = (i / 64, i % 64);
+        let len = (64 - b).min(end - i);
+        written[k] |= if len == 64 { !0 } else { ((1u64 << len) - 1) << b };
+        i += len;
+    }
 }
 
 /// Memory as one of several threads sees it during a split: RAM as it was, read-only and shared,
@@ -186,7 +219,7 @@ impl maxwell::Memory for Overlay<'_> {
             match self.mmu.translate(self.space, va, self.smmu, self.ram) {
                 Some(p) => {
                     let o = (va & 0xfff) as usize;
-                    match self.log.pages.get(&p.offset) {
+                    match (!self.log.pages.is_empty()).then(|| self.log.pages.get(&p.offset)).flatten() {
                         Some((bytes, _)) => part.copy_from_slice(&bytes[o..o + n]),
                         None => part.copy_from_slice(&self.ram[p.offset + o..p.offset + o + n]),
                     }
@@ -210,9 +243,7 @@ impl maxwell::Memory for Overlay<'_> {
                     });
                     let o = (va & 0xfff) as usize;
                     bytes[o..o + n].copy_from_slice(&data[..n]);
-                    for i in o..o + n {
-                        written[i / 64] |= 1 << (i % 64);
-                    }
+                    mark(written, o, n);
                 }
                 _ => {
                     self.log.fault.get_or_insert((va, true));
@@ -306,6 +337,17 @@ impl View<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marking_written_ranges() {
+        let mut w = [0u64; 64];
+        mark(&mut w, 3, 2);
+        assert_eq!(w[0], 0b11000);
+        mark(&mut w, 60, 70);
+        assert_eq!((w[0] >> 60, w[1], w[2]), (0xf, !0, 0b11));
+        mark(&mut w, 0, 0x1000);
+        assert!(w.iter().all(|&x| x == !0));
+    }
 
     #[test]
     fn split_views_see_their_writes_and_meet_in_order() {

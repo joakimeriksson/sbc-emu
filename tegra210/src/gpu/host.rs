@@ -96,6 +96,10 @@ impl Host {
     /// if its USERD's GP_GET is what the host last wrote there; a new one gets a fresh state.
     pub fn rebound(&mut self, id: u32, smmu: &crate::smmu::Smmu, ram: &[u8]) {
         let same = self.channels.get(&id).is_none_or(|s| s.gp_get.is_none_or(|(userd, get)| mmu::read32(userd + 0x88, smmu, ram) == Some(get)));
+        if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+            let s = self.channels.get(&id);
+            eprintln!("[chan] {id} bound again: {} (last GP_GET {:?}, now {:?})", if same { "kept" } else { "new" }, s.and_then(|s| s.gp_get).map(|g| g.1), s.and_then(|s| s.gp_get).and_then(|(u, _)| mmu::read32(u + 0x88, smmu, ram)));
+        }
         if !same {
             self.forget(id);
         }
@@ -289,12 +293,9 @@ impl State {
                             7 => if old == 0 || old > payload { payload } else { old - 1 },
                             _ => old,
                         };
+                        // (32 bits only, whatever RELEASE_SIZE says: CUDA reduces counters that sit
+                        // next to other semaphores, with that bit clear)
                         view.write32(at, new);
-                        if v & 1 << 24 == 0 {
-                            // RELEASE_SIZE 16 bytes: with the time stamp, as a release
-                            view.write32(at + 4, 0);
-                            view.write(at + 8, &now.to_le_bytes());
-                        }
                         if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] host reduce {at:#x}: {old:#x} -> {new:#x} (op {v:#x})"); }
                     }
                     1 => self.waiting = Some((at, payload, Test::Equal)),

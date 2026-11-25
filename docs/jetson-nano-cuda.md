@@ -15,7 +15,7 @@ DET person 0.83 [222,406,123,452]
 DET person 0.27 [-0,550,63,323]
 ```
 
-One inference takes 280–350 ms of GPU time on an Apple M-series Mac (the emulator charges a GPU job
+One inference takes about 0.45 s of GPU time on an Apple M-series Mac (the emulator charges a GPU job
 the host time it took); building the engine, which times every candidate kernel, about ten
 minutes.
 

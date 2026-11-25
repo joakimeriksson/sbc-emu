@@ -224,8 +224,9 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
             let (x, y, z) = ((g % gx as u64) as u32, (g / gx as u64 % gy as u64) as u32, (g / gx as u64 / gy as u64) as u32);
             shared.fill(0);
             let mut left: Vec<bool> = vec![true; batches];
-            // the instructions this workgroup may run come out of the launch's before it starts
-            let want = FUEL * batches as u64;
+            // the instructions this workgroup may run come out of the launch's before it starts (at
+            // most a worker's share of it, so that workgroups running at once cannot take it all)
+            let want = (FUEL * batches as u64).min(LAUNCH_FUEL / workers as u64);
             let start = left_fuel.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| Some(f.saturating_sub(want))).map_or(0, |f| f.min(want));
             let mut fuel = start;
             for (b, l) in lanes.iter_mut().enumerate() {
