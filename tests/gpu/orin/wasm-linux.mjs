@@ -25,7 +25,7 @@ async function load(path) {
   return [ptr, data.length];
 }
 
-const [kernel, initrd, script] = process.argv.slice(2);
+const [kernel, initrd, script, kind = "ioctl"] = process.argv.slice(2);
 assert.equal(ex.sbc_boot_orin(768, ...await load(kernel), ...await load(initrd)), 0, 'boot setup failed');
 assert.equal(ex.sbc_jit(1), 1, 'AArch64 JIT unavailable');
 
@@ -56,9 +56,17 @@ for (const line of (await readFile(script, 'utf8')).trim().split('\n')) {
   }
   consumed = found + expected.length;
 }
-assert.match(serial, /^NVGPU_IOCTL_ STATUS=0\s*$/m, serial.slice(-4000));
-const irq = serial.match(/^\s*\d+:\s+[1-9]\d*\s+GICv3 48[0-7] Level\s+host1x_syncpt/m);
-assert.ok(irq, serial.slice(-4000));
 assert.ok(ex.sbc_jit_blocks() > 0);
-console.log('Orin WASM Linux GPU: NVGPU_IOCTL_ STATUS=0');
-console.log(irq[0].trim());
+if (kind === 'cuda') {
+  assert.match(serial, /^CUDA_PROBE_ STATUS=0\s*$/m, serial.slice(-4000));
+  const output = serial.match(/^CUDA kernel output=0x24681357 status=0[ \t\r]*$/m);
+  assert.ok(output, serial.slice(-4000));
+  console.log(`Orin WASM Linux GPU: ${output[0].trim()}`);
+} else {
+  assert.equal(kind, 'ioctl');
+  assert.match(serial, /^NVGPU_IOCTL_ STATUS=0\s*$/m, serial.slice(-4000));
+  const irq = serial.match(/^\s*\d+:\s+[1-9]\d*\s+GICv3 48[0-7] Level\s+host1x_syncpt/m);
+  assert.ok(irq, serial.slice(-4000));
+  console.log('Orin WASM Linux GPU: NVGPU_IOCTL_ STATUS=0');
+  console.log(irq[0].trim());
+}

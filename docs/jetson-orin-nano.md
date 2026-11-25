@@ -213,7 +213,8 @@ It verifies `cuInit`, enumeration of one Orin GPU with compute capability 8.7,
 context creation, device allocation, a known-value host/device round trip,
 and a PTX kernel whose result is read back. NVIDIA's JIT compiler emits SM87
 instructions, and the driver submits an inline QMD and waits on its semaphore.
-CUDA uses the Ampere copy engine for transfers and constant fills and the
+Set `SBC_ORIN_WASM=1` when running the CUDA test to verify the same workload
+with the WebAssembly emulator. CUDA uses the Ampere copy engine for transfers and constant fills and the
 compute class for inline uploads. The upload implementation is shared with
 Tegra210. The fixture downloads pinned packages locally. The Tegra DRM driver creates a
 render node using the Host1x/VIC discovery path, and the stock fuse driver
@@ -233,7 +234,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | The Linux fixture checks a known-answer Ampere shader. JetPack CUDA creates a context, transfers data and launches a JIT-compiled SM87 kernel. Broader shader and CUDA workload coverage remains pending. |
 | Graphics | The stock driver submits clipped, masked and layered C797 color clears and masked block-linear depth/stencil clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
-| Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests also pass in the WebAssembly build. |
+| Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests and the full CUDA fixture also pass in the WebAssembly build. |
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
 Orin or Ampere modules. Reuse the Maxwell renderer and texture code where the

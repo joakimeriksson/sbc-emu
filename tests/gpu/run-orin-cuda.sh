@@ -84,6 +84,11 @@ sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
 printf 'serial /cuda-probe; echo "CUDA_PROBE_" "STATUS=$?"\\r\n' >> "$work/cuda.txt"
 printf 'wait-serial CUDA_PROBE_ STATUS=\nquit\n' >> "$work/cuda.txt"
 
+if [ "${SBC_ORIN_WASM:-0}" = 1 ]; then
+    node tests/gpu/orin/wasm-linux.mjs "$fixture/Image" "$work/initramfs.cpio.gz" "$work/cuda.txt" cuda
+    exit
+fi
+
 "$emulator" run --board jetson-orin-nano-4gb --gpu on \
     --kernel "$fixture/Image" --initrd "$work/initramfs.cpio.gz" \
     --script "$work/cuda.txt" --timeout 60 > "$work/boot.log" 2>&1 || {
