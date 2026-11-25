@@ -18,8 +18,8 @@ fn input(spec: &str) -> Vec<String> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     if let Some(n) = spec.strip_prefix("avfoundation:") {
         // (macOS cameras deliver 30 frames a second at 640x480 or more; ffmpeg scales). The
-        // pixel format must be named: ffmpeg's default, yuv420p, is one no Mac camera offers,
-        // and ffmpeg then stops; uyvy422 is what they all deliver.
+        // pixel format is named: ffmpeg's default, yuv420p, is one Mac cameras do not offer, and
+        // ffmpeg then prints an error before falling back; uyvy422 is what they deliver.
         let mut v = s(&["-f", "avfoundation", "-framerate", "30", "-pixel_format", "uyvy422", "-i"]);
         v.push(n.to_string());
         v
@@ -51,8 +51,8 @@ pub fn start(spec: &str) -> Result<FrameSource, String> {
     if let Some(err) = child.stderr.take() {
         let _ = std::thread::Builder::new().name("camera-ffmpeg-log".into()).spawn(move || {
             use std::io::BufRead;
-            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                eprint!("[camera] ffmpeg: {line}\r\n");
+            for line in std::io::BufReader::new(err).split(b'\n').map_while(Result::ok) {
+                eprint!("[camera] ffmpeg: {}\r\n", String::from_utf8_lossy(&line).trim_end());
             }
         });
     }
