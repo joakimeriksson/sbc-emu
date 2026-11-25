@@ -146,6 +146,8 @@ fn compiled(n: usize) -> bool {
 
 /// `check` with `N` lanes.
 pub fn check_lanes<const N: usize>(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String> {
+    // (it turns the JIT off and on: no other check at the same time)
+    let _switch = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
     let mut r = Rng(seed | 1);
     let tops = opcodes();
     let mut ops = BTreeMap::new();

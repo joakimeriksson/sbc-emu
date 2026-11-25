@@ -226,6 +226,10 @@ impl Default for Frame {
     }
 }
 
+/// Held by whatever turns the JIT off and on to compare it with the interpreter (the tests
+/// run at once).
+pub static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static BLOCKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -290,7 +294,8 @@ impl Code {
             if n >= MIN_BLOCK && c.blocks.len() < u16::MAX as usize - 1 {
                 c.start[k] = c.blocks.len() as u16 + 1;
                 let ir = forward(&low.ir);
-                let ir = if EXT { fold(&ir) } else { ir };
+                // (as long as its ids fit)
+                let ir = if EXT { fold(&ir).filter(|f| f.len() < Id::MAX as usize).unwrap_or(ir) } else { ir };
                 let mut cbs: Vec<u16> = ir.iter().filter_map(|n| if let Node::Cb(i) = n { Some(*i) } else { None }).collect();
                 cbs.sort_unstable();
                 cbs.dedup();
@@ -349,7 +354,7 @@ impl Code {
             if let Some(m) = self.native[k].get_or_init(|| a64::Module::new(self, N)) {
                 let r = m.enter(self, p, l, h, fuel);
                 if r.is_some() {
-                    RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    RUNS.with(|r| r.set(r.get() + 1));
                 }
                 return r;
             }
@@ -368,7 +373,7 @@ impl Code {
             };
             let ran = w.run(b, gpr, pred, frame, active);
             if ran {
-                RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RUNS.with(|r| r.set(r.get() + 1));
             }
             return ran;
         }
@@ -382,7 +387,7 @@ impl Code {
             if let Some(m) = self.native[k].get_or_init(|| a64::Module::new(self, N)) {
                 let ran = m.run(b, gpr.as_mut_ptr() as *mut u32, pred.as_mut_ptr(), cc.as_mut_ptr(), frame, active);
                 if ran {
-                    RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    RUNS.with(|r| r.set(r.get() + 1));
                 }
                 return ran;
             }
@@ -392,11 +397,14 @@ impl Code {
     }
 }
 
-static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// (per thread: the GPU's threads would all write one line)
+    static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-/// Blocks run by compiled code so far (natively: entries into a program's code).
+/// Blocks run by compiled code so far on this thread (natively: entries into a program's code).
 pub fn runs() -> u64 {
-    RUNS.load(std::sync::atomic::Ordering::Relaxed)
+    RUNS.with(|r| r.get())
 }
 
 /// Programs compiled, by their code: the GPU decodes its programs again after each submission
@@ -1213,7 +1221,7 @@ pub fn eval<const N: usize>(b: &Block, gpr: &mut [[u32; N]; 256], pred: &mut [u3
 /// (Natively) predicates and flags kept in values within a block as `forward` keeps registers,
 /// each written once at the end; and every value made once (the same node of the same
 /// arguments is the same value).
-fn fold(ir: &[Node]) -> Vec<Node> {
+fn fold(ir: &[Node]) -> Option<Vec<Node>> {
     let mut out: Vec<Node> = Vec::with_capacity(ir.len());
     let mut map = vec![0 as Id; ir.len()];
     let mut seen: std::collections::HashMap<Node, Id> = std::collections::HashMap::new();
@@ -1277,7 +1285,7 @@ fn fold(ir: &[Node]) -> Vec<Node> {
             out.push(Node::StoreP(p as u8, c, all));
         }
     }
-    out
+    Some(out)
 }
 
 /// Keeps registers in values within a block: a register is read from the lanes once, a write

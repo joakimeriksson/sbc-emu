@@ -202,7 +202,7 @@ pub trait Host<const N: usize> {
     }
 
     /// Called before every instruction (for tracing); compiled out when not implemented. Not
-    /// called for the instructions of the shader JIT's blocks (in the browser; `jit::set_enabled`).
+    /// called for the instructions of the shader JIT's blocks (`jit::set_enabled`).
     #[inline(always)]
     fn trace(&mut self, addr: u32, inst: &Inst, lanes: &Lanes<N>) {}
 }

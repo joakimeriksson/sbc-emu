@@ -104,6 +104,9 @@ impl Module {
         }
         let at = a.w.len();
         let (table, leave, n) = program(&mut a, code, &entry, lanes)?;
+        if a.far {
+            return None;
+        }
         slots = slots.max(n);
         let mem = Exec::new(&a.w)?;
         Some(Module { mem, entry, program: at * 4, table, leave, slots })
@@ -124,7 +127,7 @@ impl Module {
         // and uses the frame's spill slots (`slots` of them) and scratch words (4).
         unsafe {
             let f = std::mem::transmute::<*const u8, BlockFn>(self.mem.base.add(*at));
-            f(gpr, pred, frame.cb.as_ptr(), active, frame.spill.as_mut_ptr(), frame.scratch.as_mut_ptr(), cc) != 0
+            ieee(|| f(gpr, pred, frame.cb.as_ptr(), active, frame.spill.as_mut_ptr(), frame.scratch.as_mut_ptr(), cc)) != 0
         }
     }
 
@@ -161,7 +164,8 @@ impl Module {
                 cc: (*lp).cc.as_mut_ptr(),
             };
             let f = std::mem::transmute::<*const u8, ProgramFn>(self.mem.base.add(self.program));
-            let stopped = f(&mut ctx, (*lp).pc) != 0;
+            let pc = (*lp).pc;
+            let stopped = ieee(|| f(&mut ctx, pc)) != 0;
             *fuel = ctx.fuel;
             if let Some(p) = env.panic.take() {
                 std::panic::resume_unwind(p);
@@ -173,6 +177,26 @@ impl Module {
             Some(None)
         }
     }
+}
+
+/// Runs `f` with the host's floating-point control register in its default state (round to
+/// nearest even, IEEE halves, no flushing), as the code and the interpreter's functions assume:
+/// the guest's may be live, as the GPU runs within its CPU's write to a register.
+#[inline]
+fn ieee<T>(f: impl FnOnce() -> T) -> T {
+    let old: u64;
+    // SAFETY: reading FPCR has no other effect
+    unsafe { std::arch::asm!("mrs {}, fpcr", out(reg) old, options(nomem, nostack, preserves_flags)) };
+    if old == 0 {
+        return f();
+    }
+    // SAFETY: FPCR's default; the old value is put back before returning (`f` does not unwind:
+    // the code's calls into Rust catch panics)
+    unsafe { std::arch::asm!("msr fpcr, {}", in(reg) 0u64, options(nomem, nostack, preserves_flags)) };
+    let r = f();
+    // SAFETY: as above
+    unsafe { std::arch::asm!("msr fpcr, {}", in(reg) old, options(nomem, nostack, preserves_flags)) };
+    r
 }
 
 /// The interpreter's side of a program's run.
@@ -239,10 +263,20 @@ mod sys {
         #[cfg(target_os = "linux")]
         pub fn __clear_cache(start: *mut c_void, end: *mut c_void);
     }
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        pub fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    }
     #[cfg(target_os = "macos")]
     pub const FLAGS: c_int = 0x0002 | 0x1000 | 0x0800; // PRIVATE | ANON | JIT
     #[cfg(target_os = "linux")]
     pub const FLAGS: c_int = 0x0002 | 0x0020; // PRIVATE | ANONYMOUS
+    /// (macOS: read, write and execute, writes switched per thread; Linux: written, then
+    /// read and execute)
+    #[cfg(target_os = "macos")]
+    pub const PROT: c_int = 7;
+    #[cfg(target_os = "linux")]
+    pub const PROT: c_int = 3;
 }
 
 impl Exec {
@@ -253,8 +287,10 @@ impl Exec {
         // copied into it with this thread's write protection off (macOS), and the instruction
         // cache is synchronised for them before anyone runs them.
         unsafe {
-            let p = sys::mmap(std::ptr::null_mut(), len, 7, sys::FLAGS, -1, 0);
+            let p = sys::mmap(std::ptr::null_mut(), len, sys::PROT, sys::FLAGS, -1, 0);
             if p as isize == -1 || p.is_null() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("[gpu] shader JIT: the system gives no memory for code; shaders are interpreted"));
                 return None;
             }
             let base = p as *mut u8;
@@ -267,7 +303,13 @@ impl Exec {
                 sys::sys_icache_invalidate(p, bytes);
             }
             #[cfg(target_os = "linux")]
-            sys::__clear_cache(p, base.add(bytes) as *mut std::ffi::c_void);
+            {
+                sys::__clear_cache(p, base.add(bytes) as *mut std::ffi::c_void);
+                if sys::mprotect(p, len, 5) != 0 {
+                    sys::munmap(p, len);
+                    return None;
+                }
+            }
             Some(Exec { base, len })
         }
     }
@@ -290,6 +332,8 @@ struct Asm {
     w: Vec<u32>,
     /// a literal and the `ldr q` instructions that load it
     lits: Vec<([u32; 4], Vec<usize>)>,
+    /// a branch or literal out of its instruction's reach (the code is not used)
+    far: bool,
 }
 
 // general registers
@@ -385,17 +429,23 @@ impl Asm {
     }
     /// `b to`.
     fn branch(&mut self, to: usize) {
-        let off = (to as i64 - self.w.len() as i64) as u32 & 0x3ff_ffff;
+        let d = to as i64 - self.w.len() as i64;
+        self.far |= d.unsigned_abs() >= 1 << 25;
+        let off = d as u32 & 0x3ff_ffff;
         self.put(0x1400_0000 | off);
     }
     /// `b.cond to`.
     fn branch_cond(&mut self, cond: u32, to: usize) {
-        let off = (to as i64 - self.w.len() as i64) as u32 & 0x7_ffff;
+        let d = to as i64 - self.w.len() as i64;
+        self.far |= d.unsigned_abs() >= 1 << 18;
+        let off = d as u32 & 0x7_ffff;
         self.put(0x5400_0000 | off << 5 | cond);
     }
     /// Points the `b` at `at` to `to`.
     fn patch_branch(&mut self, at: usize, to: usize) {
-        let off = (to as i64 - at as i64) as u32 & 0x3ff_ffff;
+        let d = to as i64 - at as i64;
+        self.far |= d.unsigned_abs() >= 1 << 25;
+        let off = d as u32 & 0x3ff_ffff;
         self.w[at] = 0x1400_0000 | off;
     }
     /// `ldr/str w t, [x n, #off]`.
@@ -426,6 +476,7 @@ impl Asm {
         for (v, at) in std::mem::take(&mut self.lits) {
             let here = self.w.len();
             for a in at {
+                self.far |= here - a >= 1 << 18;
                 let off = (here - a) as u32;
                 self.w[a] |= (off & 0x7_ffff) << 5;
             }
@@ -638,8 +689,7 @@ fn body(a: &mut Asm, b: &Block, lanes: usize) -> Option<usize> {
     a.put(0x9100_0000 | 16 << 10 | XG << 5 | XG); // add x19, x19, #16
     a.put(0x9100_0000 | 4 << 10 | XK << 5 | XK); // add x24, x24, #4
     a.put(0xf100_001f | (lanes as u32) << 10 | XK << 5); // cmp x24, #lanes
-    let back = (top as i64 - a.w.len() as i64) as u32 & 0x7_ffff;
-    a.put(0x5400_000b | back << 5); // b.lt top
+    a.branch_cond(0xb, top); // b.lt top
     Some(ra.slots)
 }
 
