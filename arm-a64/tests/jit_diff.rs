@@ -1,7 +1,8 @@
 //! The JIT against the interpreter on random instruction sequences (any host with a JIT): integer
 //! data processing with every flag producer and consumer, loads and stores of every addressing
-//! form and size (integer and FP/SIMD, pairs, page crossings), exclusives, forward conditional
-//! branches (superblock side exits) and instructions the JIT hands to the interpreter in between.
+//! form and size (integer and FP/SIMD, pairs, AdvSIMD structures, page crossings), exclusives,
+//! forward conditional branches (superblock side exits) and instructions the JIT hands to the
+//! interpreter in between.
 //! Each sequence runs in a loop (compiled, then linked) from the same random state on both;
 //! registers, flags, FP/SIMD registers, memory and the instruction count must match exactly.
 //! Half of them run with the MMU on and the data pages mapped scrambled, next to a second
@@ -50,7 +51,8 @@ fn insn(g: &mut G, k: usize, n: usize) -> u32 {
     let sf = g.bit();
     let w = if sf == 1 { 64 } else { 32 };
     let (rd, rn, rm) = (g.d(), g.dz(), g.dz());
-    match g.below(39) {
+    match g.below(41) {
+        39 | 40 => ldst_struct(g),
         0 | 1 => {
             // ADD/SUB (immediate); S forms may compare (rd = ZR), sources may be SP
             let s = g.bit();
@@ -262,6 +264,37 @@ fn ldst(g: &mut G) -> u32 {
             let option = [2, 3, 6, 7][g.below(4) as usize];
             head | (1 << 21) | (21 << 16) | (option << 13) | (g.bit() << 12) | (0b10 << 10) | (19 << 5) | rt
         }
+    }
+}
+
+/// An AdvSIMD structure load or store: LD1-LD4/ST1-ST4 of multiple structures, of one lane,
+/// LD1R-LD4R (now and then a reserved form: UNDEFINED, the case ends there). Registers v0..v7,
+/// sometimes v29..v31 (the list wraps to v0); no offset from x19, x24 (the other region, at
+/// times across a page) or SP, or post-indexed on x22 by the size or by x21 (it moves, also
+/// across pages), sometimes on x23 next to the reserved granule.
+fn ldst_struct(g: &mut G) -> u32 {
+    let (q, l) = (g.bit(), g.bit());
+    let rt = if g.below(6) == 0 { 29 + g.below(3) } else { g.below(8) };
+    let (post, rm, rn) = match g.below(6) {
+        0 => (0, 0, [19, 24, 31][g.below(3) as usize]),
+        1 | 2 => (1, 31, 22),
+        3 | 4 => (1, 21, 22),
+        _ => (1, if g.bit() == 0 { 31 } else { 21 }, 23),
+    };
+    let head = (q << 30) | (post << 23) | (l << 22) | (rm << 16) | (rn << 5) | rt;
+    if g.bit() == 0 {
+        let opc = if g.below(16) == 0 { g.below(16) } else { [0, 2, 4, 6, 7, 8, 10][g.below(7) as usize] };
+        head | (0b0011000 << 23) | (opc << 12) | (g.below(4) << 10)
+    } else {
+        // single structure: opc 0..5 lanes (b, h, s/d), 6/7 replicate (loads)
+        let (opc, s, size) = match g.below(4) {
+            0 => (g.bit(), g.bit(), g.below(4)),
+            1 => (2 | g.bit(), g.bit(), 2 * g.bit()),
+            2 => { let d = g.bit(); (4 | g.bit(), if d == 1 { 0 } else { g.bit() }, d) }
+            _ => (6 | g.bit(), if g.below(16) == 0 { 1 } else { 0 }, g.below(4)),
+        };
+        let l = if opc >= 6 && g.below(16) != 0 { 1 } else { l };
+        (head & !(1 << 22)) | (l << 22) | (0b0011010 << 23) | (g.bit() << 21) | (opc << 13) | (s << 12) | (size << 10)
     }
 }
 
