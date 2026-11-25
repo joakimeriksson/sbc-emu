@@ -7,6 +7,8 @@ pub const TX_POOL: usize = 0x70000;
 pub const RX_POOL: usize = 0x71000;
 pub const POOL_SIZE: u64 = 0x1000;
 
+pub const CLK_ACTMON: u32 = 1;
+pub const CLK_HOST1X: u32 = 46;
 pub const CLK_UARTA: u32 = 155;
 const CLK_PLLP_OUT0: u32 = 102;
 pub const CLK_GPC0: u32 = 41;
@@ -84,7 +86,7 @@ impl Clock {
 
 pub struct Bpmp {
     pub sram: Vec<u8>,
-    clocks: [Clock; 5],
+    clocks: [Clock; 7],
     uart_reset: bool,
     gpu_reset: bool,
     gpu_power: bool,
@@ -95,6 +97,8 @@ impl Default for Bpmp {
         Self {
             sram: vec![0; SRAM_SIZE as usize],
             clocks: [
+                Clock::new(CLK_ACTMON, "actmon", None, 19_200_000),
+                Clock::new(CLK_HOST1X, "host1x", None, 204_000_000),
                 Clock::new(CLK_PLLP_OUT0, "pllp_out0", None, 408_000_000),
                 Clock::new(CLK_UARTA, "uarta", Some(CLK_PLLP_OUT0), 16 * 115_200),
                 Clock::new(CLK_GPC0, "gpc0clk", None, 306_000_000),

@@ -167,6 +167,7 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
         dt.begin("tegra-carveouts");
         dt.str("compatible", "nvidia,carveouts-t19x");
         dt.end();
+        host1x_node(&mut dt);
         gpu_node(&mut dt);
     }
     if high_speed_uart && !bpmp {
@@ -271,6 +272,44 @@ fn bpmp_nodes(dt: &mut Fdt) {
     dt.cells("#reset-cells", &[1]);
     dt.cells("#power-domain-cells", &[1]);
     dt.cells("phandle", &[BPMP_HANDLE]);
+    dt.end();
+}
+
+fn host1x_node(dt: &mut Fdt) {
+    use crate::{bpmp, host1x};
+
+    dt.begin("host1x@13e00000");
+    dt.str("compatible", "nvidia,tegra234-host1x");
+    dt.cells(
+        "reg",
+        &[
+            range(host1x::COMMON, host1x::WINDOW),
+            range(host1x::HYPERVISOR, host1x::WINDOW),
+            range(host1x::VM, host1x::WINDOW),
+            range(host1x::ACTMON, host1x::ACTMON_SIZE),
+        ]
+        .concat(),
+    );
+    dt.strs("reg-names", &["common", "hypervisor", "vm", "actmon"]);
+    dt.cells(
+        "interrupts",
+        &[448, 449, 450, 451, 452, 453, 454, 455, 263]
+            .map(|spi| [0, spi, 4])
+            .concat(),
+    );
+    dt.strs(
+        "interrupt-names",
+        &[
+            "syncpt0", "syncpt1", "syncpt2", "syncpt3", "syncpt4", "syncpt5", "syncpt6", "syncpt7",
+            "host1x",
+        ],
+    );
+    dt.cells(
+        "clocks",
+        &[BPMP_HANDLE, bpmp::CLK_HOST1X, BPMP_HANDLE, bpmp::CLK_ACTMON],
+    );
+    dt.strs("clock-names", &["host1x", "actmon"]);
+    dt.empty("dma-coherent");
     dt.end();
 }
 

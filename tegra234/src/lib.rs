@@ -2,6 +2,7 @@
 pub mod boot;
 mod bpmp;
 pub mod gpu;
+mod host1x;
 mod hsp;
 mod mc;
 mod mss_nvlink;
@@ -42,6 +43,7 @@ struct Soc {
     uart: Pl011,
     uarta: UartA,
     gpu: gpu::Gpu,
+    host1x: host1x::Host1x,
     mss_nvlink: mss_nvlink::MssNvlink,
     gpu_node: bool,
     firmware: Option<Firmware>,
@@ -85,6 +87,8 @@ impl Soc {
                 .ok_or(Fault::Unmapped)?
                 .hsp
                 .read(addr - hsp::BASE)
+        } else if self.gpu_node && host1x::contains(addr) {
+            self.host1x.read(addr)
         } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
             self.gpu.read(addr - gpu::BAR0, self.now)
         } else if self.gpu_bar_accessible(addr, gpu::BAR1) {
@@ -115,8 +119,11 @@ impl Soc {
             }
         } else if self.mss_nvlink.write(addr, value) {
             return Ok(());
+        } else if self.gpu_node && host1x::contains(addr) {
+            self.host1x.write(addr, value);
         } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
-            self.gpu.write(addr - gpu::BAR0, value, &mut self.ram);
+            self.gpu
+                .write(addr - gpu::BAR0, value, &mut self.ram, &mut self.host1x);
         } else if self.gpu_bar_accessible(addr, gpu::BAR1) {
             self.gpu.bar1_write(addr - gpu::BAR1, value, &mut self.ram);
         } else {
@@ -262,10 +269,11 @@ impl Machine {
         }
         let mut soc = Soc {
             ram: vec![0; ram_bytes],
-            gic: Gic::with_affinities(&AFFINITIES[..cores]),
+            gic: Gic::with_affinities_and_intids(&AFFINITIES[..cores], 512),
             uart: Pl011::new(),
             uarta: UartA::new(high_speed_uart),
             gpu: gpu::Gpu::default(),
+            host1x: host1x::Host1x::default(),
             mss_nvlink: Default::default(),
             gpu_node: false,
             firmware: None,
@@ -421,6 +429,14 @@ impl Machine {
             (gpu::NONSTALL_SPI + 32) as usize,
             self.soc.gpu.nonstall_irq(),
         );
+        if self.soc.gpu_node {
+            let mask = self.soc.host1x.irq_mask();
+            for index in 0..host1x::IRQ_COUNT {
+                self.soc
+                    .gic
+                    .set_line(host1x::FIRST_IRQ + index, mask & (1 << index) != 0);
+            }
+        }
         for (core, (cpu, state)) in self.cpus.iter_mut().zip(&mut self.state).enumerate() {
             if *state == CoreState::Off {
                 continue;
@@ -938,52 +954,53 @@ mod tests {
     fn ga10b_gsp_boot_and_scheduler_messages_raise_stall_interrupts() {
         let mut gpu = gpu::Gpu::default();
         let mut ram = [];
-        gpu.write(0x110100, 2, &mut ram);
+        let mut host1x = host1x::Host1x::default();
+        gpu.write(0x110100, 2, &mut ram, &mut host1x);
         assert_eq!(gpu.read(0x11165c, 0), 2);
         assert!(!gpu.stall_irq());
 
-        gpu.write(0x111668, 0x11, &mut ram);
-        gpu.write(0x110180, 1 << 24, &mut ram);
-        gpu.write(0x110184, 0x0123_4567, &mut ram);
-        gpu.write(0x110184, 0x89ab_cdef, &mut ram);
-        gpu.write(0x110180, 1 << 25, &mut ram);
+        gpu.write(0x111668, 0x11, &mut ram, &mut host1x);
+        gpu.write(0x110180, 1 << 24, &mut ram, &mut host1x);
+        gpu.write(0x110184, 0x0123_4567, &mut ram, &mut host1x);
+        gpu.write(0x110184, 0x89ab_cdef, &mut ram, &mut host1x);
+        gpu.write(0x110180, 1 << 25, &mut ram, &mut host1x);
         assert_eq!(gpu.read(0x110184, 0), 0x0123_4567);
         assert_eq!(gpu.read(0x110184, 0), 0x89ab_cdef);
-        gpu.write(0x1101c0, 1 << 24, &mut ram);
-        gpu.write(0x1101c4, 1, &mut ram);
-        gpu.write(0x1101c0, 0x7ffc, &mut ram);
-        gpu.write(0x1101c4, 2, &mut ram);
-        gpu.write(0x110100, 2, &mut ram);
+        gpu.write(0x1101c0, 1 << 24, &mut ram, &mut host1x);
+        gpu.write(0x1101c4, 1, &mut ram, &mut host1x);
+        gpu.write(0x1101c0, 0x7ffc, &mut ram, &mut host1x);
+        gpu.write(0x1101c4, 2, &mut ram, &mut host1x);
+        gpu.write(0x110100, 2, &mut ram, &mut host1x);
         assert_eq!(gpu.read(0x11165c, 0), 3);
         assert!(!gpu.stall_irq());
 
-        gpu.write(0xb81210, 1 << 27, &mut ram);
-        gpu.write(0xb81608, 1 << 2, &mut ram);
+        gpu.write(0xb81210, 1 << 27, &mut ram, &mut host1x);
+        gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x);
         assert!(gpu.stall_irq());
-        gpu.write(0xb81610, 1 << 2, &mut ram);
+        gpu.write(0xb81610, 1 << 2, &mut ram, &mut host1x);
         assert!(!gpu.stall_irq());
         assert_eq!(gpu.read(0xb81600, 0), 1 << 2);
         assert_eq!(gpu.read(0xb81010, 0), 1 << 27);
-        gpu.write(0x110004, 1 << 6, &mut ram);
-        gpu.write(0xb81608, 1 << 2, &mut ram);
+        gpu.write(0x110004, 1 << 6, &mut ram, &mut host1x);
+        gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x);
         assert!(!gpu.stall_irq());
 
         assert_eq!(gpu.read(0x110c84, 0), 0x8800);
-        gpu.write(0x110ac0, (1 << 25) | 0x800, &mut ram);
+        gpu.write(0x110ac0, (1 << 25) | 0x800, &mut ram, &mut host1x);
         for word in [0x1802, 0, 0x8000, 0x0800, 0x8800, 0x0100_0800] {
             assert_eq!(gpu.read(0x110ac4, 0), word);
         }
-        gpu.write(0x110c84, 0x8818, &mut ram);
-        gpu.write(0x110ac0, 1 << 24, &mut ram);
-        gpu.write(0x110ac4, 0x2a01_040e, &mut ram);
-        gpu.write(0x110c00, 0x8004, &mut ram);
+        gpu.write(0x110c84, 0x8818, &mut ram, &mut host1x);
+        gpu.write(0x110ac0, 1 << 24, &mut ram, &mut host1x);
+        gpu.write(0x110ac4, 0x2a01_040e, &mut ram, &mut host1x);
+        gpu.write(0x110c00, 0x8004, &mut ram, &mut host1x);
         assert!(gpu.stall_irq());
         assert_eq!(gpu.read(0x110c04, 0), 0x8004);
         assert_eq!(gpu.read(0x110c80, 0), 0x881c);
-        gpu.write(0x110ac0, 0x818, &mut ram);
+        gpu.write(0x110ac0, 0x818, &mut ram, &mut host1x);
         assert_eq!(gpu.read(0x110ac4, 0), 0x2a00_040e);
 
-        gpu.write(0x1103c0, 1, &mut ram);
+        gpu.write(0x1103c0, 1, &mut ram, &mut host1x);
         assert_eq!(gpu.read(0x11165c, 0), 0);
         assert!(!gpu.stall_irq());
         assert_eq!(gpu.read(0x110c80, 0), 0);

@@ -113,7 +113,13 @@ impl Gpu {
         value
     }
 
-    pub fn write(&mut self, offset: u64, value: u32, ram: &mut [u8]) {
+    pub(crate) fn write(
+        &mut self,
+        offset: u64,
+        value: u32,
+        ram: &mut [u8],
+        host1x: &mut crate::host1x::Host1x,
+    ) {
         if self.trace
             && !gr::Gr::firmware_data_port(offset)
             && !gsp::Gsp::firmware_data_port(offset)
@@ -153,7 +159,7 @@ impl Gpu {
                 ram,
             ),
             host::DOORBELL | host::LEGACY_DEMO_DOORBELL => {
-                if self.host.ring(value, ram).is_none() && self.trace {
+                if self.host.ring(value, ram, host1x).is_none() && self.trace {
                     eprintln!("[gpu] doorbell {value:#x} could not complete");
                 }
             }

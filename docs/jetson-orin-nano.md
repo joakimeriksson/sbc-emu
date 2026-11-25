@@ -167,14 +167,16 @@ fixture opens `/dev/nvgpu/igpu0/ctrl`. Run `sh tests/gpu/run-orin-ioctl.sh`
 after building the fixture to check GPU characteristics, allocate a GPU
 address space, and submit a copy through nvgpu. The test checks that both
 words arrive across GPU page boundaries, checks the copy-engine semaphore,
-and waits on the Linux sync-file fence.
+and waits on the Linux sync-file fence. It also checks the guest's interrupt
+counters for delivery of a Host1x syncpoint threshold interrupt.
 
 The GPU model exposes separate graphics and asynchronous copy runlists and
 maps BAR1 through the GA10B page tables. It models Falcon firmware uploads,
 the GSP startup interrupt, and the scheduler messages for context binding,
 engine registration and initial domain creation. FECS also acknowledges the
 driver's initial context bind and save requests. These are firmware protocol
-models. Host1x syncpoints and Ampere shader execution remain unimplemented.
+models. The Tegra234 Host1x model supports CPU and GPU syncpoint increments
+and threshold interrupts. Ampere shader execution remains unimplemented.
 
 ### Jetson GPU parity
 
@@ -184,8 +186,8 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 
 | Milestone | Acceptance check |
 |---|---|
-| Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. Host1x syncpoints are still pending. |
-| Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
+| Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
+| Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | Execute a known-answer Ampere shader, then run a CUDA kernel in the guest and compare its output with a CPU reference. |
 | Graphics | Run the existing GLES 2, 3 and 3.2 scenes on GA10B and compare images with Mesa software rendering. Exercise the display separately for the Jetson demo workloads. |
 | Browser | Run the same shader and rendering checks on the WASM build with matching results. |

@@ -1,6 +1,6 @@
 //! GICv3 non-secure subset for up to eight PEs: distributor, one redistributor per PE and the
 //! ICC system-register interface of the PE that accesses it (`cur`).
-//! 480 INTIDs, Group 1, edge/level pending, priority, acknowledge/EOI/deactivation, SPI
+//! Configurable INTID count, Group 1, edge/level pending, priority, acknowledge/EOI/deactivation, SPI
 //! routing by affinity (or IRM "any PE") and SGIs by ICC_SGI1R_EL1.
 //! No ITS, LPIs, virtualization or security groups.
 //!
@@ -53,7 +53,7 @@ pub struct Gic {
     ctlr: u32,
     /// SPIs (indices below 32 unused: those live in each PE)
     shared: Vec<Line>,
-    route: [u64; NIRQ],
+    route: Vec<u64>,
     pes: Vec<Pe>,
     affinities: Vec<u64>,
     /// SPIs that are enabled, Group 1, asserted and not active (any PE may take them)
@@ -74,9 +74,15 @@ impl Gic {
 
     /// MPIDR affinity fields for each redistributor, in frame order.
     pub fn with_affinities(affinities: &[u64]) -> Self {
+        Self::with_affinities_and_intids(affinities, NIRQ)
+    }
+
+    /// Include all SPIs wired by the board, rounded to a GICD_TYPER bank.
+    pub fn with_affinities_and_intids(affinities: &[u64], intids: usize) -> Self {
+        assert!((32..=512).contains(&intids) && intids.is_multiple_of(32));
         let n = affinities.len();
         assert!((1..=8).contains(&n));
-        Self { ctlr: 0x40, shared: vec![Line::default(); NIRQ], route: [0; NIRQ], pes: (0..n).map(|_| Pe::default()).collect(), affinities: affinities.to_vec(),
+        Self { ctlr: 0x40, shared: vec![Line::default(); intids], route: vec![0; intids], pes: (0..n).map(|_| Pe::default()).collect(), affinities: affinities.to_vec(),
             ready: std::cell::RefCell::new(None), cur: 0, acknowledges: 0 }
     }
     pub fn cpus(&self) -> usize { self.pes.len() }
@@ -121,7 +127,7 @@ impl Gic {
         let ok = |l: &Line| l.enabled && l.group && !l.active && l.asserted() && l.priority < p.pmr && (l.priority as u16) < running;
         let private = (0..32).filter(|&i| ok(&p.private[i]));
         let mut ready = self.ready.borrow_mut();
-        let ready = ready.get_or_insert_with(|| (32..NIRQ).filter(|&i| { let l = &self.shared[i]; l.enabled && l.group && !l.active && l.asserted() }).map(|i| i as u16).collect());
+        let ready = ready.get_or_insert_with(|| (32..self.shared.len()).filter(|&i| { let l = &self.shared[i]; l.enabled && l.group && !l.active && l.asserted() }).map(|i| i as u16).collect());
         let shared = ready.iter().map(|&i| i as usize).filter(|&i| ok(&self.shared[i]) && self.routed(i, pe));
         private.chain(shared).min_by_key(|&i| (self.line(pe, i).priority, i))
     }
@@ -175,7 +181,7 @@ impl Gic {
                     if self.pes[c].cpu_ctlr & 2 == 0 { self.line_mut(c, i).active = false; }
                 }
             }
-            DIR => { let i = (v & 0xff_ffff) as usize; if i < NIRQ { self.line_mut(c, i).active = false; } }
+            DIR => { let i = (v & 0xff_ffff) as usize; if i < self.shared.len() { self.line_mut(c, i).active = false; } }
             SGI1R => self.sgi(v),
             r if r == key(3,0,12,9,0) => self.pes[c].running.retain(|(_,p)| v & (1u64 << (*p >> 3)) != 0),
             r if r == key(3,0,12,12,3) || (key(3,0,12,8,4)..=key(3,0,12,8,7)).contains(&r) || (key(3,0,12,9,1)..=key(3,0,12,9,3)).contains(&r) => {},
@@ -200,7 +206,7 @@ impl Gic {
 
     fn bits(&self, pe: usize, base: usize, which: u64) -> u32 {
         (0..32).fold(0, |v, n| { let i = base+n;
-            if i >= NIRQ { return v; }
+            if i >= self.shared.len() { return v; }
             let l = self.line(pe, i);
             let bit = match which { 0x80 => l.group, 0x100 | 0x180 => l.enabled,
                 0x200 | 0x280 => l.asserted(), 0x300 | 0x380 => l.active, _ => false };
@@ -210,8 +216,8 @@ impl Gic {
     fn bank_read(&self, pe: usize, off: u64) -> u32 {
         match off {
             0x80..=0xbf | 0x100..=0x3ff => { let kind = off & !0x7f; self.bits(pe, ((off-kind)/4*32) as usize,kind) }
-            0x400..=0x5df => { let i = (off-0x400) as usize; (0..4).fold(0, |v,n| v | ((self.line(pe, i+n).priority as u32) << (n*8))) }
-            0xc00..=0xc77 => { let i = ((off-0xc00)/4*16) as usize; (0..16).fold(0, |v,n| v | (u32::from(self.line(pe, i+n).edge) << (n*2+1))) }
+            0x400..=0x5ff if (off-0x400) as usize + 4 <= self.shared.len() => { let i = (off-0x400) as usize; (0..4).fold(0, |v,n| v | ((self.line(pe, i+n).priority as u32) << (n*8))) }
+            0xc00..=0xc7f if ((off-0xc00)/4*16) as usize + 16 <= self.shared.len() => { let i = ((off-0xc00)/4*16) as usize; (0..16).fold(0, |v,n| v | (u32::from(self.line(pe, i+n).edge) << (n*2+1))) }
             _ => 0,
         }
     }
@@ -220,7 +226,7 @@ impl Gic {
             0x80..=0xbf | 0x100..=0x3ff => {
                 let kind = off & !0x7f;
                 let base = ((off-kind)/4*32) as usize;
-                for n in 0..32 { let i=base+n; if i>=NIRQ { break; }
+                for n in 0..32 { let i=base+n; if i>=self.shared.len() { break; }
                     let set=v & (1<<n)!=0;
                     let l = self.line_mut(pe, i);
                     match kind { 0x80 => l.group=set,
@@ -229,8 +235,8 @@ impl Gic {
                         0x300 if set => l.active=true, 0x380 if set => l.active=false, _=>{} }
                 }
             }
-            0x400..=0x5df => { let i=(off-0x400) as usize; for n in 0..4 {self.line_mut(pe, i+n).priority=(v>>(n*8)) as u8 & 0xf8;} }
-            0xc00..=0xc77 => { let i=((off-0xc00)/4*16) as usize; for n in 0..16 {self.line_mut(pe, i+n).edge=v & (2<<(n*2))!=0;} }
+            0x400..=0x5ff if (off-0x400) as usize + 4 <= self.shared.len() => { let i=(off-0x400) as usize; for n in 0..4 {self.line_mut(pe, i+n).priority=(v>>(n*8)) as u8 & 0xf8;} }
+            0xc00..=0xc7f if ((off-0xc00)/4*16) as usize + 16 <= self.shared.len() => { let i=((off-0xc00)/4*16) as usize; for n in 0..16 {self.line_mut(pe, i+n).edge=v & (2<<(n*2))!=0;} }
             _=>{}
         }
     }
@@ -241,10 +247,10 @@ impl Gic {
     pub fn dist_read(&self, off: u64) -> u32 {
         match off {
             0 => self.ctlr,
-            4 => (NIRQ as u32 / 32 - 1) | ((self.pes.len() as u32 - 1) << 5) | (9 << 19), // 10-bit INTIDs; no LPIs
+            4 => (self.shared.len() as u32 / 32 - 1) | ((self.pes.len() as u32 - 1) << 5) | (9 << 19), // 10-bit INTIDs; no LPIs
             8 => 0x0200_043b,
             0xffe8 => 0x30,
-            0x6000..=0x6eff => { let i=((off-0x6000)/8) as usize; if i<NIRQ { (self.route[i] >> ((off&4)*8)) as u32 } else {0} }
+            0x6000..=0x6fff => { let i=((off-0x6000)/8) as usize; if i<self.shared.len() { (self.route[i] >> ((off&4)*8)) as u32 } else {0} }
             o if Self::private_offset(o) => 0,
             _ => self.bank_read(0, off),
         }
@@ -253,7 +259,7 @@ impl Gic {
         self.changed();
         match off {
             0 => self.ctlr = (v & 0x37) | 0x40,
-            0x6000..=0x6eff => { let i=((off-0x6000)/8) as usize; let shift=(off&4)*8; if i<NIRQ {self.route[i]=(self.route[i]&!(0xffff_ffff<<shift))|((v as u64)<<shift);} }
+            0x6000..=0x6fff => { let i=((off-0x6000)/8) as usize; let shift=(off&4)*8; if i<self.shared.len() {self.route[i]=(self.route[i]&!(0xffff_ffff<<shift))|((v as u64)<<shift);} }
             o if Self::private_offset(o) => {},
             _ => self.bank_write(0, off,v),
         }

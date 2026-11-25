@@ -25,6 +25,8 @@ sed '$d' scripts/jetson-orin-nano-gpu-power.txt >"$work/ioctl.txt"
 cat >>"$work/ioctl.txt" <<'SCRIPT'
 serial /gpu-ioctl; echo "NVGPU_IOCTL_" "STATUS=$?"\r
 wait-serial NVGPU_IOCTL_ STATUS=
+serial cat /proc/interrupts; echo "NVGPU_IRQS_" "END"\r
+wait-serial NVGPU_IRQS_ END
 quit
 SCRIPT
 
@@ -35,6 +37,7 @@ SCRIPT
         exit 1
     }
 if ! rg '^NVGPU_IOCTL_ STATUS=0[[:space:]]*$' "$work/boot.log" ||
+   ! rg '^\s*[0-9]+:(\s+[0-9]+)*\s+[1-9][0-9]*(\s+[0-9]+)*\s+GICv3 48[0-7] Level\s+host1x_syncpt' "$work/boot.log" ||
    ! rg 'GPU: 2 completed GPFIFO entries' "$work/boot.log"; then
     tail -40 "$work/boot.log"
     exit 1

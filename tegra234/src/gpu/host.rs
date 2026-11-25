@@ -1,5 +1,6 @@
 //! GA10B runlist, RAMFC, USERD and GPFIFO submission for the copy engine.
 use super::{copy, mmu};
+use crate::host1x::Host1x;
 use std::collections::HashMap;
 
 // Runlist and USERMODE register offsets within GA10B BAR0.
@@ -99,7 +100,7 @@ impl Host {
         }
     }
 
-    pub fn ring(&mut self, token: u32, ram: &mut [u8]) -> Option<()> {
+    pub fn ring(&mut self, token: u32, ram: &mut [u8], host1x: &mut Host1x) -> Option<()> {
         if token >> 16 & 0x7f != 0 {
             return None;
         }
@@ -128,7 +129,13 @@ impl Host {
             if words > MAX_WORDS {
                 return None;
             }
-            channel.execute(&mut memory, address, words, &mut self.nonstall_pending)?;
+            channel.execute(
+                &mut memory,
+                address,
+                words,
+                &mut self.nonstall_pending,
+                host1x,
+            )?;
             get = (get + 1) & (entries - 1);
             memory.ram[get_offset..get_offset + 4].copy_from_slice(&get.to_le_bytes());
             self.submissions += 1;
@@ -144,6 +151,7 @@ impl Channel {
         base: u64,
         words: u32,
         nonstall: &mut bool,
+        host1x: &mut Host1x,
     ) -> Option<()> {
         let mut index = 0;
         while index < words {
@@ -154,7 +162,7 @@ impl Channel {
             let sub = (header >> 13 & 7) as usize;
             let mut method = (header & 0x1fff) * 4;
             if mode == 4 {
-                self.method(memory, sub, method, count, nonstall)?;
+                self.method(memory, sub, method, count, nonstall, host1x)?;
                 continue;
             }
             if !matches!(mode, 1 | 3 | 5) || count > words - index {
@@ -163,7 +171,7 @@ impl Channel {
             for n in 0..count {
                 let data = memory.load(base + u64::from(index) * 4)?;
                 index += 1;
-                self.method(memory, sub, method, data, nonstall)?;
+                self.method(memory, sub, method, data, nonstall, host1x)?;
                 if mode == 1 || (mode == 5 && n == 0) {
                     method += 4;
                 }
@@ -179,6 +187,7 @@ impl Channel {
         method: u32,
         data: u32,
         nonstall: &mut bool,
+        host1x: &mut Host1x,
     ) -> Option<()> {
         match method {
             0 => self.classes[sub] = data & 0xffff,
@@ -189,7 +198,10 @@ impl Channel {
                 // Bit 20 requests idle, which the synchronous engine already guarantees.
                 let [lo, hi, payload, _] = self.semaphore;
                 let address = u64::from(lo) | u64::from(hi & 0xff) << 32;
-                memory.store(address, payload)?;
+                let physical = memory.translate(address, true)?;
+                if !host1x.gpu_increment(physical) {
+                    memory.store(address, payload)?;
+                }
             }
             _ if self.classes[sub] == copy::CLASS => self.copy.method(method, data, memory)?,
             _ => return None,
