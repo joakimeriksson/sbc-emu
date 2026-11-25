@@ -21,6 +21,8 @@ enum {
     SASS_OFFSET = 0x800,
     COMPUTE_INPUT = 0xa00,
     COMPUTE_OUTPUT = 0xa40,
+    COLOR_TARGET = 0xc00,
+    TILED_TARGET = PAGE_BYTES,
     NVMAP_HEAP_IOVMM = 1U << 30,
     NVMAP_WRITE_COMBINE = 1,
     NVMAP_TEST_TAG = 1U << 16,
@@ -226,19 +228,55 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         words[COMPUTE_OUTPUT / 4 + i] = 0;
         words[COMPUTE_OUTPUT / 4 + 4 + i] = 0x9e3779b9;
     }
-    words[0] = packet(0, 1);
-    words[1] = 0xc7c0;
-    words[2] = packet(0x2b4, 1);
-    words[3] = (va + QMD_OFFSET) >> 8;
-    words[4] = packet(0x2c0, 1);
-    words[5] = 3;
-    int result = submit_work(channel, va, 6);
+    // Clear a clipped rectangle in a 16x4 RGBA8 target with a 64-byte pitch.
+    const uint64_t target = va + COLOR_TARGET;
+    for (unsigned i = 0; i < 64; ++i)
+        words[COLOR_TARGET / 4 + i] = 0x12345678;
+    const uint64_t tiled_target = va + TILED_TARGET;
+    for (unsigned i = 0; i < 128; ++i)
+        words[TILED_TARGET / 4 + i] = 0x10203040;
+    const uint32_t push[] = {
+        packet(0, 1), 0xc7c0,
+        packet(0x2b4, 1), (va + QMD_OFFSET) >> 8,
+        packet(0x2c0, 1), 3,
+        packet(0, 1), 0xc797,
+        packet(0x800, 7), target >> 32, target, 64, 4, 0xd5, 1 << 12, 1,
+        packet(0xff4, 2), (4 << 16) | 1, (3 << 16) | 1,
+        packet(0x121c, 1), 1,
+        packet(0xd80, 4), 0x3f800000, 0x3f000000, 0, 0x3f800000,
+        packet(0x19d0, 1), 0x3c,
+        // Clear only green in an adjacent block-linear target.
+        packet(0x800, 7), tiled_target >> 32, tiled_target, 16, 8, 0xd5, 0, 1,
+        packet(0xff4, 2), (6 << 16) | 5, (4 << 16) | 1,
+        packet(0x19d0, 1), 0x08,
+    };
+    for (unsigned i = 0; i < sizeof(push) / sizeof(push[0]); ++i)
+        words[i] = push[i];
+    int result = submit_work(channel, va, sizeof(push) / sizeof(push[0]));
     if (result)
         return result;
     for (unsigned i = 0; i < 4; ++i) {
         if (words[COMPUTE_OUTPUT / 4 + i] != inputs[i] + 17
             || words[COMPUTE_OUTPUT / 4 + 4 + i] != 0x9e3779b9)
             return 18;
+    }
+    for (unsigned y = 0; y < 4; ++y) {
+        for (unsigned x = 0; x < 16; ++x) {
+            const uint32_t expected = y >= 1 && x >= 1 && x < 5 ? 0xff0080ff : 0x12345678;
+            if (words[COLOR_TARGET / 4 + y * 16 + x] != expected)
+                return 19;
+        }
+    }
+    for (unsigned y = 0; y < 8; ++y) {
+        for (unsigned x = 0; x < 16; ++x) {
+            // A single 64-byte by 8-row GOB.
+            const unsigned offset = (x / 8) * 256 + (y / 2) * 64
+                + (x / 4 % 2) * 32 + (y % 2) * 16 + (x % 4) * 4;
+            const uint32_t expected = x >= 5 && x < 11 && y >= 1 && y < 5
+                ? 0x10208040 : 0x10203040;
+            if (words[(TILED_TARGET + offset) / 4] != expected)
+                return 20;
+        }
     }
     return 0;
 }

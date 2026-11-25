@@ -9,3 +9,4 @@ description = "NVIDIA Tegra234 / Jetson Orin Nano direct Linux bring-up"
 arm-a64 = { path = "../arm-a64" }
 emu-core = { path = "../emu-core" }
 peripherals = { path = "../peripherals" }
+maxwell-tex = { path = "../maxwell-tex" }

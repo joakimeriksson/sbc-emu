@@ -13,6 +13,7 @@ mod gsp;
 mod host;
 mod mmu;
 mod sass;
+mod threed;
 
 mod top;
 

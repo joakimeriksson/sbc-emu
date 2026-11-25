@@ -1,5 +1,5 @@
 //! GA10B runlist, RAMFC, USERD and GPFIFO submission.
-use super::{compute, copy, mmu};
+use super::{compute, copy, mmu, threed};
 use crate::host1x::Host1x;
 use std::collections::HashMap;
 
@@ -61,6 +61,7 @@ struct Channel {
     classes: [u32; 8],
     copy: copy::Copy,
     compute: compute::Compute,
+    threed: threed::ThreeD,
     semaphore: [u32; 4],
 }
 
@@ -205,6 +206,7 @@ impl Channel {
             _ => match self.classes[sub] {
                 copy::CLASS => self.copy.method(method, data, memory)?,
                 compute::CLASS => self.compute.method(method, data, memory)?,
+                threed::CLASS => self.threed.method(method, data, memory)?,
                 _ => return None,
             },
         }
