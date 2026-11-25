@@ -203,7 +203,7 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
     qmd[48] = program;
     qmd[49] = program >> 32;
 
-    // SM87 encodings for output[threadIdx.x] = input[threadIdx.x] + 17.
+    // SM87 encodings for output[threadIdx.x] = input[threadIdx.x] + 17 * (threadIdx.x + 1).
     const uint64_t shader[][2] = {
         {0x0000000000027919, 0x000e220000002100}, // S2R R2, SR_TID.X
         {0x000000040200780c, 0x000fe20003f060f0}, // ISETP.GE.U32.AND P0, PT, R2, 4, PT
@@ -214,7 +214,11 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         {add_registers(3, 3, 3), 0x000fe20007ffe0ff},
         {add_registers(0, 0, 3), 0x000fe20007ffe0ff},
         {0xffffc03f00047981, 0x000fe2000c1ee900}, // LDG.E R4, [R0.64+UZR-0x40]
-        {0x0000001104047810, 0x000fe20007ffe0ff}, // IADD3 R4, R4, 17, RZ
+        {0x0000000102057810, 0x000fe20007ffe0ff}, // IADD3 R5, R2, 1, RZ
+        {0x0000001104047810, 0x000fe20007ffe0ff}, // loop: IADD3 R4, R4, 17, RZ
+        {0xffffffff05057810, 0x000fe20007ffe0ff}, // IADD3 R5, R5, -1, RZ
+        {0x000000000500780c, 0x000fe20003f050f0}, // ISETP.NE.U32.AND P0, PT, R5, 0, PT
+        {0xffffffc000007947, 0x000fea000003ffff}, // BRA P0, loop (16 words back)
         {0x0000000400007986, 0x000fe2000c10e93f}, // STG.E [R0.64+UZR], R4
         {0x000000000000794d, 0x000fea0003800000}, // EXIT
     };
@@ -277,7 +281,7 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
     if (result)
         return result;
     for (unsigned i = 0; i < 4; ++i) {
-        if (words[COMPUTE_OUTPUT / 4 + i] != inputs[i] + 17
+        if (words[COMPUTE_OUTPUT / 4 + i] != inputs[i] + 17 * (i + 1)
             || words[COMPUTE_OUTPUT / 4 + 4 + i] != 0x9e3779b9)
             return 18;
     }

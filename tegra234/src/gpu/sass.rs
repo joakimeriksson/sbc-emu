@@ -4,6 +4,7 @@ use super::mmu::View;
 
 const RZ: u8 = 255;
 const MAX_INSTRUCTIONS: usize = 256;
+const MAX_THREAD_STEPS: usize = 1024;
 
 #[derive(Clone, Copy)]
 enum Operand {
@@ -70,6 +71,7 @@ impl Compare {
 enum Instruction {
     Nop,
     Exit,
+    Branch(Predicate, i64),
     Move(u8, Operand),
     Add(u8, u8, Operand, u8),
     Compare(u8, u8, Operand, Compare),
@@ -113,6 +115,14 @@ impl Instruction {
         };
         let instruction = match opcode {
             0x918 => Self::Nop,
+            0x947 if (raw >> 32) & 1 == 0 && (raw >> 82) & 0x1f == 0 => {
+                // BRA encodes a signed 48-bit offset in words from the next instruction.
+                let words = ((raw >> 34) as i64) << 16 >> 16;
+                if words % 4 != 0 {
+                    return None;
+                }
+                Self::Branch(Predicate((raw >> 87) as u8 & 0xf), words / 4)
+            }
             0x94d if (raw >> 84) & 0x7f == 0x38 => Self::Exit,
             0x202 | 0x802 if (raw >> 72) & 0xf == 0xf => Self::Move(dst, b),
             // Plain IADD3 with neither carry input, output predicate nor source modifier.
@@ -167,6 +177,7 @@ pub(super) struct Program(Vec<(Predicate, Instruction)>);
 impl Program {
     pub fn read(memory: &View, address: u64) -> Option<Self> {
         let mut instructions = Vec::new();
+        let mut last_target = 0;
         for index in 0..MAX_INSTRUCTIONS {
             let address = address + 16 * index as u64;
             let mut raw = 0;
@@ -174,7 +185,16 @@ impl Program {
                 raw |= u128::from(memory.load(address + 4 * word)?) << (32 * word);
             }
             let (predicate, instruction) = Instruction::decode(raw)?;
-            let done = predicate.0 == Predicate::ALWAYS && matches!(instruction, Instruction::Exit);
+            if let Instruction::Branch(_, relative) = instruction {
+                let target = usize::try_from(index as i64 + 1 + relative).ok()?;
+                if target >= MAX_INSTRUCTIONS {
+                    return None;
+                }
+                last_target = last_target.max(target);
+            }
+            let done = predicate.0 == Predicate::ALWAYS
+                && index >= last_target
+                && matches!(instruction, Instruction::Exit);
             instructions.push((predicate, instruction));
             if done {
                 return Some(Self(instructions));
@@ -186,13 +206,22 @@ impl Program {
     pub fn run(&self, memory: &mut View, local: [u32; 3], group: [u32; 3]) -> Option<()> {
         let mut registers = [0u32; 256];
         let mut predicates = [false; 7];
-        for (predicate, instruction) in &self.0 {
+        let mut pc = 0;
+        for _ in 0..MAX_THREAD_STEPS {
+            let (predicate, instruction) = self.0.get(pc)?;
+            pc += 1;
             if !predicate.test(&predicates) {
                 continue;
             }
             let (dst, value) = match *instruction {
                 Instruction::Nop => continue,
                 Instruction::Exit => return Some(()),
+                Instruction::Branch(condition, relative) => {
+                    if condition.test(&predicates) {
+                        pc = usize::try_from(pc as i64 + relative).ok()?;
+                    }
+                    continue;
+                }
                 Instruction::Move(dst, src) => (dst, src.get(&registers)),
                 Instruction::Add(dst, a, b, c) => (
                     dst,
