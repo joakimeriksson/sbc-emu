@@ -17,8 +17,10 @@ use std::sync::{Arc, Mutex};
 fn input(spec: &str) -> Vec<String> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     if let Some(n) = spec.strip_prefix("avfoundation:") {
-        // (macOS cameras deliver 30 frames a second at 640x480 or more; ffmpeg scales)
-        let mut v = s(&["-f", "avfoundation", "-framerate", "30", "-i"]);
+        // (macOS cameras deliver 30 frames a second at 640x480 or more; ffmpeg scales). The
+        // pixel format is named: ffmpeg's default, yuv420p, is one Mac cameras do not offer, and
+        // ffmpeg then prints an error before falling back; uyvy422 is what they deliver.
+        let mut v = s(&["-f", "avfoundation", "-framerate", "30", "-pixel_format", "uyvy422", "-i"]);
         v.push(n.to_string());
         v
     } else if let Some(dev) = spec.strip_prefix("v4l2:") {
@@ -40,9 +42,20 @@ pub fn start(spec: &str) -> Result<FrameSource, String> {
         .args(input(spec))
         .args(["-an", "-vf", &fit, "-r", "30", "-pix_fmt", "yuyv422", "-f", "rawvideo", "-"])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("--camera-source: cannot run ffmpeg: {e}"))?;
     let mut out = child.stdout.take().ok_or("--camera-source: no output from ffmpeg")?;
+    // ffmpeg's messages, each line ended with \r\n: the terminal is in raw mode while the
+    // guest's console runs, and a bare \n there leaves the next line where this one ended
+    if let Some(err) = child.stderr.take() {
+        let _ = std::thread::Builder::new().name("camera-ffmpeg-log".into()).spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(err).split(b'\n').map_while(Result::ok) {
+                eprint!("[camera] ffmpeg: {}\r\n", String::from_utf8_lossy(&line).trim_end());
+            }
+        });
+    }
     let source: FrameSource = Arc::new(Mutex::new(None));
     let latest = source.clone();
     let spec = spec.to_string();
@@ -56,7 +69,7 @@ pub fn start(spec: &str) -> Result<FrameSource, String> {
                 }
             }
             let _ = child.wait();
-            eprintln!("[camera] {spec}: ffmpeg ended; the camera keeps its last picture");
+            eprint!("[camera] {spec}: ffmpeg ended; the camera keeps its last picture\r\n");
         })
         .map_err(|e| e.to_string())?;
     Ok(source)
@@ -68,7 +81,7 @@ mod tests {
 
     #[test]
     fn inputs() {
-        assert_eq!(input("avfoundation:0")[..4], ["-f", "avfoundation", "-framerate", "30"]);
+        assert_eq!(input("avfoundation:0")[..6], ["-f", "avfoundation", "-framerate", "30", "-pixel_format", "uyvy422"]);
         assert_eq!(input("avfoundation:0").last().unwrap(), "0");
         assert_eq!(input("v4l2:/dev/video2"), ["-f", "v4l2", "-i", "/dev/video2"]);
         assert_eq!(input("street.mp4"), ["-re", "-stream_loop", "-1", "-i", "street.mp4"]);
