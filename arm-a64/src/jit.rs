@@ -1193,7 +1193,7 @@ impl Cpu {
                 if rd != 31 { let h = e.def(rd, R::Zr); mov64(&mut e.out, h, sx); e.dirty(rd, R::Zr); }
                 natives += 1;
                 e.pending_native += 1;
-            } else if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
+            } else if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2..=5))
                 || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6))
             {
                 // NOP and the hints that are NOPs here (YIELD, SEV, PAC, BTI, ...), DSB/DMB/ISB;

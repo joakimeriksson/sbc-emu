@@ -695,8 +695,10 @@ impl Cpu {
                     0b0010 => {
                         // hints
                         return match (crm << 3) | op2 {
+                            0b000_0010 if self.event => { self.event = false; Ok(()) } // WFE with the event register set
                             0b000_0010 | 0b000_0011 => { self.last_wfe = op2 == 0b010; Err(Trap::Wait) } // WFE, WFI
-                            _ => Ok(()), // NOP, YIELD, SEV, SEVL, PAC/BTI hints (not implemented: NOP)
+                            0b000_0100 | 0b000_0101 => { self.event = true; Ok(()) } // SEV, SEVL (other cores in WFE are woken by the machine)
+                            _ => Ok(()), // NOP, YIELD, PAC/BTI hints (not implemented: NOP)
                         };
                     }
                     0b0011 => {

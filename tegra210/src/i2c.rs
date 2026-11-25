@@ -22,6 +22,8 @@ const CONFIG_LOAD: usize = 0x8c;
 
 const INT_BUS_CLR_DONE: u32 = 1 << 11;
 const INT_XFER_COMPLETE: u32 = 1 << 7;
+/// every packet written so far is done (L4T's downstream driver completes a transfer on this)
+const INT_ALL_PACKETS_COMPLETE: u32 = 1 << 6;
 const INT_NO_ACK: u32 = 1 << 3;
 const INT_TX_REQ: u32 = 1 << 1;
 const INT_RX_REQ: u32 = 1 << 0;
@@ -232,7 +234,8 @@ impl TegraI2c {
     fn check_complete(&mut self) {
         if self.completing && self.rx.len() <= 4 * DEPTH {
             self.completing = false;
-            self.regs[INT_STATUS / 4] |= INT_XFER_COMPLETE;
+            let all = if self.header.is_empty() && self.payload.is_empty() { INT_ALL_PACKETS_COMPLETE } else { 0 };
+            self.regs[INT_STATUS / 4] |= INT_XFER_COMPLETE | all;
         }
     }
 }
@@ -270,6 +273,21 @@ mod tests {
         for w in [0x10 << 0, len - 1, flags | addr << 1].into_iter().chain(data.iter().copied()) {
             c.write(TX_FIFO as u64, w, 0);
         }
+    }
+
+    /// L4T's driver writes a register-address packet and a read packet, then waits for
+    /// ALL_PACKETS_XFER_COMPLETE with the RX request.
+    #[test]
+    fn all_packets_complete_for_the_downstream_driver() {
+        let mut c = TegraI2c::default();
+        c.attach(0x3c, Box::new(Mem { data: (0..=255).collect(), ..Default::default() }));
+        packet(&mut c, 0x3c, HEADER_REPEAT_START, 1, &[0x58]);
+        packet(&mut c, 0x3c, HEADER_READ, 4, &[]);
+        c.write(INT_MASK as u64, INT_ALL_PACKETS_COMPLETE | INT_RX_REQ, 0);
+        assert_eq!(c.read(INT_STATUS as u64) & (INT_ALL_PACKETS_COMPLETE | INT_RX_REQ), INT_ALL_PACKETS_COMPLETE | INT_RX_REQ);
+        assert_eq!(c.read(RX_FIFO as u64), 0x5b5a_5958);
+        c.write(INT_STATUS as u64, u32::MAX, 0);
+        assert!(!c.irq());
     }
 
     #[test]

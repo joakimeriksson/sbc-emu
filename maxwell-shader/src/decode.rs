@@ -243,6 +243,50 @@ fn decode_op(addr: u32, w: W) -> Option<Op> {
         _ => {}
     }
 
+    // VADD
+    if top & 0xfc00 == 0x2000 {
+        let b_reg = w.b(50);
+        let (b, b_bits, b_sel) = if b_reg {
+            match w.f(28, 3) {
+                k @ 0..=3 => (Src::Reg(w.rb()), 8, k as u8),
+                4 => (Src::Reg(w.rb()), 16, 0),
+                5 => (Src::Reg(w.rb()), 16, 2),
+                _ => (Src::Reg(w.rb()), 32, 0),
+            }
+        } else {
+            let v = w.f(20, 16);
+            (Src::Imm(if w.b(49) { v as u16 as i16 as i32 as u32 } else { v }), 32, 0)
+        };
+        return Some(Op::Vadd {
+            d: w.d(),
+            a: w.a(),
+            a_bits: if w.b(38) { 16 } else { 8 },
+            a_sel: w.f(36, 2) as u8,
+            a_signed: w.b(48),
+            b,
+            b_bits,
+            b_sel,
+            b_signed: w.b(49),
+            c: w.rc(),
+            op: w.f(51, 3) as u8,
+            d_signed: w.b(54),
+            cc: w.b(47),
+        });
+    }
+    // LEA.HI with a constant: its own layout
+    if top & 0xfc00 == 0x1800 {
+        return Some(Op::Lea {
+            d: w.d(),
+            a: w.a(),
+            b: w.cb(),
+            hi: Some(w.rc()),
+            shift: w.f(51, 5) as u8,
+            neg_a: w.b(56),
+            x: w.b(57),
+            cc: w.b(47),
+            pd: w.f(48, 3) as u8,
+        });
+    }
     // Three-source operations: which of the sources is the constant is in the opcode.
     if let Some(op) = three_source(w, top) {
         return Some(op);
@@ -534,6 +578,31 @@ fn two_source(w: W, form: Form, sel: u32) -> Option<Op> {
             x: w.b(43),
             sat: w.b(50),
             cc,
+        },
+        0xce8 => Op::P2r { d, a, b: ib, cc: w.b(40), byte: w.f(41, 2) as u8 },
+        0xcf0 => Op::R2p { a, b: ib, cc: w.b(40), byte: w.f(41, 2) as u8 },
+        // (register, constant and float immediate forms)
+        0xc88 => Op::Fchk {
+            pd: w.f(0, 3) as u8,
+            a,
+            b: fb,
+            abs_a: w.b(46),
+            neg_a: w.b(48),
+            abs_b: w.b(49),
+            neg_b: w.b(45),
+        },
+        // LEA (the low three bits of the selector are the predicate written)
+        0xbd0 => Op::Lea { d, a, b: ib, hi: None, shift: w.f(39, 5) as u8, neg_a: w.b(45), x: w.b(46), cc, pd: w.f(48, 3) as u8 },
+        0xbd8 if form == Form::Reg => Op::Lea {
+            d,
+            a,
+            b: ib,
+            hi: Some(w.rc()),
+            shift: w.f(28, 5) as u8,
+            neg_a: w.b(37),
+            x: w.b(38),
+            cc,
+            pd: w.f(48, 3) as u8,
         },
         0xc18 => Op::IScAdd {
             d,

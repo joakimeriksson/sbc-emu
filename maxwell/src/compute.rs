@@ -2,23 +2,22 @@
 //! for every workgroup.
 use crate::common_host;
 use crate::inline::Inline;
-use crate::pipe::{self, Common, Pipe, Work, L};
+use crate::pipe::{self, Common, Pipe, Work};
 use crate::threed::Cbuf;
 use crate::Memory;
 use maxwell_shader::{Exit, Host, Lanes, Program, SurfOp, TexOp};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub struct Compute {
     regs: Vec<u32>,
     inline: Inline,
-    /// registers of a workgroup's further sixteen threads
-    lanes: Vec<Lanes<L>>,
-    shared: Vec<u8>,
     pub launches: u64,
 }
 
 impl Default for Compute {
     fn default() -> Self {
-        Self { regs: vec![0; 0x1000], inline: Inline::default(), lanes: Vec::new(), shared: Vec::new(), launches: 0 }
+        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0 }
     }
 }
 
@@ -62,6 +61,10 @@ impl Launch {
     }
 }
 
+/// Lanes that run in lockstep: a warp, as CUDA's kernels assume (shuffles, votes, lane ids and
+/// warp-synchronous code see all 32 threads at once).
+const W: usize = 32;
+
 /// The largest workgroup (threads), the most local memory of one, and the most instructions (of
 /// sixteen threads each) for sixteen threads and in a launch: programs that do not end are stopped.
 const MAX_THREADS: u64 = 4096;
@@ -69,23 +72,23 @@ const MAX_LOCAL: usize = 1 << 28;
 const FUEL: u64 = 400_000_000;
 const LAUNCH_FUEL: u64 = 20_000_000_000;
 
-struct Group<'a, 'm> {
+struct Group<'a, 'm, const N: usize> {
     common: &'a mut Common<'m>,
     shared: &'a mut [u8],
     group: [u32; 3],
     /// each lane's thread
-    local: [[u32; L]; 3],
+    local: [[u32; N]; 3],
 }
 
-impl Host<L> for Group<'_, '_> {
-    common_host!(L);
+impl<const N: usize> Host<N> for Group<'_, '_, N> {
+    common_host!(N);
 
-    fn sysval(&mut self, sys: u8) -> [u32; L] {
+    fn sysval(&mut self, sys: u8) -> [u32; N] {
         match sys {
             0x20 => std::array::from_fn(|l| self.local[0][l] | self.local[1][l] << 16 | self.local[2][l] << 26),
             0x21..=0x23 => self.local[sys as usize - 0x21],
-            0x25..=0x27 => [self.group[sys as usize - 0x25]; L],
-            _ => [0; L],
+            0x25..=0x27 => [self.group[sys as usize - 0x25]; N],
+            _ => [0; N],
         }
     }
 
@@ -122,6 +125,7 @@ impl Compute {
             // a semaphore
             0x1b0c => {
                 let at = self.address(0x1b00);
+                if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] compute report {at:#x} = {:#x} (op {v:#x})", self.r(0x1b08)); }
                 if v & 3 == 0 && v >> 28 & 1 != 0 {
                     mem.write(at, &self.r(0x1b08).to_le_bytes());
                 } else if v & 1 == 0 {
@@ -148,6 +152,7 @@ impl Compute {
             self.run(&launch, &program, pipe, mem);
         }
         for (at, payload, short) in launch.releases {
+            if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] qmd release {at:#x} = {payload:#x}"); }
             mem.write(at, &payload.to_le_bytes());
             if !short {
                 mem.write(at + 8, &now.to_le_bytes());
@@ -156,76 +161,130 @@ impl Compute {
     }
 
     fn run(&mut self, launch: &Launch, program: &Program, pipe: &mut Pipe, mem: &mut dyn Memory) {
-        let [tx, ty, tz] = launch.threads.map(|t| t.max(1));
-        let threads = tx as u64 * ty as u64 * tz as u64;
-        if threads > MAX_THREADS {
-            pipe.fail(format!("compute workgroup of {threads} threads"));
-            return;
+        // 32-lane warps, as CUDA's kernels assume; in the browser a kernel that cannot see the warp
+        // width (no shuffles, votes, lane ids or lane masks) runs in the shader JIT's 16 lanes
+        use maxwell_shader::isa::Op;
+        let narrow = cfg!(target_arch = "wasm32")
+            && !program.any(|op| matches!(op, Op::Shfl { .. } | Op::Vote { .. } | Op::S2R { sys: 0x00 | 0x38..=0x3c, .. }));
+        if narrow {
+            run_lanes::<16>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), self.r(0x2608));
+        } else {
+            run_lanes::<W>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), self.r(0x2608));
         }
-        let batches = (threads as usize).div_ceil(L);
-        if launch.local > pipe::MAX_LOCAL || launch.local * batches * L > MAX_LOCAL {
-            pipe.fail(format!("compute shader with {} bytes of local memory", launch.local));
-            return;
-        }
-        // the descriptor invalidates the caches
-        pipe.invalidate_textures();
-        pipe.cbufs_changed = true;
-        let work = Work::compute(pipe, launch.cbufs, self.address(0x1574), self.address(0x155c), self.r(0x2608));
-        pipe.need_workers(1);
-        while self.lanes.len() < batches {
-            self.lanes.push(Lanes::new());
-        }
-        for l in &mut self.lanes[..batches] {
+    }
+}
+
+/// Run a launch's workgroups in batches of `N` lanes (a warp: 32), on the GPU worker pool unless
+/// the shader uses global atomics.
+fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe, mem: &mut dyn Memory, local_base: u64, shared_base: u64, tex_cb: u32) {
+    let [tx, ty, tz] = launch.threads.map(|t| t.max(1));
+    let threads = tx as u64 * ty as u64 * tz as u64;
+    if threads > MAX_THREADS {
+        pipe.fail(format!("compute workgroup of {threads} threads"));
+        return;
+    }
+    let batches = (threads as usize).div_ceil(N);
+    if launch.local > pipe::MAX_LOCAL || launch.local * batches * N > MAX_LOCAL {
+        pipe.fail(format!("compute shader with {} bytes of local memory", launch.local));
+        return;
+    }
+    // the descriptor invalidates the caches
+    pipe.invalidate_textures();
+    pipe.cbufs_changed = true;
+    let work = Work::compute(pipe, launch.cbufs, local_base, shared_base, tex_cb);
+    // which thread each lane is
+    let thread = |batch: usize, lane: usize| {
+        let t = (batch * N + lane) as u32;
+        [t % tx, t / tx % ty, t / tx / ty]
+    };
+    let locals: Vec<[[u32; N]; 3]> = (0..batches).map(|b| std::array::from_fn(|k| std::array::from_fn(|l| thread(b, l)[k]))).collect();
+    let [gx, gy, gz] = launch.groups;
+    let groups = gx as u64 * gy as u64 * gz as u64;
+    let atomics = program.any(|op| matches!(op, maxwell_shader::isa::Op::Atom { .. } | maxwell_shader::isa::Op::Suatom { .. }));
+    // (each thread has the local memory of a workgroup's threads)
+    let per_thread = (launch.local * batches * N).max(1);
+    let workers = if atomics { 1 } else { pipe::threads().min(groups as usize).min(MAX_LOCAL / per_thread).max(1) };
+    pipe.need_workers(workers);
+    let next = AtomicU64::new(0);
+    let left_fuel = AtomicU64::new(LAUNCH_FUEL);
+    let failed: Mutex<Option<String>> = Mutex::new(None);
+    // run workgroups until there are none left; each thread with its own lanes and shared memory
+    let one = |worker: &mut pipe::Worker, mem: &mut dyn Memory| {
+        let (_, mut common) = worker.parts(&work, mem);
+        let mut lanes: Vec<Lanes<N>> = (0..batches).map(|_| Lanes::new()).collect();
+        for l in &mut lanes {
             l.set_local_size(launch.local);
         }
-        self.shared.resize(launch.shared, 0);
-        // which thread each lane is
-        let thread = |batch: usize, lane: usize| {
-            let t = (batch * L + lane) as u32;
-            [t % tx, t / tx % ty, t / tx / ty]
-        };
-        let locals: Vec<[[u32; L]; 3]> = (0..batches).map(|b| std::array::from_fn(|k| std::array::from_fn(|l| thread(b, l)[k]))).collect();
-        let (_, mut common) = pipe.workers[0].parts(&work, mem);
-        let mut failed = None;
-        let mut left_fuel = LAUNCH_FUEL;
-        'groups: for z in 0..launch.groups[2] {
-            for y in 0..launch.groups[1] {
-                for x in 0..launch.groups[0] {
-                    self.shared.fill(0);
-                    let mut left: Vec<bool> = vec![true; batches];
-                    let start = (FUEL * batches as u64).min(left_fuel);
-                    let mut fuel = start;
-                    for (b, l) in self.lanes[..batches].iter_mut().enumerate() {
-                        let n = (threads as usize - b * L).min(L);
-                        l.start(program, (1u64 << n).wrapping_sub(1) as u32, 0);
+        let mut shared = vec![0u8; launch.shared];
+        loop {
+            let g = next.fetch_add(1, Ordering::Relaxed);
+            if g >= groups {
+                break;
+            }
+            let (x, y, z) = ((g % gx as u64) as u32, (g / gx as u64 % gy as u64) as u32, (g / gx as u64 / gy as u64) as u32);
+            shared.fill(0);
+            let mut left: Vec<bool> = vec![true; batches];
+            // the instructions this workgroup may run come out of the launch's before it starts (at
+            // most a worker's share of it, so that workgroups running at once cannot take it all)
+            let want = (FUEL * batches as u64).min(LAUNCH_FUEL / workers as u64);
+            let start = left_fuel.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| Some(f.saturating_sub(want))).map_or(0, |f| f.min(want));
+            let mut fuel = start;
+            for (b, l) in lanes.iter_mut().enumerate() {
+                let n = (threads as usize - b * N).min(N);
+                l.start(program, (1u64 << n).wrapping_sub(1) as u32, 0);
+            }
+            // everyone to the next barrier, until all are done
+            let mut stop = None;
+            while stop.is_none() && left.iter().any(|&l| l) {
+                for b in 0..batches {
+                    if !left[b] {
+                        continue;
                     }
-                    // everyone to the next barrier, until all are done
-                    while left.iter().any(|&l| l) {
-                        for b in 0..batches {
-                            if !left[b] {
-                                continue;
-                            }
-                            let mut host = Group { common: &mut common, shared: &mut self.shared, group: [x, y, z], local: locals[b] };
-                            match maxwell_shader::run(program, &mut self.lanes[b], &mut host, &mut fuel) {
-                                Exit::Done => left[b] = false,
-                                Exit::Barrier => {}
-                                e => {
-                                    failed = Some(format!("compute shader stopped: {e:?}"));
-                                    break 'groups;
-                                }
-                            }
+                    let mut host = Group::<N> { common: &mut common, shared: &mut shared[..], group: [x, y, z], local: locals[b] };
+                    match maxwell_shader::run(program, &mut lanes[b], &mut host, &mut fuel) {
+                        Exit::Done => left[b] = false,
+                        Exit::Barrier => {}
+                        e => {
+                            stop = Some(format!("compute shader stopped: {e:?}"));
+                            break;
                         }
                     }
-                    left_fuel -= start - fuel;
                 }
             }
+            // what it did not use goes back
+            left_fuel.fetch_add(fuel, Ordering::Relaxed);
+            if let Some(e) = stop {
+                failed.lock().unwrap().get_or_insert(e);
+                next.store(groups, Ordering::Relaxed);
+                break;
+            }
         }
-        if let Some(e) = failed {
-            pipe.fail(e);
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if workers > 1 {
+        let pool = &mut pipe.workers[..workers];
+        let split = mem.split(workers, &mut |views| {
+            let slots: Vec<Mutex<(&mut pipe::Worker, Box<dyn Memory + Send + '_>)>> = pool.iter_mut().zip(views).map(|(w, v)| Mutex::new((w, v))).collect();
+            crate::pool::run(workers, &|k| {
+                let (w, v) = &mut *slots[k].lock().unwrap();
+                one(w, &mut **v);
+            });
+        });
+        if split {
+            if let Some(e) = failed.into_inner().unwrap() {
+                pipe.fail(e);
+            }
+            pipe.invalidate_textures();
+            pipe.cbufs_changed = true;
+            return;
         }
-        pipe.invalidate_textures();
-        pipe.cbufs_changed = true;
     }
+    one(&mut pipe.workers[0], mem);
+    if let Some(e) = failed.into_inner().unwrap() {
+        pipe.fail(e);
+    }
+    pipe.invalidate_textures();
+    pipe.cbufs_changed = true;
 }
 
 #[cfg(test)]

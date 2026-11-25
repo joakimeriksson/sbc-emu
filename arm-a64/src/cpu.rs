@@ -149,6 +149,8 @@ pub struct Cpu {
     pub(crate) jit_refill: u64,
     /// the last `Trap::Wait` came from `wfe` (true) or `wfi` (false)
     pub last_wfe: bool,
+    /// the event register: set by SEV/SEVL, consumed by the next WFE (which then does not wait)
+    pub event: bool,
     /// multi-threaded run: cores execute in parallel on shared memory, so barriers and
     /// acquire/release become host fences and store-exclusive a compare-and-swap
     pub mt: bool,
@@ -223,7 +225,7 @@ impl Cpu {
             brk_to_host: false,
             firmware_calls_to_host: false,
             cur_insn: 0,
-            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, ram_base: 0, utlb: [[UTLB_EMPTY; UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, jit_interp: 0, jit_refill: 0, last_wfe: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
+            tlb: None, ram: std::ptr::null_mut(), ram_len: 0, ram_base: 0, utlb: [[UTLB_EMPTY; UT]; 3], utlb_asid: 0, utlb_unpriv: 0, tlb_blocks: [(u64::MAX, 0); 2], jit: None, code_pages: None, jit_bus: None, jit_trap: None, store_log: None, chain_until: 0, chain_stop: false, jit_disp: 0, jit_exit: 0, jit_interp: 0, jit_refill: 0, last_wfe: false, event: false, tlbi_bcast: None, jit_off: false, interp_run: false, watch: Vec::new(), watch_hit: None, crypto: false, mt: false, wall_clock: None, excl_val: 0, ic_bcast: None, aarch32: false, a32: None,
         }
     }
 
@@ -478,7 +480,7 @@ fn snapshot_fields(c: &Cpu) {
         // step; `aarch32` and `a32` are entered again from the saved CPSR
         cur_insn: _, tlb: _, ram: _, ram_len: _, ram_base: _, utlb: _, utlb_asid: _, utlb_unpriv: _,
         tlb_blocks: _, jit: _, code_pages: _, jit_bus: _, jit_trap: _, store_log: _, chain_until: _,
-        chain_stop: _, jit_disp: _, jit_exit: _, jit_interp: _, jit_refill: _, last_wfe: _, mt: _,
+        chain_stop: _, jit_disp: _, jit_exit: _, jit_interp: _, jit_refill: _, last_wfe: _, event: _, mt: _,
         wall_clock: _, excl_val: _, ic_bcast: _, crypto: _, jit_off: _, interp_run: _, watch: _,
         watch_hit: _, tlbi_bcast: _, profile: _,
     } = c;

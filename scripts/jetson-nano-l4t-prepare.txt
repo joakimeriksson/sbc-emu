@@ -1,0 +1,21 @@
+# Once per card: NVIDIA's L4T userspace, GPU firmware, the nvgpu module, the CUDA test and TensorRT
+# onto the Jetson Nano's Debian card (docs/jetson-nano-cuda.md). On the host:
+#   scripts/jetson-nano-l4t-fixture.sh          # cache/l4t/serve
+#   cp cache/jetson-nano/debian/disk.raw cache/l4t/disk.raw && truncate -s 8G cache/l4t/disk.raw
+#   python3 -m http.server 8800 --bind 127.0.0.1 -d cache/l4t/serve &   # (the guest's 10.0.2.2)
+#   D=cache/jetson-nano/debian
+#   sbc-emu run --board jetson-nano --kernel $D/vmlinuz --dtb $D/tegra210-p3450-0000.dtb \
+#     --initrd $D/initramfs.cpio.gz --sd cache/l4t/disk.raw --sd-persist --append "console=ttyS0,115200 \
+#     root=card rw quiet audit=0 systemd.set_credential=passwd.plaintext-password.root:nano \
+#     systemd.set_credential=firstboot.locale:C.UTF-8 systemd.set_credential=firstboot.timezone:UTC \
+#     systemd.set_credential=firstboot.keymap:us" --script scripts/jetson-nano-l4t-prepare.txt
+wait-serial login:
+sleep 2
+serial root\r
+wait-serial Password:
+serial nano\r
+wait-serial ~#
+sleep 1
+serial python3 -c "import urllib.request as u; d=u.urlopen('http://10.0.2.2:8800/prepare.sh').read(); open('/tmp/p.sh','wb').write(d)" && sh /tmp/p.sh 2>&1 | tail -3\r
+wait-serial PREPARE_OK
+serial sync; poweroff\r

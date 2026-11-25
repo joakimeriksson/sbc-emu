@@ -304,7 +304,7 @@ impl Cpu {
         let sf = bit(i, 31);
         let (rd, rn, rm) = (i & 31, bits(i, 9, 5), bits(i, 20, 16));
         // NOP and the hints that are NOPs here (PAC, BTI, YIELD, ...), DSB/DMB/ISB, PRFM
-        if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2 | 3))
+        if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2..=5))
             || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6))
             || i & 0xffc0_0000 == 0xf980_0000 || i & 0xffe0_0c00 == 0xf880_0000 || i & 0xffe0_0c00 == 0xf8a0_0800
         {

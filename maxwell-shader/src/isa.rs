@@ -399,6 +399,21 @@ pub enum Op {
     /// `shift`: 0 plain, 1 (a + b) >> 16, 2 (a + b) << 16; `half`: 0 word, 1 H0, 2 H1 per source.
     IAdd3 { d: Reg, a: Reg, b: Src, c: Reg, neg: [bool; 3], half: [u8; 3], shift: u8, x: bool, cc: bool },
     IScAdd { d: Reg, a: Reg, b: Src, shift: u8, neg_a: bool, neg_b: bool, cc: bool },
+    /// LEA: d = (a << shift) + b; LEA.HI (`hi`: the high word's register c): d = the high word of
+    /// (c:a << shift) + b. X adds the carry; the carry out goes to CC (with `cc`) and to `pd`.
+    Lea { d: Reg, a: Reg, b: Src, hi: Option<Reg>, shift: u8, neg_a: bool, x: bool, cc: bool, pd: u8 },
+    /// VADD (video add): an 8/16-bit part of a (`a_bits`, at byte `a_sel`) plus an 8/16/32-bit
+    /// part of b, then with c: 0..=3 merged into its high half, low half, byte 0, byte 2; 4 added;
+    /// 5 min; 6 max; 7 alone.
+    /// `d_signed`: c and the result are signed (for accumulate, min and max).
+    Vadd { d: Reg, a: Reg, a_bits: u8, a_sel: u8, a_signed: bool, b: Src, b_bits: u8, b_sel: u8, b_signed: bool, c: Reg, op: u8, d_signed: bool, cc: bool },
+    /// P2R: predicates P0..P6 (or the condition code) where `b`'s low byte has bits, into byte
+    /// `byte` of a copy of a.
+    P2r { d: Reg, a: Reg, b: Src, cc: bool, byte: u8 },
+    /// R2P: the bits of byte `byte` of a into the predicates (or the condition code) `b` selects.
+    R2p { a: Reg, b: Src, cc: bool, byte: u8 },
+    /// FCHK.DIVIDE: pd = whether a / b needs the exact (slow) path.
+    Fchk { pd: u8, a: Reg, b: Src, abs_a: bool, neg_a: bool, abs_b: bool, neg_b: bool },
     IMul { d: Reg, a: Reg, b: Src, sa: bool, sb: bool, hi: bool, cc: bool },
     IMad { d: Reg, a: Reg, b: Src, c: Src, sa: bool, sb: bool, hi: bool, neg_ab: bool, neg_c: bool, sat: bool, x: bool, cc: bool },
     Xmad { d: Reg, a: Reg, b: Src, c: Src, ha: bool, hb: bool, sa: bool, sb: bool, psl: bool, mrg: bool, mode: u8, x: bool, cc: bool },

@@ -78,7 +78,8 @@ listed at exit (`SBC_STUB_LOG=1` prints them as they happen).
 | Ethernet | the link at 1 Gbit/s with MSI, DHCP, ping; in Debian, `apt install` through the NAT | `scripts/jetson-nano-net.txt` |
 | USB | keyboard, tablet and stick enumerate; the stick's data reads back, also after the controller suspends and resumes | `scripts/jetson-nano-usb.txt` |
 | HDMI | `tegra-drm` reads the EDID and shows the console | `scripts/jetson-nano-display.txt` |
-| GPU | nouveau and Debian's Mesa 25.0.7: kmscube and every glmark2 scene on HDMI; the GLES 2, 3 and 3.2 test scenes against Mesa's software renderers | `scripts/jetson-nano-gl.txt` ([jetson-nano-gpu.md](jetson-nano-gpu.md#tests)) |
+| GPU | nouveau and Debian's Mesa 25.0.7: kmscube and every glmark2 scene on HDMI; the GLES 2, 3 and 3.2 test scenes against Mesa's software renderers; Mesa's OpenCL (rusticl) and Vulkan (NVK) compute | `scripts/jetson-nano-gl.txt` ([jetson-nano-gpu.md](jetson-nano-gpu.md#tests)) |
+| CUDA, TensorRT | NVIDIA's L4T kernel, `nvgpu`, CUDA 10.2 and TensorRT 8.2: a CUDA kernel, and YOLOv8n with the host's detections | `scripts/jetson-nano-cuda.txt`, `scripts/jetson-nano-tensorrt.txt` ([jetson-nano-cuda.md](jetson-nano-cuda.md)) |
 | Debugging | `--gdb PORT` ([debugging.md](debugging.md)) | `tools/gdb-check.py` |
 
 ## Speed
@@ -97,8 +98,9 @@ a JIT to WebAssembly.
   come from the command line).
 - USB 3.0 devices, the on-board hub, the device-mode port; DisplayPort, HDMI audio, YUV
   overlays, VIC.
-- GPU: see [jetson-nano-gpu.md](jetson-nano-gpu.md#not-done); Vulkan (NVK) is untried.
-- NVIDIA's JetPack image, which needs NVIDIA's bootloader hand-off and closed GPU userspace.
+- GPU: see [jetson-nano-gpu.md](jetson-nano-gpu.md#not-done).
+- NVIDIA's JetPack image as a whole (its bootloaders and Ubuntu): its kernel, GPU driver, CUDA and
+  TensorRT run with Debian's root ([jetson-nano-cuda.md](jetson-nano-cuda.md)).
 
 The milestones and notes from the bring-up are in the development record,
 [history/jetson-nano-plan.md](history/jetson-nano-plan.md).

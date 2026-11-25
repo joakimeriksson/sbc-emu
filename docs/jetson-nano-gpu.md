@@ -113,8 +113,13 @@ Natively the interpreter runs on all the host's cores and has no JIT.
 - Page faults are not reported to the driver: unmapped memory reads as zero.
 - Window rectangles, line and polygon stipple, line smoothing, quads outlined without their diagonal, disabling multisampling on a multisampled
   target.
-- Multiple vertex streams in transform feedback; subgroups wider than 16 lanes in compute.
-- Vulkan (NVK) and NVIDIA's own driver have not been tried.
+- Multiple vertex streams in transform feedback.
+- NVK only with `NVK_I_WANT_A_BROKEN_VULKAN_DRIVER=1` (it does not support the GM20B officially) and
+  a memory type marked device-local (on Tegra NVK has none; ncnn needs one); with them ncnn runs
+  YOLOv8n with the CPU's detections. NVIDIA's own driver: [jetson-nano-cuda.md](jetson-nano-cuda.md).
 - The GPU runs on the CPU's thread (a core waits while it draws); the shader JIT has no native backend.
+  A compute launch's workgroups run in 32-lane warps on several host threads (one, if the shader
+  uses global atomics).
 
-`SBC_TRACE_GPU=1` prints register accesses, `SBC_TRACE_GPFIFO=1` every method.
+`SBC_TRACE_GPU=1` prints register accesses, `SBC_TRACE_GPFIFO=1` every method; `SBC_SHADER_FAULT=1`
+the instruction a shader stops at, `SBC_SHADER_DUMP=1` every compute program.

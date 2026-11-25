@@ -44,6 +44,11 @@ impl Pmu {
             0x12c => 4 << 12 | 1 << 8 | 2 << 4 | 5,
             0x0dc | 0x20c => if self.bound { 5 << 12 } else { 0 },
             0x10c => self.r(o) & !6, // memories scrubbed
+            // a data port's control: where it is and how it moves
+            0x1c0..=0x1ff if o & 7 == 0 => {
+                let (a, w, r) = self.ports[(o as usize - 0x1c0) / 8];
+                a | (w as u32) << 24 | (r as u32) << 25
+            }
             0x1c4..=0x1ff if o & 7 == 4 => {
                 let p = (o as usize - 0x1c4) / 8;
                 let a = self.ports[p].0 as usize & 0xfffc;

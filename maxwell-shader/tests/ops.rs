@@ -833,3 +833,85 @@ fn endless_pushes() {
     let e = run(&p, &mut l, &mut Mem::default(), &mut fuel);
     assert!(matches!(e, Exit::Fault(_)), "{e:?}");
 }
+
+/// LEA and LEA.HI (NVIDIA's compiler builds 64-bit addresses with them): (r5:r4) = (r3:r2) +
+/// ((r1:r0) << s), the carry through CC; the constant form of LEA.HI; the words TensorRT's
+/// kernels use decode.
+#[test]
+fn lea_builds_64_bit_addresses() {
+    let mut r = Rng(11);
+    for _ in 0..2000 {
+        let v: [[u32; 4]; 4] = std::array::from_fn(|_| r.lanes());
+        let regs = [(0, v[0]), (1, v[1]), (2, v[2]), (3, v[3])];
+        let s = (r.next() & 7) as u64;
+        let l = exec(
+            &[
+                word(0x5bd7, &[(0, 8, 4), (8, 8, 0), (20, 8, 2), (39, 5, s), (47, 1, 1)]),
+                word(0x5bdf, &[(0, 8, 5), (8, 8, 0), (20, 8, 3), (39, 8, 1), (28, 5, s), (38, 1, 1)]),
+                // LEA.HI with c[0][0x144] (the test's constant is index << 16 | offset)
+                word(0x1800 | s << 3, &[(0, 8, 6), (8, 8, 0), (20, 14, 0x144 >> 2), (39, 8, 1)]),
+            ],
+            &regs,
+        );
+        for i in 0..4 {
+            let x = v[0][i] as u64 | (v[1][i] as u64) << 32;
+            let base = v[2][i] as u64 | (v[3][i] as u64) << 32;
+            let got = l.gpr[4][i] as u64 | (l.gpr[5][i] as u64) << 32;
+            assert_eq!(got, base.wrapping_add(x << s), "shift {s}");
+            assert_eq!(l.gpr[6][i], 0x144u32.wrapping_add((x << s >> 32) as u32));
+        }
+    }
+    for w in [0x5bd7_8100_00e7_130eu64, 0x5bd7_8100_00b7_110b, 0x5bd7_8100_0107_1510, 0x4bd7_8100_05e7_0f09] {
+        let p = Program::decode(&assemble(&[w])).unwrap();
+        assert!(p.any(|o| matches!(o, Op::Lea { .. })), "{w:#x}: {p}");
+    }
+}
+
+/// The video add, predicate packing and division check NVIDIA's compiler uses (the words are
+/// TensorRT's): VADD.UD.U16.U16.MRG_16H puts a.h0 + b.h0 in c's high half; P2R packs
+/// predicates under a mask; R2P unpacks them; FCHK flags divisions that need the exact path.
+#[test]
+fn vadd_p2r_r2p_fchk() {
+    let mut r = Rng(3);
+    for _ in 0..500 {
+        let v: [[u32; 4]; 3] = std::array::from_fn(|_| r.lanes());
+        // VADD r8 = merge(r8.l, r2.h0 + r3.h0)  (0x2044044040370208: d r8, a r2, b r3, c r8)
+        let l = exec(&[0x2044_0440_4037_0208], &[(2, v[0]), (3, v[1]), (8, v[2])]);
+        for i in 0..4 {
+            let want = v[2][i] & 0xffff | (v[0][i].wrapping_add(v[1][i]) & 0xffff) << 16;
+            assert_eq!(l.gpr[8][i], want);
+        }
+    }
+    // R2P from r0 byte 0 into P0..P6 (mask 0x7f), then P2R RZ with mask 0x3c into r104
+    let r2p = word(0x38f0, &[(8, 8, 0), (20, 19, 0x7f)]);
+    let l = exec(&[r2p, 0x38e8_0000_03c7_ff68], &[(0, [0x5a, 0x7f, 0x01, 0x24])]);
+    for (i, p) in [0x5au32, 0x7f, 0x01, 0x24].into_iter().enumerate() {
+        assert_eq!(l.gpr[104][i], p & 0x3c, "lane {i}");
+    }
+    // FCHK.DIVIDE P0, r0, r1 then P2R r2 (mask 1)
+    let fchk = word(0x5c88, &[(0, 3, 0), (8, 8, 0), (20, 8, 1)]);
+    let p2r = word(0x38e8, &[(0, 8, 2), (8, 8, 255), (20, 19, 1)]);
+    let x = [6.0f32, 1.0, 1.0e-40, f32::INFINITY].map(f32::to_bits);
+    let y = [3.0f32, 0.0, 2.0, 1.0].map(f32::to_bits);
+    let l = exec(&[fchk, p2r], &[(0, x), (1, y)]);
+    assert_eq!(l.gpr[2], [0, 1, 1, 1], "6/3 is fast; /0, a subnormal and infinity are not");
+}
+
+/// FCHK's constant and immediate forms decode; VADD's MIN compares with c as the destination's
+/// type (bit 54: signed).
+#[test]
+fn fchk_forms_and_vadd_destination_sign() {
+    for top in [0x5c88u64, 0x4c88, 0x3888] {
+        let p = Program::decode(&assemble(&[word(top, &[(0, 3, 0), (8, 8, 0), (20, 8, 1)])])).unwrap();
+        assert!(p.any(|o| matches!(o, Op::Fchk { .. })), "{top:#x}: {p}");
+    }
+    // VADD.S32 MIN r2 = min(r0.b0 (u8) + r1 (u32), r3): b's register form, 32 bits (bits 28-30 = 6)
+    let vmin = |signed_dest: u64| {
+        word(0x2000, &[(0, 8, 2), (8, 8, 0), (20, 8, 1), (28, 3, 6), (50, 1, 1), (51, 3, 5), (54, 1, signed_dest), (39, 8, 3)])
+    };
+    let regs = [(0, [1, 1, 1, 1]), (1, [0, 0, 0, 0]), (3, [0xffff_ffff, 5, 0, 0x8000_0000])];
+    let signed = exec(&[vmin(1)], &regs);
+    assert_eq!(signed.gpr[2], [0xffff_ffff, 1, 0, 0x8000_0000], "c as a signed destination: -1 < 1");
+    let unsigned = exec(&[vmin(0)], &regs);
+    assert_eq!(unsigned.gpr[2], [1, 1, 0, 1], "c as an unsigned destination");
+}
