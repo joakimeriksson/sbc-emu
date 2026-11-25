@@ -69,6 +69,8 @@ pub struct Lanes<const N: usize> {
     stack: Vec<Token>,
     /// Masks SAM saved.
     sam: Vec<u32>,
+    /// Registers the last program may have written (the ones `start` clears for the next).
+    written: usize,
     /// What the JIT's blocks read (kept to reuse its memory).
     frame: crate::jit::Frame,
 }
@@ -109,6 +111,7 @@ impl<const N: usize> Lanes<N> {
             helper: 0,
             stack: Vec::with_capacity(16),
             sam: Vec::new(),
+            written: 0,
             frame: Default::default(),
         }
     }
@@ -123,12 +126,19 @@ impl<const N: usize> Lanes<N> {
         }
     }
 
+    /// Clears the local memory (lanes kept from an earlier launch start like new ones).
+    pub fn clear_local(&mut self) {
+        self.local.fill(0);
+    }
+
     /// Prepares to run `p` from its entry in `lanes`. Lanes in `helper` (a subset) run only
     /// for the sake of their quad's derivatives: their stores and atomics do nothing. Clears the
-    /// registers the program uses.
+    /// registers the program uses, and those the program before wrote.
     pub fn start(&mut self, p: &Program, lanes: u32, helper: u32) {
+        // (and those an earlier program wrote: lanes kept from it start as new ones)
         let n = (p.gprs() as usize).min(255);
-        self.gpr[..n].fill([0; N]);
+        self.gpr[..n.max(self.written)].fill([0; N]);
+        self.written = n;
         self.pred = [0, 0, 0, 0, 0, 0, 0, !0];
         (self.zero, self.sign, self.carry, self.overflow) = (0, 0, 0, 0);
         self.pc = p.entry;
@@ -653,6 +663,8 @@ pub fn run<const N: usize, H: Host<N>>(
 
         match inst.op {
             Op::Nop | Op::Fence => {}
+            // (the workgroups of a parallel launch share memory through relaxed atomics)
+            Op::Membar => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
             Op::Invalid(_) | Op::Bpt => return fault(pc),
 
             Op::FAdd { d, a, am, b, bm, ftz, sat, cc, rnd } => {
@@ -2282,7 +2294,7 @@ mod tests {
     use super::prmt;
 
     /// PRMT byte by byte, as the PTX manual describes it.
-    fn reference(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
+    pub(super) fn reference(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
         let src = (a as u64 | (c as u64) << 32).to_le_bytes();
         let s = (sel & 3) as usize;
         let r: [u8; 4] = match mode {
@@ -2331,5 +2343,65 @@ mod tests {
                 assert_eq!(prmt(a, super::prmt_bytes(sel, mode), c, 0), reference(a, sel, c, mode), "as mode 0: {a:#x} {sel:#x} {c:#x} mode {mode}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use crate::isa::*;
+    use crate::jit::check::{program, Cb};
+    use crate::{run, Host, Lanes};
+
+    /// A word that decodes to an instruction `want` accepts.
+    fn find(want: impl Fn(&Op) -> bool) -> u64 {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        loop {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let w = x & !(0xf << 16) | 7 << 16;
+            if want(&crate::decode::decode(8, w).op) {
+                return w;
+            }
+        }
+    }
+
+    /// PRMT with a selector that is the same in every lane (immediate and constant buffer forms),
+    /// through `run`, against the byte-wise definition. (Where the JIT runs, it runs those.)
+    #[test]
+    fn prmt_with_one_selector() {
+        for form in 0..2 {
+            for mode in 0..8u8 {
+                let w = find(|op| match *op {
+                    Op::Prmt { b: Src::Imm(_), mode: m, .. } => form == 0 && m == mode,
+                    Op::Prmt { b: Src::Cb(..), mode: m, .. } => form == 1 && m == mode,
+                    _ => false,
+                });
+                let p = program(&[w]);
+                let Op::Prmt { d, a, b, c, mode } = p.code[0].op else { unreachable!() };
+                let mut l = Lanes::<16>::new();
+                l.start(&p, 0xffff, 0);
+                for k in 0..255 {
+                    l.gpr[k] = std::array::from_fn(|i| ((k * 977 + i * 131) as u32).wrapping_mul(0x9e37_79b9));
+                }
+                let before = l.gpr.clone();
+                let mut fuel = 10;
+                run(&p, &mut l, &mut Cb, &mut fuel);
+                let value = |s: Src, i: usize| match s {
+                    Src::Reg(r) => before[r as usize][i],
+                    Src::Imm(v) => v,
+                    Src::Cb(k, o) => Host::<16>::cbuf(&Cb, k as u32, o),
+                };
+                for i in 0..16 {
+                    let want = super::tests::reference(before[a as usize][i], value(b, i), value(c, i), mode);
+                    assert_eq!(l.gpr[d as usize][i], want, "{:?} lane {i}", p.code[0].op);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn membar_decodes() {
+        assert_eq!(crate::decode::decode(8, 0xef98_0000_0007_000f).op, Op::Membar);
     }
 }

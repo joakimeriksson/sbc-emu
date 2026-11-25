@@ -588,6 +588,7 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
         Op::Ram => "ram".into(),
         Op::Bar => "bar".into(),
         Op::Fence => "fence".into(),
+        Op::Membar => "membar".into(),
         Op::Bpt => "bpt".into(),
     };
     if x.pred == PT {

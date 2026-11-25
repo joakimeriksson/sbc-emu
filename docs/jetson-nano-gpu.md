@@ -120,8 +120,10 @@ Natively the interpreter runs on all the host's cores and has no JIT.
 - The GPU runs on the CPU's thread (a core waits while it draws); the shader JIT has no native backend.
   A compute launch's workgroups run in 32-lane warps on several host threads (one, if the shader
   uses global atomics); the warps of a workgroup that has no barriers and no shared memory run
-  apart. The threads share guest RAM through atomic word accesses (relaxed): what one workgroup
-  writes, the others see; bytes written by two at once end up as one of them wrote them.
+  apart. The threads share guest RAM through relaxed atomic accesses of 64-bit words: what one
+  workgroup writes, the others see; an aligned access of up to 8 bytes does not tear (16-byte
+  ones are two); bytes written by two at once end up as one of them wrote them; MEMBAR is a
+  sequentially consistent fence. Registers and local memory start cleared in every launch.
 
 `SBC_TRACE_GPU=1` prints register accesses, `SBC_TRACE_GPFIFO=1` every method; `SBC_SHADER_FAULT=1`
 the instruction a shader stops at, `SBC_SHADER_DUMP=1` every compute program.
