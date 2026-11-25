@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Freestanding arm64 Linux copy-engine test for the Jetson R36 nvgpu ABI.
+// Freestanding arm64 Linux copy and compute test for the Jetson R36 nvgpu ABI.
 #include <stdint.h>
 
 enum {
@@ -17,6 +17,10 @@ enum {
     SOURCE_OFFSET = PAGE_BYTES - 4,
     DESTINATION_OFFSET = 3 * PAGE_BYTES - 4,
     SEMAPHORE_OFFSET = 0x300,
+    QMD_OFFSET = 0x400,
+    SASS_OFFSET = 0x800,
+    COMPUTE_INPUT = 0xa00,
+    COMPUTE_OUTPUT = 0xa40,
     NVMAP_HEAP_IOVMM = 1U << 30,
     NVMAP_WRITE_COMBINE = 1,
     NVMAP_TEST_TAG = 1U << 16,
@@ -85,7 +89,7 @@ static uint32_t packet(unsigned method, unsigned count)
     return (1U << 29) | (count << 16) | (method / 4);
 }
 
-static int copy_probe(int as, int channel)
+static int map_buffer(int as, volatile uint32_t **words, uint64_t *va)
 {
     long nvmap = open_device("/dev/nvmap");
     if (nvmap < 0)
@@ -113,10 +117,39 @@ static int copy_probe(int as, int channel)
     if (syscall(SYS_IOCTL, as, IOCTL(IOC_RDWR, 'A', 7, map), (long)&map, 0) < 0)
         return 14;
 
-    const uint64_t source = map.va + SOURCE_OFFSET;
-    const uint64_t dest = map.va + DESTINATION_OFFSET;
-    const uint64_t fence = map.va + SEMAPHORE_OFFSET;
-    volatile uint32_t *words = (volatile uint32_t *)addr;
+    *words = (volatile uint32_t *)addr;
+    *va = map.va;
+    return 0;
+}
+
+static int submit_work(int channel, uint64_t va, uint32_t count)
+{
+    __asm__ volatile("dsb sy" ::: "memory");
+    const uint32_t entry[2] = {
+        va, (va >> 32) | (count << 10)
+    };
+    struct {
+        uint64_t entries;
+        uint32_t count, flags, fence_id, fence_value;
+    } submit = { (uintptr_t)entry, 1, NVGPU_FENCE_GET | NVGPU_FENCE_FD, 0, 0 };
+    long result = syscall(SYS_IOCTL, channel, IOCTL(IOC_RDWR, 'H', 0x6b, submit), (long)&submit, 0);
+    if (result < 0)
+        return 30 + -result;
+    struct {
+        int32_t fd;
+        int16_t events, revents;
+    } pollfd = { submit.fence_id, POLLIN, 0 };
+    int64_t timeout[2] = {1, 0};
+    if (syscall(SYS_PPOLL, (long)&pollfd, 1, (long)timeout, 0) != 1 || !(pollfd.revents & POLLIN))
+        return 17;
+    return 0;
+}
+
+static int copy_probe(int channel, volatile uint32_t *words, uint64_t va)
+{
+    const uint64_t source = va + SOURCE_OFFSET;
+    const uint64_t dest = va + DESTINATION_OFFSET;
+    const uint64_t fence = va + SEMAPHORE_OFFSET;
     words[SOURCE_OFFSET / 4] = 0x1ebad123;
     words[SOURCE_OFFSET / 4 + 1] = 0xa2c4056f;
     words[DESTINATION_OFFSET / 4] = 0;
@@ -133,24 +166,9 @@ static int copy_probe(int as, int channel)
     };
     for (unsigned i = 0; i < sizeof(push) / sizeof(push[0]); ++i)
         words[i] = push[i];
-    __asm__ volatile("dsb sy" ::: "memory");
-    const uint32_t entry[2] = {
-        map.va, (map.va >> 32) | ((sizeof(push) / 4) << 10)
-    };
-    struct {
-        uint64_t entries;
-        uint32_t count, flags, fence_id, fence_value;
-    } submit = { (uintptr_t)entry, 1, NVGPU_FENCE_GET | NVGPU_FENCE_FD, 0, 0 };
-    long result = syscall(SYS_IOCTL, channel, IOCTL(IOC_RDWR, 'H', 0x6b, submit), (long)&submit, 0);
-    if (result < 0)
-        return 30 + -result;
-    struct {
-        int32_t fd;
-        int16_t events, revents;
-    } pollfd = { submit.fence_id, POLLIN, 0 };
-    int64_t timeout[2] = {1, 0};
-    if (syscall(SYS_PPOLL, (long)&pollfd, 1, (long)timeout, 0) != 1 || !(pollfd.revents & POLLIN))
-        return 17;
+    int result = submit_work(channel, va, sizeof(push) / sizeof(push[0]));
+    if (result)
+        return result;
     if (words[SEMAPHORE_OFFSET / 4] != 1)
         return 15;
     if (words[DESTINATION_OFFSET / 4] != 0x1ebad123 || words[DESTINATION_OFFSET / 4 + 1] != 0xa2c4056f)
@@ -158,28 +176,85 @@ static int copy_probe(int as, int channel)
     return 0;
 }
 
-static int run_probe(void)
+static uint64_t move_imm(unsigned reg, uint32_t value)
 {
-    long ctrl = open_device("/dev/nvgpu/igpu0/ctrl");
-    if (ctrl < 0)
-        return 1;
+    return UINT64_C(0x7802) | (uint64_t)reg << 16 | (uint64_t)value << 32;
+}
 
-    uint32_t info[64];
-    struct characteristics_query query = { sizeof(info), (uintptr_t)info };
-    if (syscall(SYS_IOCTL, ctrl, IOCTL(IOC_RDWR, 'G', 5, query), (long)&query, 0) < 0
-        || query.buffer_size < 2 * sizeof(uint32_t) || !info[0] || !info[1])
-        return 2;
+static uint64_t add_registers(unsigned dst, unsigned a, unsigned b)
+{
+    return UINT64_C(0x7210) | (uint64_t)dst << 16 | (uint64_t)a << 24 | (uint64_t)b << 32;
+}
 
+static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
+{
+    const uint64_t program = va + SASS_OFFSET;
+    const uint64_t output = va + COMPUTE_OUTPUT;
+    volatile uint32_t *qmd = words + QMD_OFFSET / 4;
+    for (unsigned i = 0; i < 64; ++i)
+        qmd[i] = 0;
+    qmd[12] = qmd[13] = qmd[14] = 1;
+    qmd[18] = (8 << 16) | 0x30; // QMD v3.0, eight threads along X.
+    qmd[19] = (1 << 16) | 1;
+    qmd[48] = program;
+    qmd[49] = program >> 32;
+
+    // SM87 encodings for output[threadIdx.x] = input[threadIdx.x] + 17.
+    const uint64_t shader[][2] = {
+        {0x0000000000027919, 0x000e220000002100}, // S2R R2, SR_TID.X
+        {0x000000040200780c, 0x000fe20003f060f0}, // ISETP.GE.U32.AND P0, PT, R2, 4, PT
+        {0x000000000000094d, 0x000fea0003800000}, // @P0 EXIT
+        {move_imm(0, output), 0x000fe20000000f00},
+        {move_imm(1, output >> 32), 0x000fe20000000f00},
+        {add_registers(3, 2, 2), 0x000fe20007ffe0ff},
+        {add_registers(3, 3, 3), 0x000fe20007ffe0ff},
+        {add_registers(0, 0, 3), 0x000fe20007ffe0ff},
+        {0xffffc03f00047981, 0x000fe2000c1ee900}, // LDG.E R4, [R0.64+UZR-0x40]
+        {0x0000001104047810, 0x000fe20007ffe0ff}, // IADD3 R4, R4, 17, RZ
+        {0x0000000400007986, 0x000fe2000c10e93f}, // STG.E [R0.64+UZR], R4
+        {0x000000000000794d, 0x000fea0003800000}, // EXIT
+    };
+    for (unsigned i = 0; i < sizeof(shader) / sizeof(shader[0]); ++i) {
+        for (unsigned half = 0; half < 2; ++half) {
+            words[SASS_OFFSET / 4 + 4 * i + 2 * half] = shader[i][half];
+            words[SASS_OFFSET / 4 + 4 * i + 2 * half + 1] = shader[i][half] >> 32;
+        }
+    }
+    const uint32_t inputs[] = {3, 42, 0xabcdef01, 0xfffffff8};
+    for (unsigned i = 0; i < 4; ++i) {
+        words[COMPUTE_INPUT / 4 + i] = inputs[i];
+        words[COMPUTE_OUTPUT / 4 + i] = 0;
+        words[COMPUTE_OUTPUT / 4 + 4 + i] = 0x9e3779b9;
+    }
+    words[0] = packet(0, 1);
+    words[1] = 0xc7c0;
+    words[2] = packet(0x2b4, 1);
+    words[3] = (va + QMD_OFFSET) >> 8;
+    words[4] = packet(0x2c0, 1);
+    words[5] = 3;
+    int result = submit_work(channel, va, 6);
+    if (result)
+        return result;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (words[COMPUTE_OUTPUT / 4 + i] != inputs[i] + 17
+            || words[COMPUTE_OUTPUT / 4 + 4 + i] != 0x9e3779b9)
+            return 18;
+    }
+    return 0;
+}
+
+static int run_engine(long ctrl, int compute)
+{
     struct address_space_args as = { .fd = -1, .va_start = 1ULL << 30, .va_end = 1ULL << 36 };
     if (syscall(SYS_IOCTL, ctrl, IOCTL(IOC_RDWR, 'G', 8, as), (long)&as, 0) < 0 || as.fd < 0)
         return 3;
 
-    long channel_device = open_device("/dev/nvgpu/igpu0/channel");
-    int32_t channel = -1;
+    int32_t channel = open_device("/dev/nvgpu/igpu0/channel");
     // OPEN_CHANNEL picks runlist zero, the modeled asynchronous copy engine.
-    if (channel_device < 0
-        || syscall(SYS_IOCTL, channel_device, IOCTL(IOC_READ, 'H', 0x70, channel), (long)&channel, 0) < 0
-        || channel < 0)
+    if (channel < 0)
+        return 4;
+    if (!compute && (syscall(SYS_IOCTL, channel, IOCTL(IOC_READ, 'H', 0x70, channel), (long)&channel, 0) < 0
+                     || channel < 0))
         return 4;
 
     if (syscall(SYS_IOCTL, as.fd, IOCTL(IOC_RDWR, 'A', 1, channel), (long)&channel, 0) < 0)
@@ -196,7 +271,31 @@ static int run_probe(void)
     uint32_t gpfifo[8] = {32, 4};
     if (syscall(SYS_IOCTL, channel, IOCTL(IOC_WRITE, 'H', 0x7b, gpfifo), (long)gpfifo, 0) < 0)
         return 8;
-    return copy_probe(as.fd, channel);
+    volatile uint32_t *words;
+    uint64_t va;
+    int result = map_buffer(as.fd, &words, &va);
+    if (result)
+        return result;
+    return compute ? compute_probe(channel, words, va) : copy_probe(channel, words, va);
+}
+
+static int run_probe(void)
+{
+    long ctrl = open_device("/dev/nvgpu/igpu0/ctrl");
+    if (ctrl < 0)
+        return 1;
+
+    uint32_t info[64];
+    struct characteristics_query query = { sizeof(info), (uintptr_t)info };
+    if (syscall(SYS_IOCTL, ctrl, IOCTL(IOC_RDWR, 'G', 5, query), (long)&query, 0) < 0
+        || query.buffer_size < 2 * sizeof(uint32_t) || !info[0] || !info[1])
+        return 2;
+
+    const int copy = run_engine(ctrl, 0);
+    if (copy)
+        return copy;
+    const int compute = run_engine(ctrl, 1);
+    return compute ? 100 + compute : 0;
 }
 
 void _start(void)

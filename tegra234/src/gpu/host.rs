@@ -1,14 +1,13 @@
-//! GA10B runlist, RAMFC, USERD and GPFIFO submission for the copy engine.
-use super::{copy, mmu};
+//! GA10B runlist, RAMFC, USERD and GPFIFO submission.
+use super::{compute, copy, mmu};
 use crate::host1x::Host1x;
 use std::collections::HashMap;
 
 // Runlist and USERMODE register offsets within GA10B BAR0.
 pub(super) const RUNLIST: u64 = 0x800000;
 pub(super) const GR_RUNLIST: u64 = 0x804000;
-pub(super) const BASE_LO: u64 = RUNLIST + 0x80;
-pub(super) const BASE_HI: u64 = RUNLIST + 0x84;
 pub(super) const SUBMIT: u64 = RUNLIST + 0x88;
+pub(super) const GR_SUBMIT: u64 = GR_RUNLIST + 0x88;
 pub(super) const DOORBELL: u64 = 0xbb0090;
 pub(super) const LEGACY_DEMO_DOORBELL: u64 = 0x030090;
 const GP_GET: u64 = 0x88;
@@ -50,7 +49,7 @@ pub(super) fn read_config(offset: u64) -> Option<u32> {
 
 #[derive(Default)]
 pub(super) struct Host {
-    channels: HashMap<u32, Channel>,
+    channels: [HashMap<u32, Channel>; 2],
     pub submissions: u64,
     pub nonstall_pending: bool,
 }
@@ -61,13 +60,15 @@ struct Channel {
     userd: u64,
     classes: [u32; 8],
     copy: copy::Copy,
+    compute: compute::Compute,
     semaphore: [u32; 4],
 }
 
 impl Host {
-    pub fn submit(&mut self, lo: u32, hi: u32, count: u32, ram: &[u8]) {
+    pub fn submit(&mut self, runlist: usize, lo: u32, hi: u32, count: u32, ram: &[u8]) {
+        let channels = &mut self.channels[runlist];
         if count == 0 {
-            self.channels.clear();
+            channels.clear();
             return;
         }
         if count > MAX_ENTRIES {
@@ -78,7 +79,7 @@ impl Host {
         let Some(offset) = mmu::physical(ram, base, bytes) else {
             return;
         };
-        let mut previous = std::mem::take(&mut self.channels);
+        let mut previous = std::mem::take(channels);
         for entry in ram[offset..offset + bytes].chunks_exact(16) {
             let word = |at: usize| u32::from_le_bytes(entry[at..at + 4].try_into().unwrap());
             let (userd_lo, userd_hi, inst_lo, inst_hi) = (word(0), word(4), word(8), word(12));
@@ -96,15 +97,13 @@ impl Host {
                     userd,
                     ..Channel::default()
                 });
-            self.channels.insert(id, channel);
+            channels.insert(id, channel);
         }
     }
 
     pub fn ring(&mut self, token: u32, ram: &mut [u8], host1x: &mut Host1x) -> Option<()> {
-        if token >> 16 & 0x7f != 0 {
-            return None;
-        }
-        let channel = self.channels.get_mut(&(token & 0xfff))?;
+        let runlist = (token >> 16 & 0x7f) as usize;
+        let channel = self.channels.get_mut(runlist)?.get_mut(&(token & 0xfff))?;
         let lo = mmu::word(ram, channel.instance + 0x48)?;
         let hi = mmu::word(ram, channel.instance + 0x4c)?;
         let base = u64::from(lo & !7) | u64::from(hi & 0xff) << 32;
@@ -203,8 +202,11 @@ impl Channel {
                     memory.store(address, payload)?;
                 }
             }
-            _ if self.classes[sub] == copy::CLASS => self.copy.method(method, data, memory)?,
-            _ => return None,
+            _ => match self.classes[sub] {
+                copy::CLASS => self.copy.method(method, data, memory)?,
+                compute::CLASS => self.compute.method(method, data, memory)?,
+                _ => return None,
+            },
         }
         Some(())
     }

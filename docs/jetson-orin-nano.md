@@ -168,7 +168,9 @@ after building the fixture to check GPU characteristics, allocate a GPU
 address space, and submit a copy through nvgpu. The test checks that both
 words arrive across GPU page boundaries, checks the copy-engine semaphore,
 and waits on the Linux sync-file fence. It also checks the guest's interrupt
-counters for delivery of a Host1x syncpoint threshold interrupt.
+counters for delivery of Host1x syncpoint threshold interrupts. On the
+graphics runlist it dispatches a small, predicated Ampere shader and compares
+the four results and surrounding guard words with CPU expectations.
 
 The GPU model exposes separate graphics and asynchronous copy runlists and
 maps BAR1 through the GA10B page tables. It models Falcon firmware uploads,
@@ -176,7 +178,9 @@ the GSP startup interrupt, and the scheduler messages for context binding,
 engine registration and initial domain creation. FECS also acknowledges the
 driver's initial context bind and save requests. These are firmware protocol
 models. The Tegra234 Host1x model supports CPU and GPU syncpoint increments
-and threshold interrupts. Ampere shader execution remains unimplemented.
+and threshold interrupts. The Ampere Compute B model dispatches QMD 3.0
+workgroups with per-thread registers and predicates, global loads and stores,
+and a small set of scalar instructions.
 
 ### Jetson GPU parity
 
@@ -188,7 +192,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 |---|---|
 | Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
-| Compute | Execute a known-answer Ampere shader, then run a CUDA kernel in the guest and compare its output with a CPU reference. |
+| Compute | The Linux fixture checks a known-answer Ampere shader. The CUDA userspace path and broader shader coverage remain pending. |
 | Graphics | Run the existing GLES 2, 3 and 3.2 scenes on GA10B and compare images with Mesa software rendering. Exercise the display separately for the Jetson demo workloads. |
 | Browser | Run the same shader and rendering checks on the WASM build with matching results. |
 

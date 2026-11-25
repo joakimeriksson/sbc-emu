@@ -5,12 +5,15 @@
 
 use std::collections::HashMap;
 
+mod compute;
 mod copy;
 mod fb;
 mod gr;
 mod gsp;
 mod host;
 mod mmu;
+mod sass;
+
 mod top;
 
 pub const BAR0: u64 = 0x1700_0000;
@@ -152,9 +155,10 @@ impl Gpu {
                     self.ring_started = true;
                 }
             }
-            host::SUBMIT => self.host.submit(
-                self.regs.get(&host::BASE_LO).copied().unwrap_or(0),
-                self.regs.get(&host::BASE_HI).copied().unwrap_or(0),
+            host::SUBMIT | host::GR_SUBMIT => self.host.submit(
+                usize::from(offset == host::GR_SUBMIT),
+                self.regs.get(&(offset - 8)).copied().unwrap_or(0),
+                self.regs.get(&(offset - 4)).copied().unwrap_or(0),
                 value & 0xffff,
                 ram,
             ),

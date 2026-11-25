@@ -38,7 +38,7 @@ SCRIPT
     }
 if ! rg '^NVGPU_IOCTL_ STATUS=0[[:space:]]*$' "$work/boot.log" ||
    ! rg '^\s*[0-9]+:(\s+[0-9]+)*\s+[1-9][0-9]*(\s+[0-9]+)*\s+GICv3 48[0-7] Level\s+host1x_syncpt' "$work/boot.log" ||
-   ! rg 'GPU: 2 completed GPFIFO entries' "$work/boot.log"; then
+   ! rg 'GPU: 4 completed GPFIFO entries' "$work/boot.log"; then
     tail -40 "$work/boot.log"
     exit 1
 fi
