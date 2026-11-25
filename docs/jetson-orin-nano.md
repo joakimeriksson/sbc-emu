@@ -118,9 +118,10 @@ Set `SBC_TRACE_GPU=1` to trace BAR0 accesses using the same switch as Tegra210.
 The freestanding arm64 demo powers GA10B on through BPMP, builds a copy
 channel and maps its buffers through the five-level GMMU. Each frame submits
 Ampere C7B5 DMA copies over GPFIFO to compose a moving rover on a 640 × 360
-framebuffer. The guest checks the GPU's semaphore, USERD progress and
-framebuffer contents before advancing. The emulator scans out the framebuffer
-through the standard VNC server. [NVIDIA Ampere Copy B class](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc7b5.h)
+framebuffer. A separate graphics channel uses a C797 color clear to render
+the rover's headlamp. The guest checks both semaphores, both USERD pointers
+and framebuffer contents before advancing. The emulator scans out the
+framebuffer through the standard VNC server. [NVIDIA Ampere Copy B class](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc7b5.h)
 
 ```sh
 cargo build --release -p sbc-emu
@@ -138,11 +139,11 @@ python3 demos/orin-copy/rfb-smoke.py --output cache/jetson-orin-nano/copy-demo-v
 ```
 
 The smoke client handshakes with the same VNC server over `--vnc stdio`,
-decodes full and incremental RFB updates, and checks that the rover moved.
-The first copy runlist is provisionally placed at BAR0 offset `0x800000`
+decodes full and incremental RFB updates, and checks that the rover and its
+headlamp moved. The first copy runlist is provisionally placed at BAR0 offset `0x800000`
 for bare-metal bring-up. The copy model covers pitch-linear 4 KiB mappings,
-multiline blits and one-word semaphore writes. The demo uses the copy engine
-and a simple framebuffer.
+multiline blits and one-word semaphore writes. The demo uses a simple
+framebuffer for scanout.
 
 To run the same image in the site worker, build the demo and stage a local
 WebAssembly build. Open `board.html?b=jetson-orin-nano-gpu` on the local site.

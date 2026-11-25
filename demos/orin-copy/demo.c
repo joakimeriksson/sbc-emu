@@ -3,10 +3,11 @@
 enum {
     WIDTH = 640, HEIGHT = 360, STRIDE = 4 * WIDTH,
     ROVER_W = 108, ROVER_H = 48,
-    BAR0 = 0x17000000, COPY_RUNLIST = 0x800000, DOORBELL = 0xbb0090,
+    BAR0 = 0x17000000, COPY_RUNLIST = 0x800000, GR_RUNLIST = 0x804000, DOORBELL = 0xbb0090,
     RUNLIST = 0x82000000, USERD = 0x82001000, INSTANCE = 0x82002000,
     PDB = 0x82003000, PTE = 0x82007000, RING = 0x82008000,
     PUSH = 0x82009000, FENCE = 0x8200a000, ROVER = 0x8200b000,
+    GR_LIST = RUNLIST + 0x400, GR_USERD = USERD + 0x100, GR_INSTANCE = 0x82011000,
     TERRAIN = 0x82100000, FRAMEBUFFER = 0x8ff00000,
     RING_VA = 0x1000, PUSH_VA = 0x2000, FENCE_VA = 0x3000,
     ROVER_VA = 0x4000, TERRAIN_VA = 0x10000, FRAMEBUFFER_VA = 0x100000,
@@ -71,6 +72,17 @@ static int power_gpu(void) {
     return 1;
 }
 
+static void init_channel(uint32_t engine, uint32_t list, uint32_t userd, uint32_t instance) {
+    put(instance + 0x48, RING_VA);
+    put(instance + 0x4c, 2 << 16); // Four GPFIFO entries.
+    put(instance + 0x200, PDB | 2);
+    entry(list, userd | 0xa0);
+    entry(list + 8, instance); // Channel 0 on this runlist.
+    put(BAR0 + engine + 0x80, list | 2);
+    put(BAR0 + engine + 0x84, 0);
+    put(BAR0 + engine + 0x88, 1);
+}
+
 static void init_gpu(void) {
     // All demo VAs are in the first 2 MiB. The small-page pointer is the
     // upper half of the last directory's dual PDE.
@@ -84,15 +96,9 @@ static void init_gpu(void) {
     map(TERRAIN_VA, TERRAIN, STRIDE * HEIGHT);
     map(FRAMEBUFFER_VA, FRAMEBUFFER, STRIDE * HEIGHT);
 
-    put(INSTANCE + 0x48, RING_VA);
-    put(INSTANCE + 0x4c, 2 << 16); // Four GPFIFO entries.
-    put(INSTANCE + 0x200, PDB | 2);
-    entry(RUNLIST, USERD | 0xa0);
-    entry(RUNLIST + 8, INSTANCE); // Channel 0.
     put(BAR0 + 0x12004c, 4);
-    put(BAR0 + COPY_RUNLIST + 0x80, RUNLIST | 2);
-    put(BAR0 + COPY_RUNLIST + 0x84, 0);
-    put(BAR0 + COPY_RUNLIST + 0x88, 1);
+    init_channel(COPY_RUNLIST, RUNLIST, USERD, INSTANCE);
+    init_channel(GR_RUNLIST, GR_LIST, GR_USERD, GR_INSTANCE);
 }
 
 static void textures(void) {
@@ -155,6 +161,55 @@ static unsigned blit(unsigned n, uint32_t src, uint32_t dst, unsigned pitch,
     return n;
 }
 
+static int submit(unsigned words, unsigned slot, unsigned runlist, uint32_t userd,
+                  uint32_t fence, uint32_t sequence) {
+    put(RING + slot * 8, PUSH_VA);
+    put(RING + slot * 8 + 4, words << 10);
+    put(userd + 0x8c, (slot + 1) & 3);
+    __asm__ volatile("dsb sy" ::: "memory");
+    put(BAR0 + DOORBELL, runlist << 16);
+    uint64_t start = ticks();
+    while (get(fence) != sequence) {
+        if (ticks() - start > 31250000)
+            return 0;
+    }
+    return get(userd + 0x88) == ((slot + 1) & 3);
+}
+
+static int headlamp(unsigned x, unsigned slot, unsigned sequence) {
+    unsigned n = packet(0, 0, 1);
+    commands[n++] = 0xc797;
+    n = packet(n, 0x800, 7);
+    commands[n++] = 0;
+    commands[n++] = FRAMEBUFFER_VA;
+    commands[n++] = STRIDE;
+    commands[n++] = HEIGHT;
+    commands[n++] = 0xd5; // RGBA8.
+    commands[n++] = 1 << 12; // Pitch linear.
+    commands[n++] = 1;
+    n = packet(n, 0x121c, 1);
+    commands[n++] = 1;
+    n = packet(n, 0xff4, 2);
+    commands[n++] = (10 << 16) | (x + 95);
+    commands[n++] = (7 << 16) | 269;
+    n = packet(n, 0xd80, 4);
+    // Simple framebuffer scanout swaps the R and B bytes.
+    commands[n++] = 0x3e800000;
+    commands[n++] = 0x3f400000;
+    commands[n++] = 0x3f800000;
+    commands[n++] = 0x3f800000;
+    n = packet(n, 0x19d0, 1);
+    commands[n++] = 0x3c;
+    n = packet(n, 0x5c, 5);
+    commands[n++] = FENCE_VA + 4;
+    commands[n++] = 0;
+    commands[n++] = sequence;
+    commands[n++] = 0;
+    commands[n++] = 1;
+    return submit(n, slot, 1, GR_USERD, FENCE + 4, sequence)
+        && get(FRAMEBUFFER + 272 * STRIDE + (x + 100) * 4) == UINT32_C(0xffffbf40);
+}
+
 static int frame(unsigned number, unsigned slot) {
     unsigned n = packet(0, 0, 1);
     commands[n++] = 0xc7b5;
@@ -172,17 +227,7 @@ static int frame(unsigned number, unsigned slot) {
     commands[n++] = number + 1;
     n = packet(n, 0x300, 1);
     commands[n++] = 8;
-    put(RING + slot * 8, PUSH_VA);
-    put(RING + slot * 8 + 4, n << 10);
-    put(USERD + 0x8c, (slot + 1) & 3);
-    __asm__ volatile("dsb sy" ::: "memory");
-    put(BAR0 + DOORBELL, 0);
-    uint64_t start = ticks();
-    while (get(FENCE) != number + 1) {
-        if (ticks() - start > 31250000)
-            return 0;
-    }
-    if (get(USERD + 0x88) != ((slot + 1) & 3))
+    if (!submit(n, slot, 0, USERD, FENCE, number + 1) || !headlamp(x, slot, number + 1))
         return 0;
     return get(FRAMEBUFFER) == get(TERRAIN) &&
            get(FRAMEBUFFER + dst - FRAMEBUFFER_VA + STRIDE + 4) == get(ROVER + (ROVER_W + 1) * 4);
@@ -197,7 +242,7 @@ void demo(void) {
     textures();
     for (unsigned n = 0;; ++n) {
         if (!frame(n, n & 3)) {
-            serial("GA10B_COPY_FAILED\r\n");
+            serial("GA10B_FRAME_FAILED\r\n");
             return;
         }
         if (n == 1)

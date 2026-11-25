@@ -82,9 +82,11 @@ def verify(child, output):
     while rover_x() is None:
         update(True)
     first_position = rover_x()
+    assert pixel(first_position + 100, 272) == bytes([0x40, 0xbf, 0xff]), "missing C797 headlamp"
     assert pixel(493, 94) == b"\x70\xad\xf3", "wrong terrain or pixel order"
     update(True)
     assert rover_x() is not None and rover_x() != first_position, "rover did not move"
+    assert pixel(rover_x() + 100, 272) == bytes([0x40, 0xbf, 0xff]), "headlamp did not move"
     if output:
         screenshot(output, width, height, frame)
     print(f"VNC {width}x{height}, rover moved from x={first_position} to x={rover_x()}")

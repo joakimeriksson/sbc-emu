@@ -30,6 +30,7 @@ function postMessage(message) {
     return r === 0x30 && g === 0xba && b === 0xae;
   });
   assert.notEqual(x, undefined, 'rover sprite missing');
+  assert.deepEqual(pixel(x + 100, 272), [0xff, 0xbf, 0x40, 255], 'C797 headlamp missing');
   if (position === undefined) position = x;
   if (position !== x) {
     assert.ok(context.exportsForTest().sbc_jit_blocks() > 0, 'AArch64 JIT did not compile any blocks');
