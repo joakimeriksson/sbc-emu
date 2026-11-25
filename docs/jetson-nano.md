@@ -139,9 +139,15 @@ same inputs is repeatable. `multi`: a host thread per core, as on the Raspberry 
 shared directly, barriers and acquire/release are host fences and store-exclusive a host
 compare-and-swap, TLB and instruction-cache invalidations reach the other cores before the
 issuing core goes on, and the devices, the GIC and the GPU sit behind one lock. Guest time
-follows the host's clock, and runs are not repeatable. A GPU submission runs on the thread of
-the core that hands it over and keeps the lock while it runs: the other cores go on until they
-touch a device. A debugger's breakpoints, watchpoints and single steps run on one thread.
+follows the host's clock, and runs are not repeatable. Linux ticks on the Tegra timers (TMR10-13,
+one a core), not the arch timer: a core asleep in WFI waits for the next device event as well as
+its own arch timer, and a busy core brings the devices up to the time when one is due (Python's
+`time.sleep(0)` takes 105 µs, `sleep(100 µs)` 222 µs; 58 and 158 µs with one thread). A GPU
+submission runs on the thread of the core that hands it over and keeps the lock while it runs:
+the other cores go on until they touch a device, and the I/O loop waits. Its time is the host's,
+all of it: one thread caps a submission at a second of guest time, a thread per core does not,
+so a submission of many seconds can leave the guest's ticks that long late (RCU stall and
+soft-lockup warnings). A debugger's breakpoints, watchpoints and single steps run on one thread.
 
 YOLOv8n on the CPU (ncnn, four threads; `demos/jetson-yolo-cam`), host seconds per frame on an
 Apple M-series Mac shared with other jobs: 0.45 with one thread, 0.11 to 0.2 with a thread per
@@ -150,11 +156,11 @@ core (the ncnn threads wait for each other, so a busy host shows). On the GPU (N
 time, which with one thread counts instructions (1 ns each) and with a thread per core follows
 the host's clock.
 
-Which driver the GL tests (`scripts/jetson-nano-gl.txt`) get depends on the order in which
-nouveau and `tegra-drm` probe at boot. When `tegra-drm`'s render node comes second
-(`renderD129`), Mesa takes its `tegra` driver, which fails three GLES 2 scenes and hangs in GLES
-3's `wr_staging`; this happens in either mode, and in most boots with `--threads multi`. With
-nouveau's node (renderer `NV12B`) the results are the same in both modes.
+Mesa takes the first render node it finds, and which one that is depends on the order in which
+nouveau and `tegra-drm` probe at boot: with `tegra-drm`'s (as in most boots with
+`--threads multi`), Mesa's `tegra` driver fails three GLES 2 scenes and hangs in GLES 3's
+`wr_staging`. `scripts/jetson-nano-gl.txt` therefore sets `MESA_LOADER_DRIVER_OVERRIDE=nouveau`,
+and its results are the same in both modes.
 
 ## Not there yet
 
