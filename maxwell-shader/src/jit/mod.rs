@@ -1,5 +1,5 @@
-//! A JIT for programs run on 16 lanes: each run of plain arithmetic (no control flow, nothing
-//! that asks the `Host`) becomes one block of straight-line code.
+//! A JIT for shader programs: each run of plain arithmetic (no control flow, nothing that asks
+//! the `Host`) becomes one block of straight-line code.
 //!
 //! The instructions of a block are first lowered to a small IR whose values are vectors (one
 //! 32-bit word per lane) or lane masks (one bit per lane). The lowering follows `exec` exactly,
@@ -8,7 +8,9 @@
 //! them keeps its registers, and an instruction with no lanes changes nothing.
 //!
 //! The IR then becomes code: WebAssembly with 128-bit SIMD in the browser (`wasm.rs`, one
-//! module per program). `eval` runs the IR itself: the tests compare it with the interpreter.
+//! module per program, for 16 lanes), or AArch64 with NEON natively on 64-bit ARM (`a64.rs`, for
+//! 16 or 32 lanes, so that compute's 32-lane warps run it too). `eval` runs the IR itself: the
+//! tests compare it and the backends with the interpreter.
 //! Constant buffer words a block reads are fetched from the `Host` once per `run`, into the
 //! frame the code reads them from.
 
@@ -16,16 +18,25 @@
 mod wasm;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::set_reset_count;
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+mod a64;
+
+/// True where there is a native backend (64-bit ARM, macOS or Linux).
+pub const NATIVE: bool = cfg!(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")));
 
 use crate::isa::*;
 use crate::program::Program;
 
-/// Lanes of the code (the GPU runs 16 lanes together).
+/// Lanes of the browser's code (the GPU's graphics run 16 lanes together; compute's warps are 32,
+/// which the native backend runs too).
 pub const LANES: usize = 16;
 /// Scratch words of a frame.
 pub const SCRATCH: usize = 3 * LANES;
-/// Blocks shorter than this are left to the interpreter.
-const MIN_BLOCK: usize = 2;
+/// Instructions only the native backend has code for (carries, PRMT, halves).
+const EXT: bool = !cfg!(target_arch = "wasm32");
+/// Blocks shorter than this are left to the interpreter (in the browser: natively, a single
+/// instruction is cheaper as code than as a call into the interpreter).
+const MIN_BLOCK: usize = if EXT { 1 } else { 2 };
 /// A block ends before its IR gets longer than this (ids are 16 bits; `forward` adds at most two
 /// nodes a write and one a register).
 const MAX_NODES: usize = 16384;
@@ -33,7 +44,7 @@ const MAX_NODES: usize = 16384;
 /// An IR value: the index of the node that makes it.
 pub type Id = u16;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Un {
     /// Single-precision square root, rounding to integral values.
     Sqrt,
@@ -63,13 +74,18 @@ pub enum Un {
     Lg2,
     Rcp64h,
     Rsq64h,
+    /// A half (in the low or high 16 bits) to single, exactly; a single to a half rounded to
+    /// nearest even (NaN to 0x7e00 with the sign), in the low 16 bits. (Natively only.)
+    HalfLo,
+    HalfHi,
+    ToHalf,
     /// Shifts by a constant (0..32).
     Shl(u8),
     ShrU(u8),
     ShrS(u8),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bin {
     And,
     Or,
@@ -100,14 +116,14 @@ pub enum Bin {
     IGt,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SOp {
     And,
     Or,
     Xor,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Node {
     /// A general register.
     Reg(Reg),
@@ -122,9 +138,12 @@ pub enum Node {
     Sel(Id, Id, Id),
     /// a * b + c with one rounding.
     Fma(Id, Id, Id),
+    /// PRMT of a and b with a selector of mode 0 (`exec::prmt_bytes`). (Natively only.)
+    Prmt(Id, Id, u16),
     /// A mask of lanes (scalar) as a vector: all ones in the lanes whose bit is set.
     Expand(Id),
-    /// Scalars: the lanes running, a predicate, a constant, operations.
+    /// Scalars: the lanes running, a predicate (8..11: the flags zero, sign, carry, overflow), a
+    /// constant, operations.
     Active,
     Pred(u8),
     SImm(u32),
@@ -135,7 +154,7 @@ pub enum Node {
     Store(Reg, Id, Id),
     /// Writes a register in every lane.
     StoreAll(Reg, Id),
-    /// Writes a predicate (value, mask).
+    /// Writes a predicate or a flag (value, mask).
     StoreP(u8, Id, Id),
 }
 
@@ -152,7 +171,7 @@ impl Node {
     pub fn args(&self) -> impl Iterator<Item = Id> {
         let (a, n) = match *self {
             Node::Un(_, a) | Node::Expand(a) | Node::Bits(a) | Node::StoreAll(_, a) => ([a, 0, 0], 1),
-            Node::Bin(_, a, b) | Node::S(_, a, b) | Node::Store(_, a, b) | Node::StoreP(_, a, b) => ([a, b, 0], 2),
+            Node::Bin(_, a, b) | Node::S(_, a, b) | Node::Store(_, a, b) | Node::StoreP(_, a, b) | Node::Prmt(a, b, _) => ([a, b, 0], 2),
             Node::Sel(a, b, c) | Node::Fma(a, b, c) => ([a, b, c], 3),
             _ => ([0; 3], 0),
         };
@@ -178,6 +197,9 @@ pub struct Code {
     pub cbs: Vec<(u8, u32)>,
     #[cfg(target_arch = "wasm32")]
     wasm: Option<wasm::Module>,
+    /// the native code for 16 and for 32 lanes, made when first run
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    native: [std::sync::OnceLock<Option<a64::Module>>; 2],
 }
 
 impl std::fmt::Debug for Code {
@@ -194,11 +216,13 @@ pub struct Frame {
     /// For the host's functions: three vectors in, the result back in the first.
     pub scratch: [u32; SCRATCH],
     pub cb: Vec<u32>,
+    /// Where the native code keeps values it has no register for (four lanes each).
+    pub spill: Vec<[u32; 4]>,
 }
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { scratch: [0; SCRATCH], cb: Vec::new() }
+        Frame { scratch: [0; SCRATCH], cb: Vec::new(), spill: Vec::new() }
     }
 }
 
@@ -219,9 +243,18 @@ pub fn set_enabled(on: bool) {
 /// On if there is a backend, not turned off, and not SBC_SHADER_JIT=0.
 pub fn enabled() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(target_arch = "wasm32")
+    (cfg!(target_arch = "wasm32") || NATIVE)
         && ENABLED.load(std::sync::atomic::Ordering::Relaxed)
         && *ENV.get_or_init(|| std::env::var_os("SBC_SHADER_JIT").is_none_or(|v| v != "0"))
+}
+
+/// Whether there is code for `n` lanes (16 in the browser; 16 or 32 natively).
+pub const fn lanes_ok(n: usize) -> bool {
+    if cfg!(target_arch = "wasm32") {
+        n == LANES
+    } else {
+        NATIVE && (n == 16 || n == 32)
+    }
 }
 
 impl Code {
@@ -238,7 +271,15 @@ impl Code {
                 entry[k + 1] = true;
             }
         }
-        let mut c = Code { start: vec![0; code.len()], blocks: Vec::new(), cbs: Vec::new(), #[cfg(target_arch = "wasm32")] wasm: None };
+        let mut c = Code {
+            start: vec![0; code.len()],
+            blocks: Vec::new(),
+            cbs: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            wasm: None,
+            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            native: Default::default(),
+        };
         let mut k = 0;
         while k < code.len() {
             let mut low = Lower { cbs: std::mem::take(&mut c.cbs), ..Lower::default() };
@@ -249,6 +290,7 @@ impl Code {
             if n >= MIN_BLOCK && c.blocks.len() < u16::MAX as usize - 1 {
                 c.start[k] = c.blocks.len() as u16 + 1;
                 let ir = forward(&low.ir);
+                let ir = if EXT { fold(&ir) } else { ir };
                 let mut cbs: Vec<u16> = ir.iter().filter_map(|n| if let Node::Cb(i) = n { Some(*i) } else { None }).collect();
                 cbs.sort_unstable();
                 cbs.dedup();
@@ -277,7 +319,6 @@ impl Code {
         }
     }
 
-    /// Fills the frame's constant buffer words.
     /// Fetches the constant buffer words block `b` reads into the frame (when the block is
     /// entered, as the interpreter would read them).
     pub fn fill(&self, b: u16, frame: &mut Frame, cbuf: impl Fn(u32, u32) -> u32) {
@@ -288,24 +329,72 @@ impl Code {
         }
     }
 
-    /// Runs block `b` on the lanes. False if it cannot be run here (then nothing changed).
-    pub fn run(&self, b: u16, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], frame: &mut Frame, active: u32) -> bool {
+    /// Fetches the words of every block (constant buffers do not change while a program runs).
+    pub fn fill_all(&self, frame: &mut Frame, cbuf: impl Fn(u32, u32) -> u32) {
+        frame.cb.clear();
+        frame.cb.extend(self.cbs.iter().map(|&(i, o)| cbuf(i as u32, o)));
+    }
+
+    /// Runs the program's native code from the lanes' instruction, if it has code there: until
+    /// the lanes stop (Some(Some(why))), or until they reach what is left to the interpreter
+    /// (Some(None): it goes on from the lanes' instruction). None: no native code here.
+    pub fn enter<const N: usize, H: crate::host::Host<N>>(&self, p: &Program, l: &mut crate::exec::Lanes<N>, h: &mut H, fuel: &mut u64) -> Option<Option<crate::exec::Exit>> {
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+        {
+            let k = match N {
+                16 => 0,
+                32 => 1,
+                _ => return None,
+            };
+            if let Some(m) = self.native[k].get_or_init(|| a64::Module::new(self, N)) {
+                let r = m.enter(self, p, l, h, fuel);
+                if r.is_some() {
+                    RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return r;
+            }
+        }
+        let _ = (p, l, h, fuel);
+        None
+    }
+
+    /// Runs block `b` on the lanes (`fill` first). False if it cannot be run here (then nothing
+    /// changed).
+    pub fn run<const N: usize>(&self, b: u16, gpr: &mut [[u32; N]; 256], pred: &mut [u32; 8], cc: &mut [u32; 4], frame: &mut Frame, active: u32) -> bool {
         #[cfg(target_arch = "wasm32")]
         if let Some(w) = &self.wasm {
+            let Some(gpr) = (gpr as &mut dyn std::any::Any).downcast_mut::<[[u32; LANES]; 256]>() else {
+                return false;
+            };
             let ran = w.run(b, gpr, pred, frame, active);
             if ran {
                 RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return ran;
         }
-        let _ = (b, gpr, pred, frame, active);
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+        {
+            let k = match N {
+                16 => 0,
+                32 => 1,
+                _ => return false,
+            };
+            if let Some(m) = self.native[k].get_or_init(|| a64::Module::new(self, N)) {
+                let ran = m.run(b, gpr.as_mut_ptr() as *mut u32, pred.as_mut_ptr(), cc.as_mut_ptr(), frame, active);
+                if ran {
+                    RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return ran;
+            }
+        }
+        let _ = (b, gpr, pred, cc, frame, active);
         false
     }
 }
 
 static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Blocks run by compiled code so far.
+/// Blocks run by compiled code so far (natively: entries into a program's code).
 pub fn runs() -> u64 {
     RUNS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -429,9 +518,10 @@ impl Lower {
             self.node(Node::Store(d, v, m));
         }
     }
+    /// Writes a predicate (or, 8..11, a flag).
     fn putp(&mut self, p: u8, m: Id, v: Id) {
         if p != 7 {
-            self.node(Node::StoreP(p & 7, v, m));
+            self.node(Node::StoreP(if p < 8 { p & 7 } else { p }, v, m));
         }
     }
     fn expand(&mut self, s: Id) -> Id {
@@ -698,6 +788,74 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             let v = l.un(if signed { Un::SToF } else { Un::UToF }, v);
             l.put(d, m, v);
         }
+        Op::IAdd { d, a, b, neg_a, neg_b, x, sat: false, cc } if EXT && (x || cc) => {
+            // as exec: the carry in is the flag (.X), or one for a negation; with .CC the flags
+            // say zero, sign, the carry out of the 33-bit sum, and signed overflow
+            let po = neg_a && neg_b && !x;
+            let mut u = l.reg(a);
+            let mut v = l.src(b);
+            if neg_a && !po {
+                u = l.bin_imm(Bin::Xor, u, !0);
+            }
+            if neg_b && !po {
+                v = l.bin_imm(Bin::Xor, v, !0);
+            }
+            let s = l.bin(Bin::Add, u, v);
+            let r = if x {
+                let c = l.node(Node::Pred(10));
+                let c = l.expand(c);
+                let one = l.bin_imm(Bin::And, c, 1);
+                l.bin(Bin::Add, s, one)
+            } else if neg_a || neg_b {
+                l.bin_imm(Bin::Add, s, 1)
+            } else {
+                s
+            };
+            if cc {
+                let below = |l: &mut Lower, a: Id, b: Id| {
+                    let a = l.bin_imm(Bin::Xor, a, 0x8000_0000);
+                    let b = l.bin_imm(Bin::Xor, b, 0x8000_0000);
+                    l.bin(Bin::ILt, a, b)
+                };
+                let c1 = below(l, s, u);
+                let c2 = below(l, r, s);
+                let carry = l.bin(Bin::Or, c1, c2);
+                let ur = l.bin(Bin::Xor, u, r);
+                let vr = l.bin(Bin::Xor, v, r);
+                let o = l.bin(Bin::And, ur, vr);
+                let zero = l.imm(0);
+                let o = l.bin(Bin::ILt, o, zero);
+                let z = l.bin(Bin::IEq, r, zero);
+                let sg = l.bin(Bin::ILt, r, zero);
+                for (f, t) in [(8, z), (9, sg), (10, carry), (11, o)] {
+                    let b = l.node(Node::Bits(t));
+                    l.putp(f, m, b);
+                }
+            }
+            l.put(d, m, r);
+        }
+        Op::Prmt { d, a, b: Src::Imm(sel), c, mode } if EXT => {
+            let x = l.reg(a);
+            let y = l.src(c);
+            let v = l.node(Node::Prmt(x, y, crate::exec::prmt_bytes(sel, mode) as u16));
+            l.put(d, m, v);
+        }
+        Op::F2F { from: 2, to: 4, d, b, m: md, int: false, high, ftz, sat, cc: false, .. } if EXT => {
+            let v = l.src(b);
+            let v = l.un(if high { Un::HalfHi } else { Un::HalfLo }, v);
+            let v = l.modf(v, md, false);
+            let v = if sat { l.un(Un::Sat, v) } else { v };
+            let v = l.finish(v, ftz, false);
+            l.put(d, m, v);
+        }
+        Op::F2F { from: 4, to: 2, d, b, m: md, rnd: Rnd::N, int: false, high, ftz, sat, cc: false } if EXT => {
+            let v = l.src(b);
+            let v = l.modf(v, md, ftz);
+            let v = if sat { l.un(Un::Sat, v) } else { v };
+            let v = l.un(Un::ToHalf, v);
+            let v = if high { l.un(Un::Shl(16), v) } else { v };
+            l.put(d, m, v);
+        }
         Op::IAdd { d, a, b, neg_a, neg_b, x: false, sat: false, cc: false } => {
             let po = neg_a && neg_b;
             let mut u = l.reg(a);
@@ -956,6 +1114,9 @@ pub fn unary(op: Un, x: u32) -> u32 {
         Un::Lg2 => f.log2().to_bits(),
         Un::Rcp64h => ((1.0 / wide(f)).to_bits() >> 32) as u32,
         Un::Rsq64h => ((1.0 / wide(f).sqrt()).to_bits() >> 32) as u32,
+        Un::HalfLo => crate::fp::half_to_f32(x as u16).to_bits(),
+        Un::HalfHi => crate::fp::half_to_f32((x >> 16) as u16).to_bits(),
+        Un::ToHalf => crate::fp::f32_to_half(f, Rnd::N) as u32,
         Un::Shl(n) => x << n,
         Un::ShrU(n) => x >> n,
         Un::ShrS(n) => (x as i32 >> n) as u32,
@@ -992,15 +1153,15 @@ pub fn binary(op: Bin, x: u32, y: u32) -> u32 {
 }
 
 /// Runs a block's IR (for the tests, and as the reference of the backends).
-pub fn eval(b: &Block, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], cb: &[u32], active: u32) {
-    let mut val = vec![[0u32; LANES]; b.ir.len()];
+pub fn eval<const N: usize>(b: &Block, gpr: &mut [[u32; N]; 256], pred: &mut [u32; 8], cc: &mut [u32; 4], cb: &[u32], active: u32) {
+    let mut val = vec![[0u32; N]; b.ir.len()];
     let mut s = vec![0u32; b.ir.len()];
     for (k, n) in b.ir.iter().enumerate() {
         let v = |i: Id| val[i as usize];
         match *n {
             Node::Reg(r) => val[k] = gpr[r as usize],
-            Node::Imm(x) => val[k] = [x; LANES],
-            Node::Cb(i) => val[k] = [cb[i as usize]; LANES],
+            Node::Imm(x) => val[k] = [x; N],
+            Node::Cb(i) => val[k] = [cb[i as usize]; N],
             Node::Un(op, a) => val[k] = v(a).map(|x| unary(op, x)),
             Node::Bin(op, a, c) => {
                 let (x, y) = (v(a), v(c));
@@ -1010,13 +1171,17 @@ pub fn eval(b: &Block, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], cb: &
                 let (m, x, y) = (v(m), v(a), v(c));
                 val[k] = std::array::from_fn(|i| x[i] & m[i] | y[i] & !m[i]);
             }
+            Node::Prmt(a, c, sel) => {
+                let (x, y) = (v(a), v(c));
+                val[k] = std::array::from_fn(|i| crate::exec::prmt(x[i], sel as u32, y[i], 0));
+            }
             Node::Fma(a, c, d) => {
                 let (x, y, z) = (v(a), v(c), v(d));
                 val[k] = std::array::from_fn(|i| crate::fp::fma(f32::from_bits(x[i]), f32::from_bits(y[i]), f32::from_bits(z[i])).to_bits());
             }
             Node::Expand(a) => val[k] = std::array::from_fn(|i| if s[a as usize] >> i & 1 != 0 { !0 } else { 0 }),
             Node::Active => s[k] = active,
-            Node::Pred(p) => s[k] = pred[p as usize],
+            Node::Pred(p) => s[k] = if p < 8 { pred[p as usize] } else { cc[p as usize & 3] },
             Node::SImm(x) => s[k] = x,
             Node::S(op, a, c) => {
                 let (x, y) = (s[a as usize], s[c as usize]);
@@ -1026,10 +1191,10 @@ pub fn eval(b: &Block, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], cb: &
                     SOp::Xor => x ^ y,
                 };
             }
-            Node::Bits(a) => s[k] = (0..LANES).fold(0, |m, i| m | ((v(a)[i] != 0) as u32) << i),
+            Node::Bits(a) => s[k] = (0..N).fold(0, |m, i| m | ((v(a)[i] != 0) as u32) << i),
             Node::Store(r, a, m) => {
                 let (x, m) = (v(a), s[m as usize]);
-                for i in 0..LANES {
+                for i in 0..N {
                     if m >> i & 1 != 0 {
                         gpr[r as usize][i] = x[i];
                     }
@@ -1038,10 +1203,81 @@ pub fn eval(b: &Block, gpr: &mut [[u32; LANES]; 256], pred: &mut [u32; 8], cb: &
             Node::StoreAll(r, a) => gpr[r as usize] = v(a),
             Node::StoreP(p, a, m) => {
                 let (x, m) = (s[a as usize], s[m as usize]);
-                pred[p as usize] = pred[p as usize] & !m | x & m;
+                let r = if p < 8 { &mut pred[p as usize] } else { &mut cc[p as usize & 3] };
+                *r = *r & !m | x & m;
             }
         }
     }
+}
+
+/// (Natively) predicates and flags kept in values within a block as `forward` keeps registers,
+/// each written once at the end; and every value made once (the same node of the same
+/// arguments is the same value).
+fn fold(ir: &[Node]) -> Vec<Node> {
+    let mut out: Vec<Node> = Vec::with_capacity(ir.len());
+    let mut map = vec![0 as Id; ir.len()];
+    let mut seen: std::collections::HashMap<Node, Id> = std::collections::HashMap::new();
+    let mut cur: [Option<Id>; 12] = [None; 12];
+    let mut dirty = [false; 12];
+    let mut stores = Vec::new();
+    fn make(out: &mut Vec<Node>, seen: &mut std::collections::HashMap<Node, Id>, n: Node) -> Id {
+        if let Some(&k) = seen.get(&n) {
+            return k;
+        }
+        out.push(n);
+        let k = (out.len() - 1) as Id;
+        seen.insert(n, k);
+        k
+    }
+    for (k, n) in ir.iter().enumerate() {
+        let r = |a: Id| map[a as usize];
+        map[k] = match *n {
+            Node::Pred(p) => match cur[p as usize] {
+                Some(c) => c,
+                None => {
+                    let c = make(&mut out, &mut seen, Node::Pred(p));
+                    cur[p as usize] = Some(c);
+                    c
+                }
+            },
+            Node::StoreP(p, v, m) => {
+                let old = match cur[p as usize] {
+                    Some(c) => c,
+                    None => make(&mut out, &mut seen, Node::Pred(p)),
+                };
+                let all = make(&mut out, &mut seen, Node::SImm(!0));
+                let not_m = make(&mut out, &mut seen, Node::S(SOp::Xor, r(m), all));
+                let keep = make(&mut out, &mut seen, Node::S(SOp::And, old, not_m));
+                let put = make(&mut out, &mut seen, Node::S(SOp::And, r(v), r(m)));
+                let new = make(&mut out, &mut seen, Node::S(SOp::Or, keep, put));
+                cur[p as usize] = Some(new);
+                dirty[p as usize] = true;
+                new
+            }
+            Node::StoreAll(g, a) => {
+                stores.push(Node::StoreAll(g, r(a)));
+                0
+            }
+            Node::Store(..) => unreachable!("forward made registers whole"),
+            Node::Reg(_) | Node::Imm(_) | Node::Cb(_) | Node::Active | Node::SImm(_) => make(&mut out, &mut seen, *n),
+            Node::Un(op, a) => make(&mut out, &mut seen, Node::Un(op, r(a))),
+            Node::Bin(op, a, b) => make(&mut out, &mut seen, Node::Bin(op, r(a), r(b))),
+            Node::Sel(a, b, c) => make(&mut out, &mut seen, Node::Sel(r(a), r(b), r(c))),
+            Node::Fma(a, b, c) => make(&mut out, &mut seen, Node::Fma(r(a), r(b), r(c))),
+            Node::Prmt(a, b, x) => make(&mut out, &mut seen, Node::Prmt(r(a), r(b), x)),
+            Node::Expand(a) => make(&mut out, &mut seen, Node::Expand(r(a))),
+            Node::S(op, a, b) => make(&mut out, &mut seen, Node::S(op, r(a), r(b))),
+            Node::Bits(a) => make(&mut out, &mut seen, Node::Bits(r(a))),
+        };
+    }
+    out.extend(stores);
+    for p in 0..12 {
+        if let (true, Some(c)) = (dirty[p], cur[p]) {
+            let all = make(&mut out, &mut seen, Node::SImm(!0));
+            out.push(Node::StoreP(p as u8, c, all));
+        }
+    }
+    out
 }
 
 /// Keeps registers in values within a block: a register is read from the lanes once, a write
@@ -1099,6 +1335,7 @@ fn forward(ir: &[Node]) -> Vec<Node> {
             Node::Bin(op, a, b) => push(&mut out, Node::Bin(op, r(a), r(b))),
             Node::Sel(a, b, c) => push(&mut out, Node::Sel(r(a), r(b), r(c))),
             Node::Fma(a, b, c) => push(&mut out, Node::Fma(r(a), r(b), r(c))),
+            Node::Prmt(a, b, s) => push(&mut out, Node::Prmt(r(a), r(b), s)),
             Node::S(op, a, b) => push(&mut out, Node::S(op, r(a), r(b))),
             Node::Bits(a) => push(&mut out, Node::Bits(r(a))),
             Node::StoreAll(g, a) => {
