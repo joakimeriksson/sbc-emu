@@ -307,30 +307,39 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
-    /// A warp's load of consecutive elements (lane i at the first lane's address + i * n, all in
-    /// one page, from a word boundary): the words at once, then each lane's part. False if the
-    /// addresses are not such a run.
+    /// The run of consecutive elements a warp's load or store is, if it is one: the first and
+    /// last lane, and the RAM offset of the first's bytes (lane i's at it + (i - first) * n,
+    /// all in one page).
     #[inline]
-    fn read_run(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) -> bool {
+    fn run(&self, at: &[u64], mask: u32, n: usize, write: bool) -> Option<(usize, usize, usize)> {
         if mask == 0 {
-            return true;
+            return None;
         }
         let (first, last) = (mask.trailing_zeros() as usize, 31 - mask.leading_zeros() as usize);
-        let base = at[first];
+        let base = *at.get(first)?;
         let o = (base & 0xfff) as usize;
-        let span = (last - first + 1) * n;
-        if base % 4 != 0 || o + span > 0x1000 || last >= at.len() || last >= out.len() {
-            return false;
+        if last >= at.len() || o + (last - first + 1) * n > 0x1000 {
+            return None;
         }
         if (first..=last).any(|i| mask >> i & 1 != 0 && at[i] != base.wrapping_add(((i - first) * n) as u64)) {
+            return None;
+        }
+        let p = self.page(base, write)?;
+        Some((first, last, p + o))
+    }
+
+    /// A warp's load of consecutive elements: the words once, then each lane's part.
+    #[inline]
+    fn read_run(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) -> bool {
+        let Some((first, last, from)) = self.run(at, mask, n, false) else { return false };
+        let skip = from % 4;
+        let words = (skip + (last - first + 1) * n).div_ceil(4);
+        let Some(src) = self.ram.get(from / 4..from / 4 + words) else { return false };
+        if last >= out.len() {
             return false;
         }
-        let Some(p) = self.page(base, false) else { return false };
-        let words = span.div_ceil(4);
-        let start = (p + o) / 4;
-        let Some(src) = self.ram.get(start..start + words) else { return false };
         // (16 bytes past the last lane's, so that every lane copies 16)
-        let mut buf = [0u8; 32 * 16 + 16];
+        let mut buf = [0u8; 33 * 16 + 4];
         for (k, w) in src.iter().enumerate() {
             buf[4 * k..4 * k + 4].copy_from_slice(&w.load(Relaxed).to_le_bytes());
         }
@@ -338,8 +347,41 @@ impl Shared<'_> {
         while m != 0 {
             let i = m.trailing_zeros() as usize;
             m &= m - 1;
-            let at = (i - first) * n;
+            let at = skip + (i - first) * n;
             out[i] = buf[at..at + 16].try_into().unwrap();
+        }
+        true
+    }
+
+    /// A warp's store of consecutive elements: the lanes' bytes put together, then each word
+    /// written once (whole, or the bytes of it the lanes write by compare and swap).
+    #[inline]
+    fn write_run(&self, at: &[u64], mask: u32, n: usize, data: &[[u8; 16]]) -> bool {
+        let Some((first, last, to)) = self.run(at, mask, n, true) else { return false };
+        let skip = to % 4;
+        let words = (skip + (last - first + 1) * n).div_ceil(4);
+        if to / 4 + words > self.ram.len() || last >= data.len() {
+            return false;
+        }
+        let mut buf = [0u8; 33 * 16 + 8];
+        let mut put = [0u8; 33 * 16 + 8];
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let at = skip + (i - first) * n;
+            buf[at..at + n].copy_from_slice(&data[i][..n]);
+            put[at..at + n].fill(0xff);
+        }
+        for k in 0..words {
+            let v = u32::from_le_bytes(buf[4 * k..4 * k + 4].try_into().unwrap());
+            let w = u32::from_le_bytes(put[4 * k..4 * k + 4].try_into().unwrap());
+            let word = &self.ram[to / 4 + k];
+            if w == !0 {
+                word.store(v, Relaxed);
+            } else if w != 0 {
+                let _ = word.fetch_update(Relaxed, Relaxed, |x| Some(x & !w | v & w));
+            }
         }
         true
     }
@@ -383,6 +425,9 @@ impl maxwell::Memory for Shared<'_> {
         }
     }
     fn write_lanes(&mut self, at: &[u64], mask: u32, n: usize, data: &[[u8; 16]]) {
+        if self.write_run(at, mask, n, data) {
+            return;
+        }
         let mut m = mask;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -539,7 +584,7 @@ mod tests {
             views[0].read(0x0400_5005, &mut b[..3]);
             assert_eq!(b[..3], [2, 0xaa, 3]);
             views[1].write(0x0400_6000, &[9]);
-            // a warp's loads, as a run of consecutive elements or not, are each lane's
+            // a warp's loads and stores, as a run of consecutive elements or not, are each lane's
             let bytes: Vec<u8> = (0..64).map(|k| k as u8 * 3 + 1).collect();
             views[0].write(0x0400_5100, &bytes);
             for (n, step, mask) in [(2usize, 2u64, !0u32), (4, 4, 0xffff_00f0), (2, 6, !0), (1, 1, 0x8000_0001), (4, 4, !0)] {
@@ -550,6 +595,20 @@ mod tests {
                     let mut one = [0u8; 16];
                     views[1].read(at[i], &mut one[..n]);
                     assert_eq!(out[i][..n], one[..n], "n {n} step {step} lane {i}");
+                }
+            }
+            for (n, start, mask) in [(2usize, 0x0400_5302u64, 0x7fff_fffeu32), (1, 0x0400_5401, 0xf0f0_f0f0), (4, 0x0400_5500, !0)] {
+                let mut before = [0u8; 0x100];
+                views[0].read(start - 0x10, &mut before);
+                let at: Vec<u64> = (0..32).map(|i| start + (i * n) as u64).collect();
+                let data: Vec<[u8; 16]> = (0..32).map(|i| [0x80 + i as u8; 16]).collect();
+                views[1].write_lanes(&at, mask, n, &data);
+                let mut after = [0u8; 0x100];
+                views[0].read(start - 0x10, &mut after);
+                for (k, (&b, &a)) in before.iter().zip(&after).enumerate() {
+                    let rel = k as i64 - 0x10;
+                    let lane = (rel >= 0).then(|| rel as usize / n).filter(|&i| i < 32 && mask >> i & 1 != 0);
+                    assert_eq!(a, lane.map_or(b, |i| 0x80 + i as u8), "n {n} byte {rel}");
                 }
             }
         });
