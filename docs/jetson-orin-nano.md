@@ -183,8 +183,9 @@ address space, and submit a copy through nvgpu. The test checks that both
 words arrive across GPU page boundaries, checks the copy-engine semaphore,
 and waits on the Linux sync-file fence. It also checks the guest's interrupt
 counters for delivery of Host1x syncpoint threshold interrupts. On the
-graphics runlist it dispatches a small, predicated Ampere shader and compares
-the four results and surrounding guard words with CPU expectations. It
+graphics runlist it dispatches an Ampere shader that loads a launch constant
+and runs a predicated loop. It compares the four results and surrounding guard
+words with CPU expectations. It
 also checks clipped and channel-masked Ampere C797 color clears in both
 pitch-linear and block-linear render targets. It checks that array-layer and
 attachment selection preserve neighboring layers, and verifies independent
@@ -198,7 +199,7 @@ driver's initial context bind and save requests. These are firmware protocol
 models. The Tegra234 Host1x model supports CPU and GPU syncpoint increments
 and threshold interrupts. The Ampere Compute B model dispatches QMD 3.0
 workgroups with per-thread registers and predicates, global loads and stores,
-and a small set of scalar instructions. The C797 clear path shares color and
+QMD-bound constant loads, and bounded scalar branches. The C797 clear path shares color and
 depth/stencil formats and surface layout code with the Tegra210 renderer.
 [NVIDIA Ampere 3D class](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clc797.h)
 

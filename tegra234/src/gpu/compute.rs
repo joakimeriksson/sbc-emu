@@ -1,6 +1,9 @@
 //! Ampere Compute B (C7C0), using QMD v3.0 dispatch descriptors.
 //! Register and descriptor layouts follow NVIDIA's clc7c0 and clc7c0qmd headers.
-use super::{mmu::View, sass};
+use super::{
+    mmu::View,
+    sass::{self, CONSTANT_BINDINGS, ConstantBuffer},
+};
 
 pub(super) const CLASS: u32 = 0xc7c0;
 const QMD_ADDRESS: u32 = 0x2b4;
@@ -17,6 +20,7 @@ struct Launch {
     program: u64,
     groups: [u32; 3],
     threads: [u32; 3],
+    constants: [Option<ConstantBuffer>; CONSTANT_BINDINGS],
 }
 
 impl Launch {
@@ -31,8 +35,22 @@ impl Launch {
         if program & 15 != 0 {
             return None;
         }
+        let valid = word(20)?;
+        let mut constants = [None; CONSTANT_BINDINGS];
+        for (index, entry) in constants.iter_mut().enumerate() {
+            if valid & (1 << index) != 0 {
+                let descriptor = 32 + index as u64 * 2;
+                let low = word(descriptor)?;
+                let high = word(descriptor + 1)?;
+                *entry = Some(ConstantBuffer {
+                    address: u64::from(low) | u64::from(high & 0x1ffff) << 32,
+                    size: (high >> 19) << 4,
+                });
+            }
+        }
         Some(Self {
             program,
+            constants,
             groups: [word(12)?, word(13)? & 0xffff, word(14)? & 0xffff],
             threads: [version_and_x >> 16, yz & 0xffff, yz >> 16],
         })
@@ -51,7 +69,12 @@ impl Launch {
         for group in 0..count(self.groups)? {
             let group = coordinates(group, self.groups);
             for local in 0..threads {
-                shader.run(memory, coordinates(local, self.threads), group)?;
+                shader.run(
+                    memory,
+                    coordinates(local, self.threads),
+                    group,
+                    &self.constants,
+                )?;
             }
         }
         Some(())

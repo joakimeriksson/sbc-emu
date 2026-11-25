@@ -21,6 +21,7 @@ enum {
     SASS_OFFSET = 0x800,
     COMPUTE_INPUT = 0xa00,
     COMPUTE_OUTPUT = 0xa40,
+    CONSTANTS = 0xb00,
     COLOR_TARGET = 0xc00,
     TILED_TARGET = PAGE_BYTES,
     ZETA_TARGET = PAGE_BYTES + 512,
@@ -200,6 +201,11 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
     qmd[12] = qmd[13] = qmd[14] = 1;
     qmd[18] = (8 << 16) | 0x30; // QMD v3.0, eight threads along X.
     qmd[19] = (1 << 16) | 1;
+    const uint64_t constants = va + CONSTANTS;
+    qmd[20] = 1; // Constant buffer zero is valid.
+    qmd[32] = constants;
+    qmd[33] = (constants >> 32) | (1 << 19); // Size is 16 bytes.
+    words[CONSTANTS / 4 + 3] = 17;
     qmd[48] = program;
     qmd[49] = program >> 32;
 
@@ -215,7 +221,8 @@ static int compute_probe(int channel, volatile uint32_t *words, uint64_t va)
         {add_registers(0, 0, 3), 0x000fe20007ffe0ff},
         {0xffffc03f00047981, 0x000fe2000c1ee900}, // LDG.E R4, [R0.64+UZR-0x40]
         {0x0000000102057810, 0x000fe20007ffe0ff}, // IADD3 R5, R2, 1, RZ
-        {0x0000001104047810, 0x000fe20007ffe0ff}, // loop: IADD3 R4, R4, 17, RZ
+        {0x00000300ff067b82, 0x000fe20000000800}, // LDC R6, c[0][0xc]
+        {add_registers(4, 4, 6), 0x000fe20007ffe0ff}, // loop: IADD3 R4, R4, R6, RZ
         {0xffffffff05057810, 0x000fe20007ffe0ff}, // IADD3 R5, R5, -1, RZ
         {0x000000000500780c, 0x000fe20003f050f0}, // ISETP.NE.U32.AND P0, PT, R5, 0, PT
         {0xffffffc000007947, 0x000fea000003ffff}, // BRA P0, loop (16 words back)

@@ -5,6 +5,22 @@ use super::mmu::View;
 const RZ: u8 = 255;
 const MAX_INSTRUCTIONS: usize = 256;
 const MAX_THREAD_STEPS: usize = 1024;
+pub(super) const CONSTANT_BINDINGS: usize = 8;
+
+#[derive(Clone, Copy)]
+pub(super) struct ConstantBuffer {
+    pub address: u64,
+    pub size: u32,
+}
+
+impl ConstantBuffer {
+    fn load(self, offset: u32, memory: &View) -> Option<u32> {
+        if offset.checked_add(4)? > self.size {
+            return None;
+        }
+        memory.load(self.address + u64::from(offset))
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Operand {
@@ -77,6 +93,7 @@ enum Instruction {
     Compare(u8, u8, Operand, Compare),
     System(u8, u8),
     Load(u8, Address),
+    LoadConstant(u8, u8, u8, u16),
     Store(Address, u8),
 }
 
@@ -151,6 +168,9 @@ impl Instruction {
                     },
                 )
             }
+            0xb82 if (raw >> 73) & 7 == 4 && (raw >> 78) & 3 == 0 && (raw >> 91) & 1 == 0 => {
+                Self::LoadConstant(dst, a, (raw >> 54) as u8 & 0x1f, (raw >> 38) as u16)
+            }
             0x919 => Self::System(dst, (raw >> 72) as u8),
             // Ampere LDG.E/STG.E with an extended GPR-pair address, UZR,
             // and a single 32-bit value.
@@ -203,7 +223,13 @@ impl Program {
         None
     }
 
-    pub fn run(&self, memory: &mut View, local: [u32; 3], group: [u32; 3]) -> Option<()> {
+    pub fn run(
+        &self,
+        memory: &mut View,
+        local: [u32; 3],
+        group: [u32; 3],
+        constants: &[Option<ConstantBuffer>; CONSTANT_BINDINGS],
+    ) -> Option<()> {
         let mut registers = [0u32; 256];
         let mut predicates = [false; 7];
         let mut pc = 0;
@@ -248,6 +274,11 @@ impl Program {
                     },
                 ),
                 Instruction::Load(dst, ref address) => (dst, memory.load(address.get(&registers))?),
+                Instruction::LoadConstant(dst, index, binding, offset) => {
+                    let buffer = (*constants.get(usize::from(binding))?)?;
+                    let offset = registers[usize::from(index)].wrapping_add(u32::from(offset));
+                    (dst, buffer.load(offset, memory)?)
+                }
                 Instruction::Store(ref address, data) => {
                     memory.store(address.get(&registers), registers[data as usize])?;
                     continue;
