@@ -90,7 +90,13 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 fn execute(args: &[String]) -> Result<(), String> {
     // (--camera takes no value)
     let valued: Vec<String> = args.iter().filter(|a| *a != "--camera").cloned().collect();
-    serial_board::validate_options(&valued, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net", "--usb-drive", "--hdmi-mode", "--vnc", "--screenshot", "--camera-source"])?;
+    serial_board::validate_options(&valued, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net", "--usb-drive", "--hdmi-mode", "--vnc", "--screenshot", "--camera-source", "--threads"])?;
+    // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
+    let multi = match arg(args, "--threads") {
+        None | Some("single") => false,
+        Some("multi") => true,
+        Some(_) => return Err("--threads single|multi".into()),
+    };
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel Image|vmlinuz is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb tegra210-p3450-0000.dtb is required")?)?;
@@ -127,6 +133,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let mut m = Machine::with_clock(ram, smp, unix)?;
         m.soc.log_stub_pages = log_stubs;
+        m.multi = multi;
         let jit = if no_jit {
             m.set_jit(false);
             false
@@ -135,9 +142,10 @@ fn execute(args: &[String]) -> Result<(), String> {
         };
         if !announced.replace(true) {
             eprintln!(
-                "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
+                "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}, {}), GIC-400, UART A, timers, clock/reset controller, PMC, \
                  fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive, --camera), HDMI, the GM20B GPU; PSCI by the host; other devices are read-back stubs",
-                crate::cpu_backend(jit)
+                crate::cpu_backend(jit),
+                if multi { "a host thread each" } else { "one host thread" }
             );
         }
         if let Some(d) = disk.clone() {

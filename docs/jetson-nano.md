@@ -41,7 +41,8 @@ Without `--sd-persist` the card is copy-on-write and the image file is not chang
 
 Options: `--net nat|local|none` (default `nat`: DHCP, DNS and NAT to the host's network),
 `--usb-drive IMAGE` (a USB stick), `--hdmi-mode WxH` or `off` (default 1280x720), `--vnc :N`,
-`--screenshot FILE`, `--smp N`, `--ram-mb N` (default 4096), `--gdb PORT`.
+`--screenshot FILE`, `--smp N`, `--ram-mb N` (default 4096), `--gdb PORT`, `--threads single|multi`
+([below](#speed)).
 
 ## Webcam
 
@@ -128,9 +129,23 @@ listed at exit (`SBC_STUB_LOG=1` prints them as they happen).
 
 The A64 JIT ([jit.md](jit.md)) is on by default on AArch64 hosts (macOS and Linux), on x86-64
 Linux and in the browser; `--no-jit` or `SBC_JIT=0` runs the interpreter alone. The quick start
-reaches its shell in about 6 s on an Apple M-series Mac. The cores take turns on one host
-thread. GPU shaders are interpreted natively, on several host threads; in the browser they have
-a JIT to WebAssembly.
+reaches its shell in about 6 s on an Apple M-series Mac. GPU shaders are interpreted natively,
+on several host threads; in the browser they have a JIT to WebAssembly.
+
+`--threads single|multi` chooses how the cores run. `single` (the default, and the only way in
+the browser): they take turns on one host thread in rounds of virtual time, and a run with the
+same inputs is repeatable. `multi`: a host thread per core, as on the Raspberry Pi 4
+([raspberry-pi-4.md](raspberry-pi-4.md)) and with the same design (`tegra210/src/mt.rs`): RAM is
+shared directly, barriers and acquire/release are host fences and store-exclusive a host
+compare-and-swap, TLB and instruction-cache invalidations reach the other cores before the
+issuing core goes on, and the devices, the GIC and the GPU sit behind one lock. Guest time
+follows the host's clock, and runs are not repeatable. A GPU submission runs on the thread of
+the core that hands it over and keeps the lock while it runs: the other cores go on until they
+touch a device. A debugger's breakpoints, watchpoints and single steps run on one thread.
+
+YOLOv8n on the CPU (ncnn, four threads; `demos/jetson-yolo-cam`) takes PLACEHOLDER_CPU; on the GPU (NVK) PLACEHOLDER_NVK.
+The guest's own per-frame times differ more than that: with one thread its clock counts
+instructions, not the host's seconds.
 
 ## Not there yet
 

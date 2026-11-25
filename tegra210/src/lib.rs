@@ -14,6 +14,8 @@ pub mod gpu;
 pub mod host1x;
 pub mod i2c;
 pub mod max77620;
+#[cfg(not(target_arch = "wasm32"))]
+mod mt;
 pub mod padctl;
 pub mod pcie;
 pub mod pmc;
@@ -508,6 +510,11 @@ pub struct Machine {
     debugging: bool,
     /// each core's `jit_off` before a debugger set something
     jit_off_before: Vec<bool>,
+    /// run the cores on their own host threads (`--threads multi`: faster, not repeatable;
+    /// `mt.rs`); a debugger's breakpoints, watchpoints and steps run on one thread
+    pub multi: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    mt: Option<mt::Mt>,
 }
 
 impl Machine {
@@ -563,7 +570,7 @@ impl Machine {
         };
         let mut soc = soc;
         soc.gpio.set_input(HDMI_HPD, true);
-        let mut m = Self { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, cur: 0, next_check: 0, round_end: u64::MAX, irqs: 0, exceptions: 0, breakpoints: Default::default(), debugging: false, jit_off_before: vec![false; ncpu] };
+        let mut m = Self { cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, cur: 0, next_check: 0, round_end: u64::MAX, irqs: 0, exceptions: 0, breakpoints: Default::default(), debugging: false, jit_off_before: vec![false; ncpu], multi: false, #[cfg(not(target_arch = "wasm32"))] mt: None };
         for k in 0..ncpu {
             let c = m.fresh_cpu(k);
             m.cpus.push(c);
@@ -779,8 +786,19 @@ impl Machine {
         self.update();
     }
 
-    /// Run up to `budget` instructions over all cores.
+    /// Run up to `budget` instructions over all cores (with `multi`, about 10 ms of host time
+    /// on a thread per core instead).
     pub fn run(&mut self, budget: u64) -> Stop {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.multi && !self.debugging {
+            return self.run_threaded(std::time::Duration::from_millis(10));
+        }
+        if self.cpus[0].mt {
+            // back on one thread (a debugger is attached): turn-taking semantics again
+            for c in self.cpus.iter_mut() {
+                c.mt = false;
+            }
+        }
         let end = self.instret().saturating_add(budget);
         let mut total = self.instret();
         let mut steps = budget;
@@ -959,7 +977,10 @@ impl Machine {
         let jit_off = std::mem::replace(&mut self.cpus[k].jit_off, true);
         let turn = self.breakpoints.last_turn(self.cur);
         self.breakpoints.begin_step(k, self.cpus[k].pc);
+        // one instruction on one core: on this thread, also with --threads multi
+        let multi = std::mem::replace(&mut self.multi, false);
         let stop = self.run(1);
+        self.multi = multi;
         self.breakpoints.end_step(k);
         self.breakpoints.keep_turn(turn);
         self.cpus[k].jit_off = jit_off;
@@ -1012,9 +1033,7 @@ impl Machine {
         const INVALID_PARAMETERS: u64 = -2i64 as u64;
         const ALREADY_ON: u64 = -4i64 as u64;
         let x = self.cpus[k].x;
-        let supported = |f: u32| matches!(f, 0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003 | 0x8400_0004 | 0xc400_0004 | 0x8400_0006 | 0x8400_0008 | 0x8400_0009 | 0x8400_000a);
         let ret = match x[0] as u32 {
-            0x8400_0000 => 0x10000, // PSCI 1.0
             0x8400_0002 => {
                 self.state[k] = CoreState::Off;
                 self.cpus[k].set_irq(false, false);
@@ -1032,28 +1051,48 @@ impl Machine {
                 None => INVALID_PARAMETERS,
                 Some(t) => (self.state[t] == CoreState::Off) as u64,
             },
-            0x8400_0006 => 2, // no trusted OS to migrate
             0x8400_0008 => return Some(Stop::PowerOff),
             0x8400_0009 => return Some(Stop::Reset),
-            0x8400_000a => if supported(x[1] as u32) { 0 } else { NOT_SUPPORTED },
             // NVIDIA's SiP call for a "secure PMC" (L4T's kernel): PMC register reads and writes
             // through the secure monitor (PMC_READ 0xaa, PMC_WRITE 0xbb; offsets from the PMC base)
-            // L4T: program the protected video region (TE_SMC_PROGRAM_VPR); nothing is protected here
-            0x8200_0003 => 0,
             0xc2ff_fe00 => match x[1] {
                 0xaa => { self.cpus[k].x[1] = u64::from(self.soc.pmc.read(x[2])); 0 }
                 0xbb => { self.soc.pmc.write(x[2], x[3] as u32); 0 }
                 _ => NOT_SUPPORTED,
             },
-            _ => NOT_SUPPORTED,
+            f => Self::psci_simple(f, x[1]),
         };
         self.cpus[k].x[0] = ret;
         None
     }
 
+    /// The firmware calls that need no core or device: the result for function `f` with
+    /// argument `x1` (shared with the threaded machine's PSCI).
+    fn psci_simple(f: u32, x1: u64) -> u64 {
+        const NOT_SUPPORTED: u64 = -1i64 as u64;
+        let supported = |f: u32| matches!(f, 0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003 | 0x8400_0004 | 0xc400_0004 | 0x8400_0006 | 0x8400_0008 | 0x8400_0009 | 0x8400_000a);
+        match f {
+            0x8400_0000 => 0x10000, // PSCI 1.0
+            0x8400_0006 => 2,       // no trusted OS to migrate
+            0x8400_000a => if supported(x1 as u32) { 0 } else { NOT_SUPPORTED },
+            // L4T: program the protected video region (TE_SMC_PROGRAM_VPR); nothing is protected here
+            0x8200_0003 => 0,
+            _ => NOT_SUPPORTED,
+        }
+    }
+
     fn cpu_on(&mut self, caller: usize, t: usize, entry: u64, context: u64) {
         let (el, now) = (self.cpus[caller].el, self.cpus[caller].now_ns());
-        let c = &mut self.cpus[t];
+        Self::reset_core(&mut self.cpus[t], t, el, entry, context, now);
+        self.soc.gic.reset_cpu_interface(t);
+        self.state[t] = CoreState::Run;
+        self.round_end = self.round_end.min(now + quantum());
+        self.soc.dirty = true;
+    }
+
+    /// Core `t` as PSCI CPU_ON leaves it: at `entry` in `el` with `context` in X0, its clock at
+    /// `now`; it keeps its JIT, debugger watchpoints and the threaded machine's settings.
+    fn reset_core(c: &mut Cpu, t: usize, el: u8, entry: u64, context: u64, now: u64) {
         let mut f = Cpu::new();
         f.profile = CORTEX_A57;
         f.sys.cntfrq = CNTFRQ;
@@ -1074,12 +1113,10 @@ impl Machine {
         f.sys.cpacr_el1 = 3 << 20;
         f.jit_off = c.jit_off;
         f.watch = c.watch.clone();
+        f.mt = c.mt;
+        f.wall_clock = c.wall_clock;
         let mut old = std::mem::replace(c, f);
         old.hand_jit_to(c);
-        self.soc.gic.reset_cpu_interface(t);
-        self.state[t] = CoreState::Run;
-        self.round_end = self.round_end.min(now + quantum());
-        self.soc.dirty = true;
     }
 }
 
@@ -1208,6 +1245,45 @@ mod tests {
         assert!(m.debug_write(0, RAM_BASE + 0x10_0000, &0xe3a0_0002u32.to_le_bytes()));
         m.run(1_000_000);
         assert_eq!(m.soc.ram[0x20_0000], 2);
+    }
+
+    /// `--threads multi`: four cores on their own host threads add 100,000 each to one counter
+    /// with LDXR/STXR (interpreted and compiled), then sleep; no increment is lost.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn four_threads_count_with_exclusives() {
+        for jit in [false, true] {
+            let mut m = Machine::with_cpus(64 << 20, 4).unwrap();
+            if jit && !m.enable_jit() {
+                continue;
+            }
+            m.multi = true;
+            load(&mut m, &[
+                0xd2b0_0201, // mov x1, #0x80100000
+                0xd290_d402, // mov x2, #0x86a0
+                0xf2a0_0022, // movk x2, #1, lsl #16 (100,000)
+                0x885f_7c23, // 1: ldxr w3, [x1]
+                0x1100_0463, // add w3, w3, #1
+                0x8804_7c23, // stxr w4, w3, [x1]
+                0x35ff_ffa4, // cbnz w4, 1b
+                0xf100_0442, // subs x2, x2, #1
+                0x54ff_ff61, // b.ne 1b
+                0xd503_207f, // 2: wfi
+                0x17ff_ffff, // b 2b
+            ]);
+            for k in 0..4 {
+                m.cpus[k].pc = RAM_BASE;
+                m.cpus[k].el = 1;
+                m.state[k] = CoreState::Run;
+            }
+            let start = std::time::Instant::now();
+            while m.state.iter().any(|&s| s != CoreState::Wfi) && start.elapsed().as_secs() < 30 {
+                let stop = m.run(1_000_000);
+                assert!(matches!(stop, Stop::Budget | Stop::Idle(_)), "{stop:?}");
+            }
+            assert_eq!(m.state, [CoreState::Wfi; 4], "jit {jit}");
+            assert_eq!(u32::from_le_bytes(m.soc.ram[0x10_0000..0x10_0004].try_into().unwrap()), 400_000, "jit {jit}");
+        }
     }
 
     #[test]
