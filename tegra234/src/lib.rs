@@ -19,7 +19,11 @@ const FRAMEBUFFER: u64 = 0x8ff0_0000;
 const FRAMEBUFFER_RESERVATION: u64 = 1 << 20;
 const APB_MISC: u64 = 0x0010_0000;
 const APB_STRAPS: u64 = 0x0010_f000;
+const EFUSE: u64 = 0x0381_0000;
+const EFUSE_SIZE: u64 = 0x1_0000;
 const CHIP_ID_A01: u32 = 0x0001_2310;
+// Use NVIDIA's QT platform ID for the GPU model, where nvgpu skips the silicon PMU.
+const CHIP_ID_A01_QT: u32 = CHIP_ID_A01 | (1 << 20);
 const GICD: u64 = 0x0f40_0000;
 const GICD_SIZE: u64 = 0x1_0000;
 const GICR: u64 = 0x0f44_0000;
@@ -63,9 +67,16 @@ impl Soc {
         } else if (GICR..GICR + GICR_SIZE).contains(&addr) {
             self.gic.redist_read(addr - GICR)
         } else if addr == APB_MISC + 4 {
-            CHIP_ID_A01
+            if self.gpu_node {
+                CHIP_ID_A01_QT
+            } else {
+                CHIP_ID_A01
+            }
         } else if addr == APB_STRAPS {
             0
+        } else if self.gpu_node && (EFUSE..EFUSE + EFUSE_SIZE).contains(&addr) {
+            // Production mode in the shadow array. HIDREV supplies the SoC ID.
+            u32::from(addr == EFUSE + 0x100)
         } else if let Some(value) = mc::read(addr) {
             value
         } else if let Some(value) = self.mss_nvlink.read(addr) {

@@ -1,7 +1,7 @@
 //! A minimal Tegra234 device tree for direct Linux boot.
 use crate::{
-    Machine, AFFINITIES, GICD, GICD_SIZE, GICR, GICR_SIZE, RAM_BASE, UART, UARTA, UARTA_SPI,
-    UART_SIZE, UART_SPI,
+    AFFINITIES, GICD, GICD_SIZE, GICR, GICR_SIZE, Machine, RAM_BASE, UART, UART_SIZE, UART_SPI,
+    UARTA, UARTA_SPI,
 };
 use emu_core::{arm64_image::kernel_image, fdt::Fdt};
 
@@ -167,6 +167,12 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
         dt.begin("tegra-carveouts");
         dt.str("compatible", "nvidia,carveouts-t19x");
         dt.end();
+        dt.begin("fuse@3810000");
+        dt.str("compatible", "nvidia,tegra234-efuse");
+        dt.cells("reg", &range(crate::EFUSE, crate::EFUSE_SIZE));
+        dt.cells("clocks", &[BPMP_HANDLE, crate::bpmp::CLK_FUSE]);
+        dt.str("clock-names", "fuse");
+        dt.end();
         host1x_node(&mut dt);
         gpu_node(&mut dt);
     }
@@ -310,6 +316,20 @@ fn host1x_node(dt: &mut Fdt) {
     );
     dt.strs("clock-names", &["host1x", "actmon"]);
     dt.empty("dma-coherent");
+    dt.cells("#address-cells", &[2]);
+    dt.cells("#size-cells", &[2]);
+    dt.empty("ranges");
+
+    dt.begin("vic@15340000");
+    dt.str("compatible", "nvidia,tegra234-vic");
+    dt.cells("reg", &range(0x15340000, 0x40000));
+    dt.cells("interrupts", &[0, 206, 4]);
+    dt.cells("clocks", &[BPMP_HANDLE, bpmp::CLK_VIC]);
+    dt.str("clock-names", "vic");
+    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_VIC]);
+    dt.str("reset-names", "vic");
+    dt.empty("dma-coherent");
+    dt.end();
     dt.end();
 }
 

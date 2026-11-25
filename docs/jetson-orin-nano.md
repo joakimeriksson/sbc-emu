@@ -206,6 +206,16 @@ QMD-bound constant loads, and bounded scalar branches. The C797 clear path share
 depth/stencil formats and surface layout code with the Tegra210 renderer.
 [NVIDIA Ampere 3D class](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clc797.h)
 
+### JetPack CUDA driver
+
+`sh tests/gpu/run-orin-cuda.sh` boots NVIDIA's R36.4.4 modules and userspace.
+It verifies `cuInit`, enumeration of one Orin GPU, and compute capability 8.7.
+The fixture downloads pinned packages locally. The Tegra DRM driver creates a
+render node using the Host1x/VIC discovery path, and the stock fuse driver
+reports the Tegra234 A01 identity. The board reports NVIDIA's QT pre-silicon
+platform ID with the GPU enabled. This selects the driver's simulation path
+while production silicon PMU firmware remains unmodeled.
+
 ### Jetson GPU parity
 
 Use the [Tegra210 GPU test suite](jetson-nano-gpu.md#tests) as the coverage
@@ -216,7 +226,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 |---|---|
 | Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
-| Compute | The Linux fixture checks a known-answer Ampere shader. The CUDA userspace path and broader shader coverage remain pending. |
+| Compute | The Linux fixture checks a known-answer Ampere shader. JetPack CUDA enumerates the GPU and reports compute capability 8.7. CUDA context initialization and kernel launch remain pending. |
 | Graphics | The stock driver submits clipped, masked and layered C797 color clears and masked block-linear depth/stencil clears. Draw calls and the existing GLES 2, 3 and 3.2 scenes remain pending. |
 | Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests also pass in the WebAssembly build. |
 

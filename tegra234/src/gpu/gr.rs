@@ -7,6 +7,10 @@ const GPC_RESET_BROADCAST: u64 = 0x41a610;
 const GPC0_RESET_STATUS: u64 = 0x502610;
 const RESET_RELEASED: u32 = 1;
 const GPC0_TPCS: u64 = 0x502608;
+const GPC0_TPC0_SM_ARCH: u64 = 0x504330;
+// Each version has an eight-bit minor field.
+const SM87: u32 = (8 << 8) | 7;
+const GA10B_SM_ARCH: u32 = (SM87 << 20) | (SM87 << 8) | 48;
 const GPC0_ZCULL_BANKS: u64 = 0x500920;
 const GPC0_PES0_TPC_MASK: u64 = 0x500c30;
 const FE_POWER_MODE: u64 = 0x404170;
@@ -32,7 +36,8 @@ const DISCOVER_PREEMPT_SIZE: u32 = 0x1a;
 const DISCOVER_PM_SIZE: u32 = 0x25;
 const CONTEXT_BYTES: u32 = 0x20_000;
 const ZCULL_BYTES: u32 = 0x1000;
-const PM_BYTES: u32 = 0x1000;
+// Reserve space for the R36 netlist's aligned SYS, FBP and GPC HWPM register lists.
+const PM_BYTES: u32 = 0x20_000;
 
 #[derive(Default)]
 pub(super) struct Gr {
@@ -58,6 +63,7 @@ impl Gr {
     pub fn read(&self, offset: u64) -> Option<u32> {
         match offset {
             GPC_RESET_BROADCAST | GPC0_RESET_STATUS => Some(self.released),
+            GPC0_TPC0_SM_ARCH => Some(GA10B_SM_ARCH),
             GPC0_TPCS => Some(TPCS_PER_GPC | TPCS_PER_GPC << 16),
             GPC0_ZCULL_BANKS => Some(TPCS_PER_GPC),
             GPC0_PES0_TPC_MASK => Some((1 << TPCS_PER_GPC) - 1),

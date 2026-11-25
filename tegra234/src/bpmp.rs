@@ -8,7 +8,9 @@ pub const RX_POOL: usize = 0x71000;
 pub const POOL_SIZE: u64 = 0x1000;
 
 pub const CLK_ACTMON: u32 = 1;
+pub const CLK_FUSE: u32 = 40;
 pub const CLK_HOST1X: u32 = 46;
+pub const CLK_VIC: u32 = 167;
 pub const CLK_UARTA: u32 = 155;
 const CLK_PLLP_OUT0: u32 = 102;
 pub const CLK_GPC0: u32 = 41;
@@ -16,6 +18,7 @@ pub const CLK_GPC1: u32 = 236;
 pub const CLK_GPUSYS: u32 = 304;
 pub const RESET_UARTA: u32 = 100;
 pub const RESET_GPU: u32 = 19;
+pub const RESET_VIC: u32 = 113;
 pub const GPU: u32 = 35;
 
 const CHANNEL_STRIDE: usize = 256;
@@ -86,9 +89,10 @@ impl Clock {
 
 pub struct Bpmp {
     pub sram: Vec<u8>,
-    clocks: [Clock; 7],
+    clocks: [Clock; 9],
     uart_reset: bool,
     gpu_reset: bool,
+    vic_reset: bool,
     gpu_power: bool,
 }
 
@@ -98,7 +102,9 @@ impl Default for Bpmp {
             sram: vec![0; SRAM_SIZE as usize],
             clocks: [
                 Clock::new(CLK_ACTMON, "actmon", None, 19_200_000),
+                Clock::new(CLK_FUSE, "fuse", None, 19_200_000),
                 Clock::new(CLK_HOST1X, "host1x", None, 204_000_000),
+                Clock::new(CLK_VIC, "vic", None, 204_000_000),
                 Clock::new(CLK_PLLP_OUT0, "pllp_out0", None, 408_000_000),
                 Clock::new(CLK_UARTA, "uarta", Some(CLK_PLLP_OUT0), 16 * 115_200),
                 Clock::new(CLK_GPC0, "gpc0clk", None, 306_000_000),
@@ -107,6 +113,7 @@ impl Default for Bpmp {
             ],
             uart_reset: false,
             gpu_reset: false,
+            vic_reset: false,
             gpu_power: false,
         }
     }
@@ -231,12 +238,13 @@ impl Bpmp {
 
     fn reset(&mut self, cmd: u32, id: u32, resp: &mut [u8]) -> i32 {
         if cmd == RESET_GET_MAX_ID {
-            put(resp, 0, RESET_UARTA);
+            put(resp, 0, RESET_VIC);
             return 0;
         }
         let reset = match id {
             RESET_UARTA => &mut self.uart_reset,
             RESET_GPU => &mut self.gpu_reset,
+            RESET_VIC => &mut self.vic_reset,
             _ => return EINVAL,
         };
         match cmd {
@@ -262,13 +270,16 @@ impl Bpmp {
             CLK_GET_RATE => resp[..8].copy_from_slice(&clock.rate.to_le_bytes()),
             CLK_SET_RATE | CLK_ROUND_RATE => {
                 let requested = i64::from_le_bytes(req[8..16].try_into().unwrap());
-                if requested <= 0 {
-                    return EINVAL;
-                }
-                let rate = if id == CLK_PLLP_OUT0 {
-                    clock.rate
-                } else {
-                    requested as u64
+                let rate = match id {
+                    CLK_VIC => {
+                        // Supply a small, discrete rate table for the VIC driver's OPP discovery.
+                        let step = 102_000_000;
+                        let requested = requested.clamp(step, 10 * step) as u64;
+                        requested.div_ceil(step as u64) * step as u64
+                    }
+                    CLK_PLLP_OUT0 if requested > 0 => clock.rate,
+                    _ if requested > 0 => requested as u64,
+                    _ => return EINVAL,
                 };
                 if cmd == CLK_SET_RATE {
                     clock.rate = rate;
