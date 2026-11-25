@@ -3,6 +3,7 @@
 use super::mmu::View;
 
 const RZ: u8 = 255;
+const URZ: u8 = 63;
 const MAX_INSTRUCTIONS: usize = 256;
 const MAX_THREAD_STEPS: usize = 1024;
 pub(super) const CONSTANT_BINDINGS: usize = 8;
@@ -25,15 +26,32 @@ impl ConstantBuffer {
 #[derive(Clone, Copy)]
 enum Operand {
     Register(u8),
+    Uniform(u8),
     Immediate(u32),
+    Constant(u8, u16),
 }
 
 impl Operand {
-    fn get(self, registers: &[u32; 256]) -> u32 {
-        match self {
-            Self::Register(index) => registers[index as usize],
+    fn constant(raw: u128) -> Self {
+        Self::Constant((raw >> 54) as u8 & 0x1f, (raw >> 38) as u16)
+    }
+
+    fn get(
+        self,
+        registers: &[u32; 256],
+        uniform: &[u32; 64],
+        constants: &[Option<ConstantBuffer>; CONSTANT_BINDINGS],
+        memory: &View,
+    ) -> Option<u32> {
+        Some(match self {
+            Self::Register(index) => registers[usize::from(index)],
+            Self::Uniform(index) => uniform[usize::from(index)],
             Self::Immediate(value) => value,
-        }
+            Self::Constant(binding, offset) => {
+                let buffer = (*constants.get(usize::from(binding))?)?;
+                buffer.load(u32::from(offset), memory)?
+            }
+        })
     }
 }
 
@@ -89,6 +107,11 @@ enum Instruction {
     Exit,
     Branch(Predicate, i64),
     Move(u8, Operand),
+    MoveUniform(u8, u32),
+    LoadUniformPair(u8, u8, u16),
+    BarrierImmediate(u8, u32),
+    BarrierMoveClear(u8, u8),
+    MultiplyAdd(u8, u8, u8, Operand),
     Add(u8, u8, Operand, u8),
     Compare(u8, u8, Operand, Compare),
     System(u8, u8),
@@ -99,24 +122,32 @@ enum Instruction {
 
 struct Address {
     low_register: u8,
+    uniform_register: u8,
     offset: i32,
 }
 
 impl Address {
-    fn new(raw: u128) -> Option<Self> {
+    fn new(raw: u128, uniform_register: u8) -> Option<Self> {
         let low_register = (raw >> 24) as u8;
         let extended = (raw >> 90) & 3 == 3;
         let word_access = (raw >> 73) & 7 == 4;
-        (extended && word_access && low_register < RZ - 1).then_some(Self {
-            low_register,
-            offset: ((raw as u64 as i64) >> 40) as i32,
-        })
+        (extended && word_access && low_register < RZ - 1 && uniform_register <= URZ).then_some(
+            Self {
+                low_register,
+                uniform_register,
+                offset: ((raw as u64 as i64) >> 40) as i32,
+            },
+        )
     }
 
-    fn get(&self, registers: &[u32; 256]) -> u64 {
+    fn get(&self, registers: &[u32; 256], uniform: &[u32; 64]) -> u64 {
         let i = usize::from(self.low_register);
         let base = u64::from(registers[i]) | u64::from(registers[i + 1]) << 32;
-        base.wrapping_add_signed(i64::from(self.offset))
+        let u = usize::from(self.uniform_register);
+        let uniform_base =
+            u64::from(uniform[u]) | u64::from(uniform.get(u + 1).copied().unwrap_or(0)) << 32;
+        base.wrapping_add(uniform_base)
+            .wrapping_add_signed(i64::from(self.offset))
     }
 }
 
@@ -128,6 +159,8 @@ impl Instruction {
         let a = (raw >> 24) as u8;
         let b = match opcode & 0xe00 {
             0x200 => Operand::Register((raw >> 32) as u8),
+            0xa00 => Operand::constant(raw),
+            0xc00 => Operand::Uniform((raw >> 32) as u8 & URZ),
             _ => Operand::Immediate((raw >> 32) as u32),
         };
         let instruction = match opcode {
@@ -142,6 +175,31 @@ impl Instruction {
             }
             0x94d if (raw >> 84) & 0x7f == 0x38 => Self::Exit,
             0x202 | 0x802 if (raw >> 72) & 0xf == 0xf => Self::Move(dst, b),
+            0xa02
+                if (raw >> 72) & 0xf == 0xf && (raw >> 59) & 0x1f == 0 && (raw >> 91) & 1 == 0 =>
+            {
+                Self::Move(dst, b)
+            }
+            0x882 if dst <= URZ && (raw >> 64) & 0x0fff_ffff == 0 => {
+                Self::MoveUniform(dst, (raw >> 32) as u32)
+            }
+            0xab9 if dst < URZ - 1 && (raw >> 73) & 7 == 5 && (raw >> 91) & 1 == 0 => {
+                Self::LoadUniformPair(dst, (raw >> 54) as u8 & 0x1f, (raw >> 38) as u16)
+            }
+            0x956 if a < 16 && (raw >> 64) & 0xff_ffff == 0 => {
+                Self::BarrierImmediate(a, (raw >> 32) as u32)
+            }
+            0xf55 if dst < 16 && (raw >> 32) & 0xff < 16 && (raw >> 84) & 1 != 0 => {
+                Self::BarrierMoveClear(dst, (raw >> 32) as u8)
+            }
+            0x424 | 0x624 if ((raw >> 72) & 0x7ffff) & !2 == 0x78e00 => {
+                let add = if opcode == 0x424 {
+                    Operand::Immediate((raw >> 32) as u32)
+                } else {
+                    Operand::constant(raw)
+                };
+                Self::MultiplyAdd(dst, a, (raw >> 64) as u8, add)
+            }
             // Plain IADD3 with neither carry input, output predicate nor source modifier.
             0x210 | 0x810
                 if (raw >> 72) & 0x7ffff == 0x7ffe0
@@ -150,11 +208,13 @@ impl Instruction {
                 Self::Add(dst, a, b, (raw >> 64) as u8)
             }
             // ISETP without the extended comparison or source modifiers.
-            0x20c | 0x80c
+            0x20c | 0x80c | 0xc0c
                 if (raw >> 72) & 1 == 0
                     && (raw >> 74) & 3 != 3
                     && (raw >> 84) & 7 == 7
-                    && (opcode == 0x80c || (raw >> 40) & 0xffffff == 0) =>
+                    && (opcode == 0x80c || (raw >> 40) & 0xffffff == 0)
+                    && (opcode != 0xc0c
+                        || ((raw >> 32) & 0xff <= u128::from(URZ) && (raw >> 91) & 1 != 0)) =>
             {
                 Self::Compare(
                     (raw >> 81) as u8 & 7,
@@ -172,8 +232,8 @@ impl Instruction {
                 Self::LoadConstant(dst, a, (raw >> 54) as u8 & 0x1f, (raw >> 38) as u16)
             }
             0x919 => Self::System(dst, (raw >> 72) as u8),
-            // Ampere LDG.E/STG.E with an extended GPR-pair address, UZR,
-            // and a single 32-bit value.
+            // Ampere LDG.E/STG.E with an extended register-pair address and
+            // one 32-bit value. LDG here uses the zero uniform register.
             0x981
                 if (raw >> 32) & 0xff == 63
                     && (raw >> 64) & 0xf == 0
@@ -181,10 +241,10 @@ impl Instruction {
                     && (raw >> 87) & 1 == 0
                     && (raw >> 72) & 1 == 1 =>
             {
-                Self::Load(dst, Address::new(raw)?)
+                Self::Load(dst, Address::new(raw, URZ)?)
             }
-            0x986 if (raw >> 64) & 0xff == 63 && (raw >> 72) & 1 == 1 => {
-                Self::Store(Address::new(raw)?, (raw >> 32) as u8)
+            0x986 if (raw >> 72) & 1 == 1 => {
+                Self::Store(Address::new(raw, (raw >> 64) as u8)?, (raw >> 32) as u8)
             }
             _ => return None,
         };
@@ -231,6 +291,8 @@ impl Program {
         constants: &[Option<ConstantBuffer>; CONSTANT_BINDINGS],
     ) -> Option<()> {
         let mut registers = [0u32; 256];
+        let mut uniform = [0u32; 64];
+        let mut barriers = [0u32; 16];
         let mut predicates = [false; 7];
         let mut pc = 0;
         for _ in 0..MAX_THREAD_STEPS {
@@ -239,6 +301,7 @@ impl Program {
             if !predicate.test(&predicates) {
                 continue;
             }
+            let operand = |src: Operand| src.get(&registers, &uniform, constants, memory);
             let (dst, value) = match *instruction {
                 Instruction::Nop => continue,
                 Instruction::Exit => return Some(()),
@@ -248,20 +311,47 @@ impl Program {
                     }
                     continue;
                 }
-                Instruction::Move(dst, src) => (dst, src.get(&registers)),
+                Instruction::Move(dst, src) => (dst, operand(src)?),
+                Instruction::MoveUniform(dst, value) => {
+                    if dst != URZ {
+                        uniform[usize::from(dst)] = value;
+                    }
+                    continue;
+                }
+                Instruction::LoadUniformPair(dst, binding, offset) => {
+                    let buffer = (*constants.get(usize::from(binding))?)?;
+                    let lo = buffer.load(u32::from(offset), memory)?;
+                    let hi = buffer.load(u32::from(offset) + 4, memory)?;
+                    let dst = usize::from(dst);
+                    uniform[dst] = lo;
+                    uniform[dst + 1] = hi;
+                    continue;
+                }
+                Instruction::BarrierImmediate(dst, value) => {
+                    barriers[usize::from(dst)] = value;
+                    continue;
+                }
+                Instruction::BarrierMoveClear(dst, src) => {
+                    let value = std::mem::take(&mut barriers[usize::from(src)]);
+                    barriers[usize::from(dst)] = value;
+                    continue;
+                }
+                Instruction::MultiplyAdd(dst, a, b, add) => (
+                    dst,
+                    registers[usize::from(a)]
+                        .wrapping_mul(registers[usize::from(b)])
+                        .wrapping_add(operand(add)?),
+                ),
                 Instruction::Add(dst, a, b, c) => (
                     dst,
                     registers[a as usize]
-                        .wrapping_add(b.get(&registers))
+                        .wrapping_add(operand(b)?)
                         .wrapping_add(registers[c as usize]),
                 ),
                 Instruction::Compare(dst, a, b, ref comparison) => {
                     if dst != Predicate::ALWAYS {
-                        predicates[usize::from(dst)] = comparison.test(
-                            registers[usize::from(a)],
-                            b.get(&registers),
-                            &predicates,
-                        );
+                        predicates[usize::from(dst)] =
+                            comparison.test(registers[usize::from(a)], operand(b)?, &predicates);
                     }
                     continue;
                 }
@@ -273,14 +363,16 @@ impl Program {
                         _ => return None,
                     },
                 ),
-                Instruction::Load(dst, ref address) => (dst, memory.load(address.get(&registers))?),
+                Instruction::Load(dst, ref address) => {
+                    (dst, memory.load(address.get(&registers, &uniform))?)
+                }
                 Instruction::LoadConstant(dst, index, binding, offset) => {
                     let buffer = (*constants.get(usize::from(binding))?)?;
                     let offset = registers[usize::from(index)].wrapping_add(u32::from(offset));
                     (dst, buffer.load(offset, memory)?)
                 }
                 Instruction::Store(ref address, data) => {
-                    memory.store(address.get(&registers), registers[data as usize])?;
+                    memory.store(address.get(&registers, &uniform), registers[data as usize])?;
                     continue;
                 }
             };

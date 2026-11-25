@@ -8,6 +8,13 @@ use super::{
 pub(super) const CLASS: u32 = 0xc7c0;
 const QMD_ADDRESS: u32 = 0x2b4;
 const SIGNAL_PCAS2: u32 = 0x2c0;
+const INLINE_ADDRESS_A: u32 = 0x318;
+const INLINE_ADDRESS_B: u32 = 0x31c;
+const INLINE_DATA: u32 = 0x320;
+const INLINE_LAST_WORD: u32 = INLINE_DATA + 63 * 4;
+const RELEASE_ENABLE: u32 = 1 << 23;
+const RELEASE_MEMBAR: u32 = 1 << 19;
+const RELEASE_SIZE: u32 = 3 << 30;
 const REPORT_SEMAPHORE_A: u32 = 0x1b00;
 const REPORT_SEMAPHORE_D: u32 = 0x1b0c;
 const REPORT_ONE_WORD: u32 = 1 << 28;
@@ -17,6 +24,7 @@ const MAX_LAUNCH_THREADS: u32 = 16384;
 #[derive(Default)]
 pub(super) struct Compute {
     qmd_address: Option<u64>,
+    inline_address: [u32; 2],
     report: [u32; 3],
     upload: maxwell::inline::Inline,
     pub timestamp: u64,
@@ -27,6 +35,7 @@ struct Launch {
     groups: [u32; 3],
     threads: [u32; 3],
     constants: [Option<ConstantBuffer>; CONSTANT_BINDINGS],
+    release: [Option<(u64, u32, bool)>; 2],
 }
 
 impl Launch {
@@ -54,15 +63,31 @@ impl Launch {
                 });
             }
         }
+        let mut release = [None; 2];
+        for (index, entry) in release.iter_mut().enumerate() {
+            let offset = 24 + index as u64 * 4;
+            let flags = word(offset + 1)?;
+            if flags & RELEASE_ENABLE != 0 {
+                let format = flags >> 30;
+                if format > 1
+                    || flags & !(RELEASE_ENABLE | RELEASE_MEMBAR | RELEASE_SIZE | 0xff) != 0
+                {
+                    return None;
+                }
+                let address = u64::from(word(offset)?) | u64::from(flags & 0xff) << 32;
+                *entry = Some((address, word(offset + 2)?, format == 0));
+            }
+        }
         Some(Self {
             program,
+            release,
             constants,
             groups: [word(12)?, word(13)? & 0xffff, word(14)? & 0xffff],
             threads: [version_and_x >> 16, yz & 0xffff, yz >> 16],
         })
     }
 
-    fn run(&self, memory: &mut View) -> Option<()> {
+    fn run(&self, memory: &mut View, timestamp: u64) -> Option<()> {
         let count = |dimensions: [u32; 3]| dimensions.into_iter().try_fold(1_u32, u32::checked_mul);
         let threads = count(self.threads)?;
         if threads > MAX_WORKGROUP_SIZE
@@ -83,6 +108,9 @@ impl Launch {
                 )?;
             }
         }
+        for (address, payload, timed) in self.release.into_iter().flatten() {
+            memory.release(address, payload, timed.then_some(timestamp))?;
+        }
         Some(())
     }
 }
@@ -91,9 +119,23 @@ impl Compute {
     pub fn method(&mut self, method: u32, data: u32, memory: &mut View) -> Option<()> {
         match method {
             0x100 | 0x110 => {} // NOP and WAIT_FOR_IDLE on the synchronous engine.
+            INLINE_ADDRESS_A => self.inline_address[0] = data,
+            INLINE_ADDRESS_B => self.inline_address[1] = data,
+            INLINE_DATA..=INLINE_LAST_WORD => {
+                let [hi, lo] = self.inline_address;
+                let address = (u64::from(hi) << 40) | (u64::from(lo) << 8);
+                if hi >> 8 != 0 {
+                    return None;
+                }
+                memory.store(address + u64::from(method - INLINE_DATA), data)?;
+                // Writing the final word submits the descriptor to the scheduler.
+                if method == INLINE_LAST_WORD {
+                    Launch::read(memory, address)?.run(memory, self.timestamp)?;
+                }
+            }
             QMD_ADDRESS => self.qmd_address = Some(u64::from(data) << 8),
             SIGNAL_PCAS2 if matches!(data, 2 | 3) => {
-                Launch::read(memory, self.qmd_address?)?.run(memory)?;
+                Launch::read(memory, self.qmd_address?)?.run(memory, self.timestamp)?;
             }
             // State for features outside the scalar path. The in-order interpreter
             // has no shader caches, texture access, or asynchronous work distributor.

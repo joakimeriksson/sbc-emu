@@ -27,11 +27,12 @@ fetch() {
     bsdtar -xOf "$path" "$data" > "$work/data.tar"
     bsdtar -xf "$work/data.tar" -C "$work/packages"
 }
-for name in nvidia-l4t-core nvidia-l4t-cuda; do
+for name in nvidia-l4t-core nvidia-l4t-cuda nvidia-l4t-3d-core; do
     file="${name}_${version}_arm64.deb"
     case "$name" in
         nvidia-l4t-core) hash=04975607d121dd679a9f026939d5c126dd9e682bbba6b71c01942212ebc2b090 ;;
         nvidia-l4t-cuda) hash=b7bcb9d5b6c10347b1c4d05cd2540edc5e69f438d9bd249fff00c536f7bea0cb ;;
+        nvidia-l4t-3d-core) hash=12440f0eff87ff22906726fdad61d87a2681bf8ace9d824b8b208e0ee8dfdbcc ;;
     esac
     fetch "$fixture/downloads/$file" "$nvidia/$name/$file" "$hash"
 done
@@ -61,6 +62,7 @@ for name in nvcucompat nvrm_gpu nvrm_mem nvrm_chip nvrm_sync nvrm_host1x nvos nv
     cp "$usr_lib/nvidia/lib$name.so" "$work/root/lib/"
 done
 cp "$usr_lib/nvidia/libcuda.so.1.1" "$work/root/lib/libcuda.so.1"
+cp "$usr_lib/nvidia/libnvidia-ptxjitcompiler.so.540.4.0" "$work/root/lib/libnvidia-ptxjitcompiler.so.1"
 
 rustc_path=$(rustup which rustc)
 rustlib=$("$rustc_path" --print sysroot)/lib
@@ -88,7 +90,7 @@ printf 'wait-serial CUDA_PROBE_ STATUS=\nquit\n' >> "$work/cuda.txt"
         tail -80 "$work/boot.log"
         exit 1
     }
-rg '^cuInit=0[[:space:]]*$|^CUDA (device: Orin|compute capability: 8\.7)[[:space:]]*$|^cu(CtxCreate=0|MemAlloc=0|MemcpyHtoD=0|MemcpyDtoH=0 data=0xfeedcafe)[[:space:]]*$' "$work/boot.log"
+rg '^cuInit=0[[:space:]]*$|^CUDA (device: Orin|compute capability: 8\.7)[[:space:]]*$|^cu(CtxCreate=0|MemAlloc=0|MemcpyHtoD=0|MemcpyDtoH=0 data=0xfeedcafe|LaunchKernel=0|CtxSynchronize=0)[[:space:]]*$|^CUDA kernel output=0x24681357 status=0[[:space:]]*$' "$work/boot.log"
 rg '^CUDA_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
     tail -50 "$work/boot.log"
     exit 1

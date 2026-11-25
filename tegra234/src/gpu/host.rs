@@ -216,6 +216,17 @@ impl Channel {
             // GPU memory accesses use the current page tables and guest RAM.
             0x34 if matches!(data >> 27, 0x05 | 0x09 | 0x0e | 0x10 | 0x15) => {}
             0x5c..=0x68 => self.semaphore[((method - 0x5c) / 4) as usize] = data,
+            0x6c if matches!(data, 0 | 2 | 3) => {
+                let [lo, hi, payload, _] = self.semaphore;
+                let address = u64::from(lo) | u64::from(hi & 0xff) << 32;
+                let value = memory.load(address)?;
+                let acquired = match data {
+                    0 => value == payload,
+                    2 => value >= payload,
+                    _ => value.wrapping_sub(payload) as i32 >= 0,
+                };
+                acquired.then_some(())?;
+            }
             0x6c if matches!(data, 1 | 0x10_0001) => {
                 // nvgpu appends a host-class semaphore release to retire the job.
                 // Bit 20 requests idle, which the synchronous engine already guarantees.
