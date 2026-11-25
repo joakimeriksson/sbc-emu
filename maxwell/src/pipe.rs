@@ -266,7 +266,17 @@ impl Pipe {
             Some(u64::from_le_bytes(b))
         });
         let p = match made {
-            Ok(p) => Some(Arc::new(p)),
+            Ok(p) => {
+                static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+                if std::env::var_os("SBC_SHADER_DUMP").is_some() {
+                    let mut seen = SEEN.lock().unwrap();
+                    if !seen.contains(&(base + entry as u64)) {
+                        seen.push(base + entry as u64);
+                        eprintln!("[shader dump] compute program at {:#x}:\n{p}[shader dump] end", base + entry as u64);
+                    }
+                }
+                Some(Arc::new(p))
+            }
             Err(e) => {
                 self.error(e);
                 None
