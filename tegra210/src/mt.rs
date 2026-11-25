@@ -8,13 +8,17 @@
 //!   compare-and-swap). A GPU submission runs on the thread of the core that wrote GP_PUT and
 //!   holds the lock meanwhile: the other cores go on until they touch a device.
 //! - Time follows the host clock: each core moves its virtual clock up to the wall clock every
-//!   few thousand instructions; a core in WFI sleeps until an interrupt or its timer is due.
-//!   The GPU's time model needs no change: its work takes wall time, which is guest time here.
+//!   few thousand instructions; a core in WFI sleeps until an interrupt, its arch timer or the
+//!   next device event is due (Linux ticks on the Tegra timers, TMR10-13), and a busy core
+//!   brings the devices up to the time when one is due. The GPU's time model needs no change:
+//!   its work takes wall time, which is guest time here, all of it (one thread caps a
+//!   submission at a second).
 //! - Interrupt lines are published per core as atomics after every device access.
 //! - TLB and instruction-cache invalidations are queued for the other cores; each core has its
 //!   own JIT.
 //! - An I/O loop on the machine's thread brings the devices (timers, display, USB, network,
 //!   GPU semaphores) up to the wall clock every half millisecond.
+//! - A panic on a core thread stops the machine and is raised again on the machine's thread.
 //!
 //! The machine still owns the cores and the SoC: `Machine::run` lets the threads run for a
 //! slice of wall time and parks them again before it returns, so everything outside `run` sees
@@ -67,6 +71,11 @@ pub(crate) struct Shared {
     kick: Vec<AtomicPtr<u64>>,
     /// core k is executing (in `run_core`)
     active: Vec<AtomicBool>,
+    /// the next device event (`Soc::next_event`, ns; u64::MAX: none): the Tegra timers that
+    /// Linux ticks on (TMR10-13, one a core), display, USB, network and GPU retries
+    dev_next: AtomicU64,
+    /// a core thread panicked: the payload, raised again on the machine's thread
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 // SAFETY: the raw pointers are only dereferenced while the machine is in `run` (it outlives the
@@ -99,6 +108,15 @@ impl Shared {
         soc.service(self.now());
         soc.dirty = false;
         self.publish(soc);
+        // sleeping cores wait for the device events too: one that comes sooner wakes them to
+        // wait again
+        let next = soc.next_event().unwrap_or(u64::MAX);
+        if self.dev_next.swap(next, SeqCst) > next { self.cv.notify_all(); }
+    }
+
+    /// The devices, if an event is due (lock held).
+    fn service_due(&self, soc: &mut Soc) {
+        if self.dev_next.load(SeqCst) <= self.now() { self.service(soc); }
     }
 
     fn report(&self, s: Stop) {
@@ -234,6 +252,7 @@ impl Mt {
             event: Mutex::new(None), soc: AtomicPtr::new(std::ptr::null_mut()), cpus: AtomicPtr::new(std::ptr::null_mut()),
             ncpu, t0: Instant::now(), offset: AtomicI64::new(0), exceptions: AtomicU64::new(0), irqs: AtomicU64::new(0),
             kick: (0..ncpu).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect(), active: (0..ncpu).map(|_| AtomicBool::new(false)).collect(),
+            dev_next: AtomicU64::new(u64::MAX), panic: Mutex::new(None),
         });
         let threads = (0..ncpu).map(|k| {
             let sh = sh.clone();
@@ -261,19 +280,33 @@ fn worker(sh: &Shared, k: usize) {
                 sh.state[k].store(RUN, SeqCst);
                 sh.running.fetch_add(1, SeqCst);
                 drop(g);
-                run_core(sh, k);
+                // a panic (a device model's assertion, say) stops the machine and is raised
+                // again on its thread, as with one thread; `running` stays right meanwhile
+                if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_core(sh, k))) {
+                    let mut slot = sh.panic.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() { *slot = Some(p); }
+                    drop(slot);
+                    sh.stop.store(true, SeqCst);
+                }
                 g = sh.guard();
                 sh.running.fetch_sub(1, SeqCst);
                 sh.cv.notify_all();
                 continue;
             }
         }
-        // asleep (WFI, off) or parked: an interrupt, a CPU_ON, the run phase or the core's own
-        // timer wakes it (checked again at least every 2 ms)
+        // asleep (WFI, off) or parked: an interrupt, a CPU_ON, the run phase, the core's own
+        // timer or a device event wakes it (checked again at least every 2 ms)
         let wait = if sh.stop.load(SeqCst) || sh.state[k].load(SeqCst) == OFF { Duration::from_millis(50) } else {
+            // a device event that is due (the Tegra timer this core ticks on) raises its
+            // interrupt now, not at the I/O loop's next round
+            // SAFETY: lock held, run phase
+            sh.service_due(unsafe { sh.soc() });
+            if sh.lines[k].load(SeqCst) != 0 { continue; }
             // SAFETY: run phase, own core
             let cpu = unsafe { sh.cpu(k) };
-            if deadline(cpu).is_some_and(|d| woke_for == Some(d)) { Duration::from_millis(2) } else { timer_wait(cpu, sh.now()) }
+            let now = sh.now();
+            let arch = if deadline(cpu).is_some_and(|d| woke_for == Some(d)) { Duration::from_millis(2) } else { timer_wait(cpu, now) };
+            arch.min(Duration::from_nanos(sh.dev_next.load(SeqCst).saturating_sub(now).max(10_000)))
         };
         g = sh.cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
     }
@@ -334,7 +367,17 @@ fn run_core(sh: &Shared, k: usize) {
         if cpu.instret >= next_sync || cpu.sys.timers_changed {
             sync_time(sh, cpu, k, &mut last_lv);
             next_sync = cpu.instret + SLICE;
-            if let Some(d) = deadline(cpu) { let t = cpu.now_ns(); if d > t { next_sync = next_sync.min(cpu.instret + (d - t)); } }
+            let t = cpu.now_ns();
+            if let Some(d) = deadline(cpu) { if d > t { next_sync = next_sync.min(cpu.instret + (d - t)); } }
+            // a device event that is due: the busy core brings the devices up to now itself
+            let dn = sh.dev_next.load(Relaxed);
+            if dn <= t {
+                let _g = sh.guard();
+                // SAFETY: lock held, run phase
+                sh.service_due(unsafe { sh.soc() });
+            } else {
+                next_sync = next_sync.min(cpu.instret + (dn - t));
+            }
         }
         cpu.set_irq(sh.lines[k].load(Relaxed) & 1 != 0, false);
         // SAFETY: an atomic store to this core's own field (other cores may store 0 to it)
@@ -401,7 +444,9 @@ fn psci(sh: &Shared, k: usize) -> Option<Stop> {
                 tc.jit_off = cpu.jit_off;
                 if tc.jit.is_none() && cpu.jit.is_some() { tc.enable_jit(); }
                 // SAFETY: lock held
-                unsafe { sh.soc() }.gic.reset_cpu_interface(t);
+                let soc = unsafe { sh.soc() };
+                soc.gic.reset_cpu_interface(t);
+                sh.publish(soc);
                 sh.state[t].store(RUN, SeqCst);
                 sh.cv.notify_all();
                 0
@@ -459,7 +504,7 @@ impl Machine {
             // SAFETY: lock held; the cores only reach the SoC under it
             sh.service(unsafe { sh.soc() });
             if let Some(s) = sh.event.lock().unwrap_or_else(|e| e.into_inner()).take() { break s; }
-            if Instant::now() >= end { break Stop::Budget; }
+            if Instant::now() >= end || sh.stop.load(SeqCst) { break Stop::Budget; }
         };
         // park the cores
         {
@@ -468,6 +513,7 @@ impl Machine {
             sh.cv.notify_all();
         }
         while sh.running.load(SeqCst) != 0 { std::thread::yield_now(); }
+        if let Some(p) = sh.panic.lock().unwrap_or_else(|e| e.into_inner()).take() { std::panic::resume_unwind(p); }
         let _g = sh.guard();
         self.now = self.now.max(sh.now());
         self.exceptions += sh.exceptions.swap(0, Relaxed);

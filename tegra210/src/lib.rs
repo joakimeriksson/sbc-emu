@@ -1286,6 +1286,70 @@ mod tests {
         }
     }
 
+    /// `--threads multi`: interrupts wake cores that sleep in WFI. Core 0 arms its Tegra timer
+    /// (TMR10, 100 us, SPI 208) and sleeps; when it wakes it sends SGI 1 to core 1, asleep since
+    /// it started. Each stores the interrupt it acknowledges.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn threads_wake_from_wfi_on_a_timer_and_an_sgi() {
+        let mut m = Machine::with_cpus(64 << 20, 2).unwrap();
+        m.multi = true;
+        m.soc.timers.write(0x14, 0x045f); // 19.2 MHz
+        let gic: [u32; 4] = [
+            0xd2aa_0080, // mov x0, #0x50040000
+            0xf282_0000, // movk x0, #0x1000 (GICD)
+            0x9140_0402, // add x2, x0, #0x1000 (GICC)
+            0x5280_0021, // mov w1, #1
+        ];
+        let core0: [u32; 20] = [
+            0xb900_0001, // str w1, [x0] (GICD_CTLR)
+            0xb900_0041, // str w1, [x2] (GICC_CTLR)
+            0x5280_1fe3, // mov w3, #0xff
+            0xb900_0443, // str w3, [x2, #4] (GICC_PMR)
+            0x52a0_0024, // mov w4, #0x10000
+            0xb901_1804, // str w4, [x0, #0x118] (enable SPI 208)
+            0xd2ac_0005, // mov x5, #0x60000000
+            0xf28a_1205, // movk x5, #0x5090 (TMR10)
+            0x52b0_0006, // mov w6, #0x80000000
+            0x7280_efe6, // movk w6, #0x77f (enabled, 100 us)
+            0xb900_00a6, // str w6, [x5]
+            0xd503_207f, // wfi
+            0xb940_0c48, // ldr w8, [x2, #0xc] (GICC_IAR)
+            0xd2b0_0207, // mov x7, #0x80100000
+            0xb900_00e8, // str w8, [x7]
+            0x52a0_0049, // mov w9, #0x20000
+            0x7280_0029, // movk w9, #1 (SGI 1 to core 1)
+            0xb90f_0009, // str w9, [x0, #0xf00] (GICD_SGIR)
+            0xd503_207f, // 1: wfi
+            0x17ff_ffff, // b 1b
+        ];
+        let core1: [u32; 9] = [
+            0xb900_0041, // str w1, [x2] (GICC_CTLR)
+            0x5280_1fe3, // mov w3, #0xff
+            0xb900_0443, // str w3, [x2, #4] (GICC_PMR)
+            0xd503_207f, // wfi
+            0xb940_0c48, // ldr w8, [x2, #0xc] (GICC_IAR)
+            0xd2b0_0207, // mov x7, #0x80100000
+            0xb900_04e8, // str w8, [x7, #4]
+            0xd503_207f, // 1: wfi
+            0x17ff_ffff, // b 1b
+        ];
+        for (k, (at, code)) in [(0usize, &core0[..]), (0x100, &core1[..])].into_iter().enumerate() {
+            for (i, w) in gic.iter().chain(code).enumerate() {
+                m.soc.ram[at + i * 4..at + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            m.cpus[k].pc = RAM_BASE + at as u64;
+            m.cpus[k].el = 1;
+            m.state[k] = CoreState::Run;
+        }
+        let word = |m: &Machine, o: usize| u32::from_le_bytes(m.soc.ram[o..o + 4].try_into().unwrap());
+        let start = std::time::Instant::now();
+        while word(&m, 0x10_0004) == 0 && start.elapsed().as_secs() < 10 {
+            m.run(1_000_000);
+        }
+        assert_eq!((word(&m, 0x10_0000), word(&m, 0x10_0004)), (208, 1), "the interrupts each core acknowledged");
+    }
+
     #[test]
     fn narrow_reads_of_the_sd_buffer_take_what_they_read() {
         let mut m = Machine::with_cpus(64 << 20, 1).unwrap();
