@@ -147,14 +147,14 @@ pub struct Worker {
     generation: u64,
     /// a shader wrote memory
     pub stored: bool,
-    /// compute's warps, kept from launch to launch (`Vec<Lanes<N>>`)
-    pub warps: Option<Box<dyn std::any::Any + Send>>,
+    /// compute's warps, kept from launch to launch (`Vec<Lanes<N>>`), of 16 and of 32 lanes
+    pub warps: [Option<Box<dyn std::any::Any + Send>>; 2],
 }
 
 impl Worker {
     fn new() -> Self {
         Self {
-            warps: None,
+            warps: [None, None],
             lanes: Lanes::new(),
             words: Box::new(std::array::from_fn(|_| std::array::from_fn(|_| Words::default()))),
             textures: Cache::default(),

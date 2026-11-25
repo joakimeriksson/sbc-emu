@@ -4,7 +4,7 @@
 use crate::smmu::{Group, Smmu};
 use crate::RAM_BASE;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
 
 /// An address space: what a channel's instance block (or a BAR's) says at 0x200.
@@ -72,17 +72,21 @@ impl Words for [u8] {
     }
 }
 
-impl Words for [AtomicU32] {
+impl Words for [AtomicU64] {
     fn size(&self) -> usize {
-        self.len() * 4
+        self.len() * 8
     }
     fn word(&self, o: usize) -> Option<u32> {
         if o % 4 != 0 {
             return None;
         }
-        self.get(o / 4).map(|w| w.load(Relaxed))
+        self.get(o / 8).map(|w| (w.load(Relaxed) >> (8 * (o % 8))) as u32)
     }
 }
+
+// (the byte lanes of the shared words are counted from the least significant)
+#[cfg(not(target_endian = "little"))]
+compile_error!("the GPU's shared RAM words assume a little-endian host");
 
 /// Offset in RAM of a GPU physical address.
 pub fn physical(pa: u64, smmu: &Smmu, ram: &[u8]) -> Option<usize> {
@@ -203,100 +207,90 @@ impl maxwell::Memory for View<'_> {
     }
 }
 
-/// RAM as words that several threads read and write at once. None if it is not word-aligned.
-fn atomic_words(ram: &mut [u8]) -> Option<&[AtomicU32]> {
-    if ram.as_ptr().align_offset(std::mem::align_of::<AtomicU32>()) != 0 {
+/// RAM as 64-bit words that several threads read and write at once (a naturally aligned 8-byte
+/// access is one atomic access, as on the GPU). None if it is not aligned for them.
+fn atomic_words(ram: &mut [u8]) -> Option<&[AtomicU64]> {
+    if ram.as_ptr().align_offset(std::mem::align_of::<AtomicU64>()) != 0 {
         return None;
     }
-    // SAFETY: AtomicU32 has the size and in-memory representation of u32, and the pointer is
+    // SAFETY: AtomicU64 has the size and in-memory representation of u64, and the pointer is
     // aligned for it (checked above). The slice borrows `ram` mutably for its whole lifetime, so
-    // every access to these bytes meanwhile is through the atomics (what `AtomicU32::from_mut_slice`
+    // every access to these bytes meanwhile is through the atomics (what `AtomicU64::from_mut_slice`
     // does, which is not stable yet).
-    Some(unsafe { std::slice::from_raw_parts(ram.as_mut_ptr().cast::<AtomicU32>(), ram.len() / 4) })
+    Some(unsafe { std::slice::from_raw_parts(ram.as_mut_ptr().cast::<AtomicU64>(), ram.len() / 8) })
 }
 
 /// Bytes of RAM at byte offset `at`, from the shared words. False if they are not all in RAM.
+/// An access within one word is one atomic load.
 #[inline(always)]
-fn load(ram: &[AtomicU32], at: usize, out: &mut [u8]) -> bool {
-    let Some(end) = at.checked_add(out.len()).filter(|&e| e <= ram.len() * 4) else {
+fn load(ram: &[AtomicU64], at: usize, out: &mut [u8]) -> bool {
+    if at.checked_add(out.len()).is_none_or(|e| e > ram.len() * 8) {
         return false;
-    };
-    // (what shaders load: a part of a word, or aligned words)
-    let word = |o: usize| ram[o / 4].load(Relaxed);
-    match out.len() {
-        1 => {
-            out[0] = (word(at) >> (8 * (at % 4))) as u8;
-            return true;
-        }
-        2 if at % 4 != 3 => {
-            *<&mut [u8; 2]>::try_from(out).unwrap() = ((word(at) >> (8 * (at % 4))) as u16).to_le_bytes();
-            return true;
-        }
-        4 if at % 4 == 0 => {
-            *<&mut [u8; 4]>::try_from(out).unwrap() = word(at).to_le_bytes();
-            return true;
-        }
-        8 if at % 4 == 0 => {
-            *<&mut [u8; 8]>::try_from(out).unwrap() = (word(at) as u64 | (word(at + 4) as u64) << 32).to_le_bytes();
-            return true;
-        }
-        _ => {}
     }
-    if at % 4 == 0 && out.len() % 4 == 0 {
-        for (o, w) in out.chunks_exact_mut(4).zip(&ram[at / 4..end / 4]) {
-            o.copy_from_slice(&w.load(Relaxed).to_le_bytes());
+    let word = |o: usize| ram[o / 8].load(Relaxed);
+    let (n, sh) = (out.len(), at % 8);
+    if n <= 8 && sh + n <= 8 {
+        let v = word(at) >> (8 * sh);
+        match n {
+            1 => out[0] = v as u8,
+            2 => *<&mut [u8; 2]>::try_from(out).unwrap() = (v as u16).to_le_bytes(),
+            4 => *<&mut [u8; 4]>::try_from(out).unwrap() = (v as u32).to_le_bytes(),
+            8 => *<&mut [u8; 8]>::try_from(out).unwrap() = v.to_le_bytes(),
+            _ => out.copy_from_slice(&v.to_le_bytes()[..n]),
         }
         return true;
     }
     let mut k = 0;
-    while k < out.len() {
-        let (o, sh) = ((at + k) / 4, (at + k) % 4);
-        let n = (4 - sh).min(out.len() - k);
+    while k < n {
+        let (o, sh) = ((at + k) / 8, (at + k) % 8);
+        let m = (8 - sh).min(n - k);
         let w = ram[o].load(Relaxed).to_le_bytes();
-        out[k..k + n].copy_from_slice(&w[sh..sh + n]);
-        k += n;
+        out[k..k + m].copy_from_slice(&w[sh..sh + m]);
+        k += m;
     }
     true
 }
 
-/// Writes bytes at byte offset `at` to the shared words: whole words with a store, parts of
-/// one by compare and swap (so that the word's other bytes keep what another thread wrote to
-/// them). False if they are not all in RAM.
+/// Writes the bytes `put` selects of `v` into a shared word: a store if it is all of them, else
+/// by compare and swap (so that the word's other bytes keep what another thread wrote to them).
 #[inline(always)]
-fn store(ram: &[AtomicU32], at: usize, data: &[u8]) -> bool {
-    if at.checked_add(data.len()).is_none_or(|e| e > ram.len() * 4) {
-        return false;
+fn put_word(word: &AtomicU64, v: u64, put: u64) {
+    if put == !0 {
+        word.store(v, Relaxed);
+    } else if put != 0 {
+        let _ = word.fetch_update(Relaxed, Relaxed, |x| Some(x & !put | v & put));
     }
-    if data.len() == 4 && at % 4 == 0 {
-        ram[at / 4].store(u32::from_le_bytes(data.try_into().unwrap()), Relaxed);
-        return true;
+}
+
+/// Writes bytes at byte offset `at` to the shared words, each word touched once. False if they
+/// are not all in RAM.
+#[inline(always)]
+fn store(ram: &[AtomicU64], at: usize, data: &[u8]) -> bool {
+    if at.checked_add(data.len()).is_none_or(|e| e > ram.len() * 8) {
+        return false;
     }
     let mut k = 0;
     while k < data.len() {
-        let (o, sh) = ((at + k) / 4, (at + k) % 4);
-        let n = (4 - sh).min(data.len() - k);
-        if n == 4 {
-            ram[o].store(u32::from_le_bytes(data[k..k + 4].try_into().unwrap()), Relaxed);
-        } else {
-            let mut b = [0u8; 4];
-            b[sh..sh + n].copy_from_slice(&data[k..k + n]);
-            let v = u32::from_le_bytes(b);
-            let mask = (u32::MAX >> (32 - 8 * n as u32)) << (8 * sh as u32);
-            let _ = ram[o].fetch_update(Relaxed, Relaxed, |w| Some(w & !mask | v));
-        }
+        let (o, sh) = ((at + k) / 8, (at + k) % 8);
+        let n = (8 - sh).min(data.len() - k);
+        let mut b = [0u8; 8];
+        b[sh..sh + n].copy_from_slice(&data[k..k + n]);
+        let put = (u64::MAX >> (64 - 8 * n as u32)) << (8 * sh as u32);
+        put_word(&ram[o], u64::from_le_bytes(b), put);
         k += n;
     }
     true
 }
 
 /// Memory as one of several threads sees it during a split (a compute launch's workgroups):
-/// RAM is shared, as words read and written atomically (relaxed), so each thread sees what the
-/// others wrote, and workgroups that write the same bytes at once (a race in the guest's
-/// program, as on the GPU) leave one of the values written in each of them. (A cache line of its
+/// RAM is shared, as 64-bit words read and written atomically (relaxed), so each thread sees what
+/// the others wrote, an aligned access of up to 8 bytes does not tear, and workgroups that write
+/// the same bytes at once (a race in the guest's program, as on the GPU) leave one of the values
+/// written in each of them. MEMBAR orders them (`exec`). (A cache line of its
 /// own: it is written as its thread goes from page to page.)
 #[repr(align(128))]
 struct Shared<'a> {
-    ram: &'a [AtomicU32],
+    ram: &'a [AtomicU64],
     smmu: &'a Smmu,
     mmu: Mmu,
     space: Space,
@@ -332,16 +326,16 @@ impl Shared<'_> {
     #[inline]
     fn read_run(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) -> bool {
         let Some((first, last, from)) = self.run(at, mask, n, false) else { return false };
-        let skip = from % 4;
-        let words = (skip + (last - first + 1) * n).div_ceil(4);
-        let Some(src) = self.ram.get(from / 4..from / 4 + words) else { return false };
+        let skip = from % 8;
+        let words = (skip + (last - first + 1) * n).div_ceil(8);
+        let Some(src) = self.ram.get(from / 8..from / 8 + words) else { return false };
         if last >= out.len() {
             return false;
         }
         // (16 bytes past the last lane's, so that every lane copies 16)
-        let mut buf = [0u8; 33 * 16 + 4];
+        let mut buf = [0u8; 33 * 16 + 8];
         for (k, w) in src.iter().enumerate() {
-            buf[4 * k..4 * k + 4].copy_from_slice(&w.load(Relaxed).to_le_bytes());
+            buf[8 * k..8 * k + 8].copy_from_slice(&w.load(Relaxed).to_le_bytes());
         }
         let mut m = mask;
         while m != 0 {
@@ -358,13 +352,13 @@ impl Shared<'_> {
     #[inline]
     fn write_run(&self, at: &[u64], mask: u32, n: usize, data: &[[u8; 16]]) -> bool {
         let Some((first, last, to)) = self.run(at, mask, n, true) else { return false };
-        let skip = to % 4;
-        let words = (skip + (last - first + 1) * n).div_ceil(4);
-        if to / 4 + words > self.ram.len() || last >= data.len() {
+        let skip = to % 8;
+        let words = (skip + (last - first + 1) * n).div_ceil(8);
+        if to / 8 + words > self.ram.len() || last >= data.len() {
             return false;
         }
-        let mut buf = [0u8; 33 * 16 + 8];
-        let mut put = [0u8; 33 * 16 + 8];
+        let mut buf = [0u8; 33 * 16 + 16];
+        let mut put = [0u8; 33 * 16 + 16];
         let mut m = mask;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -374,14 +368,9 @@ impl Shared<'_> {
             put[at..at + n].fill(0xff);
         }
         for k in 0..words {
-            let v = u32::from_le_bytes(buf[4 * k..4 * k + 4].try_into().unwrap());
-            let w = u32::from_le_bytes(put[4 * k..4 * k + 4].try_into().unwrap());
-            let word = &self.ram[to / 4 + k];
-            if w == !0 {
-                word.store(v, Relaxed);
-            } else if w != 0 {
-                let _ = word.fetch_update(Relaxed, Relaxed, |x| Some(x & !w | v & w));
-            }
+            let v = u64::from_le_bytes(buf[8 * k..8 * k + 8].try_into().unwrap());
+            let w = u64::from_le_bytes(put[8 * k..8 * k + 8].try_into().unwrap());
+            put_word(&self.ram[to / 8 + k], v, w);
         }
         true
     }
@@ -394,7 +383,7 @@ impl Shared<'_> {
             return Some(at);
         }
         let p = self.mmu.translate(self.space, va, self.smmu, self.ram)?;
-        if (write && !p.write) || p.offset + 0x1000 > self.ram.len() * 4 {
+        if (write && !p.write) || p.offset + 0x1000 > self.ram.len() * 8 {
             return None;
         }
         self.last.set((va >> 12, p.offset, p.write));
@@ -619,7 +608,7 @@ mod tests {
     }
 
     /// Threads that write bytes of the same words at once: every byte ends up as one thread
-    /// wrote it, and bytes nobody wrote keep their value.
+    /// wrote it, bytes nobody wrote keep their value, and 8-byte accesses do not tear.
     #[test]
     fn split_views_race_on_bytes() {
         use maxwell::Memory;
@@ -637,6 +626,11 @@ mod tests {
                             if round % 7 == 0 {
                                 view.write(0x0400_5114, &[k as u8; 4]);
                             }
+                            // an aligned 8-byte access is one: never half of one store and half of another
+                            view.write(0x0400_5118, &[k as u8 + 1; 8]);
+                            let mut b = [0u8; 8];
+                            view.read(0x0400_5118, &mut b);
+                            assert!(b.iter().all(|&x| x == b[0]), "torn: {b:?}");
                         }
                     });
                 }

@@ -218,11 +218,15 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
     let failed: Mutex<Option<String>> = Mutex::new(None);
     // run work until there is none left; each thread with its own lanes and shared memory
     let one = |worker: &mut pipe::Worker, mem: &mut dyn Memory| {
-        // the warps' registers, from the launch before if it had as many lanes
-        let mut lanes: Vec<Lanes<N>> = worker.warps.take().and_then(|w| w.downcast::<Vec<Lanes<N>>>().ok()).map_or_else(Vec::new, |w| *w);
+        // the warps' registers, kept from earlier launches of as many lanes. A launch starts as
+        // with new ones: `start` clears the registers the program uses (it reads no others) and
+        // the local memory is cleared here.
+        let slot = (N == 32) as usize;
+        let mut lanes: Vec<Lanes<N>> = worker.warps[slot].take().and_then(|w| w.downcast::<Vec<Lanes<N>>>().ok()).map_or_else(Vec::new, |w| *w);
         lanes.resize_with(batches, Lanes::new);
         for l in &mut lanes {
             l.set_local_size(launch.local);
+            l.clear_local();
         }
         let (_, mut common) = worker.parts(&work, mem);
         let mut shared = vec![0u8; launch.shared];
@@ -273,7 +277,7 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
                 break;
             }
         }
-        worker.warps = Some(Box::new(lanes));
+        worker.warps[slot] = Some(Box::new(lanes));
     };
     #[cfg(not(target_arch = "wasm32"))]
     if workers > 1 {
