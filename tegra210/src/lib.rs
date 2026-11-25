@@ -639,7 +639,13 @@ impl Machine {
     /// Plug a USB stick in.
     pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
         self.soc.usb.storage = Some(emu_core::usb::Storage::new(disk));
-        self.soc.xusb.attach(true);
+        self.soc.xusb.attach(true, self.soc.usb.camera.is_some());
+    }
+
+    /// Plug a USB webcam in.
+    pub fn attach_camera(&mut self, camera: emu_core::usb::Camera) {
+        self.soc.usb.camera = Some(camera);
+        self.soc.xusb.attach(self.soc.usb.storage.is_some(), true);
     }
 
     /// Put a card in the microSD slot.

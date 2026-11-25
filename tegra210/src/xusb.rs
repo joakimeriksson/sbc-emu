@@ -52,16 +52,19 @@ impl Default for Xusb {
         let mut xhci = Xhci::new(Layout { usb3: 0..4, usb2: 4..8 });
         xhci.ready = false;
         let mut s = Self { xhci, fpci: HashMap::new(), ipfs: HashMap::new(), csb: HashMap::new(), messages: 0 };
-        s.attach(false);
+        s.attach(false, false);
         s
     }
 }
 
 impl Xusb {
-    /// A keyboard and a tablet, and a USB stick on request.
-    pub fn attach(&mut self, stick: bool) {
-        // (the first USB 2 port is the micro-B connector: a device, not a host)
-        self.xhci.attach(&[None, stick.then_some(DevId::Storage), Some(DevId::Keyboard), Some(DevId::Tablet)]);
+    /// A keyboard and a tablet, and a USB stick and a webcam on request, on the USB 2 ports: the
+    /// first is the micro-B connector (a device, not a host), the keyboard is always on the
+    /// third; the camera takes the stick's port, or with a stick the tablet's.
+    pub fn attach(&mut self, stick: bool, camera: bool) {
+        let second = if stick { Some(DevId::Storage) } else { camera.then_some(DevId::Camera) };
+        let fourth = if stick && camera { DevId::Camera } else { DevId::Tablet };
+        self.xhci.attach(&[None, second, Some(DevId::Keyboard), Some(fourth)]);
     }
 
     /// The controller was held in reset, or its power was off: the firmware is gone.
@@ -148,6 +151,18 @@ impl Xusb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The devices' USB 2 ports: the micro-B port stays empty, the keyboard stays on the third;
+    /// the camera on the stick's port, or with a stick on the tablet's.
+    #[test]
+    fn ports_for_a_stick_and_a_camera() {
+        let mut x = Xusb::default();
+        assert_eq!(x.xhci.attached(), [DevId::Keyboard, DevId::Tablet]);
+        x.attach(false, true);
+        assert_eq!(x.xhci.attached(), [DevId::Camera, DevId::Keyboard, DevId::Tablet]);
+        x.attach(true, true);
+        assert_eq!(x.xhci.attached(), [DevId::Storage, DevId::Keyboard, DevId::Camera]);
+    }
 
     #[test]
     fn the_firmware_starts_and_the_mailbox_answers() {

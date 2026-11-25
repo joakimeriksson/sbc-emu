@@ -94,8 +94,13 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 // and the V3D 3D GPU next to it (dtoverlay=vc4-kms-v3d), unless --no-gpu
                 if !args.iter().any(|a| a == "--no-gpu") { m.soc.v3d = Some(v3d::V3d::new()); }
             }
-            // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern)
-            if args.iter().any(|a| a == "--camera") { m.soc.devs.camera = Some(bcm2711::usbdev::Camera::new()); ports.push(DevId::Camera); }
+            // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern); --camera-source SPEC: its
+            // pictures from the host (the Mac's camera, a video: cli/src/camera.rs)
+            if let Some(spec) = crate::arg(args, "--camera-source") {
+                let source = crate::camera::start(spec)?;
+                m.soc.devs.camera = Some(emu_core::usb::Camera::with_source(source));
+                ports.push(DevId::Camera);
+            } else if args.iter().any(|a| a == "--camera") { m.soc.devs.camera = Some(bcm2711::usbdev::Camera::new()); ports.push(DevId::Camera); }
             m.soc.pcie.xhci.attach(&ports);
         }
         let (k, i, c) = match (&kernel, disk.as_mut()) {
