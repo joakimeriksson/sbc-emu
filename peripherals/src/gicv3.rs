@@ -286,7 +286,7 @@ impl Gic {
 
 emu_core::snap_struct!(Line { group, enabled, pending, level, active, edge, priority });
 emu_core::snap_struct!(Pe { private, pmr, cpu_ctlr, group1, waker, sre, running } skip { cached });
-emu_core::snap_struct!(Gic { ctlr, route, cur, acknowledges } fixed { shared, pes } skip { ready, affinities } after |s| {
+emu_core::snap_struct!(Gic { ctlr, cur, acknowledges } fixed { shared, pes, route } skip { ready, affinities } after |s| {
     s.changed();
     if s.cur >= s.pes.len() { return Err(emu_core::snap::SnapError(format!("GIC: PE {} of {}", s.cur, s.pes.len()))); }
     Ok(())

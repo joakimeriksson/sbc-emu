@@ -75,9 +75,13 @@ struct Channel {
     semaphore: [u32; 4],
     legacy_semaphore: [u32; 3],
     packet: Option<Packet>,
+    /// Where an entry stopped (a semaphore acquire not yet satisfied, a fault): its push buffer and
+    /// the word to go on from, so that the methods before it do not run again.
+    resume: Option<(u64, u32)>,
 }
 
 /// The rest of a method packet: its data words still to come.
+#[derive(Clone, Copy)]
 struct Packet {
     mode: u32,
     sub: usize,
@@ -169,9 +173,14 @@ impl Host {
             if words > MAX_WORDS {
                 return None;
             }
+            let start = match channel.resume.take() {
+                Some((at, word)) if at == address && word < words => word,
+                _ => 0,
+            };
             channel.execute(
                 &mut memory,
                 address,
+                start,
                 words,
                 &mut self.nonstall_pending,
                 host1x,
@@ -202,12 +211,13 @@ impl Channel {
         &mut self,
         memory: &mut mmu::View,
         base: u64,
+        start: u32,
         words: u32,
         nonstall: &mut bool,
         host1x: &mut Host1x,
         trace: bool,
     ) -> Option<()> {
-        let mut index = 0;
+        let mut index = start;
         while index < words {
             let word = memory.load(base + u64::from(index) * 4)?;
             index += 1;
@@ -218,6 +228,9 @@ impl Channel {
                     .method(memory, packet.sub, method, word, nonstall, host1x, trace)
                     .is_none()
                 {
+                    // the next ring goes on with this word, in this packet
+                    self.packet = Some(packet);
+                    self.resume = Some((base, index - 1));
                     if trace {
                         eprintln!(
                             "[gpu] subchannel {} method {method:#x} value {word:#x} at word {} stopped",
@@ -253,7 +266,10 @@ impl Channel {
             let sub = (header >> 13 & 7) as usize;
             let method = (header & 0x1fff) * 4;
             if mode == 4 {
-                self.method(memory, sub, method, count, nonstall, host1x, trace)?;
+                if self.method(memory, sub, method, count, nonstall, host1x, trace).is_none() {
+                    self.resume = Some((base, index - 1));
+                    return None;
+                }
                 self.end_packet(memory, sub, trace)?;
                 continue;
             }
@@ -342,10 +358,13 @@ impl Channel {
                 } else {
                     let old = load(memory)?;
                     let signed = data >> 31 == 0;
+                    // a 32-bit semaphore's signed values are 32-bit ones
+                    let int = |v: u64| if wide { v as i64 } else { v as u32 as i32 as i64 };
+                    let narrow = |v: i64| if wide { v as u64 } else { u64::from(v as u32) };
                     match data >> 27 & 0xf {
-                        0 if signed => (old as i64).min(payload as i64) as u64,
+                        0 if signed => narrow(int(old).min(int(payload))),
                         0 => old.min(payload),
-                        1 if signed => (old as i64).max(payload as i64) as u64,
+                        1 if signed => narrow(int(old).max(int(payload))),
                         1 => old.max(payload),
                         2 => old ^ payload,
                         3 => old & payload,
@@ -454,7 +473,13 @@ impl Channel {
                     self.threed.written();
                 }
                 let result = match class {
-                    copy::CLASS => self.copy.method(method, data, memory),
+                    copy::CLASS => self.copy.method(method, data, memory).inspect(|_| {
+                        // LAUNCH_DMA's INTERRUPT_TYPE: the copy is done at once, so either kind
+                        // (blocking or not) arrives as the engine's non-stall interrupt
+                        if method == 0x300 && data >> 5 & 3 != 0 {
+                            *nonstall = true;
+                        }
+                    }),
                     compute::CLASS => self.compute.method(method, data, memory),
                     threed::CLASS => self.threed.method(method, data, memory),
                     twod::CLASS => self.twod.method(method, data, memory),

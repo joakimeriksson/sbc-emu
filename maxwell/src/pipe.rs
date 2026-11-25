@@ -685,7 +685,8 @@ pub fn work(t: &Threed, s: usize) -> Work {
         tsc: t.address(0x155c),
         // SM70 bound textures name their constant buffer: `index` is buffer << 14 | word
         tex_cb: if t.pipe.sm70 { u32::MAX } else { t.r(0x2608) },
-        linked: t.r(0x1234) & 1 != 0,
+        // SET_SAMPLER_BINDING (Kepler's TEX_MISC on Maxwell: left as it was)
+        linked: t.pipe.sm70 && t.r(0x1234) & 1 != 0,
     }
 }
 
