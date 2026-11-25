@@ -144,7 +144,8 @@ the core that hands it over and keeps the lock while it runs: the other cores go
 touch a device. A debugger's breakpoints, watchpoints and single steps run on one thread.
 
 YOLOv8n on the CPU (ncnn, four threads; `demos/jetson-yolo-cam`), host seconds per frame on an
-Apple M-series Mac shared with other jobs: 2.6 with one thread, 0.8 with a thread per core. On the GPU (NVK) both take about
+Apple M-series Mac shared with other jobs: 0.45 with one thread, 0.11 to 0.2 with a thread per
+core (the ncnn threads wait for each other, so a busy host shows). On the GPU (NVK) both take about
 2.5 s: the GPU's work is the frame. Detections are the same. The demo's own times are guest
 time, which with one thread counts instructions (1 ns each) and with a thread per core follows
 the host's clock.
