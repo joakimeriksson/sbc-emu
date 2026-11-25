@@ -7,8 +7,8 @@
 //! registers dirty before the access and its registers and base used after it; with the MMU on
 //! and a read-only page (stores refill, then take a Permission fault); and with a reservation
 //! held (in the granule stored to, or next to it). Registers, the base's writeback, memory,
-//! faults, the exclusive monitor and the instruction count must match, and the accesses that
-//! fit in a page must run natively.
+//! faults, the exclusive monitor and the instruction count must match, and on AArch64 hosts the
+//! accesses that fit in a page must run natively.
 use arm_a64::{jit, Cpu};
 use emu_core::{Core, FlatRam, Trap};
 
@@ -181,6 +181,9 @@ fn encodings() -> Vec<(u32, bool)> {
     v
 }
 
+/// The AArch64 backend compiles these instructions; elsewhere only the results are compared.
+const NATIVE: bool = cfg!(target_arch = "aarch64");
+
 #[test]
 fn structure_loads_and_stores_match_the_interpreter() {
     if !jit::available() { return; }
@@ -236,11 +239,12 @@ fn structure_loads_and_stores_match_the_interpreter() {
             if let Some(d) = differences(&i, &j) { bad.push(format!("{what}: {d}")); }
             if i.0.excl() != j.0.excl() { bad.push(format!("{what}: exclusive monitor: interp {:x?} jit {:x?}", i.0.excl(), j.0.excl())); }
             // inside one page and defined (no exception, a load's page readable or a store's
-            // writable): native, not the interpreter
+            // writable): native, not the interpreter (on AArch64 hosts: the x86-64 backend,
+            // `jit_x64.rs`, hands these instructions to the interpreter)
             let ro = env.mmu && (w >> 22) & 1 == 0 && addr + n > P + 0x1000;
             if fits && i.0.esr[1] == 0 && !ro {
                 defined += 1;
-                if calls == 0 { native += 1; } else { bad.push(format!("{what}: {calls} interpreter calls (not native)")); }
+                if calls == 0 { native += 1; } else if NATIVE { bad.push(format!("{what}: {calls} interpreter calls (not native)")); }
             }
             // the cases themselves: the end of RAM aborts, the MMU's read-only page faults stores
             if pi == 6 && i.0.esr[1] >> 26 != 0x25 && i.0.esr[1] >> 26 != 0 { bad.push(format!("{what}: no data abort past the end of RAM (ESR {:#x})", i.0.esr[1])); }
