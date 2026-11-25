@@ -34,7 +34,8 @@ SCRIPT
         cat "$work/boot.log"
         exit 1
     }
-if ! rg '^NVGPU_IOCTL_ STATUS=0' "$work/boot.log"; then
+if ! rg '^NVGPU_IOCTL_ STATUS=0[[:space:]]*$' "$work/boot.log" ||
+   ! rg 'GPU: 2 completed GPFIFO entries' "$work/boot.log"; then
     tail -40 "$work/boot.log"
     exit 1
 fi

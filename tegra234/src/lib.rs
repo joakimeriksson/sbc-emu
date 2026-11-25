@@ -417,6 +417,10 @@ impl Machine {
         self.soc
             .gic
             .set_line((gpu::GSP_STALL_SPI + 32) as usize, self.soc.gpu.stall_irq());
+        self.soc.gic.set_line(
+            (gpu::NONSTALL_SPI + 32) as usize,
+            self.soc.gpu.nonstall_irq(),
+        );
         for (core, (cpu, state)) in self.cpus.iter_mut().zip(&mut self.state).enumerate() {
             if *state == CoreState::Off {
                 continue;
@@ -889,6 +893,10 @@ mod tests {
         assert_ne!(runlist, copy_runlist);
         assert_eq!(soc.read32(reg(copy_runlist + 0x228)).unwrap() >> 24, 1);
         assert_eq!(soc.read32(reg(copy_runlist + 0x08)).unwrap() >> 16, 0);
+        for status in [0x040108, 0x040148, runlist + 0x220, copy_runlist + 0x220] {
+            soc.write32(reg(status), u32::MAX).unwrap();
+            assert_eq!(soc.read32(reg(status)), Ok(0));
+        }
 
         for base in [0x01f2_0000, 0x01e0_0000] {
             soc.write32(base + 0x10, 1).unwrap();

@@ -2,28 +2,37 @@
 use super::{copy, mmu};
 use std::collections::HashMap;
 
-// BAR0 apertures for the modeled copy runlist and the TU104-style doorbell.
+// Runlist and USERMODE register offsets within GA10B BAR0.
 pub(super) const RUNLIST: u64 = 0x800000;
 pub(super) const GR_RUNLIST: u64 = 0x804000;
 pub(super) const BASE_LO: u64 = RUNLIST + 0x80;
 pub(super) const BASE_HI: u64 = RUNLIST + 0x84;
 pub(super) const SUBMIT: u64 = RUNLIST + 0x88;
-pub(super) const DOORBELL: u64 = 0x030090;
+pub(super) const DOORBELL: u64 = 0xbb0090;
+pub(super) const LEGACY_DEMO_DOORBELL: u64 = 0x030090;
 const GP_GET: u64 = 0x88;
 const GP_PUT: u64 = 0x8c;
 const MAX_ENTRIES: u32 = 128;
 const MAX_WORDS: u32 = 8192;
 const PBDMA: u32 = 0x040000;
+const PBDMA_STRIDE: u64 = 0x800;
+const PBDMA_COUNT: u64 = 6;
 const CHANNEL_RAM: u32 = 0x900000;
 const VALID: u32 = 1 << 31;
 
 pub(super) fn read_config(offset: u64) -> Option<u32> {
+    if (u64::from(PBDMA)..u64::from(PBDMA) + PBDMA_COUNT * PBDMA_STRIDE).contains(&offset)
+        && matches!((offset - u64::from(PBDMA)) % PBDMA_STRIDE, 0x108 | 0x148)
+    {
+        // Write-one-to-clear status. The modeled PBDMAs have no pending faults.
+        return Some(0);
+    }
     if (GR_RUNLIST..GR_RUNLIST + 0x1000).contains(&offset) {
         return Some(match offset - GR_RUNLIST {
             0x04 => CHANNEL_RAM + 0x10000,
             0x08 => 1 << 16, // runlist ID 1
             0x10 => VALID | PBDMA,
-            0x14 | 0x204 | 0x228 => 0,
+            0x14 | 0x204 | 0x220 | 0x228 => 0,
             _ => return None,
         });
     }
@@ -31,9 +40,9 @@ pub(super) fn read_config(offset: u64) -> Option<u32> {
         0x04 => CHANNEL_RAM,
         0x08 => 0, // runlist ID 0
         0x10 => VALID | PBDMA,
-        0x14 => 0,        // no second PBDMA
-        0x204 => 1 << 16, // copy engine interrupt ID 1
-        0x228 => 1 << 24, // copy engine ID 1
+        0x14 | 0x220 => 0, // no second PBDMA
+        0x204 => 1 << 16,  // copy engine interrupt ID 1
+        0x228 => 1 << 24,  // copy engine ID 1
         _ => return None,
     })
 }
@@ -42,6 +51,7 @@ pub(super) fn read_config(offset: u64) -> Option<u32> {
 pub(super) struct Host {
     channels: HashMap<u32, Channel>,
     pub submissions: u64,
+    pub nonstall_pending: bool,
 }
 
 #[derive(Default)]
@@ -50,6 +60,7 @@ struct Channel {
     userd: u64,
     classes: [u32; 8],
     copy: copy::Copy,
+    semaphore: [u32; 4],
 }
 
 impl Host {
@@ -117,7 +128,7 @@ impl Host {
             if words > MAX_WORDS {
                 return None;
             }
-            channel.execute(&mut memory, address, words)?;
+            channel.execute(&mut memory, address, words, &mut self.nonstall_pending)?;
             get = (get + 1) & (entries - 1);
             memory.ram[get_offset..get_offset + 4].copy_from_slice(&get.to_le_bytes());
             self.submissions += 1;
@@ -127,7 +138,13 @@ impl Host {
 }
 
 impl Channel {
-    fn execute(&mut self, memory: &mut mmu::View, base: u64, words: u32) -> Option<()> {
+    fn execute(
+        &mut self,
+        memory: &mut mmu::View,
+        base: u64,
+        words: u32,
+        nonstall: &mut bool,
+    ) -> Option<()> {
         let mut index = 0;
         while index < words {
             let header = memory.load(base + u64::from(index) * 4)?;
@@ -137,7 +154,7 @@ impl Channel {
             let sub = (header >> 13 & 7) as usize;
             let mut method = (header & 0x1fff) * 4;
             if mode == 4 {
-                self.method(memory, sub, method, count)?;
+                self.method(memory, sub, method, count, nonstall)?;
                 continue;
             }
             if !matches!(mode, 1 | 3 | 5) || count > words - index {
@@ -146,7 +163,7 @@ impl Channel {
             for n in 0..count {
                 let data = memory.load(base + u64::from(index) * 4)?;
                 index += 1;
-                self.method(memory, sub, method, data)?;
+                self.method(memory, sub, method, data, nonstall)?;
                 if mode == 1 || (mode == 5 && n == 0) {
                     method += 4;
                 }
@@ -155,14 +172,28 @@ impl Channel {
         Some(())
     }
 
-    fn method(&mut self, memory: &mut mmu::View, sub: usize, method: u32, data: u32) -> Option<()> {
-        if method == 0 {
-            self.classes[sub] = data & 0xffff;
-            return Some(());
+    fn method(
+        &mut self,
+        memory: &mut mmu::View,
+        sub: usize,
+        method: u32,
+        data: u32,
+        nonstall: &mut bool,
+    ) -> Option<()> {
+        match method {
+            0 => self.classes[sub] = data & 0xffff,
+            0x20 => *nonstall = true,
+            0x5c..=0x68 => self.semaphore[((method - 0x5c) / 4) as usize] = data,
+            0x6c if matches!(data, 1 | 0x10_0001) => {
+                // nvgpu appends a host-class semaphore release to retire the job.
+                // Bit 20 requests idle, which the synchronous engine already guarantees.
+                let [lo, hi, payload, _] = self.semaphore;
+                let address = u64::from(lo) | u64::from(hi & 0xff) << 32;
+                memory.store(address, payload)?;
+            }
+            _ if self.classes[sub] == copy::CLASS => self.copy.method(method, data, memory)?,
+            _ => return None,
         }
-        if self.classes[sub] != copy::CLASS {
-            return None;
-        }
-        self.copy.method(method, data, memory)
+        Some(())
     }
 }

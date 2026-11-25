@@ -164,6 +164,9 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
         bpmp_nodes(&mut dt);
     }
     if machine.soc.gpu_node {
+        dt.begin("tegra-carveouts");
+        dt.str("compatible", "nvidia,carveouts-t19x");
+        dt.end();
         gpu_node(&mut dt);
     }
     if high_speed_uart && !bpmp {
