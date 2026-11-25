@@ -526,6 +526,21 @@ pub fn prmt(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
     }
 }
 
+/// The selector of PRMT's mode 0 (a nibble per result byte) that does what `sel` does in `mode`.
+pub fn prmt_bytes(sel: u32, mode: u8) -> u32 {
+    let s = sel & 3;
+    let n = |i: u32| match mode {
+        0 => sel >> (4 * i) & 15,
+        1 => i + s,
+        2 => (i + 8 - s) & 7,
+        3 => s,
+        4 => i.max(s),
+        5 => i.min(s),
+        _ => (i & 1) + (s & 1) * 2,
+    };
+    (0..4).fold(0, |r, i| r | n(i) << (4 * i))
+}
+
 fn shift(v: u32, n: u32, wrap: bool) -> Option<(u32, u32)> {
     if wrap {
         Some((v, n & 31))
@@ -1228,25 +1243,35 @@ pub fn run<const N: usize, H: Host<N>>(
                 l.put(d, m, v.map(|x| if not { x.count_zeros() } else { x.count_ones() }));
             }
             Op::Prmt { d, a, b, c, mode } => {
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-                // (the mode is known here, so each arm is a loop of shifts)
-                let mut r = [0u32; N];
-                macro_rules! each {
-                    ($mode:expr) => {
-                        for i in 0..N {
-                            r[i] = prmt(u[i], v[i], w[i], $mode);
+                let (u, w) = (l.gpr[a as usize], l.src(h, c));
+                let r: [u32; N] = match b {
+                    Src::Reg(rb) => {
+                        let v = l.gpr[rb as usize];
+                        // (the mode is known here, so each arm is a loop of shifts)
+                        match mode {
+                            0 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 0)),
+                            1 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 1)),
+                            2 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 2)),
+                            3 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 3)),
+                            4 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 4)),
+                            5 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 5)),
+                            _ => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 6)),
                         }
-                    };
-                }
-                match mode {
-                    0 => each!(0),
-                    1 => each!(1),
-                    2 => each!(2),
-                    3 => each!(3),
-                    4 => each!(4),
-                    5 => each!(5),
-                    _ => each!(6),
-                }
+                    }
+                    // the same selector in every lane: the shift of each byte, once
+                    _ => {
+                        let sel = prmt_bytes(l.src(h, b)[0], mode);
+                        if sel & 0x8888 == 0 {
+                            let sh: [u32; 4] = std::array::from_fn(|k| 8 * (sel >> (4 * k) & 7));
+                            std::array::from_fn(|i| {
+                                let x = u[i] as u64 | (w[i] as u64) << 32;
+                                (x >> sh[0]) as u32 & 0xff | ((x >> sh[1]) as u32 & 0xff) << 8 | ((x >> sh[2]) as u32 & 0xff) << 16 | ((x >> sh[3]) as u32) << 24
+                            })
+                        } else {
+                            std::array::from_fn(|i| prmt(u[i], sel, w[i], 0))
+                        }
+                    }
+                };
                 l.put(d, m, r);
             }
             Op::Sel { d, a, b, p } => {
@@ -2295,6 +2320,7 @@ mod tests {
             let (a, c, sel) = (next() as u32, next() as u32, next() as u32);
             for mode in 0..8 {
                 assert_eq!(prmt(a, sel, c, mode), reference(a, sel, c, mode), "{a:#x} {sel:#x} {c:#x} mode {mode}");
+                assert_eq!(prmt(a, super::prmt_bytes(sel, mode), c, 0), reference(a, sel, c, mode), "as mode 0: {a:#x} {sel:#x} {c:#x} mode {mode}");
             }
         }
     }
