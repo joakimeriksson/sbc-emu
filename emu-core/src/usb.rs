@@ -582,11 +582,17 @@ pub struct Camera {
     payload: Vec<u8>,
     poff: usize,
     pub frames: u64,
+    /// where the pictures come from (the host's camera, a video); none: a test pattern
+    source: Option<FrameSource>,
 }
 
-const CAM_W: usize = 640;
-const CAM_H: usize = 480;
-const CAM_FRAME: usize = CAM_W * CAM_H * 2;
+/// The latest picture from outside, 640x480 YUYV (`CAM_FRAME` bytes), for a camera to send; a
+/// host thread fills it.
+pub type FrameSource = std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>;
+
+pub const CAM_W: usize = 640;
+pub const CAM_H: usize = 480;
+pub const CAM_FRAME: usize = CAM_W * CAM_H * 2;
 const CAM_INTERVAL: u32 = 333_333; // 100 ns units: 30 fps
 const CAM_PAYLOAD: usize = 65_536;
 
@@ -594,9 +600,14 @@ impl Default for Camera { fn default() -> Self { Self::new() } }
 
 impl Camera {
     pub fn new() -> Self {
-        let mut c = Camera { st: Std::default(), probe: [0; 34], streaming: false, now: 0, next_frame: 0, frame: Vec::new(), sent: 0, fid: 0, payload: Vec::new(), poff: 0, frames: 0 };
+        let mut c = Camera { st: Std::default(), probe: [0; 34], streaming: false, now: 0, next_frame: 0, frame: Vec::new(), sent: 0, fid: 0, payload: Vec::new(), poff: 0, frames: 0, source: None };
         c.probe = Self::default_probe();
         c
+    }
+
+    /// A camera that sends the pictures `source` holds (the test pattern until the first comes).
+    pub fn with_source(source: FrameSource) -> Self {
+        Camera { source: Some(source), ..Self::new() }
     }
 
     fn default_probe() -> [u8; 34] {
@@ -613,8 +624,12 @@ impl Camera {
 
     pub fn set_time(&mut self, now: u64) { self.now = now; }
 
-    /// Colour bars, a white box moving across them, a grey ramp along the bottom.
+    /// The source's latest picture, or colour bars with a white box moving across them and a grey
+    /// ramp along the bottom.
     fn render(&self) -> Vec<u8> {
+        if let Some(f) = self.source.as_ref().and_then(|s| s.lock().ok().and_then(|f| f.clone())).filter(|f| f.len() == CAM_FRAME) {
+            return f;
+        }
         const BARS: [(u8, u8, u8); 8] = [(235, 128, 128), (210, 16, 146), (170, 166, 16), (145, 54, 34), (106, 202, 222), (81, 90, 240), (41, 240, 110), (16, 128, 128)];
         let mut f = vec![0u8; CAM_FRAME];
         let bx = (self.frames as usize * 8) % (CAM_W - 64);
@@ -744,4 +759,23 @@ impl UsbDevice for Camera {
     }
     fn has_input(&self) -> bool { self.streaming && (self.poff < self.payload.len() || !self.frame.is_empty() || self.now >= self.next_frame) }
     fn bus_reset(&mut self) { self.st = Std::default(); self.streaming = false; self.frame.clear(); self.payload.clear(); self.poff = 0; }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    use super::*;
+
+    /// A camera with a source sends the source's picture, and the test pattern until one comes.
+    #[test]
+    fn pictures_from_a_source() {
+        let source: FrameSource = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let cam = Camera::with_source(source.clone());
+        let pattern = Camera::new().render();
+        assert_eq!(cam.render(), pattern);
+        *source.lock().unwrap() = Some(vec![7; CAM_FRAME]);
+        assert_eq!(cam.render(), vec![7; CAM_FRAME]);
+        // a picture of the wrong size is not sent
+        *source.lock().unwrap() = Some(vec![7; 16]);
+        assert_eq!(cam.render(), pattern);
+    }
 }

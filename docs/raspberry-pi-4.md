@@ -132,7 +132,7 @@ More options, mostly after QEMU's:
   scratch copy of the image, e.g. one with Mesa and the GPU tests installed).
 - `--usb-drive IMAGE`: a USB stick (copy-on-write, like the SD card) on the third USB-A port;
   given with `--restore`, it is hot-plugged after the restore.
-- `--camera`: a USB webcam (UVC, 640×480 YUYV at 30 frames/s of guest time, a test pattern).
+- `--camera`: a USB webcam (UVC, 640×480 YUYV at 30 frames/s of guest time, a test pattern); `--camera-source avfoundation:N|v4l2:DEV|FILE` gives it the host's camera or a video through ffmpeg ([jetson-nano.md](jetson-nano.md#webcam)).
 - `--audio-out FILE.wav`: what the guest plays on the I²S DAC (`aplay`, `speaker-test`), as a
   16-bit stereo WAV.
 - `--otg-keyboard`: the keyboard on the USB-C (DWC2 OTG) port instead of the xHCI ports.

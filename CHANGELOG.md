@@ -19,6 +19,10 @@ in an earlier repository whose history was rewritten; it is summarised here with
 - Maxwell GPU: compute workgroups in 32-lane warps on several host threads (Mesa's OpenCL YOLOv8n
   54 -> 6.5 s per image); LEA, VADD, P2R, R2P and FCHK in the shader core.
 
+- USB webcam pictures from the host: `--camera-source avfoundation:N|v4l2:DEV|FILE` (through
+  ffmpeg) on the Raspberry Pi 4 and the Jetson Nano; the Jetson Nano gets `--camera`. A demo finds
+  objects in them with YOLOv8n on the emulated GPU (`demos/jetson-yolo-cam/`).
+
 ### Fixed
 
 - arm-a64: SEV/SEVL set an event register that the next WFE consumes (a `SEVL; WFE` lock with one

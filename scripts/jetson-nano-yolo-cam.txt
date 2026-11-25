@@ -1,0 +1,17 @@
+# YOLOv8n on the Jetson Nano's webcam (docs/jetson-nano.md#webcam): the demo set up on the card
+# (demos/jetson-yolo-cam/setup.sh), the camera fed from the host, boxes on the HDMI screen:
+#   sbc-emu run --board jetson-nano ...Debian's... --hdmi-mode 1280x720 \
+#     --camera-source cache/yolo-cam/street.mp4 --script scripts/jetson-nano-yolo-cam.txt
+# (--camera-source avfoundation:0 for the Mac's camera, with --vnc :1 to watch)
+wait-serial login:
+sleep 2
+serial root\r
+wait-serial Password:
+serial nano\r
+wait-serial ~#
+sleep 1
+serial sh /opt/yolo-cam/run.sh nvk --frames 8 2>&1 | grep '^frame'; echo YOLO_""DONE\r
+wait-serial frame 7:
+wait-serial YOLO_DONE
+screenshot out/jetson-nano-yolo-cam.png
+serial poweroff\r

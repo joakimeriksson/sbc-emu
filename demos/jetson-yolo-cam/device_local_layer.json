@@ -1,0 +1,3 @@
+{"file_format_version": "1.2.0", "layer": {"name": "VK_LAYER_SBC_uma", "type": "GLOBAL", "library_path": "./libdevice_local_layer.so",
+ "api_version": "1.3.0", "implementation_version": "1", "description": "mark memory DEVICE_LOCAL",
+ "functions": {"vkNegotiateLoaderLayerInterfaceVersion": "uma_NegotiateLoaderLayerInterfaceVersion", "vkGetInstanceProcAddr": "uma_GetInstanceProcAddr"}}}

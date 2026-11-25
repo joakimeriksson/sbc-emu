@@ -88,7 +88,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net", "--usb-drive", "--hdmi-mode", "--vnc", "--screenshot"])?;
+    // (--camera takes no value)
+    let valued: Vec<String> = args.iter().filter(|a| *a != "--camera").cloned().collect();
+    serial_board::validate_options(&valued, &["--dtb", "--dump-dtb", "--sd", "--smp", "--net", "--usb-drive", "--hdmi-mode", "--vnc", "--screenshot", "--camera-source"])?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = read(arg(args, "--kernel").ok_or("--kernel Image|vmlinuz is required")?)?;
     let dtb = read(arg(args, "--dtb").ok_or("--dtb tegra210-p3450-0000.dtb is required")?)?;
@@ -134,7 +136,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         if !announced.replace(true) {
             eprintln!(
                 "[jetson-nano] experimental Tegra X1: {smp} Cortex-A57 core(s) ({}), GIC-400, UART A, timers, clock/reset controller, PMC, \
-                 fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive), HDMI, the GM20B GPU; PSCI by the host; other devices are read-back stubs",
+                 fuses, I2C with the PMIC, GPIO, SD card, PCIe with the RTL8111H Ethernet controller, USB (keyboard, tablet, --usb-drive, --camera), HDMI, the GM20B GPU; PSCI by the host; other devices are read-back stubs",
                 crate::cpu_backend(jit)
             );
         }
@@ -144,6 +146,13 @@ fn execute(args: &[String]) -> Result<(), String> {
         // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
         if let Some(path) = arg(args, "--usb-drive") {
             m.attach_usb_drive(Box::new(crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?));
+        }
+        // --camera: a USB webcam (UVC, 640x480 YUYV: a test pattern); --camera-source SPEC: its
+        // pictures from the host (the Mac's camera, a video: cli/src/camera.rs)
+        if let Some(spec) = arg(args, "--camera-source") {
+            m.attach_camera(emu_core::usb::Camera::with_source(crate::camera::start(spec)?));
+        } else if args.iter().any(|a| a == "--camera") {
+            m.attach_camera(emu_core::usb::Camera::new());
         }
         if let Some(mode) = &hdmi {
             m.connect_monitor(mode);
