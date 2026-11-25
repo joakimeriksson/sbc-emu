@@ -547,6 +547,13 @@ macro_rules! common_host {
             self.common.stored = true;
             self.common.mem.write(addr, data);
         }
+        fn load_lanes(&mut self, at: &[u64; $n], mask: u32, n: usize, out: &mut [[u8; 16]; $n]) {
+            self.common.mem.read_lanes(at, mask, n, out);
+        }
+        fn store_lanes(&mut self, at: &[u64; $n], mask: u32, n: usize, data: &[[u8; 16]; $n]) {
+            self.common.stored = true;
+            self.common.mem.write_lanes(at, mask, n, data);
+        }
         fn texture(&mut self, op: &TexOp<{ $n }>) -> [[u32; $n]; 4] {
             self.common.texture(op)
         }

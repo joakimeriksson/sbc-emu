@@ -324,6 +324,41 @@ impl Shared<'_> {
 }
 
 impl maxwell::Memory for Shared<'_> {
+    fn read_lanes(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) {
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let va = at[i];
+            // (within a page, as nearly every access is)
+            let o = (va & 0xfff) as usize;
+            if o + n <= 0x1000 {
+                if let Some(p) = self.page(va, false) {
+                    if load(self.ram, p + o, &mut out[i][..n]) {
+                        continue;
+                    }
+                }
+            }
+            self.read(va, &mut out[i][..n]);
+        }
+    }
+    fn write_lanes(&mut self, at: &[u64], mask: u32, n: usize, data: &[[u8; 16]]) {
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let va = at[i];
+            let o = (va & 0xfff) as usize;
+            if o + n <= 0x1000 {
+                if let Some(p) = self.page(va, true) {
+                    if store(self.ram, p + o, &data[i][..n]) {
+                        continue;
+                    }
+                }
+            }
+            self.write(va, &data[i][..n]);
+        }
+    }
     #[inline]
     fn read(&self, mut va: u64, mut out: &mut [u8]) {
         while !out.is_empty() {

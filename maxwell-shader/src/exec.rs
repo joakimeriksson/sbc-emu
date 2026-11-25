@@ -2040,17 +2040,19 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
             }
         }
         Op::Ld { d, a, off, ty, wide } => {
+            // the warp's addresses, then one call for all of them
+            let at: [u64; N] = std::array::from_fn(|i| global(l, a, off, wide, i));
+            let mut buf = [[0u8; 16]; N];
+            h.load_lanes(&at, m, ty.bytes(), &mut buf);
             for i in lanes(m) {
-                let mut buf = [0; 16];
-                h.load(global(l, a, off, wide, i), &mut buf[..ty.bytes()]);
-                load(l, d, ty, i, &buf);
+                load(l, d, ty, i, &buf[i]);
             }
         }
         Op::St { r, a, off, ty, wide } => {
-            for i in lanes(m & !quiet) {
-                let buf = data(l, r, ty, i);
-                h.store(global(l, a, off, wide, i), &buf[..ty.bytes()]);
-            }
+            let m = m & !quiet;
+            let at: [u64; N] = std::array::from_fn(|i| global(l, a, off, wide, i));
+            let buf: [[u8; 16]; N] = std::array::from_fn(|i| if m >> i & 1 != 0 { data(l, r, ty, i) } else { [0; 16] });
+            h.store_lanes(&at, m, ty.bytes(), &buf);
         }
         Op::Ldl { d, a, off, ty } => {
             for i in lanes(m) {
