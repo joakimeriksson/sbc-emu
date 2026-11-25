@@ -11,11 +11,13 @@ mod fb;
 mod gr;
 mod gsp;
 mod host;
+mod mme;
 mod mmu;
 mod sass;
 mod threed;
 
 mod top;
+mod twod;
 
 pub const BAR0: u64 = 0x1700_0000;
 pub const BAR1: u64 = 0x1800_0000;

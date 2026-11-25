@@ -62,6 +62,11 @@ if (kind === 'cuda') {
   const output = serial.match(/^CUDA kernel output=0x24681357 status=0[ \t\r]*$/m);
   assert.ok(output, serial.slice(-4000));
   console.log(`Orin WASM Linux GPU: ${output[0].trim()}`);
+} else if (kind === 'egl') {
+  assert.match(serial, /^EGL_PROBE_ STATUS=0\s*$/m, serial.slice(-4000));
+  const pixel = serial.match(/^GL pixel: 255 0 0 255[ \t\r]*$/m);
+  assert.ok(pixel, serial.slice(-4000));
+  console.log(`Orin WASM Linux GPU: ${pixel[0].trim()}`);
 } else {
   assert.equal(kind, 'ioctl');
   assert.match(serial, /^NVGPU_IOCTL_ STATUS=0\s*$/m, serial.slice(-4000));
