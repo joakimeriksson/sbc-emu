@@ -171,7 +171,10 @@ impl State {
             eprintln!("[method] {sub} {:04x} {method:04x} {v:08x}", self.class[sub]);
         }
         if method >= 0x100 {
-            match self.class[sub] {
+            // subchannel 4 of a graphics channel is its copy engine (GRCE) even unbound: NVK
+            // sends copies there without binding a class (nouveau's GL driver binds 0xb0b5)
+            let class = if sub == 4 && self.class[sub] == 0 { 0xb0b5 } else { self.class[sub] };
+            match class {
                 0xb0b5 => {
                     if method == 0x300 {
                         self.engine.end(view);
