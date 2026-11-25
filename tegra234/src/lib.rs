@@ -4,6 +4,7 @@ mod bpmp;
 pub mod gpu;
 mod hsp;
 mod mc;
+mod mss_nvlink;
 mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -41,6 +42,7 @@ struct Soc {
     uart: Pl011,
     uarta: UartA,
     gpu: gpu::Gpu,
+    mss_nvlink: mss_nvlink::MssNvlink,
     gpu_node: bool,
     firmware: Option<Firmware>,
     now: u64,
@@ -63,6 +65,8 @@ impl Soc {
         } else if addr == APB_STRAPS {
             0
         } else if let Some(value) = mc::read(addr) {
+            value
+        } else if let Some(value) = self.mss_nvlink.read(addr) {
             value
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
@@ -107,6 +111,8 @@ impl Soc {
             {
                 firmware.hsp.ring_ccplex();
             }
+        } else if self.mss_nvlink.write(addr, value) {
+            return Ok(());
         } else if self.gpu_bar0_accessible(addr) {
             self.gpu.write(addr - gpu::BAR0, value, &mut self.ram);
         } else {
@@ -256,6 +262,7 @@ impl Machine {
             uart: Pl011::new(),
             uarta: UartA::new(high_speed_uart),
             gpu: gpu::Gpu::default(),
+            mss_nvlink: Default::default(),
             gpu_node: false,
             firmware: None,
             now: 0,
@@ -858,6 +865,43 @@ mod tests {
         assert_eq!(soc.read32(ring_result), Ok(0));
         assert_eq!(threaded.call(soc, 66, &[1, 35, 0], true), 0);
         assert_eq!(soc.read32(gpu::BAR0), Err(Fault::Unmapped));
+    }
+
+    #[test]
+    fn ga10b_engine_discovery_and_fecs_startup_use_consistent_hardware_state() {
+        let mut machine = Machine::new(256 << 20, 1).unwrap();
+        let soc = &mut machine.soc;
+        let reg = |offset| gpu::BAR0 + offset;
+
+        let discovery = soc.read32(reg(0x0224fc)).unwrap();
+        assert_eq!(discovery, (6 << 20) | 2);
+        let runlist = u64::from(soc.read32(reg(0x022808)).unwrap() & !0x3);
+        assert_eq!(soc.read32(reg(runlist + 0x10)).unwrap(), 0x8004_0000);
+        assert_eq!(soc.read32(reg(runlist + 0x268)).unwrap() >> 24, 1);
+
+        for base in [0x01f2_0000, 0x01e0_0000] {
+            soc.write32(base + 0x10, 1).unwrap();
+            assert_eq!(soc.read32(base + 0x10).unwrap(), 0);
+            soc.write32(base + 0x40, 3).unwrap();
+            assert_eq!(soc.read32(base + 0x40).unwrap(), 3);
+        }
+        soc.write32(reg(0x100cbc), 1 << 31).unwrap();
+        assert_eq!(soc.read32(reg(0x100cbc)).unwrap(), 0);
+        assert_ne!(soc.read32(reg(0x100c80)).unwrap() & (1 << 15), 0);
+
+        soc.write32(reg(0x41a610), 1).unwrap();
+        assert_eq!(soc.read32(reg(0x502610)).unwrap(), 1);
+        soc.write32(reg(0x409100), 2).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)).unwrap(), 0);
+        soc.write32(reg(0x409184), 0).unwrap();
+        soc.write32(reg(0x41a184), 0).unwrap();
+        soc.write32(reg(0x409100), 2).unwrap();
+        soc.write32(reg(0x41a100), 2).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)).unwrap(), 1);
+        soc.write32(reg(0x409504), 0x10).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)).unwrap(), 0x20_000);
+        soc.write32(reg(0x41a610), 0).unwrap();
+        assert_eq!(soc.read32(reg(0x409800)).unwrap(), 0);
     }
 
     #[test]

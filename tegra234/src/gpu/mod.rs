@@ -6,8 +6,11 @@
 use std::collections::HashMap;
 
 mod copy;
+mod fb;
+mod gr;
 mod host;
 mod mmu;
+mod top;
 
 pub const BAR0: u64 = 0x1700_0000;
 pub const BAR1: u64 = 0x1800_0000;
@@ -28,6 +31,8 @@ const RING_CONNECTIVITY_PASS: u32 = 1;
 
 pub struct Gpu {
     regs: HashMap<u64, u32>,
+    fb: fb::Fb,
+    gr: gr::Gr,
     host: host::Host,
     ring_started: bool,
     trace: bool,
@@ -37,6 +42,8 @@ impl Default for Gpu {
     fn default() -> Self {
         Self {
             regs: HashMap::new(),
+            fb: fb::Fb::default(),
+            gr: gr::Gr::default(),
             host: host::Host::default(),
             ring_started: false,
             trace: std::env::var_os("SBC_TRACE_GPU").is_some(),
@@ -52,7 +59,13 @@ impl Gpu {
             PTIMER_TIME_1 => (now >> 32) as u32,
             RING_COMMAND => 0, // The supported command completes on write.
             RING_START_RESULTS => u32::from(self.ring_started) * RING_CONNECTIVITY_PASS,
-            _ => self.regs.get(&offset).copied().unwrap_or(0),
+            _ => self
+                .fb
+                .read(offset)
+                .or_else(|| top::read(offset))
+                .or_else(|| host::read_config(offset))
+                .or_else(|| self.gr.read(offset))
+                .unwrap_or_else(|| self.regs.get(&offset).copied().unwrap_or(0)),
         };
         if self.trace && !matches!(offset, PTIMER_TIME_0 | PTIMER_TIME_1) {
             eprintln!("[gpu] read {offset:06x} = {value:08x}");
@@ -61,8 +74,11 @@ impl Gpu {
     }
 
     pub fn write(&mut self, offset: u64, value: u32, ram: &mut [u8]) {
-        if self.trace {
+        if self.trace && !gr::Gr::firmware_data_port(offset) {
             eprintln!("[gpu] write {offset:06x} <- {value:08x}");
+        }
+        if self.fb.write(offset, value) || self.gr.write(offset, value) {
+            return;
         }
         match offset {
             RING_COMMAND => {
@@ -82,14 +98,17 @@ impl Gpu {
                 }
             }
             0 | PTIMER_TIME_0 | PTIMER_TIME_1 | RING_START_RESULTS => {}
-            _ => {
+            _ if top::read(offset).is_none() && host::read_config(offset).is_none() => {
                 self.regs.insert(offset, value);
             }
+            _ => {}
         }
     }
 
     pub fn reset(&mut self) {
         self.regs.clear();
+        self.fb = fb::Fb::default();
+        self.gr = gr::Gr::default();
         self.host = host::Host::default();
         self.ring_started = false;
     }

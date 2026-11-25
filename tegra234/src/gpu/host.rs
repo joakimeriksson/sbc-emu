@@ -12,6 +12,22 @@ const GP_GET: u64 = 0x88;
 const GP_PUT: u64 = 0x8c;
 const MAX_ENTRIES: u32 = 128;
 const MAX_WORDS: u32 = 8192;
+const PBDMA: u32 = 0x040000;
+const CHANNEL_RAM: u32 = 0x900000;
+const VALID: u32 = 1 << 31;
+
+pub(super) fn read_config(offset: u64) -> Option<u32> {
+    Some(match offset.checked_sub(RUNLIST)? {
+        0x08 => 0, // runlist ID 0
+        0x04 => CHANNEL_RAM,
+        0x10 => VALID | PBDMA, // PBDMA 0, BAR0 base in bits 25:10
+        0x14 => 0,             // no second PBDMA
+        0x204 | 0x228 => 0,    // graphics interrupt and engine ID 0
+        0x244 => 1 << 16,      // copy engine interrupt ID 1
+        0x268 => 1 << 24,      // copy engine ID 1
+        _ => return None,
+    })
+}
 
 #[derive(Default)]
 pub(super) struct Host {

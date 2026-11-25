@@ -147,8 +147,8 @@ Tegra234 display-controller emulation remain separate milestones.
 
 ### Driver binding
 
-The probe fixture stages NVIDIA's R36.4.4 `nvgpu` and its dependencies in a
-second initramfs archive. The script verifies the `gk20a` driver symlink and
+The probe fixture stages NVIDIA's R36.4.4 `nvgpu`, dependencies, and GA10B
+firmware in a second initramfs archive. The script verifies the `gk20a` driver symlink and
 the `/dev/nvgpu/igpu0/power` character device. Building the fixture needs
 `bsdtar` with Zstandard support, `cpio`, and `shasum`.
 
@@ -161,10 +161,17 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb --gpu on \
   --script scripts/jetson-orin-nano-gpu-probe.txt --timeout 60
 ```
 
-The current model binds the driver with host1x syncpoints disabled. A write
-of `1` to the power device reaches BAR0 and completes privileged-ring startup.
-The driver reports a missing engine discovery table, and a subsequent write
-to the unmapped SoC address `0x01f20010` stalls power-on initialization.
+Use `scripts/jetson-orin-nano-gpu-power.txt` in the same command to exercise
+runtime power-on and print the kernel's result. The driver now initializes the
+internal GPU-to-memory links and discovers the modeled graphics and copy engines,
+which share one runlist and one push-buffer DMA descriptor. It completes the
+GMMU and framebuffer flush sequence, resets the graphics cluster, uploads FECS
+and GPCCS firmware, and receives the modeled context-size replies. [NVIDIA's internal memory-link sequence](https://github.com/OE4T/linux-nvgpu/blob/patches-rel-36/drivers/gpu/nvgpu/hal/mssnvlink/mssnvlink_ga10b.c)
+
+Power-on currently returns an error at GSP scheduler bootstrap because the GSP
+Falcon data-memory capacity and firmware protocol remain to be modeled. Host1x
+syncpoints are still disabled. The FECS size values reserve guest buffers for
+the modeled topology. Graphics context execution remains open.
 
 ### Jetson GPU parity
 

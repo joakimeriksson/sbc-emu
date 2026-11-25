@@ -1,0 +1,6 @@
+wait-serial TEGRA234_BOOT_OK
+serial for m in host1x mc-utils nvsciipc nvmap nvgpu; do insmod /modules/$m.ko || break; done; test -c /dev/nvgpu/igpu0/power && echo "NVGPU_" "BOUND"\r
+wait-serial NVGPU_ BOUND
+serial echo 1 > /dev/nvgpu/igpu0/power; result=$?; dmesg | tail -12; echo "NVGPU_POWER_" "STATUS=$result"\r
+wait-serial NVGPU_POWER_ STATUS=
+quit
