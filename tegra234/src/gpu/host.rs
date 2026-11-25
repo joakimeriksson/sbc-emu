@@ -152,6 +152,7 @@ impl Host {
         }
         let get_offset = mmu::physical(ram, get_addr, 4)?;
         let mut memory = mmu::View::from_instance(ram, channel.instance)?;
+        channel.threed.begin();
         for _ in 0..entries {
             if get == put {
                 return Some(());
@@ -175,6 +176,7 @@ impl Host {
                 host1x,
                 trace,
             )?;
+            channel.threed.flush(&mut memory)?;
             get = (get + 1) & (entries - 1);
             memory.ram[get_offset..get_offset + 4].copy_from_slice(&get.to_le_bytes());
             // The push-buffer GET pointers: drivers poll them to reuse push-buffer space.
@@ -282,6 +284,7 @@ impl Channel {
         memory: &mut mmu::View,
         host1x: &mut Host1x,
     ) -> Option<()> {
+        self.threed.flush(memory)?;
         // Operation, acquire TSG switch, release WFI, payload size, timestamp, reduction.
         if data & !0xfb10_1007 != 0 {
             return None;
@@ -408,6 +411,7 @@ impl Channel {
             0x08 | 0x24 => {} // Host NOP and framebuffer flush.
             0x10..=0x18 => self.legacy_semaphore[((method - 0x10) / 4) as usize] = data,
             0x1c if data & !0x0110_101f == 0 => {
+                self.threed.flush(memory)?;
                 let [hi, lo, payload] = self.legacy_semaphore;
                 let address = (u64::from(hi & 0xff) << 32) | u64::from(lo & !3);
                 match data & 0x1f {
@@ -443,6 +447,11 @@ impl Channel {
                     0 if sub == 4 => copy::CLASS,
                     class => class,
                 };
+                // Another engine sees what the 3D engine drew, and the 3D engine what it wrote.
+                if class != threed::CLASS {
+                    self.threed.flush(memory)?;
+                    self.threed.written();
+                }
                 let result = match class {
                     copy::CLASS => self.copy.method(method, data, memory),
                     compute::CLASS => self.compute.method(method, data, memory),

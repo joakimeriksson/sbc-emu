@@ -77,6 +77,81 @@ impl Program {
         Ok(Program { code, words, entry, gprs, jit: Default::default() })
     }
 
+    /// Decodes everything reachable from code address `entry` of SM70+ code (128-bit
+    /// instructions, no scheduling words). `fetch` returns the 64-bit word at a code address.
+    /// An instruction may become two operations; jumps go to the first of them. A convergence
+    /// barrier's meeting point (SSY) moves past the BSYNC (SYNC) at its label.
+    pub fn decode_sm70_at(
+        entry: u32,
+        fetch: &mut dyn FnMut(u32) -> Option<u64>,
+    ) -> Result<Program, String> {
+        use crate::decode_sm70::{decode, SIZE};
+        let mut found: BTreeMap<u32, (u128, Vec<Inst>)> = BTreeMap::new();
+        let mut work = vec![entry];
+        while let Some(mut addr) = work.pop() {
+            loop {
+                if found.contains_key(&addr) {
+                    break;
+                }
+                if found.len() >= MAX_INSTS {
+                    return Err(format!("program at {entry:#x} is too long"));
+                }
+                let lo = fetch(addr).ok_or_else(|| format!("no code at {addr:#x}"))?;
+                let hi = fetch(addr + 8).ok_or_else(|| format!("no code at {:#x}", addr + 8))?;
+                let raw = lo as u128 | (hi as u128) << 64;
+                let insts = decode(addr, raw);
+                let last = *insts.last().unwrap();
+                for inst in &insts {
+                    if let Some(t) = target(&inst.op) {
+                        work.push(t);
+                    }
+                }
+                found.insert(addr, (raw, insts));
+                if ends(&last) {
+                    break;
+                }
+                addr = addr.wrapping_add(SIZE);
+            }
+        }
+
+        let mut first = BTreeMap::new();
+        let mut n = 0u32;
+        for (&addr, (_, insts)) in &found {
+            first.insert(addr, n);
+            n += insts.len() as u32;
+        }
+        let index = |a: u32| first.get(&a).copied().ok_or(());
+        let mut code = Vec::with_capacity(n as usize);
+        let mut words = Vec::with_capacity(n as usize);
+        let mut gprs = 0;
+        for (&addr, (raw, insts)) in &found {
+            for &inst in insts {
+                let mut inst = inst;
+                if let Op::Bra { t, .. }
+                | Op::Cal { t }
+                | Op::Pret { t }
+                | Op::Ssy { t }
+                | Op::Pbk { t }
+                | Op::Pcnt { t } = &mut inst.op
+                {
+                    *t = index(*t).map_err(|_| format!("jump at {addr:#x} to {t:#x}"))?;
+                }
+                gprs = gprs.max(highest_reg(&inst.op));
+                code.push(inst);
+                words.push((addr, *raw as u64));
+            }
+        }
+        for k in 0..code.len() {
+            if let Op::Ssy { t } = code[k].op {
+                if matches!(code.get(t as usize).map(|i| i.op), Some(Op::Sync { .. })) {
+                    code[k].op = Op::Ssy { t: t + 1 };
+                }
+            }
+        }
+        let entry = index(entry).map_err(|_| "no entry".to_string())?;
+        Ok(Program { code, words, entry, gprs, jit: Default::default() })
+    }
+
     /// Decodes a program at address 0 of `code`.
     pub fn decode(code: &[u8]) -> Result<Program, String> {
         Self::decode_at(0, &mut |a| {

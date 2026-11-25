@@ -89,10 +89,14 @@ impl Copy {
         {
             return None;
         }
+        // Origins: the packed SET_*_ORIGIN of older classes plus the 32-bit *_ORIGIN_X/Y.
         let block = |base: u32, element: u64| {
             let shape = self.r(base);
             let unit = if remap { element } else { 1 };
             let origin = self.r(base + 0x14);
+            let wide = if base == 0x728 { 0x744 } else { 0x74c };
+            let origin_x = u64::from(origin & 0xffff) + u64::from(self.r(wide));
+            let origin_y = u64::from(origin >> 16) + u64::from(self.r(wide + 4));
             let block = Block {
                 width: u64::from(self.r(base + 4)) * unit,
                 height: u64::from(self.r(base + 8)),
@@ -100,11 +104,10 @@ impl Copy {
                 gobs_h: shape >> 4 & 15,
                 gobs_d: shape >> 8 & 15,
             };
-            let origin_x = u64::from(origin & 0xffff) * unit;
             (
                 block,
-                origin_x,
-                u64::from(origin >> 16),
+                origin_x * unit,
+                origin_y,
                 u64::from(self.r(base + 0x10)),
             )
         };

@@ -108,6 +108,23 @@ impl Threed {
     }
 
     /// An address in two registers (high, low).
+    /// With a lower-left window origin (SET_WINDOW_ORIGIN, which the NVIDIA driver uses; nouveau
+    /// flips the viewport instead), the height window y counts down from.
+    pub fn window_flip(&self) -> Option<u32> {
+        (self.r(0x13ac) & 1 != 0).then(|| (self.r(0xff8) & 0xffff) + (self.r(0xff8) >> 16))
+    }
+
+    /// A vertical scissor register (max << 16 | min) in window rows.
+    pub fn vertical(&self, v: u32) -> u32 {
+        match self.window_flip() {
+            Some(h) => {
+                let (min, max) = (v & 0xffff, v >> 16);
+                h.saturating_sub(max) | h.saturating_sub(min) << 16
+            }
+            None => v,
+        }
+    }
+
     pub fn address(&self, m: u32) -> u64 {
         ((self.r(m) & 0xff) as u64) << 32 | self.r(m + 4) as u64
     }
@@ -327,11 +344,16 @@ impl Threed {
         let layer = v >> 10 & 0xffff;
         let mut rect = targets.rect();
         let flags = self.r(0x10f8);
+        // CLEAR_CONTROL.USE_CLEAR_RECT (the NVIDIA driver's; nouveau sets the screen scissor)
+        if flags & 0x10 != 0 {
+            rect = rect.and(self.r(0xd6c), self.vertical(self.r(0xd70)));
+        }
         if flags & 0x100 != 0 && self.r(0xe00) & 1 != 0 {
-            rect = rect.and(self.r(0xe04), self.r(0xe08));
+            rect = rect.and(self.r(0xe04), self.vertical(self.r(0xe08)));
         }
         if flags & 0x1000 != 0 {
-            rect = rect.and(self.r(0xc00).wrapping_add(self.r(0xc00) << 16), self.r(0xc04).wrapping_add(self.r(0xc04) << 16));
+            let vertical = self.r(0xc04).wrapping_add(self.r(0xc04) << 16);
+            rect = rect.and(self.r(0xc00).wrapping_add(self.r(0xc00) << 16), self.vertical(vertical));
         }
         if rect.empty() {
             return;
@@ -355,7 +377,9 @@ impl Threed {
             if let Some((surface, format)) = targets.zeta {
                 let depth = (v & 1 != 0 && format.has_depth()).then(|| self.f(0xd90));
                 let stencil = (v & 2 != 0 && format.has_stencil()).then(|| self.r(0xda0) as u8);
-                crate::rop::clear_zeta(&surface, &format, depth, stencil, 0xff, rect, layer, mem);
+                // CLEAR_CONTROL.RESPECT_STENCIL_MASK: the front stencil write mask applies
+                let write = if flags & 1 != 0 { self.r(0x139c) as u8 } else { 0xff };
+                crate::rop::clear_zeta(&surface, &format, depth, stencil, write, rect, layer, mem);
             }
         }
     }
@@ -368,7 +392,11 @@ impl Threed {
     fn draw_indexed(&mut self, first: u32, count: u32, mem: &mut dyn Memory) {
         let size = self.r(0x17d8) & 3;
         let at = self.address(0x17c8) + ((first as u64) << size);
-        let limit = self.address(0x17d0);
+        let limit = if self.pipe.sm70 {
+            (self.address(0x17c8) + self.address(0x238)).wrapping_sub(1)
+        } else {
+            self.address(0x17d0)
+        };
         let count = count.min(((limit + 1).saturating_sub(at) >> size) as u32);
         let list = crate::vertex::indices(at, size, count as usize, mem);
         self.draw(crate::pipe::Indices::List(&list), mem);

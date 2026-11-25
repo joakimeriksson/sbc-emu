@@ -83,22 +83,27 @@ cp "$work/packages/usr/share/glvnd/egl_vendor.d/10_nvidia.json" "$work/root/usr/
 rustc_path=$(rustup which rustc)
 rustlib=$("$rustc_path" --print sysroot)/lib
 lld="$rustlib/rustlib/$("$rustc_path" -vV | sed -n 's/^host: //p')/bin/rust-lld"
-"${CLANG:-clang}" --target=aarch64-linux-gnu -fPIE -O2 -Wall -Wextra -Werror \
-    -c tests/gpu/orin/egl.c -o "$work/egl.o"
-DYLD_LIBRARY_PATH="$rustlib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-LD_LIBRARY_PATH="$rustlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    "$lld" -flavor gnu -m aarch64elf -pie --dynamic-linker /lib/ld-linux-aarch64.so.1 \
-    "$usr_lib/Scrt1.o" "$usr_lib/crti.o" "$work/egl.o" "$usr_lib/crtn.o" \
-    -L "$lib" -l:libc.so.6 -o "$work/root/egl-probe"
+for probe in egl triangle; do
+    "${CLANG:-clang}" --target=aarch64-linux-gnu -fPIE -O2 -Wall -Wextra -Werror \
+        -c "tests/gpu/orin/$probe.c" -o "$work/$probe.o"
+    DYLD_LIBRARY_PATH="$rustlib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+    LD_LIBRARY_PATH="$rustlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$lld" -flavor gnu -m aarch64elf -pie --dynamic-linker /lib/ld-linux-aarch64.so.1 \
+        "$usr_lib/Scrt1.o" "$usr_lib/crti.o" "$work/$probe.o" "$usr_lib/crtn.o" \
+        -L "$lib" -l:libc.so.6 -o "$work/root/$probe-probe"
+done
 (cd "$work/root" && find . | LC_ALL=C sort | cpio -o -H newc -R 0:0 > "$work/egl.cpio")
 gzip -n "$work/egl.cpio"
 cat "$fixture/probe-initramfs.cpio.gz" "$work/egl.cpio.gz" > "$work/initramfs.cpio.gz"
+cp "$work/initramfs.cpio.gz" "$fixture/egl-initramfs.cpio.gz"
 
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
     -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/egl.txt"
 printf 'serial /egl-probe; echo "EGL_PROBE_" "STATUS=$?"\\r\n' >> "$work/egl.txt"
-printf 'wait-serial EGL_PROBE_ STATUS=\nquit\n' >> "$work/egl.txt"
+printf 'wait-serial EGL_PROBE_ STATUS=\n' >> "$work/egl.txt"
+printf 'serial /triangle-probe; echo "TRIANGLE_PROBE_" "STATUS=$?"\\r\n' >> "$work/egl.txt"
+printf 'wait-serial TRIANGLE_PROBE_ STATUS=\nquit\n' >> "$work/egl.txt"
 
 if [ "${SBC_ORIN_WASM:-0}" = 1 ]; then
     node tests/gpu/orin/wasm-linux.mjs "$fixture/Image" "$work/initramfs.cpio.gz" "$work/egl.txt" egl
@@ -112,7 +117,8 @@ fi
         exit 1
     }
 grep -E '^eglInitialize=1 version=1\.5|^eglCreateContext=0x|^GL renderer: NVIDIA Tegra Orin|^GL pixel: 255 0 0 255[[:space:]]*$' "$work/boot.log"
-grep -E '^EGL_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
+grep -E '^triangle (inside: 0 255 0 255|outside: 255 0 0 255)[[:space:]]*$' "$work/boot.log"
+grep -E '^EGL_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" && grep -E '^TRIANGLE_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
     tail -50 "$work/boot.log"
     exit 1
 }

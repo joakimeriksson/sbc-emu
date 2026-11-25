@@ -108,6 +108,53 @@ impl<'a> View<'a> {
     }
 }
 
+/// Guest memory through the GPU page tables for the Tegra210 engines, which take `maxwell::Memory`.
+/// A fault reads zeros and drops writes; `ok` reports whether one happened.
+pub(super) struct Guest<'a, 'b> {
+    view: &'a mut View<'b>,
+    fault: std::cell::Cell<bool>,
+}
+
+impl<'a, 'b> Guest<'a, 'b> {
+    pub fn new(view: &'a mut View<'b>) -> Self {
+        Self {
+            view,
+            fault: Default::default(),
+        }
+    }
+
+    pub fn ok(&self) -> Option<()> {
+        (!self.fault.get()).then_some(())
+    }
+}
+
+impl maxwell::Memory for Guest<'_, '_> {
+    fn read(&self, mut address: u64, mut out: &mut [u8]) {
+        while !out.is_empty() {
+            let n = out.len().min(4096 - (address as usize & 4095));
+            let source = self
+                .view
+                .translate(address, false)
+                .and_then(|physical_address| physical(self.view.ram, physical_address, n));
+            match source {
+                Some(offset) => out[..n].copy_from_slice(&self.view.ram[offset..offset + n]),
+                None => {
+                    out[..n].fill(0);
+                    self.fault.set(true);
+                }
+            }
+            address += n as u64;
+            out = &mut out[n..];
+        }
+    }
+
+    fn write(&mut self, address: u64, data: &[u8]) {
+        if self.view.write(address, data).is_none() {
+            self.fault.set(true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
