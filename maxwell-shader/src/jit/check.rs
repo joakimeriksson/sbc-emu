@@ -1,13 +1,14 @@
 //! Random blocks against the interpreter: `check` runs them with the backend where there is
-//! one (the browser build exports it for tools/wasm-shader-jit-check.mjs), else with `eval`.
+//! one (the browser build exports it for tools/wasm-shader-jit-check.mjs; natively the AArch64
+//! code), else with `eval`; `check_lanes` does the same for 32 lanes.
 use super::*;
-use crate::exec::{run, Exit, Lanes};
+use crate::exec::{all, run, Exit, Lanes};
 use crate::host::Host;
 use std::collections::BTreeMap;
 
 pub struct Cb;
 
-impl Host<LANES> for Cb {
+impl<const N: usize> Host<N> for Cb {
     fn cbuf(&self, index: u32, offset: u32) -> u32 {
         word(index as u64 * 7919 + offset as u64)
     }
@@ -117,14 +118,17 @@ fn separator(r: &mut Rng) -> u64 {
 }
 
 /// Random registers and predicates.
-fn randomize(l: &mut Lanes<LANES>, r: &mut Rng) {
+fn randomize<const N: usize>(l: &mut Lanes<N>, r: &mut Rng) {
     for k in 0..255 {
-        for i in 0..LANES {
+        for i in 0..N {
             l.gpr[k][i] = word(r.next());
         }
     }
     for k in 0..7 {
         l.pred[k] = r.next() as u32;
+    }
+    for k in 0..4 {
+        l.cc[k] = r.next() as u32;
     }
 }
 
@@ -132,6 +136,18 @@ fn randomize(l: &mut Lanes<LANES>, r: &mut Rng) {
 /// Every fourth case is a program of several blocks run by `exec::run` with the JIT on and off
 /// (on where there is a backend).
 pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String> {
+    check_lanes::<LANES>(seed, cases)
+}
+
+/// Whether a backend runs code for `n` lanes here.
+fn compiled(n: usize) -> bool {
+    lanes_ok(n) && (cfg!(target_arch = "wasm32") || NATIVE)
+}
+
+/// `check` with `N` lanes.
+pub fn check_lanes<const N: usize>(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String> {
+    // (it turns the JIT off and on: no other check at the same time)
+    let _switch = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
     let mut r = Rng(seed | 1);
     let tops = opcodes();
     let mut ops = BTreeMap::new();
@@ -139,7 +155,7 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
     let sep = separator(&mut r);
     for case in 0..cases {
         if case % 4 == 3 {
-            several(&mut r, &tops, sep, case, was)?;
+            several::<N>(&mut r, &tops, sep, case, was)?;
             continue;
         }
         let n = 2 + (r.next() % 8) as usize;
@@ -152,18 +168,18 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
         for inst in &p.code[..n] {
             *ops.entry(kind(&inst.op)).or_insert(0) += 1;
         }
-        let mut l = Lanes::<LANES>::new();
-        let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & 0xffff | 1 } else { 0xffff };
+        let mut l = Lanes::<N>::new();
+        let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & all::<N>() | 1 } else { all::<N>() };
         l.start(&p, lanes, 0);
         randomize(&mut l, &mut r);
-        let (mut gpr, mut pred) = (l.gpr.clone(), l.pred);
+        let (mut gpr, mut pred, mut cc) = (l.gpr.clone(), l.pred, l.cc);
         let mut frame = Frame::default();
-        code.fill(0, &mut frame, |i, o| Host::<LANES>::cbuf(&Cb, i, o));
-        if !code.run(0, &mut gpr, &mut pred, &mut frame, lanes) {
-            if cfg!(target_arch = "wasm32") {
+        code.fill(0, &mut frame, |i, o| Host::<N>::cbuf(&Cb, i, o));
+        if !code.run(0, &mut gpr, &mut pred, &mut cc, &mut frame, lanes) {
+            if compiled(N) {
                 return Err(format!("case {case}: the compiled code did not run"));
             }
-            eval(&code.blocks[0], &mut gpr, &mut pred, &frame.cb, lanes);
+            eval(&code.blocks[0], &mut gpr, &mut pred, &mut cc, &frame.cb, lanes);
         }
         // the interpreter alone
         set_enabled(false);
@@ -180,7 +196,7 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
             }
         }
         // (bits of lanes that do not exist are left as they were by both)
-        if pred.map(|p| p & 0xffff) != l.pred.map(|p| p & 0xffff) {
+        if pred.map(|p| p & all::<N>()) != l.pred.map(|p| p & all::<N>()) || cc.map(|p| p & all::<N>()) != l.cc.map(|p| p & all::<N>()) {
             return Err(format!("case {case}: predicates {pred:08x?}\n    interpreter {:08x?}\n{}", l.pred, text()));
         }
     }
@@ -188,7 +204,7 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
 }
 
 /// A program of two to four blocks with POPC between them, run whole with the JIT and without.
-fn several(r: &mut Rng, tops: &[Vec<u64>], sep: u64, case: usize, was: bool) -> Result<(), String> {
+fn several<const N: usize>(r: &mut Rng, tops: &[Vec<u64>], sep: u64, case: usize, was: bool) -> Result<(), String> {
     let mut ins = Vec::new();
     for k in 0..2 + r.next() % 3 {
         if k > 0 {
@@ -199,8 +215,8 @@ fn several(r: &mut Rng, tops: &[Vec<u64>], sep: u64, case: usize, was: bool) -> 
         }
     }
     let p = Program::decode(&assemble(&ins)).map_err(|e| format!("case {case}: {e}"))?;
-    let mut a = Lanes::<LANES>::new();
-    let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & 0xffff | 1 } else { 0xffff };
+    let mut a = Lanes::<N>::new();
+    let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & all::<N>() | 1 } else { all::<N>() };
     a.start(&p, lanes, 0);
     randomize(&mut a, r);
     let mut b = a.clone();
@@ -211,7 +227,7 @@ fn several(r: &mut Rng, tops: &[Vec<u64>], sep: u64, case: usize, was: bool) -> 
     set_enabled(false);
     let e2 = run(&p, &mut b, &mut Cb, &mut f2);
     set_enabled(was);
-    if cfg!(target_arch = "wasm32") && runs() == before {
+    if compiled(N) && runs() == before {
         return Err(format!("case {case}: no compiled block ran"));
     }
     let text = || p.code.iter().map(|i| format!("{i:?}")).collect::<Vec<_>>().join("\n");
@@ -223,7 +239,7 @@ fn several(r: &mut Rng, tops: &[Vec<u64>], sep: u64, case: usize, was: bool) -> 
             return Err(format!("case {case}: R{k} {:08x?}\n    interpreter {:08x?}\n{}", a.gpr[k], b.gpr[k], text()));
         }
     }
-    if a.pred.map(|p| p & 0xffff) != b.pred.map(|p| p & 0xffff) {
+    if a.pred.map(|p| p & all::<N>()) != b.pred.map(|p| p & all::<N>()) || a.cc.map(|p| p & all::<N>()) != b.cc.map(|p| p & all::<N>()) {
         return Err(format!("case {case}: predicates {:08x?}\n    interpreter {:08x?}\n{}", a.pred, b.pred, text()));
     }
     Ok(())

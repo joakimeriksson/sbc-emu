@@ -54,14 +54,12 @@ pub struct Lanes<const N: usize> {
     /// Predicates, one bit per lane; predicate 7 is all ones.
     pub pred: [u32; 8],
     /// Flags, one bit per lane.
-    zero: u32,
-    sign: u32,
-    carry: u32,
-    overflow: u32,
+    /// Condition flags, one bit per lane: zero, sign, carry, overflow.
+    pub(crate) cc: [u32; 4],
     local: Vec<u8>,
     local_size: usize,
-    pc: u32,
-    active: u32,
+    pub(crate) pc: u32,
+    pub(crate) active: u32,
     start: u32,
     exited: u32,
     killed: u32,
@@ -72,7 +70,7 @@ pub struct Lanes<const N: usize> {
     /// Registers the last program may have written (the ones `start` clears for the next).
     written: usize,
     /// What the JIT's blocks read (kept to reuse its memory).
-    frame: crate::jit::Frame,
+    pub(crate) frame: crate::jit::Frame,
 }
 
 /// All N lanes.
@@ -97,10 +95,7 @@ impl<const N: usize> Lanes<N> {
         Lanes {
             gpr: gpr.try_into().unwrap(),
             pred: [0, 0, 0, 0, 0, 0, 0, !0],
-            zero: 0,
-            sign: 0,
-            carry: 0,
-            overflow: 0,
+            cc: [0; 4],
             local: Vec::new(),
             local_size: 0,
             pc: 0,
@@ -140,7 +135,7 @@ impl<const N: usize> Lanes<N> {
         self.gpr[..n.max(self.written)].fill([0; N]);
         self.written = n;
         self.pred = [0, 0, 0, 0, 0, 0, 0, !0];
-        (self.zero, self.sign, self.carry, self.overflow) = (0, 0, 0, 0);
+        self.cc = [0; 4];
         self.pc = p.entry;
         self.start = lanes & all::<N>();
         self.active = self.start;
@@ -274,20 +269,20 @@ impl<const N: usize> Lanes<N> {
 
     /// Sets zero and sign, clears carry and overflow.
     fn flags(&mut self, m: u32, z: u32, s: u32) {
-        self.zero = self.zero & !m | z & m;
-        self.sign = self.sign & !m | s & m;
-        self.carry &= !m;
-        self.overflow &= !m;
+        self.cc[0] = self.cc[0] & !m | z & m;
+        self.cc[1] = self.cc[1] & !m | s & m;
+        self.cc[2] &= !m;
+        self.cc[3] &= !m;
     }
 
     fn flags_co(&mut self, m: u32, c: u32, o: u32) {
-        self.carry = self.carry & !m | c & m;
-        self.overflow = self.overflow & !m | o & m;
+        self.cc[2] = self.cc[2] & !m | c & m;
+        self.cc[3] = self.cc[3] & !m | o & m;
     }
 
     /// Lanes whose flags satisfy a flow condition.
     fn test(&self, cond: u8) -> u32 {
-        let (z, s) = (self.zero, self.sign);
+        let (z, s) = (self.cc[0], self.cc[1]);
         match cond {
             15 => !0,
             0..=14 => {
@@ -306,14 +301,14 @@ impl<const N: usize> Lanes<N> {
                 }
                 r
             }
-            16 => !self.overflow,
-            17 => !self.carry,
+            16 => !self.cc[3],
+            17 => !self.cc[2],
             18 => !s,
-            19 => !self.carry | z,
-            20 => self.carry & !z,
+            19 => !self.cc[2] | z,
+            20 => self.cc[2] & !z,
             21 => s,
-            22 => self.carry,
-            23 => self.overflow,
+            22 => self.cc[2],
+            23 => self.cc[3],
             _ => 0,
         }
     }
@@ -610,6 +605,20 @@ fn extend(b: &[u8], ty: MemTy) -> u32 {
     }
 }
 
+/// What a fault returns (and prints with SBC_SHADER_FAULT=1).
+#[cold]
+fn fault(p: &Program, pc: u32) -> Exit {
+    if std::env::var_os("SBC_SHADER_FAULT").is_some() {
+        let w = p.words.get(pc as usize).copied();
+        eprintln!("[shader fault] at {:#x} word {:#018x} {:?}", w.map_or(0, |w| w.0), w.map_or(0, |w| w.1), p.code.get(pc as usize).map(|i| &i.op));
+        if w.is_none() {
+            let prev = (pc as usize).checked_sub(1).and_then(|k| p.words.get(k).map(|w| (w.0, w.1, p.code[k].op, p.code[k].pred)));
+            eprintln!("[shader fault]   pc index {pc} of {} entry {:#x}; before: {prev:x?}", p.code.len(), p.words.get(p.entry as usize).map_or(0, |w| w.0));
+        }
+    }
+    Exit::Fault(p.words.get(pc as usize).or(p.words.last()).map_or(0, |w| w.0))
+}
+
 /// Runs the lanes until they finish, reach a barrier or run out of fuel (instructions).
 pub fn run<const N: usize, H: Host<N>>(
     p: &Program,
@@ -617,1000 +626,1007 @@ pub fn run<const N: usize, H: Host<N>>(
     h: &mut H,
     fuel: &mut u64,
 ) -> Exit {
-    let code = &p.code[..];
-    let fault = |pc: u32| {
-        if std::env::var_os("SBC_SHADER_FAULT").is_some() {
-            let w = p.words.get(pc as usize).copied();
-            eprintln!("[shader fault] at {:#x} word {:#018x} {:?}", w.map_or(0, |w| w.0), w.map_or(0, |w| w.1), p.code.get(pc as usize).map(|i| &i.op));
-            if w.is_none() {
-                let prev = (pc as usize).checked_sub(1).and_then(|k| p.words.get(k).map(|w| (w.0, w.1, p.code[k].op, p.code[k].pred)));
-                eprintln!("[shader fault]   pc index {pc} of {} entry {:#x}; before: {prev:x?}", p.code.len(), p.words.get(p.entry as usize).map_or(0, |w| w.0));
-            }
-        }
-        Exit::Fault(p.words.get(pc as usize).or(p.words.last()).map_or(0, |w| w.0))
-    };
-    let jit = if N == crate::jit::LANES { p.jit() } else { None };
+    let jit = if crate::jit::lanes_ok(N) { p.jit() } else { None };
+    // (after the native code gave the lanes back: the interpreter runs one instruction first)
+    let mut left = false;
     loop {
         if *fuel == 0 {
             return Exit::Timeout;
         }
         if let Some(j) = jit {
+            if !std::mem::take(&mut left) {
+                match j.enter(p, l, h, fuel) {
+                    Some(Some(e)) => return e,
+                    Some(None) => {
+                        left = true;
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             if let Some((b, len)) = j.block_at(l.pc) {
                 if l.active != 0 && *fuel >= len as u64 {
                     j.fill(b, &mut l.frame, |i, o| h.cbuf(i, o));
-                    let gpr = (&mut *l.gpr as &mut dyn std::any::Any).downcast_mut::<[[u32; crate::jit::LANES]; 256]>();
-                    if let Some(gpr) = gpr {
-                        if j.run(b, gpr, &mut l.pred, &mut l.frame, l.active) {
-                            *fuel -= len as u64;
-                            l.pc += len;
-                            continue;
-                        }
+                    if j.run(b, &mut l.gpr, &mut l.pred, &mut l.cc, &mut l.frame, l.active) {
+                        *fuel -= len as u64;
+                        l.pc += len;
+                        continue;
                     }
                 }
             }
         }
-        *fuel -= 1;
-        let pc = l.pc;
-        let Some(inst) = code.get(pc as usize) else {
-            return fault(pc);
-        };
-        l.pc = pc + 1;
-        h.trace(p.words[pc as usize].0, inst, l);
-        let m = l.active & l.p(inst.pred);
-        if m == 0 {
-            continue;
-        }
-
-        match inst.op {
-            Op::Nop | Op::Fence => {}
-            // (the workgroups of a parallel launch share memory through relaxed atomics)
-            Op::Membar => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
-            Op::Invalid(_) | Op::Bpt => return fault(pc),
-
-            Op::FAdd { d, a, am, b, bm, ftz, sat, cc, rnd } => {
-                let x = modf(l.gpr[a as usize], am, ftz);
-                let y = l.srcf(h, b, bm, ftz);
-                let v = if rnd == Rnd::N {
-                    std::array::from_fn(|i| x[i] + y[i])
-                } else {
-                    std::array::from_fn(|i| fp::add(x[i], y[i], rnd))
-                };
-                let v = finish(v, ftz, sat);
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::FMul { d, a, b, neg, fmz, sat, cc, rnd, scale } => {
-                let flush = fmz.ftz || fmz.dnz;
-                let x = modf(l.gpr[a as usize], Mod { abs: false, neg }, flush);
-                let y = l.srcf(h, b, Mod::default(), flush);
-                let mut v: [f32; N] = if rnd == Rnd::N {
-                    std::array::from_fn(|i| x[i] * y[i])
-                } else {
-                    std::array::from_fn(|i| fp::mul(x[i], y[i], rnd))
-                };
-                if scale != 1.0 {
-                    v = v.map(|x| x * scale);
-                }
-                if fmz.dnz {
-                    v = std::array::from_fn(|i| if x[i] == 0.0 || y[i] == 0.0 { 0.0 } else { v[i] });
-                }
-                let v = finish(v, flush, sat);
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::Ffma { d, a, b, c, neg_ab, neg_c, fmz, sat, cc, rnd } => {
-                let flush = fmz.ftz || fmz.dnz;
-                let x = modf(l.gpr[a as usize], Mod { abs: false, neg: neg_ab }, flush);
-                let y = l.srcf(h, b, Mod::default(), flush);
-                let z = l.srcf(h, c, Mod { abs: false, neg: neg_c }, flush);
-                let mut v: [f32; N] = if rnd == Rnd::N {
-                    std::array::from_fn(|i| fp::fma(x[i], y[i], z[i]))
-                } else {
-                    std::array::from_fn(|i| fp::fma_rnd(x[i], y[i], z[i], rnd))
-                };
-                if fmz.dnz {
-                    v = std::array::from_fn(|i| if x[i] == 0.0 || y[i] == 0.0 { z[i] } else { v[i] });
-                }
-                let v = finish(v, flush, sat);
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::FMnMx { d, a, am, b, bm, ftz, cc, p } => {
-                let x = modf(l.gpr[a as usize], am, ftz);
-                let y = l.srcf(h, b, bm, ftz);
-                let sel = l.p(p);
-                let v = if sel & m == m {
-                    std::array::from_fn(|i| fp::min(x[i], y[i]))
-                } else if sel & m == 0 {
-                    std::array::from_fn(|i| fp::max(x[i], y[i]))
-                } else {
-                    std::array::from_fn(|i| {
-                        if sel >> i & 1 != 0 {
-                            fp::min(x[i], y[i])
-                        } else {
-                            fp::max(x[i], y[i])
-                        }
-                    })
-                };
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::FCmp { d, a, b, c, cond, ftz } => {
-                let z = l.srcf(h, c, Mod::default(), ftz);
-                let t = cmp32(cond, &z, &[0.0; N]);
-                let (x, y) = (l.gpr[a as usize], l.src(h, b));
-                l.put(d, m, std::array::from_fn(|i| if t >> i & 1 != 0 { x[i] } else { y[i] }));
-            }
-            Op::FSet { d, cmp, bf, cc } => {
-                let t = fcmp(l, h, &cmp);
-                let r = bool_op(cmp.bop, t, l.p(cmp.p));
-                if cc {
-                    l.flags(m, !r, if bf { 0 } else { r });
-                }
-                l.put(d, m, bools(r, bf));
-            }
-            Op::FSetP { pd, pn, cmp } => {
-                let t = fcmp(l, h, &cmp);
-                let q = l.p(cmp.p);
-                l.putp(pd, m, bool_op(cmp.bop, t, q));
-                l.putp(pn, m, bool_op(cmp.bop, !t, q));
-            }
-            Op::FSwzAdd { d, a, b, ops, ftz, cc, rnd } => {
-                let x = modf(l.gpr[a as usize], Mod::default(), ftz);
-                let y = modf(l.gpr[b as usize], Mod::default(), ftz);
-                let v = std::array::from_fn(|i| match ops >> (6 - 2 * (i & 3)) & 3 {
-                    0 => fp::add(x[i], y[i], rnd),
-                    1 => fp::add(y[i], -x[i], rnd),
-                    2 => fp::add(x[i], -y[i], rnd),
-                    _ => y[i],
-                });
-                let v = finish(v, ftz, false);
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::Mufu { d, a, m: md, op, sat } => {
-                let x = l.gpr[a as usize];
-                let v = mufu(x, md, op);
-                let v = if sat { v.map(|x| fp::sat(f32::from_bits(x)).to_bits()) } else { v };
-                l.put(d, m, v);
-            }
-            Op::Rro { d, b, m: md } => {
-                let v = l.srcf(h, b, md, false);
-                l.putf(d, m, v);
-            }
-
-            Op::DAdd { .. }
-            | Op::DMul { .. }
-            | Op::Dfma { .. }
-            | Op::DMnMx { .. }
-            | Op::DSet { .. }
-            | Op::DSetP { .. } => double(l, h, m, &inst.op),
-            Op::F2F { from: 4, to: 4, d, b, m: md, rnd, int, ftz, sat, cc, .. } => {
-                let v = l.srcf(h, b, md, ftz);
-                let v = if int { v.map(|x| fp::round_int32(x, rnd)) } else { v };
-                let v = finish(v, ftz, sat);
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::F2I { from: 4, to: IntTy { bytes: 4, signed }, d, b, m: md, rnd, ftz, cc, .. } => {
-                let v = l.srcf(h, b, md, ftz);
-                let v = if rnd == Rnd::Z { v } else { v.map(|x| fp::round_int32(x, rnd)) };
-                // `as` clamps, and NaN becomes 0.
-                let v = if signed { v.map(|x| x as i32 as u32) } else { v.map(|x| x as u32) };
-                if cc {
-                    l.flags_i(m, v);
-                }
-                l.put(d, m, v);
-            }
-            Op::I2F { from: IntTy { bytes: 4, signed }, to: 4, d, b, m: md, rnd: Rnd::N, cc, .. }
-                if !md.abs =>
-            {
-                let v = l.src(h, b);
-                let v: [f32; N] = if md.neg {
-                    v.map(|x| if signed { -(x as i32 as i64) as f32 } else { -(x as i64) as f32 })
-                } else if signed {
-                    v.map(|x| x as i32 as f32)
-                } else {
-                    v.map(|x| x as f32)
-                };
-                if cc {
-                    l.flags_f(m, v);
-                }
-                l.putf(d, m, v);
-            }
-            Op::F2F { .. } | Op::F2I { .. } | Op::I2F { .. } | Op::I2I { .. } => {
-                convert(l, h, m, &inst.op)
-            }
-
-            Op::IAdd { d, a, b, neg_a, neg_b, x, sat, cc } => {
-                let (mut u, mut v) = (l.gpr[a as usize], l.src(h, b));
-                let po = neg_a && neg_b && !x;
-                if neg_a && !po {
-                    u = u.map(|x| !x);
-                }
-                if neg_b && !po {
-                    v = v.map(|x| !x);
-                }
-                let carry = if x {
-                    l.carry
-                } else if neg_a || neg_b {
-                    !0
-                } else {
-                    0
-                };
-                if !cc && !sat {
-                    let r = std::array::from_fn(|i| {
-                        u[i].wrapping_add(v[i]).wrapping_add(carry >> i & 1)
-                    });
-                    l.put(d, m, r);
-                } else {
-                    let t: [u64; N] =
-                        std::array::from_fn(|i| u[i] as u64 + v[i] as u64 + (carry >> i & 1) as u64);
-                    let o = mask::<N>(|i| ((u[i] ^ t[i] as u32) & (v[i] ^ t[i] as u32)) >> 31 != 0);
-                    let mut r = t.map(|x| x as u32);
-                    if sat {
-                        r = std::array::from_fn(|i| {
-                            if o >> i & 1 == 0 {
-                                r[i]
-                            } else if u[i] >> 31 != 0 {
-                                0x8000_0000
-                            } else {
-                                0x7fff_ffff
-                            }
-                        });
-                    }
-                    if cc {
-                        l.flags_i(m, r);
-                        l.flags_co(m, mask::<N>(|i| t[i] >> 32 != 0), o);
-                    }
-                    l.put(d, m, r);
-                }
-            }
-            Op::IAdd3 { d, a, b, c, neg, half, shift, x, cc } => {
-                let srcs = [l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]];
-                let get = |s: usize, i: usize| {
-                    let v = match half[s] {
-                        1 => srcs[s][i] & 0xffff,
-                        2 => srcs[s][i] >> 16,
-                        _ => srcs[s][i],
-                    };
-                    if neg[s] {
-                        v.wrapping_neg()
-                    } else {
-                        v
-                    }
-                };
-                let mut c_out = 0;
-                let r = std::array::from_fn(|i| {
-                    let ab = get(0, i) as u64 + get(1, i) as u64;
-                    let ab = match shift {
-                        1 => ab >> 16,
-                        2 => (ab << 16) & 0xffff_ffff,
-                        _ => ab,
-                    };
-                    let cin = if x { l.carry >> i & 1 } else { 0 };
-                    let t = ab + get(2, i) as u64 + cin as u64;
-                    c_out |= ((t >> 32 != 0) as u32) << i;
-                    t as u32
-                });
-                if cc {
-                    l.flags_i(m, r);
-                    l.flags_co(m, c_out, 0);
-                }
-                l.put(d, m, r);
-            }
-            Op::IScAdd { d, a, b, shift, neg_a, neg_b, cc } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let sh = shift as u32 & 31;
-                let po = neg_a && neg_b;
-                let r = std::array::from_fn(|i| {
-                    let x = u[i] << sh;
-                    if po {
-                        x.wrapping_add(v[i]).wrapping_add(1)
-                    } else if neg_a {
-                        v[i].wrapping_sub(x)
-                    } else if neg_b {
-                        x.wrapping_sub(v[i])
-                    } else {
-                        x.wrapping_add(v[i])
-                    }
-                });
-                if cc {
-                    l.flags_i(m, r);
-                    let c = mask::<N>(|i| {
-                        let x = (u[i] << sh) as u64;
-                        let (x, n) = if neg_a && !po { (!x as u32 as u64, 1) } else { (x, 0) };
-                        let y = v[i] as u64;
-                        let (y, k) = if neg_b && !po { (!y as u32 as u64, 1) } else { (y, 0) };
-                        x + y + (n | k | po as u64) > u32::MAX as u64
-                    });
-                    l.flags_co(m, c, 0);
-                }
-                l.put(d, m, r);
-            }
-            Op::Lea { d, a, b, hi, shift, neg_a, x, cc, pd } => {
-                let (lo, v) = (l.gpr[a as usize], l.src(h, b));
-                let up = hi.map(|c| l.gpr[c as usize]);
-                let sh = shift as u32 & 31;
-                let mut c_out = 0;
-                let r = std::array::from_fn(|i| {
-                    let wide = match up {
-                        Some(c) => (c[i] as u64) << 32 | lo[i] as u64,
-                        None => lo[i] as u64,
-                    };
-                    let wide = if neg_a { wide.wrapping_neg() } else { wide };
-                    let s = match up {
-                        Some(_) => (wide << sh >> 32) as u32,
-                        None => (wide << sh) as u32,
-                    };
-                    let cin = if x { (l.carry >> i & 1) as u64 } else { 0 };
-                    let t = s as u64 + v[i] as u64 + cin;
-                    c_out |= ((t >> 32 != 0) as u32) << i;
-                    t as u32
-                });
-                if cc {
-                    l.flags_i(m, r);
-                    l.flags_co(m, c_out, 0);
-                }
-                l.putp(pd, m, c_out);
-                l.put(d, m, r);
-            }
-            Op::Vadd { d, a, a_bits, a_sel, a_signed, b, b_bits, b_sel, b_signed, c, op, d_signed, cc } => {
-                let part = |v: u32, bits: u8, sel: u8, signed: bool| -> i64 {
-                    let v = v >> (8 * sel as u32);
-                    match (bits, signed) {
-                        (8, false) => (v & 0xff) as i64,
-                        (8, true) => v as u8 as i8 as i64,
-                        (16, false) => (v & 0xffff) as i64,
-                        (16, true) => v as u16 as i16 as i64,
-                        (_, false) => v as i64,
-                        (_, true) => v as i32 as i64,
-                    }
-                };
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]);
-                let r = std::array::from_fn(|i| {
-                    let s = part(u[i], a_bits, a_sel, a_signed) + part(v[i], b_bits, b_sel, b_signed);
-                    let c = if d_signed { w[i] as i32 as i64 } else { w[i] as i64 };
-                    match op {
-                        0 => w[i] & 0xffff | (s as u32) << 16,
-                        1 => w[i] & 0xffff_0000 | s as u32 & 0xffff,
-                        2 => w[i] & !0xff | s as u32 & 0xff,
-                        3 => w[i] & !0xff_0000 | (s as u32 & 0xff) << 16,
-                        4 => (s + c) as u32,
-                        5 => s.min(c) as u32,
-                        6 => s.max(c) as u32,
-                        _ => s as u32,
-                    }
-                });
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::P2r { d, a, b, cc, byte } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let sh = 8 * (byte as u32 & 3);
-                let flags = [l.zero, l.sign, l.carry, l.overflow];
-                let r = std::array::from_fn(|i| {
-                    let bits: u32 = if cc {
-                        (0..4).map(|k| (flags[k] >> i & 1) << k).sum()
-                    } else {
-                        (0..7).map(|k| (l.pred[k] >> i & 1) << k).sum()
-                    };
-                    let mask = (v[i] & 0xff) << sh;
-                    u[i] & !mask | (bits << sh) & mask
-                });
-                l.put(d, m, r);
-            }
-            Op::R2p { a, b, cc, byte } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let sh = 8 * (byte as u32 & 3);
-                for k in 0..if cc { 4 } else { 7 } {
-                    let sel = mask::<N>(|i| v[i] >> k & 1 != 0) & m;
-                    let set = mask::<N>(|i| u[i] >> (sh + k) & 1 != 0);
-                    let r = if cc {
-                        match k {
-                            0 => &mut l.zero,
-                            1 => &mut l.sign,
-                            2 => &mut l.carry,
-                            _ => &mut l.overflow,
-                        }
-                    } else {
-                        &mut l.pred[k as usize]
-                    };
-                    *r = *r & !sel | set & sel;
-                }
-            }
-            Op::Fchk { pd, a, b, abs_a, neg_a, abs_b, neg_b } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let _ = (abs_a, neg_a, abs_b, neg_b); // signs do not change the check
-                let slow = mask::<N>(|i| {
-                    let (ex, ey) = ((u[i] >> 23 & 0xff) as i32, (v[i] >> 23 & 0xff) as i32);
-                    let x_zero = u[i] & 0x7fff_ffff == 0;
-                    ey == 0 || ey >= 0xfd || ex == 0xff || (ex == 0 && !x_zero) || (!x_zero && ((ex - ey) >= 126 || (ex - ey) <= -125))
-                });
-                l.putp(pd, m, slow);
-            }
-            Op::IMul { d, a, b, sa, sb, hi, cc } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let r = std::array::from_fn(|i| {
-                    let t = widen(u[i], sa).wrapping_mul(widen(v[i], sb));
-                    (if hi { t >> 32 } else { t }) as u32
-                });
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::IMad { .. } => imad(l, h, m, &inst.op),
-            Op::Xmad { d, a, b, c, ha, hb, sa, sb, psl, mrg, mode, x, cc } => {
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-                let half = |x: u32, hi: bool, signed: bool| {
-                    let x = if hi { x >> 16 } else { x & 0xffff };
-                    if signed {
-                        x as i16 as u32
-                    } else {
-                        x
-                    }
-                };
-                let carry = if x { l.carry } else { 0 };
-                let mut c_out = 0;
-                let r = std::array::from_fn(|i| {
-                    let mut t = half(u[i], ha, sa).wrapping_mul(half(v[i], hb, sb));
-                    if psl {
-                        t <<= 16;
-                    }
-                    let z = match mode {
-                        1 => w[i] & 0xffff,
-                        2 => w[i] >> 16,
-                        3 => {
-                            // Corrects an unsigned product into a signed one.
-                            let mut z = w[i];
-                            if half(u[i], ha, false) & 0x8000 != 0 {
-                                z = z.wrapping_sub(v[i] << 16);
-                            }
-                            if half(v[i], hb, false) & 0x8000 != 0 {
-                                z = z.wrapping_sub(u[i] << 16);
-                            }
-                            z
-                        }
-                        4 => w[i].wrapping_add(v[i] << 16),
-                        _ => w[i],
-                    };
-                    let s = t as u64 + z as u64 + (carry >> i & 1) as u64;
-                    c_out |= ((s >> 32 != 0) as u32) << i;
-                    if mrg {
-                        s as u32 & 0xffff | v[i] << 16
-                    } else {
-                        s as u32
-                    }
-                });
-                if cc {
-                    l.flags_i(m, r);
-                    l.flags_co(m, c_out, 0);
-                }
-                l.put(d, m, r);
-            }
-            Op::IMnMx { d, a, b, signed, part, cc, p } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let sel = l.p(p);
-                // The low parts of a wide minimum are unsigned and follow the high part's flags.
-                let lt = cmpi(1, signed && matches!(part, 0 | 3), &u, &v);
-                let eq = cmpi(2, false, &u, &v);
-                let (lt, eq) = match part {
-                    1 | 2 => (l.sign & !l.zero | l.zero & lt, l.zero & eq),
-                    _ => (lt, eq),
-                };
-                // lanes that take a
-                let take = sel & lt | !sel & !lt & !eq;
-                let r = std::array::from_fn(|i| if take >> i & 1 != 0 { u[i] } else { v[i] });
-                if cc {
-                    if part >= 2 {
-                        l.flags(m, eq, lt);
-                    } else {
-                        l.flags_i(m, r);
-                    }
-                }
-                l.put(d, m, r);
-            }
-            Op::ICmp { d, a, b, c, cond, signed } => {
-                let z = l.src(h, c);
-                let t = cmpi(cond, signed, &z, &[0; N]);
-                let (x, y) = (l.gpr[a as usize], l.src(h, b));
-                l.put(d, m, std::array::from_fn(|i| if t >> i & 1 != 0 { x[i] } else { y[i] }));
-            }
-            Op::ISet { d, cmp, bf, cc } => {
-                let t = icmp(l, h, &cmp);
-                let r = bool_op(cmp.bop, t, l.p(cmp.p));
-                if cc {
-                    l.flags(m, !r, if bf { 0 } else { r });
-                }
-                l.put(d, m, bools(r, bf));
-            }
-            Op::ISetP { pd, pn, cmp } => {
-                let t = icmp(l, h, &cmp);
-                let q = l.p(cmp.p);
-                l.putp(pd, m, bool_op(cmp.bop, t, q));
-                l.putp(pn, m, bool_op(cmp.bop, !t, q));
-            }
-            Op::Lop { d, a, b, not_a, not_b, op, x, cc, test, pd } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let (na, nb) = (if not_a { !0 } else { 0 }, if not_b { !0 } else { 0 });
-                let r: [u32; N] = match op {
-                    0 => std::array::from_fn(|i| (u[i] ^ na) & (v[i] ^ nb)),
-                    1 => std::array::from_fn(|i| (u[i] ^ na) | (v[i] ^ nb)),
-                    2 => std::array::from_fn(|i| u[i] ^ na ^ v[i] ^ nb),
-                    _ => std::array::from_fn(|i| v[i] ^ nb),
-                };
-                lop_flags(l, m, &r, x, cc, test, pd);
-                l.put(d, m, r);
-            }
-            Op::Lop3 { d, a, b, c, lut, x, cc, test, pd } => {
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]);
-                let r: [u32; N] = std::array::from_fn(|i| {
-                    let mut r = 0;
-                    for k in 0..8 {
-                        if lut >> k & 1 != 0 {
-                            let t = |x: u32, bit: u32| if k >> bit & 1 != 0 { x } else { !x };
-                            r |= t(u[i], 2) & t(v[i], 1) & t(w[i], 0);
-                        }
-                    }
-                    r
-                });
-                lop_flags(l, m, &r, x, cc, test, pd);
-                l.put(d, m, r);
-            }
-            Op::Shl { d, a, b, wrap, x, cc } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let r = std::array::from_fn(|i| shift(u[i], v[i], wrap).map_or(0, |(x, n)| x << n));
-                if cc {
-                    l.flags_i(m, r);
-                    if x {
-                        l.zero &= !m | mask::<N>(|i| r[i] == 0);
-                    }
-                }
-                l.put(d, m, r);
-            }
-            Op::Shr { d, a, b, signed, wrap, rev, cc, .. } => {
-                let (mut u, v) = (l.gpr[a as usize], l.src(h, b));
-                if rev {
-                    u = u.map(u32::reverse_bits);
-                }
-                let r = std::array::from_fn(|i| match shift(u[i], v[i], wrap) {
-                    Some((x, n)) if signed => (x as i32 >> n) as u32,
-                    Some((x, n)) => x >> n,
-                    None if signed => (u[i] as i32 >> 31) as u32,
-                    None => 0,
-                });
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::Shf { d, lo, hi, b, right, high, wrap, wide, signed, cc } => {
-                let (u, w, v) = (l.gpr[lo as usize], l.gpr[hi as usize], l.src(h, b));
-                let bits = if wide { 64 } else { 32 };
-                let r = std::array::from_fn(|i| {
-                    let n = if wrap { v[i] & (bits - 1) } else { v[i].min(bits) };
-                    let x = u[i] as u64 | (w[i] as u64) << 32;
-                    let y = if !right {
-                        x.checked_shl(n).unwrap_or(0)
-                    } else if signed {
-                        ((x as i64) >> n.min(63)) as u64
-                    } else {
-                        x.checked_shr(n).unwrap_or(0)
-                    };
-                    if high || !right {
-                        (y >> 32) as u32
-                    } else {
-                        y as u32
-                    }
-                });
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::Bfe { d, a, b, signed, rev, cc } => {
-                let (u, v) = (l.gpr[a as usize], l.src(h, b));
-                let r = std::array::from_fn(|i| {
-                    let x = if rev { u[i].reverse_bits() } else { u[i] };
-                    bfe(x, v[i] & 0xff, v[i] >> 8 & 0xff, signed)
-                });
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::Bfi { d, a, b, c, cc } => {
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-                let r = std::array::from_fn(|i| bfi(u[i], v[i] & 0xff, v[i] >> 8 & 0xff, w[i]));
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::Flo { d, b, not, signed, shift, cc } => {
-                let v = l.src(h, b);
-                let r = v.map(|x| flo(if not { !x } else { x }, signed, shift));
-                if cc {
-                    l.flags_i(m, r);
-                }
-                l.put(d, m, r);
-            }
-            Op::PopC { d, b, not } => {
-                let v = l.src(h, b);
-                l.put(d, m, v.map(|x| if not { x.count_zeros() } else { x.count_ones() }));
-            }
-            Op::Prmt { d, a, b, c, mode } => {
-                let (u, w) = (l.gpr[a as usize], l.src(h, c));
-                let r: [u32; N] = match b {
-                    Src::Reg(rb) => {
-                        let v = l.gpr[rb as usize];
-                        // (the mode is known here, so each arm is a loop of shifts)
-                        match mode {
-                            0 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 0)),
-                            1 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 1)),
-                            2 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 2)),
-                            3 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 3)),
-                            4 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 4)),
-                            5 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 5)),
-                            _ => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 6)),
-                        }
-                    }
-                    // the same selector in every lane: the shift of each byte, once
-                    _ => {
-                        let sel = prmt_bytes(l.src(h, b)[0], mode);
-                        if sel & 0x8888 == 0 {
-                            let sh: [u32; 4] = std::array::from_fn(|k| 8 * (sel >> (4 * k) & 7));
-                            std::array::from_fn(|i| {
-                                let x = u[i] as u64 | (w[i] as u64) << 32;
-                                (x >> sh[0]) as u32 & 0xff | ((x >> sh[1]) as u32 & 0xff) << 8 | ((x >> sh[2]) as u32 & 0xff) << 16 | ((x >> sh[3]) as u32) << 24
-                            })
-                        } else {
-                            std::array::from_fn(|i| prmt(u[i], sel, w[i], 0))
-                        }
-                    }
-                };
-                l.put(d, m, r);
-            }
-            Op::Sel { d, a, b, p } => {
-                let t = l.p(p);
-                let (x, y) = (l.gpr[a as usize], l.src(h, b));
-                l.put(d, m, std::array::from_fn(|i| if t >> i & 1 != 0 { x[i] } else { y[i] }));
-            }
-            Op::Mov { d, b, lanes } => {
-                let v = l.src(h, b);
-                let m = if lanes == 15 { m } else { m & lanes as u32 * 0x1111_1111 };
-                l.put(d, m, v);
-            }
-
-            Op::PSet { d, a, b, c, op1, op2, bf, cc } => {
-                let t = bool_op(op1, l.p(a), l.p(b));
-                let r = bool_op(op2, t, l.p(c));
-                if cc {
-                    l.flags(m, !r, if bf { 0 } else { r });
-                }
-                l.put(d, m, bools(r, bf));
-            }
-            Op::PSetP { pd, pn, a, b, c, op1, op2 } => {
-                let t = bool_op(op1, l.p(a), l.p(b));
-                let q = l.p(c);
-                l.putp(pd, m, bool_op(op2, t, q));
-                l.putp(pn, m, bool_op(op2, !t, q));
-            }
-
-            Op::S2R { d, sys } => {
-                let v = match sys {
-                    0x00 => std::array::from_fn(|i| i as u32),
-                    0x13 => bools(l.helper | l.killed, false),
-                    0x38 => std::array::from_fn(|i| 1 << i),
-                    0x39 => std::array::from_fn(|i| (1 << i) - 1),
-                    0x3a => std::array::from_fn(|i| (1 << i) - 1 | 1 << i),
-                    0x3b => std::array::from_fn(|i| !((1 << i) - 1 | 1 << i)),
-                    0x3c => std::array::from_fn(|i| !((1 << i) - 1)),
-                    _ => h.sysval(sys),
-                };
-                l.put(d, m, v);
-            }
-            Op::Vote { d, pd, p, op } => {
-                let t = l.p(p) & m;
-                let r = match op {
-                    VoteOp::All => t == m,
-                    VoteOp::Any => t != 0,
-                    VoteOp::Eq => t == m || t == 0,
-                };
-                l.put(d, m, [t; N]);
-                l.putp(pd, m, if r { !0 } else { 0 });
-            }
-            Op::Shfl { d, pd, a, b, c, op } => {
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-                let mut ok = 0;
-                let r = std::array::from_fn(|i| {
-                    let (lane, n) = (i as u32, v[i] & 31);
-                    let (last, seg) = (w[i] & 31, w[i] >> 8 & 31);
-                    let min = lane & seg;
-                    let max = min | last & !seg;
-                    let (j, in_range) = match op {
-                        ShflOp::Idx => {
-                            let j = min | n & !seg & 31;
-                            (j, j <= max)
-                        }
-                        ShflOp::Up => {
-                            let j = lane.wrapping_sub(n);
-                            (j, j as i32 >= min as i32)
-                        }
-                        ShflOp::Down => (lane + n, lane + n <= max),
-                        ShflOp::Bfly => (lane ^ n, lane ^ n <= max),
-                    };
-                    if in_range {
-                        ok |= 1 << i;
-                        if (j as usize) < N {
-                            u[j as usize]
-                        } else {
-                            0
-                        }
-                    } else {
-                        u[i]
-                    }
-                });
-                l.put(d, m, r);
-                l.putp(pd, m, ok);
-            }
-
-            Op::Ldc { .. }
-            | Op::Ld { .. }
-            | Op::St { .. }
-            | Op::Ldl { .. }
-            | Op::Stl { .. }
-            | Op::Lds { .. }
-            | Op::Sts { .. }
-            | Op::Atom { .. }
-            | Op::AtomS { .. } => memory(l, h, m, &inst.op),
-
-            Op::Ald { d, a, v, addr, n, patch, output } => {
-                let (base, vtx) = (l.gpr[a as usize], l.gpr[v as usize]);
-                for i in lanes(m) {
-                    for c in 0..n as u32 {
-                        let at = Attr {
-                            addr: base[i].wrapping_add(addr as u32 + 4 * c),
-                            vertex: vtx[i],
-                            patch,
-                            output,
-                        };
-                        let x = h.attr_load(i, at);
-                        l.put1(reg_at(d, c as usize), i, x);
-                    }
-                }
-            }
-            Op::Ast { r, a, v, addr, n, patch } => {
-                let (base, vtx) = (l.gpr[a as usize], l.gpr[v as usize]);
-                for i in lanes(m) {
-                    for c in 0..n as u32 {
-                        let at = Attr {
-                            addr: base[i].wrapping_add(addr as u32 + 4 * c),
-                            vertex: vtx[i],
-                            patch,
-                            output: true,
-                        };
-                        h.attr_store(i, at, l.gpr[reg_at(r, c as usize) as usize][i]);
-                    }
-                }
-            }
-            Op::Al2p { d, a, addr, n, .. } => {
-                // Physical attribute addresses are the logical ones here.
-                let base = l.gpr[a as usize];
-                for c in 0..n as u32 {
-                    l.put(
-                        reg_at(d, c as usize),
-                        m,
-                        base.map(|x| x.wrapping_add(addr as u32 + 4 * c)),
-                    );
-                }
-            }
-            Op::Isberd { d, a } => {
-                let x = l.gpr[a as usize];
-                for i in lanes(m) {
-                    let v = h.isberd(i, x[i]);
-                    l.put1(d, i, v);
-                }
-            }
-            Op::Ipa { d, addr, idx, mul, offset, mode, loc, sat } => {
-                let off = if loc == IpaLoc::Offset {
-                    let o = l.gpr[offset as usize];
-                    [
-                        // 12 bits each; the bits above may hold something else
-                        o.map(|x| ((x << 20) as i32 >> 20) as f32 / 4096.0),
-                        o.map(|x| ((x << 4) as i32 >> 20) as f32 / 4096.0),
-                    ]
-                } else {
-                    [[0.0; N]; 2]
-                };
-                let mut op = IpaOp { addr: addr as u32, mode, loc, offset: off };
-                let mut v = match idx {
-                    None => h.interpolate(&op),
-                    Some(r) => {
-                        let base = l.gpr[r as usize];
-                        let mut v = [0; N];
-                        let mut left = m;
-                        while left != 0 {
-                            let a = base[left.trailing_zeros() as usize];
-                            op.addr = a.wrapping_add(addr as u32);
-                            let x = h.interpolate(&op);
-                            for i in lanes(left) {
-                                if base[i] == a {
-                                    v[i] = x[i];
-                                    left &= !(1 << i);
-                                }
-                            }
-                        }
-                        v
-                    }
-                };
-                // Mesa asks for gl_FragCoord with .MulW too; window coordinates stay as they are.
-                let window = idx.is_none() && (0x60..0x80).contains(&addr);
-                if mul != RZ && !window && matches!(mode, IpaMode::MulW | IpaMode::State) {
-                    let w = l.gpr[mul as usize];
-                    v = std::array::from_fn(|i| {
-                        (f32::from_bits(v[i]) * f32::from_bits(w[i])).to_bits()
-                    });
-                }
-                if sat {
-                    v = v.map(|x| fp::sat(f32::from_bits(x)).to_bits());
-                }
-                l.put(d, m, v);
-            }
-            Op::Pixld { d, a, what } => {
-                let v = h.pixld(what, &l.gpr[a as usize]);
-                l.put(d, m, v);
-            }
-            Op::Out { d, a, b, emit, cut } => {
-                let (handle, stream) = (l.gpr[a as usize], l.src(h, b));
-                for i in lanes(m) {
-                    let v = h.emit(i, handle[i], stream[i], emit, cut);
-                    l.put1(d, i, v);
-                }
-            }
-
-            Op::Tex(ref t) => texture(l, h, m, t),
-            Op::Suld(_) | Op::Sust(_) | Op::Suatom { .. } => surface(l, h, m, &inst.op),
-
-            Op::Exit { cond } => {
-                let m = m & l.test(cond);
-                l.exited |= m;
-                l.active &= !m;
-                if !l.unfinished() || !l.unwind() {
-                    l.active = 0;
-                    return Exit::Done;
-                }
-            }
-            Op::Kil { cond } => {
-                l.killed |= m & l.test(cond);
-                if !l.unfinished() {
-                    l.active = 0;
-                    return Exit::Done;
-                }
-            }
-            Op::Bra { t, cond, all } => {
-                let m = m & l.test(cond);
-                let rest = l.active & !m;
-                if rest == 0 {
-                    l.pc = t;
-                } else if m != 0 && !all {
-                    if l.stack.len() >= MAX_DEPTH {
-                        return fault(pc);
-                    }
-                    l.stack.push(Token { kind: Kind::Div, pc: l.pc, lanes: rest });
-                    l.active = m;
-                    l.pc = t;
-                }
-            }
-            Op::Brx { a, base, cond } => {
-                let m = m & l.test(cond);
-                let rest = l.active & !m;
-                if rest != 0 && m != 0 {
-                    l.stack.push(Token { kind: Kind::Div, pc: l.pc, lanes: rest });
-                }
-                let reg = l.gpr[a as usize];
-                let mut left = m;
-                while left != 0 {
-                    let x = reg[left.trailing_zeros() as usize];
-                    let same = left & mask::<N>(|i| reg[i] == x);
-                    let Some(t) = p.index_of(base.wrapping_add(x)) else {
-                        return fault(pc);
-                    };
-                    left &= !same;
-                    if left == 0 {
-                        l.active = same;
-                        l.pc = t;
-                    } else {
-                        l.stack.push(Token { kind: Kind::Div, pc: t, lanes: same });
-                    }
-                }
-                if l.stack.len() >= MAX_DEPTH {
-                    return fault(pc);
-                }
-            }
-            Op::Cal { t } => {
-                if l.stack.len() >= MAX_DEPTH {
-                    return fault(pc);
-                }
-                l.stack.push(Token { kind: Kind::Ret, pc: l.pc, lanes: 0 });
-                l.pc = t;
-            }
-            Op::Pret { t } | Op::Ssy { t } | Op::Pbk { t } | Op::Pcnt { t } => {
-                let kind = match inst.op {
-                    Op::Pret { .. } => Kind::Ret,
-                    Op::Ssy { .. } => Kind::Ssy,
-                    Op::Pbk { .. } => Kind::Pbk,
-                    _ => Kind::Pcnt,
-                };
-                if l.stack.len() >= MAX_DEPTH {
-                    return fault(pc);
-                }
-                l.stack.push(Token { kind, pc: t, lanes: 0 });
-            }
-            Op::Sync { cond } | Op::Brk { cond } | Op::Cont { cond } | Op::Ret { cond } => {
-                let kind = match inst.op {
-                    Op::Sync { .. } => Kind::Ssy,
-                    Op::Brk { .. } => Kind::Pbk,
-                    Op::Cont { .. } => Kind::Pcnt,
-                    _ => Kind::Ret,
-                };
-                let m = m & l.test(cond);
-                if m == 0 {
-                    continue;
-                }
-                if !l.park(kind, m) {
-                    if kind != Kind::Ret {
-                        return fault(pc);
-                    }
-                    // A return from the main program ends it.
-                    l.exited |= m;
-                    l.active &= !m;
-                    if !l.unfinished() {
-                        l.active = 0;
-                        return Exit::Done;
-                    }
-                }
-                if l.stack.len() >= MAX_DEPTH {
-                    return fault(pc);
-                }
-                if !l.unwind() {
-                    return Exit::Done;
-                }
-            }
-            Op::Sam => {
-                if l.sam.len() >= MAX_DEPTH {
-                    return fault(pc);
-                }
-                l.sam.push(l.active);
-                for q in 0..N / 4 {
-                    if l.active >> (4 * q) & 15 != 0 {
-                        l.active |= 15 << (4 * q);
-                    }
-                }
-            }
-            Op::Ram => {
-                if let Some(a) = l.sam.pop() {
-                    l.active = a;
-                }
-            }
-            Op::Bar => return Exit::Barrier,
+        if let Some(e) = step(p, l, h, fuel) {
+            return e;
         }
     }
+}
+
+/// Runs the instruction at the lanes' program counter (one of the fuel): Some if the lanes stop.
+#[inline(always)]
+pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h: &mut H, fuel: &mut u64) -> Option<Exit> {
+    let code = &p.code[..];
+    *fuel -= 1;
+    let pc = l.pc;
+    let Some(inst) = code.get(pc as usize) else {
+        return Some(fault(p, pc));
+    };
+    l.pc = pc + 1;
+    h.trace(p.words[pc as usize].0, inst, l);
+    let m = l.active & l.p(inst.pred);
+    if m == 0 {
+        return None;
+    }
+
+    match inst.op {
+        Op::Nop | Op::Fence => {}
+        // (the workgroups of a parallel launch share memory through relaxed atomics)
+        Op::Membar => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
+        Op::Invalid(_) | Op::Bpt => return Some(fault(p, pc)),
+
+        Op::FAdd { d, a, am, b, bm, ftz, sat, cc, rnd } => {
+            let x = modf(l.gpr[a as usize], am, ftz);
+            let y = l.srcf(h, b, bm, ftz);
+            let v = if rnd == Rnd::N {
+                std::array::from_fn(|i| x[i] + y[i])
+            } else {
+                std::array::from_fn(|i| fp::add(x[i], y[i], rnd))
+            };
+            let v = finish(v, ftz, sat);
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::FMul { d, a, b, neg, fmz, sat, cc, rnd, scale } => {
+            let flush = fmz.ftz || fmz.dnz;
+            let x = modf(l.gpr[a as usize], Mod { abs: false, neg }, flush);
+            let y = l.srcf(h, b, Mod::default(), flush);
+            let mut v: [f32; N] = if rnd == Rnd::N {
+                std::array::from_fn(|i| x[i] * y[i])
+            } else {
+                std::array::from_fn(|i| fp::mul(x[i], y[i], rnd))
+            };
+            if scale != 1.0 {
+                v = v.map(|x| x * scale);
+            }
+            if fmz.dnz {
+                v = std::array::from_fn(|i| if x[i] == 0.0 || y[i] == 0.0 { 0.0 } else { v[i] });
+            }
+            let v = finish(v, flush, sat);
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::Ffma { d, a, b, c, neg_ab, neg_c, fmz, sat, cc, rnd } => {
+            let flush = fmz.ftz || fmz.dnz;
+            let x = modf(l.gpr[a as usize], Mod { abs: false, neg: neg_ab }, flush);
+            let y = l.srcf(h, b, Mod::default(), flush);
+            let z = l.srcf(h, c, Mod { abs: false, neg: neg_c }, flush);
+            let mut v: [f32; N] = if rnd == Rnd::N {
+                std::array::from_fn(|i| fp::fma(x[i], y[i], z[i]))
+            } else {
+                std::array::from_fn(|i| fp::fma_rnd(x[i], y[i], z[i], rnd))
+            };
+            if fmz.dnz {
+                v = std::array::from_fn(|i| if x[i] == 0.0 || y[i] == 0.0 { z[i] } else { v[i] });
+            }
+            let v = finish(v, flush, sat);
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::FMnMx { d, a, am, b, bm, ftz, cc, p } => {
+            let x = modf(l.gpr[a as usize], am, ftz);
+            let y = l.srcf(h, b, bm, ftz);
+            let sel = l.p(p);
+            let v = if sel & m == m {
+                std::array::from_fn(|i| fp::min(x[i], y[i]))
+            } else if sel & m == 0 {
+                std::array::from_fn(|i| fp::max(x[i], y[i]))
+            } else {
+                std::array::from_fn(|i| {
+                    if sel >> i & 1 != 0 {
+                        fp::min(x[i], y[i])
+                    } else {
+                        fp::max(x[i], y[i])
+                    }
+                })
+            };
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::FCmp { d, a, b, c, cond, ftz } => {
+            let z = l.srcf(h, c, Mod::default(), ftz);
+            let t = cmp32(cond, &z, &[0.0; N]);
+            let (x, y) = (l.gpr[a as usize], l.src(h, b));
+            l.put(d, m, std::array::from_fn(|i| if t >> i & 1 != 0 { x[i] } else { y[i] }));
+        }
+        Op::FSet { d, cmp, bf, cc } => {
+            let t = fcmp(l, h, &cmp);
+            let r = bool_op(cmp.bop, t, l.p(cmp.p));
+            if cc {
+                l.flags(m, !r, if bf { 0 } else { r });
+            }
+            l.put(d, m, bools(r, bf));
+        }
+        Op::FSetP { pd, pn, cmp } => {
+            let t = fcmp(l, h, &cmp);
+            let q = l.p(cmp.p);
+            l.putp(pd, m, bool_op(cmp.bop, t, q));
+            l.putp(pn, m, bool_op(cmp.bop, !t, q));
+        }
+        Op::FSwzAdd { d, a, b, ops, ftz, cc, rnd } => {
+            let x = modf(l.gpr[a as usize], Mod::default(), ftz);
+            let y = modf(l.gpr[b as usize], Mod::default(), ftz);
+            let v = std::array::from_fn(|i| match ops >> (6 - 2 * (i & 3)) & 3 {
+                0 => fp::add(x[i], y[i], rnd),
+                1 => fp::add(y[i], -x[i], rnd),
+                2 => fp::add(x[i], -y[i], rnd),
+                _ => y[i],
+            });
+            let v = finish(v, ftz, false);
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::Mufu { d, a, m: md, op, sat } => {
+            let x = l.gpr[a as usize];
+            let v = mufu(x, md, op);
+            let v = if sat { v.map(|x| fp::sat(f32::from_bits(x)).to_bits()) } else { v };
+            l.put(d, m, v);
+        }
+        Op::Rro { d, b, m: md } => {
+            let v = l.srcf(h, b, md, false);
+            l.putf(d, m, v);
+        }
+
+        Op::DAdd { .. }
+        | Op::DMul { .. }
+        | Op::Dfma { .. }
+        | Op::DMnMx { .. }
+        | Op::DSet { .. }
+        | Op::DSetP { .. } => double(l, h, m, &inst.op),
+        Op::F2F { from: 4, to: 4, d, b, m: md, rnd, int, ftz, sat, cc, .. } => {
+            let v = l.srcf(h, b, md, ftz);
+            let v = if int { v.map(|x| fp::round_int32(x, rnd)) } else { v };
+            let v = finish(v, ftz, sat);
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::F2I { from: 4, to: IntTy { bytes: 4, signed }, d, b, m: md, rnd, ftz, cc, .. } => {
+            let v = l.srcf(h, b, md, ftz);
+            let v = if rnd == Rnd::Z { v } else { v.map(|x| fp::round_int32(x, rnd)) };
+            // `as` clamps, and NaN becomes 0.
+            let v = if signed { v.map(|x| x as i32 as u32) } else { v.map(|x| x as u32) };
+            if cc {
+                l.flags_i(m, v);
+            }
+            l.put(d, m, v);
+        }
+        Op::I2F { from: IntTy { bytes: 4, signed }, to: 4, d, b, m: md, rnd: Rnd::N, cc, .. }
+            if !md.abs =>
+        {
+            let v = l.src(h, b);
+            let v: [f32; N] = if md.neg {
+                v.map(|x| if signed { -(x as i32 as i64) as f32 } else { -(x as i64) as f32 })
+            } else if signed {
+                v.map(|x| x as i32 as f32)
+            } else {
+                v.map(|x| x as f32)
+            };
+            if cc {
+                l.flags_f(m, v);
+            }
+            l.putf(d, m, v);
+        }
+        Op::F2F { .. } | Op::F2I { .. } | Op::I2F { .. } | Op::I2I { .. } => {
+            convert(l, h, m, &inst.op)
+        }
+
+        Op::IAdd { d, a, b, neg_a, neg_b, x, sat, cc } => {
+            let (mut u, mut v) = (l.gpr[a as usize], l.src(h, b));
+            let po = neg_a && neg_b && !x;
+            if neg_a && !po {
+                u = u.map(|x| !x);
+            }
+            if neg_b && !po {
+                v = v.map(|x| !x);
+            }
+            let carry = if x {
+                l.cc[2]
+            } else if neg_a || neg_b {
+                !0
+            } else {
+                0
+            };
+            if !cc && !sat {
+                let r = std::array::from_fn(|i| {
+                    u[i].wrapping_add(v[i]).wrapping_add(carry >> i & 1)
+                });
+                l.put(d, m, r);
+            } else {
+                let t: [u64; N] =
+                    std::array::from_fn(|i| u[i] as u64 + v[i] as u64 + (carry >> i & 1) as u64);
+                let o = mask::<N>(|i| ((u[i] ^ t[i] as u32) & (v[i] ^ t[i] as u32)) >> 31 != 0);
+                let mut r = t.map(|x| x as u32);
+                if sat {
+                    r = std::array::from_fn(|i| {
+                        if o >> i & 1 == 0 {
+                            r[i]
+                        } else if u[i] >> 31 != 0 {
+                            0x8000_0000
+                        } else {
+                            0x7fff_ffff
+                        }
+                    });
+                }
+                if cc {
+                    l.flags_i(m, r);
+                    l.flags_co(m, mask::<N>(|i| t[i] >> 32 != 0), o);
+                }
+                l.put(d, m, r);
+            }
+        }
+        Op::IAdd3 { d, a, b, c, neg, half, shift, x, cc } => {
+            let srcs = [l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]];
+            let get = |s: usize, i: usize| {
+                let v = match half[s] {
+                    1 => srcs[s][i] & 0xffff,
+                    2 => srcs[s][i] >> 16,
+                    _ => srcs[s][i],
+                };
+                if neg[s] {
+                    v.wrapping_neg()
+                } else {
+                    v
+                }
+            };
+            let mut c_out = 0;
+            let r = std::array::from_fn(|i| {
+                let ab = get(0, i) as u64 + get(1, i) as u64;
+                let ab = match shift {
+                    1 => ab >> 16,
+                    2 => (ab << 16) & 0xffff_ffff,
+                    _ => ab,
+                };
+                let cin = if x { l.cc[2] >> i & 1 } else { 0 };
+                let t = ab + get(2, i) as u64 + cin as u64;
+                c_out |= ((t >> 32 != 0) as u32) << i;
+                t as u32
+            });
+            if cc {
+                l.flags_i(m, r);
+                l.flags_co(m, c_out, 0);
+            }
+            l.put(d, m, r);
+        }
+        Op::IScAdd { d, a, b, shift, neg_a, neg_b, cc } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let sh = shift as u32 & 31;
+            let po = neg_a && neg_b;
+            let r = std::array::from_fn(|i| {
+                let x = u[i] << sh;
+                if po {
+                    x.wrapping_add(v[i]).wrapping_add(1)
+                } else if neg_a {
+                    v[i].wrapping_sub(x)
+                } else if neg_b {
+                    x.wrapping_sub(v[i])
+                } else {
+                    x.wrapping_add(v[i])
+                }
+            });
+            if cc {
+                l.flags_i(m, r);
+                let c = mask::<N>(|i| {
+                    let x = (u[i] << sh) as u64;
+                    let (x, n) = if neg_a && !po { (!x as u32 as u64, 1) } else { (x, 0) };
+                    let y = v[i] as u64;
+                    let (y, k) = if neg_b && !po { (!y as u32 as u64, 1) } else { (y, 0) };
+                    x + y + (n | k | po as u64) > u32::MAX as u64
+                });
+                l.flags_co(m, c, 0);
+            }
+            l.put(d, m, r);
+        }
+        Op::Lea { d, a, b, hi, shift, neg_a, x, cc, pd } => {
+            let (lo, v) = (l.gpr[a as usize], l.src(h, b));
+            let up = hi.map(|c| l.gpr[c as usize]);
+            let sh = shift as u32 & 31;
+            let mut c_out = 0;
+            let r = std::array::from_fn(|i| {
+                let wide = match up {
+                    Some(c) => (c[i] as u64) << 32 | lo[i] as u64,
+                    None => lo[i] as u64,
+                };
+                let wide = if neg_a { wide.wrapping_neg() } else { wide };
+                let s = match up {
+                    Some(_) => (wide << sh >> 32) as u32,
+                    None => (wide << sh) as u32,
+                };
+                let cin = if x { (l.cc[2] >> i & 1) as u64 } else { 0 };
+                let t = s as u64 + v[i] as u64 + cin;
+                c_out |= ((t >> 32 != 0) as u32) << i;
+                t as u32
+            });
+            if cc {
+                l.flags_i(m, r);
+                l.flags_co(m, c_out, 0);
+            }
+            l.putp(pd, m, c_out);
+            l.put(d, m, r);
+        }
+        Op::Vadd { d, a, a_bits, a_sel, a_signed, b, b_bits, b_sel, b_signed, c, op, d_signed, cc } => {
+            let part = |v: u32, bits: u8, sel: u8, signed: bool| -> i64 {
+                let v = v >> (8 * sel as u32);
+                match (bits, signed) {
+                    (8, false) => (v & 0xff) as i64,
+                    (8, true) => v as u8 as i8 as i64,
+                    (16, false) => (v & 0xffff) as i64,
+                    (16, true) => v as u16 as i16 as i64,
+                    (_, false) => v as i64,
+                    (_, true) => v as i32 as i64,
+                }
+            };
+            let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]);
+            let r = std::array::from_fn(|i| {
+                let s = part(u[i], a_bits, a_sel, a_signed) + part(v[i], b_bits, b_sel, b_signed);
+                let c = if d_signed { w[i] as i32 as i64 } else { w[i] as i64 };
+                match op {
+                    0 => w[i] & 0xffff | (s as u32) << 16,
+                    1 => w[i] & 0xffff_0000 | s as u32 & 0xffff,
+                    2 => w[i] & !0xff | s as u32 & 0xff,
+                    3 => w[i] & !0xff_0000 | (s as u32 & 0xff) << 16,
+                    4 => (s + c) as u32,
+                    5 => s.min(c) as u32,
+                    6 => s.max(c) as u32,
+                    _ => s as u32,
+                }
+            });
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::P2r { d, a, b, cc, byte } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let sh = 8 * (byte as u32 & 3);
+            let flags = l.cc;
+            let r = std::array::from_fn(|i| {
+                let bits: u32 = if cc {
+                    (0..4).map(|k| (flags[k] >> i & 1) << k).sum()
+                } else {
+                    (0..7).map(|k| (l.pred[k] >> i & 1) << k).sum()
+                };
+                let mask = (v[i] & 0xff) << sh;
+                u[i] & !mask | (bits << sh) & mask
+            });
+            l.put(d, m, r);
+        }
+        Op::R2p { a, b, cc, byte } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let sh = 8 * (byte as u32 & 3);
+            for k in 0..if cc { 4 } else { 7 } {
+                let sel = mask::<N>(|i| v[i] >> k & 1 != 0) & m;
+                let set = mask::<N>(|i| u[i] >> (sh + k) & 1 != 0);
+                let r = if cc {
+                    match k {
+                        0 => &mut l.cc[0],
+                        1 => &mut l.cc[1],
+                        2 => &mut l.cc[2],
+                        _ => &mut l.cc[3],
+                    }
+                } else {
+                    &mut l.pred[k as usize]
+                };
+                *r = *r & !sel | set & sel;
+            }
+        }
+        Op::Fchk { pd, a, b, abs_a, neg_a, abs_b, neg_b } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let _ = (abs_a, neg_a, abs_b, neg_b); // signs do not change the check
+            let slow = mask::<N>(|i| {
+                let (ex, ey) = ((u[i] >> 23 & 0xff) as i32, (v[i] >> 23 & 0xff) as i32);
+                let x_zero = u[i] & 0x7fff_ffff == 0;
+                ey == 0 || ey >= 0xfd || ex == 0xff || (ex == 0 && !x_zero) || (!x_zero && ((ex - ey) >= 126 || (ex - ey) <= -125))
+            });
+            l.putp(pd, m, slow);
+        }
+        Op::IMul { d, a, b, sa, sb, hi, cc } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let r = std::array::from_fn(|i| {
+                let t = widen(u[i], sa).wrapping_mul(widen(v[i], sb));
+                (if hi { t >> 32 } else { t }) as u32
+            });
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::IMad { .. } => imad(l, h, m, &inst.op),
+        Op::Xmad { d, a, b, c, ha, hb, sa, sb, psl, mrg, mode, x, cc } => {
+            let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
+            let half = |x: u32, hi: bool, signed: bool| {
+                let x = if hi { x >> 16 } else { x & 0xffff };
+                if signed {
+                    x as i16 as u32
+                } else {
+                    x
+                }
+            };
+            let carry = if x { l.cc[2] } else { 0 };
+            let mut c_out = 0;
+            let r = std::array::from_fn(|i| {
+                let mut t = half(u[i], ha, sa).wrapping_mul(half(v[i], hb, sb));
+                if psl {
+                    t <<= 16;
+                }
+                let z = match mode {
+                    1 => w[i] & 0xffff,
+                    2 => w[i] >> 16,
+                    3 => {
+                        // Corrects an unsigned product into a signed one.
+                        let mut z = w[i];
+                        if half(u[i], ha, false) & 0x8000 != 0 {
+                            z = z.wrapping_sub(v[i] << 16);
+                        }
+                        if half(v[i], hb, false) & 0x8000 != 0 {
+                            z = z.wrapping_sub(u[i] << 16);
+                        }
+                        z
+                    }
+                    4 => w[i].wrapping_add(v[i] << 16),
+                    _ => w[i],
+                };
+                let s = t as u64 + z as u64 + (carry >> i & 1) as u64;
+                c_out |= ((s >> 32 != 0) as u32) << i;
+                if mrg {
+                    s as u32 & 0xffff | v[i] << 16
+                } else {
+                    s as u32
+                }
+            });
+            if cc {
+                l.flags_i(m, r);
+                l.flags_co(m, c_out, 0);
+            }
+            l.put(d, m, r);
+        }
+        Op::IMnMx { d, a, b, signed, part, cc, p } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let sel = l.p(p);
+            // The low parts of a wide minimum are unsigned and follow the high part's flags.
+            let lt = cmpi(1, signed && matches!(part, 0 | 3), &u, &v);
+            let eq = cmpi(2, false, &u, &v);
+            let (lt, eq) = match part {
+                1 | 2 => (l.cc[1] & !l.cc[0] | l.cc[0] & lt, l.cc[0] & eq),
+                _ => (lt, eq),
+            };
+            // lanes that take a
+            let take = sel & lt | !sel & !lt & !eq;
+            let r = std::array::from_fn(|i| if take >> i & 1 != 0 { u[i] } else { v[i] });
+            if cc {
+                if part >= 2 {
+                    l.flags(m, eq, lt);
+                } else {
+                    l.flags_i(m, r);
+                }
+            }
+            l.put(d, m, r);
+        }
+        Op::ICmp { d, a, b, c, cond, signed } => {
+            let z = l.src(h, c);
+            let t = cmpi(cond, signed, &z, &[0; N]);
+            let (x, y) = (l.gpr[a as usize], l.src(h, b));
+            l.put(d, m, std::array::from_fn(|i| if t >> i & 1 != 0 { x[i] } else { y[i] }));
+        }
+        Op::ISet { d, cmp, bf, cc } => {
+            let t = icmp(l, h, &cmp);
+            let r = bool_op(cmp.bop, t, l.p(cmp.p));
+            if cc {
+                l.flags(m, !r, if bf { 0 } else { r });
+            }
+            l.put(d, m, bools(r, bf));
+        }
+        Op::ISetP { pd, pn, cmp } => {
+            let t = icmp(l, h, &cmp);
+            let q = l.p(cmp.p);
+            l.putp(pd, m, bool_op(cmp.bop, t, q));
+            l.putp(pn, m, bool_op(cmp.bop, !t, q));
+        }
+        Op::Lop { d, a, b, not_a, not_b, op, x, cc, test, pd } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let (na, nb) = (if not_a { !0 } else { 0 }, if not_b { !0 } else { 0 });
+            let r: [u32; N] = match op {
+                0 => std::array::from_fn(|i| (u[i] ^ na) & (v[i] ^ nb)),
+                1 => std::array::from_fn(|i| (u[i] ^ na) | (v[i] ^ nb)),
+                2 => std::array::from_fn(|i| u[i] ^ na ^ v[i] ^ nb),
+                _ => std::array::from_fn(|i| v[i] ^ nb),
+            };
+            lop_flags(l, m, &r, x, cc, test, pd);
+            l.put(d, m, r);
+        }
+        Op::Lop3 { d, a, b, c, lut, x, cc, test, pd } => {
+            let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]);
+            let r: [u32; N] = std::array::from_fn(|i| {
+                let mut r = 0;
+                for k in 0..8 {
+                    if lut >> k & 1 != 0 {
+                        let t = |x: u32, bit: u32| if k >> bit & 1 != 0 { x } else { !x };
+                        r |= t(u[i], 2) & t(v[i], 1) & t(w[i], 0);
+                    }
+                }
+                r
+            });
+            lop_flags(l, m, &r, x, cc, test, pd);
+            l.put(d, m, r);
+        }
+        Op::Shl { d, a, b, wrap, x, cc } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let r = std::array::from_fn(|i| shift(u[i], v[i], wrap).map_or(0, |(x, n)| x << n));
+            if cc {
+                l.flags_i(m, r);
+                if x {
+                    l.cc[0] &= !m | mask::<N>(|i| r[i] == 0);
+                }
+            }
+            l.put(d, m, r);
+        }
+        Op::Shr { d, a, b, signed, wrap, rev, cc, .. } => {
+            let (mut u, v) = (l.gpr[a as usize], l.src(h, b));
+            if rev {
+                u = u.map(u32::reverse_bits);
+            }
+            let r = std::array::from_fn(|i| match shift(u[i], v[i], wrap) {
+                Some((x, n)) if signed => (x as i32 >> n) as u32,
+                Some((x, n)) => x >> n,
+                None if signed => (u[i] as i32 >> 31) as u32,
+                None => 0,
+            });
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::Shf { d, lo, hi, b, right, high, wrap, wide, signed, cc } => {
+            let (u, w, v) = (l.gpr[lo as usize], l.gpr[hi as usize], l.src(h, b));
+            let bits = if wide { 64 } else { 32 };
+            let r = std::array::from_fn(|i| {
+                let n = if wrap { v[i] & (bits - 1) } else { v[i].min(bits) };
+                let x = u[i] as u64 | (w[i] as u64) << 32;
+                let y = if !right {
+                    x.checked_shl(n).unwrap_or(0)
+                } else if signed {
+                    ((x as i64) >> n.min(63)) as u64
+                } else {
+                    x.checked_shr(n).unwrap_or(0)
+                };
+                if high || !right {
+                    (y >> 32) as u32
+                } else {
+                    y as u32
+                }
+            });
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::Bfe { d, a, b, signed, rev, cc } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let r = std::array::from_fn(|i| {
+                let x = if rev { u[i].reverse_bits() } else { u[i] };
+                bfe(x, v[i] & 0xff, v[i] >> 8 & 0xff, signed)
+            });
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::Bfi { d, a, b, c, cc } => {
+            let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
+            let r = std::array::from_fn(|i| bfi(u[i], v[i] & 0xff, v[i] >> 8 & 0xff, w[i]));
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::Flo { d, b, not, signed, shift, cc } => {
+            let v = l.src(h, b);
+            let r = v.map(|x| flo(if not { !x } else { x }, signed, shift));
+            if cc {
+                l.flags_i(m, r);
+            }
+            l.put(d, m, r);
+        }
+        Op::PopC { d, b, not } => {
+            let v = l.src(h, b);
+            l.put(d, m, v.map(|x| if not { x.count_zeros() } else { x.count_ones() }));
+        }
+        Op::Prmt { d, a, b, c, mode } => {
+            let (u, w) = (l.gpr[a as usize], l.src(h, c));
+            let r: [u32; N] = match b {
+                Src::Reg(rb) => {
+                    let v = l.gpr[rb as usize];
+                    // (the mode is known here, so each arm is a loop of shifts)
+                    match mode {
+                        0 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 0)),
+                        1 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 1)),
+                        2 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 2)),
+                        3 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 3)),
+                        4 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 4)),
+                        5 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 5)),
+                        _ => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 6)),
+                    }
+                }
+                // the same selector in every lane: the shift of each byte, once
+                _ => {
+                    let sel = prmt_bytes(l.src(h, b)[0], mode);
+                    if sel & 0x8888 == 0 {
+                        let sh: [u32; 4] = std::array::from_fn(|k| 8 * (sel >> (4 * k) & 7));
+                        std::array::from_fn(|i| {
+                            let x = u[i] as u64 | (w[i] as u64) << 32;
+                            (x >> sh[0]) as u32 & 0xff | ((x >> sh[1]) as u32 & 0xff) << 8 | ((x >> sh[2]) as u32 & 0xff) << 16 | ((x >> sh[3]) as u32) << 24
+                        })
+                    } else {
+                        std::array::from_fn(|i| prmt(u[i], sel, w[i], 0))
+                    }
+                }
+            };
+            l.put(d, m, r);
+        }
+        Op::Sel { d, a, b, p } => {
+            let t = l.p(p);
+            let (x, y) = (l.gpr[a as usize], l.src(h, b));
+            l.put(d, m, std::array::from_fn(|i| if t >> i & 1 != 0 { x[i] } else { y[i] }));
+        }
+        Op::Mov { d, b, lanes } => {
+            let v = l.src(h, b);
+            let m = if lanes == 15 { m } else { m & lanes as u32 * 0x1111_1111 };
+            l.put(d, m, v);
+        }
+
+        Op::PSet { d, a, b, c, op1, op2, bf, cc } => {
+            let t = bool_op(op1, l.p(a), l.p(b));
+            let r = bool_op(op2, t, l.p(c));
+            if cc {
+                l.flags(m, !r, if bf { 0 } else { r });
+            }
+            l.put(d, m, bools(r, bf));
+        }
+        Op::PSetP { pd, pn, a, b, c, op1, op2 } => {
+            let t = bool_op(op1, l.p(a), l.p(b));
+            let q = l.p(c);
+            l.putp(pd, m, bool_op(op2, t, q));
+            l.putp(pn, m, bool_op(op2, !t, q));
+        }
+
+        Op::S2R { d, sys } => {
+            let v = match sys {
+                0x00 => std::array::from_fn(|i| i as u32),
+                0x13 => bools(l.helper | l.killed, false),
+                0x38 => std::array::from_fn(|i| 1 << i),
+                0x39 => std::array::from_fn(|i| (1 << i) - 1),
+                0x3a => std::array::from_fn(|i| (1 << i) - 1 | 1 << i),
+                0x3b => std::array::from_fn(|i| !((1 << i) - 1 | 1 << i)),
+                0x3c => std::array::from_fn(|i| !((1 << i) - 1)),
+                _ => h.sysval(sys),
+            };
+            l.put(d, m, v);
+        }
+        Op::Vote { d, pd, p, op } => {
+            let t = l.p(p) & m;
+            let r = match op {
+                VoteOp::All => t == m,
+                VoteOp::Any => t != 0,
+                VoteOp::Eq => t == m || t == 0,
+            };
+            l.put(d, m, [t; N]);
+            l.putp(pd, m, if r { !0 } else { 0 });
+        }
+        Op::Shfl { d, pd, a, b, c, op } => {
+            let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
+            let mut ok = 0;
+            let r = std::array::from_fn(|i| {
+                let (lane, n) = (i as u32, v[i] & 31);
+                let (last, seg) = (w[i] & 31, w[i] >> 8 & 31);
+                let min = lane & seg;
+                let max = min | last & !seg;
+                let (j, in_range) = match op {
+                    ShflOp::Idx => {
+                        let j = min | n & !seg & 31;
+                        (j, j <= max)
+                    }
+                    ShflOp::Up => {
+                        let j = lane.wrapping_sub(n);
+                        (j, j as i32 >= min as i32)
+                    }
+                    ShflOp::Down => (lane + n, lane + n <= max),
+                    ShflOp::Bfly => (lane ^ n, lane ^ n <= max),
+                };
+                if in_range {
+                    ok |= 1 << i;
+                    if (j as usize) < N {
+                        u[j as usize]
+                    } else {
+                        0
+                    }
+                } else {
+                    u[i]
+                }
+            });
+            l.put(d, m, r);
+            l.putp(pd, m, ok);
+        }
+
+        Op::Ldc { .. }
+        | Op::Ld { .. }
+        | Op::St { .. }
+        | Op::Ldl { .. }
+        | Op::Stl { .. }
+        | Op::Lds { .. }
+        | Op::Sts { .. }
+        | Op::Atom { .. }
+        | Op::AtomS { .. } => memory(l, h, m, &inst.op),
+
+        Op::Ald { d, a, v, addr, n, patch, output } => {
+            let (base, vtx) = (l.gpr[a as usize], l.gpr[v as usize]);
+            for i in lanes(m) {
+                for c in 0..n as u32 {
+                    let at = Attr {
+                        addr: base[i].wrapping_add(addr as u32 + 4 * c),
+                        vertex: vtx[i],
+                        patch,
+                        output,
+                    };
+                    let x = h.attr_load(i, at);
+                    l.put1(reg_at(d, c as usize), i, x);
+                }
+            }
+        }
+        Op::Ast { r, a, v, addr, n, patch } => {
+            let (base, vtx) = (l.gpr[a as usize], l.gpr[v as usize]);
+            for i in lanes(m) {
+                for c in 0..n as u32 {
+                    let at = Attr {
+                        addr: base[i].wrapping_add(addr as u32 + 4 * c),
+                        vertex: vtx[i],
+                        patch,
+                        output: true,
+                    };
+                    h.attr_store(i, at, l.gpr[reg_at(r, c as usize) as usize][i]);
+                }
+            }
+        }
+        Op::Al2p { d, a, addr, n, .. } => {
+            // Physical attribute addresses are the logical ones here.
+            let base = l.gpr[a as usize];
+            for c in 0..n as u32 {
+                l.put(
+                    reg_at(d, c as usize),
+                    m,
+                    base.map(|x| x.wrapping_add(addr as u32 + 4 * c)),
+                );
+            }
+        }
+        Op::Isberd { d, a } => {
+            let x = l.gpr[a as usize];
+            for i in lanes(m) {
+                let v = h.isberd(i, x[i]);
+                l.put1(d, i, v);
+            }
+        }
+        Op::Ipa { d, addr, idx, mul, offset, mode, loc, sat } => {
+            let off = if loc == IpaLoc::Offset {
+                let o = l.gpr[offset as usize];
+                [
+                    // 12 bits each; the bits above may hold something else
+                    o.map(|x| ((x << 20) as i32 >> 20) as f32 / 4096.0),
+                    o.map(|x| ((x << 4) as i32 >> 20) as f32 / 4096.0),
+                ]
+            } else {
+                [[0.0; N]; 2]
+            };
+            let mut op = IpaOp { addr: addr as u32, mode, loc, offset: off };
+            let mut v = match idx {
+                None => h.interpolate(&op),
+                Some(r) => {
+                    let base = l.gpr[r as usize];
+                    let mut v = [0; N];
+                    let mut left = m;
+                    while left != 0 {
+                        let a = base[left.trailing_zeros() as usize];
+                        op.addr = a.wrapping_add(addr as u32);
+                        let x = h.interpolate(&op);
+                        for i in lanes(left) {
+                            if base[i] == a {
+                                v[i] = x[i];
+                                left &= !(1 << i);
+                            }
+                        }
+                    }
+                    v
+                }
+            };
+            // Mesa asks for gl_FragCoord with .MulW too; window coordinates stay as they are.
+            let window = idx.is_none() && (0x60..0x80).contains(&addr);
+            if mul != RZ && !window && matches!(mode, IpaMode::MulW | IpaMode::State) {
+                let w = l.gpr[mul as usize];
+                v = std::array::from_fn(|i| {
+                    (f32::from_bits(v[i]) * f32::from_bits(w[i])).to_bits()
+                });
+            }
+            if sat {
+                v = v.map(|x| fp::sat(f32::from_bits(x)).to_bits());
+            }
+            l.put(d, m, v);
+        }
+        Op::Pixld { d, a, what } => {
+            let v = h.pixld(what, &l.gpr[a as usize]);
+            l.put(d, m, v);
+        }
+        Op::Out { d, a, b, emit, cut } => {
+            let (handle, stream) = (l.gpr[a as usize], l.src(h, b));
+            for i in lanes(m) {
+                let v = h.emit(i, handle[i], stream[i], emit, cut);
+                l.put1(d, i, v);
+            }
+        }
+
+        Op::Tex(ref t) => texture(l, h, m, t),
+        Op::Suld(_) | Op::Sust(_) | Op::Suatom { .. } => surface(l, h, m, &inst.op),
+
+        Op::Exit { cond } => {
+            let m = m & l.test(cond);
+            l.exited |= m;
+            l.active &= !m;
+            if !l.unfinished() || !l.unwind() {
+                l.active = 0;
+                return Some(Exit::Done);
+            }
+        }
+        Op::Kil { cond } => {
+            l.killed |= m & l.test(cond);
+            if !l.unfinished() {
+                l.active = 0;
+                return Some(Exit::Done);
+            }
+        }
+        Op::Bra { t, cond, all } => {
+            let m = m & l.test(cond);
+            let rest = l.active & !m;
+            if rest == 0 {
+                l.pc = t;
+            } else if m != 0 && !all {
+                if l.stack.len() >= MAX_DEPTH {
+                    return Some(fault(p, pc));
+                }
+                l.stack.push(Token { kind: Kind::Div, pc: l.pc, lanes: rest });
+                l.active = m;
+                l.pc = t;
+            }
+        }
+        Op::Brx { a, base, cond } => {
+            let m = m & l.test(cond);
+            let rest = l.active & !m;
+            if rest != 0 && m != 0 {
+                l.stack.push(Token { kind: Kind::Div, pc: l.pc, lanes: rest });
+            }
+            let reg = l.gpr[a as usize];
+            let mut left = m;
+            while left != 0 {
+                let x = reg[left.trailing_zeros() as usize];
+                let same = left & mask::<N>(|i| reg[i] == x);
+                let Some(t) = p.index_of(base.wrapping_add(x)) else {
+                    return Some(fault(p, pc));
+                };
+                left &= !same;
+                if left == 0 {
+                    l.active = same;
+                    l.pc = t;
+                } else {
+                    l.stack.push(Token { kind: Kind::Div, pc: t, lanes: same });
+                }
+            }
+            if l.stack.len() >= MAX_DEPTH {
+                return Some(fault(p, pc));
+            }
+        }
+        Op::Cal { t } => {
+            if l.stack.len() >= MAX_DEPTH {
+                return Some(fault(p, pc));
+            }
+            l.stack.push(Token { kind: Kind::Ret, pc: l.pc, lanes: 0 });
+            l.pc = t;
+        }
+        Op::Pret { t } | Op::Ssy { t } | Op::Pbk { t } | Op::Pcnt { t } => {
+            let kind = match inst.op {
+                Op::Pret { .. } => Kind::Ret,
+                Op::Ssy { .. } => Kind::Ssy,
+                Op::Pbk { .. } => Kind::Pbk,
+                _ => Kind::Pcnt,
+            };
+            if l.stack.len() >= MAX_DEPTH {
+                return Some(fault(p, pc));
+            }
+            l.stack.push(Token { kind, pc: t, lanes: 0 });
+        }
+        Op::Sync { cond } | Op::Brk { cond } | Op::Cont { cond } | Op::Ret { cond } => {
+            let kind = match inst.op {
+                Op::Sync { .. } => Kind::Ssy,
+                Op::Brk { .. } => Kind::Pbk,
+                Op::Cont { .. } => Kind::Pcnt,
+                _ => Kind::Ret,
+            };
+            let m = m & l.test(cond);
+            if m == 0 {
+                return None;
+            }
+            if !l.park(kind, m) {
+                if kind != Kind::Ret {
+                    return Some(fault(p, pc));
+                }
+                // A return from the main program ends it.
+                l.exited |= m;
+                l.active &= !m;
+                if !l.unfinished() {
+                    l.active = 0;
+                    return Some(Exit::Done);
+                }
+            }
+            if l.stack.len() >= MAX_DEPTH {
+                return Some(fault(p, pc));
+            }
+            if !l.unwind() {
+                return Some(Exit::Done);
+            }
+        }
+        Op::Sam => {
+            if l.sam.len() >= MAX_DEPTH {
+                return Some(fault(p, pc));
+            }
+            l.sam.push(l.active);
+            for q in 0..N / 4 {
+                if l.active >> (4 * q) & 15 != 0 {
+                    l.active |= 15 << (4 * q);
+                }
+            }
+        }
+        Op::Ram => {
+            if let Some(a) = l.sam.pop() {
+                l.active = a;
+            }
+        }
+        Op::Bar => return Some(Exit::Barrier),
+    }
+    None
 }
 
 /// The lane numbers in a mask.
@@ -1654,8 +1670,8 @@ fn icmp<const N: usize, H: Host<N>>(l: &Lanes<N>, h: &H, c: &ICmpArgs) -> u32 {
     // left "no borrow" in the carry flag and "equal" in the zero flag.
     let lt = cmpi(1, c.signed, a, &b);
     let eq = cmpi(2, c.signed, a, &b);
-    let wide_lt = lt | eq & !l.carry;
-    let wide_eq = eq & l.zero;
+    let wide_lt = lt | eq & !l.cc[2];
+    let wide_eq = eq & l.cc[0];
     let mut r = 0;
     if c.cond & 1 != 0 {
         r |= wide_lt;
@@ -1690,7 +1706,7 @@ fn lop_flags<const N: usize>(
     }
     if cc {
         // .X: the zero flag covers a wider value.
-        let z = mask::<N>(|i| r[i] == 0) & if x { l.zero } else { !0 };
+        let z = mask::<N>(|i| r[i] == 0) & if x { l.cc[0] } else { !0 };
         l.flags(m, z, mask::<N>(|i| (r[i] as i32) < 0));
     }
 }
@@ -1721,7 +1737,7 @@ fn imad<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &H, m: u32, op: &Op) {
         return;
     };
     let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-    let carry = if x { l.carry } else { 0 };
+    let carry = if x { l.cc[2] } else { 0 };
     let po = neg_ab && neg_c;
     let mut c_out = 0;
     let mut o_out = 0;

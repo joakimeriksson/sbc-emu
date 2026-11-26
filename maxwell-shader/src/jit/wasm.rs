@@ -406,6 +406,11 @@ fn node(w: &mut W, n: &Node, vals: &[Val], expanded: &mut [Option<Vec4>]) -> Val
             Val::V(d)
         }
         Node::Fma(a, b, c) => Val::V(fma(w, v(a), v(b), v(c))),
+        // (only the native backend has these: lowering does not make them in the browser)
+        Node::Prmt(..) => {
+            w.failed = true;
+            Val::None
+        }
         Node::Expand(a) => {
             let e = expand(w, s(a));
             Val::V(e)

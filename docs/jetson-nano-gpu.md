@@ -86,7 +86,7 @@ In the browser the GPU has one thread: expect some 1 to 15 frames per second.
 with `SBC_STEP=0.0333333` each picture moves the demos on a fixed 1/30 s (`gpu-demo --step`), so the
 pictures (`SBC_SHOTS=DIR`) are the same from run to run, and `SBC_SHADER_JIT=0` turns the shader JIT off.
 
-## Shader JIT (browser)
+## Shader JIT
 
 In the browser, runs of plain arithmetic in a shader (floating point, integer, logic, shifts,
 conversions, comparisons, predicates, MUFU) become WebAssembly with 128-bit SIMD
@@ -104,7 +104,23 @@ the demos with `SBC_STEP` and `SBC_SHOTS`, with and without the JIT: the six pic
 bit. In Node on a loaded Apple M-series machine, 30 pictures of 640 x 480 took (without / with the JIT):
 planet 4.5 / 2.0 s, tunnel 2.2 / 1.5 s, shadow 3.4 / 2.5 s, swarm 1.6 / 1.3 s, fur 2.4 / 2.4 s. Shaders
 are then about a fifth of the time; the CPU (a third) and the rasterizer (a quarter) take the most.
-Natively the interpreter runs on all the host's cores and has no JIT.
+
+Natively on 64-bit ARM (macOS and Linux), the same runs become AArch64 code with NEON
+(`maxwell-shader/src/jit/a64.rs`), for 16 lanes (graphics) and for compute's 32-lane warps; each
+program is one piece of code. The lanes go four at a time (a NEON register), the block's values in
+registers v0..v27; predicates and flags are kept in values within a block, and values that are the
+same are made once. Natively the blocks also take what only that backend has: IADD with carries
+(.CC, .X), PRMT with a constant selector (a byte table lookup), and F2F between half and single.
+Every other instruction (memory, textures, control flow) is run by the interpreter, called from the
+code, which then goes on at the instruction that follows or where the interpreter left the lanes
+(a table of each instruction's code). The code runs on all the GPU's threads at once. A fused
+multiply-add is `fmla` (as `fp::fma` is `f32::mul_add` there); NaNs are made the GPU's after the
+operations, as in the interpreter, so the results are the same to the bit; MUFU's sine, cosine,
+powers and logarithms call the interpreter's functions. `SBC_SHADER_JIT=0` turns it off. Checks:
+`cargo test -p maxwell-shader jit` runs the random blocks with the native code for 16 and 32 lanes,
+whole programs of several blocks with it and without, and every half through the conversions.
+YOLOv8n through NVK (ncnn): about 1 s of host time per frame on an M-series Mac, against 1.4 s
+without the JIT; what is left is mostly the lanes' memory accesses, one by one.
 
 ## Not done
 
@@ -117,7 +133,8 @@ Natively the interpreter runs on all the host's cores and has no JIT.
 - NVK only with `NVK_I_WANT_A_BROKEN_VULKAN_DRIVER=1` (it does not support the GM20B officially) and
   a memory type marked device-local (on Tegra NVK has none; ncnn needs one); with them ncnn runs
   YOLOv8n with the CPU's detections. NVIDIA's own driver: [jetson-nano-cuda.md](jetson-nano-cuda.md).
-- The GPU runs on the CPU's thread (a core waits while it draws); the shader JIT has no native backend.
+- The GPU runs on the CPU's thread (a core waits while it draws); the shader JIT has no x86-64
+  backend, and its native code leaves memory and control flow to the interpreter.
   A compute launch's workgroups run in 32-lane warps on several host threads (one, if the shader
   uses global atomics); the warps of a workgroup that has no barriers and no shared memory run
   apart. The threads share guest RAM through relaxed atomic accesses of 64-bit words: what one
