@@ -20,7 +20,7 @@ pub mod wifi;
 pub mod machine;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod mt;
-pub mod pl011;
+pub use peripherals::pl011;
 pub mod pcie;
 pub mod i2s;
 pub mod bluetooth;

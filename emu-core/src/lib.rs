@@ -10,6 +10,7 @@ pub mod sdcard;
 pub mod usb;
 pub mod ext4;
 pub mod fdt;
+pub mod arm64_image;
 mod stop;
 pub use stop::Stop;
 

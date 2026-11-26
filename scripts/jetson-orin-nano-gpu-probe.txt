@@ -1,0 +1,4 @@
+wait-serial TEGRA234_BOOT_OK
+serial for m in host1x mc-utils nvsciipc nvmap nvgpu; do insmod /modules/$m.ko || break; done; test "$(basename "$(readlink /sys/bus/platform/devices/17000000.gpu/driver)")" = gk20a && test -c /dev/nvgpu/igpu0/power && echo "NVGPU_" "BOUND"\r
+wait-serial NVGPU_ BOUND
+quit

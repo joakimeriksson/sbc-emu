@@ -1,0 +1,10 @@
+# Exercise Tegra234 UART A through Linux and the separate host UART loopback.
+# Run with --rover-uart loopback and a kernel supporting the selected UART driver.
+wait-serial TEGRA234_BOOT_OK
+serial port=ttyS1; if grep -q hsuart /proc/device-tree/serial@3100000/compatible; then port=ttyTHS1; fi; exec 3<>/dev/$port; stty raw -echo 115200 <&3 && [ "$(stty speed <&3)" = 115200 ] && echo "UART_" "READY"\r
+wait-serial UART_ READY
+serial printf %s OK >&3; dd bs=1 count=2 <&3 2>/dev/null | grep -qx OK && echo "SHORT_" "OK"\r
+wait-serial SHORT_ OK
+serial seq 1 75 > /tmp/uartsent; cat /tmp/uartsent >&3; dd bs=1 count=$(wc -c </tmp/uartsent) <&3 >/tmp/uartrecv 2>/dev/null; cmp /tmp/uartsent /tmp/uartrecv && echo "BURST_" "OK"\r
+wait-serial BURST_ OK
+quit

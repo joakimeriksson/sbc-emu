@@ -40,6 +40,7 @@ emulated Jetson Nano's GPU, and the music was played by MilkyTracker on the emul
 | Orange Pi RV | StarFive JH7110, 4× SiFive U74 (RISC-V) | the board's own boot chain from its SPI flash or SD card to Alpine, Xunlong's kernel or Canonical's Ubuntu 24.04.5, unmodified; Wi-Fi, NVMe; the PowerVR GPU with Vulkan. Also in the browser. | [orangepi-rv.md](docs/orangepi-rv.md) |
 | ASUS Tinker Board S | Rockchip RK3288, 4× Cortex-A12 | Armbian from SD or eMMC to a login on HDMI; the Mali-T760 GPU with Panfrost. Also in the browser. | [tinkerboard.md](docs/tinkerboard.md) |
 | NVIDIA Jetson Nano | Tegra X1, 4× Cortex-A57 | Debian 13 from the microSD card with Debian's own kernel; Ethernet, USB, HDMI; the Maxwell GPU through nouveau and Mesa (OpenGL ES 3.2). Also in the browser. | [jetson-nano.md](docs/jetson-nano.md) |
+| NVIDIA Jetson Orin Nano 4GB | Tegra234, 6× Cortex-A78AE | Direct Linux boot to an Alpine shell, with a separate UART A byte link; NVIDIA's nvgpu drives the GA10B GPU: CUDA kernels, EGL/GLES 2 and 3, and the copy engine. | [jetson-orin-nano.md](docs/jetson-orin-nano.md) |
 | ESP32-S31 Function CoreBoard | Espressif ESP32-S31, 2× RV32IMAC | Espressif's official Linux flash image, from the mask ROM to a shell. Also in the browser. | [esp32s31.md](docs/esp32s31.md) |
 
 The Raspberry Pi 4 is complete enough for real use; the other boards are experimental. Each
@@ -52,7 +53,7 @@ One command boots a board to a shell in your terminal (macOS or Linux, with
 
 ```sh
 git clone https://github.com/joakimeriksson/sbc-emu && cd sbc-emu
-scripts/quickstart.sh pi4b      # or orangepi5, orangepi-one, tinkerboard, orangepi-rv, jetson-nano, esp32s31
+scripts/quickstart.sh pi4b      # or orangepi5, orangepi-one, tinkerboard, orangepi-rv, jetson-nano, jetson-orin-nano-4gb, esp32s31
 ```
 
 `Ctrl-A x` quits. **[Getting started](docs/getting-started.md)** has every board, the full

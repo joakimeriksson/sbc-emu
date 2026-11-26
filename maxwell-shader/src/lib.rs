@@ -21,6 +21,7 @@
 #![allow(clippy::needless_range_loop, clippy::precedence, clippy::large_enum_variant)]
 
 pub mod decode;
+pub mod decode_sm70;
 pub mod disasm;
 pub mod exec;
 pub mod fp;

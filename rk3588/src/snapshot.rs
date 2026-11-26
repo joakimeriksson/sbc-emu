@@ -9,7 +9,7 @@ use emu_core::snap::{self, Snap, SnapError, R, W};
 
 const BOARD: &str = "orangepi5";
 /// Of the layout: raise it when what is saved changes.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 emu_core::snap_enum!(CoreState { Off, Run, Wfi, Wfe });
 

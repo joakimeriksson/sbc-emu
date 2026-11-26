@@ -13,11 +13,13 @@ pub struct Compute {
     regs: Vec<u32>,
     inline: Inline,
     pub launches: u64,
+    /// Volta-and-later descriptors (QMD v3, Tegra234's C7C0) and SM70 programs
+    pub sm70: bool,
 }
 
 impl Default for Compute {
     fn default() -> Self {
-        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0 }
+        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0, sm70: false }
     }
 }
 
@@ -25,6 +27,10 @@ impl Default for Compute {
 #[derive(Debug, PartialEq)]
 struct Launch {
     entry: u32,
+    /// SM70: the program's own address (`entry` is then 0)
+    program: Option<u64>,
+    /// SM70: a texture's sampler has its number
+    linked: bool,
     /// workgroups and threads in each
     groups: [u32; 3],
     threads: [u32; 3],
@@ -51,6 +57,8 @@ impl Launch {
             .collect();
         Self {
             entry: w[8],
+            program: None,
+            linked: false,
             groups: [w[12], w[13] & 0xffff, w[13] >> 16],
             threads: [w[18] >> 16, w[19] & 0xffff, w[19] >> 16],
             shared: (w[17] & 0x3_ffff) as usize,
@@ -64,6 +72,34 @@ impl Launch {
 /// Lanes that run in lockstep: a warp, as CUDA's kernels assume (shuffles, votes, lane ids and
 /// warp-synchronous code see all 32 threads at once).
 const W: usize = 32;
+
+impl Launch {
+    /// A QMD v3 (Ampere's C7C0), as NVIDIA's clc7c0qmd.h lays it out.
+    fn decode_v3(w: &[u32; 64]) -> Self {
+        let mut cbufs = [Cbuf::default(); 18];
+        for (k, c) in cbufs.iter_mut().enumerate().take(8).filter(|(k, _)| w[20] >> k & 1 != 0) {
+            let (lo, hi) = (w[32 + 2 * k], w[33 + 2 * k]);
+            *c = Cbuf { address: ((hi & 0x1_ffff) as u64) << 32 | lo as u64, size: (hi >> 19) << 4 };
+        }
+        // (address, payload, one word): release 0 at word 24, release 1 at word 28
+        let releases = [24, 28]
+            .into_iter()
+            .filter(|&r| w[r + 1] >> 23 & 1 != 0)
+            .map(|r| (((w[r + 1] & 0xff) as u64) << 32 | w[r] as u64, w[r + 2], w[r + 1] >> 30 == 1))
+            .collect();
+        Self {
+            entry: 0,
+            program: Some(((w[49] & 0x1_ffff) as u64) << 32 | w[48] as u64),
+            linked: w[11] >> 30 & 1 != 0,
+            groups: [w[12], w[13] & 0xffff, w[14] & 0xffff],
+            threads: [w[18] >> 16, w[19] & 0xffff, w[19] >> 16],
+            shared: (w[17] & 0x3_ffff) as usize,
+            local: ((w[23] & 0xff_ffff) + (w[50] & 0xff_ffff)) as usize,
+            cbufs,
+            releases,
+        }
+    }
+}
 
 /// The largest workgroup (threads), the most local memory of one, and the most instructions (of
 /// sixteen threads each) for sixteen threads and in a launch: programs that do not end are stopped.
@@ -118,7 +154,7 @@ impl Compute {
         match m {
             0x21c | 0x1280 => pipe.invalidate_shaders(),
             0x1698 if v & 1 != 0 => pipe.invalidate_shaders(),
-            0x2bc => {
+            0x2bc if !self.sm70 => {
                 self.launch(pipe, mem, now);
                 return true;
             }
@@ -142,12 +178,17 @@ impl Compute {
     }
 
     fn launch(&mut self, pipe: &mut Pipe, mem: &mut dyn Memory, now: u64) {
+        self.launch_at((self.r(0x2b4) as u64) << 8, pipe, mem, now);
+    }
+
+    /// Run the descriptor at `qmd`: B1C0's layout, or QMD v3 with `sm70`.
+    pub fn launch_at(&mut self, qmd: u64, pipe: &mut Pipe, mem: &mut dyn Memory, now: u64) {
         let mut raw = [0u8; 256];
-        mem.read((self.r(0x2b4) as u64) << 8, &mut raw);
+        mem.read(qmd, &mut raw);
         let words: [u32; 64] = std::array::from_fn(|k| u32::from_le_bytes(raw[4 * k..4 * k + 4].try_into().unwrap()));
-        let launch = Launch::decode(&words);
+        let launch = if self.sm70 { Launch::decode_v3(&words) } else { Launch::decode(&words) };
         self.launches += 1;
-        let base = self.address(0x1608);
+        let base = launch.program.unwrap_or_else(|| self.address(0x1608));
         if let Some(program) = pipe.program(base, launch.entry, mem) {
             self.run(&launch, &program, pipe, mem);
         }
@@ -163,11 +204,13 @@ impl Compute {
     fn run(&mut self, launch: &Launch, program: &Program, pipe: &mut Pipe, mem: &mut dyn Memory) {
         // 32-lane warps, as CUDA's kernels assume; in the browser a kernel that cannot see the warp
         // width (no shuffles, votes, lane ids or lane masks) runs in the shader JIT's 16 lanes
+        // Volta-and-later programs name bound textures by constant buffer and word
+        let tex_cb = if self.sm70 { u32::MAX } else { self.r(0x2608) };
         let narrow = cfg!(target_arch = "wasm32") && narrow(program);
         if narrow {
-            run_lanes::<16>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), self.r(0x2608));
+            run_lanes::<16>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), tex_cb);
         } else {
-            run_lanes::<W>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), self.r(0x2608));
+            run_lanes::<W>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), tex_cb);
         }
     }
 }
@@ -204,7 +247,7 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
     // the descriptor invalidates the caches
     pipe.invalidate_textures();
     pipe.cbufs_changed = true;
-    let work = Work::compute(pipe, launch.cbufs, local_base, shared_base, tex_cb);
+    let work = Work::compute(pipe, launch.cbufs, local_base, shared_base, tex_cb, launch.linked);
     // which thread each lane is
     let thread = |batch: usize, lane: usize| {
         let t = (batch * N + lane) as u32;
@@ -413,7 +456,7 @@ mod tests {
     }
 
     fn launch(groups: u32) -> Launch {
-        Launch { entry: 0, groups: [groups, 1, 1], threads: [1, 1, 1], shared: 0, local: 0, cbufs: [Cbuf::default(); 18], releases: Vec::new() }
+        Launch { entry: 0, program: None, linked: false, groups: [groups, 1, 1], threads: [1, 1, 1], shared: 0, local: 0, cbufs: [Cbuf::default(); 18], releases: Vec::new() }
     }
 
     const ST: u64 = 0xeed8;

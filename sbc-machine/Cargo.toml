@@ -14,3 +14,4 @@ esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }
 tegra210 = { path = "../tegra210" }
 emu-core = { path = "../emu-core" }
+tegra234 = { path = "../tegra234" }

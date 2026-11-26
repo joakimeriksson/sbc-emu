@@ -37,3 +37,6 @@ pub mod xhci;
 
 pub use gic::{Gic, NCPU, SPURIOUS};
 pub use uart::Uart;
+
+pub mod gicv3;
+pub mod pl011;

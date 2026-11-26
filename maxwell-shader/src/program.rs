@@ -10,6 +10,8 @@ pub struct Program {
     pub(crate) code: Vec<Inst>,
     /// Code address and original word of every instruction, in address order.
     pub(crate) words: Vec<(u32, u64)>,
+    /// SM70: the upper 64-bit half of every instruction word (address, word), which `words` lacks.
+    pub(crate) high: Vec<(u32, u64)>,
     pub(crate) entry: u32,
     gprs: u32,
     /// The JIT's code, made when first wanted.
@@ -74,7 +76,90 @@ impl Program {
             words.push((addr, word));
         }
         let entry = index(entry).map_err(|_| "no entry".to_string())?;
-        Ok(Program { code, words, entry, gprs, jit: Default::default() })
+        Ok(Program { code, words, high: Vec::new(), entry, gprs, jit: Default::default() })
+    }
+
+    /// Decodes everything reachable from code address `entry` of SM70+ code (128-bit
+    /// instructions, no scheduling words). `fetch` returns the 64-bit word at a code address.
+    /// An instruction may become two operations; jumps go to the first of them. A convergence
+    /// barrier's meeting point (SSY) moves past the BSYNC (SYNC) at its label.
+    pub fn decode_sm70_at(
+        entry: u32,
+        fetch: &mut dyn FnMut(u32) -> Option<u64>,
+    ) -> Result<Program, String> {
+        use crate::decode_sm70::{decode, SIZE};
+        let mut found: BTreeMap<u32, (u128, Vec<Inst>)> = BTreeMap::new();
+        let mut work = vec![entry];
+        while let Some(mut addr) = work.pop() {
+            loop {
+                if found.contains_key(&addr) {
+                    break;
+                }
+                if found.len() >= MAX_INSTS {
+                    return Err(format!("program at {entry:#x} is too long"));
+                }
+                let lo = fetch(addr).ok_or_else(|| format!("no code at {addr:#x}"))?;
+                let hi = fetch(addr + 8).ok_or_else(|| format!("no code at {:#x}", addr + 8))?;
+                let raw = lo as u128 | (hi as u128) << 64;
+                let mut insts = decode(addr, raw);
+                if insts.is_empty() {
+                    insts.push(Inst { pred: PT, op: Op::Nop });
+                }
+                let last = *insts.last().unwrap();
+                for inst in &insts {
+                    if let Some(t) = target(&inst.op) {
+                        work.push(t);
+                    }
+                    // the code after a BSSY's BSYNC is reached only through the BSYNC
+                    if let Op::Ssy { t } = inst.op {
+                        work.push(t.wrapping_add(SIZE));
+                    }
+                }
+                found.insert(addr, (raw, insts));
+                if ends(&last) {
+                    break;
+                }
+                addr = addr.wrapping_add(SIZE);
+            }
+        }
+
+        let mut first = BTreeMap::new();
+        let mut n = 0u32;
+        for (&addr, (_, insts)) in &found {
+            first.insert(addr, n);
+            n += insts.len() as u32;
+        }
+        let index = |a: u32| first.get(&a).copied().ok_or(());
+        let mut code = Vec::with_capacity(n as usize);
+        let mut words = Vec::with_capacity(n as usize);
+        let high = found.iter().map(|(&addr, (raw, _))| (addr + 8, (*raw >> 64) as u64)).collect();
+        let mut gprs = 0;
+        for (&addr, (raw, insts)) in &found {
+            for &inst in insts {
+                let mut inst = inst;
+                if let Op::Bra { t, .. }
+                | Op::Cal { t }
+                | Op::Pret { t }
+                | Op::Ssy { t }
+                | Op::Pbk { t }
+                | Op::Pcnt { t } = &mut inst.op
+                {
+                    *t = index(*t).map_err(|_| format!("jump at {addr:#x} to {t:#x}"))?;
+                }
+                gprs = gprs.max(highest_reg(&inst.op));
+                code.push(inst);
+                words.push((addr, *raw as u64));
+            }
+        }
+        for k in 0..code.len() {
+            if let Op::Ssy { t } = code[k].op {
+                if matches!(code.get(t as usize).map(|i| i.op), Some(Op::Sync { .. })) {
+                    code[k].op = Op::Ssy { t: t + 1 };
+                }
+            }
+        }
+        let entry = index(entry).map_err(|_| "no entry".to_string())?;
+        Ok(Program { code, words, high, entry, gprs, jit: Default::default() })
     }
 
     /// Decodes a program at address 0 of `code`.
@@ -88,7 +173,7 @@ impl Program {
 
     /// Whether the code in memory is still what was decoded.
     pub fn matches(&self, fetch: &mut dyn FnMut(u32) -> Option<u64>) -> bool {
-        self.words.iter().all(|&(a, w)| fetch(a) == Some(w))
+        self.words.iter().chain(&self.high).all(|&(a, w)| fetch(a) == Some(w))
     }
 
     /// Code addresses (and words) this program was decoded from, in address order.
@@ -182,6 +267,8 @@ fn highest_reg(op: &Op) -> u32 {
         | Op::FSet { d, .. }
         | Op::FSwzAdd { d, .. }
         | Op::Mufu { d, .. }
+        | Op::Half { d, .. }
+        | Op::PackHalves { d, .. }
         | Op::Rro { d, .. }
         | Op::DSet { d, .. }
         | Op::IAdd { d, .. }

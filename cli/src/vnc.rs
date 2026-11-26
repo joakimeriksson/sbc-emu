@@ -34,6 +34,7 @@ impl Screen for Machine {
 }
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 #[derive(PartialEq)]
@@ -45,7 +46,7 @@ struct PixelFormat { bpp: u8, big: bool, rmax: u16, gmax: u16, bmax: u16, rs: u8
 const SERVER_PF: PixelFormat = PixelFormat { bpp: 32, big: false, rmax: 255, gmax: 255, bmax: 255, rs: 16, gs: 8, bs: 0 };
 
 struct Client {
-    s: TcpStream,
+    s: Transport,
     rx: Vec<u8>,
     phase: Phase,
     minor: u8,
@@ -63,13 +64,60 @@ struct Client {
 }
 
 pub struct Vnc {
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     client: Option<Client>,
     frame: Vec<u8>,
     last: Instant,
     password: Option<Vec<u8>>,
     /// the size of the last frame the display showed
     last_size: Option<(u32, u32)>,
+}
+
+enum Transport {
+    Tcp(TcpStream),
+    Stdio(Receiver<Vec<u8>>),
+}
+
+impl Transport {
+    fn receive(&mut self, pending: &mut Vec<u8>) -> bool {
+        match self {
+            Self::Tcp(stream) => {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => return false,
+                        Ok(n) => pending.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
+                        Err(_) => return false,
+                    }
+                }
+            }
+            Self::Stdio(input) => loop {
+                match input.try_recv() {
+                    Ok(data) => pending.extend_from_slice(&data),
+                    Err(TryRecvError::Empty) => return true,
+                    Err(TryRecvError::Disconnected) => return false,
+                }
+            },
+        }
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.write_all(data),
+            Self::Stdio(_) => {
+                let mut output = std::io::stdout().lock();
+                output.write_all(data)?;
+                output.flush()
+            }
+        }
+    }
+
+    fn set_nonblocking(&self, enabled: bool) {
+        if let Self::Tcp(stream) = self {
+            let _ = stream.set_nonblocking(enabled);
+        }
+    }
 }
 
 /// A fresh 16-byte challenge (clock and address mixed; it only has to differ per connection).
@@ -100,8 +148,26 @@ fn keysym_usage(k: u32) -> Option<u8> {
 }
 
 impl Vnc {
-    /// `spec`: ":N" (port 5900+N, like QEMU) or a port number, optionally `,password=PW`
-    /// (the first 8 bytes count, as in every VNC server); listens on 127.0.0.1.
+    /// Serve one RFB client over a pair of pipes.
+    pub fn stdio() -> std::io::Result<Vnc> {
+        let (tx, rx) = mpsc::sync_channel(8);
+        std::thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = input.read(&mut buf) {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Self::client(Transport::Stdio(rx), None, None)?;
+        Ok(Vnc {
+            listener: None, client: Some(client), frame: Vec::new(), last: Instant::now(),
+            password: None, last_size: None,
+        })
+    }
+
+    /// `spec`: ":N" or a port number, optionally `,password=PW`. Listens on loopback.
     pub fn listen(spec: &str) -> std::io::Result<Vnc> {
         let (spec, password) = match spec.split_once(",password=") {
             Some((s, p)) => (s, Some(p.as_bytes().iter().copied().take(8).collect::<Vec<u8>>())),
@@ -114,29 +180,39 @@ impl Vnc {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         eprintln!("[sbc-emu] VNC server on 127.0.0.1:{port} (display :{})", port.wrapping_sub(5900));
-        Ok(Vnc { listener, client: None, frame: Vec::new(), last: Instant::now(), password, last_size: None })
+        Ok(Vnc { listener: Some(listener), client: None, frame: Vec::new(), last: Instant::now(), password, last_size: None })
+    }
+
+    fn client(
+        s: Transport,
+        password: Option<Vec<u8>>,
+        init_size: Option<(u32, u32)>,
+    ) -> std::io::Result<Client> {
+        let mut client = Client {
+            s, rx: Vec::new(), phase: Phase::Version, minor: 8, pf: SERVER_PF,
+            resize_ok: false, want: None, shown: Vec::new(), size: (0, 0),
+            password, challenge: challenge(), init_size,
+        };
+        client.s.write_all(b"RFB 003.008\n")?;
+        Ok(client)
+    }
+
+    pub fn stdio_disconnected(&self) -> bool {
+        self.listener.is_none() && self.client.is_none()
     }
 
     /// Serve the viewer: handshake, input, and at most ~30 updates a second.
     pub fn poll(&mut self, m: &mut dyn Screen) {
         if let Some(sz) = m.shown_size() { self.last_size = Some(sz); }
-        if let Ok((s, _)) = self.listener.accept() {
+        if let Some((s, _)) = self.listener.as_ref().and_then(|socket| socket.accept().ok()) {
             let _ = s.set_nonblocking(true);
             let _ = s.set_nodelay(true);
-            let mut c = Client { s, rx: Vec::new(), phase: Phase::Version, minor: 8, pf: SERVER_PF, resize_ok: false, want: None, shown: Vec::new(), size: (0, 0),
-                                 password: self.password.clone(), challenge: challenge(), init_size: self.last_size };
-            let _ = c.s.write_all(b"RFB 003.008\n");
-            self.client = Some(c);
+            self.client = Self::client(Transport::Tcp(s), self.password.clone(), self.last_size).ok();
         }
         let Some(c) = self.client.as_mut() else { return };
-        let mut buf = [0u8; 4096];
-        loop {
-            match c.s.read(&mut buf) {
-                Ok(0) => { self.client = None; return; }
-                Ok(n) => c.rx.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => { self.client = None; return; }
-            }
+        if !c.s.receive(&mut c.rx) {
+            self.client = None;
+            return;
         }
         if !c.messages(m) { self.client = None; return; }
         if c.want.is_some() && c.phase == Phase::Normal && self.last.elapsed() >= Duration::from_millis(33) {
@@ -313,9 +389,9 @@ impl Client {
         self.shown.clear();
         self.shown.extend_from_slice(frame);
         self.want = None;
-        let _ = self.s.set_nonblocking(false);
+        self.s.set_nonblocking(false);
         let ok = self.s.write_all(&msg).is_ok();
-        let _ = self.s.set_nonblocking(true);
+        self.s.set_nonblocking(true);
         ok
     }
 }

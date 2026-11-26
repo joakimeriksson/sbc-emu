@@ -41,6 +41,7 @@ dependencies = [
  "arm-a64",
  "emu-core",
  "miniz_oxide",
+ "peripherals",
  "sbc-net",
  "v3d",
 ]
@@ -226,6 +227,7 @@ dependencies = [
  "sbc-machine",
  "starfive-jh7110",
  "tegra210",
+ "tegra234",
  "v3d",
 ]
 
@@ -250,6 +252,7 @@ dependencies = [
  "ruzstd",
  "starfive-jh7110",
  "tegra210",
+ "tegra234",
  "v3d",
 ]
 
@@ -266,6 +269,7 @@ dependencies = [
  "rockchip-rk3288",
  "starfive-jh7110",
  "tegra210",
+ "tegra234",
 ]
 
 [[package]]
@@ -294,9 +298,19 @@ dependencies = [
  "emu-core",
  "maxwell",
  "maxwell-shader",
- "miniz_oxide",
  "peripherals",
  "sbc-net",
+]
+
+[[package]]
+name = "tegra234"
+version = "0.1.0"
+dependencies = [
+ "arm-a64",
+ "emu-core",
+ "maxwell",
+ "maxwell-tex",
+ "peripherals",
 ]
 
 [[package]]

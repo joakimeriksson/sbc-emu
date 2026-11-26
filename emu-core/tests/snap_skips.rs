@@ -10,6 +10,8 @@ const APPROVED: &[(&str, &str, &str)] = &[
     ("arm-a32", "Cpu", "model tlb ram ram_base ram_len ram_phys utlb io jit jit_bus jit_trap chain_until jit_off interp_run jit_disp jit_front el1 el0_exit mt watch"), // the machine's set-up, caches (dropped), what lives during a step, the debugger's
     ("emu-core", "SdCard", "trace"),                        // debugging output
     ("mali400", "Mali400", "logged trace"),                 // debugging output
+    ("peripherals", "Gic", "affinities ready"),             // fixed board topology; cache dropped by `after`
+    ("peripherals", "Pe", "cached"),                        // cache dropped by the Gic's `after`
     ("peripherals", "Pl330", "log"),                        // debugging output
     ("midgard", "MaliT760", "trace"),                       // debugging output
     ("rockchip-rk3288", "Dsi", "log"),                      // debugging output
@@ -21,11 +23,9 @@ const APPROVED: &[(&str, &str, &str)] = &[
     ("rockchip-rk3288", "Soc", "code_watch display_name display_rotation log_stub_pages"), // of compiled code; the board's set-up; debugging output
     ("rockchip-rk3288", "Vop", "log"),                      // debugging output
     ("rk3588", "Clock", "name"),                            // a constant of the board
-    ("rk3588", "Gic", "ready"),                             // a cache, dropped by `after`
     ("rk3588", "Gpu", "cost_ns"),                           // always 0 between steps: charged to the core after each one
     ("rk3588", "I2sTdm", "capture out"),                    // --audio-out, what was recorded
     ("rk3588", "Machine", "breakpoints dtb mt multi"),      // the debugger's; the boot's; threads and the choice to use them
-    ("rk3588", "Pe", "cached"),                             // a cache, dropped by the Gic's `after`
     ("rk3588", "Tiler", "bytes primitives"),                // totals of its frames, counted again by `after`
     ("rk3588", "Xhci", "trace"),                            // debugging output
     ("powervr", "Firmware", "trace trace_jobs"),           // debugging output

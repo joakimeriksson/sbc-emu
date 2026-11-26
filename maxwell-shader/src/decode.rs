@@ -1104,6 +1104,7 @@ const NO_TEX: Tex = Tex {
     deriv: RZ,
     comp: 0,
     ndv: false,
+    f16: false,
     live_only: false,
 };
 

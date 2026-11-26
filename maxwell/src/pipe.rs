@@ -177,7 +177,7 @@ impl Worker {
         for (w, b) in words.iter_mut().zip(&work.cbufs) {
             w.bind(*b, work.constants);
         }
-        let common = Common { mem, words, textures: &mut self.textures, samplers: &mut self.samplers, cache: &mut self.cache, tic: work.tic, tsc: work.tsc, tex_cb: work.tex_cb, stored: false };
+        let common = Common { mem, words, textures: &mut self.textures, samplers: &mut self.samplers, cache: &mut self.cache, tic: work.tic, tsc: work.tsc, tex_cb: work.tex_cb, linked: work.linked, stored: false };
         (&mut self.lanes, common)
     }
 }
@@ -193,6 +193,8 @@ pub struct Work {
     tic: u64,
     tsc: u64,
     tex_cb: u32,
+    /// SET_SAMPLER_BINDING VIA_HEADER_BINDING: a texture's sampler has its number
+    linked: bool,
 }
 
 pub struct Pipe {
@@ -207,6 +209,9 @@ pub struct Pipe {
     /// primitives by tile, empty between draws
     pub bins: Vec<Vec<u32>>,
     pub errors: std::collections::BTreeSet<String>,
+    /// Volta-and-later shaders (Tegra234's Ampere): 128-bit SM70 code after a 128-byte header,
+    /// each stage at its own 64-bit address, and buffer sizes instead of limit addresses.
+    pub sm70: bool,
 }
 
 impl Default for Pipe {
@@ -221,6 +226,7 @@ impl Default for Pipe {
             workers: Vec::new(),
             bins: Vec::new(),
             errors: Default::default(),
+            sm70: false,
         }
     }
 }
@@ -263,11 +269,15 @@ impl Pipe {
         if let Some(p) = self.programs.get(&(base + entry as u64)) {
             return p.clone();
         }
-        let made = Program::decode_at(entry, &mut |a| {
+        let mut fetch = |a: u32| {
             let mut b = [0; 8];
             mem.read(base + a as u64, &mut b);
             Some(u64::from_le_bytes(b))
-        });
+        };
+        let made = if self.sm70 { Program::decode_sm70_at(entry, &mut fetch) } else { Program::decode_at(entry, &mut fetch) };
+        if let (true, Ok(p)) = (self.sm70, &made) {
+            report_sm70(p, base, mem);
+        }
         let p = match made {
             Ok(p) => {
                 static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
@@ -296,16 +306,25 @@ impl Pipe {
         }
         let mut header = [0u8; 0x50];
         mem.read(base + start as u64, &mut header);
+        let sm70 = self.sm70;
         let made = match Sph::parse(&header) {
             None => Err(format!("no shader header at {start:#x}")),
             Some(sph) => {
-                let entry = start + 0x50;
-                // addresses inside a program count from its first instruction's block
-                Program::decode_at(entry, &mut |a| {
+                let mut fetch = |a: u32| {
                     let mut b = [0; 8];
                     mem.read(base + a as u64, &mut b);
                     Some(u64::from_le_bytes(b))
-                })
+                };
+                // addresses inside a program count from its first instruction's block
+                if sm70 {
+                    let made = Program::decode_sm70_at(start + 0x80, &mut fetch);
+                    if let Ok(p) = &made {
+                        report_sm70(p, base + start as u64, mem);
+                    }
+                    made
+                } else {
+                    Program::decode_at(start + 0x50, &mut fetch)
+                }
                 .map(|program| Shader { program, sph })
             }
         };
@@ -321,6 +340,28 @@ impl Pipe {
     }
 }
 
+/// SM70 code at `base`: instructions the decoder does not know, whole, for a disassembler; and
+/// with SBC_DUMP_SHADERS=DIR the code as far as it was decoded (a graphics shader's header first).
+fn report_sm70(p: &Program, base: u64, mem: &dyn Memory) {
+    let read = |at: u64| {
+        let mut b = [0; 8];
+        mem.read(at, &mut b);
+        u64::from_le_bytes(b)
+    };
+    for (inst, &(at, _)) in p.insts().iter().zip(p.words()) {
+        if let maxwell_shader::isa::Op::Invalid(_) = inst.op {
+            let (lo, hi) = (read(base + at as u64), read(base + at as u64 + 8));
+            eprintln!("[maxwell] sm70 unknown at {base:#x}+{at:#x}: {hi:016x}{lo:016x}");
+        }
+    }
+    if let Some(dir) = std::env::var_os("SBC_DUMP_SHADERS") {
+        let end = p.words().iter().map(|w| w.0 + 16).max().unwrap_or(0);
+        let mut bytes = vec![0; end as usize];
+        mem.read(base, &mut bytes);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{base:x}.bin")), bytes);
+    }
+}
+
 /// What every stage's host needs.
 pub struct Common<'a> {
     pub mem: &'a mut dyn Memory,
@@ -331,10 +372,20 @@ pub struct Common<'a> {
     pub tic: u64,
     pub tsc: u64,
     pub tex_cb: u32,
+    pub linked: bool,
     pub stored: bool,
 }
 
 impl Common<'_> {
+    /// A bound texture's handle.
+    fn bound(&self, w: u32) -> u32 {
+        if self.tex_cb == u32::MAX {
+            self.cbuf(w >> 14, 4 * (w & 0x3fff))
+        } else {
+            self.cbuf(self.tex_cb, 4 * w)
+        }
+    }
+
     #[inline(always)]
     pub fn cbuf(&self, index: u32, offset: u32) -> u32 {
         self.words.get(index as usize).map_or(0, |w| w.get(offset, &*self.mem))
@@ -382,7 +433,7 @@ impl Common<'_> {
                 }
                 Handle::Bindless(h) => self.quad(op, q, h[first], active, &mut out),
                 Handle::Bound(w) => {
-                    let h = self.cbuf(self.tex_cb, 4 * w);
+                    let h = self.bound(w);
                     self.quad(op, q, h, active, &mut out);
                 }
             }
@@ -427,7 +478,7 @@ impl Common<'_> {
                 put(r);
             }
             _ => {
-                let smp = self.sampler_at(handle >> 20);
+                let smp = self.sampler_at(if self.linked { handle & 0xfffff } else { handle >> 20 });
                 let lod = match op.lod_mode {
                     _ if op.kind == TexKind::Grad => {
                         let g = |v: &[[f32; N]; 2]| -> [[f32; 4]; 3] { std::array::from_fn(|c| std::array::from_fn(|k| v.get(c).map_or(0.0, |v| v[4 * q + k]))) };
@@ -464,7 +515,7 @@ impl Common<'_> {
     fn surface<const N: usize>(&mut self, op: &SurfOp<N>, l: usize) -> (Arc<Texture>, [i32; 3], u32) {
         let h = match op.handle {
             Handle::Bindless(h) => h[l],
-            Handle::Bound(w) => self.cbuf(self.tex_cb, 4 * w),
+            Handle::Bound(w) => self.bound(w),
         };
         let t = self.texture_at(h & 0xf_ffff);
         let c = |k: usize| op.coord[k][l] as i32;
@@ -615,11 +666,11 @@ const FUEL: u64 = 4_000_000;
 
 impl Work {
     /// Compute's resources.
-    pub fn compute(pipe: &mut Pipe, cbufs: [Cbuf; 18], tic: u64, tsc: u64, tex_cb: u32) -> Self {
+    pub fn compute(pipe: &mut Pipe, cbufs: [Cbuf; 18], tic: u64, tsc: u64, tex_cb: u32, linked: bool) -> Self {
         if std::mem::take(&mut pipe.cbufs_changed) {
             pipe.constant_generation += 1;
         }
-        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb }
+        Self { stage: 5, cbufs, textures: pipe.texture_generation, constants: pipe.constant_generation, tic, tsc, tex_cb, linked }
     }
 }
 
@@ -632,7 +683,10 @@ pub fn work(t: &Threed, s: usize) -> Work {
         constants: t.pipe.constant_generation,
         tic: t.address(0x1574),
         tsc: t.address(0x155c),
-        tex_cb: t.r(0x2608),
+        // SM70 bound textures name their constant buffer: `index` is buffer << 14 | word
+        tex_cb: if t.pipe.sm70 { u32::MAX } else { t.r(0x2608) },
+        // SET_SAMPLER_BINDING (Kepler's TEX_MISC on Maxwell: left as it was)
+        linked: t.pipe.sm70 && t.r(0x1234) & 1 != 0,
     }
 }
 
@@ -672,7 +726,15 @@ fn strip(t: &mut Threed, list: &[u32], arrays: bool, id: &mut u32, mem: &mut dyn
     }
     let base = t.address(0x1608);
     let stage = |t: &Threed, k: u32| (t.r(0x2000 + 0x40 * k) & 1 != 0).then(|| t.r(0x2004 + 0x40 * k));
-    let shader = |t: &mut Threed, k: u32| stage(t, k).and_then(|s| t.pipe.shader(base, s, mem));
+    // SM70: SET_PIPELINE_PROGRAM_ADDRESS_A/B per stage
+    let shader = |t: &mut Threed, k: u32| {
+        if t.pipe.sm70 {
+            let on = t.r(0x2000 + 0x40 * k) & 1 != 0;
+            on.then(|| t.address(0x2014 + 0x40 * k)).and_then(|at| t.pipe.shader(at, 0, mem))
+        } else {
+            stage(t, k).and_then(|s| t.pipe.shader(base, s, mem))
+        }
+    };
     let Some(vs) = shader(t, 1) else { return };
     let (control, eval, geometry, fs) = (shader(t, 2), shader(t, 3), shader(t, 4), shader(t, 5));
     let (vertices, remap) = shade_vertices(t, &vs, list, arrays, mem);
@@ -816,7 +878,12 @@ fn shade_vertices(t: &mut Threed, vs: &Arc<Shader>, list: &[u32], arrays: bool, 
         Stream {
             on: f >> 12 & 1 != 0,
             at: t.address(0x1c04 + 16 * j),
-            limit: t.address(0x1f00 + 8 * j),
+            // the last byte of the stream
+            limit: if t.pipe.sm70 {
+                (t.address(0x1c04 + 16 * j) + t.address(0x600 + 8 * j)).wrapping_sub(1)
+            } else {
+                t.address(0x1f00 + 8 * j)
+            },
             stride: (f & 0xfff) as u64,
             divisor: (t.r(0x1880 + 4 * j) & 1 != 0).then(|| t.r(0x1c0c + 16 * j)),
         }
@@ -879,6 +946,8 @@ fn written(t: &mut Threed) {
 
 /// What the rasterizer needs to know about a fragment shader's surroundings.
 pub struct Setup {
+    /// gl_FragCoord.y counts up from the bottom of a window this high (`Threed::window_flip`)
+    pub flip: Option<f32>,
     pub targets: Targets,
     pub rect: Rect,
     pub ds: DepthStencil,
@@ -919,7 +988,7 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
     let targets = Targets::new(t);
     let mut rect = targets.rect();
     if t.r(0xe00) & 1 != 0 {
-        rect = rect.and(t.r(0xe04), t.r(0xe08));
+        rect = rect.and(t.r(0xe04), t.vertical(t.r(0xe08)));
     }
     if rect.empty() {
         return;
@@ -982,6 +1051,7 @@ fn rasterize(t: &mut Threed, g: &mut Geometry, fs: Option<Arc<Shader>>, mem: &mu
     inputs.iter().enumerate().for_each(|(k, i)| slots[i.0] = k as u8);
     let dual = outputs.iter().any(|(_, o)| o.blend.on && o.blend.rgb[1..].iter().chain(&o.blend.alpha[1..]).any(|f| matches!(f & 0xfff, 0x900..=0x903)));
     let s = Setup {
+        flip: t.window_flip().map(|h| h as f32),
         rect,
         early: forced || !changes,
         ds,
@@ -1112,7 +1182,7 @@ impl Host<L> for FragmentHost<'_, '_> {
         let of = |f: &dyn Fn(&Prim, usize) -> f32| std::array::from_fn(|l| f(self.prims[l / 4], l).to_bits());
         match op.addr {
             0x70 => return x.map(f32::to_bits),
-            0x74 => return y.map(f32::to_bits),
+            0x74 => return y.map(|y| self.setup.flip.map_or(y, |h| h - y).to_bits()),
             0x78 => return of(&|p, l| p.z.at(x[l], y[l])),
             0x7c => return of(&|p, l| p.w.at(x[l], y[l])),
             0x3fc => return std::array::from_fn(|l| if self.prims[l / 4].front { u32::MAX } else { 0 }),

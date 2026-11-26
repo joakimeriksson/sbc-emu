@@ -254,6 +254,8 @@ pub struct Tex {
     pub comp: u8,
     /// .NDV: derivatives from all lanes of the quad.
     pub ndv: bool,
+    /// Results as half floats, two to a register (SM70 .F16).
+    pub f16: bool,
     /// Only live lanes need a result.
     pub live_only: bool,
 }
@@ -357,6 +359,28 @@ pub struct ICmpArgs {
     pub p: Pred,
 }
 
+/// Packed half-float arithmetic (SM70 HADD2, HMUL2, HFMA2, HMNMX2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HalfOp {
+    Add,
+    Mul,
+    Fma,
+    /// The minimum where `p` holds, else the maximum.
+    MnMx,
+}
+
+/// Operands of a packed half-float operation: per source, which halves it gives (0 both in
+/// place, 1 a 32-bit float to both, 2 the low half to both, 3 the high half to both) and its
+/// modifiers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HalfSrcs {
+    pub a: Reg,
+    pub b: Src,
+    pub c: Src,
+    pub swz: [u8; 3],
+    pub m: [Mod; 3],
+}
+
 /// Jump target: a code address while decoding, an index into `Program` once linked.
 pub type Target = u32;
 
@@ -377,6 +401,13 @@ pub enum Op {
     /// Per-lane add/subtract; `ops` holds 2 bits per lane of the quad, lane 0 on top.
     FSwzAdd { d: Reg, a: Reg, b: Reg, ops: u8, ftz: bool, cc: bool, rnd: Rnd },
     Mufu { d: Reg, a: Reg, m: Mod, op: Mufu, sat: bool },
+    /// Two floats into one register as halves: `a` high, `b` low (SM70 F2FP.PACK_AB).
+    PackHalves { d: Reg, a: Reg, b: Src, rnd: Rnd },
+    /// Two half floats at once; `f32`: one single-precision result from the low half.
+    Half { d: Reg, op: HalfOp, s: HalfSrcs, f32: bool, sat: bool, ftz: bool, p: Pred },
+    /// Compare two pairs of halves: `pd` gets the low half's result and `pn` the high's,
+    /// or both their AND (`hand`).
+    HSetP { pd: u8, pn: u8, s: HalfSrcs, cond: FCond, ftz: bool, bop: BoolOp, p: Pred, hand: bool },
     /// Range reduction before MUFU: modelled as the identity.
     Rro { d: Reg, b: Src, m: Mod },
 

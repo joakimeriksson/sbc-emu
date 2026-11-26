@@ -21,6 +21,7 @@ mod orangepi_one;
 mod tinkerboard;
 mod orangepi_rv;
 mod jetson_nano;
+mod jetson_orin_nano;
 mod serial_board;
 mod script;
 
@@ -129,6 +130,7 @@ fn run(args: &[String]) -> ExitCode {
         Board::OrangePiRv => orangepi_rv::run(args),
         Board::Esp32S31 => esp32s31::run(args),
         Board::JetsonNano => jetson_nano::run(args),
+        Board::JetsonOrinNano => jetson_orin_nano::run(args),
         Board::Pi3 => unreachable!("checked above"),
     }
 }

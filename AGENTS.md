@@ -50,6 +50,7 @@ Who is working where right now (update this table when you start or finish somet
 | Mali-T760 (Midgard) GPU of the RK3288 (`docs/mali-t760.md`) | `midgard/`, its hookup in `rockchip-rk3288/src/machine.rs`, `scripts/mali-t760-*` | Claude Code (the Orange Pi One session) |
 | RISC-V: RV32 core (M/S/U, Sv32) and the ESP32-S31-Function-CoreBoard-1 Linux board (`docs/esp32s31.md`); the RV64 boards are in the Orange Pi RV row | `riscv-rv32/`, `espressif/` | Claude Code |
 | NVIDIA Jetson Nano / Tegra X1 (`docs/jetson-nano.md`; plan: `docs/history/jetson-nano-plan.md`); the `ram_base` of `arm-a64` (RAM above physical 0) | `tegra210/`, its GPU `maxwell/`, `maxwell-shader/`, `maxwell-tex/` (`docs/jetson-nano-gpu.md`), `cli/src/jetson_nano.rs`, `scripts/jetson-nano-*`, its GPU demos (`demos/nano-gl/`, `tools/stub_library.py`) | Claude Code |
+| NVIDIA Jetson Orin Nano 4GB / Tegra234 and its GA10B (Ampere) GPU (`docs/jetson-orin-nano.md`) | `tegra234/` (its GPU in `tegra234/src/gpu/`; the SM70 decoder in `maxwell-shader/src/decode_sm70.rs`), `cli/src/jetson_orin_nano.rs`, `scripts/jetson-orin-nano-*`, `tests/gpu/orin/`, `tests/gpu/run-orin-*.sh`, `demos/orin-copy/`, `demos/orin-gl/` | Codex (`codex/tegra234-direct-boot`), continued by Claude Code (`claude/orin-cuda`) |
 
 ## Never
 

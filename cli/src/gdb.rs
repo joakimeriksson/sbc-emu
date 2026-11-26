@@ -168,6 +168,26 @@ impl Target for tegra210::Machine {
     fn describe(&self, c: usize) -> String { format!("CPU#{c} {:?} EL{}", self.state[c], self.cpus[c].el) }
 }
 
+impl Target for tegra234::Machine {
+    fn cores(&self) -> usize { self.cpus.len() }
+    fn layout(&self) -> Layout { a64_layout() }
+    fn reg(&self, core: usize, n: usize) -> Option<Vec<u8>> { a64_reg(&self.cpus[core], n) }
+    fn set_reg(&mut self, core: usize, n: usize, bytes: &[u8]) -> bool {
+        a64_set_reg(&mut self.cpus[core], n, bytes).is_some()
+    }
+    fn read(&mut self, core: usize, va: u64, len: usize) -> Option<Vec<u8>> { self.debug_read(core, va, len) }
+    fn write(&mut self, core: usize, va: u64, data: &[u8]) -> bool { self.debug_write(core, va, data) }
+    fn breakpoint(&mut self, addr: u64, insert: bool) { self.debug_breakpoint(addr, insert) }
+    fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) {
+        self.debug_watch(addr, len, kind, insert)
+    }
+    fn step(&mut self, core: usize) -> Option<Stop> { self.debug_step(core) }
+    fn describe(&self, core: usize) -> String {
+        format!("CPU#{core} Cortex-A78AE {:?} EL{}", self.state[core], self.cpus[core].el)
+    }
+    fn stopped_core(&self) -> usize { self.current_core() }
+}
+
 // ---------------------------------------------------------------- 32-bit Arm
 
 fn a32_layout() -> Layout {

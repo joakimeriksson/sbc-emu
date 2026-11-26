@@ -590,6 +590,9 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
         Op::Fence => "fence".into(),
         Op::Membar => "membar".into(),
         Op::Bpt => "bpt".into(),
+        Op::Half { d, op, s, f32, .. } => format!("half.{op:?}{} r{d}, r{}, {:?}, {:?} {:?}", if f32 { ".f32" } else { "" }, s.a, s.b, s.c, s.swz),
+        Op::PackHalves { d, a, b, .. } => format!("f2fp.pack_ab r{d}, r{a}, {b:?}"),
+        Op::HSetP { pd, pn, s, cond, .. } => format!("hsetp p{pd}, p{pn}, r{}, {:?} cond {cond}", s.a, s.b),
     };
     if x.pred == PT {
         s

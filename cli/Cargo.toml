@@ -20,3 +20,4 @@ riscv64 = { path = "../riscv64" }
 riscv-rv32 = { path = "../riscv-rv32" }
 esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }
+tegra234 = { path = "../tegra234" }
