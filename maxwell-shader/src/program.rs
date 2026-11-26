@@ -123,6 +123,34 @@ impl Program {
             }
         }
 
+        // Uniform registers and the decoder's two scratch ones go above the program's vector
+        // registers (by default R190 up): measure how far those go, and move them if needed.
+        {
+            use crate::decode_sm70::{with_map, Map, SCRATCH};
+            let measure = Map { uniform: 0, scratch: 0, measure: true };
+            let ((vector, _), uniform) = with_map(measure, || {
+                let v = found.iter().flat_map(|(&addr, (raw, _))| decode(addr, *raw)).map(|i| highest_reg(&i.op)).max().unwrap_or(0);
+                (v, ())
+            });
+            if vector > SCRATCH as u32 {
+                let scratch = vector as Reg;
+                let base = vector + 2;
+                // (a uniform register can start a 128-bit group)
+                if base + uniform as u32 + 4 > RZ as u32 {
+                    return Err(format!("program at {entry:#x}: R{} and UR{uniform} do not both fit", vector - 1));
+                }
+                let map = Map { uniform: base as u8, scratch, measure: false };
+                with_map(map, || {
+                    for (&addr, (raw, insts)) in found.iter_mut() {
+                        *insts = decode(addr, *raw);
+                        if insts.is_empty() {
+                            insts.push(Inst { pred: PT, op: Op::Nop });
+                        }
+                    }
+                });
+            }
+        }
+
         let mut first = BTreeMap::new();
         let mut n = 0u32;
         for (&addr, (_, insts)) in &found {
@@ -273,6 +301,7 @@ fn highest_reg(op: &Op) -> u32 {
         | Op::DSet { d, .. }
         | Op::IAdd { d, .. }
         | Op::IAdd3 { d, .. }
+        | Op::IAdd3P { d, .. }
         | Op::IScAdd { d, .. }
         | Op::Lea { d, .. }
         | Op::Vadd { d, .. }

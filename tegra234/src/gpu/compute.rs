@@ -56,6 +56,8 @@ impl Compute {
                 self.engine.last.1,
                 self.engine.last.2
             );
+            let (below, above) = guest.extent(address);
+            eprintln!("[gpu]   mapped memory ends at {below:#x?} below it and starts again at {above:#x?}");
         }
         guest.ok()
     }

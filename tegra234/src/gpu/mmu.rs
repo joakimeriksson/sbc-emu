@@ -132,6 +132,16 @@ impl<'a, 'b> Guest<'a, 'b> {
     pub fn ok(&self) -> Option<()> {
         (!self.fault.get()).then_some(())
     }
+
+    /// For a fault report: the mapped 4 KiB pages next to an unmapped address, the end of those
+    /// below it and the start of those above it (searching 256 MiB each way).
+    pub fn extent(&self, address: u64) -> (Option<u64>, Option<u64>) {
+        let page = address & !4095;
+        let mapped = |a: u64| self.view.translate(a, false).is_some();
+        let below = (1..65536u64).map(|k| page.wrapping_sub(k * 4096)).find(|&a| mapped(a)).map(|a| a + 4096);
+        let above = (1..65536u64).map(|k| page + k * 4096).find(|&a| mapped(a));
+        (below, above)
+    }
 }
 
 impl maxwell::Memory for Guest<'_, '_> {

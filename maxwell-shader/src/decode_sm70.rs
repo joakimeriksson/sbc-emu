@@ -18,6 +18,38 @@ pub const SCRATCH: Reg = UNIFORM_BASE - 2;
 /// Bytes per instruction.
 pub const SIZE: u32 = 16;
 
+/// Where this thread's decoding puts uniform and scratch registers (`UNIFORM_BASE` and `SCRATCH`
+/// unless a program uses vector registers that far up, see `Program::decode_sm70_at`), and
+/// whether it only measures: uniform registers read as RZ and the highest one is recorded.
+#[derive(Clone, Copy)]
+pub(crate) struct Map {
+    pub uniform: u8,
+    pub scratch: Reg,
+    pub measure: bool,
+}
+
+impl Map {
+    pub const DEFAULT: Map = Map { uniform: UNIFORM_BASE, scratch: SCRATCH, measure: false };
+}
+
+thread_local! {
+    static MAP: std::cell::Cell<Map> = const { std::cell::Cell::new(Map::DEFAULT) };
+    static HIGHEST_UNIFORM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` decoding with `map`; returns its result and the highest uniform register named.
+pub(crate) fn with_map<T>(map: Map, f: impl FnOnce() -> T) -> (T, u8) {
+    let old = MAP.with(|m| m.replace(map));
+    HIGHEST_UNIFORM.with(|h| h.set(0));
+    let r = f();
+    MAP.with(|m| m.set(old));
+    (r, HIGHEST_UNIFORM.with(|h| h.get()))
+}
+
+fn scratch() -> Reg {
+    MAP.with(|m| m.get().scratch)
+}
+
 #[derive(Clone, Copy)]
 struct W(u128);
 
@@ -38,7 +70,15 @@ impl W {
     fn ureg(self, lo: u32) -> Reg {
         match self.f(lo, 6) {
             63 => RZ,
-            n => UNIFORM_BASE + n as u8,
+            n => {
+                let map = MAP.with(|m| m.get());
+                HIGHEST_UNIFORM.with(|h| h.set(h.get().max(n as u8)));
+                if map.measure {
+                    RZ
+                } else {
+                    map.uniform + n as u8
+                }
+            }
         }
     }
     fn pred(self, lo: u32, not: u32) -> Pred {
@@ -232,7 +272,7 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
                 return one(Op::Ldgsts { s, soff, g, goff, ty, p });
             }
             let add = |d: Reg, a: Reg, b: Reg, x: bool| Op::IAdd3 { d, a, b: Src::Reg(b), c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x, cc: true };
-            return Some(vec![add(SCRATCH, g, uniform, false), add(SCRATCH + 1, g + 1, uniform + 1, true), Op::Ldgsts { s, soff, g: SCRATCH, goff, ty, p }]);
+            return Some(vec![add(scratch(), g, uniform, false), add(scratch() + 1, g + 1, uniform + 1, true), Op::Ldgsts { s, soff, g: scratch(), goff, ty, p }]);
         }
         0x941 => return one(Op::Sync { cond: 15 }),
         0x95b => return one(Op::Kil { cond: 15 }),
@@ -274,8 +314,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             let mut ops = Vec::new();
             let a = if stride != 0 && a != RZ {
                 let shift = [0, 2, 3, 4][stride as usize];
-                ops.push(Op::IScAdd { d: SCRATCH, a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false });
-                SCRATCH
+                ops.push(Op::IScAdd { d: scratch(), a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false });
+                scratch()
             } else {
                 a
             };
@@ -305,26 +345,26 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             // Shared and local: [R + UR + off], the register scaled first.
             if w.b(91) && uniform != RZ && !global {
                 let shift = if matches!(opcode, 0x984 | 0x988) { [0, 2, 3, 4][w.f(78, 2) as usize] } else { 0 };
-                let ops = vec![Op::IScAdd { d: SCRATCH, a, b: Src::Reg(uniform), shift, neg_a: false, neg_b: false, cc: false }];
+                let ops = vec![Op::IScAdd { d: scratch(), a, b: Src::Reg(uniform), shift, neg_a: false, neg_b: false, cc: false }];
                 let access = match opcode {
-                    0x983 => Op::Ldl { d, a: SCRATCH, off, ty },
-                    0x987 => Op::Stl { r: data, a: SCRATCH, off, ty },
-                    0x984 => Op::Lds { d, a: SCRATCH, off, ty },
-                    _ => Op::Sts { r: data, a: SCRATCH, off, ty },
+                    0x983 => Op::Ldl { d, a: scratch(), off, ty },
+                    0x987 => Op::Stl { r: data, a: scratch(), off, ty },
+                    0x984 => Op::Lds { d, a: scratch(), off, ty },
+                    _ => Op::Sts { r: data, a: scratch(), off, ty },
                 };
                 return Some(ops.into_iter().chain([access]).collect());
             }
             if w.b(91) && uniform != RZ && !(global && wide) {
                 let add = |d: Reg, a: Reg, b: Reg, x: bool| Op::IAdd3 { d, a, b: Src::Reg(b), c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x, cc: true };
-                let a = SCRATCH;
+                let a = scratch();
                 let access = if opcode == 0x981 { Op::Ld { d, a, off, ty, wide: true } } else { Op::St { r: data, a, off, ty, wide: true } };
-                return Some(vec![add(SCRATCH, w.reg(24), uniform, false), add(SCRATCH + 1, RZ, uniform + 1, true), access]);
+                return Some(vec![add(scratch(), w.reg(24), uniform, false), add(scratch() + 1, RZ, uniform + 1, true), access]);
             }
             // Shared accesses scale their register: .X4, .X8, .X16 (bits 78..80).
             let stride = if matches!(opcode, 0x984 | 0x988) { w.f(78, 2) } else { 0 };
             let (a, mut ops) = if stride != 0 && a != RZ {
                 let shift = [0, 2, 3, 4][stride as usize];
-                (SCRATCH, vec![Op::IScAdd { d: SCRATCH, a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false }])
+                (scratch(), vec![Op::IScAdd { d: scratch(), a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false }])
             } else {
                 (a, Vec::new())
             };
@@ -450,7 +490,7 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         if d == RZ {
             return one(Op::Nop);
         }
-        return Some(vec![imad(SCRATCH, s.c, false), imad(d + 1, c_hi, true), Op::Mov { d, b: Src::Reg(SCRATCH), lanes: 15 }]);
+        return Some(vec![imad(scratch(), s.c, false), imad(d + 1, c_hi, true), Op::Mov { d, b: Src::Reg(scratch()), lanes: 15 }]);
     }
     let op = match (base, uniform) {
         // MOV
@@ -527,8 +567,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         (0x024, _) if w.b(74) => {
             let signed = w.b(73);
             return Some(vec![
-                Op::IMad { d: SCRATCH, a: s.a, b: s.b, c: Src::Reg(RZ), sa: signed, sb: signed, hi: false, neg_ab: false, neg_c: false, sat: false, x: false, cc: false },
-                Op::IAdd3P { d, a: SCRATCH, b: s.c, c: Src::Reg(RZ), neg: [false, s.cm.neg, false], x: true, cin: [pred(w, 87, 90), no_carry], cout: [pdst(w, 81), 7] },
+                Op::IMad { d: scratch(), a: s.a, b: s.b, c: Src::Reg(RZ), sa: signed, sb: signed, hi: false, neg_ab: false, neg_c: false, sat: false, x: false, cc: false },
+                Op::IAdd3P { d, a: scratch(), b: s.c, c: Src::Reg(RZ), neg: [false, s.cm.neg, false], x: true, cin: [pred(w, 87, 90), no_carry], cout: [pdst(w, 81), 7] },
             ]);
         }
         (0x024, _) => {
@@ -588,19 +628,19 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             let mut ops = Vec::new();
             // .SX32 (bit 73): the high word is a's sign
             let hi = if w.b(73) {
-                ops.push(Op::Shf { d: SCRATCH, lo: RZ, hi: s.a, b: Src::Imm(31), right: true, high: true, wrap: false, wide: true, signed: true, cc: false });
-                SCRATCH
+                ops.push(Op::Shf { d: scratch(), lo: RZ, hi: s.a, b: Src::Imm(31), right: true, high: true, wrap: false, wide: true, signed: true, cc: false });
+                scratch()
             } else {
                 reg_of(s.c)?
             };
-            ops.push(Op::Shf { d: SCRATCH, lo: s.a, hi, b: Src::Imm(shift), right: false, high: true, wrap: false, wide: true, signed: false, cc: false });
+            ops.push(Op::Shf { d: scratch(), lo: s.a, hi, b: Src::Imm(shift), right: false, high: true, wrap: false, wide: true, signed: false, cc: false });
             let x = w.b(74);
             if !x && pdst(w, 81) & 7 == 7 {
-                ops.push(Op::IAdd3 { d, a: SCRATCH, b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: false, cc: false });
+                ops.push(Op::IAdd3 { d, a: scratch(), b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: false, cc: false });
                 return Some(ops);
             }
             let cin = [if x { pred(w, 87, 90) } else { no_carry }, no_carry];
-            ops.push(Op::IAdd3P { d, a: SCRATCH, b: s.b, c: Src::Reg(RZ), neg: [false; 3], x, cin, cout: [pdst(w, 81), 7] });
+            ops.push(Op::IAdd3P { d, a: scratch(), b: s.b, c: Src::Reg(RZ), neg: [false; 3], x, cin, cout: [pdst(w, 81), 7] });
             return Some(ops);
         }
         // LEA: (a << shift) + b, its carry out to a predicate (81) for a LEA.HI.X
@@ -613,8 +653,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
                 Op::IScAdd { d, a: s.a, b: s.b, shift, neg_a: w.b(72), neg_b: false, cc: false }
             } else {
                 return Some(vec![
-                    Op::IScAdd { d: SCRATCH, a: s.a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false },
-                    Op::IAdd3P { d, a: SCRATCH, b: s.b, c: Src::Reg(RZ), neg: [w.b(72), false, false], x: false, cin: [no_carry; 2], cout: [cout, 7] },
+                    Op::IScAdd { d: scratch(), a: s.a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false },
+                    Op::IAdd3P { d, a: scratch(), b: s.b, c: Src::Reg(RZ), neg: [w.b(72), false, false], x: false, cin: [no_carry; 2], cout: [cout, 7] },
                 ]);
             }
         }
@@ -1134,6 +1174,36 @@ mod tests {
         assert_eq!(ops(0x000ea800099ee1cc_00000007140779a8), vec![Op::Atom { d: 7, a: 20, b: 7, off: 0, op: AtomOp::Inc, ty: AtomTy::U32, wide: true }]);
         // UFLO.U32 UR4, UR5
         assert_eq!(ops(0x000fe200080e0000_00000005000472bd), vec![Op::Flo { d: ur(4), b: Src::Reg(ur(5)), not: false, signed: false, shift: false, cc: false }]);
+    }
+
+    /// A program using vector registers up past R190 gets its uniform registers above them
+    /// (TensorRT's kernels use R212 and UR18).
+    #[test]
+    fn uniform_registers_go_above_the_vector_ones() {
+        const CODE: &[u64] = &[
+            // UMOV UR8, 0x11
+            0x0000001100087882, 0x000fe40000000000,
+            // MOV R200, 0x22
+            0x0000002200c87802, 0x000fe20000000f00,
+            // MOV R5, UR8
+            0x0000000800057c02, 0x000fe20008000f00,
+            // EXIT
+            0x000000000000794d, 0x000fea0003800000,
+        ];
+        struct H;
+        impl crate::Host<16> for H {
+            fn cbuf(&self, _index: u32, _offset: u32) -> u32 {
+                0
+            }
+        }
+        let p = Program::decode_sm70_at(0, &mut |a| CODE.get(a as usize / 8).copied()).unwrap();
+        let Op::Mov { b: Src::Reg(ur8), .. } = p.insts()[2].op else { panic!("{:?}", p.insts()) };
+        assert!(ur8 > 200 && ur8 < RZ, "UR8 is R{ur8}");
+        let mut l = crate::Lanes::<16>::new();
+        l.start(&p, 0xffff, 0);
+        let mut fuel = 100;
+        assert!(matches!(crate::run(&p, &mut l, &mut H, &mut fuel), crate::Exit::Done));
+        assert_eq!((l.gpr[5][0], l.gpr[200][0]), (0x11, 0x22));
     }
 
     /// 64-bit adds from a TensorRT kernel: the carries stay in their predicates (P4 and P3

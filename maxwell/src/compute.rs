@@ -158,6 +158,23 @@ impl<const N: usize> Host<N> for Group<'_, '_, N> {
         if program.is_some_and(|p| p != TRACE_PROGRAM.load(Ordering::Relaxed)) || HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
             return;
         }
+        static CB_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // SBC_TRACE_CB=[buffer:]start,end[;...] (hex): constant buffer words there, at the first hit
+        if let Ok(v) = std::env::var("SBC_TRACE_CB") {
+            if !CB_DONE.swap(true, Ordering::Relaxed) {
+                for range in v.split(';') {
+                    let (cb, range) = range.split_once(':').unwrap_or(("0", range));
+                    let cb = cb.trim().parse().unwrap_or(0);
+                    let mut it = range.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok());
+                    if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                        for o in (a..b).step_by(16) {
+                            let w: Vec<String> = (0..4).map(|k| format!("{:08x}", self.cbuf(cb, o + 4 * k))).collect();
+                            eprintln!("[trace] c[{cb:#x}][{o:#x}] {}", w.join(" "));
+                        }
+                    }
+                }
+            }
+        }
         let preds: Vec<String> = lanes.pred.iter().chain(&lanes.upred).map(|p| format!("{p:08x}")).collect();
         eprintln!("[trace] {addr:#x} group {:?} local0 {:?} active {:08x} {:?} P0-7,UP0-7 {}", self.group, [self.local[0][0], self.local[1][0], self.local[2][0]], lanes.active_mask(), inst.op, preds.join(" "));
         for &r in regs {
