@@ -20,16 +20,16 @@ impl W {
         ((self.f(pos, len) << (32 - len)) as i32) >> (32 - len)
     }
     fn d(self) -> Reg {
-        self.f(0, 8) as u8
+        self.f(0, 8) as Reg
     }
     fn a(self) -> Reg {
-        self.f(8, 8) as u8
+        self.f(8, 8) as Reg
     }
     fn rb(self) -> Reg {
-        self.f(20, 8) as u8
+        self.f(20, 8) as Reg
     }
     fn rc(self) -> Reg {
-        self.f(39, 8) as u8
+        self.f(39, 8) as Reg
     }
     fn cb(self) -> Src {
         Src::Cb(self.f(34, 5) as u8, self.f(20, 14) << 2)
@@ -1066,7 +1066,7 @@ pub fn reg_at(r: Reg, n: u32) -> Reg {
     if r == RZ {
         RZ
     } else {
-        r.wrapping_add(n as u8)
+        r.wrapping_add(n as Reg)
     }
 }
 
@@ -1264,7 +1264,7 @@ fn tex(w: W, top: u32) -> Option<Tex> {
     t.scalar = true;
     t.ndv = false;
     t.array = false;
-    t.d1 = w.f(28, 8) as u8;
+    t.d1 = w.f(28, 8) as Reg;
     let (ra, rb) = (w.a(), w.rb());
     let (a1, b1) = (reg_at(ra, 1), reg_at(rb, 1));
     let mask3 = w.f(50, 3) as usize;

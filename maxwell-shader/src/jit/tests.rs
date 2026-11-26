@@ -44,14 +44,15 @@ fn long_runs_are_cut() {
     for k in 0..255 {
         l.gpr[k] = std::array::from_fn(|i| ((k * 977 + i * 13) as u32).wrapping_mul(0x9e37_79b9));
     }
-    let (mut gpr, mut pred, mut cc) = (l.gpr.clone(), l.pred, l.cc);
+    let (mut pred, mut cc) = (l.pred, l.cc);
+    let mut gpr: Box<[[u32; LANES]; 256]> = Box::new(l.gpr[..256].try_into().unwrap());
     let frame = Frame::default();
     for b in &code.blocks {
         eval(b, &mut gpr, &mut pred, &mut cc, &frame.cb, 0xffff);
     }
     let mut fuel = 10_000;
     run(&p, &mut l, &mut super::check::Cb, &mut fuel);
-    assert!(*gpr == *l.gpr);
+    assert!(gpr[..] == l.gpr[..256]);
 }
 
 /// Timing of a sequence like the hot loop of ncnn's convolutions on NVK (run by hand).

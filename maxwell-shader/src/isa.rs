@@ -3,10 +3,14 @@
 //! Register 255 reads as zero and drops writes; predicate 7 is true.
 
 /// A general register number; 255 is zero.
-pub type Reg = u8;
+pub type Reg = u16;
 
 /// "No register": reads zero, writes are dropped.
 pub const RZ: Reg = 255;
+
+/// The register file: R0..R254, RZ, then room past it for an SM70 program's uniform and scratch
+/// registers when its vector registers fill the rest (only the interpreter reaches those).
+pub const REGS: usize = 256 + 64 + 2;
 
 /// An operand that may come from a register, a constant buffer or the instruction.
 #[derive(Clone, Copy, Debug, PartialEq)]

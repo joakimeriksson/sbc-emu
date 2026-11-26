@@ -50,7 +50,7 @@ const MAX_DEPTH: usize = 4096;
 #[repr(align(128))]
 pub struct Lanes<const N: usize> {
     /// General registers by lane. Register 255 must stay zero.
-    pub gpr: Box<[[u32; N]; 256]>,
+    pub gpr: Box<[[u32; N]; REGS]>,
     /// Predicates, one bit per lane; predicate 7 is all ones.
     pub pred: [u32; 8],
     /// SM70's uniform predicates UP0..UP6 and UPT (7, all ones); `Pred` names them as 8..15.
@@ -98,7 +98,7 @@ impl<const N: usize> Lanes<N> {
 
     pub fn new() -> Self {
         assert!((4..=32).contains(&N) && N.is_multiple_of(4), "lanes come in quads, at most 32");
-        let gpr: Box<[[u32; N]]> = vec![[0; N]; 256].into_boxed_slice();
+        let gpr: Box<[[u32; N]]> = vec![[0; N]; REGS].into_boxed_slice();
         Lanes {
             gpr: gpr.try_into().unwrap(),
             pred: [0, 0, 0, 0, 0, 0, 0, !0],
@@ -139,7 +139,7 @@ impl<const N: usize> Lanes<N> {
     /// registers the program uses, and those the program before wrote.
     pub fn start(&mut self, p: &Program, lanes: u32, helper: u32) {
         // (and those an earlier program wrote: lanes kept from it start as new ones)
-        let n = (p.gprs() as usize).min(255);
+        let n = (p.gprs() as usize).min(REGS);
         self.gpr[..n.max(self.written)].fill([0; N]);
         self.written = n;
         self.pred = [0, 0, 0, 0, 0, 0, 0, !0];
@@ -695,7 +695,7 @@ pub fn run<const N: usize, H: Host<N>>(
             if let Some((b, len)) = j.block_at(l.pc) {
                 if l.active != 0 && *fuel >= len as u64 {
                     j.fill(b, &mut l.frame, |i, o| h.cbuf(i, o));
-                    if j.run(b, &mut l.gpr, &mut l.pred, &mut l.cc, &mut l.frame, l.active) {
+                    if j.run(b, (&mut l.gpr[..256]).try_into().unwrap(), &mut l.pred, &mut l.cc, &mut l.frame, l.active) {
                         *fuel -= len as u64;
                         l.pc += len;
                         continue;

@@ -172,7 +172,8 @@ pub fn check_lanes<const N: usize>(seed: u64, cases: usize) -> Result<BTreeMap<S
         let lanes = if r.next().is_multiple_of(3) { r.next() as u32 & all::<N>() | 1 } else { all::<N>() };
         l.start(&p, lanes, 0);
         randomize(&mut l, &mut r);
-        let (mut gpr, mut pred, mut cc) = (l.gpr.clone(), l.pred, l.cc);
+        let (mut pred, mut cc) = (l.pred, l.cc);
+        let mut gpr: Box<[[u32; N]; 256]> = Box::new(l.gpr[..256].try_into().unwrap());
         let mut frame = Frame::default();
         code.fill(0, &mut frame, |i, o| Host::<N>::cbuf(&Cb, i, o));
         if !code.run(0, &mut gpr, &mut pred, &mut cc, &mut frame, lanes) {

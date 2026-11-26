@@ -12,9 +12,11 @@
 use crate::isa::*;
 
 /// Where uniform registers live among the general ones.
-pub const UNIFORM_BASE: u8 = 192;
+pub const UNIFORM_BASE: Reg = 192;
 /// Two general registers the decoder uses to put an address together (below the uniform ones).
 pub const SCRATCH: Reg = UNIFORM_BASE - 2;
+/// Where uniform registers go when a program's vector registers leave no room below RZ.
+pub const EXTRA_BASE: Reg = RZ + 1;
 /// Bytes per instruction.
 pub const SIZE: u32 = 16;
 
@@ -32,14 +34,15 @@ pub(crate) struct Map {
 impl Map {
     pub const DEFAULT: Map = Map { uniform: Map::from(UNIFORM_BASE), scratch: SCRATCH, measure: false };
 
-    /// URn at `base + n` (RZ past R254).
-    pub const fn from(base: u8) -> [Reg; 64] {
+    /// URn at `base + n`: below RZ (RZ past R254), or past it (`EXTRA_BASE`, which only the
+    /// interpreter runs).
+    pub const fn from(base: Reg) -> [Reg; 64] {
         let mut t = [RZ; 64];
         let mut n = 0;
         while n < 63 {
-            let r = base as u32 + n as u32;
-            if r < RZ as u32 {
-                t[n] = r as Reg;
+            let r = base + n as Reg;
+            if base > RZ || r < RZ {
+                t[n] = r;
             }
             n += 1;
         }
@@ -524,8 +527,9 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
     let no_carry = Pred { idx: 7, not: true };
     // IMAD.WIDE: d:d+1 = a * b + c:c+1, the product 64 bits (CUDA's address arithmetic). The low
     // word goes to SCRATCH with its carry, the high word adds it, then the low word moves to d (so
-    // that d may be a or b).
-    if base == 0x025 {
+    // that d may be a or b). IMAD.HI is its high word alone: c is a pair there too (division's
+    // reciprocal step, IMAD.HI.U32 R3, R3, R5, R2 with R2 zero, adds R3).
+    if base == 0x025 || base == 0x027 {
         let signed = w.b(73);
         let c_hi = match s.c {
             Src::Reg(r) if r == RZ => Src::Reg(RZ),
@@ -536,6 +540,9 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         let imad = |d, c, hi| Op::IMad { d, a: s.a, b: s.b, c, sa: signed, sb: signed, hi, neg_ab: false, neg_c: s.cm.neg, sat: false, x: hi, cc: !hi };
         if d == RZ {
             return one(Op::Nop);
+        }
+        if base == 0x027 {
+            return Some(vec![imad(scratch(), s.c, false), imad(d, c_hi, true)]);
         }
         return Some(vec![imad(scratch(), s.c, false), imad(d + 1, c_hi, true), Op::Mov { d, b: Src::Reg(scratch()), lanes: 15 }]);
     }
@@ -627,10 +634,6 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         (0x024, _) => {
             let signed = w.b(73);
             Op::IMad { d, a: s.a, b: s.b, c: s.c, sa: signed, sb: signed, hi: false, neg_ab: false, neg_c: s.cm.neg, sat: false, x: false, cc: false }
-        }
-        (0x027, _) => {
-            let signed = w.b(73);
-            Op::IMad { d, a: s.a, b: s.b, c: s.c, sa: signed, sb: signed, hi: true, neg_ab: false, neg_c: s.cm.neg, sat: false, x: false, cc: false }
         }
         (0x017, _) => Op::IMnMx { d, a: s.a, b: s.b, signed: w.b(73), part: 0, cc: false, p: if uniform { w.upred(87, 90) } else { w.pred(87, 90) } },
         // ISETP (UISETP writes and reads uniform predicates); .EX continues a 64-bit compare
@@ -1205,6 +1208,9 @@ mod tests {
         // LEA.HI R70, R139, R70, RZ, 0x1e: the destination is the addend
         let v = ops(0x000fe200078ff0ff_000000468b467211);
         assert!(matches!(v[..], [Op::Shf { d: SCRATCH, lo: 139, hi: RZ, .. }, Op::IAdd3 { d: 70, a: SCRATCH, b: Src::Reg(70), x: false, .. }]), "{v:?}");
+        // IMAD.HI.U32 R3, R3, R5, R2: the addend is the pair R2:R3 (division's reciprocal step)
+        let v = ops(0x000fe400078e0002_0000000503037227);
+        assert!(matches!(v[..], [Op::IMad { d: SCRATCH, a: 3, b: Src::Reg(5), c: Src::Reg(2), hi: false, cc: true, .. }, Op::IMad { d: 3, a: 3, b: Src::Reg(5), c: Src::Reg(3), hi: true, x: true, .. }]), "{v:?}");
         // USEL UR10, UR10, 0x2, UP0: the selector is a uniform predicate
         let v = ops(0x000fe40008000000_000000020a0a7887);
         assert!(matches!(v[..], [Op::Sel { a, b: Src::Imm(2), p: Pred { idx: 8, not: false }, .. }] if a == UNIFORM_BASE + 10), "{v:?}");

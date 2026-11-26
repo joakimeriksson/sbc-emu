@@ -142,7 +142,8 @@ EOF
     --script "$work/trt.txt" --timeout "${SBC_TRT_TIMEOUT:-7200}" > "$work/boot.log" 2>&1 || true
 cp "$work/boot.log" "$fixture/trt-boot.log"
 grep -E '^(DET |TRT_ STATUS|.*(Engine built|GPU Compute Time|PASSED|FAILED))' "$work/boot.log" || true
-grep '^DET ' "$work/boot.log" | diff - "$yolo/reference.txt" && echo "TRT_YOLO MATCH" || {
+# (the serial console ends lines with \r)
+grep '^DET ' "$work/boot.log" | tr -d '\r' | diff - "$yolo/reference.txt" && echo "TRT_YOLO MATCH" || {
     tail -40 "$work/boot.log"
     exit 1
 }
