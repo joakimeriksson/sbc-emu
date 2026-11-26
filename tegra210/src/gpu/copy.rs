@@ -27,7 +27,7 @@ impl Copy {
         }
         // a semaphore: one word, or four with the time
         let at = address(0x240);
-        if std::env::var_os("SBC_TRACE_SEM").is_some() && v >> 3 & 3 != 0 { eprintln!("[sem] copy release {at:#x} = {:#x} (launch {v:#x})", self.r(0x248)); }
+        if crate::gpu::flag::sem() && v >> 3 & 3 != 0 { eprintln!("[sem] copy release {at:#x} = {:#x} (launch {v:#x})", self.r(0x248)); }
         match v >> 3 & 3 {
             1 => view.write32(at, self.r(0x248)),
             2 => {

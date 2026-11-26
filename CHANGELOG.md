@@ -25,6 +25,11 @@ in an earlier repository whose history was rewritten; it is summarised here with
 
 ### Fixed
 
+- Maxwell GPU: in the browser, kernels whose threads talk through shared memory (warp-synchronous
+  reductions) run in 32-lane warps instead of the shader JIT's 16 lanes.
+- Jetson Nano GPU: a closed process's graphics context is no longer inherited by a new one.
+- 64-bit cores: the event register is saved in snapshots, so a snapshot between SEVL and WFE
+  does not make the restored WFE wait.
 - arm-a64: SEV/SEVL set an event register that the next WFE consumes (a `SEVL; WFE` lock with one
   core running slept forever).
 - Jetson Nano GPU: copies on an unbound subchannel 4 (NVK's) reach the copy engine.

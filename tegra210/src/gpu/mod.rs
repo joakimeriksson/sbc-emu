@@ -6,6 +6,24 @@ pub mod copy;
 pub mod mmu;
 pub mod pmu;
 
+/// Tracing switched on in the environment (read once: some are asked on every method).
+pub(crate) mod flag {
+    use std::sync::OnceLock;
+    fn on(cell: &OnceLock<bool>, name: &str) -> bool {
+        *cell.get_or_init(|| std::env::var_os(name).is_some())
+    }
+    /// `SBC_TRACE_SEM`: semaphores
+    pub fn sem() -> bool {
+        static F: OnceLock<bool> = OnceLock::new();
+        on(&F, "SBC_TRACE_SEM")
+    }
+    /// `SBC_TRACE_SYNCPT`: sync points and channel binds
+    pub fn syncpt() -> bool {
+        static F: OnceLock<bool> = OnceLock::new();
+        on(&F, "SBC_TRACE_SYNCPT")
+    }
+}
+
 use crate::smmu::Smmu;
 use mmu::{Mmu, Space};
 use std::collections::HashMap;
@@ -281,17 +299,26 @@ impl Gpu {
                 self.regs.insert(o, v);
             }
             0x80_0000..=0x80_0fff => {
-                let c = &mut self.channels[(o as usize >> 3) & 0x1ff];
+                let id = (o as u32 >> 3) & 0x1ff;
+                if o & 4 == 0 && v >> 31 == 0 && self.channels[id as usize].inst >> 31 != 0 {
+                    // unbound: is its context still named by a bound channel?
+                    let block = |inst: u32| ((inst & 0x0fff_ffff) as u64) << 12;
+                    let (channels, ram) = (&self.channels, &*ram);
+                    let named = host::context_of(id, block(channels[id as usize].inst), smmu, ram);
+                    self.host.unbind(id, named, |c| {
+                        channels.iter().enumerate().any(|(k, ch)| k as u32 != id && ch.inst >> 31 != 0 && host::context_of(k as u32, block(ch.inst), smmu, ram) == c)
+                    });
+                }
+                let c = &mut self.channels[id as usize];
                 if o & 4 == 0 {
                     // a channel bound to another instance block is a new one; unbinding, and binding
                     // the same block again (nvgpu does it when the GPU comes back from power gating),
                     // keeps what the channel's context holds: its subchannels' classes, a half-run
                     // push buffer, a semaphore it waits for
-                    if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+                    if crate::gpu::flag::syncpt() {
                         eprintln!("[chan] {} inst {:#x} -> {v:#x}", (o >> 3) & 0x1ff, c.inst);
                     }
                     if v >> 31 != 0 {
-                        let id = (o as u32 >> 3) & 0x1ff;
                         if (c.bound ^ v) & 0x0fff_ffff != 0 {
                             self.host.forget(id);
                         } else {
@@ -495,6 +522,44 @@ mod tests {
         g.tick(g.retry);
         g.poll(&smmu, &mut ram);
         assert!(!g.waiting);
+    }
+
+    /// Through the channel registers: closing one stream of a context keeps the context for the
+    /// others; closing the last leaves it behind, and a new channel with it starts it fresh.
+    #[test]
+    fn closing_a_stream_keeps_its_context_for_the_others() {
+        // instance blocks at 0x1000, 0x2000 and 0x3000 of RAM, in one address space, all naming
+        // context 0x12_3456_7000 (words 132, 133)
+        let (smmu, mut ram) = (Smmu::default(), vec![0u8; 0x4000]);
+        let put = |ram: &mut [u8], o: usize, v: u32| ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        for inst in [0x1000, 0x2000, 0x3000] {
+            put(&mut ram, inst + 0x200, 0x8000_0000);
+            put(&mut ram, inst + 4 * 132, 0x3456_7000);
+            put(&mut ram, inst + 4 * 133, 0x12);
+        }
+        let k = (0x8000_0000, 0x12_3456_7000);
+        let mut g = Gpu { time_scale: 0.0, runlist: vec![1, 2, 3], ..Default::default() };
+        // (each write runs what is bound and enabled)
+        let bind = |g: &mut Gpu, ram: &mut [u8], id: u64, inst: Option<u64>| {
+            g.write(0x80_0000 + 8 * id, inst.map_or(0, |i| 1 << 31 | ((crate::RAM_BASE + i) >> 12) as u32), &smmu, ram);
+        };
+        let enable = |g: &mut Gpu, ram: &mut [u8], id: u64| g.write(0x80_0004 + 8 * id, 1 << 10, &smmu, ram);
+        let mark = |g: &mut Gpu| g.host.engine(k).map(|e| e.threed.regs[0]);
+        bind(&mut g, &mut ram, 1, Some(0x1000));
+        bind(&mut g, &mut ram, 2, Some(0x2000));
+        enable(&mut g, &mut ram, 1);
+        enable(&mut g, &mut ram, 2);
+        g.host.engine(k).unwrap().threed.regs[0] = 7;
+        // stream 2 is closed; stream 1 runs on with what the context holds
+        bind(&mut g, &mut ram, 2, None);
+        enable(&mut g, &mut ram, 1);
+        assert_eq!(mark(&mut g), Some(7));
+        // the last one is closed; a new process's channel with the same context starts it fresh
+        bind(&mut g, &mut ram, 1, None);
+        assert_eq!(mark(&mut g), Some(7));
+        bind(&mut g, &mut ram, 3, Some(0x3000));
+        enable(&mut g, &mut ram, 3);
+        assert_eq!(mark(&mut g), Some(0));
     }
 
     #[test]

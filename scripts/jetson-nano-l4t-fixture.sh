@@ -4,9 +4,11 @@
 # cuDNN, cuBLAS and the CUDA runtime from NVIDIA's Jetson apt repository. Downloaded and checked
 # (SHA-256) into OUT; OUT/serve is what tests/gpu/l4t/prepare.sh fetches from the guest. These are
 # NVIDIA's files under NVIDIA's licence: they stay in cache/ and are never committed.
-# Usage: scripts/jetson-nano-l4t-fixture.sh [OUT]   (default cache/l4t); docs/jetson-nano-cuda.md
+# Usage: scripts/jetson-nano-l4t-fixture.sh [OUT]   (default the repository's cache/l4t);
+# docs/jetson-nano-cuda.md
 set -eu
-OUT=${1:-cache/l4t}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+OUT=${1:-$REPO/cache/l4t}
 mkdir -p "$OUT/serve"
 get() { # get NAME URL SHA256
   if [ ! -f "$OUT/$1" ]; then
@@ -43,5 +45,5 @@ if [ ! -f "$OUT/serve/Image" ]; then
   mv "$L/kernel/Image" "$OUT/serve/Image"
   rm -rf "$OUT/.unpack"
 fi
-cp tests/gpu/l4t/*.sh tests/gpu/l4t/*.c tests/gpu/l4t/*.py "$OUT/serve/"
+cp "$REPO"/tests/gpu/l4t/*.sh "$REPO"/tests/gpu/l4t/*.c "$REPO"/tests/gpu/l4t/*.py "$OUT/serve/"
 echo "$OUT/serve"

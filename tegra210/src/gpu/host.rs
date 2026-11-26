@@ -2,7 +2,7 @@
 //! at segments of methods; the host executes its own methods (semaphores, interrupts, references)
 //! and passes the others to the engine object on their subchannel.
 use super::mmu::{self, View};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Done {
@@ -66,19 +66,23 @@ pub struct Host {
     engines: HashMap<(u64, u64), maxwell::Engine>,
     /// the context each channel last ran with
     contexts: HashMap<u32, (u64, u64)>,
+    /// contexts no bound channel named when the last one naming them was unbound: a closed
+    /// process's, or one whose channels power gating unbound (bound again, they keep it)
+    orphans: HashSet<(u64, u64)>,
     trace: bool,
 }
 
 impl Default for Host {
     fn default() -> Self {
-        Self { channels: HashMap::new(), engines: HashMap::new(), contexts: HashMap::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
+        Self { channels: HashMap::new(), engines: HashMap::new(), contexts: HashMap::new(), orphans: HashSet::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
     }
 }
 
 impl Host {
-    /// A channel was bound or unbound: nothing of an earlier one with its number is left.
+    /// A channel was bound to another instance block: nothing of an earlier one with its number
+    /// is left.
     pub fn forget(&mut self, id: u32) {
-        if std::env::var_os("SBC_TRACE_SEM").is_some() {
+        if crate::gpu::flag::sem() {
             if let Some(s) = self.channels.get(&id) {
                 eprintln!("[sem] forget channel {id}: rest {:?} waiting {:?} syncpt_wait {:?}", s.rest, s.waiting, s.syncpt_wait);
             }
@@ -88,37 +92,70 @@ impl Host {
         if let Some(context) = self.contexts.remove(&id) {
             if !self.contexts.values().any(|&c| c == context) {
                 self.engines.remove(&context);
+                self.orphans.remove(&context);
+            }
+        }
+    }
+
+    /// Channel `id` was unbound; its instance block names `named`. A context that no bound
+    /// channel names any more (`live`) is left behind: the next channel to enter it starts it
+    /// fresh, unless one of its own channels is bound again first (`rebound`).
+    pub fn unbind(&mut self, id: u32, named: (u64, u64), live: impl Fn((u64, u64)) -> bool) {
+        for context in [Some(named), self.contexts.get(&id).copied()].into_iter().flatten() {
+            if !live(context) {
+                self.orphans.insert(context);
             }
         }
     }
 
     /// A channel bound again to its instance block: the same channel (nvgpu after power gating)
-    /// if its USERD's GP_GET is what the host last wrote there; a new one gets a fresh state.
+    /// if its USERD's GP_GET is what the host last wrote there; a new one gets a fresh state. A
+    /// channel that never took a GPFIFO entry has no state of its own to keep: it is taken as a
+    /// new one too, so that a new process's channel with the same number and instance block does
+    /// not keep the old one's place in its context (`enter` decides about the context).
     pub fn rebound(&mut self, id: u32, smmu: &crate::smmu::Smmu, ram: &[u8]) {
-        let same = self.channels.get(&id).is_none_or(|s| s.gp_get.is_none_or(|(userd, get)| mmu::read32(userd + 0x88, smmu, ram) == Some(get)));
-        if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+        let same = self.channels.get(&id).is_some_and(|s| s.gp_get.is_some_and(|(userd, get)| mmu::read32(userd + 0x88, smmu, ram) == Some(get)));
+        if crate::gpu::flag::syncpt() {
             let s = self.channels.get(&id);
             eprintln!("[chan] {id} bound again: {} (last GP_GET {:?}, now {:?})", if same { "kept" } else { "new" }, s.and_then(|s| s.gp_get).map(|g| g.1), s.and_then(|s| s.gp_get).and_then(|(u, _)| mmu::read32(u + 0x88, smmu, ram)));
         }
         if !same {
             self.forget(id);
+        } else if let Some(context) = self.contexts.get(&id) {
+            // (power gating: the process is still there)
+            self.orphans.remove(context);
         }
     }
 
-    /// `points`: host1x's sync point values (the channels' increments are applied to them too).
-    pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64, points: &mut [u32]) -> Done {
-        // the graphics context the instance block names (words 132, 133) in its address space;
-        // none: the channel's own
-        let word = |k: u64| mmu::read32(inst + 4 * k, view.smmu, view.ram).unwrap_or(0);
-        let context = match (word(132) & !0xfff) as u64 | ((word(133) & 0xff) as u64) << 32 {
-            0 => (u64::MAX, id as u64),
-            c => (view.space.directory, c),
-        };
-        if let Some(old) = self.contexts.insert(id, context).filter(|&o| o != context) {
+    /// Channel `id` runs with `context`: which channels name which context, and which contexts
+    /// are left behind.
+    fn enter(&mut self, id: u32, context: (u64, u64)) {
+        let previous = self.contexts.insert(id, context);
+        if let Some(old) = previous.filter(|&o| o != context) {
             if !self.contexts.values().any(|&c| c == old) {
                 self.engines.remove(&old);
             }
         }
+        // A context left behind (`unbind`) that a channel enters: what is left of it is a closed
+        // process's, whose address space and context address a new one happens to have again. It
+        // starts fresh. (Whenever the channel comes to it: a new channel often runs once before
+        // its context is written to its instance block.)
+        if !self.orphans.is_empty() && self.orphans.remove(&context) {
+            self.contexts.retain(|&k, &mut c| k == id || c != context);
+            self.engines.remove(&context);
+        }
+    }
+
+    /// The 3D/compute state a context holds between runs.
+    #[cfg(test)]
+    pub(super) fn engine(&mut self, context: (u64, u64)) -> Option<&mut maxwell::Engine> {
+        self.engines.get_mut(&context)
+    }
+
+    /// `points`: host1x's sync point values (the channels' increments are applied to them too).
+    pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64, points: &mut [u32]) -> Done {
+        let context = context(id, inst, view.space.directory, view.smmu, view.ram);
+        self.enter(id, context);
         let shared = self.engines.entry(context).or_default();
         let s = self.channels.entry(id).or_default();
         std::mem::swap(&mut s.engine, shared);
@@ -145,7 +182,7 @@ impl Host {
                 } else {
                     done.waiting = true;
                     s.engine.end(view);
-                    if trace || std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+                    if trace || crate::gpu::flag::syncpt() {
                         eprintln!("[gpfifo] channel {id}: waits for sync point {point} to reach {threshold} (is {v})");
                     }
                     return done;
@@ -159,7 +196,7 @@ impl Host {
                 } else {
                     done.waiting = true;
                     s.engine.end(view);
-                    if trace || (std::env::var_os("SBC_TRACE_SYNCPT").is_some() && s.reported != Some((at, value))) {
+                    if trace || (crate::gpu::flag::syncpt() && s.reported != Some((at, value))) {
                         s.reported = Some((at, value));
                         eprintln!("[gpfifo] channel {id}: waits at {at:#x} for {value:#x} (is {v:#x}, {test:?})");
                     }
@@ -188,7 +225,7 @@ impl Host {
             mmu::write32(userd + 0x88, next, view.smmu, view.ram);
             s.gp_get = Some((userd, next));
             let (at, words) = ((lo & !3) as u64 | ((hi & 0xff) as u64) << 32, hi >> 10 & 0x1f_ffff);
-            if trace || std::env::var_os("SBC_TRACE_SEM").is_some() {
+            if trace || crate::gpu::flag::sem() {
                 eprintln!("[gpfifo] channel {id}: entry {get} at {at:#x}, {words} words");
             }
             done.entries += 1;
@@ -200,6 +237,21 @@ impl Host {
         done.waiting = true;
         done
     }
+}
+
+/// The graphics context an instance block names (words 132, 133), in its address space
+/// (`directory`); none: the channel's own.
+fn context(id: u32, inst: u64, directory: u64, smmu: &crate::smmu::Smmu, ram: &[u8]) -> (u64, u64) {
+    let word = |k: u64| mmu::read32(inst + 4 * k, smmu, ram).unwrap_or(0);
+    match (word(132) & !0xfff) as u64 | ((word(133) & 0xff) as u64) << 32 {
+        0 => (u64::MAX, id as u64),
+        c => (directory, c),
+    }
+}
+
+/// The same, for a channel whose address space is not at hand.
+pub fn context_of(id: u32, inst: u64, smmu: &crate::smmu::Smmu, ram: &[u8]) -> (u64, u64) {
+    context(id, inst, mmu::space(inst, smmu, ram).directory, smmu, ram)
 }
 
 impl State {
@@ -271,7 +323,7 @@ impl State {
             0x00 => self.class[sub] = v & 0xffff,
             0x10..=0x18 => self.semaphore[(method as usize - 0x10) / 4] = v,
             0x1c => {
-                if std::env::var_os("SBC_TRACE_SEM").is_some() && v & 0x1f != 2 && v & 0x1f != 0x10 { eprintln!("[sem] host op {v:#x} at {:#x}", ((self.semaphore[0] & 0xff) as u64) << 32 | (self.semaphore[1] & !3) as u64); }
+                if crate::gpu::flag::sem() && v & 0x1f != 2 && v & 0x1f != 0x10 { eprintln!("[sem] host op {v:#x} at {:#x}", ((self.semaphore[0] & 0xff) as u64) << 32 | (self.semaphore[1] & !3) as u64); }
                 let at = ((self.semaphore[0] & 0xff) as u64) << 32 | (self.semaphore[1] & !3) as u64;
                 let payload = self.semaphore[2];
                 match v & 0x1f {
@@ -296,14 +348,14 @@ impl State {
                         // (32 bits only, whatever RELEASE_SIZE says: CUDA reduces counters that sit
                         // next to other semaphores, with that bit clear)
                         view.write32(at, new);
-                        if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] host reduce {at:#x}: {old:#x} -> {new:#x} (op {v:#x})"); }
+                        if crate::gpu::flag::sem() { eprintln!("[sem] host reduce {at:#x}: {old:#x} -> {new:#x} (op {v:#x})"); }
                     }
                     1 => self.waiting = Some((at, payload, Test::Equal)),
                     8 => self.waiting = Some((at, payload, Test::And)),
                     4 => self.waiting = Some((at, payload, Test::AtLeast)),
                     2 => {
                         self.engine.end(view);
-                        if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] host release {at:#x} = {payload:#x} (op {v:#x})"); }
+                        if crate::gpu::flag::sem() { eprintln!("[sem] host release {at:#x} = {payload:#x} (op {v:#x})"); }
                         view.write32(at, payload);
                         if v & 1 << 24 == 0 {
                             // four words with a time stamp
@@ -322,7 +374,7 @@ impl State {
                 let point = (v >> 8 & 0xff) as usize;
                 match v & 3 {
                     0 => {
-                        if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+                        if crate::gpu::flag::syncpt() {
                             eprintln!("[syncpt] wait {point} >= {:#x} (is {:#x})", self.syncpt_payload, points.get(point).copied().unwrap_or(0));
                         }
                         self.syncpt_wait = Some((point, self.syncpt_payload));
@@ -333,7 +385,7 @@ impl State {
                             *p = p.wrapping_add(1);
                         }
                         done.syncpts.push(point);
-                        if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+                        if crate::gpu::flag::syncpt() {
                             eprintln!("[syncpt] incr {point} -> {:#x}", points.get(point).copied().unwrap_or(0));
                         }
                     }
@@ -342,5 +394,112 @@ impl State {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contexts_of_closed_channels_are_not_inherited() {
+        let mut h = Host::default();
+        let k = (0x1000, 0x20_0000);
+        // two streams of one context; the second one shares the first's engine
+        h.enter(1, k);
+        h.engines.entry(k).or_default();
+        h.enter(2, k);
+        assert!(h.engines.contains_key(&k));
+        // stream 2 is closed while 1 is bound; another stream shares the context
+        h.unbind(2, k, |c| c == k);
+        h.enter(9, k);
+        assert!(h.engines.contains_key(&k));
+        h.forget(9);
+        assert!(h.engines.contains_key(&k));
+        // the process is closed: its last bound channel is unbound. A new process's channel with
+        // the same address space and context address, which runs once before its context is in
+        // its instance block, starts it fresh
+        h.unbind(1, k, |_| false);
+        h.enter(3, (u64::MAX, 3));
+        assert!(h.engines.contains_key(&k));
+        h.enter(3, k);
+        assert!(!h.engines.contains_key(&k));
+        assert_eq!(h.contexts.keys().copied().collect::<Vec<_>>(), [3]);
+        // and then keeps it
+        h.engines.entry(k).or_default();
+        h.enter(3, k);
+        h.enter(4, k);
+        assert!(h.engines.contains_key(&k));
+        // forgetting the last channel of a context drops it
+        h.forget(3);
+        h.forget(4);
+        assert!(!h.engines.contains_key(&k) && h.contexts.is_empty() && h.orphans.is_empty());
+    }
+
+    #[test]
+    fn power_gating_keeps_contexts() {
+        let mut h = Host::default();
+        let smmu = crate::smmu::Smmu::default();
+        let mut ram = vec![0u8; 0x1000];
+        let userd = crate::RAM_BASE + 0x200;
+        let k = (0x1000, 0x20_0000);
+        // channel 1 took entries; channel 2, of the same context, none
+        h.enter(1, k);
+        h.engines.entry(k).or_default();
+        h.channels.entry(1).or_default().gp_get = Some((userd, 3));
+        mmu::write32(userd + 0x88, 3, &smmu, &mut ram);
+        h.enter(2, k);
+        // both unbound, then bound again to their blocks before anything runs
+        h.unbind(1, k, |_| true);
+        h.unbind(2, k, |_| false);
+        h.rebound(2, &smmu, &ram);
+        h.rebound(1, &smmu, &ram);
+        h.enter(2, k);
+        h.enter(1, k);
+        assert!(h.engines.contains_key(&k) && h.orphans.is_empty());
+    }
+
+    #[test]
+    fn bound_channels_name_their_contexts() {
+        // instance blocks at 0x1000 and 0x2000 of RAM in one address space, naming context
+        // 0x12_3456_7000 (words 132, 133) and none
+        let mut ram = vec![0u8; 0x4000];
+        let base = crate::RAM_BASE;
+        let put = |ram: &mut [u8], o: usize, v: u32| ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        for inst in [0x1000, 0x2000] {
+            put(&mut ram, inst + 0x200, 0x8000_0000);
+        }
+        put(&mut ram, 0x1000 + 4 * 132, 0x3456_7abc);
+        put(&mut ram, 0x1000 + 4 * 133, 0x12);
+        let smmu = crate::smmu::Smmu::default();
+        assert_eq!(context_of(5, base + 0x1000, &smmu, &ram), (0x8000_0000, 0x12_3456_7000));
+        assert_eq!(context_of(6, base + 0x2000, &smmu, &ram), (u64::MAX, 6));
+    }
+
+    #[test]
+    fn a_channel_bound_again_is_the_same_only_if_it_took_entries() {
+        let mut h = Host::default();
+        let smmu = crate::smmu::Smmu::default();
+        let mut ram = vec![0u8; 0x1000];
+        let userd = crate::RAM_BASE + 0x200;
+        let k = (0x1000, 0x20_0000);
+        // channel 1 took entries up to GP_GET 3; bound again with GP_GET still 3: the same
+        h.enter(1, k);
+        h.engines.entry(k).or_default();
+        h.channels.entry(1).or_default().gp_get = Some((userd, 3));
+        mmu::write32(userd + 0x88, 3, &smmu, &mut ram);
+        h.rebound(1, &smmu, &ram);
+        assert!(h.channels.contains_key(&1) && h.engines.contains_key(&k));
+        // GP_GET moved: another channel in the block
+        mmu::write32(userd + 0x88, 0, &smmu, &mut ram);
+        h.rebound(1, &smmu, &ram);
+        assert!(!h.channels.contains_key(&1) && !h.engines.contains_key(&k));
+        // a channel that took no entries has nothing of its own: a new process's channel with
+        // its number and block does not take its place in the context
+        h.enter(2, k);
+        h.engines.entry(k).or_default();
+        h.channels.entry(2).or_default();
+        h.rebound(2, &smmu, &ram);
+        assert!(!h.contexts.contains_key(&2) && !h.engines.contains_key(&k));
     }
 }

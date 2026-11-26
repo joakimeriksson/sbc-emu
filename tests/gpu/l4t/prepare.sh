@@ -5,10 +5,12 @@
 # Any failure stops it before PREPARE_OK.
 set -eu
 H=${L4T_SERVER:-http://10.0.2.2:8800}
-# a download reaches its name only when it is complete
+# a download reaches its name only when it is complete (the returns: set -e does not hold in a
+# function called before ||)
 get() {
-    python3 -c "import urllib.request as u,sys; d=u.urlopen(sys.argv[1]).read(); open(sys.argv[2]+'.part','wb').write(d)" "$H/$1" "$2"
-    mv "$2.part" "$2"
+    rm -f "$2.part"
+    python3 -c "import urllib.request as u,sys; d=u.urlopen(sys.argv[1]).read(); open(sys.argv[2]+'.part','wb').write(d)" "$H/$1" "$2" || return 1
+    mv "$2.part" "$2" || return 1
 }
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update

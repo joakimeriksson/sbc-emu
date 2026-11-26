@@ -125,7 +125,7 @@ impl Compute {
             // a semaphore
             0x1b0c => {
                 let at = self.address(0x1b00);
-                if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] compute report {at:#x} = {:#x} (op {v:#x})", self.r(0x1b08)); }
+                if crate::trace_sem() { eprintln!("[sem] compute report {at:#x} = {:#x} (op {v:#x})", self.r(0x1b08)); }
                 if v & 3 == 0 && v >> 28 & 1 != 0 {
                     mem.write(at, &self.r(0x1b08).to_le_bytes());
                 } else if v & 1 == 0 {
@@ -152,7 +152,7 @@ impl Compute {
             self.run(&launch, &program, pipe, mem);
         }
         for (at, payload, short) in launch.releases {
-            if std::env::var_os("SBC_TRACE_SEM").is_some() { eprintln!("[sem] qmd release {at:#x} = {payload:#x}"); }
+            if crate::trace_sem() { eprintln!("[sem] qmd release {at:#x} = {payload:#x}"); }
             mem.write(at, &payload.to_le_bytes());
             if !short {
                 mem.write(at + 8, &now.to_le_bytes());
@@ -163,15 +163,28 @@ impl Compute {
     fn run(&mut self, launch: &Launch, program: &Program, pipe: &mut Pipe, mem: &mut dyn Memory) {
         // 32-lane warps, as CUDA's kernels assume; in the browser a kernel that cannot see the warp
         // width (no shuffles, votes, lane ids or lane masks) runs in the shader JIT's 16 lanes
-        use maxwell_shader::isa::Op;
-        let narrow = cfg!(target_arch = "wasm32")
-            && !program.any(|op| matches!(op, Op::Shfl { .. } | Op::Vote { .. } | Op::S2R { sys: 0x00 | 0x38..=0x3c, .. }));
+        let narrow = cfg!(target_arch = "wasm32") && narrow(program);
         if narrow {
             run_lanes::<16>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), self.r(0x2608));
         } else {
             run_lanes::<W>(launch, program, pipe, mem, self.address(0x1574), self.address(0x155c), self.r(0x2608));
         }
     }
+}
+
+/// Whether a program may run in 16 lanes, the shader JIT's, instead of a 32-lane warp: it cannot
+/// see the warp's width (no shuffles, votes, lane ids or lane masks), and its threads do not talk
+/// through shared memory (warp-synchronous code, `s[t] += s[t + 16]` with no barrier, needs the
+/// whole warp to run each step before the next).
+fn narrow(program: &Program) -> bool {
+    use maxwell_shader::isa::Op;
+    !shares_memory(program) && !program.any(|op| matches!(op, Op::Shfl { .. } | Op::Vote { .. } | Op::S2R { sys: 0x00 | 0x38..=0x3c, .. }))
+}
+
+/// Whether a workgroup's threads meet through shared memory or wait for each other at barriers.
+fn shares_memory(program: &Program) -> bool {
+    use maxwell_shader::isa::Op;
+    program.any(|op| matches!(op, Op::Bar | Op::Lds { .. } | Op::Sts { .. } | Op::AtomS { .. }))
 }
 
 /// Run a launch's workgroups in batches of `N` lanes (a warp: 32), on the GPU worker pool unless
@@ -203,11 +216,7 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
     let atomics = program.any(|op| matches!(op, maxwell_shader::isa::Op::Atom { .. } | maxwell_shader::isa::Op::Suatom { .. }));
     // Warps of a workgroup that neither waits at barriers nor shares memory do not meet: they
     // are run as work of their own, which spreads a launch of few workgroups over more threads.
-    let apart = batches > 1
-        && !program.any(|op| {
-            use maxwell_shader::isa::Op;
-            matches!(op, Op::Bar | Op::Lds { .. } | Op::Sts { .. } | Op::AtomS { .. })
-        });
+    let apart = batches > 1 && !shares_memory(program);
     // (each thread has the local memory of a workgroup's threads)
     let per_thread = (launch.local * batches * N).max(1);
     let units = if apart { groups * batches as u64 } else { groups };
@@ -330,4 +339,132 @@ mod tests {
         assert_eq!(l.releases, [(0x2_0000_1000, 99, true)]);
 
     }
+
+    /// Memory whose split views share it, as the Tegra's do: 64-bit words, each accessed whole
+    /// (an aligned access of up to 8 bytes does not tear).
+    use std::sync::atomic::AtomicU64 as Word;
+    struct Ram(Vec<Word>);
+    struct View<'a>(&'a [Word]);
+    impl Memory for View<'_> {
+        fn read(&self, a: u64, out: &mut [u8]) {
+            let mut k = 0;
+            while k < out.len() {
+                let at = a as usize + k;
+                let (w, o) = (at / 8, at % 8);
+                let n = (8 - o).min(out.len() - k);
+                out[k..k + n].copy_from_slice(&self.0[w].load(Ordering::Relaxed).to_le_bytes()[o..o + n]);
+                k += n;
+            }
+        }
+        fn write(&mut self, a: u64, data: &[u8]) {
+            let mut k = 0;
+            while k < data.len() {
+                let at = a as usize + k;
+                let (w, o) = (at / 8, at % 8);
+                let n = (8 - o).min(data.len() - k);
+                let _ = self.0[w].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    let mut b = v.to_le_bytes();
+                    b[o..o + n].copy_from_slice(&data[k..k + n]);
+                    Some(u64::from_le_bytes(b))
+                });
+                k += n;
+            }
+        }
+    }
+    impl Memory for Ram {
+        fn read(&self, a: u64, out: &mut [u8]) { View(&self.0).read(a, out) }
+        fn write(&mut self, a: u64, data: &[u8]) { View(&self.0).write(a, data) }
+        fn split(&mut self, n: usize, run: &mut dyn FnMut(Vec<Box<dyn Memory + Send + '_>>)) -> bool {
+            let ram = &self.0[..];
+            run((0..n).map(|_| Box::new(View(ram)) as Box<dyn Memory + Send + '_>).collect());
+            true
+        }
+    }
+
+    /// An instruction word: the top 16 bits and fields (position, length, value), as in
+    /// maxwell-shader's tests; `pred` is the guard (7: always, 0: P0).
+    fn word(top: u64, pred: u64, fields: &[(u32, u32, u64)]) -> u64 {
+        let mut w = top << 48 | pred << 16;
+        for &(pos, len, v) in fields {
+            w |= (v & ((1 << len) - 1)) << pos;
+        }
+        w
+    }
+
+    /// Code with scheduling words; instruction n is at `at(n)`.
+    fn program(ins: &[u64]) -> Program {
+        let exit = 0xe300_0000_0007_000f;
+        let mut w = Vec::new();
+        for (n, i) in ins.iter().chain([&exit]).enumerate() {
+            if n % 3 == 0 {
+                w.push(0x001f_8000_fc00_07e0u64);
+            }
+            w.push(*i);
+        }
+        Program::decode(&w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap()
+    }
+
+    fn at(n: usize) -> u64 {
+        (n + n / 3 + 1) as u64 * 8
+    }
+
+    fn bra(pred: u64, from: usize, to: usize) -> u64 {
+        word(0xe240, pred, &[(0, 5, 15), (20, 24, at(to).wrapping_sub(at(from) + 8) & 0xff_ffff)])
+    }
+
+    fn launch(groups: u32) -> Launch {
+        Launch { entry: 0, groups: [groups, 1, 1], threads: [1, 1, 1], shared: 0, local: 0, cbufs: [Cbuf::default(); 18], releases: Vec::new() }
+    }
+
+    const ST: u64 = 0xeed8;
+    const LD: u64 = 0xeed0;
+
+    #[test]
+    fn workgroups_that_wait_for_each_other_through_memory() {
+        // workgroup 0 counts to 20000, then sets the flag at 0x1000; the others wait for it and
+        // store what they saw at 0x1100 + 4 * group. The workgroups' threads share memory, so the
+        // waiters see the flag while workgroup 0 runs on another thread.
+        let p = program(&[
+            word(0xf0c8, 7, &[(0, 8, 0), (20, 8, 0x25)]),                                                // 0: r0 = group
+            word(0x3660, 7, &[(3, 3, 0), (0, 3, 7), (8, 8, 0), (20, 19, 0), (39, 3, 7), (49, 3, 5)]),   // 1: p0 = r0 != 0
+            bra(0, 2, 9),                                                                                // 2: (p0) bra 9
+            word(0x0100, 7, &[(0, 8, 2), (12, 4, 15), (20, 32, 0)]),                                     // 3: r2 = 0
+            word(0x3810, 7, &[(0, 8, 2), (8, 8, 2), (20, 19, 1)]),                                       // 4: r2 += 1
+            word(0x3660, 7, &[(3, 3, 0), (0, 3, 7), (8, 8, 2), (20, 19, 20000), (39, 3, 7), (49, 3, 1)]), // 5: p0 = r2 < 20000
+            bra(0, 6, 4),                                                                                // 6: (p0) bra 4
+            word(ST, 7, &[(0, 8, 2), (8, 8, 0xff), (20, 24, 0x1000), (48, 3, 4)]),                       // 7: [0x1000] = r2
+            word(0xe300, 7, &[(0, 5, 15)]),                                                              // 8: exit
+            word(LD, 7, &[(0, 8, 1), (8, 8, 0xff), (20, 24, 0x1000), (48, 3, 4)]),                       // 9: r1 = [0x1000]
+            word(0x3660, 7, &[(3, 3, 0), (0, 3, 7), (8, 8, 1), (20, 19, 0), (39, 3, 7), (49, 3, 2)]),   // 10: p0 = r1 == 0
+            bra(0, 11, 9),                                                                               // 11: (p0) bra 9
+            word(0x3848, 7, &[(0, 8, 3), (8, 8, 0), (20, 19, 2)]),                                       // 12: r3 = r0 << 2
+            word(ST, 7, &[(0, 8, 1), (8, 8, 3), (20, 24, 0x1100), (48, 3, 4)]),                          // 13: [r3 + 0x1100] = r1
+        ]);
+        let mut pipe = Pipe::default();
+        let mut mem = Ram((0..0x400).map(|_| Word::new(0)).collect());
+        let groups = 8;
+        run_lanes::<W>(&launch(groups), &p, &mut pipe, &mut mem, 0, 0, 0);
+        assert!(pipe.errors.is_empty(), "{:?}", pipe.errors);
+        let mut b = [0u8; 4];
+        mem.read(0x1000, &mut b);
+        assert_eq!(b, 20000u32.to_le_bytes());
+        for g in 1..groups as u64 {
+            mem.read(0x1100 + 4 * g, &mut b);
+            assert_eq!(b, 20000u32.to_le_bytes(), "group {g}");
+        }
+    }
+
+    #[test]
+    fn sixteen_lanes_only_for_threads_that_do_not_talk() {
+        // r1 = 7; [0x1000] = r1: no lane can tell how wide the warp is
+        let alone = [word(0x0100, 7, &[(0, 8, 1), (12, 4, 15), (20, 32, 7)]), word(ST, 7, &[(0, 8, 1), (8, 8, 0xff), (20, 24, 0x1000), (48, 3, 4)])];
+        assert!(narrow(&program(&alone)));
+        // s[r0] = r1; r2 = s[r0 + 64] with no barrier between: warp-synchronous
+        let sts = word(0xef58, 7, &[(0, 8, 1), (8, 8, 0), (20, 24, 0), (48, 3, 4)]);
+        let lds = word(0xef48, 7, &[(0, 8, 2), (8, 8, 0), (20, 24, 64), (48, 3, 4)]);
+        assert!(!narrow(&program(&[sts, lds])));
+        // the lane id
+        assert!(!narrow(&program(&[word(0xf0c8, 7, &[(0, 8, 0), (20, 8, 0)])])));
+    }
+
 }
