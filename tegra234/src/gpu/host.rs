@@ -175,7 +175,12 @@ impl Host {
             }
             let start = match channel.resume.take() {
                 Some((at, word)) if at == address && word < words => word,
-                _ => 0,
+                // the stopped entry is gone (the GPFIFO was rewound): so is its packet
+                Some(_) => {
+                    channel.packet = None;
+                    0
+                }
+                None => 0,
             };
             channel.execute(
                 &mut memory,

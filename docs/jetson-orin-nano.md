@@ -166,7 +166,9 @@ boot Linux and run the same GPU tests in WebAssembly.
 The probe fixture stages NVIDIA's R36.4.4 `nvgpu`, dependencies, and GA10B
 firmware in a second initramfs archive. The script verifies the `gk20a` driver symlink and
 the `/dev/nvgpu/igpu0/power` character device. Building the fixture needs
-`bsdtar` with Zstandard support, `cpio`, and `shasum`.
+`bsdtar` with Zstandard support, `cpio`, and `shasum`. macOS's own `bsdtar` has no
+Zstandard; Homebrew's `libarchive` has (`brew install libarchive`, then put
+`$(brew --prefix libarchive)/bin` first in `PATH`).
 
 ```sh
 sh scripts/jetson-nano-fixture.sh cache/jetson-orin-nano orin
@@ -280,6 +282,19 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 - Uniform registers and the decoder's scratch registers share R190..R254 with the
   vector registers, so kernels using more than 190 registers are wrong.
 - The GLES 3.2 suite hangs after `compute_ssbo`; GLES 2 and 3 have known differing scenes.
+- These SM70 decoder gaps give wrong numbers without a fault (to be fixed on `claude/orin-cuda`):
+  - carries: IADD3 carry-out, IMAD.X, and the LDG/STG address carry are dropped;
+  - uniform predicates (UP0..UP6) alias P0..P6;
+  - uniform-register writes reach only the active lanes;
+  - F2FP.PACK_AB ignores its rounding bits (`.RZ` decodes as round-up, `.MERGE_C` as round-down);
+  - F2F `.H1` and I2F's byte select are ignored (the low half or byte is read);
+  - a bound texture's index is cut to 16 bits, so a handle in cbuf 5 reads cbuf 1;
+  - `highest_reg` counts uniform registers, so a kernel's register memset is too large.
+- Engine state (3D and compute) is kept per channel and rebuilt from each runlist submit.
+  A channel is reused only when its id, instance block and USERD all match. So two CUDA
+  streams of one context each have their own engine state, and a new process that gets the
+  same id and addresses before a runlist update inherits the old state. Ampere's QMDs carry
+  most compute state, so neither has mattered so far.
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
 Orin or Ampere modules. Reuse the Maxwell renderer and texture code where the
