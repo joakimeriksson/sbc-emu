@@ -9,12 +9,13 @@
 #   curl -LO https://ultralytics.com/images/bus.jpg && cd -
 #   uv run --with opencv-python-headless --with onnxruntime python tests/gpu/l4t/yolo-input.py \
 #       cache/jetson-r3644/yolo/bus.jpg cache/jetson-r3644/yolo > cache/jetson-r3644/yolo/reference.txt
-# Usage: tests/gpu/run-orin-trt.sh [FIXTURE]   (SBC_TRT_TIMEOUT: seconds of emulated time, default 7200)
+# Usage: tests/gpu/run-orin-trt.sh [FIXTURE]   (SBC_TRT_TIMEOUT: seconds of emulated time, default 7200;
+# SBC_TRT_YOLO: another image's folder from yolo-input.py, default FIXTURE/yolo)
 set -eu
 cd "$(dirname "$0")/../.."
 fixture=${1:-cache/jetson-r3644}
 emulator=${SBC_EMU:-target/release/sbc-emu}
-yolo=$fixture/yolo
+yolo=${SBC_TRT_YOLO:-$fixture/yolo}
 test -s "$fixture/Image"
 test -s "$fixture/probe-initramfs.cpio.gz"
 for f in yolov8n.onnx input.bin input.scale reference.txt; do test -s "$yolo/$f"; done

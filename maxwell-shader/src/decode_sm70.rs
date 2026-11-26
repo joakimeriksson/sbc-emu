@@ -20,30 +20,68 @@ pub const SIZE: u32 = 16;
 
 /// Where this thread's decoding puts uniform and scratch registers (`UNIFORM_BASE` and `SCRATCH`
 /// unless a program uses vector registers that far up, see `Program::decode_sm70_at`), and
-/// whether it only measures: uniform registers read as RZ and the highest one is recorded.
+/// whether it only measures: uniform registers read as RZ and the ones named are recorded.
+/// `uniform[n]` is where URn lives (RZ: nowhere, it reads as zero).
 #[derive(Clone, Copy)]
 pub(crate) struct Map {
-    pub uniform: u8,
+    pub uniform: [Reg; 64],
     pub scratch: Reg,
     pub measure: bool,
 }
 
 impl Map {
-    pub const DEFAULT: Map = Map { uniform: UNIFORM_BASE, scratch: SCRATCH, measure: false };
+    pub const DEFAULT: Map = Map { uniform: Map::from(UNIFORM_BASE), scratch: SCRATCH, measure: false };
+
+    /// URn at `base + n` (RZ past R254).
+    pub const fn from(base: u8) -> [Reg; 64] {
+        let mut t = [RZ; 64];
+        let mut n = 0;
+        while n < 63 {
+            let r = base as u32 + n as u32;
+            if r < RZ as u32 {
+                t[n] = r as Reg;
+            }
+            n += 1;
+        }
+        t
+    }
+
+    /// The uniform registers in `used` (a bit per URn), packed from `start` in aligned groups of
+    /// `group` (2 or 4) so that 64- and 128-bit groups stay together; None if they do not fit
+    /// below RZ.
+    pub fn packed(start: u32, used: u64, group: u32) -> Option<[Reg; 64]> {
+        let mut t = [RZ; 64];
+        let mut at = start;
+        let mask = (1u64 << group) - 1;
+        for first in (0..63).step_by(group as usize) {
+            if used >> first & mask == 0 {
+                continue;
+            }
+            for n in first..(first + group).min(63) {
+                if at >= RZ as u32 {
+                    return None;
+                }
+                t[n as usize] = at as Reg;
+                at += 1;
+            }
+        }
+        Some(t)
+    }
 }
 
 thread_local! {
     static MAP: std::cell::Cell<Map> = const { std::cell::Cell::new(Map::DEFAULT) };
-    static HIGHEST_UNIFORM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static USED_UNIFORM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Runs `f` decoding with `map`; returns its result and the highest uniform register named.
-pub(crate) fn with_map<T>(map: Map, f: impl FnOnce() -> T) -> (T, u8) {
+/// Runs `f` decoding with `map`; returns its result and the uniform registers named (a bit per
+/// URn).
+pub(crate) fn with_map<T>(map: Map, f: impl FnOnce() -> T) -> (T, u64) {
     let old = MAP.with(|m| m.replace(map));
-    HIGHEST_UNIFORM.with(|h| h.set(0));
+    USED_UNIFORM.with(|h| h.set(0));
     let r = f();
     MAP.with(|m| m.set(old));
-    (r, HIGHEST_UNIFORM.with(|h| h.get()))
+    (r, USED_UNIFORM.with(|h| h.get()))
 }
 
 fn scratch() -> Reg {
@@ -69,7 +107,7 @@ impl W {
     }
     fn ureg(self, lo: u32) -> Reg {
         if self.f(lo, 6) != 63 {
-            HIGHEST_UNIFORM.with(|h| h.set(h.get().max(self.f(lo, 6) as u8)));
+            USED_UNIFORM.with(|h| h.set(h.get() | 1 << self.f(lo, 6)));
         }
         self.ureg_quiet(lo)
     }
@@ -80,7 +118,7 @@ impl W {
         match self.f(lo, 6) {
             63 => RZ,
             _ if map.measure => RZ,
-            n => u8::try_from(map.uniform as u32 + n).ok().filter(|&r| r < RZ).unwrap_or(RZ),
+            n => map.uniform[n as usize],
         }
     }
     fn pred(self, lo: u32, not: u32) -> Pred {
@@ -594,7 +632,7 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             let signed = w.b(73);
             Op::IMad { d, a: s.a, b: s.b, c: s.c, sa: signed, sb: signed, hi: true, neg_ab: false, neg_c: s.cm.neg, sat: false, x: false, cc: false }
         }
-        (0x017, _) => Op::IMnMx { d, a: s.a, b: s.b, signed: w.b(73), part: 0, cc: false, p: w.pred(87, 90) },
+        (0x017, _) => Op::IMnMx { d, a: s.a, b: s.b, signed: w.b(73), part: 0, cc: false, p: if uniform { w.upred(87, 90) } else { w.pred(87, 90) } },
         // ISETP (UISETP writes and reads uniform predicates); .EX continues a 64-bit compare
         (0x00c, _) => {
             let (pdst, pred): (fn(W, u32) -> u8, fn(W, u32, u32) -> Pred) = if uniform { (W::updst, W::upred) } else { (W::pdst, W::pred) };
@@ -624,7 +662,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         }
         // F2FP.PACK_AB (bits 72.. 0: two F32 into F16)
         (0x03e, false) if w.f(72, 3) == 0 => Op::PackHalves { d, a: s.a, b: s.b, rnd: w.rnd(78) },
-        (0x007, _) => Op::Sel { d, a: s.a, b: s.b, p: w.pred(87, 90) },
+        // SEL (USEL selects on a uniform predicate)
+        (0x007, _) => Op::Sel { d, a: s.a, b: s.b, p: if uniform { w.upred(87, 90) } else { w.pred(87, 90) } },
         // FSEL: SEL of floats
         (0x008, false) => {
             if s.am != Mod::default() || s.bm != Mod::default() {
@@ -1166,6 +1205,9 @@ mod tests {
         // LEA.HI R70, R139, R70, RZ, 0x1e: the destination is the addend
         let v = ops(0x000fe200078ff0ff_000000468b467211);
         assert!(matches!(v[..], [Op::Shf { d: SCRATCH, lo: 139, hi: RZ, .. }, Op::IAdd3 { d: 70, a: SCRATCH, b: Src::Reg(70), x: false, .. }]), "{v:?}");
+        // USEL UR10, UR10, 0x2, UP0: the selector is a uniform predicate
+        let v = ops(0x000fe40008000000_000000020a0a7887);
+        assert!(matches!(v[..], [Op::Sel { a, b: Src::Imm(2), p: Pred { idx: 8, not: false }, .. }] if a == UNIFORM_BASE + 10), "{v:?}");
         // LDGSTS.E.BYPASS.128 [R39], [R12.64], P3
         assert_eq!(ops(0x0003e20009901c4c_000000000c277fae), vec![Op::Ldgsts { s: 39, soff: 0, g: 12, goff: 0, ty: MemTy::B128, p: Pred { idx: 3, not: false } }]);
         // @!UP1 UIMAD.U32 UR10, UR17, 0x1, UR7 (nvdisasm): the guard is a uniform predicate
@@ -1227,6 +1269,20 @@ mod tests {
 
     /// 64-bit adds from a TensorRT kernel: the carries stay in their predicates (P4 and P3
     /// both live at once), and IMAD.X adds one.
+    #[test]
+    fn used_uniform_registers_pack_in_groups() {
+        // UR4, UR5 and UR33 of a program with vectors up to R229: two groups of four from R232
+        let used = 1 << 4 | 1 << 5 | 1 << 33;
+        let t = Map::packed(232, used, 4).unwrap();
+        assert_eq!(t[4..8], [232, 233, 234, 235]);
+        assert_eq!(t[32..36], [236, 237, 238, 239]);
+        assert_eq!((t[0], t[8], t[63]), (RZ, RZ, RZ));
+        // pairs when groups of four do not fit
+        assert!(Map::packed(250, used, 4).is_none());
+        let t = Map::packed(250, used, 2).unwrap();
+        assert_eq!((t[4], t[5], t[32], t[33]), (250, 251, 252, 253));
+    }
+
     #[test]
     fn carries_live_in_predicates() {
         const CODE: &[u64] = &[

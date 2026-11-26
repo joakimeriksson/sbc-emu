@@ -255,6 +255,11 @@ impl Compute {
         let base = launch.program.unwrap_or_else(|| self.address(0x1608));
         self.last = (base + launch.entry as u64, launch.groups, launch.threads);
         TRACE_PROGRAM.store(self.last.0, Ordering::Relaxed);
+        // SBC_TRACE_LAUNCHES: each launch's program and grid (to find a kernel to trace)
+        static LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LAUNCHES.get_or_init(|| std::env::var_os("SBC_TRACE_LAUNCHES").is_some()) {
+            eprintln!("[launch] {} program {:#x} groups {:?} threads {:?} shared {:#x}", self.launches, self.last.0, launch.groups, launch.threads, launch.shared);
+        }
         if let Some(program) = pipe.program(base, launch.entry, mem) {
             self.run(&launch, &program, pipe, mem);
         } else {

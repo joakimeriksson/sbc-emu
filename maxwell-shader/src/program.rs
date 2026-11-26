@@ -124,28 +124,26 @@ impl Program {
         }
 
         // Uniform registers and the decoder's two scratch ones go above the program's vector
-        // registers (by default R190 up): measure how far those go, and move them if needed.
+        // registers (by default R190 up): measure how far those go, and move them if needed,
+        // packing the uniform registers the program names.
         {
             use crate::decode_sm70::{with_map, Map, SCRATCH};
-            let measure = Map { uniform: 0, scratch: 0, measure: true };
-            let (mut vector, mut uniform, mut uniform_at) = (0, 0, 0);
+            let measure = Map { uniform: [RZ; 64], scratch: 0, measure: true };
+            let (mut vector, mut used) = (0, 0u64);
             for (&addr, (raw, _)) in &found {
                 let (v, u) = with_map(measure, || decode(addr, *raw).iter().map(|i| highest_reg(&i.op)).max().unwrap_or(0));
                 vector = vector.max(v);
-                if u > uniform {
-                    (uniform, uniform_at) = (u, addr);
-                }
+                used |= u;
             }
             if vector > SCRATCH as u32 {
                 let scratch = vector as Reg;
-                let base = vector + 2;
-                // (a uniform register can start a 128-bit group)
-                if base + uniform as u32 + 4 > RZ as u32 {
-                    let raw = found.get(&uniform_at).map_or(0, |f| f.0);
-                    return Err(format!("program: R{} and UR{uniform} (at {uniform_at:#x}: {raw:032x}) do not both fit", vector - 1));
-                }
-                let map = Map { uniform: base as u8, scratch, measure: false };
-                let ((), highest) = with_map(map, || {
+                let start = vector + 2;
+                let Some(uniform) = Map::packed(start, used, 4).or_else(|| Map::packed(start, used, 2)) else {
+                    let names: Vec<String> = (0..64).filter(|n| used >> n & 1 != 0).map(|n| format!("UR{n}")).collect();
+                    return Err(format!("program at {entry:#x}: R0..R{} and {} do not all fit", vector - 1, names.join(" ")));
+                };
+                let map = Map { uniform, scratch, measure: false };
+                let ((), again) = with_map(map, || {
                     for (&addr, (raw, insts)) in found.iter_mut() {
                         *insts = decode(addr, *raw);
                         if insts.is_empty() {
@@ -153,9 +151,7 @@ impl Program {
                         }
                     }
                 });
-                if base + highest as u32 >= RZ as u32 {
-                    return Err(format!("program at {entry:#x}: UR{highest} does not fit above R{}", vector - 1));
-                }
+                debug_assert_eq!(again, used);
             }
         }
 
