@@ -68,17 +68,19 @@ impl W {
         self.f(lo, 8) as Reg
     }
     fn ureg(self, lo: u32) -> Reg {
+        if self.f(lo, 6) != 63 {
+            HIGHEST_UNIFORM.with(|h| h.set(h.get().max(self.f(lo, 6) as u8)));
+        }
+        self.ureg_quiet(lo)
+    }
+    /// A uniform register field that may not be an operand (the c slot of a two-source
+    /// operation): mapped, not counted. Past R254 it reads as RZ.
+    fn ureg_quiet(self, lo: u32) -> Reg {
+        let map = MAP.with(|m| m.get());
         match self.f(lo, 6) {
             63 => RZ,
-            n => {
-                let map = MAP.with(|m| m.get());
-                HIGHEST_UNIFORM.with(|h| h.set(h.get().max(n as u8)));
-                if map.measure {
-                    RZ
-                } else {
-                    map.uniform + n as u8
-                }
-            }
+            _ if map.measure => RZ,
+            n => u8::try_from(map.uniform as u32 + n).ok().filter(|&r| r < RZ).unwrap_or(RZ),
         }
     }
     fn pred(self, lo: u32, not: u32) -> Pred {
@@ -127,15 +129,17 @@ fn alu(w: W) -> Option<Alu> {
     let uniform = w.uniform_alu();
     let form = w.f(9, 3);
     let reg = |lo| if uniform { w.ureg(lo) } else { w.reg(lo) };
+    // (a two-source operation's c slot holds other fields: not counted as a uniform register)
+    let c_reg = |lo| if uniform { w.ureg_quiet(lo) } else { w.reg(lo) };
     let m = |abs, neg| Mod { abs: w.b(abs), neg: w.b(neg) };
     let cb = || Src::Cb(w.f(54, 5) as u8, w.f(38, 16));
     let (wide_mod, b_slot) = (m(62, 63), m(74, 75));
     let (b, bm, c, cm) = match form {
-        1 => (Src::Reg(reg(32)), wide_mod, Src::Reg(reg(64)), b_slot),
+        1 => (Src::Reg(reg(32)), wide_mod, Src::Reg(c_reg(64)), b_slot),
         2 => (Src::Reg(reg(64)), b_slot, Src::Imm(w.f(32, 32)), Mod::default()),
         3 if !w.b(91) => (Src::Reg(reg(64)), b_slot, cb(), wide_mod),
-        4 => (Src::Imm(w.f(32, 32)), Mod::default(), Src::Reg(reg(64)), b_slot),
-        5 if !w.b(91) => (cb(), wide_mod, Src::Reg(reg(64)), b_slot),
+        4 => (Src::Imm(w.f(32, 32)), Mod::default(), Src::Reg(c_reg(64)), b_slot),
+        5 if !w.b(91) => (cb(), wide_mod, Src::Reg(c_reg(64)), b_slot),
         6 => (Src::Reg(w.ureg(32)), wide_mod, Src::Reg(reg(64)), b_slot),
         7 => (Src::Reg(reg(64)), b_slot, Src::Reg(w.ureg(32)), wide_mod),
         _ => return None,
@@ -214,7 +218,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
     match opcode {
         0x918 => return one(Op::Nop),
         // Convergence-barrier bookkeeping, warp synchronization, dependency waits.
-        0x355 | 0x356 | 0x956 | 0xf55 | 0x148 | 0x948 | 0x91a => return one(Op::Nop),
+        // (WARPSYNC: 0x148 and 0x948 with an immediate mask, 0x348 with a register)
+        0x355 | 0x356 | 0x956 | 0xf55 | 0x148 | 0x348 | 0x948 | 0x91a => return one(Op::Nop),
         // BREAK leaves a convergence barrier; the SSY/SYNC model needs nothing for that.
         // YIELD and ERRBAR have nothing to do here either.
         0x942 | 0x946 | 0x9ab => return one(Op::Nop),
@@ -470,6 +475,10 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
     let uniform = op9 >= 0x80 && op9 < 0x100;
     let base = if uniform { op9 - 0x80 } else { op9 };
     let s = alu(w)?;
+    // the uniform operations with three sources: their c (forms 1, 4, 5) is a register
+    if uniform && matches!(s.form, 1 | 4 | 5) && matches!(base, 0x010 | 0x011 | 0x012 | 0x016 | 0x019 | 0x024 | 0x025 | 0x027) {
+        w.ureg(64);
+    }
     let d = if uniform { w.ureg(16) } else { w.reg(16) };
     let ftz = w.b(80);
     // carries live in predicates (uniform ones for uniform operations)
@@ -529,7 +538,11 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             cmp: FCmpArgs { a: s.a, am: s.am, b: s.b, bm: s.bm, cond: w.f(76, 4) as u8, ftz, bop: w.bop(74)?, p: w.pred(87, 90) },
         },
         (0x108, false) => {
-            let a = reg_of(s.b)?;
+            // (an immediate or constant operand goes through the scratch register)
+            let (a, mut ops) = match s.b {
+                Src::Reg(r) => (r, Vec::new()),
+                b => (scratch(), vec![Op::Mov { d: scratch(), b, lanes: 15 }]),
+            };
             let op = [Mufu::Cos, Mufu::Sin, Mufu::Ex2, Mufu::Lg2, Mufu::Rcp, Mufu::Rsq, Mufu::Rcp64h, Mufu::Rsq64h, Mufu::Sqrt]
                 [*[0, 1, 2, 3, 4, 5, 6, 7, 8].get(w.f(74, 6) as usize)?];
             if w.b(73) {
@@ -538,12 +551,12 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             // SM70 has no RRO: SIN and COS take turns, the compiler having divided by 2 pi
             if matches!(op, Mufu::Sin | Mufu::Cos) {
                 let turn = std::f32::consts::TAU.to_bits();
-                return Some(vec![
-                    Op::FMul { d, a, b: Src::Imm(turn), neg: false, fmz: Fmz::default(), sat: false, cc: false, rnd: Rnd::N, scale: 1.0 },
-                    Op::Mufu { d, a: d, m: s.bm, op, sat: false },
-                ]);
+                ops.push(Op::FMul { d, a, b: Src::Imm(turn), neg: false, fmz: Fmz::default(), sat: false, cc: false, rnd: Rnd::N, scale: 1.0 });
+                ops.push(Op::Mufu { d, a: d, m: s.bm, op, sat: false });
+            } else {
+                ops.push(Op::Mufu { d, a, m: s.bm, op, sat: false });
             }
-            Op::Mufu { d, a, m: s.bm, op, sat: false }
+            return Some(ops);
         }
         // IADD3: carries out to two predicates (81, 84); .X (74) adds two carry predicates (87, 77)
         (0x010, _) => {
@@ -563,6 +576,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             let cin = if x { [pred(w, 87, 90), pred(w, 77, 80)] } else { [no_carry; 2] };
             Op::IAdd3P { d, a: s.a, b: s.b, c: s.c, neg: [s.am.neg, s.bm.neg, s.cm.neg], x, cin, cout }
         }
+        // FCHK P, a, b (whether a / b needs the exact routine)
+        (0x102, false) => Op::FChk { pd: w.pdst(81), a: s.a, b: s.b },
         // IMAD.X: a * b + c + the carry predicate (87)
         (0x024, _) if w.b(74) => {
             let signed = w.b(73);
@@ -1172,6 +1187,10 @@ mod tests {
         // RED.E.ADD.F32.FTZ.RN.STRONG.GPU [R16.64+0x4], R7; ATOMG.E.INC.STRONG.GPU PT, R7, [R20.64], R7
         assert_eq!(ops(0x0005e4000c10e78c_000004071000798e), vec![Op::Atom { d: RZ, a: 16, b: 7, off: 4, op: AtomOp::Add, ty: AtomTy::F32, wide: true }]);
         assert_eq!(ops(0x000ea800099ee1cc_00000007140779a8), vec![Op::Atom { d: 7, a: 20, b: 7, off: 0, op: AtomOp::Inc, ty: AtomTy::U32, wide: true }]);
+        // MUFU.RSQ R2, -QNAN (an immediate operand)
+        assert_eq!(ops(0x000e220000001400_ffc0000000027908), vec![Op::Mov { d: SCRATCH, b: Src::Imm(0xffc0_0000), lanes: 15 }, Op::Mufu { d: 2, a: SCRATCH, m: Mod::default(), op: Mufu::Rsq, sat: false }]);
+        // FCHK P5, R4, 2 (nvdisasm)
+        assert_eq!(ops(0x000e6400000a0000_4000000004007902), vec![Op::FChk { pd: 5, a: 4, b: Src::Imm(0x4000_0000) }]);
         // UFLO.U32 UR4, UR5
         assert_eq!(ops(0x000fe200080e0000_00000005000472bd), vec![Op::Flo { d: ur(4), b: Src::Reg(ur(5)), not: false, signed: false, shift: false, cc: false }]);
     }

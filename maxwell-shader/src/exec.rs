@@ -637,6 +637,19 @@ fn extend(b: &[u8], ty: MemTy) -> u32 {
     }
 }
 
+/// FCHK: whether a / b (as bits) needs the exact division routine. Saying yes too often only
+/// costs time; the routine's answer is right either way.
+fn fchk(a: u32, b: u32) -> bool {
+    let (ea, eb) = ((a >> 23 & 0xff) as i32, (b >> 23 & 0xff) as i32);
+    let a_zero = a & 0x7fff_ffff == 0;
+    // b zero, denormal, infinite or NaN; a denormal, infinite or NaN
+    if eb == 0 || eb == 0xff || ea == 0xff || (ea == 0 && !a_zero) {
+        return true;
+    }
+    // the quotient (and the reciprocal of b) well inside the normal range
+    !a_zero && !(-120..=120).contains(&(ea - eb)) || !(3..=252).contains(&eb) || !a_zero && !(3..=252).contains(&ea)
+}
+
 /// The program offset of the last memory instruction run (on any thread): a fault report's best guess.
 pub static LAST_MEMORY_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -973,6 +986,14 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
                 }
                 l.put(d, m, r);
             }
+        }
+        Op::FChk { pd, a, b } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let mut t = 0u32;
+            for i in 0..N {
+                t |= (fchk(u[i], v[i]) as u32) << i;
+            }
+            l.putp(pd, m, t);
         }
         Op::IAdd3P { d, a, b, c, neg, x, cin, cout } => {
             let (va, vb, vc) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));

@@ -436,6 +436,10 @@ pub enum Op {
     /// SM70's IADD3 with its carries in predicates: d = a + b + c + cin[0] + cin[1]. cout[0] gets
     /// the carry of a + b + cin[0], cout[1] that of adding c + cin[1] (7 or 15: none). A negated
     /// operand is -x, or ~x in the .X form (`x`), the high word of a 64-bit add.
+    /// SM70 FCHK: pd = whether a / b needs the exact (slow) division routine instead of a
+    /// reciprocal and a refinement: an operand is not a normal number (b also not zero), or the
+    /// quotient's exponent is near the edge of the range.
+    FChk { pd: u8, a: Reg, b: Src },
     IAdd3P { d: Reg, a: Reg, b: Src, c: Src, neg: [bool; 3], x: bool, cin: [Pred; 2], cout: [u8; 2] },
     /// LEA: d = (a << shift) + b; LEA.HI (`hi`: the high word's register c): d = the high word of
     /// (c:a << shift) + b. X adds the carry; the carry out goes to CC (with `cc`) and to `pd`.

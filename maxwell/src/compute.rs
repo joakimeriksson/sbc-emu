@@ -257,6 +257,8 @@ impl Compute {
         TRACE_PROGRAM.store(self.last.0, Ordering::Relaxed);
         if let Some(program) = pipe.program(base, launch.entry, mem) {
             self.run(&launch, &program, pipe, mem);
+        } else {
+            eprintln!("[maxwell] compute launch skipped: no program at {:#x}", self.last.0);
         }
         for (at, payload, short) in launch.releases {
             if crate::trace_sem() { eprintln!("[sem] qmd release {at:#x} = {payload:#x}"); }

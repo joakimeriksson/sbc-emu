@@ -178,6 +178,7 @@ impl Gpu {
                 {
                     eprintln!("[gpu] doorbell {value:#x} could not complete");
                 }
+                self.host.retry_blocked(ram, host1x, self.trace, now);
             }
             0 | BAR1_STATUS | PTIMER_TIME_0 | PTIMER_TIME_1 | RING_START_RESULTS => {}
             _ if top::read(offset).is_none() && host::read_config(offset).is_none() => {

@@ -128,19 +128,24 @@ impl Program {
         {
             use crate::decode_sm70::{with_map, Map, SCRATCH};
             let measure = Map { uniform: 0, scratch: 0, measure: true };
-            let ((vector, _), uniform) = with_map(measure, || {
-                let v = found.iter().flat_map(|(&addr, (raw, _))| decode(addr, *raw)).map(|i| highest_reg(&i.op)).max().unwrap_or(0);
-                (v, ())
-            });
+            let (mut vector, mut uniform, mut uniform_at) = (0, 0, 0);
+            for (&addr, (raw, _)) in &found {
+                let (v, u) = with_map(measure, || decode(addr, *raw).iter().map(|i| highest_reg(&i.op)).max().unwrap_or(0));
+                vector = vector.max(v);
+                if u > uniform {
+                    (uniform, uniform_at) = (u, addr);
+                }
+            }
             if vector > SCRATCH as u32 {
                 let scratch = vector as Reg;
                 let base = vector + 2;
                 // (a uniform register can start a 128-bit group)
                 if base + uniform as u32 + 4 > RZ as u32 {
-                    return Err(format!("program at {entry:#x}: R{} and UR{uniform} do not both fit", vector - 1));
+                    let raw = found.get(&uniform_at).map_or(0, |f| f.0);
+                    return Err(format!("program: R{} and UR{uniform} (at {uniform_at:#x}: {raw:032x}) do not both fit", vector - 1));
                 }
                 let map = Map { uniform: base as u8, scratch, measure: false };
-                with_map(map, || {
+                let ((), highest) = with_map(map, || {
                     for (&addr, (raw, insts)) in found.iter_mut() {
                         *insts = decode(addr, *raw);
                         if insts.is_empty() {
@@ -148,6 +153,9 @@ impl Program {
                         }
                     }
                 });
+                if base + highest as u32 >= RZ as u32 {
+                    return Err(format!("program at {entry:#x}: UR{highest} does not fit above R{}", vector - 1));
+                }
             }
         }
 

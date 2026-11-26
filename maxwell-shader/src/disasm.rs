@@ -367,6 +367,7 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
             neg(r(a), neg_a),
             neg(b, neg_b)
         ),
+        Op::FChk { pd, a, b } => format!("fchk {} {}, {}", Pred { idx: pd, not: false }, R(a), i(b)),
         Op::IAdd3P { d, a, b, c, neg: n, x: e, cin, cout } => format!(
             "iadd3{} {} {} {}, {}{}, {}{}, {}{} {} {}",
             dot(e, ".x"),
