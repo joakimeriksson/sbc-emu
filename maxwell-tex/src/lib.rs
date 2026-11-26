@@ -41,14 +41,37 @@ pub trait Memory {
     fn read(&self, addr: u64, out: &mut [u8]);
     fn write(&mut self, addr: u64, data: &[u8]);
 
+    /// `n` bytes (at most 16) at `at[i]` into `out[i]`, for each lane `i` of `mask` (a warp's
+    /// load; what `out[i]` holds past `n` bytes is not defined). The default reads lane by lane.
+    fn read_lanes(&self, at: &[u64], mask: u32, n: usize, out: &mut [[u8; 16]]) {
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.read(at[i], &mut out[i][..n]);
+        }
+    }
+
+    /// The same for a store, lane after lane.
+    fn write_lanes(&mut self, at: &[u64], mask: u32, n: usize, data: &[[u8; 16]]) {
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.write(at[i], &data[i][..n]);
+        }
+    }
+
     /// The same memory for another thread, to read only (writes may be dropped). None: one thread.
     fn share(&self) -> Option<Box<dyn Memory + Send + '_>> {
         None
     }
 
     /// The same memory for `n` threads at once (a compute launch's workgroups): `run` gets a view
-    /// for each; a view sees its own writes, and they all reach memory when `run` returns, in the
-    /// views' order (bytes several views wrote end up as the last one's). false: one thread only.
+    /// for each, and each view sees what all of them wrote. An access within an aligned 8-byte
+    /// word is one atomic access (it does not tear, as on the GPU; wider ones are several), and
+    /// bytes several views write at once end up as one of theirs. The accesses are relaxed:
+    /// MEMBAR orders them. false: one thread only.
     fn split(&mut self, _n: usize, _run: &mut dyn FnMut(Vec<Box<dyn Memory + Send + '_>>)) -> bool {
         false
     }

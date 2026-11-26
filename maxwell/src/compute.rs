@@ -201,37 +201,55 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
     let [gx, gy, gz] = launch.groups;
     let groups = gx as u64 * gy as u64 * gz as u64;
     let atomics = program.any(|op| matches!(op, maxwell_shader::isa::Op::Atom { .. } | maxwell_shader::isa::Op::Suatom { .. }));
+    // Warps of a workgroup that neither waits at barriers nor shares memory do not meet: they
+    // are run as work of their own, which spreads a launch of few workgroups over more threads.
+    let apart = batches > 1
+        && !program.any(|op| {
+            use maxwell_shader::isa::Op;
+            matches!(op, Op::Bar | Op::Lds { .. } | Op::Sts { .. } | Op::AtomS { .. })
+        });
     // (each thread has the local memory of a workgroup's threads)
     let per_thread = (launch.local * batches * N).max(1);
-    let workers = if atomics { 1 } else { pipe::threads().min(groups as usize).min(MAX_LOCAL / per_thread).max(1) };
+    let units = if apart { groups * batches as u64 } else { groups };
+    let workers = if atomics { 1 } else { pipe::threads().min(usize::try_from(units).unwrap_or(usize::MAX)).min(MAX_LOCAL / per_thread).max(1) };
     pipe.need_workers(workers);
     let next = AtomicU64::new(0);
     let left_fuel = AtomicU64::new(LAUNCH_FUEL);
     let failed: Mutex<Option<String>> = Mutex::new(None);
-    // run workgroups until there are none left; each thread with its own lanes and shared memory
+    // run work until there is none left; each thread with its own lanes and shared memory
     let one = |worker: &mut pipe::Worker, mem: &mut dyn Memory| {
-        let (_, mut common) = worker.parts(&work, mem);
-        let mut lanes: Vec<Lanes<N>> = (0..batches).map(|_| Lanes::new()).collect();
+        // the warps' registers, kept from earlier launches of as many lanes. A launch starts as
+        // with new ones: `start` clears the registers the program uses (it reads no others) and
+        // the local memory is cleared here.
+        let slot = (N == 32) as usize;
+        let mut lanes: Vec<Lanes<N>> = worker.warps[slot].take().and_then(|w| w.downcast::<Vec<Lanes<N>>>().ok()).map_or_else(Vec::new, |w| *w);
+        lanes.resize_with(batches, Lanes::new);
         for l in &mut lanes {
             l.set_local_size(launch.local);
+            l.clear_local();
         }
+        let (_, mut common) = worker.parts(&work, mem);
         let mut shared = vec![0u8; launch.shared];
+        let mut left: Vec<bool> = vec![false; batches];
         loop {
-            let g = next.fetch_add(1, Ordering::Relaxed);
-            if g >= groups {
+            let u = next.fetch_add(1, Ordering::Relaxed);
+            if u >= units {
                 break;
             }
+            // a workgroup, or one warp of it
+            let (g, warps) = if apart { (u / batches as u64, (u % batches as u64) as usize..(u % batches as u64) as usize + 1) } else { (u, 0..batches) };
             let (x, y, z) = ((g % gx as u64) as u32, (g / gx as u64 % gy as u64) as u32, (g / gx as u64 / gy as u64) as u32);
             shared.fill(0);
-            let mut left: Vec<bool> = vec![true; batches];
-            // the instructions this workgroup may run come out of the launch's before it starts (at
-            // most a worker's share of it, so that workgroups running at once cannot take it all)
-            let want = (FUEL * batches as u64).min(LAUNCH_FUEL / workers as u64);
+            left.fill(false);
+            left[warps.clone()].fill(true);
+            // the instructions this work may run come out of the launch's before it starts (at
+            // most a worker's share of it, so that work running at once cannot take it all)
+            let want = (FUEL * warps.len() as u64).min(LAUNCH_FUEL / workers as u64);
             let start = left_fuel.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| Some(f.saturating_sub(want))).map_or(0, |f| f.min(want));
             let mut fuel = start;
-            for (b, l) in lanes.iter_mut().enumerate() {
+            for b in warps {
                 let n = (threads as usize - b * N).min(N);
-                l.start(program, (1u64 << n).wrapping_sub(1) as u32, 0);
+                lanes[b].start(program, (1u64 << n).wrapping_sub(1) as u32, 0);
             }
             // everyone to the next barrier, until all are done
             let mut stop = None;
@@ -255,10 +273,11 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
             left_fuel.fetch_add(fuel, Ordering::Relaxed);
             if let Some(e) = stop {
                 failed.lock().unwrap().get_or_insert(e);
-                next.store(groups, Ordering::Relaxed);
+                next.store(units, Ordering::Relaxed);
                 break;
             }
         }
+        worker.warps[slot] = Some(Box::new(lanes));
     };
     #[cfg(not(target_arch = "wasm32"))]
     if workers > 1 {

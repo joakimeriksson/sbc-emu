@@ -147,11 +147,14 @@ pub struct Worker {
     generation: u64,
     /// a shader wrote memory
     pub stored: bool,
+    /// compute's warps, kept from launch to launch (`Vec<Lanes<N>>`), of 16 and of 32 lanes
+    pub warps: [Option<Box<dyn std::any::Any + Send>>; 2],
 }
 
 impl Worker {
     fn new() -> Self {
         Self {
+            warps: [None, None],
             lanes: Lanes::new(),
             words: Box::new(std::array::from_fn(|_| std::array::from_fn(|_| Words::default()))),
             textures: Cache::default(),
@@ -543,6 +546,13 @@ macro_rules! common_host {
         fn store(&mut self, addr: u64, data: &[u8]) {
             self.common.stored = true;
             self.common.mem.write(addr, data);
+        }
+        fn load_lanes(&mut self, at: &[u64; $n], mask: u32, n: usize, out: &mut [[u8; 16]; $n]) {
+            self.common.mem.read_lanes(at, mask, n, out);
+        }
+        fn store_lanes(&mut self, at: &[u64; $n], mask: u32, n: usize, data: &[[u8; 16]; $n]) {
+            self.common.stored = true;
+            self.common.mem.write_lanes(at, mask, n, data);
         }
         fn texture(&mut self, op: &TexOp<{ $n }>) -> [[u32; $n]; 4] {
             self.common.texture(op)

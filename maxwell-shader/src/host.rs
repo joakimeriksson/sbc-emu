@@ -104,6 +104,25 @@ pub trait Host<const N: usize> {
         out.fill(0);
     }
     fn store(&mut self, addr: u64, data: &[u8]) {}
+    /// A warp's load: `n` bytes (at most 16) at `at[i]` for each lane `i` of `mask`. The
+    /// default loads lane by lane.
+    fn load_lanes(&mut self, at: &[u64; N], mask: u32, n: usize, out: &mut [[u8; 16]; N]) {
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.load(at[i], &mut out[i][..n]);
+        }
+    }
+    /// A warp's store, lane after lane in order.
+    fn store_lanes(&mut self, at: &[u64; N], mask: u32, n: usize, data: &[[u8; 16]; N]) {
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            self.store(at[i], &data[i][..n]);
+        }
+    }
     /// An atomic on global memory; returns the old value. The default is made of `load` and
     /// `store`.
     fn atomic(&mut self, addr: u64, op: AtomOp, ty: AtomTy, a: u64, b: u64) -> u64 {

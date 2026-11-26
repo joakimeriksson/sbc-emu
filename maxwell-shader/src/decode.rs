@@ -852,7 +852,8 @@ fn other(addr: u32, w: W, top: u32) -> Option<Op> {
         0xef48 => return Some(Op::Lds { d, a, off: w.s(20, 24), ty: w.mem(48)? }),
         0xef50 => return Some(Op::Stl { r: d, a, off: w.s(20, 24), ty: w.mem(48)? }),
         0xef58 => return Some(Op::Sts { r: d, a, off: w.s(20, 24), ty: w.mem(48)? }),
-        0xef80 | 0xef98 | 0xf0f0 => return Some(Op::Fence),
+        0xef98 => return Some(Op::Membar),
+        0xef80 | 0xf0f0 => return Some(Op::Fence),
         0xef90 => {
             return Some(Op::Ldc {
                 d,

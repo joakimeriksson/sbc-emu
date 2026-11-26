@@ -488,8 +488,10 @@ pub enum Op {
     Sam,
     Ram,
     Bar,
-    /// MEMBAR, CCTL, DEPBAR: nothing to do here.
+    /// Cache control and DEPBAR: nothing to do here.
     Fence,
+    /// MEMBAR: the memory accesses before it are seen before those after it, by every thread.
+    Membar,
     Bpt,
 }
 

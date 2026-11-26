@@ -44,8 +44,10 @@ struct Token {
 const MAX_DEPTH: usize = 4096;
 
 /// Registers and control state of N lanes. Lane n of a quad is at x = n & 1, y = n >> 1 & 1;
-/// with more than 4 lanes, every four lanes form a quad.
+/// with more than 4 lanes, every four lanes form a quad. (Aligned to a cache line, as lanes run on
+/// several threads at once.)
 #[derive(Clone)]
+#[repr(align(128))]
 pub struct Lanes<const N: usize> {
     /// General registers by lane. Register 255 must stay zero.
     pub gpr: Box<[[u32; N]; 256]>,
@@ -67,6 +69,8 @@ pub struct Lanes<const N: usize> {
     stack: Vec<Token>,
     /// Masks SAM saved.
     sam: Vec<u32>,
+    /// Registers the last program may have written (the ones `start` clears for the next).
+    written: usize,
     /// What the JIT's blocks read (kept to reuse its memory).
     frame: crate::jit::Frame,
 }
@@ -107,6 +111,7 @@ impl<const N: usize> Lanes<N> {
             helper: 0,
             stack: Vec::with_capacity(16),
             sam: Vec::new(),
+            written: 0,
             frame: Default::default(),
         }
     }
@@ -121,12 +126,19 @@ impl<const N: usize> Lanes<N> {
         }
     }
 
+    /// Clears the local memory (lanes kept from an earlier launch start like new ones).
+    pub fn clear_local(&mut self) {
+        self.local.fill(0);
+    }
+
     /// Prepares to run `p` from its entry in `lanes`. Lanes in `helper` (a subset) run only
     /// for the sake of their quad's derivatives: their stores and atomics do nothing. Clears the
-    /// registers the program uses.
+    /// registers the program uses, and those the program before wrote.
     pub fn start(&mut self, p: &Program, lanes: u32, helper: u32) {
+        // (and those an earlier program wrote: lanes kept from it start as new ones)
         let n = (p.gprs() as usize).min(255);
-        self.gpr[..n].fill([0; N]);
+        self.gpr[..n.max(self.written)].fill([0; N]);
+        self.written = n;
         self.pred = [0, 0, 0, 0, 0, 0, 0, !0];
         (self.zero, self.sign, self.carry, self.overflow) = (0, 0, 0, 0);
         self.pc = p.entry;
@@ -481,27 +493,62 @@ fn flo(x: u32, signed: bool, shift: bool) -> u32 {
     }
 }
 
-fn prmt(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
-    let src = (a as u64 | (c as u64) << 32).to_le_bytes();
-    let s = (sel & 3) as usize;
-    let r: [u8; 4] = match mode {
-        0 => std::array::from_fn(|i| {
-            let n = sel >> (4 * i) & 15;
-            let b = src[(n & 7) as usize];
-            if n & 8 != 0 {
-                (b as i8 >> 7) as u8
-            } else {
-                b
+/// PRMT: bytes of `a` (0..3) and `c` (4..7) picked by `sel` and the mode. Shifts on the
+/// 64-bit pair, without a byte array: the interpreter runs it for every lane.
+#[inline(always)]
+pub fn prmt(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
+    let x = a as u64 | (c as u64) << 32;
+    let s = sel & 3;
+    // the source's byte n
+    let byte = |n: u32| (x >> (8 * n)) as u32 & 0xff;
+    match mode {
+        // each result byte by a nibble: bits 0..2 the source byte, bit 3 its sign in all bits
+        0 => {
+            let mut r = 0;
+            for i in 0..4 {
+                let n = sel >> (4 * i);
+                let b = (x >> (8 * (n & 7))) as u32;
+                let b = if n & 8 != 0 { ((b as u8 as i8) >> 7) as u8 as u32 } else { b & 0xff };
+                r |= b << (8 * i);
             }
-        }),
-        1 => std::array::from_fn(|i| src[i + s]),
-        2 => std::array::from_fn(|i| src[if i >= s { i - s } else { 8 + i - s }]),
-        3 => [src[s]; 4],
-        4 => std::array::from_fn(|i| src[i.max(s)]),
-        5 => std::array::from_fn(|i| src[i.min(s)]),
-        _ => std::array::from_fn(|i| src[(i & 1) + (s & 1) * 2]),
+            r
+        }
+        // forward: bytes s..s + 4
+        1 => (x >> (8 * s)) as u32,
+        // backward: byte i is source byte i - s, wrapping around the eight
+        2 => x.rotate_left(8 * s) as u32,
+        // byte s in all four
+        3 => byte(s) * 0x0101_0101,
+        // edge clamps: byte i is source byte max(i, s) or min(i, s)
+        4 => {
+            let keep = !0u32 << (8 * s);
+            a & keep | byte(s) * 0x0101_0101 & !keep
+        }
+        5 => {
+            let keep = if s == 3 { !0 } else { !(!0u32 << (8 * (s + 1))) };
+            a & keep | byte(s) * 0x0101_0101 & !keep
+        }
+        // half s & 1 in both halves
+        _ => {
+            let h = a >> (16 * (s & 1)) & 0xffff;
+            h | h << 16
+        }
+    }
+}
+
+/// The selector of PRMT's mode 0 (a nibble per result byte) that does what `sel` does in `mode`.
+pub fn prmt_bytes(sel: u32, mode: u8) -> u32 {
+    let s = sel & 3;
+    let n = |i: u32| match mode {
+        0 => sel >> (4 * i) & 15,
+        1 => i + s,
+        2 => (i + 8 - s) & 7,
+        3 => s,
+        4 => i.max(s),
+        5 => i.min(s),
+        _ => (i & 1) + (s & 1) * 2,
     };
-    u32::from_le_bytes(r)
+    (0..4).fold(0, |r, i| r | n(i) << (4 * i))
 }
 
 fn shift(v: u32, n: u32, wrap: bool) -> Option<(u32, u32)> {
@@ -616,6 +663,8 @@ pub fn run<const N: usize, H: Host<N>>(
 
         match inst.op {
             Op::Nop | Op::Fence => {}
+            // (the workgroups of a parallel launch share memory through relaxed atomics)
+            Op::Membar => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
             Op::Invalid(_) | Op::Bpt => return fault(pc),
 
             Op::FAdd { d, a, am, b, bm, ftz, sat, cc, rnd } => {
@@ -1206,8 +1255,36 @@ pub fn run<const N: usize, H: Host<N>>(
                 l.put(d, m, v.map(|x| if not { x.count_zeros() } else { x.count_ones() }));
             }
             Op::Prmt { d, a, b, c, mode } => {
-                let (u, v, w) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
-                l.put(d, m, std::array::from_fn(|i| prmt(u[i], v[i], w[i], mode)));
+                let (u, w) = (l.gpr[a as usize], l.src(h, c));
+                let r: [u32; N] = match b {
+                    Src::Reg(rb) => {
+                        let v = l.gpr[rb as usize];
+                        // (the mode is known here, so each arm is a loop of shifts)
+                        match mode {
+                            0 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 0)),
+                            1 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 1)),
+                            2 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 2)),
+                            3 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 3)),
+                            4 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 4)),
+                            5 => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 5)),
+                            _ => std::array::from_fn(|i| prmt(u[i], v[i], w[i], 6)),
+                        }
+                    }
+                    // the same selector in every lane: the shift of each byte, once
+                    _ => {
+                        let sel = prmt_bytes(l.src(h, b)[0], mode);
+                        if sel & 0x8888 == 0 {
+                            let sh: [u32; 4] = std::array::from_fn(|k| 8 * (sel >> (4 * k) & 7));
+                            std::array::from_fn(|i| {
+                                let x = u[i] as u64 | (w[i] as u64) << 32;
+                                (x >> sh[0]) as u32 & 0xff | ((x >> sh[1]) as u32 & 0xff) << 8 | ((x >> sh[2]) as u32 & 0xff) << 16 | ((x >> sh[3]) as u32) << 24
+                            })
+                        } else {
+                            std::array::from_fn(|i| prmt(u[i], sel, w[i], 0))
+                        }
+                    }
+                };
+                l.put(d, m, r);
             }
             Op::Sel { d, a, b, p } => {
                 let t = l.p(p);
@@ -1975,17 +2052,25 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
             }
         }
         Op::Ld { d, a, off, ty, wide } => {
+            // the warp's addresses, then one call for all of them
+            let mut at = [0u64; N];
+            for (i, x) in at.iter_mut().enumerate() {
+                *x = global(l, a, off, wide, i);
+            }
+            let mut buf = [[0u8; 16]; N];
+            h.load_lanes(&at, m, ty.bytes(), &mut buf);
             for i in lanes(m) {
-                let mut buf = [0; 16];
-                h.load(global(l, a, off, wide, i), &mut buf[..ty.bytes()]);
-                load(l, d, ty, i, &buf);
+                load(l, d, ty, i, &buf[i]);
             }
         }
         Op::St { r, a, off, ty, wide } => {
-            for i in lanes(m & !quiet) {
-                let buf = data(l, r, ty, i);
-                h.store(global(l, a, off, wide, i), &buf[..ty.bytes()]);
+            let m = m & !quiet;
+            let mut at = [0u64; N];
+            for (i, x) in at.iter_mut().enumerate() {
+                *x = global(l, a, off, wide, i);
             }
+            let buf: [[u8; 16]; N] = std::array::from_fn(|i| if m >> i & 1 != 0 { data(l, r, ty, i) } else { [0; 16] });
+            h.store_lanes(&at, m, ty.bytes(), &buf);
         }
         Op::Ldl { d, a, off, ty } => {
             for i in lanes(m) {
@@ -2201,5 +2286,122 @@ fn surface<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prmt;
+
+    /// PRMT byte by byte, as the PTX manual describes it.
+    pub(super) fn reference(a: u32, sel: u32, c: u32, mode: u8) -> u32 {
+        let src = (a as u64 | (c as u64) << 32).to_le_bytes();
+        let s = (sel & 3) as usize;
+        let r: [u8; 4] = match mode {
+            0 => std::array::from_fn(|i| {
+                let n = sel >> (4 * i) & 15;
+                let b = src[(n & 7) as usize];
+                if n & 8 != 0 {
+                    (b as i8 >> 7) as u8
+                } else {
+                    b
+                }
+            }),
+            1 => std::array::from_fn(|i| src[i + s]),
+            2 => std::array::from_fn(|i| src[if i >= s { i - s } else { 8 + i - s }]),
+            3 => [src[s]; 4],
+            4 => std::array::from_fn(|i| src[i.max(s)]),
+            5 => std::array::from_fn(|i| src[i.min(s)]),
+            _ => std::array::from_fn(|i| src[(i & 1) + (s & 1) * 2]),
+        };
+        u32::from_le_bytes(r)
+    }
+
+    #[test]
+    fn prmt_matches_the_bytewise_definition() {
+        let (a, c) = (0x8382_0180, 0x8786_8584);
+        assert_eq!(prmt(a, 0x3210, c, 0), a);
+        assert_eq!(prmt(a, 0x7654, c, 0), c);
+        assert_eq!(prmt(a, 0x9810, c, 0), 0x00ff_0180, "sign bytes");
+        assert_eq!(prmt(a, 0x1, c, 1), 0x8483_8201);
+        assert_eq!(prmt(a, 0x1, c, 2), 0x8201_8087);
+        assert_eq!(prmt(a, 0x2, c, 3), 0x8282_8282);
+        assert_eq!(prmt(a, 0x2, c, 4), 0x8382_8282);
+        assert_eq!(prmt(a, 0x1, c, 5), 0x0101_0180);
+        assert_eq!(prmt(a, 0x1, c, 6), 0x8382_8382);
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let (a, c, sel) = (next() as u32, next() as u32, next() as u32);
+            for mode in 0..8 {
+                assert_eq!(prmt(a, sel, c, mode), reference(a, sel, c, mode), "{a:#x} {sel:#x} {c:#x} mode {mode}");
+                assert_eq!(prmt(a, super::prmt_bytes(sel, mode), c, 0), reference(a, sel, c, mode), "as mode 0: {a:#x} {sel:#x} {c:#x} mode {mode}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use crate::isa::*;
+    use crate::jit::check::{program, Cb};
+    use crate::{run, Host, Lanes};
+
+    /// A word that decodes to an instruction `want` accepts.
+    fn find(want: impl Fn(&Op) -> bool) -> u64 {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        loop {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let w = x & !(0xf << 16) | 7 << 16;
+            if want(&crate::decode::decode(8, w).op) {
+                return w;
+            }
+        }
+    }
+
+    /// PRMT with a selector that is the same in every lane (immediate and constant buffer forms),
+    /// through `run`, against the byte-wise definition. (Where the JIT runs, it runs those.)
+    #[test]
+    fn prmt_with_one_selector() {
+        for form in 0..2 {
+            for mode in 0..8u8 {
+                let w = find(|op| match *op {
+                    Op::Prmt { b: Src::Imm(_), mode: m, .. } => form == 0 && m == mode,
+                    Op::Prmt { b: Src::Cb(..), mode: m, .. } => form == 1 && m == mode,
+                    _ => false,
+                });
+                let p = program(&[w]);
+                let Op::Prmt { d, a, b, c, mode } = p.code[0].op else { unreachable!() };
+                let mut l = Lanes::<16>::new();
+                l.start(&p, 0xffff, 0);
+                for k in 0..255 {
+                    l.gpr[k] = std::array::from_fn(|i| ((k * 977 + i * 131) as u32).wrapping_mul(0x9e37_79b9));
+                }
+                let before = l.gpr.clone();
+                let mut fuel = 10;
+                run(&p, &mut l, &mut Cb, &mut fuel);
+                let value = |s: Src, i: usize| match s {
+                    Src::Reg(r) => before[r as usize][i],
+                    Src::Imm(v) => v,
+                    Src::Cb(k, o) => Host::<16>::cbuf(&Cb, k as u32, o),
+                };
+                for i in 0..16 {
+                    let want = super::tests::reference(before[a as usize][i], value(b, i), value(c, i), mode);
+                    assert_eq!(l.gpr[d as usize][i], want, "{:?} lane {i}", p.code[0].op);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn membar_decodes() {
+        assert_eq!(crate::decode::decode(8, 0xef98_0000_0007_000f).op, Op::Membar);
     }
 }
