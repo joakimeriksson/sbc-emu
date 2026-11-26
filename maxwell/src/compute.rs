@@ -176,7 +176,6 @@ impl Compute {
 /// see the warp's width (no shuffles, votes, lane ids or lane masks), and its threads do not talk
 /// through shared memory (warp-synchronous code, `s[t] += s[t + 16]` with no barrier, needs the
 /// whole warp to run each step before the next).
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn narrow(program: &Program) -> bool {
     use maxwell_shader::isa::Op;
     !shares_memory(program) && !program.any(|op| matches!(op, Op::Shfl { .. } | Op::Vote { .. } | Op::S2R { sys: 0x00 | 0x38..=0x3c, .. }))
@@ -341,16 +340,35 @@ mod tests {
 
     }
 
-    /// Memory whose split views share it, as the Tegra's do.
-    use std::sync::atomic::AtomicU8;
-    struct Ram(Vec<AtomicU8>);
-    struct View<'a>(&'a [AtomicU8]);
+    /// Memory whose split views share it, as the Tegra's do: 64-bit words, each accessed whole
+    /// (an aligned access of up to 8 bytes does not tear).
+    use std::sync::atomic::AtomicU64 as Word;
+    struct Ram(Vec<Word>);
+    struct View<'a>(&'a [Word]);
     impl Memory for View<'_> {
         fn read(&self, a: u64, out: &mut [u8]) {
-            for (k, b) in out.iter_mut().enumerate() { *b = self.0[a as usize + k].load(Ordering::Relaxed); }
+            let mut k = 0;
+            while k < out.len() {
+                let at = a as usize + k;
+                let (w, o) = (at / 8, at % 8);
+                let n = (8 - o).min(out.len() - k);
+                out[k..k + n].copy_from_slice(&self.0[w].load(Ordering::Relaxed).to_le_bytes()[o..o + n]);
+                k += n;
+            }
         }
         fn write(&mut self, a: u64, data: &[u8]) {
-            for (k, &b) in data.iter().enumerate() { self.0[a as usize + k].store(b, Ordering::Relaxed); }
+            let mut k = 0;
+            while k < data.len() {
+                let at = a as usize + k;
+                let (w, o) = (at / 8, at % 8);
+                let n = (8 - o).min(data.len() - k);
+                let _ = self.0[w].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    let mut b = v.to_le_bytes();
+                    b[o..o + n].copy_from_slice(&data[k..k + n]);
+                    Some(u64::from_le_bytes(b))
+                });
+                k += n;
+            }
         }
     }
     impl Memory for Ram {
@@ -423,7 +441,7 @@ mod tests {
             word(ST, 7, &[(0, 8, 1), (8, 8, 3), (20, 24, 0x1100), (48, 3, 4)]),                          // 13: [r3 + 0x1100] = r1
         ]);
         let mut pipe = Pipe::default();
-        let mut mem = Ram((0..0x2000).map(|_| AtomicU8::new(0)).collect());
+        let mut mem = Ram((0..0x400).map(|_| Word::new(0)).collect());
         let groups = 8;
         run_lanes::<W>(&launch(groups), &p, &mut pipe, &mut mem, 0, 0, 0);
         assert!(pipe.errors.is_empty(), "{:?}", pipe.errors);

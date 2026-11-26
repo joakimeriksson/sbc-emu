@@ -97,8 +97,10 @@ Beyond what nouveau needs:
 - The GPU: the noise-aware PLL's calibration, unit counts, the L2's compression parameters, the
   FECS arbiter, the PMU's data ports; host1x sync point increments and waits from the push
   buffers; semaphore reductions; a channel bound again to the same instance block keeps its state
-  (nvgpu after power gating); channels of one graphics context share its 3D/compute state
-  (CUDA's streams).
+  if it has taken work and GP_GET is where the host left it (nvgpu after power gating); channels
+  of one graphics context share its 3D/compute state (CUDA's streams), and a context whose last
+  bound channel is unbound starts fresh for the next channel that enters it, unless one of its
+  own channels is bound again first.
 - The shader core: LEA, VADD, P2R, R2P and FCHK, which NVIDIA's compiler uses; compute
   workgroups in 32-lane warps, on several host threads.
 - The CPU: an event register (`SEVL; WFE` falls through), which L4T's 4.9 kernel's locks need.

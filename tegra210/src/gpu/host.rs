@@ -2,7 +2,7 @@
 //! at segments of methods; the host executes its own methods (semaphores, interrupts, references)
 //! and passes the others to the engine object on their subchannel.
 use super::mmu::{self, View};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Done {
@@ -66,12 +66,15 @@ pub struct Host {
     engines: HashMap<(u64, u64), maxwell::Engine>,
     /// the context each channel last ran with
     contexts: HashMap<u32, (u64, u64)>,
+    /// contexts no bound channel named when the last one naming them was unbound: a closed
+    /// process's, or one whose channels power gating unbound (bound again, they keep it)
+    orphans: HashSet<(u64, u64)>,
     trace: bool,
 }
 
 impl Default for Host {
     fn default() -> Self {
-        Self { channels: HashMap::new(), engines: HashMap::new(), contexts: HashMap::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
+        Self { channels: HashMap::new(), engines: HashMap::new(), contexts: HashMap::new(), orphans: HashSet::new(), trace: std::env::var_os("SBC_TRACE_GPFIFO").is_some() }
     }
 }
 
@@ -89,6 +92,18 @@ impl Host {
         if let Some(context) = self.contexts.remove(&id) {
             if !self.contexts.values().any(|&c| c == context) {
                 self.engines.remove(&context);
+                self.orphans.remove(&context);
+            }
+        }
+    }
+
+    /// Channel `id` was unbound; its instance block names `named`. A context that no bound
+    /// channel names any more (`live`) is left behind: the next channel to enter it starts it
+    /// fresh, unless one of its own channels is bound again first (`rebound`).
+    pub fn unbind(&mut self, id: u32, named: (u64, u64), live: impl Fn((u64, u64)) -> bool) {
+        for context in [Some(named), self.contexts.get(&id).copied()].into_iter().flatten() {
+            if !live(context) {
+                self.orphans.insert(context);
             }
         }
     }
@@ -106,34 +121,35 @@ impl Host {
         }
         if !same {
             self.forget(id);
+        } else if let Some(context) = self.contexts.get(&id) {
+            // (power gating: the process is still there)
+            self.orphans.remove(context);
         }
     }
 
     /// Channel `id` runs with `context`: which channels name which context, and which contexts
-    /// are left behind. `live`: whether a bound channel other than `id` names a context.
-    fn enter(&mut self, id: u32, context: (u64, u64), live: impl FnOnce((u64, u64)) -> bool) {
+    /// are left behind.
+    fn enter(&mut self, id: u32, context: (u64, u64)) {
         let previous = self.contexts.insert(id, context);
         if let Some(old) = previous.filter(|&o| o != context) {
             if !self.contexts.values().any(|&c| c == old) {
                 self.engines.remove(&old);
             }
         }
-        // A new channel whose context no other bound channel names: what is left of it is a
-        // closed process's, whose address space and context address the new one happens to have
-        // again. The context starts fresh. (A live process's channels are bound, whether they
-        // have run or not; power gating binds them again before anything runs.)
-        if previous.is_none() && self.engines.contains_key(&context) && !live(context) {
+        // A context left behind (`unbind`) that a channel enters: what is left of it is a closed
+        // process's, whose address space and context address a new one happens to have again. It
+        // starts fresh. (Whenever the channel comes to it: a new channel often runs once before
+        // its context is written to its instance block.)
+        if !self.orphans.is_empty() && self.orphans.remove(&context) {
             self.contexts.retain(|&k, &mut c| k == id || c != context);
             self.engines.remove(&context);
         }
     }
 
     /// `points`: host1x's sync point values (the channels' increments are applied to them too).
-    /// `bound`: the bound channels, (number, instance block).
-    pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64, points: &mut [u32], bound: &[(u32, u64)]) -> Done {
+    pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64, points: &mut [u32]) -> Done {
         let context = context(id, inst, view.space.directory, view.smmu, view.ram);
-        let (smmu, ram) = (view.smmu, &*view.ram);
-        self.enter(id, context, |c| bound.iter().any(|&(k, inst)| k != id && context_of(k, inst, smmu, ram) == c));
+        self.enter(id, context);
         let shared = self.engines.entry(context).or_default();
         let s = self.channels.entry(id).or_default();
         std::mem::swap(&mut s.engine, shared);
@@ -228,7 +244,7 @@ fn context(id: u32, inst: u64, directory: u64, smmu: &crate::smmu::Smmu, ram: &[
 }
 
 /// The same, for a channel whose address space is not at hand.
-fn context_of(id: u32, inst: u64, smmu: &crate::smmu::Smmu, ram: &[u8]) -> (u64, u64) {
+pub fn context_of(id: u32, inst: u64, smmu: &crate::smmu::Smmu, ram: &[u8]) -> (u64, u64) {
     context(id, inst, mmu::space(inst, smmu, ram).directory, smmu, ram)
 }
 
@@ -384,27 +400,57 @@ mod tests {
         let mut h = Host::default();
         let k = (0x1000, 0x20_0000);
         // two streams of one context; the second one shares the first's engine
-        h.enter(1, k, |_| false);
+        h.enter(1, k);
         h.engines.entry(k).or_default();
-        h.enter(2, k, |c| c == k);
+        h.enter(2, k);
         assert!(h.engines.contains_key(&k));
-        // another stream, while a stream that has not run yet is bound: it shares the context
-        h.enter(9, k, |c| c == k);
+        // stream 2 is closed while 1 is bound; another stream shares the context
+        h.unbind(2, k, |c| c == k);
+        h.enter(9, k);
         assert!(h.engines.contains_key(&k));
         h.forget(9);
         assert!(h.engines.contains_key(&k));
-        // the process is closed: no bound channel names the context. A new process's channel
-        // with the same address space and context address starts fresh
-        h.enter(3, k, |_| false);
+        // the process is closed: its last bound channel is unbound. A new process's channel with
+        // the same address space and context address, which runs once before its context is in
+        // its instance block, starts it fresh
+        h.unbind(1, k, |_| false);
+        h.enter(3, (u64::MAX, 3));
+        assert!(h.engines.contains_key(&k));
+        h.enter(3, k);
         assert!(!h.engines.contains_key(&k));
         assert_eq!(h.contexts.keys().copied().collect::<Vec<_>>(), [3]);
-        // a channel that ran before keeps its context, whatever else is bound
+        // and then keeps it
         h.engines.entry(k).or_default();
-        h.enter(3, k, |_| false);
+        h.enter(3, k);
+        h.enter(4, k);
         assert!(h.engines.contains_key(&k));
         // forgetting the last channel of a context drops it
         h.forget(3);
-        assert!(!h.engines.contains_key(&k) && h.contexts.is_empty());
+        h.forget(4);
+        assert!(!h.engines.contains_key(&k) && h.contexts.is_empty() && h.orphans.is_empty());
+    }
+
+    #[test]
+    fn power_gating_keeps_contexts() {
+        let mut h = Host::default();
+        let smmu = crate::smmu::Smmu::default();
+        let mut ram = vec![0u8; 0x1000];
+        let userd = crate::RAM_BASE + 0x200;
+        let k = (0x1000, 0x20_0000);
+        // channel 1 took entries; channel 2, of the same context, none
+        h.enter(1, k);
+        h.engines.entry(k).or_default();
+        h.channels.entry(1).or_default().gp_get = Some((userd, 3));
+        mmu::write32(userd + 0x88, 3, &smmu, &mut ram);
+        h.enter(2, k);
+        // both unbound, then bound again to their blocks before anything runs
+        h.unbind(1, k, |_| true);
+        h.unbind(2, k, |_| false);
+        h.rebound(2, &smmu, &ram);
+        h.rebound(1, &smmu, &ram);
+        h.enter(2, k);
+        h.enter(1, k);
+        assert!(h.engines.contains_key(&k) && h.orphans.is_empty());
     }
 
     #[test]
@@ -432,7 +478,7 @@ mod tests {
         let userd = crate::RAM_BASE + 0x200;
         let k = (0x1000, 0x20_0000);
         // channel 1 took entries up to GP_GET 3; bound again with GP_GET still 3: the same
-        h.enter(1, k, |_| false);
+        h.enter(1, k);
         h.engines.entry(k).or_default();
         h.channels.entry(1).or_default().gp_get = Some((userd, 3));
         mmu::write32(userd + 0x88, 3, &smmu, &mut ram);
@@ -444,7 +490,7 @@ mod tests {
         assert!(!h.channels.contains_key(&1) && !h.engines.contains_key(&k));
         // a channel that took no entries has nothing of its own: a new process's channel with
         // its number and block does not take its place in the context
-        h.enter(2, k, |_| false);
+        h.enter(2, k);
         h.engines.entry(k).or_default();
         h.channels.entry(2).or_default();
         h.rebound(2, &smmu, &ram);

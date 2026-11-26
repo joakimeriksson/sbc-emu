@@ -299,7 +299,17 @@ impl Gpu {
                 self.regs.insert(o, v);
             }
             0x80_0000..=0x80_0fff => {
-                let c = &mut self.channels[(o as usize >> 3) & 0x1ff];
+                let id = (o as u32 >> 3) & 0x1ff;
+                if o & 4 == 0 && v >> 31 == 0 && self.channels[id as usize].inst >> 31 != 0 {
+                    // unbound: is its context still named by a bound channel?
+                    let block = |inst: u32| ((inst & 0x0fff_ffff) as u64) << 12;
+                    let (channels, ram) = (&self.channels, &*ram);
+                    let named = host::context_of(id, block(channels[id as usize].inst), smmu, ram);
+                    self.host.unbind(id, named, |c| {
+                        channels.iter().enumerate().any(|(k, ch)| k as u32 != id && ch.inst >> 31 != 0 && host::context_of(k as u32, block(ch.inst), smmu, ram) == c)
+                    });
+                }
+                let c = &mut self.channels[id as usize];
                 if o & 4 == 0 {
                     // a channel bound to another instance block is a new one; unbinding, and binding
                     // the same block again (nvgpu does it when the GPU comes back from power gating),
@@ -309,7 +319,6 @@ impl Gpu {
                         eprintln!("[chan] {} inst {:#x} -> {v:#x}", (o >> 3) & 0x1ff, c.inst);
                     }
                     if v >> 31 != 0 {
-                        let id = (o as u32 >> 3) & 0x1ff;
                         if (c.bound ^ v) & 0x0fff_ffff != 0 {
                             self.host.forget(id);
                         } else {
@@ -429,8 +438,6 @@ impl Gpu {
     fn run_once(&mut self, smmu: &Smmu, ram: &mut [u8]) -> (bool, bool) {
         let (mut waiting, mut progress) = (false, false);
         let now = self.time();
-        // (which channels are bound: a context a bound channel names is a live process's)
-        let bound: Vec<(u32, u64)> = self.channels.iter().enumerate().filter(|(_, c)| c.inst >> 31 != 0).map(|(k, c)| (k as u32, ((c.inst & 0x0fff_ffff) as u64) << 12)).collect();
         for k in 0..self.runlist.len() {
             let id = self.runlist[k];
             let Some(c) = self.channels.get(id as usize).copied() else { continue };
@@ -438,7 +445,7 @@ impl Gpu {
                 let inst = ((c.inst & 0x0fff_ffff) as u64) << 12;
                 let space = mmu::space(inst, smmu, ram);
                 let mut view = mmu::View { ram, smmu, mmu: &self.mmu, space, fault: Default::default() };
-                let done = self.host.run_channel(id, inst, &mut view, now, &mut self.points, &bound);
+                let done = self.host.run_channel(id, inst, &mut view, now, &mut self.points);
                 if let Some((va, write)) = view.fault.get() {
                     if std::env::var_os("SBC_SHADER_FAULT").is_some() {
                         eprintln!("[gpu] channel {id}: unmapped {} at {va:#x}", if write { "write" } else { "read" });
