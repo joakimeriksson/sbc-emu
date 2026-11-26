@@ -4,7 +4,7 @@ set -eu
 out=${1:-cache/jetson-orin-nano/copy-demo.Image}
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 rustc_path=$(rustup which rustc)
 rustlib=$("$rustc_path" --print sysroot)/lib
 lld="$rustlib/rustlib/$("$rustc_path" -vV | sed -n 's/^host: //p')/bin/rust-lld"

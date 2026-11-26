@@ -410,7 +410,7 @@ pub fn runs() -> u64 {
 /// Programs compiled, by their code: the GPU decodes its programs again after each submission
 /// (memory may have changed), and the same code must not be compiled (and given a table slot)
 /// again each time.
-type Key = (u32, Vec<(u32, u64)>);
+type Key = (u32, Vec<(u32, u64)>, Vec<(u32, u64)>);
 static CACHE: std::sync::Mutex<Option<std::collections::HashMap<Key, Option<std::sync::Arc<Code>>>>> = std::sync::Mutex::new(None);
 /// Programs kept; past that the cache starts again (the page frees the slots of what was
 /// dropped when the CPU's JIT next starts over).
@@ -418,7 +418,9 @@ const CACHE_MAX: usize = 4096;
 
 /// The code of a program: from the cache, or compiled.
 pub fn code_for(p: &Program) -> Option<std::sync::Arc<Code>> {
-    let key = (p.entry, p.words.clone());
+    // the whole of each word: SM70 instructions differing only in their upper half (a
+    // register, a compare, a LOP3 table) must not share code
+    let key = (p.entry, p.words.clone(), p.high.clone());
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let map = cache.get_or_insert_with(Default::default);
     if let Some(c) = map.get(&key) {

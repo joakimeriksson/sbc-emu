@@ -8,7 +8,7 @@ test -s "$fixture/Image"
 test -s "$fixture/probe-initramfs.cpio.gz"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 rustc_path=$(rustup which rustc)
 rustlib=$("$rustc_path" --print sysroot)/lib
 lld="$rustlib/rustlib/$("$rustc_path" -vV | sed -n 's/^host: //p')/bin/rust-lld"
@@ -41,9 +41,9 @@ fi
         cat "$work/boot.log"
         exit 1
     }
-if ! rg '^NVGPU_IOCTL_ STATUS=0[[:space:]]*$' "$work/boot.log" ||
-   ! rg '^\s*[0-9]+:(\s+[0-9]+)*\s+[1-9][0-9]*(\s+[0-9]+)*\s+GICv3 48[0-7] Level\s+host1x_syncpt' "$work/boot.log" ||
-   ! rg 'GPU: 4 completed GPFIFO entries' "$work/boot.log"; then
+if ! grep -Eq '^NVGPU_IOCTL_ STATUS=0[[:space:]]*$' "$work/boot.log" ||
+   ! grep -Eq '^[[:space:]]*[0-9]+:([[:space:]]+[0-9]+)*[[:space:]]+[1-9][0-9]*([[:space:]]+[0-9]+)*[[:space:]]+GICv3 48[0-7] Level[[:space:]]+host1x_syncpt' "$work/boot.log" ||
+   ! grep -Eq 'GPU: 4 completed GPFIFO entries' "$work/boot.log"; then
     tail -40 "$work/boot.log"
     exit 1
 fi

@@ -45,18 +45,21 @@ impl<'a> View<'a> {
         let dual = table + (address >> 21 & 255) * 16;
         let big = self.pte(dual)?;
         let small = self.pte(dual + 8)?;
-        let (table, shift) = match (small & 6, big & 6) {
-            (4 | 6, 0) => ((small << 4) & 0xff_ffff_f000, 12),
-            (0, 4 | 6) => ((big << 4) & 0xff_ffff_ff00, 16),
-            _ => return None,
-        };
-        let index_mask = (1 << (21 - shift)) - 1;
-        let entry = self.pte(table + (address >> shift & index_mask) * 8)?;
-        if entry & 1 == 0 || entry & 6 < 4 || (write && entry & 0x40 != 0) {
-            return None;
-        }
-        let page_mask = (1 << shift) - 1;
-        Some(((entry << 4) & 0xff_ffff_f000 & !page_mask) | (address & page_mask))
+        // nvgpu can map 4 KiB and 64 KiB pages in one 2 MiB region: the small page first
+        let mut tables = [(small, 0xff_ffff_f000, 12), (big, 0xff_ffff_ff00, 16)].into_iter();
+        tables.find_map(|(pde, table_mask, shift)| {
+            if pde & 6 < 4 {
+                return None;
+            }
+            let table = (pde << 4) & table_mask;
+            let index_mask = (1 << (21 - shift)) - 1;
+            let entry = self.pte(table + (address >> shift & index_mask) * 8)?;
+            if entry & 1 == 0 || entry & 6 < 4 || (write && entry & 0x40 != 0) {
+                return None;
+            }
+            let page_mask = (1 << shift) - 1;
+            Some(((entry << 4) & 0xff_ffff_f000 & !page_mask) | (address & page_mask))
+        })
     }
 
     pub fn load(&self, address: u64) -> Option<u32> {

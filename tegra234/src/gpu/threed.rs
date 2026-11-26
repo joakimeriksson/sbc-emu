@@ -96,6 +96,10 @@ impl ThreeD {
             }
             0x560 => {
                 let source = self.mme_address();
+                // (no more than the MME's data RAM: one MMIO write cannot ask for gigabytes)
+                if value as usize > mme::DATA_WORDS {
+                    return None;
+                }
                 self.mme_fifo = (0..u64::from(value))
                     .map(|word| memory.load(source + word * 4))
                     .collect::<Option<_>>()?;

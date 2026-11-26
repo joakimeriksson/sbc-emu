@@ -141,8 +141,9 @@ python3 demos/orin-copy/rfb-smoke.py --output cache/jetson-orin-nano/copy-demo-v
 The smoke client handshakes with the same VNC server over `--vnc stdio`,
 decodes full and incremental RFB updates, and checks that the rover and its
 headlamp moved. The first copy runlist is provisionally placed at BAR0 offset `0x800000`
-for bare-metal bring-up. The copy model covers pitch-linear 4 KiB mappings,
-multiline blits and one-word semaphore writes. The demo uses a simple
+for bare-metal bring-up. The copy model covers pitch-linear and block-linear
+surfaces on 4 KiB and 64 KiB pages, multiline blits, component remapping and
+constant fills, and one- and four-word semaphore writes. The demo uses a simple
 framebuffer for scanout.
 
 To run the same image in the site worker, build the demo and stage a local
@@ -201,8 +202,9 @@ engine registration and initial domain creation. FECS also acknowledges the
 driver's initial context bind and save requests. These are firmware protocol
 models. The Tegra234 Host1x model supports CPU and GPU syncpoint increments
 and threshold interrupts. The Ampere Compute B model dispatches QMD 3.0
-workgroups with per-thread registers and predicates, global loads and stores,
-QMD-bound constant loads, and bounded scalar branches. The C797 clear path shares color and
+workgroups on the shared Maxwell shader interpreter (`maxwell-shader`) with its SM70
+decoder: 32-lane warps, shared memory and barriers, global, local and atomic memory,
+and QMD-bound constant buffers. The C797 clear path shares color and
 depth/stencil formats and surface layout code with the Tegra210 renderer.
 [NVIDIA Ampere 3D class](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clc797.h)
 
@@ -246,7 +248,8 @@ instructions. Other paths the stock stack needs:
   pitch and block-linear surfaces, component remapping and constant fills;
 - method packets that continue in the next GPFIFO entry;
 - host `SET_REFERENCE`, legacy `SEMAPHORE_A`–`D`, and `SEM_EXECUTE` with 64-bit
-  payloads, timestamps, acquire modes and reductions;
+  payloads, timestamps, acquire modes and reductions (an entry blocked on an acquire
+  resumes at that word on the channel's next doorbell);
 - the USERD push-buffer `GET` pointers, `NOTIFY`, `REPORT_SEMAPHORE_EXECUTE`,
   and the legacy 3D `SET_REPORT_SEMAPHORE_A`–`D`. GL fences poll the last of these,
   so without it the process spins at exit.
@@ -262,8 +265,21 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 | Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
 | Compute | The Linux fixture checks a known-answer Ampere shader. JetPack CUDA creates a context, transfers data and launches a JIT-compiled SM87 kernel. Broader shader and CUDA workload coverage remains pending. |
-| Graphics | The stock driver submits clipped, masked and layered C797 color clears and masked block-linear depth/stencil clears. NVIDIA's stock EGL and OpenGL ES stack creates a context, clears a pbuffer and reads it back, with its MME macros executed. Draw calls (Ampere vertex and fragment shaders) and the existing GLES 2, 3 and 3.2 scenes remain pending. |
+| Graphics | The stock driver submits clipped, masked and layered C797 color clears and masked block-linear depth/stencil clears. NVIDIA's stock EGL and OpenGL ES stack creates a context, clears a pbuffer and reads it back, with its MME macros executed. Draw calls run Ampere vertex and fragment shaders: the GLES 2 suite passes 23 of 25 scenes and the GLES 3 suite 31 of 49 (`tests/gpu/run-orin-gl.sh gles2test gltest`); the GLES 3.2 suite hangs after `compute_ssbo`. |
 | Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests and the full CUDA fixture also pass in the WebAssembly build. |
+
+### Known not to work
+
+- A channel blocked on a semaphore acquire is retried only when that channel is rung
+  again, so waits on another channel, the CPU or Host1x can hang
+  (`cuStreamWaitEvent`, GL waiting on the copy engine).
+- GPU page faults raise no fault interrupt: the GPFIFO entry stops at the faulting method.
+- The SM70 decoder models convergence barriers (BSSY/BSYNC) with the Maxwell SSY/SYNC
+  stack: BREAK out of nested regions, divergent `BRA.DIV`/`BRA.CONV`, and warp-level
+  reconvergence before SHFL or VOTE are approximations.
+- Uniform registers and the decoder's scratch registers share R190..R254 with the
+  vector registers, so kernels using more than 190 registers are wrong.
+- The GLES 3.2 suite hangs after `compute_ssbo`; GLES 2 and 3 have known differing scenes.
 
 Keep GA10B register, firmware, runlist and shader decoding in the corresponding
 Orin or Ampere modules. Reuse the Maxwell renderer and texture code where the

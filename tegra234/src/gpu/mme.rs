@@ -321,7 +321,7 @@ impl State {
             23 => {
                 self.loop_count = x.max(1) - 1;
                 self.loop_start = self.ip;
-                self.loop_end = self.ip + usize::from(imm) - 1;
+                self.loop_end = (self.ip + usize::from(imm)).saturating_sub(1);
                 0
             }
             24 => {

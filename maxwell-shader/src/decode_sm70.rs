@@ -346,6 +346,9 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         // R2P PR, R.Bn, mask: predicates from the bits of a register's byte n (bits 76..78).
         0x804 => {
             let (a, mask, byte) = (w.reg(24), w.f(32, 7), w.f(76, 2));
+            if mask == 0 {
+                return one(Op::Nop);
+            }
             return Some(
                 (0..7)
                     .filter(|i| mask >> i & 1 != 0)
@@ -871,6 +874,38 @@ mod tests {
             Some(if a % 16 == 0 { lo } else { hi })
         })
         .unwrap()
+    }
+
+    #[test]
+    fn code_after_a_bsync_is_decoded() {
+        // BSSY B0, 0x20; MOV R0, 7; BSYNC B0; IADD3 R0, R0, 0x100, RZ; EXIT
+        let p = program(&[
+            (0x0000001000007945, 0x000fe20000000000),
+            (0x0000000700007802, 0x000fe20000000f00),
+            (0x0000000000007941, 0x000fea0003800000),
+            (0x0000010000007810, 0x000fe20007ffe0ff),
+            (0x000000000000794d, 0x000fea0003800000),
+        ]);
+        let ops: Vec<Op> = p.insts().iter().map(|i| i.op).collect();
+        assert!(matches!(ops[0], Op::Ssy { t: 3 }), "{ops:?}");
+        assert!(matches!(ops[3], Op::IAdd3 { d: 0, a: 0, b: Src::Imm(0x100), .. }), "{ops:?}");
+        assert!(matches!(ops[4], Op::Exit { .. }), "{ops:?}");
+    }
+
+    #[test]
+    fn an_r2p_without_a_mask_is_a_nop() {
+        let p = program(&[(0x0000000000007804 | 157 << 24, 0x000fe20000000000), (0x000000000000794d, 0x000fea0003800000)]);
+        assert_eq!(p.insts()[0].op, Op::Nop);
+    }
+
+    #[test]
+    fn programs_differing_in_upper_halves_differ() {
+        // FFMA R0, R1, R2, R3 against FFMA R0, R1, R2, R5: only the upper half differs
+        let exit = (0x000000000000794d, 0x000fea0003800000);
+        let a = program(&[(0x0000000201007223, 0x000fe20000000003), exit]);
+        let b = [(0x0000000201007223u64, 0x000fe20000000005u64), exit];
+        let mut fetch = |x: u32| b.get(x as usize / 16).map(|&(lo, hi)| if x % 16 == 0 { lo } else { hi });
+        assert!(!a.matches(&mut fetch));
     }
 
     #[test]

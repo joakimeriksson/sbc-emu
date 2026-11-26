@@ -8,7 +8,7 @@ fixture=cache/jetson-r3644
 file=$1
 offset=$(($(printf '%d' "${2:-0}")))
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 mkdir -p "$work/root"
 # Keep whole instructions up to the closing self-branch (or the last non-zero one).
 python3 - "$file" "$offset" "$work/root/shader.bin" <<'PY'

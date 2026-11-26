@@ -7,7 +7,7 @@ emulator=${SBC_EMU:-target/release/sbc-emu}
 test -s "$fixture/Image"
 test -s "$fixture/probe-initramfs.cpio.gz"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 mkdir -p "$work/root/modules" "$work/root/lib" "$work/packages" "$fixture/userspace-debs"
 
 version=36.4.4-20250616085344
@@ -96,9 +96,18 @@ fi
         tail -80 "$work/boot.log"
         exit 1
     }
-rg '^cuInit=0[[:space:]]*$|^CUDA (device: Orin|compute capability: 8\.7)[[:space:]]*$|^cu(CtxCreate=0|MemAlloc=0|MemcpyHtoD=0|MemcpyDtoH=0 data=0xfeedcafe|LaunchKernel=0|CtxSynchronize=0)[[:space:]]*$|^CUDA kernel output=0x24681357 status=0[[:space:]]*$' "$work/boot.log"
 cp "$work/boot.log" "$fixture/cuda-boot.log"
-rg '^CUDA_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
+# every line must be there (one alternation would pass on any single one)
+for want in 'cuInit=0' 'CUDA device: Orin' 'CUDA compute capability: 8\.7' 'cuCtxCreate=0' 'cuMemAlloc=0' \
+    'cuMemcpyHtoD=0' 'cuMemcpyDtoH=0 data=0xfeedcafe' 'cuLaunchKernel=0' 'cuCtxSynchronize=0' \
+    'CUDA kernel output=0x24681357 status=0'; do
+    grep -Eq "^$want[[:space:]]*\$" "$work/boot.log" || {
+        echo "missing: $want"
+        tail -50 "$work/boot.log"
+        exit 1
+    }
+done
+grep -E '^CUDA_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
     tail -50 "$work/boot.log"
     exit 1
 }

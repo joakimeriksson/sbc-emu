@@ -8,7 +8,7 @@ emulator=${SBC_EMU:-target/release/sbc-emu}
 test -s "$fixture/Image"
 test -s "$fixture/probe-initramfs.cpio.gz"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 mkdir -p "$work/root/modules" "$work/root/lib" "$work/packages" "$fixture/userspace-debs"
 
 version=36.4.4-20250616085344

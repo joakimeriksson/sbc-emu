@@ -13,7 +13,7 @@ emulator=${SBC_EMU:-target/release/sbc-emu}
 suites=${*:-gles2test gltest gles32test}
 test -s "$fixture/egl-initramfs.cpio.gz" || sh tests/gpu/run-orin-egl.sh > /dev/null
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 debs="$fixture/userspace-debs"
 mkdir -p "$debs" "$work/root/lib" "$work/sysroot" "$work/mesa"
 

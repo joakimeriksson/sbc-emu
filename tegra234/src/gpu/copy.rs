@@ -82,11 +82,9 @@ impl Copy {
             (1, 1, 1)
         };
         let (source_element, destination_element) = (size * from, size * to);
-        if length
-            .checked_mul(lines)?
-            .checked_mul(source_element.max(destination_element))?
-            > MAX_BYTES
-        {
+        // (a line on its own too: with no lines the product is 0, but a line is still allocated)
+        let line_bytes = length.checked_mul(source_element.max(destination_element))?;
+        if line_bytes > MAX_BYTES || line_bytes.checked_mul(lines.max(1))? > MAX_BYTES {
             return None;
         }
         // Origins: the packed SET_*_ORIGIN of older classes plus the 32-bit *_ORIGIN_X/Y.

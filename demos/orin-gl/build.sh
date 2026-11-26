@@ -14,7 +14,7 @@ for name in libc6 libc6-dev linux-libc-dev; do
     test -s "$debs/$name.deb" || { echo "run tests/gpu/run-orin-gl.sh first (it fetches $name)"; exit 1; }
 done
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "${work:?}"' EXIT
 mkdir -p "$work/sysroot" "$work/root"
 for name in libc6 libc6-dev linux-libc-dev; do
     data=$(bsdtar -tf "$debs/$name.deb" | sed -n '/^data\.tar/p')
