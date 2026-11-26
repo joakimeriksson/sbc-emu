@@ -433,6 +433,10 @@ pub enum Op {
     /// `shift`: 0 plain, 1 (a + b) >> 16, 2 (a + b) << 16; `half`: 0 word, 1 H0, 2 H1 per source.
     IAdd3 { d: Reg, a: Reg, b: Src, c: Reg, neg: [bool; 3], half: [u8; 3], shift: u8, x: bool, cc: bool },
     IScAdd { d: Reg, a: Reg, b: Src, shift: u8, neg_a: bool, neg_b: bool, cc: bool },
+    /// SM70's IADD3 with its carries in predicates: d = a + b + c + cin[0] + cin[1]. cout[0] gets
+    /// the carry of a + b + cin[0], cout[1] that of adding c + cin[1] (7 or 15: none). A negated
+    /// operand is -x, or ~x in the .X form (`x`), the high word of a 64-bit add.
+    IAdd3P { d: Reg, a: Reg, b: Src, c: Src, neg: [bool; 3], x: bool, cin: [Pred; 2], cout: [u8; 2] },
     /// LEA: d = (a << shift) + b; LEA.HI (`hi`: the high word's register c): d = the high word of
     /// (c:a << shift) + b. X adds the carry; the carry out goes to CC (with `cc`) and to `pd`.
     Lea { d: Reg, a: Reg, b: Src, hi: Option<Reg>, shift: u8, neg_a: bool, x: bool, cc: bool, pd: u8 },

@@ -367,6 +367,21 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
             neg(r(a), neg_a),
             neg(b, neg_b)
         ),
+        Op::IAdd3P { d, a, b, c, neg: n, x: e, cin, cout } => format!(
+            "iadd3{} {} {} {}, {}{}, {}{}, {}{} {} {}",
+            dot(e, ".x"),
+            R(d),
+            Pred { idx: cout[0], not: false },
+            Pred { idx: cout[1], not: false },
+            if n[0] { "-" } else { "" },
+            R(a),
+            if n[1] { "-" } else { "" },
+            i(b),
+            if n[2] { "-" } else { "" },
+            i(c),
+            cin[0],
+            cin[1]
+        ),
         Op::IAdd3 { d, a, b, c, neg: n, half, shift, x: e, cc: f } => format!(
             "iadd3{}{} {} {} {} {} half {half:?} shift {shift}",
             dot(e, ".x"),

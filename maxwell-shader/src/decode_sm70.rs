@@ -432,6 +432,9 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
     let s = alu(w)?;
     let d = if uniform { w.ureg(16) } else { w.reg(16) };
     let ftz = w.b(80);
+    // carries live in predicates (uniform ones for uniform operations)
+    let (pdst, pred): (fn(W, u32) -> u8, fn(W, u32, u32) -> Pred) = if uniform { (W::updst, W::upred) } else { (W::pdst, W::pred) };
+    let no_carry = Pred { idx: 7, not: true };
     // IMAD.WIDE: d:d+1 = a * b + c:c+1, the product 64 bits (CUDA's address arithmetic). The low
     // word goes to SCRATCH with its carry, the high word adds it, then the low word moves to d (so
     // that d may be a or b).
@@ -502,16 +505,31 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             }
             Op::Mufu { d, a, m: s.bm, op, sat: false }
         }
-        // IADD3 (.X adds the carry); the carry and overflow predicates become the carry flag.
+        // IADD3: carries out to two predicates (81, 84); .X (74) adds two carry predicates (87, 77)
         (0x010, _) => {
             let x = w.b(74);
-            let carry_out = w.pdst(81) != 7;
-            let (mut b, mut c, mut nb, mut nc) = (s.b, s.c, s.bm.neg, s.cm.neg);
-            if reg_of(c).is_none() {
-                std::mem::swap(&mut b, &mut c);
-                std::mem::swap(&mut nb, &mut nc);
+            let cout = [pdst(w, 81), pdst(w, 84)];
+            if !x && cout.iter().all(|p| p & 7 == 7) {
+                // no carries: the plain add, which the JIT compiles
+                let (mut b, mut c, mut nb, mut nc) = (s.b, s.c, s.bm.neg, s.cm.neg);
+                if reg_of(c).is_none() {
+                    std::mem::swap(&mut b, &mut c);
+                    std::mem::swap(&mut nb, &mut nc);
+                }
+                if let Some(c) = reg_of(c) {
+                    return one(Op::IAdd3 { d, a: s.a, b, c, neg: [s.am.neg, nb, nc], half: [0; 3], shift: 0, x: false, cc: false });
+                }
             }
-            Op::IAdd3 { d, a: s.a, b, c: reg_of(c)?, neg: [s.am.neg, nb, nc], half: [0; 3], shift: 0, x, cc: carry_out }
+            let cin = if x { [pred(w, 87, 90), pred(w, 77, 80)] } else { [no_carry; 2] };
+            Op::IAdd3P { d, a: s.a, b: s.b, c: s.c, neg: [s.am.neg, s.bm.neg, s.cm.neg], x, cin, cout }
+        }
+        // IMAD.X: a * b + c + the carry predicate (87)
+        (0x024, _) if w.b(74) => {
+            let signed = w.b(73);
+            return Some(vec![
+                Op::IMad { d: SCRATCH, a: s.a, b: s.b, c: Src::Reg(RZ), sa: signed, sb: signed, hi: false, neg_ab: false, neg_c: false, sat: false, x: false, cc: false },
+                Op::IAdd3P { d, a: SCRATCH, b: s.c, c: Src::Reg(RZ), neg: [false, s.cm.neg, false], x: true, cin: [pred(w, 87, 90), no_carry], cout: [pdst(w, 81), 7] },
+            ]);
         }
         (0x024, _) => {
             let signed = w.b(73);
@@ -563,8 +581,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         // LEA.HI: b + the high word of (c:a) << shift
         // LEA.HI: b + the high word of (c:a) << shift; .X adds the carry of the LEA before it.
         (0x011, _) if w.b(80) => {
-            if w.b(72) || w.pdst(81) != 7 {
-                return None; // a negated intermediate, a carry out
+            if w.b(72) {
+                return None; // a negated intermediate
             }
             let shift = w.f(75, 5);
             let mut ops = Vec::new();
@@ -576,15 +594,29 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
                 reg_of(s.c)?
             };
             ops.push(Op::Shf { d: SCRATCH, lo: s.a, hi, b: Src::Imm(shift), right: false, high: true, wrap: false, wide: true, signed: false, cc: false });
-            ops.push(Op::IAdd3 { d, a: SCRATCH, b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: w.b(74), cc: false });
+            let x = w.b(74);
+            if !x && pdst(w, 81) & 7 == 7 {
+                ops.push(Op::IAdd3 { d, a: SCRATCH, b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: false, cc: false });
+                return Some(ops);
+            }
+            let cin = [if x { pred(w, 87, 90) } else { no_carry }, no_carry];
+            ops.push(Op::IAdd3P { d, a: SCRATCH, b: s.b, c: Src::Reg(RZ), neg: [false; 3], x, cin, cout: [pdst(w, 81), 7] });
             return Some(ops);
         }
-        // LEA: (a << shift) + b; a carry out (bits 81..84) goes to the carry flag for a LEA.HI.X.
+        // LEA: (a << shift) + b, its carry out to a predicate (81) for a LEA.HI.X
         (0x011, _) => {
             if w.b(74) {
                 return None; // LEA.X
             }
-            Op::IScAdd { d, a: s.a, b: s.b, shift: w.f(75, 5) as u8, neg_a: w.b(72), neg_b: false, cc: w.pdst(81) != 7 }
+            let (shift, cout) = (w.f(75, 5) as u8, pdst(w, 81));
+            if cout & 7 == 7 {
+                Op::IScAdd { d, a: s.a, b: s.b, shift, neg_a: w.b(72), neg_b: false, cc: false }
+            } else {
+                return Some(vec![
+                    Op::IScAdd { d: SCRATCH, a: s.a, b: Src::Reg(RZ), shift, neg_a: false, neg_b: false, cc: false },
+                    Op::IAdd3P { d, a: SCRATCH, b: s.b, c: Src::Reg(RZ), neg: [w.b(72), false, false], x: false, cin: [no_carry; 2], cout: [cout, 7] },
+                ]);
+            }
         }
         // P2R d, PR, a, mask: the predicates where the mask has bits into byte n (bits 76..78) of a
         (0x003, false) => Op::P2r { d, a: s.a, b: s.b, cc: false, byte: w.f(76, 2) as u8 },
@@ -1070,9 +1102,12 @@ mod tests {
         assert_eq!(c, Pred { idx: 8, not: false });
         // P2R R157, PR, RZ, 0xf
         assert_eq!(ops(0x000fe40000000000_0000000fff9d7803), vec![Op::P2r { d: 157, a: RZ, b: Src::Imm(0xf), cc: false, byte: 0 }]);
-        // LEA.HI.X.SX32 R18, R17, R0, 0x1, P4 (adds the carry flag)
+        // LEA.HI.X.SX32 R18, R17, R0, 0x1, P4 (adds the carry predicate)
         let v = ops(0x080fe400020f0eff_0000000011127211);
-        assert!(matches!(v[..], [Op::Shf { d: SCRATCH, lo: RZ, hi: 17, signed: true, .. }, Op::Shf { d: SCRATCH, lo: 17, hi: SCRATCH, .. }, Op::IAdd3 { d: 18, a: SCRATCH, b: Src::Reg(0), x: true, .. }]), "{v:?}");
+        assert!(
+            matches!(v[..], [Op::Shf { d: SCRATCH, lo: RZ, hi: 17, signed: true, .. }, Op::Shf { d: SCRATCH, lo: 17, hi: SCRATCH, .. }, Op::IAdd3P { d: 18, a: SCRATCH, b: Src::Reg(0), x: true, cin: [Pred { idx: 4, not: false }, _], .. }]),
+            "{v:?}"
+        );
         // LEA.HI R70, R139, R70, RZ, 0x1e: the destination is the addend
         let v = ops(0x000fe200078ff0ff_000000468b467211);
         assert!(matches!(v[..], [Op::Shf { d: SCRATCH, lo: 139, hi: RZ, .. }, Op::IAdd3 { d: 70, a: SCRATCH, b: Src::Reg(70), x: false, .. }]), "{v:?}");
@@ -1099,6 +1134,46 @@ mod tests {
         assert_eq!(ops(0x000ea800099ee1cc_00000007140779a8), vec![Op::Atom { d: 7, a: 20, b: 7, off: 0, op: AtomOp::Inc, ty: AtomTy::U32, wide: true }]);
         // UFLO.U32 UR4, UR5
         assert_eq!(ops(0x000fe200080e0000_00000005000472bd), vec![Op::Flo { d: ur(4), b: Src::Reg(ur(5)), not: false, signed: false, shift: false, cc: false }]);
+    }
+
+    /// 64-bit adds from a TensorRT kernel: the carries stay in their predicates (P4 and P3
+    /// both live at once), and IMAD.X adds one.
+    #[test]
+    fn carries_live_in_predicates() {
+        const CODE: &[u64] = &[
+            // IADD3 R157, P4, P3, R146, c[0x0][0x2a8], R69
+            0x0000aa00929d7a10, 0x100fe20007b9e045,
+            // IADD3.X R156, R149, c[0x0][0x2ac], R69, P4, P3
+            0x0000ab00959c7a10, 0x000fc400027e6445,
+            // IMAD.X R73, R83, 0x1, R69, P3
+            0x0000000153497824, 0x000fe200018e0645,
+            // EXIT
+            0x000000000000794d, 0x000fea0003800000,
+        ];
+        struct H;
+        impl crate::Host<16> for H {
+            fn cbuf(&self, _index: u32, offset: u32) -> u32 {
+                match offset {
+                    0x2a8 => 0xffff_ffff,
+                    0x2ac => 2,
+                    _ => 0,
+                }
+            }
+        }
+        let p = Program::decode_sm70_at(0, &mut |a| CODE.get(a as usize / 8).copied()).unwrap();
+        let mut l = crate::Lanes::<16>::new();
+        l.start(&p, 0xffff, 0);
+        for (r, v) in [(146, 0xffff_ffff), (69, 0xffff_ffff), (149, 1), (83, 10)] {
+            l.gpr[r] = [v; 16];
+        }
+        let mut fuel = 1000;
+        assert!(matches!(crate::run(&p, &mut l, &mut H, &mut fuel), crate::Exit::Done));
+        // 3 * 0xffffffff = 0x2_fffffffd: one carry from each stage
+        assert_eq!(l.gpr[157][0], 0xffff_fffd);
+        assert_eq!((l.pred[4] & 1, l.pred[3] & 1), (1, 1));
+        assert_eq!(l.gpr[156][0], 4); // 1 + 2 + 0xffffffff + P4 + P3
+        // 10 * 1 + 0xffffffff + P3
+        assert_eq!(l.gpr[73][0], 10);
     }
 
     /// NVIDIA's GLES compute shader of gltest: v[i] = group * 1000 + s[63 - tid], s[tid] =

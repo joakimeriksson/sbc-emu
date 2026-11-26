@@ -974,6 +974,23 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
                 l.put(d, m, r);
             }
         }
+        Op::IAdd3P { d, a, b, c, neg, x, cin, cout } => {
+            let (va, vb, vc) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
+            let (c0, c1) = (l.p(cin[0]), l.p(cin[1]));
+            // -v is ~v + 1, except in the high word of a 64-bit add (the low word's carry has it)
+            let arg = |v: u32, n: bool| if !n { v as u64 } else if x { !v as u64 } else { !v as u64 + 1 };
+            let (mut r, mut k0, mut k1) = ([0u32; N], 0u32, 0u32);
+            for i in 0..N {
+                let s0 = arg(va[i], neg[0]) + arg(vb[i], neg[1]) + (c0 >> i & 1) as u64;
+                let s1 = (s0 & 0xffff_ffff) + arg(vc[i], neg[2]) + (c1 >> i & 1) as u64;
+                r[i] = s1 as u32;
+                k0 |= ((s0 >> 32 != 0) as u32) << i;
+                k1 |= ((s1 >> 32 != 0) as u32) << i;
+            }
+            l.put(d, m, r);
+            l.putp(cout[0], m, k0);
+            l.putp(cout[1], m, k1);
+        }
         Op::IAdd3 { d, a, b, c, neg, half, shift, x, cc } => {
             let srcs = [l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]];
             let get = |s: usize, i: usize| {
