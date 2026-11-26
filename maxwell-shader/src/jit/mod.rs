@@ -903,6 +903,83 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             };
             l.put(d, m, r);
         }
+        // SM70's integer core: IMAD and IADD3 without carries, SHF by a constant
+        Op::IMad { d, a, b, c, neg_ab, neg_c, hi: false, sat: false, x: false, cc: false, .. } => {
+            let po = neg_ab && neg_c;
+            let u = l.reg(a);
+            let v = l.src(b);
+            let mut r = l.bin(Bin::Mul, u, v);
+            if neg_ab && !po {
+                let zero = l.imm(0);
+                r = l.bin(Bin::Sub, zero, r);
+            }
+            let w = l.src(c);
+            r = if neg_c && !po { l.bin(Bin::Sub, r, w) } else { l.bin(Bin::Add, r, w) };
+            if po {
+                r = l.bin_imm(Bin::Add, r, 1);
+            }
+            l.put(d, m, r);
+        }
+        Op::IAdd3 { d, a, b, c, neg, half: [0, 0, 0], shift: 0, x: false, cc: false } => {
+            let srcs = [l.reg(a), l.src(b), l.reg(c)];
+            let mut r: Option<Id> = None;
+            let mut sub: Vec<Id> = Vec::new();
+            for (k, v) in srcs.into_iter().enumerate() {
+                if neg[k] {
+                    sub.push(v);
+                } else {
+                    r = Some(match r {
+                        Some(r) => l.bin(Bin::Add, r, v),
+                        None => v,
+                    });
+                }
+            }
+            let mut r = r.unwrap_or_else(|| l.imm(0));
+            for v in sub {
+                r = l.bin(Bin::Sub, r, v);
+            }
+            l.put(d, m, r);
+        }
+        Op::Shf { d, lo, hi, b: Src::Imm(v), right, high, wrap, wide, signed, cc: false } => {
+            // as exec: the 64-bit hi:lo shifted by n, the high word (left, or .HI) or the low one
+            let n = if wrap { v & if wide { 63 } else { 31 } } else { v.min(if wide { 64 } else { 32 }) };
+            let (u, w) = (l.reg(lo), l.reg(hi));
+            let shr = if signed { Bin::ShrS } else { Bin::ShrU };
+            let r = if !right {
+                match n {
+                    0 => w,
+                    1..=31 => {
+                        let a = l.bin_imm(Bin::Shl, w, n);
+                        let b = l.bin_imm(Bin::ShrU, u, 32 - n);
+                        l.bin(Bin::Or, a, b)
+                    }
+                    32 => u,
+                    33..=63 => l.bin_imm(Bin::Shl, u, n - 32),
+                    _ => l.imm(0),
+                }
+            } else if high {
+                match n {
+                    0 => w,
+                    1..=31 => l.bin_imm(shr, w, n),
+                    _ if signed => l.bin_imm(Bin::ShrS, w, 31),
+                    _ => l.imm(0),
+                }
+            } else {
+                match n {
+                    0 => u,
+                    1..=31 => {
+                        let a = l.bin_imm(Bin::ShrU, u, n);
+                        let b = l.bin_imm(Bin::Shl, w, 32 - n);
+                        l.bin(Bin::Or, a, b)
+                    }
+                    32 => w,
+                    33..=63 => l.bin_imm(shr, w, n - 32),
+                    _ if signed => l.bin_imm(Bin::ShrS, w, 31),
+                    _ => l.imm(0),
+                }
+            };
+            l.put(d, m, r);
+        }
         Op::IMul { d, a, b, hi: false, cc: false, .. } => {
             let u = l.reg(a);
             let v = l.src(b);

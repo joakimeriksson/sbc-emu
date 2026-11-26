@@ -601,6 +601,10 @@ macro_rules! common_host {
         fn load_lanes(&mut self, at: &[u64; $n], mask: u32, n: usize, out: &mut [[u8; 16]; $n]) {
             self.common.mem.read_lanes(at, mask, n, out);
         }
+        fn atomic(&mut self, addr: u64, op: maxwell_shader::isa::AtomOp, ty: maxwell_shader::isa::AtomTy, a: u64, b: u64) -> u64 {
+            self.common.stored = true;
+            self.common.mem.update(addr, ty.bytes(), &mut |old| maxwell_shader::host::atomic_apply(op, ty, old, a, b))
+        }
         fn store_lanes(&mut self, at: &[u64; $n], mask: u32, n: usize, data: &[[u8; 16]; $n]) {
             self.common.stored = true;
             self.common.mem.write_lanes(at, mask, n, data);

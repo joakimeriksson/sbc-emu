@@ -145,6 +145,9 @@ fn trace_config() -> &'static Option<TraceConfig> {
     })
 }
 
+/// The workers the last launch had (for SBC_TRACE_LAUNCHES).
+static LAST_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The program of the launch running (for tracing).
 static TRACE_PROGRAM: AtomicU64 = AtomicU64::new(0);
 
@@ -257,11 +260,17 @@ impl Compute {
         TRACE_PROGRAM.store(self.last.0, Ordering::Relaxed);
         // SBC_TRACE_LAUNCHES: each launch's program and grid (to find a kernel to trace)
         static LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *LAUNCHES.get_or_init(|| std::env::var_os("SBC_TRACE_LAUNCHES").is_some()) {
-            eprintln!("[launch] {} program {:#x} groups {:?} threads {:?} shared {:#x}", self.launches, self.last.0, launch.groups, launch.threads, launch.shared);
-        }
+        let trace = *LAUNCHES.get_or_init(|| std::env::var_os("SBC_TRACE_LAUNCHES").is_some());
+        let started = std::time::Instant::now();
         if let Some(program) = pipe.program(base, launch.entry, mem) {
             self.run(&launch, &program, pipe, mem);
+            if trace {
+                let why = if program.any(|op| matches!(op, maxwell_shader::isa::Op::Atom { .. } | maxwell_shader::isa::Op::Suatom { .. })) { " atomics" } else { "" };
+                eprintln!(
+                    "[launch] {} program {:#x} groups {:?} threads {:?}: {} workers{why}, {:.1} ms",
+                    self.launches, self.last.0, launch.groups, launch.threads, LAST_WORKERS.load(Ordering::Relaxed), started.elapsed().as_secs_f64() * 1e3
+                );
+            }
         } else {
             eprintln!("[maxwell] compute launch skipped: no program at {:#x}", self.last.0);
         }
@@ -336,8 +345,9 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
     // (each thread has the local memory of a workgroup's threads)
     let per_thread = (launch.local * batches * N).max(1);
     let units = if apart { groups * batches as u64 } else { groups };
-    let workers = if atomics { 1 } else { pipe::threads().min(usize::try_from(units).unwrap_or(usize::MAX)).min(MAX_LOCAL / per_thread).max(1) };
+    let workers = if atomics && !mem.split_atomics() { 1 } else { pipe::threads().min(usize::try_from(units).unwrap_or(usize::MAX)).min(MAX_LOCAL / per_thread).max(1) };
     pipe.need_workers(workers);
+    LAST_WORKERS.store(workers, Ordering::Relaxed);
     let next = AtomicU64::new(0);
     let left_fuel = AtomicU64::new(LAUNCH_FUEL);
     let failed: Mutex<Option<String>> = Mutex::new(None);

@@ -720,6 +720,9 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
     };
     l.pc = pc + 1;
     h.trace(p.words[pc as usize].0, inst, l);
+    if interp_stats() {
+        count_interpreted(&inst.op);
+    }
     let m = l.active & l.p(inst.pred);
     if m == 0 {
         return None;
@@ -2579,4 +2582,32 @@ mod run_tests {
     fn membar_decodes() {
         assert_eq!(crate::decode::decode(8, 0xef98_0000_0007_000f).op, Op::Membar);
     }
+}
+
+/// SBC_INTERP_STATS: count the instructions the interpreter runs, by kind, and print the most
+/// common ones every 50 million (to see what keeps code out of the JIT).
+fn interp_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SBC_INTERP_STATS").is_some())
+}
+
+#[cold]
+fn count_interpreted(op: &Op) {
+    use std::collections::HashMap;
+    thread_local! {
+        static COUNTS: std::cell::RefCell<(u64, HashMap<String, u64>)> = Default::default();
+    }
+    COUNTS.with(|c| {
+        let mut c = c.borrow_mut();
+        let name = format!("{op:?}");
+        let kind = name[..name.find([' ', '(', '{']).unwrap_or(name.len())].to_string();
+        *c.1.entry(kind).or_insert(0) += 1;
+        c.0 += 1;
+        if c.0 % 50_000_000 == 0 {
+            let mut v: Vec<_> = c.1.iter().map(|(k, n)| (*n, k.clone())).collect();
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            let top: Vec<String> = v.iter().take(14).map(|(n, k)| format!("{k} {:.1}%", 100.0 * *n as f64 / c.0 as f64)).collect();
+            eprintln!("[interp] {}M instructions: {}", c.0 / 1_000_000, top.join(", "));
+        }
+    });
 }

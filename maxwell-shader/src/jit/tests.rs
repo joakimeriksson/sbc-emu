@@ -226,3 +226,52 @@ fn native_code_ignores_the_hosts_fpcr() {
         assert_eq!(a.gpr[k], b.gpr[k], "R{k}");
     }
 }
+
+/// SM70's integer core (IMAD, IADD3, SHF by a constant) compiled, against the interpreter.
+#[test]
+fn sm70_integer_ops_match_the_interpreter() {
+    use crate::exec::{run, Exit, Lanes};
+    use crate::isa::*;
+    let _switch = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let was = super::enabled();
+    for case in 0..3000 {
+        let mut ops = Vec::new();
+        for _ in 0..2 + next() % 6 {
+            let reg = |x: u64| (x % 12) as Reg;
+            let r = next();
+            let src = if r % 3 == 0 { Src::Imm(next() as u32 >> (next() % 32)) } else { Src::Reg(reg(next())) };
+            let op = match r % 3 {
+                0 => Op::IMad { d: reg(next()), a: reg(next()), b: src, c: if next() % 4 == 0 { Src::Imm(next() as u32) } else { Src::Reg(reg(next())) }, sa: next() % 2 == 0, sb: next() % 2 == 0, hi: false, neg_ab: next() % 3 == 0, neg_c: next() % 3 == 0, sat: false, x: false, cc: false },
+                1 => Op::IAdd3 { d: reg(next()), a: reg(next()), b: src, c: reg(next()), neg: [next() % 3 == 0, next() % 3 == 0, next() % 3 == 0], half: [0; 3], shift: 0, x: false, cc: false },
+                _ => Op::Shf { d: reg(next()), lo: reg(next()), hi: if next() % 4 == 0 { RZ } else { reg(next()) }, b: Src::Imm((next() % 70) as u32), right: next() % 2 == 0, high: next() % 2 == 0, wrap: next() % 2 == 0, wide: next() % 2 == 0, signed: next() % 2 == 0, cc: false },
+            };
+            ops.push(op);
+        }
+        let p = crate::program::Program::from_ops(&ops);
+        let mut a = Lanes::<LANES>::new();
+        a.start(&p, 0xffff, 0);
+        for k in 0..12 {
+            a.gpr[k] = std::array::from_fn(|_| next() as u32);
+        }
+        let mut b = a.clone();
+        super::set_enabled(true);
+        assert!(super::Code::compile(&p).is_some_and(|c| c.block_at(0).is_some_and(|(_, n)| n as usize == ops.len())), "case {case}: not one block: {ops:?}");
+        let (mut f1, mut f2) = (1000, 1000);
+        let e1 = run(&p, &mut a, &mut super::check::Cb, &mut f1);
+        super::set_enabled(false);
+        let e2 = run(&p, &mut b, &mut super::check::Cb, &mut f2);
+        super::set_enabled(was);
+        assert_eq!((e1, e2), (Exit::Done, Exit::Done));
+        for k in 0..12 {
+            assert_eq!(a.gpr[k], b.gpr[k], "case {case}: R{k}\n{ops:#?}");
+        }
+    }
+}
+

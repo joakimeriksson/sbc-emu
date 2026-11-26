@@ -233,6 +233,23 @@ impl Program {
         self.gprs
     }
 
+    /// A program of these operations, then EXIT (for tests of the JIT against the interpreter).
+    #[cfg(test)]
+    pub(crate) fn from_ops(ops: &[Op]) -> Program {
+        let mut code: Vec<Inst> = ops.iter().map(|&op| Inst { pred: PT, op }).collect();
+        code.push(Inst { pred: PT, op: Op::Exit { cond: 15 } });
+        // (words from the operations: the JIT caches code by them)
+        let word = |i: &Inst| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}", i.op).hash(&mut h);
+            h.finish()
+        };
+        let words = code.iter().enumerate().map(|(k, i)| (k as u32 * 16, word(i))).collect();
+        let gprs = code.iter().map(|i| highest_reg(&i.op)).max().unwrap_or(0);
+        Program { code, words, high: Vec::new(), entry: 0, gprs, past_rz: false, jit: Default::default() }
+    }
+
     /// The JIT's blocks of this program (compiled the first time), if the JIT is on.
     #[inline]
     pub fn jit(&self) -> Option<&crate::jit::Code> {
