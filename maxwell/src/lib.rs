@@ -16,6 +16,12 @@ pub mod vertex;
 
 pub use maxwell_tex::Memory;
 
+/// `SBC_TRACE_SEM` (read once: asked on every semaphore).
+pub(crate) fn trace_sem() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("SBC_TRACE_SEM").is_some())
+}
+
 pub trait MemoryExt: Memory {
     fn read32(&self, va: u64) -> u32 {
         let mut b = [0; 4];

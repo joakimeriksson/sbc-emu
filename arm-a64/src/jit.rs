@@ -1196,7 +1196,8 @@ impl Cpu {
             } else if (i & 0xffff_f01f == 0xd503_201f && !matches!((i >> 5) & 0x7f, 2..=5))
                 || (i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4..=6))
             {
-                // NOP and the hints that are NOPs here (YIELD, SEV, PAC, BTI, ...), DSB/DMB/ISB;
+                // NOP and the hints that are NOPs here (YIELD, PAC, BTI, ...; not WFE, WFI, SEV or
+                // SEVL, which the interpreter runs), DSB/DMB/ISB;
                 // with cores running in parallel DSB/DMB order the host's accesses too
                 if self.mt && i & 0xffff_f01f == 0xd503_301f && matches!((i >> 5) & 7, 4 | 5) { e.out.push(0xd503_3bbf); } // dmb ish
                 natives += 1;

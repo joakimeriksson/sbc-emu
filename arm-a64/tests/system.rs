@@ -306,3 +306,34 @@ fn generic_timer_compare_and_irq_delivery() {
     assert!(waits >= 1);
     assert_eq!(cpu.x[5], 5); // ENABLE | ISTATUS
 }
+
+#[test]
+fn an_event_set_before_a_snapshot_is_not_lost() {
+    // sevl; wfe falls through, the next one waits. A snapshot taken between SEVL and WFE does
+    // not hold the event register: a restored core sets it, so its WFE falls through too.
+    use arm_a64::Cpu;
+    use emu_core::{Core, FlatRam};
+    let code = assemble("sevl\n wfe\n wfe\n brk #0\n");
+    let mut ram = FlatRam::new(0, RAM);
+    ram.load(LOAD, &code).unwrap();
+    let core = |ram: &mut FlatRam| {
+        let mut cpu = Cpu::new();
+        cpu.brk_to_host = true;
+        cpu.ram = ram.mem.as_mut_ptr();
+        cpu.ram_len = ram.mem.len() as u64;
+        cpu.el = 1;
+        cpu.pc = LOAD;
+        cpu
+    };
+    let mut cpu = core(&mut ram);
+    cpu.step(&mut ram).unwrap();
+    let mut w = emu_core::snap::W(Vec::new());
+    cpu.save_state(&mut w);
+    assert!(cpu.step(&mut ram).is_ok());
+    assert!(matches!(cpu.step(&mut ram), Err(Trap::Wait)));
+    let mut restored = core(&mut ram);
+    restored.load_state(&mut emu_core::snap::R::new(&w.0)).unwrap();
+    assert_eq!(restored.pc, LOAD + 4);
+    assert!(restored.step(&mut ram).is_ok(), "the restored WFE falls through");
+    assert!(matches!(restored.step(&mut ram), Err(Trap::Wait)));
+}

@@ -605,6 +605,14 @@ mod tests {
         assert_eq!(v.ram[0x5000..0x5009], [1, 1, 2, 2, 2, 2, 0xaa, 3, 0xaa]);
         // a fault of a view reaches the view it came from
         assert_eq!(v.fault.get(), Some((0x0400_6000, true)));
+        // and so does an unmapped read, which reads zeros
+        v.fault.set(None);
+        assert!(v.split(2, &mut |views| {
+            let mut b = [0xff; 4];
+            views[1].read(0x0400_6000, &mut b);
+            assert_eq!(b, [0; 4]);
+        }));
+        assert_eq!(v.fault.get(), Some((0x0400_6000, false)));
     }
 
     /// Threads that write bytes of the same words at once: every byte ends up as one thread

@@ -6,6 +6,24 @@ pub mod copy;
 pub mod mmu;
 pub mod pmu;
 
+/// Tracing switched on in the environment (read once: some are asked on every method).
+pub(crate) mod flag {
+    use std::sync::OnceLock;
+    fn on(cell: &OnceLock<bool>, name: &str) -> bool {
+        *cell.get_or_init(|| std::env::var_os(name).is_some())
+    }
+    /// `SBC_TRACE_SEM`: semaphores
+    pub fn sem() -> bool {
+        static F: OnceLock<bool> = OnceLock::new();
+        on(&F, "SBC_TRACE_SEM")
+    }
+    /// `SBC_TRACE_SYNCPT`: sync points and channel binds
+    pub fn syncpt() -> bool {
+        static F: OnceLock<bool> = OnceLock::new();
+        on(&F, "SBC_TRACE_SYNCPT")
+    }
+}
+
 use crate::smmu::Smmu;
 use mmu::{Mmu, Space};
 use std::collections::HashMap;
@@ -287,7 +305,7 @@ impl Gpu {
                     // the same block again (nvgpu does it when the GPU comes back from power gating),
                     // keeps what the channel's context holds: its subchannels' classes, a half-run
                     // push buffer, a semaphore it waits for
-                    if std::env::var_os("SBC_TRACE_SYNCPT").is_some() {
+                    if crate::gpu::flag::syncpt() {
                         eprintln!("[chan] {} inst {:#x} -> {v:#x}", (o >> 3) & 0x1ff, c.inst);
                     }
                     if v >> 31 != 0 {
@@ -411,6 +429,8 @@ impl Gpu {
     fn run_once(&mut self, smmu: &Smmu, ram: &mut [u8]) -> (bool, bool) {
         let (mut waiting, mut progress) = (false, false);
         let now = self.time();
+        // (which channels are bound: a context a bound channel names is a live process's)
+        let bound: Vec<(u32, u64)> = self.channels.iter().enumerate().filter(|(_, c)| c.inst >> 31 != 0).map(|(k, c)| (k as u32, ((c.inst & 0x0fff_ffff) as u64) << 12)).collect();
         for k in 0..self.runlist.len() {
             let id = self.runlist[k];
             let Some(c) = self.channels.get(id as usize).copied() else { continue };
@@ -418,7 +438,7 @@ impl Gpu {
                 let inst = ((c.inst & 0x0fff_ffff) as u64) << 12;
                 let space = mmu::space(inst, smmu, ram);
                 let mut view = mmu::View { ram, smmu, mmu: &self.mmu, space, fault: Default::default() };
-                let done = self.host.run_channel(id, inst, &mut view, now, &mut self.points);
+                let done = self.host.run_channel(id, inst, &mut view, now, &mut self.points, &bound);
                 if let Some((va, write)) = view.fault.get() {
                     if std::env::var_os("SBC_SHADER_FAULT").is_some() {
                         eprintln!("[gpu] channel {id}: unmapped {} at {va:#x}", if write { "write" } else { "read" });

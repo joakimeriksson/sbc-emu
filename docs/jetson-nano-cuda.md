@@ -72,8 +72,8 @@ reference detections are printed):
 
 ```sh
 cd cache/l4t/serve && uv run --with ultralytics yolo export model=yolov8n.pt format=onnx imgsz=640 opset=12 && cd -
-curl -LO https://ultralytics.com/images/bus.jpg
-uv run --with opencv-python-headless --with onnxruntime python tests/gpu/l4t/yolo-input.py bus.jpg cache/l4t/serve
+curl -L -o cache/l4t/bus.jpg https://ultralytics.com/images/bus.jpg
+uv run --with opencv-python-headless --with onnxruntime python tests/gpu/l4t/yolo-input.py cache/l4t/bus.jpg cache/l4t/serve
 ```
 
 and run `scripts/jetson-nano-tensorrt.txt` with the same command line and `--timeout 3000`:

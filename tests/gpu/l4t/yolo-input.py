@@ -1,7 +1,7 @@
 # yolo-input.py IMAGE OUTDIR (on the host): YOLOv8n's 640x640 letterboxed input (OUTDIR/input.bin,
 # float32 NCHW), its scale (OUTDIR/input.scale), and the reference detections from ONNX Runtime
 # with OUTDIR/yolov8n.onnx, which tests/gpu/l4t/trtpost.py's output on the Jetson should match.
-#   uv run --with opencv-python-headless --with onnxruntime python tests/gpu/l4t/yolo-input.py bus.jpg cache/l4t/serve
+#   uv run --with opencv-python-headless --with onnxruntime python tests/gpu/l4t/yolo-input.py cache/l4t/bus.jpg cache/l4t/serve
 import os, sys
 import cv2
 import numpy as np

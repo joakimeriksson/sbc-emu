@@ -47,6 +47,10 @@ pub(crate) fn utag(va: u64, el: u64) -> u64 { (va >> 12) | (el << 60) }
 /// An empty micro-TLB entry: no tag has bits 52..59 set.
 pub(crate) const UTLB_EMPTY: (u64, u64) = (u64::MAX, 0);
 
+/// Snapshot key (beside `SNAP_AARCH32_CPSR`, not a system register encoding) of the event
+/// register, present while it is set.
+const SNAP_EVENT: u32 = 0x1_0001;
+
 /// Board-selected CPU identity. ISA feature registers still advertise implemented features only.
 #[derive(Clone, Copy, Debug)]
 pub struct CpuProfile {
@@ -433,6 +437,7 @@ impl Cpu {
         let mut other = s.other.clone();
         for (k, v) in [crate::sysreg::TPIDR_EL0, crate::sysreg::TPIDRRO_EL0, crate::sysreg::TPIDR_EL1].into_iter().zip(s.tpidr) { other.insert(k, v); }
         if let Some(c) = cpsr { other.insert(crate::aarch32::SNAP_AARCH32_CPSR, c); }
+        if self.event { other.insert(SNAP_EVENT, 1); }
         w.u64(other.len() as u64);
         for (k, v) in &other { w.u32(*k); w.u64(*v); }
     }
@@ -463,6 +468,7 @@ impl Cpu {
         }
         self.tlb_flush();
         if let Some(j) = self.jit.as_mut() { j.flush(); }
+        self.event = self.sys.other.remove(&SNAP_EVENT).is_some();
         Ok(())
     }
 }
@@ -476,11 +482,13 @@ fn snapshot_fields(c: &Cpu) {
         x: _, sp: _, pc: _, nzcv: _, daif: _, el: _, spsel: _, elr: _, spsr: _, esr: _, far: _, vbar: _,
         sctlr: _, v: _, fpcr: _, fpsr: _, fpsr_nzcv: _, sys: _, irq: _, fiq: _, instret: _, excl_addr: _,
         excl_armed: _, brk_to_host: _, firmware_calls_to_host: _, aarch32: _, a32: _,
+        // in `other` while set
+        event: _,
         // rebuilt (TLBs, compiled code), the machine's (RAM, profile, threads, debugger), or within a
         // step; `aarch32` and `a32` are entered again from the saved CPSR
         cur_insn: _, tlb: _, ram: _, ram_len: _, ram_base: _, utlb: _, utlb_asid: _, utlb_unpriv: _,
         tlb_blocks: _, jit: _, code_pages: _, jit_bus: _, jit_trap: _, store_log: _, chain_until: _,
-        chain_stop: _, jit_disp: _, jit_exit: _, jit_interp: _, jit_refill: _, last_wfe: _, event: _, mt: _,
+        chain_stop: _, jit_disp: _, jit_exit: _, jit_interp: _, jit_refill: _, last_wfe: _, mt: _,
         wall_clock: _, excl_val: _, ic_bcast: _, crypto: _, jit_off: _, interp_run: _, watch: _,
         watch_hit: _, tlbi_bcast: _, profile: _,
     } = c;
