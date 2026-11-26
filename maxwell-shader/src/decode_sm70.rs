@@ -47,6 +47,13 @@ impl W {
     fn pdst(self, lo: u32) -> u8 {
         self.f(lo, 3) as u8
     }
+    /// A uniform predicate UP0..UP6, UPT: predicates 8..15.
+    fn upred(self, lo: u32, not: u32) -> Pred {
+        Pred { idx: 8 + self.f(lo, 3) as u8, not: self.b(not) }
+    }
+    fn updst(self, lo: u32) -> u8 {
+        8 + self.f(lo, 3) as u8
+    }
     fn opcode(self) -> u32 {
         self.f(0, 12)
     }
@@ -136,7 +143,11 @@ fn lut_swap_bc(lut: u8) -> u8 {
 /// one instruction what takes two here. Jump targets are code addresses.
 pub fn decode(addr: u32, raw: u128) -> Vec<Inst> {
     let w = W(raw);
-    let pred = w.pred(12, 15);
+    let mut pred = w.pred(12, 15);
+    // a uniform operation's guard is a uniform predicate (@UP1 UIADD3 ...)
+    if w.uniform_alu() {
+        pred.idx += 8;
+    }
     // @G BRA C, target: a branch on two predicates. Lanes without G go on to the next
     // instruction; the others branch where C holds.
     let cond = w.pred(87, 90);
@@ -165,10 +176,16 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         // Convergence-barrier bookkeeping, warp synchronization, dependency waits.
         0x355 | 0x356 | 0x956 | 0xf55 | 0x148 | 0x948 | 0x91a => return one(Op::Nop),
         // BREAK leaves a convergence barrier; the SSY/SYNC model needs nothing for that.
-        0x942 => return one(Op::Nop),
+        // YIELD and ERRBAR have nothing to do here either.
+        0x942 | 0x946 | 0x9ab => return one(Op::Nop),
         0x947 => {
-            if w.b(32) {
-                return None;
+            // BRA.CONV ~URZ / BRA.DIV ~URZ (bits 32, 33): branch where the warp is converged /
+            // diverged; warps here run converged at such points (around warp-wide shuffles).
+            match (w.f(32, 2), w.f(24, 8)) {
+                (0, _) => {}
+                (3, 0x7f) => return one(Op::Bra { t: rel(addr, w), cond: 15, all: false }),
+                (2, 0x7f) => return one(Op::Nop),
+                _ => return None,
             }
             let p = w.pred(87, 90);
             // A predicated branch: the guard predicate is the condition.
@@ -182,6 +199,41 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             return (p.idx == 7 && !p.not).then(|| vec![Op::Exit { cond: 15 }]);
         }
         0x945 => return one(Op::Ssy { t: rel(addr, w) }),
+        // ATOMG d, [a.64 + off], b and RED [a.64 + off], b (no result): the operation in bits
+        // 87..91, the type in 73..76, a 64-bit address with bit 91.
+        0x9a8 | 0x98e => {
+            let op = [AtomOp::Add, AtomOp::Min, AtomOp::Max, AtomOp::Inc, AtomOp::Dec, AtomOp::And, AtomOp::Or, AtomOp::Xor, AtomOp::Exch]
+                [*[0, 1, 2, 3, 4, 5, 6, 7, 8].get(w.f(87, if opcode == 0x98e { 3 } else { 4 }) as usize)?];
+            let ty = match w.f(73, 3) {
+                0 => AtomTy::U32,
+                1 => AtomTy::S32,
+                2 => AtomTy::U64,
+                3 => AtomTy::F32,
+                5 => AtomTy::S64,
+                _ => return None,
+            };
+            let (d, b) = if opcode == 0x98e { (RZ, w.reg(32)) } else { (w.reg(16), w.reg(32)) };
+            if opcode == 0x9a8 && w.pdst(81) != 7 {
+                return None;
+            }
+            return one(Op::Atom { d, a: w.reg(24), b, off: w.sf(40, 24), op, ty, wide: w.b(91) });
+        }
+        // CALL.REL.NOINC and RET.REL.NODEC Rn: the return address the caller put in Rn is the
+        // instruction after the call, which the call stack has.
+        0x944 => return one(Op::Cal { t: rel(addr, w) }),
+        0x950 => return one(Op::Ret { cond: 15 }),
+        // LDGSTS [Rs + soff], [Rg.64 + goff (+ URn where bit 76 is clear)], valid predicate
+        0xfae => {
+            let ty = mem_ty(w.f(73, 3))?;
+            let (s, soff, g, goff) = (w.reg(16), w.sf(44, 20), w.reg(24), w.sf(32, 12));
+            let p = w.pred(87, 90);
+            let uniform = w.ureg(64);
+            if w.b(76) || uniform == RZ {
+                return one(Op::Ldgsts { s, soff, g, goff, ty, p });
+            }
+            let add = |d: Reg, a: Reg, b: Reg, x: bool| Op::IAdd3 { d, a, b: Src::Reg(b), c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x, cc: true };
+            return Some(vec![add(SCRATCH, g, uniform, false), add(SCRATCH + 1, g + 1, uniform + 1, true), Op::Ldgsts { s, soff, g: SCRATCH, goff, ty, p }]);
+        }
         0x941 => return one(Op::Sync { cond: 15 }),
         0x95b => return one(Op::Kil { cond: 15 }),
         0xb1d => return one(Op::Bar),
@@ -250,10 +302,19 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             let d = w.reg(16);
             let wide = w.b(90);
             let global = matches!(opcode, 0x981 | 0x986);
+            // Shared and local: [R + UR + off], the register scaled first.
+            if w.b(91) && uniform != RZ && !global {
+                let shift = if matches!(opcode, 0x984 | 0x988) { [0, 2, 3, 4][w.f(78, 2) as usize] } else { 0 };
+                let ops = vec![Op::IScAdd { d: SCRATCH, a, b: Src::Reg(uniform), shift, neg_a: false, neg_b: false, cc: false }];
+                let access = match opcode {
+                    0x983 => Op::Ldl { d, a: SCRATCH, off, ty },
+                    0x987 => Op::Stl { r: data, a: SCRATCH, off, ty },
+                    0x984 => Op::Lds { d, a: SCRATCH, off, ty },
+                    _ => Op::Sts { r: data, a: SCRATCH, off, ty },
+                };
+                return Some(ops.into_iter().chain([access]).collect());
+            }
             if w.b(91) && uniform != RZ && !(global && wide) {
-                if !global {
-                    return None;
-                }
                 let add = |d: Reg, a: Reg, b: Reg, x: bool| Op::IAdd3 { d, a, b: Src::Reg(b), c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x, cc: true };
                 let a = SCRATCH;
                 let access = if opcode == 0x981 { Op::Ld { d, a, off, ty, wide: true } } else { Op::St { r: data, a, off, ty, wide: true } };
@@ -327,12 +388,11 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             return one(Op::Shfl { d: w.reg(16), pd: w.pdst(81), a: w.reg(24), b: lane, c, op });
         }
         0x81c => {
-            // PLOP3 of three predicates; the second operation's table is in bits 16..24.
+            // PLOP3 of three predicates; the second operation's table is in bits 16..24. Bit 67:
+            // the third is a uniform predicate.
             let lut0 = (w.f(64, 3) | w.f(72, 5) << 3) as u8;
-            if w.b(67) {
-                return None;
-            }
-            return Some(plop3(w.pdst(81), w.pred(87, 90), w.pred(77, 80), w.pred(68, 71), lut0)?);
+            let c = if w.b(67) { w.upred(68, 71) } else { w.pred(68, 71) };
+            return Some(plop3(w.pdst(81), w.pred(87, 90), w.pred(77, 80), c, lut0)?);
         }
         _ => {}
     }
@@ -375,14 +435,13 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
     // IMAD.WIDE: d:d+1 = a * b + c:c+1, the product 64 bits (CUDA's address arithmetic). The low
     // word goes to SCRATCH with its carry, the high word adds it, then the low word moves to d (so
     // that d may be a or b).
-    if (base, uniform) == (0x025, false) {
+    if base == 0x025 {
         let signed = w.b(73);
         let c_hi = match s.c {
             Src::Reg(r) if r == RZ => Src::Reg(RZ),
             Src::Reg(r) => Src::Reg(r + 1),
             Src::Cb(b, off) => Src::Cb(b, off + 4),
             Src::Imm(v) => Src::Imm(if signed && v >> 31 != 0 { u32::MAX } else { 0 }),
-            _ => return None,
         };
         let imad = |d, c, hi| Op::IMad { d, a: s.a, b: s.b, c, sa: signed, sb: signed, hi, neg_ab: false, neg_c: s.cm.neg, sat: false, x: hi, cc: !hi };
         if d == RZ {
@@ -463,14 +522,14 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
             Op::IMad { d, a: s.a, b: s.b, c: s.c, sa: signed, sb: signed, hi: true, neg_ab: false, neg_c: s.cm.neg, sat: false, x: false, cc: false }
         }
         (0x017, _) => Op::IMnMx { d, a: s.a, b: s.b, signed: w.b(73), part: 0, cc: false, p: w.pred(87, 90) },
+        // ISETP (UISETP writes and reads uniform predicates); .EX continues a 64-bit compare
         (0x00c, _) => {
-            if w.b(72) {
-                return None; // .EX: a 64-bit compare continued from a predicate
-            }
+            let (pdst, pred): (fn(W, u32) -> u8, fn(W, u32, u32) -> Pred) = if uniform { (W::updst, W::upred) } else { (W::pdst, W::pred) };
+            let ex = w.b(72).then(|| pred(w, 68, 71));
             Op::ISetP {
-                pd: w.pdst(81),
-                pn: w.pdst(84),
-                cmp: ICmpArgs { a: s.a, b: s.b, cond: w.f(76, 3) as u8, signed: w.b(73), x: false, bop: w.bop(74)?, p: w.pred(87, 90) },
+                pd: pdst(w, 81),
+                pn: pdst(w, 84),
+                cmp: ICmpArgs { a: s.a, b: s.b, cond: w.f(76, 3) as u8, signed: w.b(73), x: false, ex, bop: w.bop(74)?, p: pred(w, 87, 90) },
             }
         }
         (0x012, _) => {
@@ -479,8 +538,8 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
                 std::mem::swap(&mut b, &mut c);
                 lut = lut_swap_bc(lut);
             }
-            let pd = w.pdst(81);
-            Op::Lop3 { d, a: s.a, b, c: reg_of(c)?, lut, x: false, cc: false, test: if pd == 7 { 0 } else { 3 }, pd }
+            let pd = if uniform { w.updst(81) } else { w.pdst(81) };
+            Op::Lop3 { d, a: s.a, b, c: reg_of(c)?, lut, x: false, cc: false, test: if pd & 7 == 7 { 0 } else { 3 }, pd }
         }
         (0x019, _) => {
             let ty = w.f(73, 2);
@@ -502,23 +561,36 @@ fn decode_ops(addr: u32, w: W) -> Option<Vec<Op>> {
         }
         (0x016, _) => Op::Prmt { d, a: s.a, b: s.b, c: s.c, mode: w.f(72, 3) as u8 },
         // LEA.HI: b + the high word of (c:a) << shift
+        // LEA.HI: b + the high word of (c:a) << shift; .X adds the carry of the LEA before it.
         (0x011, _) if w.b(80) => {
-            if w.b(74) || w.b(72) || s.b == Src::Reg(d) {
-                return None; // .X, a negated intermediate, or a destination that is b
+            if w.b(72) || w.pdst(81) != 7 {
+                return None; // a negated intermediate, a carry out
             }
             let shift = w.f(75, 5);
-            return Some(vec![
-                Op::Shf { d, lo: s.a, hi: reg_of(s.c)?, b: Src::Imm(shift), right: false, high: true, wrap: false, wide: true, signed: false, cc: false },
-                Op::IAdd3 { d, a: d, b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: false, cc: false },
-            ]);
+            let mut ops = Vec::new();
+            // .SX32 (bit 73): the high word is a's sign
+            let hi = if w.b(73) {
+                ops.push(Op::Shf { d: SCRATCH, lo: RZ, hi: s.a, b: Src::Imm(31), right: true, high: true, wrap: false, wide: true, signed: true, cc: false });
+                SCRATCH
+            } else {
+                reg_of(s.c)?
+            };
+            ops.push(Op::Shf { d: SCRATCH, lo: s.a, hi, b: Src::Imm(shift), right: false, high: true, wrap: false, wide: true, signed: false, cc: false });
+            ops.push(Op::IAdd3 { d, a: SCRATCH, b: s.b, c: RZ, neg: [false; 3], half: [0; 3], shift: 0, x: w.b(74), cc: false });
+            return Some(ops);
         }
+        // LEA: (a << shift) + b; a carry out (bits 81..84) goes to the carry flag for a LEA.HI.X.
         (0x011, _) => {
             if w.b(74) {
                 return None; // LEA.X
             }
-            Op::IScAdd { d, a: s.a, b: s.b, shift: w.f(75, 5) as u8, neg_a: w.b(72), neg_b: false, cc: false }
+            Op::IScAdd { d, a: s.a, b: s.b, shift: w.f(75, 5) as u8, neg_a: w.b(72), neg_b: false, cc: w.pdst(81) != 7 }
         }
+        // P2R d, PR, a, mask: the predicates where the mask has bits into byte n (bits 76..78) of a
+        (0x003, false) => Op::P2r { d, a: s.a, b: s.b, cc: false, byte: w.f(76, 2) as u8 },
         (0x013, false) => Op::I2I { d, b: s.b, m: Mod { abs: true, neg: false }, from: IntTy { bytes: 4, signed: true }, to: IntTy { bytes: 4, signed: true }, sel: 0, sat: false, cc: false },
+        // UFLO
+        (0x03d, true) => Op::Flo { d, b: s.b, not: s.bm.neg, signed: w.b(73), shift: w.b(74), cc: false },
         (0x100, false) => Op::Flo { d, b: s.b, not: s.bm.neg, signed: w.b(73), shift: w.b(74), cc: false },
         (0x109, false) => Op::PopC { d, b: s.b, not: s.bm.neg },
         (0x104 | 0x110, false) => Op::F2F {
@@ -939,7 +1011,7 @@ mod tests {
                 op: Op::ISetP {
                     pd: 0,
                     pn: 7,
-                    cmp: ICmpArgs { a: RZ, b: Src::Reg(ur2), cond: 5, signed: false, x: false, bop: BoolOp::And, p: PT },
+                    cmp: ICmpArgs { a: RZ, b: Src::Reg(ur2), cond: 5, signed: false, x: false, ex: None, bop: BoolOp::And, p: PT },
                 },
             }
         );
@@ -974,6 +1046,59 @@ mod tests {
         let ops: Vec<Op> = decode(0, raw).into_iter().map(|i| i.op).collect();
         let imad = |d, c, hi| Op::IMad { d, a: 6, b: Src::Reg(7), c, sa: true, sb: true, hi, neg_ab: false, neg_c: false, sat: false, x: hi, cc: !hi };
         assert_eq!(ops, vec![imad(SCRATCH, Src::Cb(0, 0x160), false), imad(3, Src::Cb(0, 0x164), true), Op::Mov { d: 2, b: Src::Reg(SCRATCH), lanes: 15 }]);
+    }
+
+    /// Instructions of TensorRT 10's kernels (YOLOv8n on the Orin), as nvdisasm would print them.
+    #[test]
+    fn tensorrt_kernel_instructions() {
+        let ops = |raw: u128| -> Vec<Op> { decode(0, raw).into_iter().map(|i| i.op).collect() };
+        let ur = |n| UNIFORM_BASE + n;
+        // UIMAD.WIDE.U32 UR6, UR5, UR8, UR6
+        let imad = |d, c, hi| Op::IMad { d, a: ur(5), b: Src::Reg(ur(8)), c, sa: false, sb: false, hi, neg_ab: false, neg_c: false, sat: false, x: hi, cc: !hi };
+        assert_eq!(
+            ops(0x001fc8000f8e0006_00000008050672a5),
+            vec![imad(SCRATCH, Src::Reg(ur(6)), false), imad(ur(7), Src::Reg(ur(7)), true), Op::Mov { d: ur(6), b: Src::Reg(SCRATCH), lanes: 15 }]
+        );
+        // UIMAD.WIDE UR18, UR4, 0x4, URZ
+        let imad = |d, c, hi| Op::IMad { d, a: ur(4), b: Src::Imm(4), c, sa: true, sb: true, hi, neg_ab: false, neg_c: false, sat: false, x: hi, cc: !hi };
+        assert_eq!(ops(0x000fe2000f8e023f_00000004041278a5), vec![imad(SCRATCH, Src::Reg(RZ), false), imad(ur(19), Src::Reg(RZ), true), Op::Mov { d: ur(18), b: Src::Reg(SCRATCH), lanes: 15 }]);
+        // ISETP.GE.U32.AND.EX P0, PT, R3, c[0x0][0x174], PT, P0
+        let Op::ISetP { pd: 0, pn: 7, cmp } = ops(0x000fda0003f06100_00005d0003007a0c)[0] else { panic!() };
+        assert_eq!((cmp.a, cmp.b, cmp.cond, cmp.signed, cmp.ex, cmp.p), (3, Src::Cb(0, 0x174), 6, false, Some(Pred { idx: 0, not: false }), PT));
+        // PLOP3.LUT P0, PT, PT, PT, UP0, 0x80, 0x0: P0 = UP0
+        let [Inst { op: Op::PSetP { pd: 0, c, .. }, .. }] = decode(0, 0x000fe20003f0f008_000000000000781c)[..] else { panic!() };
+        assert_eq!(c, Pred { idx: 8, not: false });
+        // P2R R157, PR, RZ, 0xf
+        assert_eq!(ops(0x000fe40000000000_0000000fff9d7803), vec![Op::P2r { d: 157, a: RZ, b: Src::Imm(0xf), cc: false, byte: 0 }]);
+        // LEA.HI.X.SX32 R18, R17, R0, 0x1, P4 (adds the carry flag)
+        let v = ops(0x080fe400020f0eff_0000000011127211);
+        assert!(matches!(v[..], [Op::Shf { d: SCRATCH, lo: RZ, hi: 17, signed: true, .. }, Op::Shf { d: SCRATCH, lo: 17, hi: SCRATCH, .. }, Op::IAdd3 { d: 18, a: SCRATCH, b: Src::Reg(0), x: true, .. }]), "{v:?}");
+        // LEA.HI R70, R139, R70, RZ, 0x1e: the destination is the addend
+        let v = ops(0x000fe200078ff0ff_000000468b467211);
+        assert!(matches!(v[..], [Op::Shf { d: SCRATCH, lo: 139, hi: RZ, .. }, Op::IAdd3 { d: 70, a: SCRATCH, b: Src::Reg(70), x: false, .. }]), "{v:?}");
+        // LDGSTS.E.BYPASS.128 [R39], [R12.64], P3
+        assert_eq!(ops(0x0003e20009901c4c_000000000c277fae), vec![Op::Ldgsts { s: 39, soff: 0, g: 12, goff: 0, ty: MemTy::B128, p: Pred { idx: 3, not: false } }]);
+        // @!UP1 UIMAD.U32 UR10, UR17, 0x1, UR7 (nvdisasm): the guard is a uniform predicate
+        let g = decode(0, 0x000fe4000f8e000700000001110a98a4);
+        assert_eq!(g[0].pred, Pred { idx: 9, not: true });
+        // LDGSTS.E.LTC128B [R154+0x10], [R146.64+0x100], P0 (offsets from nvdisasm)
+        let raw = 0x0003e20008121948_00000000929a7fae | 1 << 48 | 1 << 40;
+        assert_eq!(ops(raw), vec![Op::Ldgsts { s: 154, soff: 0x10, g: 146, goff: 0x100, ty: MemTy::B32, p: Pred { idx: 0, not: false } }]);
+        // LDS.128 R76, [R110+UR5+0x1800]
+        let v = ops(0x0004e20008000c00_001800056e4c7984);
+        assert_eq!(v, vec![Op::IScAdd { d: SCRATCH, a: 110, b: Src::Reg(ur(5)), shift: 0, neg_a: false, neg_b: false, cc: false }, Op::Lds { d: 76, a: SCRATCH, off: 0x1800, ty: MemTy::B128 }]);
+        // STS.128 [R132+UR15], R76
+        assert!(matches!(ops(0x004fe80008000c0f_0000004c84007988)[..], [Op::IScAdd { d: SCRATCH, a: 132, .. }, Op::Sts { r: 76, a: SCRATCH, off: 0, ty: MemTy::B128 }]));
+        // BRA.CONV ~URZ, 0x1b0 at 0x180 / BRA.DIV ~URZ; CALL.REL.NOINC 0x3f0 at 0x190; RET.REL R20
+        assert_eq!(decode(0x180, 0x000fea000b800000_000000237f007947)[0].op, Op::Bra { t: 0x1b0, cond: 15, all: false });
+        assert_eq!(ops(0x000fea000b800000_000000227f007947), vec![Op::Nop]);
+        assert_eq!(decode(0x190, 0x002fea0003c00000_0000025000007944)[0].op, Op::Cal { t: 0x3f0 });
+        assert_eq!(ops(0x000fea0003800000_0000001414007950), vec![Op::Ret { cond: 15 }]);
+        // RED.E.ADD.F32.FTZ.RN.STRONG.GPU [R16.64+0x4], R7; ATOMG.E.INC.STRONG.GPU PT, R7, [R20.64], R7
+        assert_eq!(ops(0x0005e4000c10e78c_000004071000798e), vec![Op::Atom { d: RZ, a: 16, b: 7, off: 4, op: AtomOp::Add, ty: AtomTy::F32, wide: true }]);
+        assert_eq!(ops(0x000ea800099ee1cc_00000007140779a8), vec![Op::Atom { d: 7, a: 20, b: 7, off: 0, op: AtomOp::Inc, ty: AtomTy::U32, wide: true }]);
+        // UFLO.U32 UR4, UR5
+        assert_eq!(ops(0x000fe200080e0000_00000005000472bd), vec![Op::Flo { d: ur(4), b: Src::Reg(ur(5)), not: false, signed: false, shift: false, cc: false }]);
     }
 
     /// NVIDIA's GLES compute shader of gltest: v[i] = group * 1000 + s[63 - tid], s[tid] =

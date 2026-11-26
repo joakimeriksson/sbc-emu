@@ -116,8 +116,8 @@ impl<'a> View<'a> {
 pub(super) struct Guest<'a, 'b> {
     view: &'a mut View<'b>,
     fault: std::cell::Cell<bool>,
-    /// The first address that faulted, for tracing.
-    pub first_fault: std::cell::Cell<Option<(u64, bool)>>,
+    /// The first address that faulted, whether a write, and the shader's last memory instruction.
+    pub first_fault: std::cell::Cell<Option<(u64, bool, u32)>>,
 }
 
 impl<'a, 'b> Guest<'a, 'b> {
@@ -148,7 +148,7 @@ impl maxwell::Memory for Guest<'_, '_> {
                     out[..n].fill(0);
                     self.fault.set(true);
                     if self.first_fault.get().is_none() {
-                        self.first_fault.set(Some((address, false)));
+                        self.first_fault.set(Some((address, false, maxwell::compute::last_memory_pc())));
                     }
                 }
             }
@@ -161,7 +161,7 @@ impl maxwell::Memory for Guest<'_, '_> {
         if self.view.write(address, data).is_none() {
             self.fault.set(true);
             if self.first_fault.get().is_none() {
-                self.first_fault.set(Some((address, true)));
+                self.first_fault.set(Some((address, true, maxwell::compute::last_memory_pc())));
             }
         }
     }

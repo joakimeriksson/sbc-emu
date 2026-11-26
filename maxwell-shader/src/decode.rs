@@ -509,6 +509,7 @@ fn two_source(w: W, form: Form, sel: u32) -> Option<Op> {
             cond: w.f(49, 3) as u8,
             signed: w.b(48),
             x: w.b(43),
+            ex: None,
             bop: w.bop(45)?,
             p: w.pred(39, 42),
         })

@@ -355,6 +355,9 @@ pub struct ICmpArgs {
     pub signed: bool,
     /// Continue a 64-bit comparison: use the flags of the low half's subtraction.
     pub x: bool,
+    /// SM70's ISETP.EX: continue a 64-bit comparison of the high halves, the low halves' result
+    /// (same condition, unsigned) in this predicate.
+    pub ex: Option<Pred>,
     pub bop: BoolOp,
     pub p: Pred,
 }
@@ -484,6 +487,9 @@ pub enum Op {
     Stl { r: Reg, a: Reg, off: i32, ty: MemTy },
     Lds { d: Reg, a: Reg, off: i32, ty: MemTy },
     Sts { r: Reg, a: Reg, off: i32, ty: MemTy },
+    /// SM80 LDGSTS: global `[g.64 + goff]` to shared `[s + soff]` (done at once, not
+    /// asynchronously); where `p` is false the shared bytes become zeros.
+    Ldgsts { s: Reg, soff: i32, g: Reg, goff: i32, ty: MemTy, p: Pred },
     Atom { d: Reg, a: Reg, b: Reg, off: i32, op: AtomOp, ty: AtomTy, wide: bool },
     AtomS { d: Reg, a: Reg, b: Reg, off: i32, op: AtomOp, ty: AtomTy },
     Ald { d: Reg, a: Reg, v: Reg, addr: u16, n: u8, patch: bool, output: bool },

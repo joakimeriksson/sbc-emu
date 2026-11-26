@@ -15,12 +15,19 @@ pub struct Compute {
     pub launches: u64,
     /// Volta-and-later descriptors (QMD v3, Tegra234's C7C0) and SM70 programs
     pub sm70: bool,
+    /// the last launch's program address, grid and workgroup size (for fault reports)
+    pub last: (u64, [u32; 3], [u32; 3]),
 }
 
 impl Default for Compute {
     fn default() -> Self {
-        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0, sm70: false }
+        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0, sm70: false, last: (0, [0; 3], [0; 3]) }
     }
+}
+
+/// The program offset of the last memory instruction a shader ran, for fault reports.
+pub fn last_memory_pc() -> u32 {
+    maxwell_shader::exec::LAST_MEMORY_PC.load(Ordering::Relaxed)
 }
 
 /// What a launch descriptor says.
@@ -116,8 +123,39 @@ struct Group<'a, 'm, const N: usize> {
     local: [[u32; N]; 3],
 }
 
+/// SBC_TRACE_PC=offset[,reg...]: print the lanes' predicates and those registers each time a compute
+/// shader reaches that program offset (the first 4000 times).
+/// SBC_TRACE_PROGRAM=address limits it to one program.
+fn trace_config() -> &'static Option<(u32, Vec<usize>, Option<u64>)> {
+    static C: std::sync::OnceLock<Option<(u32, Vec<usize>, Option<u64>)>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let v = std::env::var("SBC_TRACE_PC").ok()?;
+        let mut it = v.split(',');
+        let pc = u32::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+        let program = std::env::var("SBC_TRACE_PROGRAM").ok().and_then(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16).ok());
+        Some((pc, it.filter_map(|r| r.parse().ok()).collect(), program))
+    })
+}
+
+/// The program of the launch running (for tracing).
+static TRACE_PROGRAM: AtomicU64 = AtomicU64::new(0);
+
 impl<const N: usize> Host<N> for Group<'_, '_, N> {
     common_host!(N);
+
+    fn trace(&mut self, addr: u32, inst: &maxwell_shader::isa::Inst, lanes: &Lanes<N>) {
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let Some((pc, regs, program)) = trace_config() else { return };
+        if addr != *pc || program.is_some_and(|p| p != TRACE_PROGRAM.load(Ordering::Relaxed)) || HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
+            return;
+        }
+        let preds: Vec<String> = lanes.pred.iter().chain(&lanes.upred).map(|p| format!("{p:08x}")).collect();
+        eprintln!("[trace] {addr:#x} group {:?} local0 {:?} active {:08x} {:?} P0-7,UP0-7 {}", self.group, [self.local[0][0], self.local[1][0], self.local[2][0]], lanes.active_mask(), inst.op, preds.join(" "));
+        for &r in regs {
+            let v: Vec<String> = lanes.gpr[r].iter().map(|x| format!("{x:x}")).collect();
+            eprintln!("[trace]   R{r} {}", v.join(" "));
+        }
+    }
 
     fn sysval(&mut self, sys: u8) -> [u32; N] {
         match sys {
@@ -189,6 +227,8 @@ impl Compute {
         let launch = if self.sm70 { Launch::decode_v3(&words) } else { Launch::decode(&words) };
         self.launches += 1;
         let base = launch.program.unwrap_or_else(|| self.address(0x1608));
+        self.last = (base + launch.entry as u64, launch.groups, launch.threads);
+        TRACE_PROGRAM.store(self.last.0, Ordering::Relaxed);
         if let Some(program) = pipe.program(base, launch.entry, mem) {
             self.run(&launch, &program, pipe, mem);
         }

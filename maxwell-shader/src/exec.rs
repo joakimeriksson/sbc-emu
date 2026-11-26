@@ -53,6 +53,8 @@ pub struct Lanes<const N: usize> {
     pub gpr: Box<[[u32; N]; 256]>,
     /// Predicates, one bit per lane; predicate 7 is all ones.
     pub pred: [u32; 8],
+    /// SM70's uniform predicates UP0..UP6 and UPT (7, all ones); `Pred` names them as 8..15.
+    pub upred: [u32; 8],
     /// Flags, one bit per lane.
     /// Condition flags, one bit per lane: zero, sign, carry, overflow.
     pub(crate) cc: [u32; 4],
@@ -89,12 +91,18 @@ impl<const N: usize> Default for Lanes<N> {
 }
 
 impl<const N: usize> Lanes<N> {
+    /// The lanes running (for tracing).
+    pub fn active_mask(&self) -> u32 {
+        self.active
+    }
+
     pub fn new() -> Self {
         assert!((4..=32).contains(&N) && N.is_multiple_of(4), "lanes come in quads, at most 32");
         let gpr: Box<[[u32; N]]> = vec![[0; N]; 256].into_boxed_slice();
         Lanes {
             gpr: gpr.try_into().unwrap(),
             pred: [0, 0, 0, 0, 0, 0, 0, !0],
+            upred: [0, 0, 0, 0, 0, 0, 0, !0],
             cc: [0; 4],
             local: Vec::new(),
             local_size: 0,
@@ -135,6 +143,7 @@ impl<const N: usize> Lanes<N> {
         self.gpr[..n.max(self.written)].fill([0; N]);
         self.written = n;
         self.pred = [0, 0, 0, 0, 0, 0, 0, !0];
+        self.upred = [0, 0, 0, 0, 0, 0, 0, !0];
         self.cc = [0; 4];
         self.pc = p.entry;
         self.start = lanes & all::<N>();
@@ -201,15 +210,15 @@ impl<const N: usize> Lanes<N> {
 
     #[inline(always)]
     fn putp(&mut self, p: u8, m: u32, v: u32) {
-        if p != 7 {
-            let r = &mut self.pred[p as usize & 7];
+        if p & 7 != 7 {
+            let r = if p < 8 { &mut self.pred[p as usize] } else { &mut self.upred[p as usize & 7] };
             *r = *r & !m | v & m;
         }
     }
 
     #[inline(always)]
     fn p(&self, p: Pred) -> u32 {
-        let v = self.pred[p.idx as usize & 7];
+        let v = if p.idx < 8 { self.pred[p.idx as usize] } else { self.upred[p.idx as usize & 7] };
         if p.not {
             !v
         } else {
@@ -627,6 +636,9 @@ fn extend(b: &[u8], ty: MemTy) -> u32 {
         _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
     }
 }
+
+/// The program offset of the last memory instruction run (on any thread): a fault report's best guess.
+pub static LAST_MEMORY_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// What a fault returns (and prints with SBC_SHADER_FAULT=1).
 #[cold]
@@ -1461,8 +1473,13 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
         | Op::Stl { .. }
         | Op::Lds { .. }
         | Op::Sts { .. }
+        | Op::Ldgsts { .. }
         | Op::Atom { .. }
-        | Op::AtomS { .. } => memory(l, h, m, &inst.op),
+        | Op::AtomS { .. } => {
+            // which instruction a memory fault came from, for the GPU's fault reports
+            LAST_MEMORY_PC.store(p.words.get(pc as usize).map_or(0, |w| w.0), std::sync::atomic::Ordering::Relaxed);
+            memory(l, h, m, &inst.op)
+        }
 
         Op::Ald { d, a, v, addr, n, patch, output } => {
             let (base, vtx) = (l.gpr[a as usize], l.gpr[v as usize]);
@@ -1731,6 +1748,18 @@ fn fcmp<const N: usize, H: Host<N>>(l: &Lanes<N>, h: &H, c: &FCmpArgs) -> u32 {
 fn icmp<const N: usize, H: Host<N>>(l: &Lanes<N>, h: &H, c: &ICmpArgs) -> u32 {
     let a = &l.gpr[c.a as usize];
     let b = l.src(h, c.b);
+    if let Some(low) = c.ex {
+        // SM70: the high halves decide, unless they are equal: then the low halves' result does
+        let (lt, eq, gt, low) = (cmpi(1, c.signed, a, &b), cmpi(2, c.signed, a, &b), cmpi(4, c.signed, a, &b), l.p(low));
+        return match c.cond & 7 {
+            0 => 0,
+            1 | 3 => lt | eq & low,
+            2 => eq & low,
+            4 | 6 => gt | eq & low,
+            5 => !eq | low,
+            _ => !0,
+        };
+    }
     if !c.x {
         return cmpi(c.cond, c.signed, a, &b);
     }
@@ -2195,6 +2224,20 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
                 let at = near(l, a, off, i) as usize;
                 let n = ty.bytes();
                 let buf = data(l, r, ty, i);
+                if let Some(s) = at.checked_add(n).and_then(|e| h.shared().get_mut(at..e)) {
+                    s.copy_from_slice(&buf[..n]);
+                }
+            }
+        }
+        Op::Ldgsts { s, soff, g, goff, ty, p } => {
+            let valid = l.p(p);
+            for i in lanes(m & !quiet) {
+                let n = ty.bytes();
+                let mut buf = [0; 16];
+                if valid >> i & 1 != 0 {
+                    h.load(global(l, g, goff, true, i), &mut buf[..n]);
+                }
+                let at = near(l, s, soff, i) as usize;
                 if let Some(s) = at.checked_add(n).and_then(|e| h.shared().get_mut(at..e)) {
                     s.copy_from_slice(&buf[..n]);
                 }

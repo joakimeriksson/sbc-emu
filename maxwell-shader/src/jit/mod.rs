@@ -441,6 +441,8 @@ struct Lower {
     cbs: Vec<(u8, u32)>,
     /// The block's `Active` node, once made.
     active: Option<Id>,
+    /// The instruction uses a uniform predicate (SM70's UP0..UPT), which blocks do not have.
+    uniform_pred: bool,
 }
 
 impl Lower {
@@ -496,6 +498,7 @@ impl Lower {
     }
     /// A predicate as a mask of lanes.
     fn p(&mut self, p: Pred) -> Id {
+        self.uniform_pred |= p.idx > 7;
         let v = if p.idx & 7 == 7 { self.simm(!0) } else { self.node(Node::Pred(p.idx & 7)) };
         if p.not {
             self.snot(v)
@@ -530,6 +533,7 @@ impl Lower {
     }
     /// Writes a predicate (or, 8..11, a flag).
     fn putp(&mut self, p: u8, m: Id, v: Id) {
+        self.uniform_pred |= p > 7;
         if p != 7 {
             self.node(Node::StoreP(if p < 8 { p & 7 } else { p }, v, m));
         }
@@ -637,7 +641,8 @@ impl Lower {
 /// have nodes of it: the caller drops the block's IR from there, or, in `compile`, stops).
 fn lower(l: &mut Lower, inst: &Inst) -> Option<()> {
     let mark = (l.ir.len(), l.cbs.len());
-    let r = lower_op(l, inst);
+    l.uniform_pred = false;
+    let r = lower_op(l, inst).filter(|_| !l.uniform_pred);
     if r.is_none() {
         l.ir.truncate(mark.0);
         l.cbs.truncate(mark.1);
@@ -954,7 +959,7 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             let v = l.sel(t, x, y);
             l.put(d, m, v);
         }
-        Op::ISet { d, cmp: cmp @ ICmpArgs { x: false, .. }, bf, cc: false } => {
+        Op::ISet { d, cmp: cmp @ ICmpArgs { x: false, ex: None, .. }, bf, cc: false } => {
             let a = l.reg(cmp.a);
             let b = l.src(cmp.b);
             let t = l.cmpi(cmp.cond, cmp.signed, a, b);
@@ -963,7 +968,7 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             let v = l.bools(r, bf);
             l.put(d, m, v);
         }
-        Op::ISetP { pd, pn, cmp: cmp @ ICmpArgs { x: false, .. } } => {
+        Op::ISetP { pd, pn, cmp: cmp @ ICmpArgs { x: false, ex: None, .. } } => {
             let a = l.reg(cmp.a);
             let b = l.src(cmp.b);
             let t = l.cmpi(cmp.cond, cmp.signed, a, b);
