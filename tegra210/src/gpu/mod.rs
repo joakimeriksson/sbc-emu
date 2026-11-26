@@ -524,6 +524,44 @@ mod tests {
         assert!(!g.waiting);
     }
 
+    /// Through the channel registers: closing one stream of a context keeps the context for the
+    /// others; closing the last leaves it behind, and a new channel with it starts it fresh.
+    #[test]
+    fn closing_a_stream_keeps_its_context_for_the_others() {
+        // instance blocks at 0x1000, 0x2000 and 0x3000 of RAM, in one address space, all naming
+        // context 0x12_3456_7000 (words 132, 133)
+        let (smmu, mut ram) = (Smmu::default(), vec![0u8; 0x4000]);
+        let put = |ram: &mut [u8], o: usize, v: u32| ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        for inst in [0x1000, 0x2000, 0x3000] {
+            put(&mut ram, inst + 0x200, 0x8000_0000);
+            put(&mut ram, inst + 4 * 132, 0x3456_7000);
+            put(&mut ram, inst + 4 * 133, 0x12);
+        }
+        let k = (0x8000_0000, 0x12_3456_7000);
+        let mut g = Gpu { time_scale: 0.0, runlist: vec![1, 2, 3], ..Default::default() };
+        // (each write runs what is bound and enabled)
+        let bind = |g: &mut Gpu, ram: &mut [u8], id: u64, inst: Option<u64>| {
+            g.write(0x80_0000 + 8 * id, inst.map_or(0, |i| 1 << 31 | ((crate::RAM_BASE + i) >> 12) as u32), &smmu, ram);
+        };
+        let enable = |g: &mut Gpu, ram: &mut [u8], id: u64| g.write(0x80_0004 + 8 * id, 1 << 10, &smmu, ram);
+        let mark = |g: &mut Gpu| g.host.engine(k).map(|e| e.threed.regs[0]);
+        bind(&mut g, &mut ram, 1, Some(0x1000));
+        bind(&mut g, &mut ram, 2, Some(0x2000));
+        enable(&mut g, &mut ram, 1);
+        enable(&mut g, &mut ram, 2);
+        g.host.engine(k).unwrap().threed.regs[0] = 7;
+        // stream 2 is closed; stream 1 runs on with what the context holds
+        bind(&mut g, &mut ram, 2, None);
+        enable(&mut g, &mut ram, 1);
+        assert_eq!(mark(&mut g), Some(7));
+        // the last one is closed; a new process's channel with the same context starts it fresh
+        bind(&mut g, &mut ram, 1, None);
+        assert_eq!(mark(&mut g), Some(7));
+        bind(&mut g, &mut ram, 3, Some(0x3000));
+        enable(&mut g, &mut ram, 3);
+        assert_eq!(mark(&mut g), Some(0));
+    }
+
     #[test]
     fn alarms_compare_the_low_word() {
         let mut g = Gpu::default();

@@ -146,6 +146,12 @@ impl Host {
         }
     }
 
+    /// The 3D/compute state a context holds between runs.
+    #[cfg(test)]
+    pub(super) fn engine(&mut self, context: (u64, u64)) -> Option<&mut maxwell::Engine> {
+        self.engines.get_mut(&context)
+    }
+
     /// `points`: host1x's sync point values (the channels' increments are applied to them too).
     pub fn run_channel(&mut self, id: u32, inst: u64, view: &mut View, now: u64, points: &mut [u32]) -> Done {
         let context = context(id, inst, view.space.directory, view.smmu, view.ram);
