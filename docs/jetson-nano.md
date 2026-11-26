@@ -41,7 +41,8 @@ Without `--sd-persist` the card is copy-on-write and the image file is not chang
 
 Options: `--net nat|local|none` (default `nat`: DHCP, DNS and NAT to the host's network),
 `--usb-drive IMAGE` (a USB stick), `--hdmi-mode WxH` or `off` (default 1280x720), `--vnc :N`,
-`--screenshot FILE`, `--smp N`, `--ram-mb N` (default 4096), `--gdb PORT`.
+`--screenshot FILE`, `--smp N`, `--ram-mb N` (default 4096), `--gdb PORT`, `--threads single|multi`
+([below](#speed)).
 
 ## Webcam
 
@@ -128,9 +129,38 @@ listed at exit (`SBC_STUB_LOG=1` prints them as they happen).
 
 The A64 JIT ([jit.md](jit.md)) is on by default on AArch64 hosts (macOS and Linux), on x86-64
 Linux and in the browser; `--no-jit` or `SBC_JIT=0` runs the interpreter alone. The quick start
-reaches its shell in about 6 s on an Apple M-series Mac. The cores take turns on one host
-thread. GPU shaders are interpreted natively, on several host threads; in the browser they have
-a JIT to WebAssembly.
+reaches its shell in about 6 s on an Apple M-series Mac. GPU shaders are interpreted natively,
+on several host threads; in the browser they have a JIT to WebAssembly.
+
+`--threads single|multi` chooses how the cores run. `single` (the default, and the only way in
+the browser): they take turns on one host thread in rounds of virtual time, and a run with the
+same inputs is repeatable. `multi`: a host thread per core, as on the Raspberry Pi 4
+([raspberry-pi-4.md](raspberry-pi-4.md)) and with the same design (`tegra210/src/mt.rs`): RAM is
+shared directly, barriers and acquire/release are host fences and store-exclusive a host
+compare-and-swap, TLB and instruction-cache invalidations reach the other cores before the
+issuing core goes on, and the devices, the GIC and the GPU sit behind one lock. Guest time
+follows the host's clock, and runs are not repeatable. Linux ticks on the Tegra timers (TMR10-13,
+one a core), not the arch timer: a core asleep in WFI waits for the next device event as well as
+its own arch timer, and a busy core brings the devices up to the time when one is due (Python's
+`time.sleep(0)` takes 105 µs, `sleep(100 µs)` 222 µs; 58 and 158 µs with one thread). A GPU
+submission runs on the thread of the core that hands it over and keeps the lock while it runs:
+the other cores go on until they touch a device, and the I/O loop waits. Its time is the host's,
+all of it: one thread caps a submission at a second of guest time, a thread per core does not,
+so a submission of many seconds can leave the guest's ticks that long late (RCU stall and
+soft-lockup warnings). A debugger's breakpoints, watchpoints and single steps run on one thread.
+
+YOLOv8n on the CPU (ncnn, four threads; `demos/jetson-yolo-cam`), host seconds per frame on an
+Apple M-series Mac shared with other jobs: 0.45 with one thread, 0.11 to 0.2 with a thread per
+core (the ncnn threads wait for each other, so a busy host shows). On the GPU (NVK) both take about
+2.5 s: the GPU's work is the frame. Detections are the same. The demo's own times are guest
+time, which with one thread counts instructions (1 ns each) and with a thread per core follows
+the host's clock.
+
+Mesa takes the first render node it finds, and which one that is depends on the order in which
+nouveau and `tegra-drm` probe at boot: with `tegra-drm`'s (as in most boots with
+`--threads multi`), Mesa's `tegra` driver fails three GLES 2 scenes and hangs in GLES 3's
+`wr_staging`. `scripts/jetson-nano-gl.txt` therefore sets `MESA_LOADER_DRIVER_OVERRIDE=nouveau`,
+and its results are the same in both modes.
 
 ## Not there yet
 

@@ -83,8 +83,8 @@ backends that compile hot code into small modules the page instantiates.
 Each machine has one virtual clock. By default its cores take turns on one host thread in
 fixed slices, and devices act at virtual times, so the same run gives the same result every
 time. When all cores wait for an interrupt, the clock moves on to the next device event, never
-ahead of the wall clock. The Raspberry Pi 4 and the Orange Pi 5 can instead
-run a host thread per core (`--threads multi`): faster, and no longer repeatable.
+ahead of the wall clock. The Raspberry Pi 4, the Orange Pi 5 and the Jetson Nano can
+instead run a host thread per core (`--threads multi`): faster, and no longer repeatable.
 
 ## Adding a board
 

@@ -2,6 +2,8 @@
 # Start tools/gpu_server.py on the host first. A Debian 13 card with gcc, libegl-dev, libgles-dev and
 # Mesa; the root password given on the command line (systemd.set_credential, see jetson-nano-debian.txt)
 # is "nano".
+# nouveau explicitly: Mesa takes the first render node it finds, which is tegra-drm's when that
+# driver probes after nouveau (as it usually does with --threads multi), and its tegra driver fails.
 wait-serial login:
 sleep 1
 serial root\r
@@ -9,6 +11,6 @@ wait-serial Password:
 serial nano\r
 wait-serial ~#
 sleep 1
-serial python3 -c "import urllib.request as u; open('/tmp/run.sh','wb').write(u.urlopen('http://10.0.2.2:8800/run-nano.sh').read())"; sh /tmp/run.sh; echo NANO-GL-""END\r
+serial python3 -c "import urllib.request as u; open('/tmp/run.sh','wb').write(u.urlopen('http://10.0.2.2:8800/run-nano.sh').read())"; MESA_LOADER_DRIVER_OVERRIDE=nouveau sh /tmp/run.sh; echo NANO-GL-""END\r
 wait-serial NANO-GL-END
 quit
