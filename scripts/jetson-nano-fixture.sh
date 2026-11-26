@@ -13,9 +13,9 @@ MIRROR=${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}
 ROOTFS=alpine-minirootfs-3.24.4-aarch64.tar.gz
 ROOTFS_URL=$MIRROR/v3.24/releases/aarch64/$ROOTFS
 ROOTFS_SHA=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
-KERNEL_APK=linux-lts-6.18.64-r0.apk
+KERNEL_APK=linux-lts-6.18.65-r0.apk
 KERNEL_URL=$MIRROR/v3.24/main/aarch64/$KERNEL_APK
-KERNEL_SHA=9d380c0060d43d4929b2de6b5ae85ccdb389d4179f222b19439ff7158d645f4a
+KERNEL_SHA=cdf4e799807d7e63db228ed18ed4110b133cfec65fc81e9466744bb552dd9389
 
 mkdir -p "$OUT/downloads"
 
