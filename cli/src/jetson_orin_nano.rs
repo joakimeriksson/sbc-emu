@@ -81,6 +81,8 @@ fn execute(args: &[String]) -> Result<(), String> {
         &[
             "--usb-drive",
             "--camera-source",
+            "--net",
+            "--hostfwd",
             "--smp",
             "--rover-uart",
             "--uart-driver",
@@ -117,6 +119,26 @@ fn execute(args: &[String]) -> Result<(), String> {
         Some("on") => true,
         Some(_) => return Err("--bpmp expects on or off".into()),
     };
+    // --net nat|local plugs in a USB Ethernet adapter (none by default: the board's own Ethernet
+    // is not modelled); --hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT, repeatable, needs nat
+    let net = match crate::arg(args, "--net") {
+        None | Some("none") => None,
+        Some("nat") => Some(true),
+        Some("local") => Some(false),
+        Some(_) => return Err("--net expects nat, local or none".into()),
+    };
+    let forwards = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--hostfwd")
+        .map(|(i, _)| {
+            let spec = args.get(i + 1).map_or("", String::as_str);
+            parse_hostfwd(spec).ok_or(format!("--hostfwd {spec}: expected tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !forwards.is_empty() && net != Some(true) {
+        return Err("--hostfwd needs --net nat".into());
+    }
     let ram = serial_board::ram_bytes(args, 4096)?;
     let read = |path: &str| std::fs::read(path).map_err(|err| format!("{path}: {err}"));
     let kernel = read(crate::arg(args, "--kernel").ok_or("expected --kernel IMAGE")?)?;
@@ -150,6 +172,18 @@ fn execute(args: &[String]) -> Result<(), String> {
                 machine.attach_camera(emu_core::usb::Camera::with_source(crate::camera::start(spec)?));
             } else if args.iter().any(|a| a == "--camera") {
                 machine.attach_camera(emu_core::usb::Camera::new());
+            }
+            if let Some(nat) = net {
+                machine.connect_usb_network(nat, std::env::var_os("SBC_NET_LOG").is_some());
+            }
+            for &(host, guest) in &forwards {
+                match machine.forward_tcp(host, guest) {
+                    Ok(()) if !announced.get() => eprintln!("[{TAG}] forwarding {host} -> guest port {guest}"),
+                    Ok(()) => {}
+                    // after a reboot the old machine still holds the port while the new one starts
+                    Err(e) if announced.get() => eprintln!("[{TAG}] --hostfwd after the reboot: {e}"),
+                    Err(e) => return Err(format!("--hostfwd: {e}")),
+                }
             }
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
@@ -264,5 +298,27 @@ impl RoverLink {
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
         )
+    }
+}
+
+/// QEMU's `--hostfwd` syntax, `tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (the host address
+/// defaults to 127.0.0.1; the guest address is ignored: there is one guest).
+fn parse_hostfwd(spec: &str) -> Option<(std::net::SocketAddr, u16)> {
+    let (h, g) = spec.strip_prefix("tcp:")?.split_once('-')?;
+    let (ha, hp) = h.rsplit_once(':')?;
+    let gp = g.rsplit_once(':').map_or(g, |(_, p)| p).parse::<u16>().ok()?;
+    let host = format!("{}:{hp}", if ha.is_empty() { "127.0.0.1" } else { ha }).parse().ok()?;
+    Some((host, gp))
+}
+
+#[cfg(test)]
+mod hostfwd_tests {
+    #[test]
+    fn hostfwd_specs() {
+        let local: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        assert_eq!(super::parse_hostfwd("tcp::5000-:5000"), Some((local, 5000)));
+        assert_eq!(super::parse_hostfwd("tcp:127.0.0.1:5000-:80"), Some((local, 80)));
+        assert_eq!(super::parse_hostfwd("udp::5000-:5000"), None);
+        assert_eq!(super::parse_hostfwd("tcp::x-:5000"), None);
     }
 }

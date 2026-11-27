@@ -311,6 +311,7 @@ dependencies = [
  "maxwell",
  "maxwell-tex",
  "peripherals",
+ "sbc-net",
 ]
 
 [[package]]

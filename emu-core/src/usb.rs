@@ -439,7 +439,7 @@ impl UsbDevice for Storage {
 
 /// The devices that exist, and which controller port each one is plugged into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum DevId { #[default] Keyboard, Tablet, Storage, Camera }
+pub enum DevId { #[default] Keyboard, Tablet, Storage, Camera, Net }
 
 #[derive(Default)]
 pub struct Devices {
@@ -447,6 +447,7 @@ pub struct Devices {
     pub tablet: Tablet,
     pub storage: Option<Storage>,
     pub camera: Option<Camera>,
+    pub net: Option<Net>,
 }
 
 impl Devices {
@@ -456,6 +457,7 @@ impl Devices {
             DevId::Tablet => Some(&mut self.tablet),
             DevId::Storage => self.storage.as_mut().map(|s| s as &mut dyn UsbDevice),
             DevId::Camera => self.camera.as_mut().map(|s| s as &mut dyn UsbDevice),
+            DevId::Net => self.net.as_mut().map(|s| s as &mut dyn UsbDevice),
         }
     }
 
@@ -467,13 +469,14 @@ impl Devices {
             DevId::Tablet => self.tablet.has_input(),
             DevId::Storage => false,
             DevId::Camera => self.camera.as_ref().is_some_and(|c| c.has_input()),
+            DevId::Net => self.net.as_ref().is_some_and(|n| n.has_input()),
         }
     }
 }
 
 // ---------------------------------------------------------------------- snapshots
 
-crate::snap_enum!(DevId { Keyboard, Tablet, Storage, Camera });
+crate::snap_enum!(DevId { Keyboard, Tablet, Storage, Camera, Net });
 crate::snap_struct!(Std { address, pending_address, configured, pending_in });
 crate::snap_struct!(Keyboard { st, held, modifiers, events, last, leds });
 crate::snap_struct!(Tablet { st, events, last, state });
@@ -494,16 +497,19 @@ impl crate::snap::Snap for Storage {
 /// All of it, pending input included (`save_state` is the Pi 4's older format).
 impl crate::snap::Snap for Devices {
     fn save(&self, w: &mut crate::snap::W) {
-        let Self { kbd, tablet, storage, camera } = self;
+        let Self { kbd, tablet, storage, camera, net } = self;
         kbd.save(w); tablet.save(w);
         crate::snap::save_fitted(w, storage);
-        w.bool(camera.is_some());
+        // one flag for the devices this format leaves out (refused on load)
+        w.bool(camera.is_some() || net.is_some());
     }
     fn load(&mut self, r: &mut crate::snap::R) -> Result<(), crate::snap::SnapError> {
-        let Self { kbd, tablet, storage, camera } = self;
+        let Self { kbd, tablet, storage, camera, net } = self;
         kbd.load(r)?; tablet.load(r)?;
         crate::snap::load_fitted(r, storage, "a USB stick (--usb-drive)")?;
-        if r.bool()? || camera.is_some() { return Err(crate::snap::SnapError("the USB camera is not in this snapshot format".into())); }
+        if r.bool()? || camera.is_some() || net.is_some() {
+            return Err(crate::snap::SnapError("the USB camera and the USB Ethernet adapter are not in this snapshot format".into()));
+        }
         Ok(())
     }
 }
@@ -777,5 +783,144 @@ mod camera_tests {
         // a picture of the wrong size is not sent
         *source.lock().unwrap() = Some(vec![7; 16]);
         assert_eq!(cam.render(), pattern);
+    }
+}
+
+// ---------------------------------------------------------------------- the Ethernet adapter
+
+/// A USB Ethernet adapter of the CDC-ECM class (Linux's `cdc_ether`, no vendor driver needed):
+/// one Ethernet frame per bulk transfer each way, and the link state on an interrupt endpoint.
+/// The board moves the frames between `take_tx`/`deliver` and its virtual network.
+pub struct Net {
+    pub st: Std,
+    /// frames from the guest, for the network
+    tx: VecDeque<Vec<u8>>,
+    /// frames for the guest
+    rx: VecDeque<Vec<u8>>,
+    /// link notifications sent so far (connection, then speed)
+    notified: u8,
+}
+
+/// The adapter's MAC address, as its iMACAddress string gives it. Universally administered
+/// (bit 1 of the first byte clear): Linux names such an ECM adapter `eth0`, a locally administered
+/// one `usb0`.
+pub const NET_MAC: [u8; 6] = [0x00, 0x1d, 0xe1, 0x5b, 0x0e, 0x01];
+const NET_MAC_STR: &str = "001DE15B0E01";
+/// The most frames waiting in either direction; more are dropped, as a full NIC would.
+const NET_QUEUE: usize = 512;
+const NET_MAX_FRAME: usize = 1514;
+
+impl Default for Net { fn default() -> Self { Self::new() } }
+
+impl Net {
+    pub fn new() -> Self { Net { st: Std::default(), tx: VecDeque::new(), rx: VecDeque::new(), notified: 0 } }
+    /// The frames the guest sent since the last call.
+    pub fn take_tx(&mut self) -> Vec<Vec<u8>> { self.tx.drain(..).collect() }
+    /// Frames from the network; dropped while the guest has not configured the adapter.
+    pub fn deliver(&mut self, frames: impl IntoIterator<Item = Vec<u8>>) {
+        for f in frames {
+            if self.st.configured && self.rx.len() < NET_QUEUE && (14..=NET_MAX_FRAME).contains(&f.len()) { self.rx.push_back(f); }
+        }
+    }
+    /// The guest has configured the adapter (the link is up for it).
+    pub fn up(&self) -> bool { self.st.configured }
+}
+
+impl UsbDevice for Net {
+    fn std(&mut self) -> &mut Std { &mut self.st }
+    fn device_desc(&self) -> Vec<u8> { let mut d = device_desc(0x0005, 64, 0x0200); d[4] = 2; d } // class: communications
+    fn config_desc(&self) -> Vec<u8> {
+        let mut d = vec![9, 2, 0, 0, 2, 1, 0, 0x80, 50]; // 2 interfaces, 100 mA
+        d.extend_from_slice(&[9, 4, 0, 0, 1, 0x02, 0x06, 0, 0]); // interface 0: communications, ECM, 1 endpoint
+        d.extend_from_slice(&[5, 0x24, 0x00, 0x10, 0x01]); // CDC header 1.10
+        d.extend_from_slice(&[5, 0x24, 0x06, 0, 1]); // union: control 0, data 1
+        d.extend_from_slice(&[13, 0x24, 0x0f, 3, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0]); // Ethernet: MAC in string 3, 1514-byte segments
+        d.extend_from_slice(&[7, 5, 0x83, 3, 16, 0, 8]); // interrupt IN 3, 16 bytes, every 16 ms (high speed)
+        d.extend_from_slice(&[9, 4, 1, 0, 0, 0x0a, 0, 0, 0]); // interface 1 alt 0: data, no endpoints (no traffic)
+        d.extend_from_slice(&[9, 4, 1, 1, 2, 0x0a, 0, 0, 0]); // interface 1 alt 1: data, 2 endpoints
+        d.extend_from_slice(&[7, 5, 0x81, 2, 0x00, 0x02, 0]); // bulk IN 1, 512 bytes
+        d.extend_from_slice(&[7, 5, 0x02, 2, 0x00, 0x02, 0]); // bulk OUT 2, 512 bytes
+        let n = d.len() as u16;
+        d[2..4].copy_from_slice(&n.to_le_bytes());
+        d
+    }
+    fn string(&self, i: u8) -> Option<&'static str> { match i { 1 => Some("sbc-emu"), 2 => Some("Virtual USB Ethernet"), 3 => Some(NET_MAC_STR), _ => None } }
+    fn speed(&self) -> Speed { Speed::High }
+    fn class_setup(&mut self, s: [u8; 8]) -> Option<Vec<u8>> {
+        match (s[0], s[1]) {
+            (0x21, 0x40..=0x43) => Some(Vec::new()), // multicast filters, power filters, packet filter: everything passes
+            (0x81, 10) => Some(vec![1]),              // GET_INTERFACE
+            _ => None,
+        }
+    }
+    fn data_in(&mut self, ep: u8, max: usize) -> Option<Vec<u8>> {
+        if !self.st.configured { return None; }
+        match ep {
+            // NETWORK_CONNECTION (connected), then CONNECTION_SPEED_CHANGE (480 Mb/s both ways)
+            3 if self.notified == 0 && max >= 8 => { self.notified = 1; Some(vec![0xa1, 0x00, 1, 0, 0, 0, 0, 0]) }
+            3 if self.notified == 1 && max >= 16 => {
+                self.notified = 2;
+                let mut n = vec![0xa1, 0x2a, 0, 0, 0, 0, 8, 0];
+                n.extend_from_slice(&480_000_000u32.to_le_bytes());
+                n.extend_from_slice(&480_000_000u32.to_le_bytes());
+                Some(n)
+            }
+            1 => {
+                // a frame larger than the transfer cannot be split (ECM ends a frame with a short packet): drop it
+                while self.rx.front().is_some_and(|f| f.len() > max) { self.rx.pop_front(); }
+                self.rx.pop_front()
+            }
+            _ => None,
+        }
+    }
+    fn data_out(&mut self, ep: u8, data: &[u8]) {
+        if ep == 2 && data.len() >= 14 && self.tx.len() < NET_QUEUE {
+            // Linux pads a frame that fills whole packets with one byte; Ethernet's own length rules ignore it
+            self.tx.push_back(data[..data.len().min(NET_MAX_FRAME)].to_vec());
+        }
+    }
+    fn has_input(&self) -> bool { self.st.configured && (self.notified < 2 || !self.rx.is_empty()) }
+    fn bus_reset(&mut self) { self.st = Std::default(); self.notified = 0; self.tx.clear(); self.rx.clear(); }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    fn setup(d: &mut Net, s: [u8; 8]) -> Vec<u8> { assert!(d.setup(s)); d.control_in(4096) }
+
+    /// Enumeration as cdc_ether does it, the link notifications, and frames both ways.
+    #[test]
+    fn an_ecm_adapter_reports_its_mac_and_link_and_passes_frames() {
+        let mut d = Net::new();
+        let cfg = setup(&mut d, [0x80, 6, 0, 2, 0, 0, 0xff, 0]);
+        assert_eq!(u16::from_le_bytes([cfg[2], cfg[3]]) as usize, cfg.len());
+        // the Ethernet functional descriptor names string 3, which holds the MAC as 12 hex digits
+        let eth = cfg.windows(3).position(|w| w == [13, 0x24, 0x0f]).unwrap();
+        let mac = setup(&mut d, [0x80, 6, cfg[eth + 3], 3, 9, 4, 0xff, 0]);
+        let mac: String = mac[2..].chunks(2).map(|c| c[0] as char).collect();
+        assert_eq!(mac, NET_MAC.iter().map(|b| format!("{b:02X}")).collect::<String>());
+        assert_eq!(NET_MAC[0] & 2, 0, "universally administered: Linux calls it eth0");
+        // nothing moves before SET_CONFIGURATION
+        d.deliver([vec![0; 60]]);
+        assert!(!d.has_input() && d.data_in(1, 2048).is_none());
+        setup(&mut d, [0x00, 9, 1, 0, 0, 0, 0, 0]);
+        setup(&mut d, [0x21, 0x43, 0x0e, 0, 0, 0, 0, 0]); // SET_ETHERNET_PACKET_FILTER
+        assert!(d.has_input());
+        assert_eq!(d.data_in(3, 16).unwrap()[..4], [0xa1, 0x00, 1, 0]);
+        assert_eq!(d.data_in(3, 16).unwrap()[1], 0x2a);
+        assert!(!d.has_input() && d.data_in(3, 16).is_none());
+        // frames in: one per transfer; not Ethernet-sized (5000, 3 bytes): never queued
+        d.deliver([vec![1; 60], vec![2; 1514], vec![3; 5000], vec![4; 3], vec![5; 100]]);
+        assert_eq!(d.data_in(1, 2048), Some(vec![1; 60]));
+        // too big for the transfer: dropped, the next one comes
+        assert_eq!(d.data_in(1, 1000), Some(vec![5; 100]));
+        assert_eq!(d.data_in(1, 2048), None);
+        // frames out, the padding byte trimmed to the largest frame
+        d.data_out(2, &[5; 1515]);
+        d.data_out(2, &[6; 10]);
+        assert_eq!(d.take_tx(), vec![vec![5; 1514]]);
+        d.bus_reset();
+        assert!(!d.has_input());
     }
 }

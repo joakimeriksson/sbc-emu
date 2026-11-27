@@ -59,6 +59,9 @@ struct Soc {
     firmware: Option<Firmware>,
     xhci: Option<peripherals::xhci::Xhci>,
     usb: emu_core::usb::Devices,
+    /// the network behind the USB Ethernet adapter, and when it is next polled
+    net: Option<sbc_net::net::VirtualNet>,
+    net_next: u64,
     now: u64,
     interrupts_changed: bool,
 }
@@ -310,6 +313,8 @@ impl Machine {
             firmware: None,
             xhci: None,
             usb: Default::default(),
+            net: None,
+            net_next: 0,
             now: 0,
             interrupts_changed: true,
         };
@@ -379,11 +384,43 @@ impl Machine {
         self.plug_usb();
     }
 
+    /// Plug a USB Ethernet adapter (CDC-ECM, port 3) into sbc-net's virtual network (DHCP, DNS,
+    /// ICMP, as on the other boards); `nat` also relays guest TCP/UDP to the host's network
+    /// (native builds only).
+    pub fn connect_usb_network(&mut self, nat: bool, log: bool) {
+        #[allow(unused_mut)]
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.net = Some(net);
+        self.soc.usb.net = Some(emu_core::usb::Net::new());
+        self.enable_usb();
+        self.plug_usb();
+    }
+
+    /// Forward a host TCP address to a guest port (needs `connect_usb_network` with NAT).
+    pub fn forward_tcp(&mut self, host: std::net::SocketAddr, guest_port: u16) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let nat = self.soc.net.as_mut().and_then(|n| n.nat.as_mut()).ok_or("port forwarding needs the USB network with NAT")?;
+            nat.add_forward(host, guest_port).map_err(|e| format!("{host}: {e}"))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (host, guest_port);
+            Err("port forwarding needs host sockets".into())
+        }
+    }
+
     fn plug_usb(&mut self) {
         use emu_core::usb::DevId;
         let devs = [
             self.soc.usb.storage.is_some().then_some(DevId::Storage),
             self.soc.usb.camera.is_some().then_some(DevId::Camera),
+            self.soc.usb.net.is_some().then_some(DevId::Net),
         ];
         if let Some(xhci) = self.soc.xhci.as_mut() {
             xhci.attach(&devs);
@@ -482,7 +519,22 @@ impl Machine {
             .filter(|&deadline| deadline > self.now)
             .chain(self.soc.uarta.next_event(self.now))
             .chain(self.soc.xhci.as_ref().and_then(|x| x.next_event(&self.soc.usb)))
+            .chain((self.soc.net.is_some() && self.soc.usb.net.as_ref().is_some_and(|n| n.up())).then_some(self.soc.net_next))
             .min()
+    }
+
+    /// Exchange frames between the USB Ethernet adapter and the network: what the guest sent goes
+    /// out at once, the network is polled every millisecond with NAT (10 ms without).
+    fn pump_network(&mut self) {
+        let (Some(net), Some(dev)) = (self.soc.net.as_mut(), self.soc.usb.net.as_mut()) else { return };
+        let now_us = self.now / 1000;
+        for frame in dev.take_tx() {
+            dev.deliver(net.handle(&frame, now_us));
+        }
+        if self.now >= self.soc.net_next {
+            dev.deliver(net.poll(now_us));
+            self.soc.net_next = self.now + if net.nat.is_some() { 1_000_000 } else { 10_000_000 };
+        }
     }
 
     fn update_interrupts(&mut self) {
@@ -491,6 +543,7 @@ impl Machine {
                 .gic
                 .set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
         }
+        self.pump_network();
         if let Some(xhci) = self.soc.xhci.as_mut() {
             let mut dma = peripherals::dma::Dma { ram: &mut self.soc.ram, base: RAM_BASE };
             xhci.tick(self.now, &mut dma, &mut self.soc.usb);
