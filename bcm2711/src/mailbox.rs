@@ -43,6 +43,8 @@ pub struct Mailbox {
     pub audio_clk: u32,
     /// firmware clock rates as set (Hz, by clock id)
     pub rates: [u32; 32],
+    /// the board revision code GET_BOARD_REVISION reports (the Pi 3 machine sets its own)
+    pub revision: u32,
 }
 
 impl Mailbox {
@@ -51,6 +53,7 @@ impl Mailbox {
             temp_mc: 45_000,
             audio_clk: 0,
             rates: std::array::from_fn(|k| clock_rate(k as u32)),
+            revision: BOARD_REVISION,
             rd: VecDeque::new(),
             cfg: 0,
             fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
@@ -133,7 +136,7 @@ impl Mailbox {
             // the audio clock
             0x0001_0007 => set(v, &[0, 3, 0, 4, 0, 5, 0, 13, 0, 14, 0, AUDIO_CLK]),
             0x0001_0001 => set(v, &[0]),
-            0x0001_0002 => set(v, &[BOARD_REVISION]),
+            0x0001_0002 => set(v, &[self.revision]),
             0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)
             0x0001_0004 => set(v, &[SERIAL as u32, (SERIAL >> 32) as u32]),
             0x0001_0005 => set(v, &[0, fb.base as u32]),

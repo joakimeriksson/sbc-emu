@@ -1,0 +1,12 @@
+[package]
+name = "bcm2837"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+emu-core = { path = "../emu-core" }
+arm-a64 = { path = "../arm-a64" }
+bcm2711 = { path = "../bcm2711" }
+peripherals = { path = "../peripherals" }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

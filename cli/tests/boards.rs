@@ -18,13 +18,10 @@ fn lists_support_honestly_and_rejects_before_opening_images() {
     assert!(listing
         .lines()
         .any(|l| l.starts_with("orangepi-one") && l.contains("experimental")));
-    for board in ["pi4b", "orangepi5", "orangepi-one", "tinkerboard", "orangepi-rv", "esp32s31", "jetson-nano"] {
+    for board in ["pi4b", "pi3b", "orangepi5", "orangepi-one", "tinkerboard", "orangepi-rv", "esp32s31", "jetson-nano"] {
         assert!(listing.lines().any(|l| l.split_whitespace().next() == Some(board)), "{board} missing: {listing}");
     }
-    // recognised, but not a board that runs: not listed
-    assert!(!listing.contains("pi3b"), "{listing}");
     for (board, error) in [
-        ("pi3b", "not implemented"),
         ("orangepi-pc", "unknown board"),
         ("typo", "unknown board"),
     ] {
@@ -76,10 +73,10 @@ fn malformed_selector_cannot_silently_boot_pi() {
 }
 
 #[test]
-fn initramfs_rejects_unimplemented_board_before_opening_busybox() {
-    let output = run(&["mkinitramfs", "--board", "pi3b", "--busybox", "/nonexistent/busybox", "-o", "/tmp/unused-sbc-initramfs"]);
+fn initramfs_rejects_unknown_board_before_opening_busybox() {
+    let output = run(&["mkinitramfs", "--board", "pi3", "--busybox", "/nonexistent/busybox", "-o", "/tmp/unused-sbc-initramfs"]);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("not implemented"));
+    assert!(stderr.contains("unknown board"));
     assert!(!stderr.contains("/nonexistent/busybox"));
 }

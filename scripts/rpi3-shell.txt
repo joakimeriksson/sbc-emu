@@ -1,0 +1,37 @@
+# Raspberry Pi 3 Model B+ (milestone 1 of docs/rpi3-plan.md): the Raspberry Pi OS kernel with a
+# BusyBox initramfs, the shell on the mini UART. Four Cortex-A53s up, each core's generic timer
+# through the per-core interrupt controller, IPIs through its mailboxes, devices through the
+# ARM-side controller; the board identity, the RNG and thermal sensor, then reboot and power off.
+# Each value is waited for: a prompt alone is not enough (the quotes keep the echoed command line
+# from matching).
+#   sbc-emu sd cat cache/os/raspios-lite.img kernel8.img | gunzip > cache/rpi3/Image
+#   sbc-emu mkinitramfs --board pi3b --busybox busybox.static -o cache/rpi3/initramfs.cpio
+#   sbc-emu run --board pi3b --kernel cache/rpi3/Image --initrd cache/rpi3/initramfs.cpio \
+#     --script scripts/rpi3-shell.txt --timeout 120
+wait-serial pi3#
+serial dmesg | grep 'Brought'; echo\r
+wait-serial smp: Brought up 1 node, 4 CPUs
+serial printf 'CPUS_%s' $(nproc); echo\r
+wait-serial CPUS_4
+serial grep -c 'CPU part.*: 0xd03' /proc/cpuinfo | sed 's/^/A53_/'\r
+wait-serial A53_4
+serial cat /proc/device-tree/model; echo\r
+wait-serial Raspberry Pi 3 Model B Plus Rev 1.3
+serial awk '/Revision/ { printf "REV_%s", $3 }' /proc/cpuinfo; echo\r
+wait-serial REV_a020d3
+serial for i in 1 2 3 4; do (n=0; while [ $n -lt 20000 ]; do n=$((n+1)); done) & done; wait; printf 'PAR_%s' OK; echo\r
+wait-serial PAR_OK
+serial sleep 1; awk '/arch_timer/ { n = 0; for (i = 2; i <= 5; i++) if ($i > 0) n++; printf "TICK_%s%d", "ON", n } /IPI0/ { m = 0; for (i = 2; i <= 5; i++) if ($i > 0) m++; printf " IPI_%s%d", "ON", m }' /proc/interrupts; echo\r
+wait-serial TICK_ON4 IPI_ON4
+serial head -c 64 /dev/hwrng | od -An -tx1 | wc -l | sed 's/^ */RNG_LINES_/'\r
+wait-serial RNG_LINES_4
+serial awk '{ printf "TEMP_%s%d", "C", $1 / 1000 }' /sys/class/thermal/thermal_zone0/temp; echo\r
+wait-serial TEMP_C45
+serial echo bcm2837-test > /tmp/probe; test "$(cat /tmp/probe)" = bcm2837-test && printf 'FS_%s' OK; echo\r
+wait-serial FS_OK
+serial reboot -f\r
+wait-serial Booting Linux on physical CPU
+wait-serial pi3#
+serial printf 'REBOOT_%s' OK; echo\r
+wait-serial REBOOT_OK
+serial poweroff -f\r

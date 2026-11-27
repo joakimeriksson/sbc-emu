@@ -13,6 +13,7 @@ pub use emu_core::Stop;
 /// A borrowed host view; ownership and board-specific configuration stay with adapters.
 pub enum Machine<'a> {
     Pi4(&'a mut bcm2711::Machine),
+    Pi3(&'a mut bcm2837::Machine),
     OrangePi5(&'a mut rk3588::Machine),
     OrangePiOne(&'a mut allwinner_h3::Machine),
     TinkerBoard(&'a mut rockchip_rk3288::Machine),
@@ -59,6 +60,7 @@ impl Machine<'_> {
     pub fn run(&mut self, budget: u64) -> Stop {
         match self {
             Self::Pi4(m) => m.run(budget),
+            Self::Pi3(m) => m.run(budget),
             Self::OrangePi5(m) => m.run(budget),
             Self::OrangePiOne(m) => m.run(budget),
             Self::TinkerBoard(m) => m.run(budget),
@@ -74,6 +76,7 @@ impl Machine<'_> {
     pub fn idle_until(&mut self, time_ns: u64) {
         match self {
             Self::Pi4(m) => m.idle_until(time_ns),
+            Self::Pi3(m) => m.idle_until(time_ns),
             Self::OrangePi5(m) => m.idle_until(time_ns),
             Self::OrangePiOne(m) => m.idle_until(time_ns),
             Self::TinkerBoard(m) => m.idle_until(time_ns),
@@ -90,6 +93,7 @@ impl Machine<'_> {
     pub fn serial_input(&mut self, byte: u8) -> bool {
         match self {
             Self::OrangePi5(m) => m.serial_input(byte),
+            Self::Pi3(m) => m.serial_input(byte),
             Self::OrangePiOne(m) => m.serial_input(byte),
             Self::TinkerBoard(m) => m.serial_input(byte),
             Self::OrangePiRv(m) => m.serial_input(byte),
@@ -119,6 +123,7 @@ impl Machine<'_> {
     pub fn serial_output(&self) -> &[u8] {
         match self {
             Self::Pi4(m) => &m.soc.uart.out,
+            Self::Pi3(m) => m.serial_output(),
             Self::OrangePi5(m) => &m.soc.uart.out,
             Self::OrangePiOne(m) => m.serial_output(),
             Self::TinkerBoard(m) => m.serial_output(),
@@ -132,6 +137,7 @@ impl Machine<'_> {
     pub fn take_serial_output(&mut self) -> Vec<u8> {
         match self {
             Self::Pi4(m) => std::mem::take(&mut m.soc.uart.out),
+            Self::Pi3(m) => m.take_serial_output(),
             Self::OrangePi5(m) => std::mem::take(&mut m.soc.uart.out),
             Self::OrangePiOne(m) => m.take_serial_output(),
             Self::TinkerBoard(m) => m.take_serial_output(),

@@ -142,6 +142,19 @@ impl Target for bcm2711::Machine {
     fn describe(&self, c: usize) -> String { format!("CPU#{c} {:?} EL{}", self.state[c], self.cpus[c].el) }
 }
 
+impl Target for bcm2837::Machine {
+    fn cores(&self) -> usize { self.cpus.len() }
+    fn layout(&self) -> Layout { a64_layout() }
+    fn reg(&self, c: usize, n: usize) -> Option<Vec<u8>> { a64_reg(&self.cpus[c], n) }
+    fn set_reg(&mut self, c: usize, n: usize, b: &[u8]) -> bool { a64_set_reg(&mut self.cpus[c], n, b).is_some() }
+    fn read(&mut self, c: usize, va: u64, len: usize) -> Option<Vec<u8>> { self.debug_read(c, va, len) }
+    fn write(&mut self, c: usize, va: u64, data: &[u8]) -> bool { self.debug_write(c, va, data) }
+    fn breakpoint(&mut self, addr: u64, insert: bool) { bcm2837::Machine::breakpoint(self, addr, insert) }
+    fn watchpoint(&mut self, addr: u64, len: u64, kind: u8, insert: bool) { bcm2837::Machine::watchpoint(self, addr, len, kind, insert) }
+    fn step(&mut self, c: usize) -> Option<Stop> { self.debug_step(c) }
+    fn describe(&self, c: usize) -> String { format!("CPU#{c} Cortex-A53 {:?} EL{}", self.state[c], self.cpus[c].el) }
+}
+
 impl Target for rk3588::Machine {
     fn cores(&self) -> usize { self.cpus.len() }
     fn layout(&self) -> Layout { a64_layout() }
