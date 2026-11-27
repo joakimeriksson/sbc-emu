@@ -48,6 +48,17 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver 
 
 The script reads the drive's first bytes through `/dev/sda` and finds the camera in sysfs.
 
+### Booting a full JetPack image from the drive
+
+The drive can hold a whole JetPack root filesystem, such as a vendor's ready-made image. Boot
+that image's own kernel (`/boot/Image` on its `APP` partition) with
+`root=PARTUUID=<APP's PARTUUID> rootwait rootfstype=ext4`. A JetPack 6 kernel needs
+`console=ttyAMA0` and `earlycon=pl011,mmio32,0x031d0000` for the console.
+
+Such images are often cut short after their last partition: the GPT describes the original disk,
+which can be larger than the file. Linux rejects a GPT whose backup header lies past the end of
+the disk, so sbc-emu presents the drive at the size the GPT gives. The extra sectors read as zeros.
+
 ## Rover UART
 
 The bring-up device tree exposes Tegra UART A at `0x03100000` as `/dev/ttyS1`
