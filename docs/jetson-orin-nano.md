@@ -26,6 +26,28 @@ or `--no-jit` for the interpreter. The scripted check expects six cores and 4 Gi
 It checks an architectural timer interrupt and a GIC IPI on every core, then
 offlines and onlines CPU 5.
 
+## USB
+
+`--usb-drive IMAGE` plugs a USB stick into the board, and `--camera` plugs in a webcam.
+`--camera-source SPEC` gives the webcam pictures from the host, as on the
+[Jetson Nano](jetson-nano.md). The drive is copy-on-write: each boot starts from the image.
+
+- **The controller:** sbc-emu's shared xHCI core at the Orin's XUSB host address `0x03610000`,
+  on SPI 163. The device tree names it `generic-xhci`, so Linux's platform xHCI driver runs it.
+  The JetPack kernel builds that driver in, together with USB storage and ext4.
+- **Not modelled:** NVIDIA's XUSB firmware, the pad controller and the device-mode port.
+  The webcam needs the `uvcvideo` module from the kernel's module package.
+
+```sh
+printf SBC_EMU_USB_DRIVE > /tmp/usb.img && truncate -s 64m /tmp/usb.img
+target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver tegra \
+  --usb-drive /tmp/usb.img --camera \
+  --kernel cache/jetson-r3644/Image --initrd cache/jetson-orin-nano/initramfs.cpio.gz \
+  --script scripts/jetson-orin-nano-usb.txt --timeout 300
+```
+
+The script reads the drive's first bytes through `/dev/sda` and finds the camera in sysfs.
+
 ## Rover UART
 
 The bring-up device tree exposes Tegra UART A at `0x03100000` as `/dev/ttyS1`
