@@ -202,6 +202,15 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
         dt.end();
     }
 
+    if machine.usb_enabled() {
+        dt.begin("usb@3610000");
+        dt.str("compatible", "generic-xhci");
+        dt.cells("reg", &range(crate::XHCI, crate::XHCI_SIZE));
+        dt.cells("interrupts", &[0, crate::XHCI_SPI, 4]);
+        dt.empty("dma-coherent");
+        dt.end();
+    }
+
     dt.begin("serial@3100000");
     dt.cells("reg", &range(UARTA, UART_SIZE));
     dt.cells("interrupts", &[0, UARTA_SPI, 4]);

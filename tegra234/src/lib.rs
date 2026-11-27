@@ -34,6 +34,12 @@ const UART_SPI: u32 = 285;
 const UARTA: u64 = 0x0310_0000;
 const UARTA_SPI: u32 = 112;
 const COUNTER_HZ: u64 = 31_250_000;
+/// The xHCI host's place on the real chip (Orin TRM: XUSB_HOST at 0x03610000, SPI 163). Here it is
+/// sbc-emu's shared xHCI core behind Linux's generic platform driver, without NVIDIA's XUSB
+/// firmware, pad control or falcon.
+pub const XHCI: u64 = 0x0361_0000;
+pub const XHCI_SIZE: u64 = 0x1_0000;
+pub const XHCI_SPI: u32 = 163;
 
 #[derive(Default)]
 struct Firmware {
@@ -51,6 +57,8 @@ struct Soc {
     mss_nvlink: mss_nvlink::MssNvlink,
     gpu_node: bool,
     firmware: Option<Firmware>,
+    xhci: Option<peripherals::xhci::Xhci>,
+    usb: emu_core::usb::Devices,
     now: u64,
     interrupts_changed: bool,
 }
@@ -81,6 +89,9 @@ impl Soc {
             value
         } else if let Some(value) = self.mss_nvlink.read(addr) {
             value
+        } else if let Some(xhci) = self.xhci.as_mut().filter(|_| (XHCI..XHCI + XHCI_SIZE).contains(&addr)) {
+            self.interrupts_changed = true;
+            xhci.read(addr - XHCI)
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
             self.uart.read(addr - UART)
@@ -114,6 +125,10 @@ impl Soc {
             self.gic.dist_write(addr - GICD, value);
         } else if (GICR..GICR + GICR_SIZE).contains(&addr) {
             self.gic.redist_write(addr - GICR, value);
+        } else if let Some(xhci) = self.xhci.as_mut().filter(|_| (XHCI..XHCI + XHCI_SIZE).contains(&addr)) {
+            self.interrupts_changed = true;
+            let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
+            xhci.write(addr - XHCI, value, &mut dma, &mut self.usb);
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.uart.write(addr - UART, value);
         } else if (UARTA..UARTA + UART_SIZE).contains(&addr) {
@@ -293,6 +308,8 @@ impl Machine {
             mss_nvlink: Default::default(),
             gpu_node: false,
             firmware: None,
+            xhci: None,
+            usb: Default::default(),
             now: 0,
             interrupts_changed: true,
         };
@@ -334,6 +351,43 @@ impl Machine {
     pub fn enable_gpu(&mut self) {
         self.enable_bpmp();
         self.soc.gpu_node = true;
+    }
+
+    /// An xHCI host with nothing plugged in; `attach_usb_drive` and `attach_camera` add devices.
+    pub fn enable_usb(&mut self) {
+        if self.soc.xhci.is_none() {
+            self.soc.xhci = Some(peripherals::xhci::Xhci::new(peripherals::xhci::Layout { usb2: 0..4, usb3: 4..8 }));
+            self.plug_usb();
+        }
+    }
+
+    pub fn usb_enabled(&self) -> bool {
+        self.soc.xhci.is_some()
+    }
+
+    /// Plug a USB drive in (port 1).
+    pub fn attach_usb_drive(&mut self, disk: Box<dyn emu_core::disk::Disk + Send>) {
+        self.soc.usb.storage = Some(emu_core::usb::Storage::new(disk));
+        self.enable_usb();
+        self.plug_usb();
+    }
+
+    /// Plug a USB webcam in (port 2).
+    pub fn attach_camera(&mut self, camera: emu_core::usb::Camera) {
+        self.soc.usb.camera = Some(camera);
+        self.enable_usb();
+        self.plug_usb();
+    }
+
+    fn plug_usb(&mut self) {
+        use emu_core::usb::DevId;
+        let devs = [
+            self.soc.usb.storage.is_some().then_some(DevId::Storage),
+            self.soc.usb.camera.is_some().then_some(DevId::Camera),
+        ];
+        if let Some(xhci) = self.soc.xhci.as_mut() {
+            xhci.attach(&devs);
+        }
     }
 
     pub fn enable_display(&mut self) {
@@ -427,6 +481,7 @@ impl Machine {
             .map(|(timer, offset)| timer.cval.wrapping_add(offset).saturating_mul(32))
             .filter(|&deadline| deadline > self.now)
             .chain(self.soc.uarta.next_event(self.now))
+            .chain(self.soc.xhci.as_ref().and_then(|x| x.next_event(&self.soc.usb)))
             .min()
     }
 
@@ -435,6 +490,12 @@ impl Machine {
             self.soc
                 .gic
                 .set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
+        }
+        if let Some(xhci) = self.soc.xhci.as_mut() {
+            let mut dma = peripherals::dma::Dma { ram: &mut self.soc.ram, base: RAM_BASE };
+            xhci.tick(self.now, &mut dma, &mut self.soc.usb);
+            let irq = xhci.irq();
+            self.soc.gic.set_line((XHCI_SPI + 32) as usize, irq);
         }
         self.soc
             .gic

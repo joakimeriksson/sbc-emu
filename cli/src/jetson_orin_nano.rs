@@ -74,9 +74,13 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
+    // (--camera takes no value)
+    let valued: Vec<String> = args.iter().filter(|a| *a != "--camera").cloned().collect();
     serial_board::validate_options(
-        args,
+        &valued,
         &[
+            "--usb-drive",
+            "--camera-source",
             "--smp",
             "--rover-uart",
             "--uart-driver",
@@ -133,6 +137,18 @@ fn execute(args: &[String]) -> Result<(), String> {
                 machine.enable_gpu();
             } else if bpmp {
                 machine.enable_bpmp();
+            }
+            // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
+            if let Some(path) = crate::arg(args, "--usb-drive") {
+                machine.attach_usb_drive(Box::new(
+                    crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?,
+                ));
+            }
+            // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern); --camera-source SPEC feeds it
+            if let Some(spec) = crate::arg(args, "--camera-source") {
+                machine.attach_camera(emu_core::usb::Camera::with_source(crate::camera::start(spec)?));
+            } else if args.iter().any(|a| a == "--camera") {
+                machine.attach_camera(emu_core::usb::Camera::new());
             }
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
