@@ -90,6 +90,8 @@ fn execute(args: &[String]) -> Result<(), String> {
             (None, None) => return Err("nothing to boot".into()),
         };
         if let Some(d) = disk.clone() { m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(Box::new(d))); }
+        // SBC_SD_TRACE=1: the SD host's commands and data on stderr
+        m.soc.sd.trace = std::env::var("SBC_SD_TRACE").is_ok_and(|v| v == "1");
         if !announced.replace(true) {
             eprintln!(
                 "[pi3] {} (BCM2837): {smp} Cortex-A53 core(s) ({}, {}), {} MiB RAM ({} MiB for Linux), per-core and ARM-side interrupt controllers, \

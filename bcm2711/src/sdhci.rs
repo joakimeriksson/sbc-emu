@@ -249,7 +249,13 @@ impl Sdhci {
             (true, 13) => { let mut s = vec![0u8; 64]; s[0] = 0x80; self.special = Some(s); r1(self) }
             (false, 13) => r1(self),
             (_, 16) => r1(self),
-            (_, 12) => { self.xfer = Xfer::None; self.raise(INT_XFER_DONE); r1(self) }
+            // STOP_TRANSMISSION: transfer complete marks the end of busy, so only for an R1b
+            // stop (Linux sends a read's stop as plain R1) or one that cut a transfer short
+            (_, 12) => {
+                if resp_ty == 3 || self.xfer != Xfer::None { self.raise(INT_XFER_DONE); }
+                self.xfer = Xfer::None;
+                r1(self)
+            }
             (false, 23) => { self.pre_count = Some(arg); r1(self) }
             // erase: CMD32/CMD33 set the first and last block, CMD38 (R1b) erases. Linux uses it
             // for discard only (the queue's write_zeroes_max_bytes is 0), after which the data is

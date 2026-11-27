@@ -44,6 +44,8 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     // the 3B+'s console is the mini UART: the PL011 belongs to Bluetooth (not modelled yet)
     f.str("serial0", &format!("/soc/serial@{}", node(m::AUX + 0x40)));
     f.str("serial1", &format!("/soc/serial@{}", node(m::UART0)));
+    f.str("uart0", &format!("/soc/serial@{}", node(m::UART0)));
+    f.str("uart1", &format!("/soc/serial@{}", node(m::AUX + 0x40)));
     f.str("mmc0", &format!("/soc/mmc@{}", node(m::SDHCI)));
     f.end();
 
