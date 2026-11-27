@@ -1,0 +1,69 @@
+# Raspberry Pi 3 Model B+ (milestone 3 of docs/rpi3-plan.md): Raspberry Pi OS Lite's first boot
+# driven with the USB keyboard on tty1 (the firmware framebuffer's console), then a login on the
+# serial console and the USB and network checks: the hub tree, the LAN7800's gigabit link, DHCP,
+# ping, DNS and an HTTP fetch through the NAT, and the cost of the USB interrupt while idle.
+# The keyboard sits behind the LAN7515's hub (full speed, split transactions); the Ethernet is
+# the LAN7800 behind its second hub (high speed, bulk transfers held until frames arrive).
+#
+# The HTTP fetch goes to a server on the host's IPv4 loopback, which the NAT reaches as the
+# gateway (port 8731); start one first, serving this directory:
+#   python3 -m http.server 8731 --bind 127.0.0.1 --directory scripts &
+#   sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-firstboot.txt --timeout 900
+# The wizard (keyboard layout, user name, password twice) is on tty1 a few seconds of guest time
+# after the serial login prompt. Its dialogs drop input typed before they open, so each step
+# waits in guest time (`sleep`) before typing; screenshots of tty1 go to out/.
+wait-serial raspberrypi login:
+sleep 8
+screenshot out/rpi3-01-keyboard-layout.png
+type \n
+sleep 6
+screenshot out/rpi3-02-username.png
+type pi\n
+sleep 6
+type raspberry\n
+sleep 6
+type raspberry\n
+sleep 8
+type \n
+sleep 10
+screenshot out/rpi3-03-tty1-login.png
+# log in on tty1 with the keyboard and leave a mark for the serial session to read
+type pi\n
+sleep 4
+type raspberry\n
+sleep 8
+type echo typed-on-tty1-$((6*7)) > /tmp/kbd.txt\n
+sleep 3
+screenshot out/rpi3-04-tty1-shell.png
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial cat /tmp/kbd.txt\r
+wait-serial typed-on-tty1-42
+# logged in on both consoles: a snapshot to resume from (--restore out/rpi3-firstboot.snap)
+save out/rpi3-firstboot.snap
+# the USB tree as on a real 3B+: the root hub, the LAN7515's two hubs, its Ethernet; the
+# keyboard and tablet on two of the USB-A ports
+serial lsusb -t\r
+wait-serial Driver=lan78xx, 480M
+serial lsusb | sort\r
+wait-serial ID 0424:7800
+serial echo $(cat /sys/class/net/eth0/address /sys/class/net/eth0/speed /sys/class/net/eth0/carrier) LINK\r
+wait-serial 02:5b:c0:00:03:01 1000 1 LINK
+# NetworkManager has the DHCP lease by now
+serial ip -4 -o addr show eth0 | awk '{ print $3, $4 }'\r
+wait-serial inet 10.0.2.15/24
+serial ping -c 3 -W 2 $(ip route | awk '/default/ { print $3 }') | tail -2 | head -1\r
+wait-serial 3 received, 0% packet loss
+serial getent hosts example.com > /dev/null && echo DNS_OK$((1))\r
+wait-serial DNS_OK1
+serial wget -qO- http://$(ip route | awk '/default/ { print $3 }'):8731/rpi3-firstboot.txt | head -1 | cut -c 1-40\r
+wait-serial # Raspberry Pi 3 Model B+ (milestone 3
+# the USB interrupt rate with the machine idle (SOF every millisecond, hub and Ethernet polls held)
+serial a=$(awk '/dwc2/ { print $2 + $3 + $4 + $5 }' /proc/interrupts); sleep 10; b=$(awk '/dwc2/ { print $2 + $3 + $4 + $5 }' /proc/interrupts); echo USB_IRQS$((0))_PER_SECOND $(( (b - a) / 10 )); echo DONE_$((6 * 7))\r
+wait-serial USB_IRQS0_PER_SECOND
+wait-serial DONE_42
+quit

@@ -400,6 +400,9 @@ impl Soc {
         if let Some(bt) = self.bt.as_mut() { bt.tick(now); }
         self.bt_pump();
         self.usb.tick(now);
+        // the OTG port's held transfers: a device that has data now completes them
+        let port = self.usb.port;
+        self.usb.poll(&mut self.ram, &mut crate::usbdev::RootPort { port, devs: &mut self.devs });
         self.pcie.xhci.tick(now, &mut self.ram, &mut self.devs);
     }
 

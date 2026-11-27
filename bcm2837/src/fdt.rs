@@ -47,6 +47,9 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("uart0", &format!("/soc/serial@{}", node(m::UART0)));
     f.str("uart1", &format!("/soc/serial@{}", node(m::AUX + 0x40)));
     f.str("mmc0", &format!("/soc/mmc@{}", node(m::SDHCI)));
+    if b.model == crate::Model::B3Plus {
+        f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/usb-port@1/ethernet@1", node(m::USB)));
+    }
     f.end();
 
     f.begin("chosen");
@@ -223,6 +226,43 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("status", "okay");
     f.end();
 
+    // the DWC2 OTG core, host only (the 3B+'s USB ports are behind the LAN7515's hubs), for
+    // the upstream `dwc2` driver: the vendor tree's `brcm,bcm2708-usb` binds `dwc_otg`, which
+    // needs the FIQ. The nodes below describe the soldered-on USB devices by port, as the vendor
+    // tree does, so the Ethernet finds its MAC address.
+    f.begin(&format!("usb@{}", node(m::USB)));
+    f.str("compatible", "brcm,bcm2835-usb");
+    f.cells("reg", &[bus(m::USB), 0x10000]);
+    f.cells("interrupts", &gpu(m::GPU_USB as u32));
+    f.str("dr_mode", "host");
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.str("status", "okay");
+    if b.model == crate::Model::B3Plus {
+        for _ in 0..2 {
+            f.begin("usb-port@1");
+            f.str("compatible", "usb424,2514");
+            f.cells("reg", &[1]);
+            f.cells("#address-cells", &[1]);
+            f.cells("#size-cells", &[0]);
+        }
+        f.begin("ethernet@1");
+        f.str("compatible", "usb424,7800");
+        f.cells("reg", &[1]);
+        f.prop("local-mac-address", &m::ETH_MAC);
+        f.begin("mdio");
+        f.cells("#address-cells", &[1]);
+        f.cells("#size-cells", &[0]);
+        f.begin("ethernet-phy@1");
+        f.cells("reg", &[1]);
+        f.end();
+        f.end();
+        f.end();
+        f.end();
+        f.end();
+    }
+    f.end();
+
     f.end(); // soc
 
     if let Some((base, w, h, stride)) = b.fb {
@@ -254,5 +294,8 @@ mod tests {
         assert_eq!(gpu(29), [1, 29]);
         assert_eq!(gpu(62), [2, 30]);
         assert_eq!(bus(crate::machine::AUX), 0x7e21_5000);
+        assert_eq!(bus(crate::machine::USB), 0x7e98_0000);
+        assert!(blob.windows(b"usb424,7800".len()).any(|w| w == b"usb424,7800"));
+        assert!(blob.windows(6).any(|w| w == crate::machine::ETH_MAC));
     }
 }

@@ -4,7 +4,8 @@
 //!
 //! A controller talks to a device in transactions, not packets: a SETUP, then the data stage
 //! (`control_in`/`control_out`), and whole transfers on the other endpoints (`data_in`, where
-//! `None` is a NAK: nothing to send yet).
+//! `None` is a NAK: nothing to send yet). Hubs (`usb_hub`) and a USB Ethernet adapter
+//! (`lan78xx`) live in their own modules.
 use crate::disk::Disk;
 use std::collections::VecDeque;
 
@@ -38,6 +39,10 @@ pub trait UsbDevice {
     fn data_out(&mut self, _ep: u8, _data: &[u8]) {}
     /// has something to send on an IN endpoint (an interrupt endpoint to poll)
     fn has_input(&self) -> bool { false }
+    /// has something to send on IN endpoint `ep` (devices with several IN endpoints say which)
+    fn has_input_ep(&self, _ep: u8) -> bool { self.has_input() }
+    /// GET_STATUS(device) reports self-powered (hubs with their own supply)
+    fn self_powered(&self) -> bool { false }
     /// bus reset: back to the default state, address 0
     fn bus_reset(&mut self) { *self.std() = Std::default(); }
 
@@ -62,7 +67,8 @@ pub trait UsbDevice {
             (0x00, 5) => { self.std().pending_address = Some((value & 0x7f) as u8); Vec::new() }
             (0x00, 9) => { self.std().configured = value == 1; Vec::new() }
             (0x80, 8) => { let c = self.std().configured; vec![c as u8] }
-            (0x80, 0) | (0x81, 0) | (0x82, 0) => vec![0, 0],
+            (0x80, 0) => vec![self.self_powered() as u8, 0],
+            (0x81, 0) | (0x82, 0) => vec![0, 0],
             (0x00, 1) | (0x00, 3) | (0x01, 11) | (0x02, 1) | (0x02, 3) => Vec::new(),
             _ => match self.class_setup(s) { Some(r) => r, None => return false },
         };
@@ -468,6 +474,38 @@ impl Devices {
             DevId::Storage => false,
             DevId::Camera => self.camera.as_ref().is_some_and(|c| c.has_input()),
         }
+    }
+}
+
+// ---------------------------------------------------------------------- what a root port reaches
+
+/// What a host controller's root port reaches: one device, or hubs with devices behind them
+/// (`usb_hub::TreeBus`). The controller addresses devices by their USB address; a hub routes
+/// a transaction to the device behind one of its enabled ports.
+pub trait UsbBus {
+    /// The speed of what is plugged into the root port (None: nothing).
+    fn root_speed(&mut self) -> Option<Speed>;
+    /// A reset on the root port: what is plugged in goes back to its default state.
+    fn root_reset(&mut self);
+    /// The device that answers to address `addr` (reached through enabled ports only).
+    fn device(&mut self, addr: u8) -> Option<&mut dyn UsbDevice>;
+    /// After a transaction: hubs carry out what it asked for (a port reset resets the device
+    /// behind that port).
+    fn settle(&mut self) {}
+}
+
+/// One device on the root port (or nothing).
+pub struct RootPort<'a> {
+    pub port: Option<DevId>,
+    pub devs: &'a mut Devices,
+}
+
+impl UsbBus for RootPort<'_> {
+    fn root_speed(&mut self) -> Option<Speed> { self.port.and_then(|d| self.devs.get(d)).map(|d| d.speed()) }
+    fn root_reset(&mut self) { if let Some(d) = self.port.and_then(|d| self.devs.get(d)) { d.bus_reset(); } }
+    fn device(&mut self, addr: u8) -> Option<&mut dyn UsbDevice> {
+        let d = self.devs.get(self.port?)?;
+        if d.address() == addr { Some(d) } else { None }
     }
 }
 

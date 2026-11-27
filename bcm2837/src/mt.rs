@@ -425,7 +425,7 @@ impl Machine {
             sh.cv.notify_all();
         }
         let insns0 = self.instret();
-        // the I/O side: device time, the watchdog
+        // the I/O side: device time, network, USB frames, the watchdog
         let end = Instant::now() + wall;
         let stop = loop {
             std::thread::sleep(Duration::from_micros(500));
@@ -433,6 +433,8 @@ impl Machine {
             let now = sh.now();
             // SAFETY: lock held; the cores only reach the SoC under it
             let soc = unsafe { sh.soc() };
+            soc.pump_network(now);
+            soc.usb_tick(now);
             soc.device_lines(now);
             sh.publish(soc);
             if let Some(halt) = soc.pm.expired() { break if halt { Stop::PowerOff } else { Stop::Reset }; }

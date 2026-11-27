@@ -6,12 +6,20 @@
 //! `--threads multi`) is the Pi 4's; what differs is the interrupt path: each core's timer
 //! outputs and mailboxes go into the per-core controller, device interrupts into the ARM-side
 //! controller, whose output the per-core controller routes to one core.
+//!
+//! USB: the DWC2 OTG core (the Pi 4's model) with the board's USB tree behind its root port:
+//! on the 3B+ the LAN7515's two hubs, its LAN7800 Ethernet (connected to `sbc-net`) and the
+//! keyboard and tablet on two of the USB-A ports (`usb_tree`).
 use crate::intc::{ArmCtrl, LocalIntc};
 use crate::Model;
 use arm_a64::{Cpu, CpuProfile};
+use bcm2711::dwc2::Dwc2;
 use bcm2711::mailbox::Mailbox;
 use bcm2711::periph::{AuxUart, Pm};
 use bcm2711::sdhci::Sdhci;
+use emu_core::lan78xx::Lan78xx;
+use emu_core::usb::{DevId, Devices};
+use emu_core::usb_hub::{Hub, Node, TreeBus, UsbTree};
 use emu_core::{Bus, Core, Fault, Trap};
 use peripherals::pl011::Pl011;
 
@@ -28,15 +36,46 @@ pub const THERMAL: u64 = 0x3f21_2000;
 pub const AUX: u64 = 0x3f21_5000;
 /// the Arasan SD host (`brcm,bcm2835-sdhci`, "mmcnr" in the vendor tree)
 pub const SDHCI: u64 = 0x3f30_0000;
+/// the DWC2 USB 2.0 OTG controller
+pub const USB: u64 = 0x3f98_0000;
 /// the ARM-local block: the per-core interrupt controller and mailboxes
 pub const LOCAL: u64 = 0x4000_0000;
 /// ARM-side interrupt numbers (bank 0)
 pub const ARM_MAILBOX: usize = 1;
 /// GPU interrupt numbers (banks 1 and 2 of the ARM-side controller)
+pub const GPU_USB: usize = 9;
 pub const GPU_AUX: usize = 29;
 pub const GPU_UART0: usize = 57;
 pub const GPU_RNG: usize = 61;
 pub const GPU_SDHCI: usize = 62;
+
+/// The Ethernet's MAC address: locally administered (the firmware of a real Pi 3B+ writes the
+/// board's own into the device tree's `local-mac-address`).
+pub const ETH_MAC: [u8; 6] = [0x02, 0x5b, 0xc0, 0x00, 0x03, 0x01];
+
+/// What hangs off the root port, by model: the 3B+'s LAN7515 (a 4-port hub, behind its port 1
+/// a 3-port hub with the LAN7800 on its port 1), the 3B's LAN9514 hub (its Ethernet is not
+/// modelled), or nothing but the keyboard (3A+, Zero 2 W). The keyboard and the tablet sit on
+/// USB-A ports, full speed, so they are reached through the hub's transaction translator.
+pub fn usb_tree(model: Model, devs: &mut Devices) -> UsbTree {
+    let mut t = UsbTree::new();
+    match model {
+        Model::B3Plus => {
+            let h1 = t.add(Node::Hub(Hub::new(4, 0x0424, 0x2514, 1 << 1, true)), None, devs);
+            let h2 = t.add(Node::Hub(Hub::new(3, 0x0424, 0x2514, 1 << 1, true)), Some((h1, 1)), devs);
+            t.add(Node::Lan(Box::new(Lan78xx::new())), Some((h2, 1)), devs);
+            t.add(Node::Dev(DevId::Keyboard), Some((h1, 2)), devs);
+            t.add(Node::Dev(DevId::Tablet), Some((h1, 3)), devs);
+        }
+        Model::B3 => {
+            let h = t.add(Node::Hub(Hub::new(5, 0x0424, 0x9514, 1 << 1, true)), None, devs);
+            t.add(Node::Dev(DevId::Keyboard), Some((h, 2)), devs);
+            t.add(Node::Dev(DevId::Tablet), Some((h, 3)), devs);
+        }
+        Model::A3Plus | Model::Zero2W => { t.add(Node::Dev(DevId::Keyboard), None, devs); }
+    }
+    t
+}
 
 pub struct Soc {
     pub ram: Vec<u8>,
@@ -56,6 +95,12 @@ pub struct Soc {
     pub rng: crate::periph::Rng,
     pub thermal: crate::periph::Thermal,
     pub pm: Pm,
+    /// the USB host and what is plugged into it
+    pub usb: Dwc2,
+    pub devs: Devices,
+    pub tree: UsbTree,
+    /// the network behind the Ethernet port (`connect_network`)
+    pub net: Option<sbc_net::net::VirtualNet>,
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
     pub unknown: Vec<u64>,
@@ -78,6 +123,7 @@ impl Soc {
             MBOX..=0x3f00_b8bf => self.mbox.read(a - MBOX),
             ARMCTRL..=0x3f00_b3ff => self.armctrl.read(a - ARMCTRL),
             SDHCI..=0x3f30_00ff => self.sd.read(a - SDHCI),
+            USB..=0x3f98_ffff => self.usb.read(a - USB),
             RNG..=0x3f10_400f => self.rng.read(a - RNG),
             THERMAL..=0x3f21_2007 => self.thermal.read(a - THERMAL),
             PM..=0x3f10_0113 => self.pm.read(a - PM),
@@ -99,6 +145,7 @@ impl Soc {
             AUX..=0x3f21_50ff => self.aux.write(a - AUX, v),
             MBOX..=0x3f00_b8bf => self.mbox.write(a - MBOX, v, &mut self.ram),
             ARMCTRL..=0x3f00_b3ff => self.armctrl.write(a - ARMCTRL, v),
+            USB..=0x3f98_ffff => self.usb.write_bus(a - USB, v, &mut self.ram, &mut TreeBus { tree: &mut self.tree, devs: &mut self.devs }),
             RNG..=0x3f10_400f => self.rng.write(a - RNG, v),
             THERMAL..=0x3f21_2007 => self.thermal.write(a - THERMAL, v),
             PM..=0x3f10_0113 => self.pm.write(a - PM, v),
@@ -115,6 +162,7 @@ impl Soc {
         self.armctrl.set_gpu(GPU_AUX, self.aux.irq());
         self.armctrl.set_gpu(GPU_UART0, self.uart.irq());
         self.armctrl.set_gpu(GPU_SDHCI, self.sd.irq());
+        self.armctrl.set_gpu(GPU_USB, self.usb.irq());
         self.armctrl.set_arm(ARM_MAILBOX, self.mbox.irq());
         self.pm.now = now;
         // nothing reads the spare UART's output yet: keep it from growing without bound
@@ -123,7 +171,30 @@ impl Soc {
     }
 
     /// The next device deadline.
-    pub(crate) fn next_event(&self) -> Option<u64> { self.pm.next_event() }
+    pub(crate) fn next_event(&self) -> Option<u64> { [self.pm.next_event(), self.usb.next_event()].into_iter().flatten().min() }
+
+    /// USB time: frames (SOF), and held transfers whose devices have data now.
+    pub(crate) fn usb_tick(&mut self, now: u64) {
+        if self.usb.tick(now) { self.dirty = true; }
+        if self.usb.held() != 0 {
+            self.usb.poll(&mut self.ram, &mut TreeBus { tree: &mut self.tree, devs: &mut self.devs });
+        }
+    }
+
+    /// Exchange frames between the USB Ethernet and the virtual network.
+    pub(crate) fn pump_network(&mut self, now: u64) {
+        let Some(lan) = self.tree.lan() else { return };
+        let now_us = now / 1000;
+        match self.net.as_mut() {
+            Some(net) => {
+                let mut replies = Vec::new();
+                for f in std::mem::take(&mut lan.tx_out) { replies.extend(net.handle(&f, now_us)); }
+                replies.extend(net.poll(now_us));
+                for f in replies { lan.receive(&f); }
+            }
+            None => lan.tx_out.clear(),
+        }
+    }
 
     /// What the display shows, as RGBA: the firmware framebuffer.
     pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.mbox.render(&self.ram, out) }
@@ -247,15 +318,36 @@ impl Machine {
         mbox.revision = model.revision();
         let soc = Soc {
             ram: vec![0; ram_arm_visible], arm_ram, cur: 0, local: LocalIntc::new(), armctrl: ArmCtrl::new(), uart: Pl011::new(), aux: AuxUart::new(),
-            mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(), asb: [0; 12],
+            mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(),
+            usb: { let mut d = Dwc2::new(); d.port = None; d }, devs: Devices::default(), tree: UsbTree::new(), net: None, asb: [0; 12],
             unknown: Vec::new(), dirty: true,
         };
         let mut m = Machine { model, cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0,
                               round_end: u64::MAX, breakpoints: Default::default(), idle_target: 0, multi: false,
                               #[cfg(not(target_arch = "wasm32"))] mt: None };
+        m.soc.tree = usb_tree(model, &mut m.soc.devs);
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
         m
+    }
+
+    /// Plug the Ethernet port into sbc-net's virtual network (DHCP, DNS); `nat` also relays
+    /// guest TCP/UDP to the host's network (native builds only). Boards without Ethernet
+    /// ignore it.
+    pub fn connect_network(&mut self, nat: bool, log: bool) {
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat { net.nat = Some(sbc_net::nat::Nat::new(log)); }
+        let _ = nat;
+        self.soc.net = Some(net);
+    }
+
+    /// Relay host TCP address `host` to the guest's TCP `guest_port` (QEMU's hostfwd); needs
+    /// `connect_network` with NAT first.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forward_tcp(&mut self, host: std::net::SocketAddr, guest_port: u16) -> Result<(), String> {
+        let nat = self.soc.net.as_mut().and_then(|n| n.nat.as_mut()).ok_or("port forwarding needs --net nat")?;
+        nat.add_forward(host, guest_port).map_err(|e| format!("{host}: {e}"))
     }
 
     fn fresh_cpu(&mut self, k: usize) -> Cpu {
@@ -353,6 +445,8 @@ impl Machine {
             let p = cpu.sys.ptimer.firing(cnt);
             self.soc.local.set_timers(k, p, v);
         }
+        self.soc.pump_network(now);
+        self.soc.usb_tick(now);
         self.soc.device_lines(now);
         for k in 0..self.cpus.len() {
             if self.state[k] == CoreState::Off { continue; }
@@ -675,7 +769,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Result<Vec<u8>, String> {
         let mut w = emu_core::snap::W::default();
-        w.tag("pi3-machine-v1");
+        w.tag("pi3-machine-v2");
         w.u8(self.model as u8);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -691,6 +785,8 @@ impl Machine {
         self.soc.sd.save_state(&mut w);
         self.soc.rng.save_state(&mut w);
         self.soc.pm.save_state(&mut w);
+        self.soc.usb.save_state(&mut w);
+        { use emu_core::snap::Snap; self.soc.devs.save(&mut w); self.soc.tree.save(&mut w); }
         for r in self.soc.asb { w.u32(r); }
         emu_core::snap::save_ram(&mut w, &self.soc.ram);
         let mut out = SNAP_MAGIC.to_vec();
@@ -704,7 +800,7 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("the snapshot is damaged ({:?})", e.status))?;
         let e = |e: emu_core::snap::SnapError| e.0;
         let mut r = emu_core::snap::R::new(&raw);
-        r.tag("pi3-machine-v1").map_err(e)?;
+        r.tag("pi3-machine-v2").map_err(e)?;
         let model = r.u8().map_err(e)?;
         if model != self.model as u8 { return Err(format!("the snapshot is of another model (this machine: --model {})", self.model.id())); }
         let (now, exceptions, irqs) = (r.u64().map_err(e)?, r.u64().map_err(e)?, r.u64().map_err(e)?);
@@ -732,6 +828,8 @@ impl Machine {
         self.soc.sd.load_state(&mut r).map_err(e)?;
         self.soc.rng.load_state(&mut r).map_err(e)?;
         self.soc.pm.load_state(&mut r).map_err(e)?;
+        self.soc.usb.load_state(&mut r, &mut self.soc.devs.kbd, false).map_err(e)?;
+        { use emu_core::snap::Snap; self.soc.devs.load(&mut r).map_err(e)?; self.soc.tree.load(&mut r).map_err(e)?; }
         for x in self.soc.asb.iter_mut() { *x = r.u32().map_err(e)?; }
         emu_core::snap::load_ram(&mut r, &mut self.soc.ram).map_err(e)?;
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }

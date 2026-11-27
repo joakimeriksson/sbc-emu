@@ -55,6 +55,7 @@ dependencies = [
  "emu-core",
  "miniz_oxide",
  "peripherals",
+ "sbc-net",
 ]
 
 [[package]]
