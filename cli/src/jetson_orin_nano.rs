@@ -138,10 +138,11 @@ fn execute(args: &[String]) -> Result<(), String> {
             } else if bpmp {
                 machine.enable_bpmp();
             }
-            // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image)
+            // --usb-drive IMAGE: a USB stick (copy-on-write; each boot starts from the image), as large
+            // as its GPT says when the image was cut short after its last partition
             if let Some(path) = crate::arg(args, "--usb-drive") {
                 machine.attach_usb_drive(Box::new(
-                    crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?,
+                    crate::disk::CowFile::open(path).map_err(|e| format!("{path}: {e}"))?.fit_gpt(),
                 ));
             }
             // --camera: a USB webcam (UVC, 640x480 YUYV, a test pattern); --camera-source SPEC feeds it
