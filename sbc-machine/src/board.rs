@@ -34,7 +34,7 @@ impl Board {
     pub fn description(self) -> &'static str {
         match self {
             Self::Pi4 => "Raspberry Pi 4 Model B / BCM2711 (4x Cortex-A72): Raspberry Pi OS and Ubuntu from SD; HDMI, USB, Ethernet, Wi-Fi, audio, V3D GPU",
-            Self::Pi3 => "not implemented: BCM2837",
+            Self::Pi3 => "experimental: Raspberry Pi 3 Model B+ / BCM2837 (4x Cortex-A53): Raspberry Pi OS from SD, or a kernel and initramfs; serial console (--model 3b+|3b|3a+|zero2w)",
             Self::OrangePi5 => "experimental: Orange Pi 5 / RK3588S (4x A76 + 4x A55): Armbian from SD, or a kernel and initramfs; HDMI, USB, NVMe, audio, Mali-G610 GPU",
             Self::OrangePiOne => "experimental: Orange Pi One / Allwinner H3 (4x Cortex-A7): Armbian from SD, or a kernel and initramfs; HDMI, USB, Ethernet, Mali-400 GPU",
             Self::TinkerBoard => "experimental: ASUS Tinker Board S / RK3288 (4x Cortex-A12): Armbian from SD or eMMC, or a kernel and initramfs; HDMI, Mali-T760 GPU",
@@ -46,7 +46,7 @@ impl Board {
     }
 
     pub fn require_implemented(self) -> Result<(), String> {
-        if matches!(self, Self::Pi4 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::OrangePiRv | Self::Esp32S31 | Self::JetsonNano | Self::JetsonOrinNano) {
+        if matches!(self, Self::Pi4 | Self::Pi3 | Self::OrangePi5 | Self::OrangePiOne | Self::TinkerBoard | Self::OrangePiRv | Self::Esp32S31 | Self::JetsonNano | Self::JetsonOrinNano) {
             Ok(())
         } else {
             Err(format!(

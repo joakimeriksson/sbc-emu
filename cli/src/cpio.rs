@@ -46,6 +46,11 @@ pub fn busybox_initramfs(busybox: &[u8]) -> Vec<u8> {
     initramfs(busybox, INIT, "pi4# ")
 }
 
+/// The Pi 3's console is the mini UART (ttyS0).
+pub fn pi3_initramfs(busybox: &[u8]) -> Vec<u8> {
+    initramfs(busybox, &INIT.replace("ttyAMA0", "ttyS0"), "pi3# ")
+}
+
 pub fn orangepi_initramfs(busybox: &[u8]) -> Vec<u8> {
     initramfs(busybox, &INIT.replace("ttyAMA0", "ttyS2"), "orangepi5# ")
 }

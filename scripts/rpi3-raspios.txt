@@ -1,0 +1,13 @@
+# Raspberry Pi 3 Model B+ (milestone 2 of docs/rpi3-plan.md): the unmodified Raspberry Pi OS
+# Lite image (64-bit, trixie, 2026-10-06; scripts/raspios-fixture.sh fetches it) booted like the
+# firmware boots it: config.txt with the Pi 3's sections, cmdline.txt (console=serial0 is the
+# mini UART on a 3B+), kernel8.img and initramfs8 from the FAT partition, then the ext4 root on
+# the SD card (copy-on-write: the image is not changed), systemd, the login prompt on ttyS0.
+#   sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-raspios.txt --timeout 600
+wait-serial Machine model: Raspberry Pi 3 Model B Plus Rev 1.3
+wait-serial smp: Brought up 1 node, 4 CPUs
+wait-serial mmcblk0: p1 p2
+wait-serial EXT4-fs (mmcblk0p2): mounted filesystem
+wait-serial Debian GNU/Linux 13 raspberrypi ttyS0
+wait-serial raspberrypi login:
+quit

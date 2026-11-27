@@ -47,6 +47,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcm2837"
+version = "0.1.0"
+dependencies = [
+ "arm-a64",
+ "bcm2711",
+ "emu-core",
+ "miniz_oxide",
+ "peripherals",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -217,6 +228,7 @@ dependencies = [
  "arm-a32",
  "arm-a64",
  "bcm2711",
+ "bcm2837",
  "emu-core",
  "esp-soc",
  "esp32s31",
@@ -262,6 +274,7 @@ version = "0.1.0"
 dependencies = [
  "allwinner-h3",
  "bcm2711",
+ "bcm2837",
  "emu-core",
  "esp-soc",
  "esp32s31",

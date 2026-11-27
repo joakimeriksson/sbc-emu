@@ -32,7 +32,7 @@ device side, debugger state, and the snapshot serializer (`snap`, see
 
 | Crate | Architecture | Boards |
 |---|---|---|
-| `arm-a64` | ARMv8-A, AArch64 (EL0–EL3, MMU, FP/NEON, generic timer) | Raspberry Pi 4, Orange Pi 5, Jetson Nano |
+| `arm-a64` | ARMv8-A, AArch64 (EL0–EL3, MMU, FP/NEON, generic timer) | Raspberry Pi 4, Raspberry Pi 3, Orange Pi 5, Jetson Nano |
 | `arm-a32` | ARMv7-A (A32, Thumb-2, VFPv4, NEON, short-descriptor MMU); also 32-bit programs under a 64-bit kernel | Orange Pi One, Tinker Board; 32-bit processes on the Arm64 boards |
 | `riscv64` | RV64GC (Zba, Zbb; M/S/U; Sv39) | Orange Pi RV |
 | `riscv-rv32` | RV32IMAC with M/S/U and Sv32 (from esp32sim, MIT) | ESP32-S31 |
@@ -44,7 +44,8 @@ geometry), so the guest sees the cores it expects.
 `tegra210`, `espressif/esp32s31`) each own a `Machine`: the cores, RAM, the SoC's devices at
 their addresses, the virtual clock that orders everything, and the board's boot: loading a
 kernel and device tree, or reading them from the card the way the board's firmware would. A
-machine's `run(budget)` runs the cores for a slice and returns a `Stop`.
+machine's `run(budget)` runs the cores for a slice and returns a `Stop`. `bcm2837` (Raspberry Pi
+3) is a machine of its own that takes the blocks it shares with the BCM2711 from `bcm2711`.
 
 **The GPU crates** are separate so that their size stays out of the SoC crates: `v3d`
 (Raspberry Pi 4), `mali400` (Orange Pi One), `midgard` (Mali-T760, Tinker Board), `powervr`
