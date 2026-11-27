@@ -59,6 +59,29 @@ Such images are often cut short after their last partition: the GPT describes th
 which can be larger than the file. Linux rejects a GPT whose backup header lies past the end of
 the disk, so sbc-emu presents the drive at the size the GPT gives. The extra sectors read as zeros.
 
+## Network
+
+The Orin Nano's own Ethernet port is not modelled. `--net nat` plugs a USB Ethernet adapter into
+the board instead: a CDC-ECM device, which Linux's `cdc_ether` driver runs without a vendor
+driver. It is the same virtual network as on the other boards (sbc-net: DHCP, DNS, ICMP), and
+`nat` relays the guest's TCP and UDP through the host's sockets. `--net local` keeps the network
+isolated. Without `--net` no adapter is plugged in.
+
+`--hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (QEMU's syntax, repeatable) forwards a
+host TCP port to the guest. It needs `--net nat`.
+
+The adapter's MAC address is universally administered, so Linux names it `eth0` with
+`net.ifnames=0`, or `enx001de15b0e01` with predictable names. The kernel needs `cdc_ether`; the
+JetPack kernels build it as a module, which a full root filesystem loads by itself.
+
+```sh
+target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver tegra \
+  --usb-drive JETPACK.img --kernel Image --append "... root=PARTUUID=... net.ifnames=0" \
+  --net nat --hostfwd tcp::5000-:5000
+```
+
+A web server listening on the guest's port 5000 then answers at `http://127.0.0.1:5000/` on the host.
+
 ## Rover UART
 
 The bring-up device tree exposes Tegra UART A at `0x03100000` as `/dev/ttyS1`
