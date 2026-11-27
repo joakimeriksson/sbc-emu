@@ -55,7 +55,7 @@ fn execute(args: &[String]) -> Result<(), String> {
     };
     let smp = arg(args, "--smp").map_or(Ok(4), |v| v.parse::<usize>().ok().filter(|n| (1..=4).contains(n)).ok_or("--smp 1..4"))?;
     let ram = serial_board::ram_bytes(args, model.ram_mb())?;
-    if ram < 64 << 20 { return Err("--ram-mb: at least 64".into()); }
+    if !(64 << 20..=1 << 30).contains(&ram) { return Err("--ram-mb: 64 to 1024 (the BCM2837 addresses 1 GiB)".into()); }
     let seed = arg(args, "--seed").map(|v| v.parse::<u64>().map_err(|_| "--seed N")).transpose()?;
     let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
     let kernel = arg(args, "--kernel").map(read).transpose()?;

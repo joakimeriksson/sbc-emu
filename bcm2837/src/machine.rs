@@ -233,10 +233,11 @@ pub(crate) fn timer_deadline(cpu: &Cpu) -> Option<u64> {
 }
 
 impl Machine {
-    /// A Pi 3 of `model` with `ram` bytes of SDRAM (the board's own size: `model.ram_mb()`) and
-    /// `ncpu` cores (the board has 4); only core 0 starts.
+    /// A Pi 3 of `model` with `ram` bytes of SDRAM (the board's own size: `model.ram_mb()`; at
+    /// most 1 GiB, all the SoC addresses) and `ncpu` cores (the board has 4); only core 0 starts.
     pub fn new(model: Model, ram: usize, ncpu: usize) -> Self {
         let ncpu = ncpu.clamp(1, 4);
+        let ram = ram.min(1 << 30);
         // the ARM sees RAM up to the peripheral window; the VideoCore's share is at the top
         let ram_arm_visible = ram.min(PERIPH as usize);
         let gpu = (model.gpu_mb() << 20).min(ram / 4);
