@@ -266,7 +266,7 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 |---|---|
 | Power-on | NVIDIA R36.4.4 powers on GA10B and opens its control device. The stock Host1x driver handles syncpoint threshold interrupts. |
 | Memory and submission | A Linux guest submits a copy across GPU page boundaries and verifies the result, completion semaphore and Host1x-backed Linux sync-file fence. GPU fault interrupts and recovery remain pending. |
-| Compute | The Linux fixture checks a known-answer Ampere shader. JetPack CUDA creates a context, transfers data and launches a JIT-compiled SM87 kernel. Broader shader and CUDA workload coverage remains pending. |
+| Compute | The Linux fixture checks a known-answer Ampere shader. JetPack CUDA creates a context, transfers data and launches a JIT-compiled SM87 kernel. TensorRT 10.3 builds YOLOv8n (FP32) and its detections match ONNX Runtime's (`sh tests/gpu/run-orin-trt.sh`, `TRT_YOLO MATCH`). FP16 and tensor-core kernels are untested. |
 | Graphics | The stock driver submits clipped, masked and layered C797 color clears and masked block-linear depth/stencil clears. NVIDIA's stock EGL and OpenGL ES stack creates a context, clears a pbuffer and reads it back, with its MME macros executed. Draw calls run Ampere vertex and fragment shaders: the GLES 2 suite passes 23 of 25 scenes and the GLES 3 suite 31 of 49 (`tests/gpu/run-orin-gl.sh gles2test gltest`); the GLES 3.2 suite hangs after `compute_ssbo`. |
 | Browser | The site worker runs the standalone rover copy demo. The stock-driver copy, compute, clear and Host1x fence tests and the full CUDA fixture also pass in the WebAssembly build. |
 
@@ -279,12 +279,13 @@ does not match GA10B, so the Orin fixture uses [NVIDIA's Jetson Linux R36.4.4 dr
 - The SM70 decoder models convergence barriers (BSSY/BSYNC) with the Maxwell SSY/SYNC
   stack: BREAK out of nested regions, divergent `BRA.DIV`/`BRA.CONV`, and warp-level
   reconvergence before SHFL or VOTE are approximations.
-- Uniform registers and the decoder's scratch registers share R190..R254 with the
-  vector registers, so kernels using more than 190 registers are wrong.
+- Linux runtime-suspends the GPU after about 5 s idle, and its resume is not modeled: the
+  next submission hangs. Keep it powered with
+  `echo on > /sys/bus/platform/devices/*gpu*/power/control`.
+- A kernel whose uniform registers do not fit below RZ keeps them past R255 and runs
+  interpreted (no JIT).
 - The GLES 3.2 suite hangs after `compute_ssbo`; GLES 2 and 3 have known differing scenes.
 - These SM70 decoder gaps give wrong numbers without a fault (to be fixed on `claude/orin-cuda`):
-  - carries: IADD3 carry-out, IMAD.X, and the LDG/STG address carry are dropped;
-  - uniform predicates (UP0..UP6) alias P0..P6;
   - uniform-register writes reach only the active lanes;
   - F2FP.PACK_AB ignores its rounding bits (`.RZ` decodes as round-up, `.MERGE_C` as round-down);
   - F2F `.H1` and I2F's byte select are ignored (the low half or byte is read);
