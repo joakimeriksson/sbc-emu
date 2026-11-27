@@ -83,6 +83,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             "--camera-source",
             "--net",
             "--hostfwd",
+            "--usb-serial",
             "--smp",
             "--rover-uart",
             "--uart-driver",
@@ -148,6 +149,10 @@ fn execute(args: &[String]) -> Result<(), String> {
         || std::env::var("SBC_JIT").is_ok_and(|v| v == "0");
     let announced = std::cell::Cell::new(false);
     let mut rover = RoverLink::open(crate::arg(args, "--rover-uart"))?;
+    let usb_serial: Option<std::net::SocketAddr> = crate::arg(args, "--usb-serial")
+        .map(|a| a.parse().map_err(|_| "--usb-serial expects a numeric HOST:PORT"))
+        .transpose()?;
+    let mut serial = UsbSerialLink::new(usb_serial);
     serial_board::run_with_io(
         config,
         || {
@@ -185,6 +190,10 @@ fn execute(args: &[String]) -> Result<(), String> {
                     Err(e) => return Err(format!("--hostfwd: {e}")),
                 }
             }
+            // --usb-serial HOST:PORT: a USB serial port (/dev/ttyACM0) whose bytes a TCP peer sends and reads
+            if usb_serial.is_some() {
+                machine.attach_usb_serial(emu_core::usb::Serial::new("Virtual USB Serial"));
+            }
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
                 eprintln!(
@@ -195,7 +204,11 @@ fn execute(args: &[String]) -> Result<(), String> {
             boot::boot_linux(&mut machine, &kernel, initrd.as_deref(), cmdline)?;
             Ok(machine)
         },
-        |machine| rover.poll(machine),
+        |machine| {
+            rover.poll(machine)?;
+            serial.poll(machine);
+            Ok(())
+        },
     )
 }
 
@@ -298,6 +311,69 @@ impl RoverLink {
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
         )
+    }
+}
+
+/// The TCP peer of `--usb-serial`: connected (and reconnected) in the background while it is
+/// not listening, so the board does not wait for it; a peer that goes away only leaves the port idle.
+struct UsbSerialLink {
+    addr: Option<std::net::SocketAddr>,
+    stream: Option<std::net::TcpStream>,
+    next_try: std::time::Instant,
+    said: bool,
+}
+
+impl UsbSerialLink {
+    fn new(addr: Option<std::net::SocketAddr>) -> Self {
+        Self { addr, stream: None, next_try: std::time::Instant::now(), said: false }
+    }
+
+    fn poll(&mut self, machine: &mut Machine) {
+        use std::io::{Read, Write};
+        let Some(addr) = self.addr else { return };
+        let output = machine.take_usb_serial_output();
+        if self.stream.is_none() {
+            if std::time::Instant::now() < self.next_try {
+                return;
+            }
+            self.next_try = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)) {
+                Ok(s) if s.set_nonblocking(true).is_ok() => {
+                    let _ = s.set_nodelay(true);
+                    eprintln!("[{TAG}] USB serial connected to {addr}");
+                    self.stream = Some(s);
+                    self.said = false;
+                }
+                _ => {
+                    if !self.said {
+                        eprintln!("[{TAG}] USB serial: waiting for {addr}");
+                        self.said = true;
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(stream) = self.stream.as_mut() else { return };
+        let busy = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted);
+        let mut closed = false;
+        // what the guest wrote; what a peer too slow to take it leaves is lost, as on a real line
+        if !output.is_empty() {
+            match stream.write(&output) {
+                Ok(0) => closed = true,
+                Ok(_) => {}
+                Err(e) => closed = !busy(&e),
+            }
+        }
+        let mut buffer = [0; 4096];
+        match stream.read(&mut buffer) {
+            Ok(0) => closed = true,
+            Ok(n) => machine.usb_serial_input(&buffer[..n]),
+            Err(e) => closed |= !busy(&e),
+        }
+        if closed {
+            eprintln!("[{TAG}] USB serial: {addr} went away");
+            self.stream = None;
+        }
     }
 }
 

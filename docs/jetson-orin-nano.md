@@ -82,6 +82,18 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver 
 
 A web server listening on the guest's port 5000 then answers at `http://127.0.0.1:5000/` on the host.
 
+## USB serial
+
+`--usb-serial HOST:PORT` plugs a USB serial port into the board: a CDC-ACM device, which Linux's
+`cdc-acm` driver shows as `/dev/ttyACM0`. USB lidars, GPS receivers and microcontroller boards
+present themselves this way. The emulator connects to HOST:PORT over TCP, retrying every second
+until a peer listens. What the peer sends, the guest reads from the port; what the guest writes
+goes to the peer. A peer that goes away leaves the port idle, and the emulator reconnects.
+
+The guest's line coding (baud rate, framing) is kept and reported back, but it does not pace the
+bytes: they arrive as the peer sends them. A guest that has not opened the port loses what the peer
+sends meanwhile, as a real device's output is lost before the host listens.
+
 ## Rover UART
 
 The bring-up device tree exposes Tegra UART A at `0x03100000` as `/dev/ttyS1`
