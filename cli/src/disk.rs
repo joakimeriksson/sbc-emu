@@ -34,6 +34,23 @@ impl CowFile {
         self.sectors = self.stored.next_multiple_of(emu_core::sdcard::UNIT);
         Ok(self)
     }
+    /// A drive image cut short after its last partition, as vendors ship them (Waveshare's
+    /// Jetson image is the first 46.8 GB of a 128 GB NVMe): its GPT's backup header (UEFI 2.10,
+    /// 5.3.2: `AlternateLBA` at offset 32 of the primary header at LBA 1) lies past the end of the
+    /// file, and Linux rejects a GPT that does not fit the disk. Such a drive is presented at the
+    /// size its GPT gives; the missing sectors read as zeros (and are kept, like the others). An
+    /// image without a GPT, or whose GPT fits, is unchanged.
+    pub fn fit_gpt(mut self) -> Self {
+        let mut h = [0u8; 92];
+        if self.file.read_exact_at(&mut h, 512).is_ok() && &h[..8] == b"EFI PART" {
+            let alternate = u64::from_le_bytes(h[32..40].try_into().unwrap());
+            // at most 2 TiB more than the file, so a corrupt header cannot claim an absurd disk
+            if alternate >= self.sectors && alternate < self.stored + (4u64 << 30) {
+                self.sectors = alternate + 1;
+            }
+        }
+        self
+    }
     /// The disk interface has no errors to give the guest; say it once.
     fn report(&mut self, what: &str, e: std::io::Error) {
         if !std::mem::replace(&mut self.reported, true) {
@@ -157,6 +174,31 @@ impl Disk for CowFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gpt_image_cut_short_is_presented_at_its_full_size() {
+        let path = std::env::temp_dir().join(format!("sbc-emu-gpt-{}.img", std::process::id()));
+        let mut img = vec![0u8; 64 * 512];
+        img[512..520].copy_from_slice(b"EFI PART");
+        img[512 + 32..512 + 40].copy_from_slice(&1000u64.to_le_bytes());   // backup header at LBA 1000
+        img[40 * 512] = 0xab;
+        std::fs::write(&path, &img).unwrap();
+        let mut d = CowFile::open(path.to_str().unwrap()).unwrap().fit_gpt();
+        assert_eq!(d.sectors(), 1001);
+        let mut s = [0u8; 512];
+        d.read(40, &mut s);
+        assert_eq!(s[0], 0xab);
+        d.read(999, &mut s);
+        assert!(s.iter().all(|&b| b == 0), "past the file reads as zero");
+        d.write(999, &[7u8; 512]);
+        d.read(999, &mut s);
+        assert_eq!(s[0], 7, "and keeps what is written there");
+        // no GPT, or a GPT that fits: unchanged
+        img[512..520].copy_from_slice(b"NOT GPT!");
+        std::fs::write(&path, &img).unwrap();
+        assert_eq!(CowFile::open(path.to_str().unwrap()).unwrap().fit_gpt().sectors(), 64);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// What the Pi 4's `loadvm` goes by.
     #[test]
