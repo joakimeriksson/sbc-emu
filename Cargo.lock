@@ -332,3 +332,10 @@ version = "0.1.0"
 dependencies = [
  "emu-core",
 ]
+
+[[package]]
+name = "vc4-3d"
+version = "0.1.0"
+dependencies = [
+ "emu-core",
+]
