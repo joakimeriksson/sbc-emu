@@ -15,12 +15,19 @@ pub struct Compute {
     pub launches: u64,
     /// Volta-and-later descriptors (QMD v3, Tegra234's C7C0) and SM70 programs
     pub sm70: bool,
+    /// the last launch's program address, grid and workgroup size (for fault reports)
+    pub last: (u64, [u32; 3], [u32; 3]),
 }
 
 impl Default for Compute {
     fn default() -> Self {
-        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0, sm70: false }
+        Self { regs: vec![0; 0x1000], inline: Inline::default(), launches: 0, sm70: false, last: (0, [0; 3], [0; 3]) }
     }
+}
+
+/// The program offset of the last memory instruction a shader ran, for fault reports.
+pub fn last_memory_pc() -> u32 {
+    maxwell_shader::exec::LAST_MEMORY_PC.load(Ordering::Relaxed)
 }
 
 /// What a launch descriptor says.
@@ -116,8 +123,68 @@ struct Group<'a, 'm, const N: usize> {
     local: [[u32; N]; 3],
 }
 
+/// SBC_TRACE_PC=offset[,reg...][;offset[,reg...]...]: print the lanes' predicates and those
+/// registers each time a compute shader reaches one of those program offsets (the first 4000
+/// times). SBC_TRACE_PROGRAM=address limits it to one program. Run with SBC_SHADER_JIT=0: native
+/// blocks do not pass through the trace.
+type TraceConfig = (Vec<(u32, Vec<usize>)>, Option<u64>);
+fn trace_config() -> &'static Option<TraceConfig> {
+    static C: std::sync::OnceLock<Option<TraceConfig>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let v = std::env::var("SBC_TRACE_PC").ok()?;
+        let points = v
+            .split(';')
+            .filter_map(|e| {
+                let mut it = e.split(',');
+                let pc = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+                Some((pc, it.filter_map(|r| r.trim().parse().ok()).collect()))
+            })
+            .collect();
+        let program = std::env::var("SBC_TRACE_PROGRAM").ok().and_then(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16).ok());
+        Some((points, program))
+    })
+}
+
+/// The workers the last launch had (for SBC_TRACE_LAUNCHES).
+static LAST_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The program of the launch running (for tracing).
+static TRACE_PROGRAM: AtomicU64 = AtomicU64::new(0);
+
 impl<const N: usize> Host<N> for Group<'_, '_, N> {
     common_host!(N);
+
+    fn trace(&mut self, addr: u32, inst: &maxwell_shader::isa::Inst, lanes: &Lanes<N>) {
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let Some((points, program)) = trace_config() else { return };
+        let Some((_, regs)) = points.iter().find(|p| p.0 == addr) else { return };
+        if program.is_some_and(|p| p != TRACE_PROGRAM.load(Ordering::Relaxed)) || HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
+            return;
+        }
+        static CB_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // SBC_TRACE_CB=[buffer:]start,end[;...] (hex): constant buffer words there, at the first hit
+        if let Ok(v) = std::env::var("SBC_TRACE_CB") {
+            if !CB_DONE.swap(true, Ordering::Relaxed) {
+                for range in v.split(';') {
+                    let (cb, range) = range.split_once(':').unwrap_or(("0", range));
+                    let cb = cb.trim().parse().unwrap_or(0);
+                    let mut it = range.split(',').filter_map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok());
+                    if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                        for o in (a..b).step_by(16) {
+                            let w: Vec<String> = (0..4).map(|k| format!("{:08x}", self.cbuf(cb, o + 4 * k))).collect();
+                            eprintln!("[trace] c[{cb:#x}][{o:#x}] {}", w.join(" "));
+                        }
+                    }
+                }
+            }
+        }
+        let preds: Vec<String> = lanes.pred.iter().chain(&lanes.upred).map(|p| format!("{p:08x}")).collect();
+        eprintln!("[trace] {addr:#x} group {:?} local0 {:?} active {:08x} {:?} P0-7,UP0-7 {}", self.group, [self.local[0][0], self.local[1][0], self.local[2][0]], lanes.active_mask(), inst.op, preds.join(" "));
+        for &r in regs {
+            let v: Vec<String> = lanes.gpr[r].iter().map(|x| format!("{x:x}")).collect();
+            eprintln!("[trace]   R{r} {}", v.join(" "));
+        }
+    }
 
     fn sysval(&mut self, sys: u8) -> [u32; N] {
         match sys {
@@ -189,8 +256,23 @@ impl Compute {
         let launch = if self.sm70 { Launch::decode_v3(&words) } else { Launch::decode(&words) };
         self.launches += 1;
         let base = launch.program.unwrap_or_else(|| self.address(0x1608));
+        self.last = (base + launch.entry as u64, launch.groups, launch.threads);
+        TRACE_PROGRAM.store(self.last.0, Ordering::Relaxed);
+        // SBC_TRACE_LAUNCHES: each launch's program and grid (to find a kernel to trace)
+        static LAUNCHES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace = *LAUNCHES.get_or_init(|| std::env::var_os("SBC_TRACE_LAUNCHES").is_some());
+        let started = std::time::Instant::now();
         if let Some(program) = pipe.program(base, launch.entry, mem) {
             self.run(&launch, &program, pipe, mem);
+            if trace {
+                let why = if program.any(|op| matches!(op, maxwell_shader::isa::Op::Atom { .. } | maxwell_shader::isa::Op::Suatom { .. })) { " atomics" } else { "" };
+                eprintln!(
+                    "[launch] {} program {:#x} groups {:?} threads {:?}: {} workers{why}, {:.1} ms",
+                    self.launches, self.last.0, launch.groups, launch.threads, LAST_WORKERS.load(Ordering::Relaxed), started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        } else {
+            eprintln!("[maxwell] compute launch skipped: no program at {:#x}", self.last.0);
         }
         for (at, payload, short) in launch.releases {
             if crate::trace_sem() { eprintln!("[sem] qmd release {at:#x} = {payload:#x}"); }
@@ -263,8 +345,9 @@ fn run_lanes<const N: usize>(launch: &Launch, program: &Program, pipe: &mut Pipe
     // (each thread has the local memory of a workgroup's threads)
     let per_thread = (launch.local * batches * N).max(1);
     let units = if apart { groups * batches as u64 } else { groups };
-    let workers = if atomics { 1 } else { pipe::threads().min(usize::try_from(units).unwrap_or(usize::MAX)).min(MAX_LOCAL / per_thread).max(1) };
+    let workers = if atomics && !mem.split_atomics() { 1 } else { pipe::threads().min(usize::try_from(units).unwrap_or(usize::MAX)).min(MAX_LOCAL / per_thread).max(1) };
     pipe.need_workers(workers);
+    LAST_WORKERS.store(workers, Ordering::Relaxed);
     let next = AtomicU64::new(0);
     let left_fuel = AtomicU64::new(LAUNCH_FUEL);
     let failed: Mutex<Option<String>> = Mutex::new(None);

@@ -74,6 +74,15 @@ LD_LIBRARY_PATH="$rustlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     "$lld" -flavor gnu -m aarch64elf -pie --dynamic-linker /lib/ld-linux-aarch64.so.1 \
     "$usr_lib/Scrt1.o" "$usr_lib/crti.o" "$work/cuda.o" "$usr_lib/crtn.o" \
     -L "$lib" -l:libc.so.6 -o "$work/root/cuda-probe"
+# the Nano's vector add (tests/gpu/l4t): 4096 threads in 32 workgroups, PTX JIT-compiled for SM87
+"${CLANG:-clang}" --target=aarch64-linux-gnu -fPIE -O2 -Wall -Werror -nostdinc \
+    -isystem "$("${CLANG:-clang}" -print-resource-dir)/include" -isystem "$work/packages/usr/include" \
+    -isystem "$work/packages/usr/include/aarch64-linux-gnu" -c tests/gpu/l4t/cuda-vadd.c -o "$work/cuda-vadd.o"
+DYLD_LIBRARY_PATH="$rustlib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+LD_LIBRARY_PATH="$rustlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    "$lld" -flavor gnu -m aarch64elf -pie --dynamic-linker /lib/ld-linux-aarch64.so.1 \
+    "$usr_lib/Scrt1.o" "$usr_lib/crti.o" "$work/cuda-vadd.o" "$usr_lib/crtn.o" \
+    -L "$lib" -l:libc.so.6 -o "$work/root/cuda-vadd"
 (cd "$work/root" && find . | LC_ALL=C sort | cpio -o -H newc -R 0:0 > "$work/cuda.cpio")
 gzip -n "$work/cuda.cpio"
 cat "$fixture/probe-initramfs.cpio.gz" "$work/cuda.cpio.gz" > "$work/initramfs.cpio.gz"
@@ -81,8 +90,8 @@ cat "$fixture/probe-initramfs.cpio.gz" "$work/cuda.cpio.gz" > "$work/initramfs.c
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
     -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/cuda.txt"
-printf 'serial /cuda-probe; echo "CUDA_PROBE_" "STATUS=$?"\\r\n' >> "$work/cuda.txt"
-printf 'wait-serial CUDA_PROBE_ STATUS=\nquit\n' >> "$work/cuda.txt"
+printf 'serial /cuda-probe; echo "CUDA_PROBE_" "STATUS=$?"; /cuda-vadd; echo "CUDA_VADD_" "STATUS=$?"\\r\n' >> "$work/cuda.txt"
+printf 'wait-serial CUDA_VADD_ STATUS=\nquit\n' >> "$work/cuda.txt"
 
 if [ "${SBC_ORIN_WASM:-0}" = 1 ]; then
     node tests/gpu/orin/wasm-linux.mjs "$fixture/Image" "$work/initramfs.cpio.gz" "$work/cuda.txt" cuda
@@ -91,7 +100,7 @@ fi
 
 "$emulator" run --board jetson-orin-nano-4gb --gpu on \
     --kernel "$fixture/Image" --initrd "$work/initramfs.cpio.gz" \
-    --script "$work/cuda.txt" --timeout 60 > "$work/boot.log" 2>&1 || {
+    --script "$work/cuda.txt" --timeout ${SBC_CUDA_TIMEOUT:-180} > "$work/boot.log" 2>&1 || {
         cp "$work/boot.log" "$fixture/cuda-boot.log"
         tail -80 "$work/boot.log"
         exit 1
@@ -107,7 +116,8 @@ for want in 'cuInit=0' 'CUDA device: Orin' 'CUDA compute capability: 8\.7' 'cuCt
         exit 1
     }
 done
-grep -E '^CUDA_PROBE_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
+grep -E '^CUDA_PROBE_ STATUS=0[[:space:]]*$|^CUDA_VADD OK' "$work/boot.log" &&
+    grep -Eq '^CUDA_VADD_ STATUS=0[[:space:]]*$' "$work/boot.log" || {
     tail -50 "$work/boot.log"
     exit 1
 }

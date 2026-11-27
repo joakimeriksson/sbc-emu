@@ -441,6 +441,8 @@ struct Lower {
     cbs: Vec<(u8, u32)>,
     /// The block's `Active` node, once made.
     active: Option<Id>,
+    /// The instruction uses a uniform predicate (SM70's UP0..UPT), which blocks do not have.
+    uniform_pred: bool,
 }
 
 impl Lower {
@@ -496,6 +498,7 @@ impl Lower {
     }
     /// A predicate as a mask of lanes.
     fn p(&mut self, p: Pred) -> Id {
+        self.uniform_pred |= p.idx > 7;
         let v = if p.idx & 7 == 7 { self.simm(!0) } else { self.node(Node::Pred(p.idx & 7)) };
         if p.not {
             self.snot(v)
@@ -530,6 +533,7 @@ impl Lower {
     }
     /// Writes a predicate (or, 8..11, a flag).
     fn putp(&mut self, p: u8, m: Id, v: Id) {
+        self.uniform_pred |= p > 7;
         if p != 7 {
             self.node(Node::StoreP(if p < 8 { p & 7 } else { p }, v, m));
         }
@@ -637,7 +641,8 @@ impl Lower {
 /// have nodes of it: the caller drops the block's IR from there, or, in `compile`, stops).
 fn lower(l: &mut Lower, inst: &Inst) -> Option<()> {
     let mark = (l.ir.len(), l.cbs.len());
-    let r = lower_op(l, inst);
+    l.uniform_pred = false;
+    let r = lower_op(l, inst).filter(|_| !l.uniform_pred);
     if r.is_none() {
         l.ir.truncate(mark.0);
         l.cbs.truncate(mark.1);
@@ -898,6 +903,83 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             };
             l.put(d, m, r);
         }
+        // SM70's integer core: IMAD and IADD3 without carries, SHF by a constant
+        Op::IMad { d, a, b, c, neg_ab, neg_c, hi: false, sat: false, x: false, cc: false, .. } => {
+            let po = neg_ab && neg_c;
+            let u = l.reg(a);
+            let v = l.src(b);
+            let mut r = l.bin(Bin::Mul, u, v);
+            if neg_ab && !po {
+                let zero = l.imm(0);
+                r = l.bin(Bin::Sub, zero, r);
+            }
+            let w = l.src(c);
+            r = if neg_c && !po { l.bin(Bin::Sub, r, w) } else { l.bin(Bin::Add, r, w) };
+            if po {
+                r = l.bin_imm(Bin::Add, r, 1);
+            }
+            l.put(d, m, r);
+        }
+        Op::IAdd3 { d, a, b, c, neg, half: [0, 0, 0], shift: 0, x: false, cc: false } => {
+            let srcs = [l.reg(a), l.src(b), l.reg(c)];
+            let mut r: Option<Id> = None;
+            let mut sub: Vec<Id> = Vec::new();
+            for (k, v) in srcs.into_iter().enumerate() {
+                if neg[k] {
+                    sub.push(v);
+                } else {
+                    r = Some(match r {
+                        Some(r) => l.bin(Bin::Add, r, v),
+                        None => v,
+                    });
+                }
+            }
+            let mut r = r.unwrap_or_else(|| l.imm(0));
+            for v in sub {
+                r = l.bin(Bin::Sub, r, v);
+            }
+            l.put(d, m, r);
+        }
+        Op::Shf { d, lo, hi, b: Src::Imm(v), right, high, wrap, wide, signed, cc: false } => {
+            // as exec: the 64-bit hi:lo shifted by n, the high word (left, or .HI) or the low one
+            let n = if wrap { v & if wide { 63 } else { 31 } } else { v.min(if wide { 64 } else { 32 }) };
+            let (u, w) = (l.reg(lo), l.reg(hi));
+            let shr = if signed { Bin::ShrS } else { Bin::ShrU };
+            let r = if !right {
+                match n {
+                    0 => w,
+                    1..=31 => {
+                        let a = l.bin_imm(Bin::Shl, w, n);
+                        let b = l.bin_imm(Bin::ShrU, u, 32 - n);
+                        l.bin(Bin::Or, a, b)
+                    }
+                    32 => u,
+                    33..=63 => l.bin_imm(Bin::Shl, u, n - 32),
+                    _ => l.imm(0),
+                }
+            } else if high {
+                match n {
+                    0 => w,
+                    1..=31 => l.bin_imm(shr, w, n),
+                    _ if signed => l.bin_imm(Bin::ShrS, w, 31),
+                    _ => l.imm(0),
+                }
+            } else {
+                match n {
+                    0 => u,
+                    1..=31 => {
+                        let a = l.bin_imm(Bin::ShrU, u, n);
+                        let b = l.bin_imm(Bin::Shl, w, 32 - n);
+                        l.bin(Bin::Or, a, b)
+                    }
+                    32 => w,
+                    33..=63 => l.bin_imm(shr, w, n - 32),
+                    _ if signed => l.bin_imm(Bin::ShrS, w, 31),
+                    _ => l.imm(0),
+                }
+            };
+            l.put(d, m, r);
+        }
         Op::IMul { d, a, b, hi: false, cc: false, .. } => {
             let u = l.reg(a);
             let v = l.src(b);
@@ -954,7 +1036,7 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             let v = l.sel(t, x, y);
             l.put(d, m, v);
         }
-        Op::ISet { d, cmp: cmp @ ICmpArgs { x: false, .. }, bf, cc: false } => {
+        Op::ISet { d, cmp: cmp @ ICmpArgs { x: false, ex: None, .. }, bf, cc: false } => {
             let a = l.reg(cmp.a);
             let b = l.src(cmp.b);
             let t = l.cmpi(cmp.cond, cmp.signed, a, b);
@@ -963,7 +1045,7 @@ fn lower_op(l: &mut Lower, inst: &Inst) -> Option<()> {
             let v = l.bools(r, bf);
             l.put(d, m, v);
         }
-        Op::ISetP { pd, pn, cmp: cmp @ ICmpArgs { x: false, .. } } => {
+        Op::ISetP { pd, pn, cmp: cmp @ ICmpArgs { x: false, ex: None, .. } } => {
             let a = l.reg(cmp.a);
             let b = l.src(cmp.b);
             let t = l.cmpi(cmp.cond, cmp.signed, a, b);

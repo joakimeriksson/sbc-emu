@@ -14,6 +14,9 @@ pub struct Program {
     pub(crate) high: Vec<(u32, u64)>,
     pub(crate) entry: u32,
     gprs: u32,
+    /// Registers past RZ (an SM70 program's uniform ones when its vector registers fill the
+    /// rest): the JIT's blocks cannot address them, so the interpreter runs it.
+    past_rz: bool,
     /// The JIT's code, made when first wanted.
     jit: std::sync::OnceLock<Option<std::sync::Arc<crate::jit::Code>>>,
 }
@@ -76,7 +79,7 @@ impl Program {
             words.push((addr, word));
         }
         let entry = index(entry).map_err(|_| "no entry".to_string())?;
-        Ok(Program { code, words, high: Vec::new(), entry, gprs, jit: Default::default() })
+        Ok(Program { code, words, high: Vec::new(), entry, gprs, past_rz: false, jit: Default::default() })
     }
 
     /// Decodes everything reachable from code address `entry` of SM70+ code (128-bit
@@ -123,6 +126,40 @@ impl Program {
             }
         }
 
+        // Uniform registers and the decoder's two scratch ones go above the program's vector
+        // registers (by default R190 up): measure how far those go, and move them if needed,
+        // packing the uniform registers the program names.
+        let mut past_rz = false;
+        {
+            use crate::decode_sm70::{with_map, Map, SCRATCH};
+            let measure = Map { uniform: [RZ; 64], scratch: 0, measure: true };
+            let (mut vector, mut used) = (0, 0u64);
+            for (&addr, (raw, _)) in &found {
+                let (v, u) = with_map(measure, || decode(addr, *raw).iter().map(|i| highest_reg(&i.op)).max().unwrap_or(0));
+                vector = vector.max(v);
+                used |= u;
+            }
+            if vector > SCRATCH as u32 {
+                // (two scratch registers: past the uniform ones if R253 or R254 is in use)
+                let (scratch, start) = if vector + 2 <= RZ as u32 { (vector as Reg, vector + 2) } else { (crate::decode_sm70::EXTRA_BASE + 64, RZ as u32) };
+                // packed below RZ if they fit, past it if not (registers the JIT does not take)
+                let uniform = Map::packed(start, used, 4)
+                    .or_else(|| Map::packed(start, used, 2))
+                    .unwrap_or(Map::from(crate::decode_sm70::EXTRA_BASE));
+                past_rz = scratch > RZ || uniform.iter().any(|&r| r > RZ);
+                let map = Map { uniform, scratch, measure: false };
+                let ((), again) = with_map(map, || {
+                    for (&addr, (raw, insts)) in found.iter_mut() {
+                        *insts = decode(addr, *raw);
+                        if insts.is_empty() {
+                            insts.push(Inst { pred: PT, op: Op::Nop });
+                        }
+                    }
+                });
+                debug_assert_eq!(again, used);
+            }
+        }
+
         let mut first = BTreeMap::new();
         let mut n = 0u32;
         for (&addr, (_, insts)) in &found {
@@ -159,7 +196,7 @@ impl Program {
             }
         }
         let entry = index(entry).map_err(|_| "no entry".to_string())?;
-        Ok(Program { code, words, high, entry, gprs, jit: Default::default() })
+        Ok(Program { code, words, high, entry, gprs, past_rz, jit: Default::default() })
     }
 
     /// Decodes a program at address 0 of `code`.
@@ -196,10 +233,27 @@ impl Program {
         self.gprs
     }
 
+    /// A program of these operations, then EXIT (for tests of the JIT against the interpreter).
+    #[cfg(test)]
+    pub(crate) fn from_ops(ops: &[Op]) -> Program {
+        let mut code: Vec<Inst> = ops.iter().map(|&op| Inst { pred: PT, op }).collect();
+        code.push(Inst { pred: PT, op: Op::Exit { cond: 15 } });
+        // (words from the operations: the JIT caches code by them)
+        let word = |i: &Inst| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}", i.op).hash(&mut h);
+            h.finish()
+        };
+        let words = code.iter().enumerate().map(|(k, i)| (k as u32 * 16, word(i))).collect();
+        let gprs = code.iter().map(|i| highest_reg(&i.op)).max().unwrap_or(0);
+        Program { code, words, high: Vec::new(), entry: 0, gprs, past_rz: false, jit: Default::default() }
+    }
+
     /// The JIT's blocks of this program (compiled the first time), if the JIT is on.
     #[inline]
     pub fn jit(&self) -> Option<&crate::jit::Code> {
-        if !crate::jit::enabled() {
+        if !crate::jit::enabled() || self.past_rz {
             return None;
         }
         self.jit.get_or_init(|| crate::jit::code_for(self)).as_deref()
@@ -273,6 +327,7 @@ fn highest_reg(op: &Op) -> u32 {
         | Op::DSet { d, .. }
         | Op::IAdd { d, .. }
         | Op::IAdd3 { d, .. }
+        | Op::IAdd3P { d, .. }
         | Op::IScAdd { d, .. }
         | Op::Lea { d, .. }
         | Op::Vadd { d, .. }

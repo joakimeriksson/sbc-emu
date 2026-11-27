@@ -62,6 +62,23 @@ pub trait Memory {
         }
     }
 
+    /// An atomic read-modify-write of `n` (at most 8) bytes at `addr`: `f` gets the old value
+    /// (little-endian, the rest zero) and gives the new one; returns the old. `f` may be called
+    /// more than once. The default reads, then writes: atomic for one thread only.
+    fn update(&mut self, addr: u64, n: usize, f: &mut dyn FnMut(u64) -> u64) -> u64 {
+        let mut buf = [0; 8];
+        self.read(addr, &mut buf[..n]);
+        let old = u64::from_le_bytes(buf);
+        self.write(addr, &f(old).to_le_bytes()[..n]);
+        old
+    }
+
+    /// Whether `update` stays atomic across the views of a `split` (then a launch with atomics
+    /// may run its workgroups on several threads).
+    fn split_atomics(&self) -> bool {
+        false
+    }
+
     /// The same memory for another thread, to read only (writes may be dropped). None: one thread.
     fn share(&self) -> Option<Box<dyn Memory + Send + '_>> {
         None

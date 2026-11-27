@@ -59,6 +59,8 @@ pub(super) struct Host {
     channels: [HashMap<u32, Channel>; 2],
     pub submissions: u64,
     pub nonstall_pending: bool,
+    /// The instance block of the channel the graphics engine last ran: FECS's current context.
+    pub gr_instance: Option<u64>,
 }
 
 #[derive(Default)]
@@ -126,6 +128,32 @@ impl Host {
         }
     }
 
+    /// Rings again the channels stopped at a semaphore acquire, while any of them gets further:
+    /// what one channel released may be what another waits for (`cuStreamWaitEvent`).
+    pub fn retry_blocked(&mut self, ram: &mut [u8], host1x: &mut Host1x, trace: bool, now: u64) {
+        for _ in 0..16 {
+            let blocked: Vec<(u32, Option<(u64, u32)>)> = self
+                .channels
+                .iter()
+                .enumerate()
+                .flat_map(|(runlist, channels)| {
+                    channels.iter().filter(|(_, c)| c.resume.is_some()).map(move |(&id, c)| ((runlist as u32) << 16 | id, c.resume))
+                })
+                .collect();
+            let mut progress = false;
+            for (token, before) in blocked {
+                // (a failed ring has nothing to report here: the doorbell path traces it)
+                let _ = self.ring(token, ram, host1x, trace, now);
+                let runlist = (token >> 16) as usize;
+                let after = self.channels.get(runlist).and_then(|c| c.get(&(token & 0xfff))).and_then(|c| c.resume);
+                progress |= after != before;
+            }
+            if !progress {
+                return;
+            }
+        }
+    }
+
     pub fn ring(
         &mut self,
         token: u32,
@@ -136,6 +164,9 @@ impl Host {
     ) -> Option<()> {
         let runlist = (token >> 16 & 0x7f) as usize;
         let channel = self.channels.get_mut(runlist)?.get_mut(&(token & 0xfff))?;
+        if runlist == 1 {
+            self.gr_instance = Some(channel.instance);
+        }
         channel.compute.timestamp = now;
         channel.copy.timestamp = now;
         channel.threed.timestamp = now;

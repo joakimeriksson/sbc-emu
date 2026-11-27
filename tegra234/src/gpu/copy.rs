@@ -211,10 +211,7 @@ mod tests {
     }
 
     fn run(ram: &mut [u8], methods: &[(u32, u32)]) {
-        let mut view = View {
-            ram,
-            root: RAM_BASE,
-        };
+        let mut view = View::new(ram, RAM_BASE);
         let mut copy = Copy::default();
         for &(method, data) in methods {
             copy.method(method, data, &mut view).unwrap();

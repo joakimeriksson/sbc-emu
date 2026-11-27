@@ -21,6 +21,8 @@ impl Display for Pred {
         f.write_str(if self.not { "!" } else { "" })?;
         match self.idx {
             7 => write!(f, "pt"),
+            15 => write!(f, "upt"),
+            n @ 8.. => write!(f, "up{}", n - 8),
             n => write!(f, "p{n}"),
         }
     }
@@ -165,14 +167,15 @@ fn fcmp(c: &FCmpArgs) -> String {
 
 fn icmp(c: &ICmpArgs) -> String {
     format!(
-        "{}{}{}{} {} {} {}",
+        "{}{}{}{} {} {} {}{}",
         ICOND[c.cond as usize & 7],
         dot(!c.signed, ".u32"),
         dot(c.x, ".x"),
         bop(c.bop),
         R(c.a),
         i(c.b),
-        c.p
+        c.p,
+        c.ex.map_or(String::new(), |p| format!(" ex {p}"))
     )
 }
 
@@ -364,6 +367,22 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
             neg(r(a), neg_a),
             neg(b, neg_b)
         ),
+        Op::FChk { pd, a, b } => format!("fchk {} {}, {}", Pred { idx: pd, not: false }, R(a), i(b)),
+        Op::IAdd3P { d, a, b, c, neg: n, x: e, cin, cout } => format!(
+            "iadd3{} {} {} {}, {}{}, {}{}, {}{} {} {}",
+            dot(e, ".x"),
+            R(d),
+            Pred { idx: cout[0], not: false },
+            Pred { idx: cout[1], not: false },
+            if n[0] { "-" } else { "" },
+            R(a),
+            if n[1] { "-" } else { "" },
+            i(b),
+            if n[2] { "-" } else { "" },
+            i(c),
+            cin[0],
+            cin[1]
+        ),
         Op::IAdd3 { d, a, b, c, neg: n, half, shift, x: e, cc: f } => format!(
             "iadd3{}{} {} {} {} {} half {half:?} shift {shift}",
             dot(e, ".x"),
@@ -524,6 +543,7 @@ pub fn inst(x: &Inst, at: &dyn Fn(Target) -> u32) -> String {
         Op::Sts { r: v, a, off, ty } => {
             format!("sts.{ty:?} s{} {}", addr(a, off), vec(v, words(ty)))
         }
+        Op::Ldgsts { s, soff, g, goff, ty, p } => format!("ldgsts.{ty:?} s{} g{} {p}", addr(s, soff), addr(g, goff)),
         Op::Atom { d, a, b, off, op, ty, wide } => format!(
             "atom.{op:?}.{ty:?}{} {} g{} {}",
             dot(wide, ".e"),

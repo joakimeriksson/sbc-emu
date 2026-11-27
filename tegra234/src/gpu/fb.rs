@@ -9,6 +9,11 @@ const MMU_ACTIVE_LTCS: u64 = 0x100ec0;
 const NISO_HUB_COUNT: u64 = 0x004c7c;
 const FLUSH: std::ops::RangeInclusive<u64> = 0x070000..=0x070010;
 const LTC_COUNT_MASK: u32 = 0x1f;
+/// ltc_ltc0_lts0_tstg_info_1: an L2 slice's size in KiB (15:0) and the slices (20:16), from which
+/// nvgpu gives CUDA the L2's size (2 MiB on the Orin Nano); TensorRT's timing model needs it.
+const LTS_TSTG_INFO_1: u64 = 0x14058c;
+const L2_SLICES: u32 = 4;
+const L2_SLICE_KIB: u32 = 512;
 const PRI_FIFO_IDLE: u32 = 0xff_8000;
 
 #[derive(Default)]
@@ -27,6 +32,7 @@ impl Fb {
             MMU_INVALIDATE_PDB => self.invalidate_pdb,
             MMU_INVALIDATE => 0,
             NISO_HUB_COUNT => 1 << 1,
+            LTS_TSTG_INFO_1 => L2_SLICES << 16 | L2_SLICE_KIB,
             offset if FLUSH.contains(&offset) => 0,
             _ => return None,
         })

@@ -47,11 +47,17 @@ impl Compute {
         let mut guest = Guest::new(memory);
         self.engine
             .launch_at(qmd, &mut self.pipe, &mut guest, self.timestamp);
-        if let Some((address, write)) = guest.first_fault.get() {
+        if let Some((address, write, pc)) = guest.first_fault.get() {
             eprintln!(
-                "[gpu] compute launch at {qmd:#x}: GPU page fault, {} {address:#x}",
-                if write { "write" } else { "read" }
+                "[gpu] compute launch at {qmd:#x}: GPU page fault, {} {address:#x} (program {:#x} at +{:#x}, groups {:?}, threads {:?})",
+                if write { "write" } else { "read" },
+                self.engine.last.0,
+                pc,
+                self.engine.last.1,
+                self.engine.last.2
             );
+            let (below, above) = guest.extent(address);
+            eprintln!("[gpu]   mapped memory ends at {below:#x?} below it and starts again at {above:#x?}");
         }
         guest.ok()
     }

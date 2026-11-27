@@ -521,6 +521,14 @@ pub(crate) fn run_with_io<B: SerialBoard>(
         }
         match stop {
             Stop::Budget => {}
+            Stop::Idle(deadline) if idle_skip() => {
+                // SBC_IDLE=skip: an idle guest's time jumps to its next deadline (a batch job
+                // that waits on timers, like CUDA's synchronization, need not wait them out)
+                while let Ok(b) = rx.try_recv() {
+                    idle_input.push(b);
+                }
+                m.host().idle_until(deadline);
+            }
             Stop::Idle(deadline) => {
                 // Virtual time never runs ahead of the wall clock while idle: sleep until the
                 // deadline's wall time. (Not only while the guest is ahead: after each turn its
@@ -581,4 +589,10 @@ pub(crate) fn run_with_io<B: SerialBoard>(
         screenshot(&mut m, tag, path);
     }
     result
+}
+
+/// SBC_IDLE=skip: idle time passes at once instead of at the wall clock's pace.
+fn idle_skip() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var("SBC_IDLE").is_ok_and(|v| v == "skip"))
 }

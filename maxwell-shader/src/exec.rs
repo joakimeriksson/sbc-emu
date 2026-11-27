@@ -50,9 +50,11 @@ const MAX_DEPTH: usize = 4096;
 #[repr(align(128))]
 pub struct Lanes<const N: usize> {
     /// General registers by lane. Register 255 must stay zero.
-    pub gpr: Box<[[u32; N]; 256]>,
+    pub gpr: Box<[[u32; N]; REGS]>,
     /// Predicates, one bit per lane; predicate 7 is all ones.
     pub pred: [u32; 8],
+    /// SM70's uniform predicates UP0..UP6 and UPT (7, all ones); `Pred` names them as 8..15.
+    pub upred: [u32; 8],
     /// Flags, one bit per lane.
     /// Condition flags, one bit per lane: zero, sign, carry, overflow.
     pub(crate) cc: [u32; 4],
@@ -89,12 +91,18 @@ impl<const N: usize> Default for Lanes<N> {
 }
 
 impl<const N: usize> Lanes<N> {
+    /// The lanes running (for tracing).
+    pub fn active_mask(&self) -> u32 {
+        self.active
+    }
+
     pub fn new() -> Self {
         assert!((4..=32).contains(&N) && N.is_multiple_of(4), "lanes come in quads, at most 32");
-        let gpr: Box<[[u32; N]]> = vec![[0; N]; 256].into_boxed_slice();
+        let gpr: Box<[[u32; N]]> = vec![[0; N]; REGS].into_boxed_slice();
         Lanes {
             gpr: gpr.try_into().unwrap(),
             pred: [0, 0, 0, 0, 0, 0, 0, !0],
+            upred: [0, 0, 0, 0, 0, 0, 0, !0],
             cc: [0; 4],
             local: Vec::new(),
             local_size: 0,
@@ -131,10 +139,11 @@ impl<const N: usize> Lanes<N> {
     /// registers the program uses, and those the program before wrote.
     pub fn start(&mut self, p: &Program, lanes: u32, helper: u32) {
         // (and those an earlier program wrote: lanes kept from it start as new ones)
-        let n = (p.gprs() as usize).min(255);
+        let n = (p.gprs() as usize).min(REGS);
         self.gpr[..n.max(self.written)].fill([0; N]);
         self.written = n;
         self.pred = [0, 0, 0, 0, 0, 0, 0, !0];
+        self.upred = [0, 0, 0, 0, 0, 0, 0, !0];
         self.cc = [0; 4];
         self.pc = p.entry;
         self.start = lanes & all::<N>();
@@ -201,15 +210,15 @@ impl<const N: usize> Lanes<N> {
 
     #[inline(always)]
     fn putp(&mut self, p: u8, m: u32, v: u32) {
-        if p != 7 {
-            let r = &mut self.pred[p as usize & 7];
+        if p & 7 != 7 {
+            let r = if p < 8 { &mut self.pred[p as usize] } else { &mut self.upred[p as usize & 7] };
             *r = *r & !m | v & m;
         }
     }
 
     #[inline(always)]
     fn p(&self, p: Pred) -> u32 {
-        let v = self.pred[p.idx as usize & 7];
+        let v = if p.idx < 8 { self.pred[p.idx as usize] } else { self.upred[p.idx as usize & 7] };
         if p.not {
             !v
         } else {
@@ -628,6 +637,22 @@ fn extend(b: &[u8], ty: MemTy) -> u32 {
     }
 }
 
+/// FCHK: whether a / b (as bits) needs the exact division routine. Saying yes too often only
+/// costs time; the routine's answer is right either way.
+fn fchk(a: u32, b: u32) -> bool {
+    let (ea, eb) = ((a >> 23 & 0xff) as i32, (b >> 23 & 0xff) as i32);
+    let a_zero = a & 0x7fff_ffff == 0;
+    // b zero, denormal, infinite or NaN; a denormal, infinite or NaN
+    if eb == 0 || eb == 0xff || ea == 0xff || (ea == 0 && !a_zero) {
+        return true;
+    }
+    // the quotient (and the reciprocal of b) well inside the normal range
+    !a_zero && !(-120..=120).contains(&(ea - eb)) || !(3..=252).contains(&eb) || !a_zero && !(3..=252).contains(&ea)
+}
+
+/// The program offset of the last memory instruction run (on any thread): a fault report's best guess.
+pub static LAST_MEMORY_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// What a fault returns (and prints with SBC_SHADER_FAULT=1).
 #[cold]
 fn fault(p: &Program, pc: u32) -> Exit {
@@ -670,7 +695,7 @@ pub fn run<const N: usize, H: Host<N>>(
             if let Some((b, len)) = j.block_at(l.pc) {
                 if l.active != 0 && *fuel >= len as u64 {
                     j.fill(b, &mut l.frame, |i, o| h.cbuf(i, o));
-                    if j.run(b, &mut l.gpr, &mut l.pred, &mut l.cc, &mut l.frame, l.active) {
+                    if j.run(b, (&mut l.gpr[..256]).try_into().unwrap(), &mut l.pred, &mut l.cc, &mut l.frame, l.active) {
                         *fuel -= len as u64;
                         l.pc += len;
                         continue;
@@ -695,6 +720,9 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
     };
     l.pc = pc + 1;
     h.trace(p.words[pc as usize].0, inst, l);
+    if interp_stats() {
+        count_interpreted(&inst.op);
+    }
     let m = l.active & l.p(inst.pred);
     if m == 0 {
         return None;
@@ -961,6 +989,31 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
                 }
                 l.put(d, m, r);
             }
+        }
+        Op::FChk { pd, a, b } => {
+            let (u, v) = (l.gpr[a as usize], l.src(h, b));
+            let mut t = 0u32;
+            for i in 0..N {
+                t |= (fchk(u[i], v[i]) as u32) << i;
+            }
+            l.putp(pd, m, t);
+        }
+        Op::IAdd3P { d, a, b, c, neg, x, cin, cout } => {
+            let (va, vb, vc) = (l.gpr[a as usize], l.src(h, b), l.src(h, c));
+            let (c0, c1) = (l.p(cin[0]), l.p(cin[1]));
+            // -v is ~v + 1, except in the high word of a 64-bit add (the low word's carry has it)
+            let arg = |v: u32, n: bool| if !n { v as u64 } else if x { !v as u64 } else { !v as u64 + 1 };
+            let (mut r, mut k0, mut k1) = ([0u32; N], 0u32, 0u32);
+            for i in 0..N {
+                let s0 = arg(va[i], neg[0]) + arg(vb[i], neg[1]) + (c0 >> i & 1) as u64;
+                let s1 = (s0 & 0xffff_ffff) + arg(vc[i], neg[2]) + (c1 >> i & 1) as u64;
+                r[i] = s1 as u32;
+                k0 |= ((s0 >> 32 != 0) as u32) << i;
+                k1 |= ((s1 >> 32 != 0) as u32) << i;
+            }
+            l.put(d, m, r);
+            l.putp(cout[0], m, k0);
+            l.putp(cout[1], m, k1);
         }
         Op::IAdd3 { d, a, b, c, neg, half, shift, x, cc } => {
             let srcs = [l.gpr[a as usize], l.src(h, b), l.gpr[c as usize]];
@@ -1461,8 +1514,13 @@ pub(crate) fn step<const N: usize, H: Host<N>>(p: &Program, l: &mut Lanes<N>, h:
         | Op::Stl { .. }
         | Op::Lds { .. }
         | Op::Sts { .. }
+        | Op::Ldgsts { .. }
         | Op::Atom { .. }
-        | Op::AtomS { .. } => memory(l, h, m, &inst.op),
+        | Op::AtomS { .. } => {
+            // which instruction a memory fault came from, for the GPU's fault reports
+            LAST_MEMORY_PC.store(p.words.get(pc as usize).map_or(0, |w| w.0), std::sync::atomic::Ordering::Relaxed);
+            memory(l, h, m, &inst.op)
+        }
 
         Op::Ald { d, a, v, addr, n, patch, output } => {
             let (base, vtx) = (l.gpr[a as usize], l.gpr[v as usize]);
@@ -1731,6 +1789,18 @@ fn fcmp<const N: usize, H: Host<N>>(l: &Lanes<N>, h: &H, c: &FCmpArgs) -> u32 {
 fn icmp<const N: usize, H: Host<N>>(l: &Lanes<N>, h: &H, c: &ICmpArgs) -> u32 {
     let a = &l.gpr[c.a as usize];
     let b = l.src(h, c.b);
+    if let Some(low) = c.ex {
+        // SM70: the high halves decide, unless they are equal: then the low halves' result does
+        let (lt, eq, gt, low) = (cmpi(1, c.signed, a, &b), cmpi(2, c.signed, a, &b), cmpi(4, c.signed, a, &b), l.p(low));
+        return match c.cond & 7 {
+            0 => 0,
+            1 | 3 => lt | eq & low,
+            2 => eq & low,
+            4 | 6 => gt | eq & low,
+            5 => !eq | low,
+            _ => !0,
+        };
+    }
     if !c.x {
         return cmpi(c.cond, c.signed, a, &b);
     }
@@ -2200,6 +2270,20 @@ fn memory<const N: usize, H: Host<N>>(l: &mut Lanes<N>, h: &mut H, m: u32, op: &
                 }
             }
         }
+        Op::Ldgsts { s, soff, g, goff, ty, p } => {
+            let valid = l.p(p);
+            for i in lanes(m & !quiet) {
+                let n = ty.bytes();
+                let mut buf = [0; 16];
+                if valid >> i & 1 != 0 {
+                    h.load(global(l, g, goff, true, i), &mut buf[..n]);
+                }
+                let at = near(l, s, soff, i) as usize;
+                if let Some(s) = at.checked_add(n).and_then(|e| h.shared().get_mut(at..e)) {
+                    s.copy_from_slice(&buf[..n]);
+                }
+            }
+        }
         Op::Atom { d, a, b, off, op, ty, wide } => {
             for i in lanes(m) {
                 let mut old = 0;
@@ -2498,4 +2582,32 @@ mod run_tests {
     fn membar_decodes() {
         assert_eq!(crate::decode::decode(8, 0xef98_0000_0007_000f).op, Op::Membar);
     }
+}
+
+/// SBC_INTERP_STATS: count the instructions the interpreter runs, by kind, and print the most
+/// common ones every 50 million (to see what keeps code out of the JIT).
+fn interp_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SBC_INTERP_STATS").is_some())
+}
+
+#[cold]
+fn count_interpreted(op: &Op) {
+    use std::collections::HashMap;
+    thread_local! {
+        static COUNTS: std::cell::RefCell<(u64, HashMap<String, u64>)> = Default::default();
+    }
+    COUNTS.with(|c| {
+        let mut c = c.borrow_mut();
+        let name = format!("{op:?}");
+        let kind = name[..name.find([' ', '(', '{']).unwrap_or(name.len())].to_string();
+        *c.1.entry(kind).or_insert(0) += 1;
+        c.0 += 1;
+        if c.0 % 50_000_000 == 0 {
+            let mut v: Vec<_> = c.1.iter().map(|(k, n)| (*n, k.clone())).collect();
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            let top: Vec<String> = v.iter().take(14).map(|(n, k)| format!("{k} {:.1}%", 100.0 * *n as f64 / c.0 as f64)).collect();
+            eprintln!("[interp] {}M instructions: {}", c.0 / 1_000_000, top.join(", "));
+        }
+    });
 }

@@ -3,10 +3,14 @@
 //! Register 255 reads as zero and drops writes; predicate 7 is true.
 
 /// A general register number; 255 is zero.
-pub type Reg = u8;
+pub type Reg = u16;
 
 /// "No register": reads zero, writes are dropped.
 pub const RZ: Reg = 255;
+
+/// The register file: R0..R254, RZ, then room past it for an SM70 program's uniform and scratch
+/// registers when its vector registers fill the rest (only the interpreter reaches those).
+pub const REGS: usize = 256 + 64 + 2;
 
 /// An operand that may come from a register, a constant buffer or the instruction.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -355,6 +359,9 @@ pub struct ICmpArgs {
     pub signed: bool,
     /// Continue a 64-bit comparison: use the flags of the low half's subtraction.
     pub x: bool,
+    /// SM70's ISETP.EX: continue a 64-bit comparison of the high halves, the low halves' result
+    /// (same condition, unsigned) in this predicate.
+    pub ex: Option<Pred>,
     pub bop: BoolOp,
     pub p: Pred,
 }
@@ -430,6 +437,14 @@ pub enum Op {
     /// `shift`: 0 plain, 1 (a + b) >> 16, 2 (a + b) << 16; `half`: 0 word, 1 H0, 2 H1 per source.
     IAdd3 { d: Reg, a: Reg, b: Src, c: Reg, neg: [bool; 3], half: [u8; 3], shift: u8, x: bool, cc: bool },
     IScAdd { d: Reg, a: Reg, b: Src, shift: u8, neg_a: bool, neg_b: bool, cc: bool },
+    /// SM70's IADD3 with its carries in predicates: d = a + b + c + cin[0] + cin[1]. cout[0] gets
+    /// the carry of a + b + cin[0], cout[1] that of adding c + cin[1] (7 or 15: none). A negated
+    /// operand is -x, or ~x in the .X form (`x`), the high word of a 64-bit add.
+    /// SM70 FCHK: pd = whether a / b needs the exact (slow) division routine instead of a
+    /// reciprocal and a refinement: an operand is not a normal number (b also not zero), or the
+    /// quotient's exponent is near the edge of the range.
+    FChk { pd: u8, a: Reg, b: Src },
+    IAdd3P { d: Reg, a: Reg, b: Src, c: Src, neg: [bool; 3], x: bool, cin: [Pred; 2], cout: [u8; 2] },
     /// LEA: d = (a << shift) + b; LEA.HI (`hi`: the high word's register c): d = the high word of
     /// (c:a << shift) + b. X adds the carry; the carry out goes to CC (with `cc`) and to `pd`.
     Lea { d: Reg, a: Reg, b: Src, hi: Option<Reg>, shift: u8, neg_a: bool, x: bool, cc: bool, pd: u8 },
@@ -484,6 +499,9 @@ pub enum Op {
     Stl { r: Reg, a: Reg, off: i32, ty: MemTy },
     Lds { d: Reg, a: Reg, off: i32, ty: MemTy },
     Sts { r: Reg, a: Reg, off: i32, ty: MemTy },
+    /// SM80 LDGSTS: global `[g.64 + goff]` to shared `[s + soff]` (done at once, not
+    /// asynchronously); where `p` is false the shared bytes become zeros.
+    Ldgsts { s: Reg, soff: i32, g: Reg, goff: i32, ty: MemTy, p: Pred },
     Atom { d: Reg, a: Reg, b: Reg, off: i32, op: AtomOp, ty: AtomTy, wide: bool },
     AtomS { d: Reg, a: Reg, b: Reg, off: i32, op: AtomOp, ty: AtomTy },
     Ald { d: Reg, a: Reg, v: Reg, addr: u16, n: u8, patch: bool, output: bool },
