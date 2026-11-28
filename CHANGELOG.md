@@ -12,6 +12,11 @@ in an earlier repository whose history was rewritten; it is summarised here with
 
 ### Added
 
+- Jetson Orin Nano: Wi-Fi with `--wifi SSID[:PASSPHRASE]`. A Broadcom BCM4350 card in the M.2
+  Key E slot behind the Orin's own PCIe controller C1 (Tegra234 DesignWare with BPMP bring-up,
+  iATU, MSIs), driven by the image's `pcie-tegra194` and `brcmfmac` (msgbuf, an emulated dongle
+  in place of the firmware): `wlan0`, scans, open and WPA2-PSK joins, soft AP (NetworkManager's
+  hotspot), sbc-net's network behind the access point (docs/jetson-orin-nano.md, "Wi-Fi").
 - Jetson Nano: NVIDIA's own GPU stack. L4T R32.7.3's kernel with `nvgpu`, CUDA 10.2 and
   TensorRT 8.2 run with Debian's root; YOLOv8n through TensorRT finds what ONNX Runtime finds
   (docs/jetson-nano-cuda.md, `scripts/jetson-nano-l4t-fixture.sh`). Mesa's OpenCL and NVK run it

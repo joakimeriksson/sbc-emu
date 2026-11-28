@@ -6,6 +6,7 @@ mod host1x;
 mod hsp;
 mod mc;
 mod mss_nvlink;
+mod pcie;
 #[cfg(not(target_arch = "wasm32"))]
 mod mt;
 mod uart;
@@ -14,6 +15,9 @@ use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
 use peripherals::{gicv3::Gic, pl011::Pl011};
 use uart::UartA;
+
+/// An access point the Wi-Fi card sees (`Machine::connect_wifi`).
+pub use peripherals::bcm43455::Network as WifiNetwork;
 
 pub const RAM_BASE: u64 = 0x8000_0000;
 pub const DISPLAY_SIZE: (u32, u32) = (640, 360);
@@ -64,6 +68,12 @@ struct Soc {
     /// the network behind the USB Ethernet adapter, and when it is next polled
     net: Option<sbc_net::net::VirtualNet>,
     net_next: u64,
+    /// PCIe controller C1 with its M.2 Key E card (`--wifi`), and the network behind the
+    /// card's access point, polled from `wifi_next` while the card is joined
+    pcie: Option<pcie::Pcie>,
+    wifi_net: Option<sbc_net::net::VirtualNet>,
+    wifi_next: u64,
+    wifi_joined: bool,
     now: u64,
     interrupts_changed: bool,
 }
@@ -184,6 +194,11 @@ impl Soc {
             self.gic.set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
         }
         self.pump_network(now);
+        self.pump_wifi(now);
+        if let Some(pcie) = self.pcie.as_mut() {
+            pcie.tick(now, &mut self.ram);
+            self.gic.set_line((pcie::MSI_SPI + 32) as usize, pcie.msi_irq());
+        }
         if let Some(xhci) = self.xhci.as_mut() {
             let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
             xhci.tick(now, &mut dma, &mut self.usb);
@@ -210,7 +225,42 @@ impl Soc {
             .into_iter()
             .chain(self.xhci.as_ref().and_then(|x| x.next_event(&self.usb)))
             .chain((self.net.is_some() && self.usb.net.as_ref().is_some_and(|n| n.up())).then_some(self.net_next))
+            .chain((self.wifi_net.is_some() && self.wifi_joined()).then_some(self.wifi_next))
+            .chain(self.pcie.as_ref().and_then(|p| p.next_event()))
             .min()
+    }
+
+    fn wifi_joined(&self) -> bool {
+        self.wifi_joined
+    }
+
+    /// Exchange the Wi-Fi card's Ethernet frames with the network behind its access point:
+    /// what the guest sent goes out at once, the network is polled every millisecond with NAT
+    /// (10 ms without) while the card is joined.
+    fn pump_wifi(&mut self, now: u64) {
+        let (Some(pcie), Some(net)) = (self.pcie.as_mut(), self.wifi_net.as_mut()) else { return };
+        let now_us = now / 1000;
+        let poll = now >= self.wifi_next;
+        let joined = pcie
+            .with_card(&mut self.ram, |card: &mut peripherals::bcm4350::Bcm4350, port| {
+                let mut replies = Vec::new();
+                for frame in card.take_transmitted() {
+                    replies.extend(net.handle(&frame, now_us));
+                }
+                let joined = card.joined().is_some();
+                if joined && poll {
+                    replies.extend(net.poll(now_us));
+                }
+                for frame in replies {
+                    card.receive(&frame, port);
+                }
+                joined
+            })
+            .unwrap_or(false);
+        if poll {
+            self.wifi_next = now + if net.nat.is_some() { 1_000_000 } else { 10_000_000 };
+        }
+        self.wifi_joined = joined;
     }
 
     /// Exchange frames between the USB Ethernet adapter and the network: what the guest sent goes
@@ -239,6 +289,12 @@ impl Soc {
         } else if let Some(offset) = Self::sram_offset(addr, N) {
             let firmware = self.firmware.as_ref().ok_or(Fault::Unmapped)?;
             bytes.copy_from_slice(&firmware.bpmp.sram[offset..offset + N]);
+        } else if let Some(pcie) = self.pcie.as_mut().filter(|_| pcie::Pcie::contains(addr)) {
+            pcie.powered = self.firmware.as_ref().is_some_and(|f| f.bpmp.pcie_available());
+            pcie.now = self.now;
+            let value = pcie.read(addr, N, &mut self.ram);
+            bytes.copy_from_slice(&value.to_le_bytes()[..N]);
+            self.interrupts_changed = true;
         } else if N == 8 && addr.is_multiple_of(8) {
             bytes[..4].copy_from_slice(&self.device_read(addr)?.to_le_bytes());
             bytes[4..].copy_from_slice(&self.device_read(addr + 4)?.to_le_bytes());
@@ -258,6 +314,13 @@ impl Soc {
         } else if let Some(offset) = Self::sram_offset(addr, N) {
             let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
             firmware.bpmp.sram[offset..offset + N].copy_from_slice(&bytes);
+        } else if let Some(pcie) = self.pcie.as_mut().filter(|_| pcie::Pcie::contains(addr)) {
+            pcie.powered = self.firmware.as_ref().is_some_and(|f| f.bpmp.pcie_available());
+            pcie.now = self.now;
+            let mut value = [0; 8];
+            value[..N].copy_from_slice(&bytes);
+            pcie.write(addr, u64::from_le_bytes(value), N, &mut self.ram);
+            self.interrupts_changed = true;
         } else if N == 8 && addr.is_multiple_of(8) {
             self.device_write(addr, u32::from_le_bytes(bytes[..4].try_into().unwrap()))?;
             self.device_write(addr + 4, u32::from_le_bytes(bytes[4..].try_into().unwrap()))?;
@@ -372,6 +435,10 @@ impl Machine {
             usb: Default::default(),
             net: None,
             net_next: 0,
+            pcie: None,
+            wifi_net: None,
+            wifi_next: 0,
+            wifi_joined: false,
             now: 0,
             interrupts_changed: true,
         };
@@ -461,11 +528,37 @@ impl Machine {
         self.plug_usb();
     }
 
+    /// A Wi-Fi card in the M.2 Key E slot on PCIe controller C1 (a Broadcom BCM4350, which
+    /// the image's brcmfmac drives as wlan0), seeing `networks` as its access points, with
+    /// sbc-net's virtual network (DHCP, DNS, ICMP; `nat` also relays TCP/UDP to the host's
+    /// network, native builds only) behind them. Needs the BPMP (the controller's clock,
+    /// resets, power and UPHY).
+    pub fn connect_wifi(&mut self, networks: Vec<peripherals::bcm43455::Network>, nat: bool, log: bool) {
+        self.enable_bpmp();
+        let mut card = peripherals::bcm4350::Bcm4350::new([0x02, 0x90, 0x4c, 0x43, 0x50, 0x01]);
+        card.set_networks(networks);
+        self.soc.pcie = Some(pcie::Pcie::new(Some(Box::new(card))));
+        #[allow(unused_mut)]
+        let mut net = sbc_net::net::VirtualNet::new(log);
+        #[cfg(not(target_arch = "wasm32"))]
+        if nat {
+            net.nat = Some(sbc_net::nat::Nat::new(log));
+        }
+        let _ = nat;
+        self.soc.wifi_net = Some(net);
+    }
+
+    pub fn wifi_enabled(&self) -> bool {
+        self.soc.pcie.is_some()
+    }
+
     /// Forward a host TCP address to a guest port (needs `connect_usb_network` with NAT).
     pub fn forward_tcp(&mut self, host: std::net::SocketAddr, guest_port: u16) -> Result<(), String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let nat = self.soc.net.as_mut().and_then(|n| n.nat.as_mut()).ok_or("port forwarding needs the USB network with NAT")?;
+            // the USB Ethernet's network, or else the Wi-Fi's
+            let net = if self.soc.net.is_some() { self.soc.net.as_mut() } else { self.soc.wifi_net.as_mut() };
+            let nat = net.and_then(|n| n.nat.as_mut()).ok_or("port forwarding needs a network with NAT")?;
             nat.add_forward(host, guest_port).map_err(|e| format!("{host}: {e}"))
         }
         #[cfg(target_arch = "wasm32")]

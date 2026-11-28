@@ -92,6 +92,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             "--vnc",
             "--screenshot",
             "--threads",
+            "--wifi",
         ],
     )?;
     // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
@@ -121,7 +122,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         Some(_) => return Err("--gpu expects on or off".into()),
     };
     let bpmp = match crate::arg(args, "--bpmp") {
-        None => gpu,
+        None => gpu || crate::arg(args, "--wifi").is_some(),
         Some("off") if gpu => return Err("--gpu on requires BPMP".into()),
         Some("off") => false,
         Some("on") => true,
@@ -144,8 +145,16 @@ fn execute(args: &[String]) -> Result<(), String> {
             parse_hostfwd(spec).ok_or(format!("--hostfwd {spec}: expected tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if !forwards.is_empty() && net != Some(true) {
-        return Err("--hostfwd needs --net nat".into());
+    // --wifi SSID[:PASSPHRASE]: a Wi-Fi card (BCM4350 on PCIe C1, the M.2 Key E slot) whose
+    // virtual access point is SSID, open or WPA2-PSK; behind it the same virtual network as
+    // --net (NAT unless --net local)
+    let wifi = crate::arg(args, "--wifi").map(parse_wifi).transpose()?;
+    if wifi.is_some() && !bpmp {
+        return Err("--wifi needs the BPMP (--bpmp on): PCIe power, clocks and resets".into());
+    }
+    let wifi_nat = net != Some(false);
+    if !forwards.is_empty() && net != Some(true) && !(net.is_none() && wifi.is_some()) {
+        return Err("--hostfwd needs --net nat (or --wifi without --net)".into());
     }
     let ram = serial_board::ram_bytes(args, 4096)?;
     let read = |path: &str| std::fs::read(path).map_err(|err| format!("{path}: {err}"));
@@ -187,6 +196,9 @@ fn execute(args: &[String]) -> Result<(), String> {
             }
             if let Some(nat) = net {
                 machine.connect_usb_network(nat, std::env::var_os("SBC_NET_LOG").is_some());
+            }
+            if let Some(network) = &wifi {
+                machine.connect_wifi(vec![network.clone()], wifi_nat, std::env::var_os("SBC_NET_LOG").is_some());
             }
             for &(host, guest) in &forwards {
                 match machine.forward_tcp(host, guest) {
@@ -393,6 +405,26 @@ impl UsbSerialLink {
             self.stream = None;
         }
     }
+}
+
+/// `--wifi SSID[:PASSPHRASE]`: the access point (WPA2-PSK with a passphrase of 8 to 63
+/// characters, open without one).
+fn parse_wifi(spec: &str) -> Result<tegra234::WifiNetwork, String> {
+    let (ssid, psk) = match spec.split_once(':') {
+        Some((ssid, pass)) => (ssid, Some(pass)),
+        None => (spec, None),
+    };
+    if ssid.is_empty() || ssid.len() > 32 {
+        return Err(format!("--wifi {spec}: the SSID must be 1 to 32 bytes"));
+    }
+    if psk.is_some_and(|p| !(8..=63).contains(&p.len())) {
+        return Err("--wifi: a WPA2 passphrase has 8 to 63 characters".into());
+    }
+    Ok(tegra234::WifiNetwork {
+        ssid: ssid.into(),
+        bssid: [0x02, 0x5b, 0xc0, 0xa9, 0x00, 0x01],
+        psk: psk.map(Into::into),
+    })
 }
 
 /// QEMU's `--hostfwd` syntax, `tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (the host address

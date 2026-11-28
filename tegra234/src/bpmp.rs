@@ -20,6 +20,12 @@ pub const RESET_UARTA: u32 = 100;
 pub const RESET_GPU: u32 = 19;
 pub const RESET_VIC: u32 = 113;
 pub const GPU: u32 = 35;
+/// PCIe controller C1 (the M.2 Key E slot): its core clock, APB and core resets, power
+/// domain (IDs as in the Orin Nano's device tree)
+pub const CLK_PEX1_C1_CORE: u32 = 0xdd;
+pub const RESET_PEX1_C1_APB: u32 = 0x7a;
+pub const RESET_PEX1_C1_CORE: u32 = 0x75;
+pub const PCIEX1A: u32 = 9;
 
 const CHANNEL_STRIDE: usize = 256;
 const FRAME: usize = 128;
@@ -39,6 +45,7 @@ const MRQ_CLK: u32 = 22;
 const MRQ_QUERY_ABI: u32 = 23;
 const MRQ_PG: u32 = 66;
 const MRQ_QUERY_FW_TAG: u32 = 71;
+const MRQ_UPHY: u32 = 69;
 
 const RESET_ASSERT: u32 = 1;
 const RESET_DEASSERT: u32 = 2;
@@ -89,11 +96,16 @@ impl Clock {
 
 pub struct Bpmp {
     pub sram: Vec<u8>,
-    clocks: [Clock; 9],
+    clocks: [Clock; 10],
     uart_reset: bool,
     gpu_reset: bool,
     vic_reset: bool,
     gpu_power: bool,
+    pcie_apb_reset: bool,
+    pcie_core_reset: bool,
+    pcie_power: bool,
+    /// the UPHY's state of PCIe controller C1 (`MRQ_UPHY` controller state)
+    pcie_controller: bool,
 }
 
 impl Default for Bpmp {
@@ -110,11 +122,16 @@ impl Default for Bpmp {
                 Clock::new(CLK_GPC0, "gpc0clk", None, 306_000_000),
                 Clock::new(CLK_GPC1, "gpc1clk", None, 306_000_000),
                 Clock::new(CLK_GPUSYS, "gpusys", None, 204_000_000),
+                Clock::new(CLK_PEX1_C1_CORE, "pex1_c1_core", None, 500_000_000),
             ],
             uart_reset: false,
             gpu_reset: false,
             vic_reset: false,
             gpu_power: false,
+            pcie_apb_reset: true,
+            pcie_core_reset: true,
+            pcie_power: false,
+            pcie_controller: false,
         }
     }
 }
@@ -212,6 +229,7 @@ impl Bpmp {
                 | MRQ_QUERY_ABI
                 | MRQ_PG
                 | MRQ_QUERY_FW_TAG
+                | MRQ_UPHY
         )
     }
 
@@ -231,6 +249,7 @@ impl Bpmp {
             MRQ_RESET => return self.reset(word(req, 0), word(req, 4), resp),
             MRQ_CLK => return self.clock(req, resp),
             MRQ_PG => return self.power(word(req, 0), word(req, 4), word(req, 8), resp),
+            MRQ_UPHY => return self.uphy(req),
             _ => return ENOHANDLER,
         }
         0
@@ -238,13 +257,15 @@ impl Bpmp {
 
     fn reset(&mut self, cmd: u32, id: u32, resp: &mut [u8]) -> i32 {
         if cmd == RESET_GET_MAX_ID {
-            put(resp, 0, RESET_VIC);
+            put(resp, 0, RESET_PEX1_C1_APB);
             return 0;
         }
         let reset = match id {
             RESET_UARTA => &mut self.uart_reset,
             RESET_GPU => &mut self.gpu_reset,
             RESET_VIC => &mut self.vic_reset,
+            RESET_PEX1_C1_APB => &mut self.pcie_apb_reset,
+            RESET_PEX1_C1_CORE => &mut self.pcie_core_reset,
             _ => return EINVAL,
         };
         match cmd {
@@ -313,18 +334,41 @@ impl Bpmp {
     }
 
     fn power(&mut self, cmd: u32, id: u32, arg: u32, resp: &mut [u8]) -> i32 {
+        let (state, name): (&mut bool, &[u8]) = match (cmd, id) {
+            (PG_QUERY_ABI, _) if arg <= PG_GET_MAX_ID => return 0,
+            (PG_QUERY_ABI, _) => return EBADCMD,
+            (PG_GET_MAX_ID, _) => {
+                put(resp, 0, GPU);
+                return 0;
+            }
+            (_, GPU) => (&mut self.gpu_power, b"gpu"),
+            (_, PCIEX1A) => (&mut self.pcie_power, b"pcie_x1a"),
+            _ => return EINVAL,
+        };
         match cmd {
-            PG_QUERY_ABI if arg <= PG_GET_MAX_ID => return 0,
-            PG_QUERY_ABI => return EBADCMD,
-            PG_GET_MAX_ID => put(resp, 0, GPU),
-            _ if id != GPU => return EINVAL,
-            PG_SET_STATE if arg <= 1 => self.gpu_power = arg == 1,
+            PG_SET_STATE if arg <= 1 => *state = arg == 1,
             PG_SET_STATE => return EINVAL,
-            PG_GET_STATE => put(resp, 0, u32::from(self.gpu_power)),
-            PG_GET_NAME => resp[..3].copy_from_slice(b"gpu"),
+            PG_GET_STATE => put(resp, 0, u32::from(*state)),
+            PG_GET_NAME => resp[..name.len()].copy_from_slice(name),
             _ => return EBADCMD,
         }
         0
+    }
+
+    /// `MRQ_UPHY`: `CMD_UPHY_PCIE_CONTROLLER_STATE` (4) turns a controller's UPHY side on or
+    /// off (`{ u16 lane; u16 cmd; u8 controller; u8 enable }`); the lane commands succeed.
+    fn uphy(&mut self, req: &[u8]) -> i32 {
+        const CMD_UPHY_PCIE_CONTROLLER_STATE: u16 = 4;
+        let cmd = u16::from_le_bytes([req[2], req[3]]);
+        if cmd == CMD_UPHY_PCIE_CONTROLLER_STATE && u32::from(req[4]) == crate::pcie::CONTROLLER {
+            self.pcie_controller = req[5] != 0;
+        }
+        0
+    }
+
+    /// PCIe controller C1 is powered, out of reset and its UPHY enabled.
+    pub fn pcie_available(&self) -> bool {
+        self.pcie_power && self.pcie_controller && !self.pcie_apb_reset
     }
 }
 

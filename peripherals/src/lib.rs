@@ -10,6 +10,8 @@
 //! | `syr82x` | Silergy SYR827/SYR828 regulators | not attached by a board yet |
 //! | `hym8563` | Haoyu HYM8563 RTC | not attached by a board yet |
 //! | `bcm43455` | Broadcom BCM43455 Wi-Fi on SDIO (brcmfmac): backplane, cores, TCM, SDPCM; an emulated FullMAC dongle in place of the firmware (scans, open and WPA2-PSK joins, Ethernet to a network) | not attached by a board yet |
+//! | `bcm4350` | Broadcom BCM4350 Wi-Fi on PCIe (brcmfmac): configuration space, BAR0 backplane window, PCIe2 mailboxes, TCM; the `bcm43455` dongle behind msgbuf rings in place of the firmware | Jetson Orin Nano |
+//! | `pci` | a PCI Express function's configuration space, the `Function` trait cards implement, bus mastering | `bcm4350` |
 //! | `dw_hdmi` | Synopsys DesignWare HDMI TX with a connected monitor: IDs, hot plug, DDC and PHY I²C masters, interrupts; the EDID (`Mode`, `edid`, `EdidEeprom`) | Allwinner H3, Rockchip RK3288 |
 //! | `pl330` | Arm DMA-330 DMA controller: the channel threads run the driver's microcode | Rockchip RK3288 (audio) |
 //! | `sdio` | an SDIO card: CMD5/52/53, CCCR, FBR, CIS; the functions behind a trait | any SD host controller |
@@ -22,11 +24,13 @@
 
 pub mod act8846;
 pub mod bcm43455;
+pub mod bcm4350;
 pub mod dma;
 pub mod dw_hdmi;
 pub mod gic;
 pub mod hym8563;
 pub mod i2c;
+pub mod pci;
 pub mod pl330;
 pub mod rk808;
 pub mod sdio;

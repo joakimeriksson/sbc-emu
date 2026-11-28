@@ -117,6 +117,50 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver 
 
 A web server listening on the guest's port 5000 then answers at `http://127.0.0.1:5000/` on the host.
 
+## Wi-Fi
+
+`--wifi SSID[:PASSPHRASE]` puts a Wi-Fi card in the M.2 Key E slot: a Broadcom BCM4350 (as on a
+Dell DW1820A card) behind the Orin's own PCIe controller C1 (`pcie@14100000`, PCI domain 1), the
+port that carries the slot on the developer kit. The guest's unmodified drivers bind it:
+NVIDIA's `pcie-tegra194` brings the controller up through the BPMP (power domain, core clock,
+APB and core resets, the UPHY's `MRQ_UPHY` controller state) and its P2U PHY (`phy@3e30000`),
+trains the link and enumerates `0001:01:00.0`; `brcmfmac` loads `brcmfmac4350-pcie.bin` into
+the card and runs it over msgbuf, and the interface is `wlan0`.
+
+The card's firmware is not executed. When the driver releases the card's Cortex-R4, an emulated
+FullMAC dongle takes its place (`peripherals/src/bcm4350/`, sharing the ioctl, event, scan, join
+and WPA2 logic of `peripherals/src/bcm43455/dongle.rs`): it publishes the msgbuf shared area,
+serves the control, receive-post and flow rings in guest memory, and interrupts with MSIs through
+the DesignWare core's MSI controller. It sees one access point, SSID, on channel 6: WPA2-PSK
+with a passphrase (8 to 63 characters), open without one. Behind it is the same virtual network
+as `--net` (sbc-net: DHCP, DNS, ICMP, with NAT unless `--net local`), a network of its own,
+separate from the USB Ethernet adapter's. `--hostfwd` goes to the USB network when `--net` is
+given, to the Wi-Fi's otherwise. `--wifi` turns the BPMP on.
+
+```sh
+target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver tegra \
+  --usb-drive UGV_Rover_jetson_ros2.img --kernel Image --append "... net.ifnames=0" \
+  --wifi mynet:mypassphrase
+```
+
+On Waveshare's UGV Rover image this behaves as on the robot: with no saved Wi-Fi profile in range,
+their AccessPopup timer starts the `AccessPopup` hotspot (NetworkManager's AP mode with
+`ipv4.method shared`; the card runs a soft AP that no station ever joins) and their app shows
+`W:192.168.50.5` and `AP`. `nmcli dev wifi list` shows SSID; `nmcli dev wifi connect SSID
+password PASSPHRASE` joins it (the guest's supplicant runs the four-way handshake with the
+dongle), DHCP gives wlan0 an address, and the app shows it in `STA` mode. AccessPopup's later
+scans (`iw dev wlan0 scan ap-force`) find the saved network and switch back to it.
+
+What differs from the robot: the robot's card is a Realtek RTL8822CE with NVIDIA's vendor driver
+(`rtl8822ce.ko`, a SoftMAC driver whose firmware, PHY and RF programming are far larger), so the
+chip, driver and MAC address differ (`lspci` shows a Broadcom BCM4350, `ethtool -i wlan0` says
+`brcmfmac`). The controller has no SMMU (`iommu-map` is left out of the device tree, so device
+addresses are physical), no memory-bandwidth interconnect and a dummy regulator; the other PCIe
+controllers (the NVMe slot, the Ethernet chip) are not modelled. The air is not modelled: signal
+strength and rates are fixed, a scan takes 1.5 s and finds the single access point, and the
+soft AP has no clients.
+Set `SBC_BRCM_LOG=1` to trace the dongle's ioctls and `SBC_PCIE_LOG=1` for unrouted PCIe accesses.
+
 ## USB serial
 
 `--usb-serial HOST:PORT` plugs a USB serial port into the board: a CDC-ACM device, which Linux's
