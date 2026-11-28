@@ -11,6 +11,8 @@ pub mod machine;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod mt;
 pub mod periph;
+#[cfg(test)]
+mod v3d_tests;
 
 pub use machine::{CoreState, Machine, Stop};
 

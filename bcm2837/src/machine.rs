@@ -28,6 +28,8 @@ pub const THERMAL: u64 = 0x3f21_2000;
 pub const AUX: u64 = 0x3f21_5000;
 /// the Arasan SD host (`brcm,bcm2835-sdhci`, "mmcnr" in the vendor tree)
 pub const SDHCI: u64 = 0x3f30_0000;
+/// the VideoCore IV 3D GPU (V3D, bus address 0x7ec0_0000)
+pub const V3D: u64 = 0x3fc0_0000;
 /// the ARM-local block: the per-core interrupt controller and mailboxes
 pub const LOCAL: u64 = 0x4000_0000;
 /// ARM-side interrupt numbers (bank 0)
@@ -37,6 +39,7 @@ pub const GPU_AUX: usize = 29;
 pub const GPU_UART0: usize = 57;
 pub const GPU_RNG: usize = 61;
 pub const GPU_SDHCI: usize = 62;
+pub const GPU_V3D: usize = vc4_3d::GPU_IRQ;
 
 pub struct Soc {
     pub ram: Vec<u8>,
@@ -56,6 +59,8 @@ pub struct Soc {
     pub rng: crate::periph::Rng,
     pub thermal: crate::periph::Thermal,
     pub pm: Pm,
+    /// the VideoCore IV 3D GPU (`vc4-3d`)
+    pub v3d: vc4_3d::V3d,
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
     pub unknown: Vec<u64>,
@@ -81,6 +86,7 @@ impl Soc {
             RNG..=0x3f10_400f => self.rng.read(a - RNG),
             THERMAL..=0x3f21_2007 => self.thermal.read(a - THERMAL),
             PM..=0x3f10_0113 => self.pm.read(a - PM),
+            V3D..=0x3fc0_0fff => self.v3d.read(a - V3D),
             // AXI bridges (ASB): the ID register; a stop request (bit 0) is acknowledged (bit 1) at once
             ASB..=0x3f00_a02f => match a & 0xff { 0x20 => 0x6272_6467, o => { let r = self.asb[(o / 4) as usize % 12]; (r & !2) | ((r & 1) << 1) } },
             LOCAL..=0x4000_00ff => self.local.read(a - LOCAL, self.armctrl.irq()),
@@ -102,6 +108,7 @@ impl Soc {
             RNG..=0x3f10_400f => self.rng.write(a - RNG, v),
             THERMAL..=0x3f21_2007 => self.thermal.write(a - THERMAL, v),
             PM..=0x3f10_0113 => self.pm.write(a - PM, v),
+            V3D..=0x3fc0_0fff => self.v3d.write(a - V3D, v, &mut self.ram),
             ASB..=0x3f00_a02f => self.asb[((a & 0xff) / 4) as usize % 12] = v & 0x00ff_ffff,
             LOCAL..=0x4000_00ff => self.local.write(a - LOCAL, v),
             PERIPH..=0x3fff_ffff | 0x4000_0100..=0x4003_ffff => self.note(a),
@@ -116,6 +123,8 @@ impl Soc {
         self.armctrl.set_gpu(GPU_UART0, self.uart.irq());
         self.armctrl.set_gpu(GPU_SDHCI, self.sd.irq());
         self.armctrl.set_arm(ARM_MAILBOX, self.mbox.irq());
+        self.v3d.tick(now, &mut self.ram);
+        self.armctrl.set_gpu(GPU_V3D, self.v3d.irq());
         self.pm.now = now;
         // nothing reads the spare UART's output yet: keep it from growing without bound
         if self.uart.out.len() > 1 << 16 { self.uart.out.clear(); }
@@ -123,7 +132,9 @@ impl Soc {
     }
 
     /// The next device deadline.
-    pub(crate) fn next_event(&self) -> Option<u64> { self.pm.next_event() }
+    pub(crate) fn next_event(&self) -> Option<u64> {
+        [self.pm.next_event(), self.v3d.next_event()].into_iter().flatten().min()
+    }
 
     /// What the display shows, as RGBA: the firmware framebuffer.
     pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.mbox.render(&self.ram, out) }
@@ -247,7 +258,7 @@ impl Machine {
         mbox.revision = model.revision();
         let soc = Soc {
             ram: vec![0; ram_arm_visible], arm_ram, cur: 0, local: LocalIntc::new(), armctrl: ArmCtrl::new(), uart: Pl011::new(), aux: AuxUart::new(),
-            mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(), asb: [0; 12],
+            mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(), v3d: vc4_3d::V3d::new(), asb: [0; 12],
             unknown: Vec::new(), dirty: true,
         };
         let mut m = Machine { model, cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0,
@@ -692,6 +703,7 @@ impl Machine {
         self.soc.rng.save_state(&mut w);
         self.soc.pm.save_state(&mut w);
         for r in self.soc.asb { w.u32(r); }
+        self.soc.v3d.save_state(&mut w);
         emu_core::snap::save_ram(&mut w, &self.soc.ram);
         let mut out = SNAP_MAGIC.to_vec();
         out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&w.0, 1));
@@ -733,6 +745,7 @@ impl Machine {
         self.soc.rng.load_state(&mut r).map_err(e)?;
         self.soc.pm.load_state(&mut r).map_err(e)?;
         for x in self.soc.asb.iter_mut() { *x = r.u32().map_err(e)?; }
+        self.soc.v3d.load_state(&mut r).map_err(e)?;
         emu_core::snap::load_ram(&mut r, &mut self.soc.ram).map_err(e)?;
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }
         self.next_check = 0;
