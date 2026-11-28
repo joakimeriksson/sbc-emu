@@ -161,6 +161,11 @@ Each ends with something a script checks, as on the other boards.
 6. **The rest of the platform.** `--threads multi`, snapshots, gdb, a browser page, the `3a+` and
    `zero2w` models (`3b` once the LAN9514 and BCM43438 are in). *Check:* boot times against the
    Pi 4's, snapshot round trip, the browser smoke test.
+   *Done* (2026-11-28): `scripts/rpi3-model-{3b,3aplus,zero2w}.txt` boot the unmodified image on
+   each model; the 3B's LAN9514 (`emu-core/src/smsc95xx.rs`); `scripts/rpi3-restore.txt` resumes
+   their snapshots (and the 3B+'s); `web/rpi3.html` with `tools/wasm-smoke-rpi3.mjs`; boot times in
+   [raspberry-pi-3.md](raspberry-pi-3.md). The 3B's BCM43438 and the Zero 2 W's CYW43436 remain
+   (another chip family than the CYW43455: no Wi-Fi or Bluetooth on those two).
 7. **VideoCore IV 3D**, in steps: control lists and the tile buffer (clears and stores), then the
    binner and a flat-shaded triangle, the QPU interpreter, textures, the rest of the GLES 2 state.
    (2026-11-28: `vc4-3d/`, [raspberry-pi-3-gpu.md](raspberry-pi-3-gpu.md): Mesa reports V3D 2.1,
