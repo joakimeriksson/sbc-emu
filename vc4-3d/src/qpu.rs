@@ -273,6 +273,37 @@ pub fn mul_op(o: u8, a: u32, b: u32) -> u32 {
     }
 }
 
+/// An add-pipe operation on all 16 lanes (one dispatch, then a loop the compiler vectorises).
+pub fn add_vec(o: u8, a: &V, b: &V) -> V {
+    macro_rules! each { ($f:expr) => {{ let f = $f; let mut r = ZERO; for l in 0..16 { r[l] = f(a[l], b[l]); } r }} }
+    match o {
+        op::FADD => each!(|x: u32, y: u32| fo(ff(x) + ff(y))),
+        op::FSUB => each!(|x: u32, y: u32| fo(ff(x) - ff(y))),
+        op::ADD => each!(|x: u32, y: u32| x.wrapping_add(y)),
+        op::SUB => each!(|x: u32, y: u32| x.wrapping_sub(y)),
+        op::AND => each!(|x: u32, y: u32| x & y),
+        op::OR => each!(|x: u32, y: u32| x | y),
+        op::XOR => each!(|x: u32, y: u32| x ^ y),
+        op::SHL => each!(|x: u32, y: u32| x << (y & 31)),
+        op::SHR => each!(|x: u32, y: u32| x >> (y & 31)),
+        op::ASR => each!(|x: u32, y: u32| ((x as i32) >> (y & 31)) as u32),
+        op::MIN => each!(|x: u32, y: u32| (x as i32).min(y as i32) as u32),
+        op::MAX => each!(|x: u32, y: u32| (x as i32).max(y as i32) as u32),
+        _ => each!(|x, y| add_op(o, x, y)),
+    }
+}
+
+/// A multiply-pipe operation on all 16 lanes.
+pub fn mul_vec(o: u8, a: &V, b: &V) -> V {
+    macro_rules! each { ($f:expr) => {{ let f = $f; let mut r = ZERO; for l in 0..16 { r[l] = f(a[l], b[l]); } r }} }
+    match o {
+        op::FMUL => each!(|x: u32, y: u32| fo(ff(x) * ff(y))),
+        op::MUL24 => each!(|x: u32, y: u32| (x & 0xff_ffff).wrapping_mul(y & 0xff_ffff)),
+        op::V8MIN if a == b => *a,
+        _ => each!(|x, y| mul_op(o, x, y)),
+    }
+}
+
 #[inline]
 fn v8(a: u32, b: u32, g: impl Fn(u32, u32) -> u32) -> u32 {
     let mut r = 0;
@@ -660,11 +691,11 @@ impl Qpu {
         match w {
             0..=31 => {
                 let r = if a { &mut self.ra[w as usize] } else { &mut self.rb[w as usize] };
-                for i in 0..16 { if mask >> i & 1 != 0 { r[i] = v[i]; } }
+                if mask == ALL { *r = *v } else { for i in 0..16 { if mask >> i & 1 != 0 { r[i] = v[i]; } } }
             }
             waddr::R0..=waddr::R3 => {
                 let r = &mut self.acc[(w - waddr::R0) as usize];
-                for i in 0..16 { if mask >> i & 1 != 0 { r[i] = v[i]; } }
+                if mask == ALL { *r = *v } else { for i in 0..16 { if mask >> i & 1 != 0 { r[i] = v[i]; } } }
             }
             waddr::R5 => {
                 let src: V = if a { std::array::from_fn(|i| v[i & !3]) } else { [v[0]; 16] };
@@ -764,8 +795,8 @@ impl Qpu {
                     _ => [i.imm; 16],
                 };
                 let (ma, mm) = (self.cond_mask(i.cond_add), self.cond_mask(i.cond_mul));
-                self.write_result(i.waddr_add, !i.ws, &v, ma, &i, false, true, [0; 16], mem, env);
-                self.write_result(i.waddr_mul, i.ws, &v, mm, &i, false, false, [0; 16], mem, env);
+                self.write_result(i.waddr_add, !i.ws, &v, ma, &i, false, true, None, mem, env);
+                self.write_result(i.waddr_mul, i.ws, &v, mm, &i, false, false, None, mem, env);
                 if i.sf { self.set_flags(&v, false, None); }
             }
             _ => self.alu(&i, mem, env),
@@ -818,7 +849,7 @@ impl Qpu {
 
     /// Write an ALU (or load-immediate) result: packing, then the destination.
     #[allow(clippy::too_many_arguments)]
-    fn write_result(&mut self, w: u8, file_a: bool, v: &V, mask: u16, i: &Inst, float_out: bool, is_add: bool, wide: [i64; 16], mem: &mut Mem, env: &mut dyn Env) {
+    fn write_result(&mut self, w: u8, file_a: bool, v: &V, mask: u16, i: &Inst, float_out: bool, is_add: bool, wide: Option<&[i64; 16]>, mem: &mut Mem, env: &mut dyn Env) {
         if w == waddr::NOP || mask == 0 { return; }
         if i.pm {
             if !is_add && i.pack != 0 {
@@ -828,7 +859,7 @@ impl Qpu {
             }
         } else if i.pack != 0 && file_a && w < 32 {
             let old = self.ra[w as usize];
-            let p: V = std::array::from_fn(|l| pack_a(i.pack, old[l], v[l], float_out, wide[l]));
+            let p: V = std::array::from_fn(|l| pack_a(i.pack, old[l], v[l], float_out, wide.map_or(v[l] as i32 as i64, |w| w[l])));
             return self.write(w, file_a, &p, mask, mem, env);
         }
         self.write(w, file_a, v, mask, mem, env)
@@ -856,18 +887,23 @@ impl Qpu {
                 std::array::from_fn(|l| unpack(i.unpack, raw[l], float_in))
             } else { raw }
         };
+        let sat32 = !i.pm && i.pack == 8;
         let add_res = if i.op_add != op::A_NOP {
             let (a, b) = (operand(self, i.add_a, af), operand(self, i.add_b, af));
-            let r: V = std::array::from_fn(|l| add_op(i.op_add, a[l], b[l]));
-            let carry: Option<V> = match i.op_add {
-                op::ADD => Some(std::array::from_fn(|l| (a[l] as u64 + b[l] as u64 > u32::MAX as u64) as u32)),
-                op::SUB => Some(std::array::from_fn(|l| (a[l] < b[l]) as u32)),
-                _ => None,
+            let r = add_vec(i.op_add, &a, &b);
+            let carry: Option<V> = if !i.sf { None } else {
+                match i.op_add {
+                    op::ADD => Some(std::array::from_fn(|l| (a[l] as u64 + b[l] as u64 > u32::MAX as u64) as u32)),
+                    op::SUB => Some(std::array::from_fn(|l| (a[l] < b[l]) as u32)),
+                    _ => None,
+                }
             };
-            let wide: [i64; 16] = match i.op_add {
-                op::ADD => std::array::from_fn(|l| a[l] as i32 as i64 + b[l] as i32 as i64),
-                op::SUB => std::array::from_fn(|l| a[l] as i32 as i64 - b[l] as i32 as i64),
-                _ => std::array::from_fn(|l| r[l] as i32 as i64),
+            let wide: Option<[i64; 16]> = if !sat32 { None } else {
+                Some(match i.op_add {
+                    op::ADD => std::array::from_fn(|l| a[l] as i32 as i64 + b[l] as i32 as i64),
+                    op::SUB => std::array::from_fn(|l| a[l] as i32 as i64 - b[l] as i32 as i64),
+                    _ => std::array::from_fn(|l| r[l] as i32 as i64),
+                })
             };
             Some((r, carry, wide))
         } else { None };
@@ -878,16 +914,15 @@ impl Qpu {
                 a = std::array::from_fn(|l| a[(l + 16 - n) & 15]);
                 b = std::array::from_fn(|l| b[(l + 16 - n) & 15]);
             }
-            Some(std::array::from_fn::<u32, 16, _>(|l| mul_op(i.op_mul, a[l], b[l])))
+            Some(mul_vec(i.op_mul, &a, &b))
         } else { None };
         if let Some((r, _, wide)) = &add_res {
             let m = self.cond_mask(i.cond_add);
-            self.write_result(i.waddr_add, !i.ws, r, m, i, add_float_out(i.op_add), true, *wide, mem, env);
+            self.write_result(i.waddr_add, !i.ws, r, m, i, add_float_out(i.op_add), true, wide.as_ref(), mem, env);
         }
         if let Some(r) = &mul_res {
             let m = self.cond_mask(i.cond_mul);
-            let wide: [i64; 16] = std::array::from_fn(|l| r[l] as i32 as i64);
-            self.write_result(i.waddr_mul, i.ws, r, m, i, i.op_mul == op::FMUL, false, wide, mem, env);
+            self.write_result(i.waddr_mul, i.ws, r, m, i, i.op_mul == op::FMUL, false, None, mem, env);
         }
         if let Some(c) = r5_vary { self.acc[5] = c; }
         if i.sf {

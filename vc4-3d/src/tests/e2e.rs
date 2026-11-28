@@ -16,7 +16,6 @@ const VS: u32 = 0x1_1000;
 const FS: u32 = 0x1_2000;
 const UNIF: u32 = 0x2_0000;
 const REC: u32 = 0x3_0000;
-const VERTS: u32 = 0x4_0000;
 const INDICES: u32 = 0x5_0000;
 const BCL: u32 = 0x6_0000;
 const RCL: u32 = 0x7_0000;
@@ -167,6 +166,8 @@ struct Scene {
     tile_alloc_size: u32,
     clear: u32,
     tiling: u8,
+    /// where the next draw's vertices go
+    vat: u32,
 }
 
 /// A vertex: clip position and up to four extra attributes (varyings).
@@ -178,7 +179,7 @@ fn px(w: u32, h: u32, x: f32, y: f32, z: f32) -> [f32; 4] { [x / (w as f32 / 2.0
 
 impl Scene {
     fn new(w: u32, h: u32) -> Scene {
-        let mut s = Scene { ram: vec![0u8; 16 << 20], w, h, bcl: Cl::default(), nrec: 0, unif_at: UNIF, depth: false, ms: false,
+        let mut s = Scene { ram: vec![0u8; 48 << 20], vat: 0x100_0000, w, h, bcl: Cl::default(), nrec: 0, unif_at: UNIF, depth: false, ms: false,
                             tile_alloc_size: 0x8_0000, clear: 0xff20_1008, tiling: tiling::RASTER };
         put(&mut s.ram, CS, &bytes(&{ let mut p = coord_shader(); p.extend(end()); p }));
         s
@@ -217,8 +218,9 @@ impl Scene {
         let (vs_at, fs_at) = (VS + 0x400 * k, FS + 0x400 * k);
         put(&mut self.ram, vs_at, &bytes(&{ let mut p = vertex_shader(nvary); p.extend(end()); p }));
         put(&mut self.ram, fs_at, &bytes(fs));
-        let vbase = VERTS + 0x2000 * k;
+        let vbase = self.vat;
         let stride = 32u32;
+        self.vat += (stride * verts.len() as u32 + 0xfff) & !0xfff;
         for (i, v) in verts.iter().enumerate() {
             let w: Vec<u32> = v.p.iter().chain(v.a.iter()).map(|f| f.to_bits()).collect();
             put32(&mut self.ram, vbase + stride * i as u32, &w);
@@ -684,11 +686,57 @@ fn capture_and_replay() {
     let jobs = crate::capture::parse(&data).unwrap();
     assert_eq!(jobs.len(), 2);
     // replay into fresh memory: the frame comes out the same
-    let mut ram = vec![0u8; 16 << 20];
+    let mut ram = vec![0u8; 48 << 20];
     let frames = crate::capture::replay(&jobs, &mut ram);
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].addr & 0x3fff_ffff, COLOR);
     assert_eq!(get32(&ram, COLOR + 4 * (10 * 64 + 10)), GREEN);
     assert_eq!(get32(&ram, COLOR + 4 * (50 * 64 + 50)), s.clear);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Throughput at 1920x1080 (run with `cargo test --release -p vc4-3d -- --ignored bench --nocapture`).
+#[test]
+#[ignore]
+fn bench_full_hd() {
+    let (w, h) = (1920u32, 1080u32);
+    let mut s = Scene::new(w, h);
+    s.depth = true;
+    s.begin(ALL_FACES & !(7 << 12) | 1 << 12 | cl::config::Z_UPDATE);
+    // 4 layers of 40x24 quads (each a 48x45-pixel cell) with gouraud shading: ~4x the frame's
+    // pixels shaded, 7680 triangles
+    let mut verts = Vec::new();
+    for layer in 0..4 {
+        let z = 0.5 - layer as f32 * 0.2;
+        for cy in 0..24 { for cx in 0..40 {
+            let (x0, y0) = (cx as f32 * 48.0, cy as f32 * 45.0);
+            let c = [cx as f32 / 40.0, cy as f32 / 24.0, layer as f32 / 4.0, 1.0];
+            let v = |x: f32, y: f32| Vx { p: px(w, h, x, y, z), a: c };
+            verts.extend([v(x0, y0), v(x0 + 48.0, y0), v(x0 + 48.0, y0 + 45.0), v(x0, y0), v(x0 + 48.0, y0 + 45.0), v(x0, y0 + 45.0)]);
+        } }
+    }
+    // shader with depth write: Z, then gouraud
+    let mut fs = vec![mov(waddr::TLB_Z, B).rb(15)];
+    let g = gouraud_fs();
+    fs.extend_from_slice(&g);
+    for chunk in verts.chunks(6 * 960) { s.draw(chunk, 4, &fs, &[], cl::PRIM_TRIANGLES, None); }
+    let reps: usize = std::env::var("BENCH_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    s.bcl.u8(cl::INCREMENT_SEMAPHORE).u8(cl::FLUSH);
+    let bcl = std::mem::take(&mut s.bcl).0;
+    put(&mut s.ram, BCL, &bcl);
+    let rcl = s.rcl(true);
+    put(&mut s.ram, RCL, &rcl);
+    let mut v = V3d::new();
+    v.time_scale = 0.0;
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        let ram = &mut s.ram;
+        v.write(BPOS as u64, 0x8_0000, ram);
+        v.write(CT0CA as u64, BCL | BUS, ram);
+        v.write(CT0EA as u64, (BCL + bcl.len() as u32) | BUS, ram);
+        v.write(CT1CA as u64, RCL | BUS, ram);
+        v.write(CT1EA as u64, (RCL + rcl.len() as u32) | BUS, ram);
+    }
+    let el = t.elapsed();
+    eprintln!("1080p frame: {:.1} ms; {}", el.as_secs_f64() * 1e3 / reps as f64, v.stats());
 }

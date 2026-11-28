@@ -58,7 +58,10 @@ struct Lane {
     x: u32,
     y: u32,
     cover: u8,
+    /// screen-space barycentrics by original vertex
     l: [f32; 3],
+    /// the same divided by each vertex's Wc (perspective weights, before normalising)
+    q: [f32; 3],
     w: f32,
     z24: u32,
 }
@@ -149,26 +152,27 @@ impl Env for FragEnv<'_> {
         let (mut v, mut c) = (ZERO, ZERO);
         if k >= self.nvary { crate::log_first("vc4: fragment shader reads more varyings than the shader record has"); }
         let p = self.prim;
-        for i in 0..16 {
-            if self.active >> i & 1 == 0 { continue; }
-            let ln = &self.lanes[i];
-            if k < p.hw {
-                // point or line coordinate: linear in screen space
-                let val = ln.l[0] * p.v[0].aux[k as usize] + ln.l[1] * p.v[1].aux[k as usize] + ln.l[2] * p.v[2].aux[k as usize];
-                v[i] = fo(val / ln.w);
-                continue;
+        if k < p.hw {
+            // point or line coordinate: linear in screen space
+            let a = [p.v[0].aux[k as usize], p.v[1].aux[k as usize], p.v[2].aux[k as usize]];
+            for (i, ln) in self.lanes.iter().enumerate() {
+                v[i] = fo((ln.l[0] * a[0] + ln.l[1] * a[1] + ln.l[2] * a[2]) / ln.w);
             }
-            let vk = (k - p.hw) as usize;
-            if self.flat >> k & 1 != 0 {
-                c[i] = fo(p.flat_src.get(vk).copied().unwrap_or(0.0));
-                continue;
-            }
-            let get = |j: usize| p.vary[j].get(vk).copied().unwrap_or(0.0);
-            let cc = get(2);
-            let s = ln.l[0] * (get(0) - cc) * p.v[0].iw + ln.l[1] * (get(1) - cc) * p.v[1].iw + ln.l[2] * 0.0;
-            v[i] = fo(s);
-            c[i] = fo(cc);
+            return (v, c);
         }
+        let vk = (k - p.hw) as usize;
+        if self.flat >> k & 1 != 0 {
+            return (v, [fo(p.flat_src.get(vk).copied().unwrap_or(0.0)); 16]);
+        }
+        // (v - C) / W at the lane with C the third vertex's value: the shader multiplies by W
+        // and adds C (r5)
+        let get = |j: usize| p.vary[j].get(vk).copied().unwrap_or(0.0);
+        let cc = get(2);
+        let (d0, d1) = (get(0) - cc, get(1) - cc);
+        for (i, ln) in self.lanes.iter().enumerate() {
+            v[i] = fo(ln.q[0] * d0 + ln.q[1] * d1);
+        }
+        c = [fo(cc); 16];
         (v, c)
     }
 
@@ -248,12 +252,15 @@ pub struct Render<'a, 'm> {
     pub st: GlState,
     rec: Option<ShaderRec>,
     cache: shade::Cache,
+    /// the fragment shader's QPU, reused from batch to batch (registers are not cleared: on
+    /// the hardware they hold whatever the last program left)
+    fsq: Box<Qpu>,
     pub out: RenderOut,
 }
 
 impl<'a, 'm> Render<'a, 'm> {
     pub fn new(tb: &'a mut TileBuffer, mem: &'a mut Mem<'m>, code: &'a mut Code, insns: &'a mut u64) -> Self {
-        Render { tb, mem, code, insns, frame: Frame::default(), tile: (0, 0), st: GlState::default(), rec: None, cache: shade::Cache::default(), out: RenderOut::default() }
+        Render { tb, mem, code, insns, frame: Frame::default(), tile: (0, 0), st: GlState::default(), rec: None, cache: shade::Cache::default(), fsq: Box::new(Qpu::new()), out: RenderOut::default() }
     }
 
     fn shader(&mut self) -> Option<ShaderRec> {
@@ -363,19 +370,25 @@ impl<'a, 'm> Render<'a, 'm> {
         let miny = (v.iter().map(|q| q.y).min().unwrap() >> 4).max(oy as i32).max(cy0);
         let maxy = ((v.iter().map(|q| q.y).max().unwrap() + 15) >> 4).min((oy + ts) as i32 - 1).min(cy1 - 1);
         if minx > maxx || miny > maxy { return; }
-        // edges: e0 = v1->v2, e1 = v2->v0, e2 = v0->v1; inside where all >= 0 (top-left ties)
-        let edges: [(i64, i64, i64, i64, bool); 3] = std::array::from_fn(|k| {
+        // edges: e0 = v1->v2, e1 = v2->v0, e2 = v0->v1, as e(x, y) = a x + b y + c over 1/16
+        // pixel; inside where all > 0, or = 0 on a top or left edge
+        let mut ea = [0i64; 3];
+        let mut eb = [0i64; 3];
+        let mut ec = [0i64; 3];
+        let mut bias = [0i64; 3];
+        for k in 0..3 {
             let (a, b) = (v[(k + 1) % 3], v[(k + 2) % 3]);
             let (dx, dy) = ((b.x - a.x) as i64, (b.y - a.y) as i64);
-            (a.x as i64, a.y as i64, dx, dy, (dy == 0 && dx > 0) || dy < 0)
-        });
-        let edge = |k: usize, px: i64, py: i64| -> (i64, bool) {
-            let (ax, ay, dx, dy, tl) = edges[k];
-            let e = dx * (py - ay) - dy * (px - ax);
-            (e, e > 0 || (e == 0 && tl))
-        };
+            ea[k] = -dy;
+            eb[k] = dx;
+            ec[k] = dy * a.x as i64 - dx * a.y as i64;
+            // e > 0 || (e == 0 && top-left)  <=>  e - bias >= 0 with bias 1 off top-left edges
+            bias[k] = if (dy == 0 && dx > 0) || dy < 0 { 0 } else { 1 };
+        }
         let samples = self.tb.samples;
         let offs: &[(i32, i32)] = if samples == 4 { &SAMPLES4 } else { &[(8, 8)] };
+        let soff: Vec<[i64; 3]> = offs.iter().map(|&(sx, sy)| std::array::from_fn(|k| ea[k] * (sx - 8) as i64 + eb[k] * (sy - 8) as i64 - bias[k])).collect();
+        let inv_area = 1.0 / area as f64;
         // depth offset
         let zoff = if st.config & cl::config::DEPTH_OFFSET != 0 {
             let (x0, y0) = (v[0].x as f64 / 16.0, v[0].y as f64 / 16.0);
@@ -386,6 +399,7 @@ impl<'a, 'm> Render<'a, 'm> {
             let (a, b) = if det != 0.0 { ((z1 * y2 - z2 * y1) / det, (x1 * z2 - x2 * z1) / det) } else { (0.0, 0.0) };
             st.offset_factor as f64 * a.abs().max(b.abs()) + st.offset_units as f64 * (1.0 / (1u64 << 25) as f64)
         } else { 0.0 };
+        let (vz, viw) = ([v[0].z as f64, v[1].z as f64, v[2].z as f64], [v[0].iw as f64, v[1].iw as f64, v[2].iw as f64]);
         let mut lanes = [Lane::default(); 16];
         let mut nl = 0usize;
         let mut active = 0u16;
@@ -398,23 +412,26 @@ impl<'a, 'm> Render<'a, 'm> {
                 for k in 0..4 {
                     let (px, py) = (qx + (k & 1) as i32, qy + (k >> 1) as i32);
                     let lane = &mut lanes[nl + k];
-                    *lane = Lane { x: (px - ox as i32).max(0) as u32, y: (py - oy as i32).max(0) as u32, ..Default::default() };
+                    lane.x = (px - ox as i32).max(0) as u32;
+                    lane.y = (py - oy as i32).max(0) as u32;
+                    lane.cover = 0;
                     if px < minx || px > maxx || py < miny || py > maxy { continue; }
+                    let (cx, cy) = ((px * 16 + 8) as i64, (py * 16 + 8) as i64);
+                    let e = [ea[0] * cx + eb[0] * cy + ec[0], ea[1] * cx + eb[1] * cy + ec[1], ea[2] * cx + eb[2] * cy + ec[2]];
                     let mut cover = 0u8;
-                    for (s, &(sx, sy)) in offs.iter().enumerate() {
-                        let (sx, sy) = ((px * 16 + sx) as i64, (py * 16 + sy) as i64);
-                        if (0..3).all(|e| edge(e, sx, sy).1) { cover |= 1 << s; }
+                    for (s_, o) in soff.iter().enumerate() {
+                        if e[0] + o[0] >= 0 && e[1] + o[1] >= 0 && e[2] + o[2] >= 0 { cover |= 1 << s_; }
                     }
                     if cover == 0 { continue; }
-                    let (cx, cy) = ((px * 16 + 8) as i64, (py * 16 + 8) as i64);
-                    let l: [f64; 3] = std::array::from_fn(|e| edge(e, cx, cy).0 as f64 / area as f64);
-                    let iw = l[0] * v[0].iw as f64 + l[1] * v[1].iw as f64 + l[2] * v[2].iw as f64;
-                    let z = l[0] * v[0].z as f64 + l[1] * v[1].z as f64 + l[2] * v[2].z as f64 + zoff;
+                    let l = [e[0] as f64 * inv_area, e[1] as f64 * inv_area, e[2] as f64 * inv_area];
+                    let iw = l[0] * viw[0] + l[1] * viw[1] + l[2] * viw[2];
+                    let z = l[0] * vz[0] + l[1] * vz[1] + l[2] * vz[2] + zoff;
                     lane.cover = cover;
                     // barycentrics by original vertex
-                    let mut lo = [0f32; 3];
-                    for k2 in 0..3 { lo[map[k2]] = l[k2] as f32; }
-                    lane.l = lo;
+                    for k2 in 0..3 {
+                        lane.l[map[k2]] = l[k2] as f32;
+                        lane.q[map[k2]] = (l[k2] * viw[k2]) as f32;
+                    }
                     lane.w = (1.0 / iw) as f32;
                     lane.z24 = (z.clamp(0.0, 1.0) * 16_777_215.0).round() as u32;
                     active |= 1 << (nl + k);
@@ -430,19 +447,23 @@ impl<'a, 'm> Render<'a, 'm> {
             }
             qy += 2;
         }
-        if nl > 0 { self.shade(rec, p, &lanes, active, rev); }
+        if nl > 0 {
+            for l in lanes[nl..].iter_mut() { l.cover = 0; }
+            self.shade(rec, p, &lanes, active, rev);
+        }
     }
 
     /// Run the fragment shader on up to four quads.
     fn shade(&mut self, rec: &ShaderRec, p: &Prim, lanes: &[Lane; 16], active: u16, rev: bool) {
         // varying interpolation uses barycentrics by the primitive's original vertex order;
         // vertex 2 is C's source, so the weights are applied as given
-        let mut q = Qpu::new();
+        let q = &mut *self.fsq;
         for i in 0..16 {
             q.ra[15][i] = fo(lanes[i].w);
             q.rb[15][i] = lanes[i].z24;
         }
         q.start(rec.fs_code, rec.fs_unif);
+        let before = q.insns;
         let origin = (self.tile.0 * self.tb.size, self.tile.1 * self.tb.size);
         let mut env = FragEnv {
             tb: self.tb, origin, lanes: *lanes, active, prim: p, nvary: rec.fs_nvary, flat: self.st.flat, next_vary: 0, rev,
@@ -450,8 +471,9 @@ impl<'a, 'm> Render<'a, 'm> {
         };
         let stop = q.run(self.code, self.mem, &mut env, FS_BUDGET);
         self.out.fragments += env.fragments;
-        *self.insns += q.insns;
-        crate::progress(q.insns);
+        let ran = q.insns - before;
+        *self.insns += ran;
+        crate::progress(ran);
         if stop != Stop::End { crate::log_first(&format!("vc4: fragment shader at {:#x} did not end ({stop:?})", rec.fs_code)); }
     }
 
