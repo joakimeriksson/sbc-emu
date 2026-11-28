@@ -163,15 +163,20 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
     if bpmp {
         bpmp_nodes(&mut dt);
     }
-    if machine.soc.gpu_node {
-        dt.begin("tegra-carveouts");
-        dt.str("compatible", "nvidia,carveouts-t19x");
-        dt.end();
+    if machine.soc.fuse_node() {
         dt.begin("fuse@3810000");
         dt.str("compatible", "nvidia,tegra234-efuse");
         dt.cells("reg", &range(crate::EFUSE, crate::EFUSE_SIZE));
         dt.cells("clocks", &[BPMP_HANDLE, crate::bpmp::CLK_FUSE]);
         dt.str("clock-names", "fuse");
+        dt.end();
+    }
+    if machine.usb_device_enabled() {
+        usb_device_nodes(&mut dt);
+    }
+    if machine.soc.gpu_node {
+        dt.begin("tegra-carveouts");
+        dt.str("compatible", "nvidia,carveouts-t19x");
         dt.end();
         host1x_node(&mut dt);
         gpu_node(&mut dt);
@@ -287,6 +292,74 @@ fn bpmp_nodes(dt: &mut Fdt) {
     dt.cells("#reset-cells", &[1]);
     dt.cells("#power-domain-cells", &[1]);
     dt.cells("phandle", &[BPMP_HANDLE]);
+    dt.end();
+}
+
+const PADCTL_HANDLE: u32 = 0x80;
+const USB2_0_HANDLE: u32 = 0x81;
+
+/// The USB-C device-mode port as on the Orin Nano's own device tree (`padctl@3520000`,
+/// `usb@3550000`), with three differences: port usb2-0 starts in the device role
+/// (`role-switch-default-mode`) instead of following the Type-C controller (an FUSB301 on I²C,
+/// not modelled: the PC is always plugged in), the controller has no USB3 PHY (the link is high
+/// speed), and there is no IOMMU or interconnect.
+fn usb_device_nodes(dt: &mut Fdt) {
+    use crate::{bpmp, xudc};
+    dt.begin("padctl@3520000");
+    dt.str("compatible", "nvidia,tegra234-xusb-padctl");
+    dt.cells("reg", &[range(xudc::PADCTL, xudc::PADCTL_SIZE), range(xudc::PADCTL_AO, xudc::PADCTL_AO_SIZE)].concat());
+    dt.strs("reg-names", &["padctl", "ao"]);
+    dt.cells("interrupts", &[0, xudc::PADCTL_SPI, 4]);
+    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_XUSB_PADCTL]);
+    dt.str("reset-names", "padctl");
+    dt.cells("phandle", &[PADCTL_HANDLE]);
+    dt.begin("pads");
+    dt.begin("usb2");
+    dt.cells("clocks", &[BPMP_HANDLE, bpmp::CLK_USB2_TRK]);
+    dt.str("clock-names", "trk");
+    dt.begin("lanes");
+    dt.begin("usb2-0");
+    dt.str("nvidia,function", "xusb");
+    dt.cells("#phy-cells", &[0]);
+    dt.cells("phandle", &[USB2_0_HANDLE]);
+    dt.end();
+    dt.end();
+    dt.end();
+    dt.end();
+    dt.begin("ports");
+    dt.begin("usb2-0");
+    dt.str("mode", "otg");
+    dt.empty("usb-role-switch");
+    dt.str("role-switch-default-mode", "peripheral");
+    dt.end();
+    dt.end();
+    dt.end();
+
+    dt.begin("usb@3550000");
+    dt.str("compatible", "nvidia,tegra234-xudc");
+    dt.cells("reg", &[range(xudc::BASE, xudc::BASE_SIZE), range(xudc::FPCI, xudc::FPCI_SIZE)].concat());
+    dt.strs("reg-names", &["base", "fpci"]);
+    dt.cells("interrupts", &[0, xudc::SPI, 4]);
+    dt.cells(
+        "clocks",
+        &[
+            BPMP_HANDLE,
+            bpmp::CLK_XUSB_CORE_DEV,
+            BPMP_HANDLE,
+            bpmp::CLK_XUSB_CORE_SS,
+            BPMP_HANDLE,
+            bpmp::CLK_XUSB_SS,
+            BPMP_HANDLE,
+            bpmp::CLK_XUSB_FS,
+        ],
+    );
+    dt.strs("clock-names", &["dev", "ss", "ss_src", "fs_src"]);
+    dt.cells("power-domains", &[BPMP_HANDLE, bpmp::XUSBB, BPMP_HANDLE, bpmp::XUSBA]);
+    dt.strs("power-domain-names", &["dev", "ss"]);
+    dt.cells("nvidia,xusb-padctl", &[PADCTL_HANDLE]);
+    dt.cells("phys", &[USB2_0_HANDLE]);
+    dt.strs("phy-names", &["usb2-0"]);
+    dt.empty("dma-coherent");
     dt.end();
 }
 

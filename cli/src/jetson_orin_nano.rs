@@ -92,6 +92,9 @@ fn execute(args: &[String]) -> Result<(), String> {
             "--vnc",
             "--screenshot",
             "--threads",
+            "--usb-device",
+            "--usb-device-fwd",
+            "--usb-device-serial",
         ],
     )?;
     // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
@@ -147,6 +150,32 @@ fn execute(args: &[String]) -> Result<(), String> {
     if !forwards.is_empty() && net != Some(true) {
         return Err("--hostfwd needs --net nat".into());
     }
+    // --usb-device on: a PC plugged into the USB-C device-mode port; --usb-device-fwd forwards a
+    // host port to the board's 192.168.55.1 over it, --usb-device-serial HOST:PORT listens for a
+    // terminal on the gadget's serial port (both imply --usb-device on)
+    let device_forwards = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--usb-device-fwd")
+        .map(|(i, _)| {
+            let spec = args.get(i + 1).map_or("", String::as_str);
+            parse_hostfwd(spec).ok_or(format!("--usb-device-fwd {spec}: expected tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let device_serial: Option<std::net::SocketAddr> = crate::arg(args, "--usb-device-serial")
+        .map(|a| a.parse().map_err(|_| "--usb-device-serial expects a numeric HOST:PORT"))
+        .transpose()?;
+    let usb_device = match crate::arg(args, "--usb-device") {
+        None => !device_forwards.is_empty() || device_serial.is_some(),
+        Some("on") => true,
+        Some("off") if device_forwards.is_empty() && device_serial.is_none() => false,
+        Some("off") => return Err("--usb-device-fwd and --usb-device-serial need --usb-device on".into()),
+        Some(_) => return Err("--usb-device expects on or off".into()),
+    };
+    if usb_device && crate::arg(args, "--bpmp") == Some("off") {
+        return Err("--usb-device needs BPMP (its clocks, reset and power domains)".into());
+    }
+    let mut device_serial = DeviceSerial::open(device_serial)?;
     let ram = serial_board::ram_bytes(args, 4096)?;
     let read = |path: &str| std::fs::read(path).map_err(|err| format!("{path}: {err}"));
     let kernel = read(crate::arg(args, "--kernel").ok_or("expected --kernel IMAGE")?)?;
@@ -201,6 +230,17 @@ fn execute(args: &[String]) -> Result<(), String> {
             if usb_serial.is_some() {
                 machine.attach_usb_serial(emu_core::usb::Serial::new("Virtual USB Serial"));
             }
+            if usb_device {
+                machine.attach_usb_device_pc(std::env::var_os("SBC_NET_LOG").is_some());
+                for &(host, guest) in &device_forwards {
+                    match machine.forward_usb_device_tcp(host, guest) {
+                        Ok(()) if !announced.get() => eprintln!("[{TAG}] forwarding {host} -> 192.168.55.1:{guest} over the USB device port"),
+                        Ok(()) => {}
+                        Err(e) if announced.get() => eprintln!("[{TAG}] --usb-device-fwd after the reboot: {e}"),
+                        Err(e) => return Err(format!("--usb-device-fwd: {e}")),
+                    }
+                }
+            }
             machine.multi = multi;
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
@@ -216,6 +256,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         |machine| {
             rover.poll(machine)?;
             serial.poll(machine);
+            device_serial.poll(machine);
             Ok(())
         },
     )
@@ -391,6 +432,64 @@ impl UsbSerialLink {
         if closed {
             eprintln!("[{TAG}] USB serial: {addr} went away");
             self.stream = None;
+        }
+    }
+}
+
+/// The terminal on the gadget's serial port (`--usb-device-serial`): the PC's `/dev/ttyACM0`
+/// as a TCP listener; one client at a time types into the board's `/dev/ttyGS0` and reads it.
+struct DeviceSerial {
+    listener: Option<std::net::TcpListener>,
+    client: Option<std::net::TcpStream>,
+    /// typed before the PC had the port
+    pending: Vec<u8>,
+}
+
+impl DeviceSerial {
+    fn open(addr: Option<std::net::SocketAddr>) -> Result<Self, String> {
+        let listener = addr
+            .map(|a| {
+                let l = std::net::TcpListener::bind(a).map_err(|e| format!("--usb-device-serial {a}: {e}"))?;
+                l.set_nonblocking(true).map_err(|e| format!("--usb-device-serial: {e}"))?;
+                eprintln!("[{TAG}] the USB device port's serial line listens on {a}");
+                Ok::<_, String>(l)
+            })
+            .transpose()?;
+        Ok(Self { listener, client: None, pending: Vec::new() })
+    }
+
+    fn poll(&mut self, machine: &mut Machine) {
+        use std::io::{Read, Write};
+        let Some(listener) = &self.listener else { return };
+        let output = machine.take_usb_device_serial_output();
+        if let Ok((s, peer)) = listener.accept() {
+            if s.set_nonblocking(true).is_ok() {
+                let _ = s.set_nodelay(true);
+                eprintln!("[{TAG}] USB device serial: {peer} connected");
+                self.client = Some(s);
+            }
+        }
+        let Some(client) = self.client.as_mut() else { return };
+        let busy = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted);
+        let mut closed = false;
+        if !output.is_empty() {
+            if let Err(e) = client.write_all(&output) {
+                closed = !busy(&e);
+            }
+        }
+        let mut buffer = [0; 4096];
+        match client.read(&mut buffer) {
+            Ok(0) => closed = true,
+            Ok(n) => self.pending.extend_from_slice(&buffer[..n]),
+            Err(e) => closed |= !busy(&e),
+        }
+        if !self.pending.is_empty() && machine.usb_device_serial_input(&self.pending) {
+            self.pending.clear();
+        }
+        self.pending.truncate(64 * 1024);
+        if closed {
+            eprintln!("[{TAG}] USB device serial: the client went away");
+            self.client = None;
         }
     }
 }

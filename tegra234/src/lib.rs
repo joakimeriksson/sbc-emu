@@ -9,6 +9,8 @@ mod mss_nvlink;
 #[cfg(not(target_arch = "wasm32"))]
 mod mt;
 mod uart;
+pub mod usb_pc;
+pub mod xudc;
 
 use arm_a64::{Cpu, CpuProfile};
 use emu_core::{Bus, Core, Fault, Stop, Trap};
@@ -61,6 +63,8 @@ struct Soc {
     firmware: Option<Firmware>,
     xhci: Option<peripherals::xhci::Xhci>,
     usb: emu_core::usb::Devices,
+    /// the USB device-mode port (`--usb-device`): the XUDC, its pad controller, the PC
+    xudc: Option<Box<xudc::Xudc>>,
     /// the network behind the USB Ethernet adapter, and when it is next polled
     net: Option<sbc_net::net::VirtualNet>,
     net_next: u64,
@@ -87,7 +91,7 @@ impl Soc {
             }
         } else if addr == APB_STRAPS {
             0
-        } else if self.gpu_node && (EFUSE..EFUSE + EFUSE_SIZE).contains(&addr) {
+        } else if self.fuse_node() && (EFUSE..EFUSE + EFUSE_SIZE).contains(&addr) {
             // Production mode in the shadow array. HIDREV supplies the SoC ID.
             u32::from(addr == EFUSE + 0x100)
         } else if let Some(value) = mc::read(addr) {
@@ -97,6 +101,8 @@ impl Soc {
         } else if let Some(xhci) = self.xhci.as_mut().filter(|_| (XHCI..XHCI + XHCI_SIZE).contains(&addr)) {
             self.interrupts_changed = true;
             xhci.read(addr - XHCI)
+        } else if let Some(xudc) = self.xudc.as_mut().filter(|_| xudc::contains(addr)) {
+            xudc.read(addr)
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.interrupts_changed = true;
             self.uart.read(addr - UART)
@@ -134,6 +140,9 @@ impl Soc {
             self.interrupts_changed = true;
             let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
             xhci.write(addr - XHCI, value, &mut dma, &mut self.usb);
+        } else if let Some(xudc) = self.xudc.as_mut().filter(|_| xudc::contains(addr)) {
+            let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
+            xudc.write(addr, value, &mut dma);
         } else if (UART..UART + UART_SIZE).contains(&addr) {
             self.uart.write(addr - UART, value);
         } else if (UARTA..UARTA + UART_SIZE).contains(&addr) {
@@ -169,6 +178,12 @@ impl Soc {
         Ok(())
     }
 
+    /// The fuse block is in the device tree: the GPU's driver and the USB pad controller read
+    /// their calibration through it.
+    fn fuse_node(&self) -> bool {
+        self.gpu_node || self.xudc.is_some()
+    }
+
     fn gpu_bar_accessible(&self, addr: u64, base: u64) -> bool {
         (base..base + gpu::SIZE).contains(&addr)
             && self
@@ -190,6 +205,11 @@ impl Soc {
             let irq = xhci.irq();
             self.gic.set_line((XHCI_SPI + 32) as usize, irq);
         }
+        if let Some(xudc) = self.xudc.as_mut() {
+            let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
+            xudc.tick(now, &mut dma);
+            self.gic.set_line((xudc::SPI + 32) as usize, xudc.irq());
+        }
         self.gic.set_line((UART_SPI + 32) as usize, self.uart.irq());
         self.gic.set_line((UARTA_SPI + 32) as usize, self.uarta.irq(now));
         self.gic.set_line((gpu::GSP_STALL_SPI + 32) as usize, self.gpu.stall_irq());
@@ -209,6 +229,7 @@ impl Soc {
             .next_event(now)
             .into_iter()
             .chain(self.xhci.as_ref().and_then(|x| x.next_event(&self.usb)))
+            .chain(self.xudc.as_ref().and_then(|x| x.next_event()))
             .chain((self.net.is_some() && self.usb.net.as_ref().is_some_and(|n| n.up())).then_some(self.net_next))
             .min()
     }
@@ -370,6 +391,7 @@ impl Machine {
             firmware: None,
             xhci: None,
             usb: Default::default(),
+            xudc: None,
             net: None,
             net_next: 0,
             now: 0,
@@ -492,6 +514,51 @@ impl Machine {
     /// What the guest wrote to the USB serial port since the last call.
     pub fn take_usb_serial_output(&mut self) -> Vec<u8> {
         self.soc.usb.serial.as_mut().map(|s| s.take_tx()).unwrap_or_default()
+    }
+
+    /// Plug a PC into the USB-C device-mode port: the XUDC and the pad controller appear in the
+    /// device tree (they need BPMP's clocks, resets and power domains), and the PC enumerates the
+    /// board's gadget once Linux sets one up (`usb_pc.rs`).
+    pub fn attach_usb_device_pc(&mut self, log: bool) {
+        self.enable_bpmp();
+        self.soc.xudc.get_or_insert_with(|| Box::new(xudc::Xudc::new(usb_pc::Pc::new(log))));
+    }
+
+    pub fn usb_device_enabled(&self) -> bool {
+        self.soc.xudc.is_some()
+    }
+
+    /// Forward a host TCP address to a TCP port of the board's 192.168.55.1, through the
+    /// device-mode port's network (the PC connects once it has its DHCP lease).
+    pub fn forward_usb_device_tcp(&mut self, host: std::net::SocketAddr, guest_port: u16) -> Result<(), String> {
+        let xudc = self.soc.xudc.as_mut().ok_or("the USB device port is not enabled")?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            xudc.pc.net.nat.add_forward(host, guest_port).map_err(|e| format!("{host}: {e}"))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (xudc, host, guest_port);
+            Err("port forwarding needs host sockets".into())
+        }
+    }
+
+    /// What the board wrote to its gadget serial port (`/dev/ttyGS0`) since the last call.
+    pub fn take_usb_device_serial_output(&mut self) -> Vec<u8> {
+        self.soc.xudc.as_mut().map(|x| std::mem::take(&mut x.pc.serial_rx)).unwrap_or_default()
+    }
+
+    /// Bytes the PC types into the board's gadget serial port; false while the PC has no
+    /// serial port (not enumerated yet, or no ACM function).
+    pub fn usb_device_serial_input(&mut self, bytes: &[u8]) -> bool {
+        let sent = self.soc.xudc.as_mut().is_some_and(|x| x.pc.serial_write(bytes));
+        self.soc.interrupts_changed |= sent;
+        sent
+    }
+
+    /// The PC's DHCP lease on the device-mode link, once it has one.
+    pub fn usb_device_lease(&self) -> Option<[u8; 4]> {
+        self.soc.xudc.as_ref().and_then(|x| x.pc.net.ip.filter(|_| x.pc.net.bound()))
     }
 
     fn plug_usb(&mut self) {

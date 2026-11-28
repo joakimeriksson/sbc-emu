@@ -20,6 +20,16 @@ pub const RESET_UARTA: u32 = 100;
 pub const RESET_GPU: u32 = 19;
 pub const RESET_VIC: u32 = 113;
 pub const GPU: u32 = 35;
+/// The USB device-mode port's clocks, the pad controller's reset and the XUSB power
+/// partitions (`TEGRA234_CLK_*`, `TEGRA234_RESET_XUSB_PADCTL`, `TEGRA234_POWER_DOMAIN_XUSB*`)
+pub const CLK_USB2_TRK: u32 = 0xa5;
+pub const CLK_XUSB_CORE_DEV: u32 = 0x109;
+pub const CLK_XUSB_CORE_SS: u32 = 0x10c;
+pub const CLK_XUSB_FS: u32 = 0x110;
+pub const CLK_XUSB_SS: u32 = 0x113;
+pub const RESET_XUSB_PADCTL: u32 = 0x72;
+pub const XUSBA: u32 = 10;
+pub const XUSBB: u32 = 11;
 
 const CHANNEL_STRIDE: usize = 256;
 const FRAME: usize = 128;
@@ -94,6 +104,9 @@ pub struct Bpmp {
     gpu_reset: bool,
     vic_reset: bool,
     gpu_power: bool,
+    /// the USB device-mode port's clocks, and its power partitions (XUSBA, XUSBB)
+    xusb_clocks: [Clock; 5],
+    xusb_power: [bool; 2],
 }
 
 impl Default for Bpmp {
@@ -115,6 +128,14 @@ impl Default for Bpmp {
             gpu_reset: false,
             vic_reset: false,
             gpu_power: false,
+            xusb_clocks: [
+                Clock::new(CLK_USB2_TRK, "usb2_trk", None, 9_600_000),
+                Clock::new(CLK_XUSB_CORE_DEV, "xusb_core_dev", None, 102_000_000),
+                Clock::new(CLK_XUSB_CORE_SS, "xusb_core_ss", None, 120_000_000),
+                Clock::new(CLK_XUSB_FS, "xusb_fs", None, 48_000_000),
+                Clock::new(CLK_XUSB_SS, "xusb_ss", None, 120_000_000),
+            ],
+            xusb_power: [false; 2],
         }
     }
 }
@@ -245,6 +266,8 @@ impl Bpmp {
             RESET_UARTA => &mut self.uart_reset,
             RESET_GPU => &mut self.gpu_reset,
             RESET_VIC => &mut self.vic_reset,
+            // nothing models the pad controller's reset
+            RESET_XUSB_PADCTL => return if matches!(cmd, RESET_ASSERT | RESET_DEASSERT | RESET_MODULE) { 0 } else { EBADCMD },
             _ => return EINVAL,
         };
         match cmd {
@@ -263,7 +286,7 @@ impl Bpmp {
             return 0;
         }
         let id = cmd_id & 0x00ff_ffff;
-        let Some(clock) = self.clocks.iter_mut().find(|clock| clock.id == id) else {
+        let Some(clock) = self.clocks.iter_mut().chain(self.xusb_clocks.iter_mut()).find(|clock| clock.id == id) else {
             return EINVAL;
         };
         match cmd {
@@ -317,11 +340,31 @@ impl Bpmp {
             PG_QUERY_ABI if arg <= PG_GET_MAX_ID => return 0,
             PG_QUERY_ABI => return EBADCMD,
             PG_GET_MAX_ID => put(resp, 0, GPU),
+            _ if id == XUSBA || id == XUSBB => return self.xusb_power(cmd, id, arg, resp),
             _ if id != GPU => return EINVAL,
             PG_SET_STATE if arg <= 1 => self.gpu_power = arg == 1,
             PG_SET_STATE => return EINVAL,
             PG_GET_STATE => put(resp, 0, u32::from(self.gpu_power)),
             PG_GET_NAME => resp[..3].copy_from_slice(b"gpu"),
+            _ => return EBADCMD,
+        }
+        0
+    }
+}
+
+impl Bpmp {
+    /// The XUSB power partitions: kept, nothing else follows them (the device-mode port
+    /// keeps its registers; its driver reprograms them when it ungates).
+    fn xusb_power(&mut self, cmd: u32, id: u32, arg: u32, resp: &mut [u8]) -> i32 {
+        let on = &mut self.xusb_power[(id - XUSBA) as usize];
+        match cmd {
+            PG_SET_STATE if arg <= 1 => *on = arg == 1,
+            PG_SET_STATE => return EINVAL,
+            PG_GET_STATE => put(resp, 0, u32::from(*on)),
+            PG_GET_NAME => {
+                let name: &[u8] = if id == XUSBA { b"xusba" } else { b"xusbb" };
+                resp[..name.len()].copy_from_slice(name);
+            }
             _ => return EBADCMD,
         }
         0
