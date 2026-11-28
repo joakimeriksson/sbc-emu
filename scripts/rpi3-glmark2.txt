@@ -1,0 +1,10 @@
+# glmark2-es2-drm (all scenes, default durations, 1920x1080 on HDMI) on the Raspberry Pi 3's
+# VideoCore IV (vc4-3d), from the snapshot of scripts/rpi3-v3d.txt. Frame rates are guest-time
+# rates: each GPU job's done interrupt waits for the host time it took (SBC_GPU_TIME).
+#   sbc-emu run --board pi3b --sd cache/os/raspios-gpu.img --restore out/rpi3-v3d.snap \
+#       --script scripts/rpi3-glmark2.txt --timeout 7200
+serial \r
+wait-serial pi@raspberrypi
+serial glmark2-es2-drm 2>&1 | tee /tmp/glmark2.log | grep --color=never -E 'GL_RENDERER|FPS|Score|rror'; echo GLMARK-$((6*7))\r
+wait-serial GLMARK-42
+quit
