@@ -142,6 +142,20 @@ fn conditions_and_flags() {
     for i in 0..16 { assert_eq!(q.ra[10][i], if i < 4 { 7 } else { 0 }); }
 }
 
+/// A conditional instruction sets the flags only in the lanes where it executes (Mesa's loops
+/// keep the lanes still looping that way: `sub.zc.sf`).
+#[test]
+fn conditional_flag_updates() {
+    let prog = [
+        nop().add(op::AND, waddr::NOP, A, B).ra(raddr::ELEM_QPU).small(1).sf(),   // Z on even lanes
+        nop().add(op::SUB, waddr::NOP, A, B).ra(raddr::ELEM_QPU).small(0).sf().cond_add(COND_ZC), // odd lanes: Z only on lane 0 (none odd)
+        ldi(10, 0),
+        ldi(10, 1).cond_add(COND_ZS),
+    ];
+    let q = run(&prog, &[], |_| {});
+    for i in 0..16 { assert_eq!(q.ra[10][i], (i % 2 == 0) as u32, "lane {i}: even lanes keep Z"); }
+}
+
 #[test]
 fn add_carry_and_saturating_pack() {
     let prog = [nop().add(op::ADD, waddr::NOP, A, B).ra(1).rb(2).sf(), ldi(10, 0), ldi(10, 1).cond_add(6),
