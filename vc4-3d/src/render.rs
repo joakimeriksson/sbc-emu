@@ -353,8 +353,7 @@ impl<'a, 'm> Render<'a, 'm> {
         let mut v = p.v;
         let area = (v[1].x - v[0].x) as i64 * (v[2].y - v[0].y) as i64 - (v[2].x - v[0].x) as i64 * (v[1].y - v[0].y) as i64;
         if area == 0 { return; }
-        let cw = area > 0;
-        let front = cw == (st.config & cl::config::CW != 0);
+        let front = crate::bin::front_facing(st.config, area);
         if p.cull && !crate::bin::facing_enabled(st.config, area) { return; }
         let rev = p.cull && !front;
         // positive orientation; `map[k]` is the original vertex at position k

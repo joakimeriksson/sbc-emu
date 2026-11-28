@@ -778,9 +778,7 @@ impl Qpu {
         let pc = self.pc;
         self.pc = pc.wrapping_add(8);
         self.insns += 1;
-        if crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0 && crate::TRACE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
-            eprintln!("\rqpu{} {pc:#010x}: {}\r", self.num, crate::disasm::disasm(i.raw));
-        }
+        let tracing = crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0 && crate::TRACE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0;
         match i.kind {
             Kind::Branch => {
                 if self.branch_taken(i.bcond) {
@@ -807,6 +805,16 @@ impl Qpu {
                 if i.sf { self.set_flags(&v, false, None); }
             }
             _ => self.alu(&i, mem, env),
+        }
+        if tracing {
+            let show = |w: u8, a: bool| -> String {
+                if w < 32 || (waddr::R0..=waddr::R3).contains(&w) || w == waddr::R5 {
+                    let v = self.peek(w, a)[0];
+                    format!(" {}={v:#x}({})", crate::disasm::waddr(w, a), f32::from_bits(v))
+                } else { String::new() }
+            };
+            let (wa, wm) = if let Kind::Branch = i.kind { (String::new(), String::new()) } else { (show(i.waddr_add, !i.ws), show(i.waddr_mul, i.ws)) };
+            eprintln!("\rqpu{} {pc:#010x}: {}  |{wa}{wm}\r", self.num, crate::disasm::disasm(i.raw));
         }
         // signals
         match i.sig {

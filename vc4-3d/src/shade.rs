@@ -27,6 +27,12 @@ impl Env for VertexEnv {
     fn vpm(&mut self) -> (&mut [u32], usize, usize) { (&mut self.vpm, 0, IN_ROWS) }
 }
 
+/// `SBC_VC4_VTX=1`: the inputs and outputs of the first vertices of each batch.
+fn vtx_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SBC_VC4_VTX").is_ok_and(|v| v != "0"))
+}
+
 /// Outputs per vertex: the coordinate shader's or the vertex shader's.
 pub fn outputs(rec: &ShaderRec, coord: bool) -> usize {
     let ps = rec.point_size() as usize;
@@ -75,6 +81,13 @@ pub fn shade_batch(rec: &ShaderRec, coord: bool, idx: &[u32], mem: &mut Mem, cod
     }
     for (l, _) in idx.iter().enumerate() {
         for k in 0..nout.min(OUT_ROWS) { out[l * nout + k] = env.vpm[(IN_ROWS + k) * 16 + l]; }
+    }
+    if vtx_trace() {
+        for (l, &v) in idx.iter().enumerate().take(16) {
+            let ins: Vec<String> = (0..12).map(|r| format!("{:.3}", f32::from_bits(env.vpm[r * 16 + l]))).collect();
+            let outs: Vec<String> = out[l * nout..(l + 1) * nout].iter().map(|&w| format!("{:.3}/{w:#x}", f32::from_bits(w))).collect();
+            eprintln!("\rvc4 {} vertex {v}: in [{}] out [{}]\r", if coord { "coord" } else { "vertex" }, ins.join(" "), outs.join(" "));
+        }
     }
     out
 }
