@@ -160,6 +160,8 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
     );
     dt.end();
 
+    hsp_top0_node(&mut dt);
+    tcu_nodes(&mut dt);
     if bpmp {
         bpmp_nodes(&mut dt);
     }
@@ -242,20 +244,79 @@ const TX_HANDLE: u32 = 21;
 const RX_HANDLE: u32 = 22;
 const BPMP_HANDLE: u32 = 23;
 
-fn bpmp_nodes(dt: &mut Fdt) {
-    use crate::{bpmp, hsp};
+const AON_HSP_HANDLE: u32 = 60;
+
+/// HSP TOP0: its doorbells (the BPMP's, with `--bpmp on`) and shared mailboxes (the TCU's
+/// receive side), with NVIDIA's interrupt wiring.
+fn hsp_top0_node(dt: &mut Fdt) {
+    use crate::{hsp, tcu};
     dt.begin("mailbox@3c00000");
     dt.strs(
         "compatible",
         &["nvidia,tegra234-hsp", "nvidia,tegra194-hsp"],
     );
     dt.cells("reg", &range(hsp::BASE, hsp::SIZE));
-    dt.cells("interrupts", &[0, hsp::SPI, 4]);
-    dt.str("interrupt-names", "doorbell");
+    let spis: Vec<u32> = std::iter::once(hsp::SPI).chain(tcu::TOP0_SHARED_SPIS).collect();
+    dt.cells("interrupts", &spis.iter().flat_map(|&spi| [0, spi, 4]).collect::<Vec<_>>());
+    let names: Vec<String> = std::iter::once("doorbell".to_string())
+        .chain((0..tcu::TOP0_SHARED_SPIS.len()).map(|i| format!("shared{i}")))
+        .collect();
+    dt.strs("interrupt-names", &names.iter().map(String::as_str).collect::<Vec<_>>());
     dt.cells("#mbox-cells", &[2]);
     dt.cells("phandle", &[HSP_HANDLE]);
     dt.end();
+}
 
+/// The AON HSP and the Tegra Combined UART (`ttyTCU0`) as NVIDIA's device tree has them:
+/// receive on TOP0 shared mailbox 0, transmit on AON shared mailbox 1.
+fn tcu_nodes(dt: &mut Fdt) {
+    use crate::tcu;
+    const SHARED_MAILBOX: u32 = 1; // TEGRA_HSP_MBOX_TYPE_SM
+    const TX: u32 = 1 << 31; // TEGRA_HSP_SM_FLAG_TX
+    dt.begin("mailbox@c150000");
+    dt.strs(
+        "compatible",
+        &["nvidia,tegra234-hsp", "nvidia,tegra194-hsp"],
+    );
+    dt.cells("reg", &range(tcu::AON_BASE, tcu::AON_SIZE));
+    dt.cells(
+        "interrupts",
+        &tcu::AON_SHARED_SPIS.map(|spi| [0, spi, 4]).concat(),
+    );
+    dt.strs("interrupt-names", &["shared1", "shared2", "shared3", "shared4"]);
+    dt.cells("#mbox-cells", &[2]);
+    dt.cells("phandle", &[AON_HSP_HANDLE]);
+    dt.end();
+
+    dt.begin("tcu");
+    dt.strs("compatible", &["nvidia,tegra234-tcu", "nvidia,tegra194-tcu"]);
+    dt.cells(
+        "mboxes",
+        &[
+            HSP_HANDLE,
+            SHARED_MAILBOX,
+            tcu::RX_MAILBOX,
+            AON_HSP_HANDLE,
+            SHARED_MAILBOX,
+            TX | tcu::TX_MAILBOX,
+        ],
+    );
+    dt.strs("mbox-names", &["rx", "tx"]);
+    dt.end();
+}
+
+/// Whether the console (the last `console=` naming a serial port) is the TCU.
+pub fn console_is_tcu(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .filter_map(|arg| arg.strip_prefix("console="))
+        .filter(|name| name.starts_with("ttyTCU") || name.starts_with("ttyAMA"))
+        .last()
+        .is_some_and(|name| name.starts_with("ttyTCU"))
+}
+
+fn bpmp_nodes(dt: &mut Fdt) {
+    use crate::{bpmp, hsp};
     dt.begin("sram@40000000");
     dt.strs("compatible", &["nvidia,tegra234-sysram", "mmio-sram"]);
     dt.cells("reg", &range(bpmp::SRAM, bpmp::SRAM_SIZE));
@@ -414,6 +475,7 @@ pub fn boot_linux(
         })
         .transpose()?;
     let dtb = device_tree(machine, cmdline, initrd_range);
+    machine.set_console_tcu(console_is_tcu(cmdline));
     if dtb.len() as u64 > INITRD_OFFSET - DTB_OFFSET {
         return Err("device tree exceeds 2 MiB".into());
     }
@@ -435,4 +497,17 @@ pub fn boot_linux(
     cpu.x = [0; 31];
     cpu.x[0] = RAM_BASE + DTB_OFFSET;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_is_tcu;
+
+    #[test]
+    fn the_last_serial_console_decides() {
+        assert!(console_is_tcu("console=ttyTCU0,115200 fbcon=map:0 console=tty0"));
+        assert!(!console_is_tcu("earlycon=pl011,mmio32,0x031d0000 console=ttyAMA0,115200"));
+        assert!(!console_is_tcu("console=ttyTCU0 console=ttyAMA0"));
+        assert!(!console_is_tcu("root=/dev/sda1"));
+    }
 }

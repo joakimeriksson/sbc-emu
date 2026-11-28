@@ -87,12 +87,49 @@ The script reads the drive's first bytes through `/dev/sda` and finds the camera
 
 The drive can hold a whole JetPack root filesystem, such as a vendor's ready-made image. Boot
 that image's own kernel (`/boot/Image` on its `APP` partition) with
-`root=PARTUUID=<APP's PARTUUID> rootwait rootfstype=ext4`. A JetPack 6 kernel needs
-`console=ttyAMA0` and `earlycon=pl011,mmio32,0x031d0000` for the console.
+`root=PARTUUID=<APP's PARTUUID> rootwait rootfstype=ext4`. The image's own command line
+(extlinux.conf's `APPEND`, without UEFI's `${cbootargs}`) works unchanged: its
+`console=ttyTCU0,115200` is the [Tegra Combined UART](#console-ttytcu0). `console=ttyAMA0` with
+`earlycon=pl011,mmio32,0x031d0000` still works too, and shows the kernel's first messages
+earlier.
+
+On a real Orin, `${cbootargs}` is what UEFI (L4TLauncher) puts there from the device tree's
+`/chosen/bootargs`; on JetPack 6 that adds no console or earlycon, only firmware bookkeeping such
+as `bl_prof_dataptr=`/`bl_prof_ro_ptr=` (the boot profiler's carve-outs), which sbc-emu does not
+have.
 
 Such images are often cut short after their last partition: the GPT describes the original disk,
 which can be larger than the file. Linux rejects a GPT whose backup header lies past the end of
 the disk, so sbc-emu presents the drive at the size the GPT gives. The extra sectors read as zeros.
+
+## Console: ttyTCU0
+
+JetPack's kernels name `console=ttyTCU0`: the Tegra Combined UART. The CPUs reach the debug UART
+only through the always-on cluster's firmware (SPE), over HSP shared mailboxes. sbc-emu models that
+link as NVIDIA's device tree wires it (`tegra234/src/tcu.rs`): the AON HSP (`0x0c150000`, shared
+interrupts 1–4 on SPIs 133–136) and TOP0's shared mailboxes and shared interrupts 0–7 (SPIs
+120–127). Linux's built-in `tegra-tcu` driver sends up to three bytes per message on AON shared
+mailbox 1; the firmware side takes each at once and clears the mailbox. Typed bytes go back three at
+a time on TOP0 shared mailbox 0, as the guest empties it.
+
+TCU output reaches the same host console as the SBSA UART's (`ttyAMA0`), so the terminal and
+`--script`'s `wait-serial`/`serial` work with either. Input goes to the TCU when the last serial
+`console=` on the kernel command line is `ttyTCU…`, else to the SBSA UART. Without `earlycon` the
+kernel log appears once the TCU driver registers (about 0.4 s into boot), from the start.
+
+## PMC scratch registers
+
+The PMC's scratch window (`0x0c390000`, 64 KiB) is modelled as retention registers, all zero at
+power-on. NVIDIA's `nvbootctrl` maps it through `/dev/mem`: SCRATCH `0x3cc` holds the bootloader
+slots' status, `0x3a4`/`0x3a8` the rootfs A/B state (`nvbootctrl verify` clears `0x3a8`). Without it
+`nv-l4t-bootloader-config.service` died with a bus error. The rest of the PMC is not modelled.
+
+`nvbootctrl dump-slots-info` and `get-current-slot` still fail: they read UEFI variables
+(`BootChainFwCurrent`, `BootChainFwStatus`, `RootfsRedundancyLevel`, … in NVIDIA's GUID
+`781e084c-a330-417c-b678-38e696380cb9`) from `/sys/firmware/efi/efivars`, and the ESRT
+(`/sys/firmware/efi/esrt`) for the firmware version. Those need UEFI runtime services, which a
+direct kernel boot does not have. The bootloader's QSPI flash is not used by `nvbootctrl` on
+JetPack 6 (UEFI owns it) and is not modelled.
 
 ## Network
 
