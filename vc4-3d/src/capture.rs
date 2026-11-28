@@ -91,10 +91,19 @@ pub fn replay(jobs: &[Captured], ram: &mut [u8]) -> Vec<crate::tlb::Frame> {
             Job::Render { start, end } => {
                 v.write(CT1CA as u64, start, ram);
                 v.write(CT1EA as u64, end, ram);
+                // the configuration is among the first packets (the kernel may put the clear first)
                 let mut m = crate::mem::Mem::new(ram);
-                let mut p = [0u8; 11];
-                m.read(start, &mut p);
-                if p[0] == crate::cl::TILE_RENDERING_MODE_CONFIG { frames.push(crate::tlb::Frame::parse(&p)); }
+                let mut a = start;
+                for _ in 0..8 {
+                    let op = m.r8(a);
+                    if op == crate::cl::TILE_RENDERING_MODE_CONFIG {
+                        let mut p = [0u8; 11];
+                        m.read(a, &mut p);
+                        frames.push(crate::tlb::Frame::parse(&p));
+                        break;
+                    }
+                    match crate::cl::size(op) { Some(n) => a = a.wrapping_add(n), None => break }
+                }
             }
         }
         v.write(INTCTL as u64, !0, ram);

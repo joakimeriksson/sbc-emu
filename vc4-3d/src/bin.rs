@@ -209,13 +209,19 @@ fn bbox(pts: &[(i32, i32)], pad: f32) -> (i32, i32, i32, i32) {
     (x0.div_euclid(16), y0.div_euclid(16), x1.div_euclid(16), y1.div_euclid(16))
 }
 
+/// Whether a triangle is front facing: `area2` is its doubled signed area in screen space
+/// (y down), positive when it runs clockwise on screen. The hardware's "clockwise" is the
+/// other way round (y up, as GL's window coordinates): Mesa sets the CW bit for GL's
+/// counter-clockwise front faces with its y-flipped viewport, and those have negative area here.
+pub fn front_facing(config: u32, area2: i64) -> bool { (area2 < 0) == (config & cl::config::CW != 0) }
+
 /// Whether a triangle (screen positions) is drawn under the face culling configuration.
 pub fn facing_enabled(config: u32, area2: i64) -> bool {
     if area2 == 0 { return false; }
-    let cw = area2 > 0;
-    let front = cw == (config & cl::config::CW != 0);
+    let front = front_facing(config, area2);
     if front { config & cl::config::ENABLE_FRONT != 0 } else { config & cl::config::ENABLE_BACK != 0 }
 }
+
 
 fn idx_record(idx: &[u32]) -> Vec<u8> {
     let wide = idx.iter().any(|&v| v > 0xffff);

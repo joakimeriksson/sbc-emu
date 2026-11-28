@@ -368,9 +368,11 @@ fn rectangle_covers_exactly_its_pixels() {
 fn indexed_strip_and_fan_and_culling() {
     let (w, h) = (64, 64);
     let c = |x, y| vx(px(w, h, x, y, 0.5));
-    // a strip quad (top left), a fan quad (bottom right), drawn with back faces culled
+    // a strip quad (top left), a fan quad (bottom right), drawn with back faces culled: front
+    // faces run clockwise on the screen (y down), so without the CW bit (the hardware's
+    // clockwise is y up)
     let mut s = Scene::new(w, h);
-    s.begin(cl::config::ENABLE_FRONT | cl::config::CW | 7 << 12);
+    s.begin(cl::config::ENABLE_FRONT | 7 << 12);
     s.draw(&[c(0.0, 0.0), c(32.0, 0.0), c(0.0, 32.0), c(32.0, 32.0)], 0, &flat_fs(false), &[RED], cl::PRIM_TRIANGLE_STRIP, Some(&[0, 1, 2, 3]));
     s.draw(&[c(32.0, 32.0), c(64.0, 32.0), c(64.0, 64.0), c(32.0, 64.0)], 0, &flat_fs(false), &[GREEN], cl::PRIM_TRIANGLE_FAN, None);
     // wound the other way: culled
