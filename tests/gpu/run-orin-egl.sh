@@ -98,7 +98,7 @@ cat "$fixture/probe-initramfs.cpio.gz" "$work/egl.cpio.gz" > "$work/initramfs.cp
 cp "$work/initramfs.cpio.gz" "$fixture/egl-initramfs.cpio.gz"
 
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
-    -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
+    -e 's/governor_pod_scaling nvgpu/governor_pod_scaling nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/egl.txt"
 printf 'serial /egl-probe; echo "EGL_PROBE_" "STATUS=$?"\\r\n' >> "$work/egl.txt"
 printf 'wait-serial EGL_PROBE_ STATUS=\n' >> "$work/egl.txt"

@@ -88,7 +88,7 @@ gzip -n "$work/cuda.cpio"
 cat "$fixture/probe-initramfs.cpio.gz" "$work/cuda.cpio.gz" > "$work/initramfs.cpio.gz"
 
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
-    -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
+    -e 's/governor_pod_scaling nvgpu/governor_pod_scaling nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/cuda.txt"
 printf 'serial /cuda-probe; echo "CUDA_PROBE_" "STATUS=$?"; /cuda-vadd; echo "CUDA_VADD_" "STATUS=$?"\\r\n' >> "$work/cuda.txt"
 printf 'wait-serial CUDA_VADD_ STATUS=\nquit\n' >> "$work/cuda.txt"

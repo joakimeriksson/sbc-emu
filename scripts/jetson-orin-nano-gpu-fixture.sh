@@ -38,8 +38,8 @@ bsdtar -xOf "$work/$kernel.tar.zst" ./boot/Image > "$work/Image"
 mkdir -p "$work/root/modules"
 bsdtar -xf "$work/$modules.tar.zst" -C "$work/root/modules" -s ',.*/,,' \
     --include '*/host1x.ko' --include '*/mc-utils.ko' --include '*/nvsciipc.ko' \
-    --include '*/nvmap.ko' --include '*/nvgpu.ko'
-for module in host1x mc-utils nvsciipc nvmap nvgpu; do
+    --include '*/nvmap.ko' --include '*/nvgpu.ko' --include '*/governor_pod_scaling.ko'
+for module in host1x mc-utils nvsciipc nvmap governor_pod_scaling nvgpu; do
     test -s "$work/root/modules/$module.ko"
 done
 bsdtar -xf "$work/$firmware.tar.zst" -C "$work/root" --include './lib/firmware/nvidia/ga10b/*'

@@ -116,7 +116,7 @@ cat "$fixture/egl-initramfs.cpio.gz" "$work/gl.cpio.gz" > "$work/initramfs.cpio.
 
 # Each suite: the GPU through NVIDIA's EGL, then llvmpipe through Mesa's, then the comparison.
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
-    -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
+    -e 's/governor_pod_scaling nvgpu/governor_pod_scaling nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/gl.txt"
 vendors=/usr/share/glvnd/egl_vendor.d
 for suite in $suites; do

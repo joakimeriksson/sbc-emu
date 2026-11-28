@@ -214,7 +214,7 @@ With `--bpmp on`, the module's thermal, power, fan and CPU-clock hardware is the
 (`tegra234/src/power.rs`), in the places NVIDIA's device tree for the module
 (`tegra234-p3768-0000+p3767-0004`) has it, so the L4T 5.15 kernel's own drivers bind and
 NVIDIA's services find the sysfs files they read, unmodified, on Waveshare's UGV Rover image
-(`nvpower` and `nvfancontrol` run; for `nvpmodel` and jtop, see the differences below):
+(`nvpower`, `nvfancontrol`, `nvpmodel` and jtop run; see the differences below):
 
 | Hardware | Linux driver | What the guest sees |
 |---|---|---|
@@ -246,19 +246,16 @@ Differences from the module:
   is empty, so `jetson_clocks --show` has no EMC rate).
 - On Waveshare's image (`--bpmp on --gpu on`), `nvpower` and `nvfancontrol` run (nvfancontrol
   in open-loop control: the image's saved `/var/lib/nvfancontrol/status` says so, as on their
-  robot). `nvpmodel -q` answers `10W`, but `nvpmodel.service` fails: setting a mode reads the
-  GPU's devfreq limits, which are missing (next item); the CPU limits are applied.
-- jtop's service does not start yet: at start it runs `jetson_clocks --show`, which needs the
-  iGPU's devfreq device (and nvpmodel's GPU clock limits need it too). nvgpu registers that
-  device only on silicon (`tegra_platform_is_silicon()`), and the GPU model reports NVIDIA's QT
-  pre-silicon chip ID (see "JetPack CUDA driver"). On silicon, nvgpu boots the GPU securely:
-  the ACR on the GSP (`acr-gsp.*.encrypt.bin.prod`), FECS and GPCCS as light-secure falcons
-  (`*_encrypt_prod.bin`) and the PMU's RISC-V RTOS (`gpmu_ucode_next_prod_image.bin`, which
-  nvgpu then drives through its command and message queues: ELPG, perfmon, golden-image
-  state). That firmware is encrypted or signed and is not run here, so the silicon path needs
-  those falcons modelled at the level of their protocols first. Without `--gpu`,
-  `jetson_clocks` stops at "Unknown GPU Type". The hardware jtop reads (thermal zones, cpufreq,
-  the INA3221, the fan) is all there.
+  robot), `nvpmodel.service` sets the 10W mode (a oneshot unit: it exits successfully, so
+  `systemctl is-active` says `inactive` as on the module), `jetson_clocks --show` lists the GPU's
+  devfreq limits and jtop's service runs; jtop's Python API reports the CPUs, the GPU (devfreq
+  governor `nvhost_podgov`, 306-624.75 MHz, load), the temperatures, RAM, power and the fan. These
+  need the GPU on nvgpu's silicon path (see "Silicon path" below). Without `--gpu`,
+  `jetson_clocks` stops at "Unknown GPU Type".
+- Waveshare's app (`~/ugv_jetson/app.py`, started by cron at `@reboot`) asks jtop once, when it
+  starts; under the emulator jtop's service starts later than that, because `multi-user.target`
+  waits about 95 s for `nv-l4t-usb-device-mode.service` (USB device mode is not modelled), so the
+  app logs "The jtop.service is not active" once per boot and shows no system information.
 
 ## Ampere GPU bring-up
 
@@ -377,9 +374,46 @@ with the WebAssembly emulator. CUDA uses the Ampere copy engine for transfers an
 compute class for inline uploads. The upload implementation is shared with
 Tegra210. The fixture downloads pinned packages locally. The Tegra DRM driver creates a
 render node using the Host1x/VIC discovery path, and the stock fuse driver
-reports the Tegra234 A01 identity. The board reports NVIDIA's QT pre-silicon
-platform ID with the GPU enabled. This selects the driver's simulation path
-while production silicon PMU firmware remains unmodeled.
+reports the Tegra234 A01 identity. The GPU runs on the driver's silicon path (below);
+`--gpu qt` keeps NVIDIA's QT pre-silicon platform, where nvgpu boots the falcons
+non-secure and without the PMU (and without devfreq).
+
+### Silicon path
+
+With `--gpu on` the board reports the production Tegra234 A01 chip ID and the GA10B's fuse
+block (`tegra234/src/gpu/fuse.rs`) reads as on a production module: privilege security,
+the WPR and secure-source isolation on, production (non-debug) signing, and the PMU and GSP
+fused to their RISC-V cores. nvgpu then takes its silicon path: it boots the GPU securely,
+enables compression and clock gating, and registers its devfreq device (`devfreq_dev`,
+the `gpu.0` alias, governor `nvhost_podgov`), which `jetson_clocks`, `nvpmodel` and jtop use.
+NVIDIA's falcon firmware in `/lib/firmware/nvidia/ga10b` is encrypted or signed and is not
+executed; the falcons are modelled at the level of the protocols nvgpu speaks with them:
+
+- ACR on the GSP (`acr-gsp.*.prod`, `gsp.rs` and `Gpu::run_acr`): nvgpu stages the image in the
+  GSP's IMEM/DMEM and starts its RISC-V core with the ACR descriptor's address in mailbox 0/1.
+  The boot ROM passes, the ACR reads the descriptor, walks the non-WPR ucode blob's WPR header
+  table (the light-secure falcons nvgpu packed: PMU, FECS, GPCCS) and halts with 0 in mailbox 0.
+  Copying the blob into the WPR carveout and checking the PKC signatures are not modelled.
+- PMU (`pmu.rs`): nvgpu writes the boot arguments' address to mailbox 0/1 and starts the
+  RISC-V core; its ROM passes once the ACR has run, the core releases its priv lockdown, and the
+  RTOS reads the command line (the super surface's GPU address and the PMU's instance block)
+  and posts its INIT message in the super surface's message queue (SWGEN0, PMU interrupt
+  vector 152). Commands are RPCs in the super surface's frame-buffer queues; each is answered in
+  place with a response message. Units: ACR (WPR region, bootstrapping FECS and GPCCS from the
+  WPR), PERFMON (init and its INIT event, start/stop, the load query), PG_LOADING and PG (ELPG
+  pre-init/init/post-init, the FECS register-list buffer, thresholds, sub-features, allow and
+  disallow with its asynchronous acknowledgement, statistics, adaptive ELPG). The PMU's hardware
+  mutexes are modelled.
+- FECS and GPCCS start light-secure through their CPU control aliases after the PMU's ACR unit
+  bootstrapped them, and answer the existing method interface plus ELPG's register-list
+  methods (size, bind instance, virtual address).
+- The MMU marks the compression backing store safe once it is programmed.
+
+Approximations: ELPG is accepted and reported allowed, but graphics is never power-gated (no
+idle filter), so the residency statistics stay at zero. PERFMON's load reads 100 % for a sample
+in which work was submitted and 0 % otherwise (the engines run each submission to completion
+when it is rung). The fixture's initramfs loads `governor_pod_scaling.ko` before nvgpu, as
+JetPack does: nvgpu's devfreq setup fails without its governor.
 
 ### JetPack EGL and OpenGL ES
 

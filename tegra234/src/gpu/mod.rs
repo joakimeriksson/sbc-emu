@@ -8,11 +8,13 @@ use std::collections::HashMap;
 mod compute;
 mod copy;
 mod fb;
+mod fuse;
 mod gr;
 mod gsp;
 mod host;
 mod mme;
 mod mmu;
+mod pmu;
 mod threed;
 
 mod top;
@@ -35,6 +37,8 @@ const NONSTALL_STATUS: u64 = 0xb81000;
 const NONSTALL_ENABLE_SET: u64 = 0xb81200;
 const NONSTALL_ENABLE_CLEAR: u64 = 0xb81400;
 const GSP_LEAF: u32 = 1 << (155 - 128);
+/// The PMU's stall vector (152) in the same leaf as the GSP's.
+const PMU_LEAF: u32 = 1 << (152 - 128);
 const GSP_SUBTREE: u32 = 1 << 2;
 const INTR_LEAF_STATUS: u64 = 0xb81010;
 const INTR_LEAF_ENABLE_SET: u64 = 0xb81210;
@@ -63,8 +67,14 @@ pub struct Gpu {
     gr: gr::Gr,
     gsp: gsp::Gsp,
     host: host::Host,
+    pmu: pmu::Pmu,
+    /// Production silicon (secure fuses, PMU) rather than NVIDIA's QT pre-silicon platform.
+    silicon: bool,
+    /// The ACR has set up the WPR and verified the light-secure images (`run_acr`).
+    acr_done: bool,
     ring_started: bool,
     gsp_leaf_enabled: bool,
+    pmu_leaf_enabled: bool,
     gsp_subtree_enabled: bool,
     nonstall_leaf_enabled: bool,
     nonstall_subtree_enabled: bool,
@@ -79,8 +89,12 @@ impl Default for Gpu {
             gr: gr::Gr::default(),
             gsp: gsp::Gsp::default(),
             host: host::Host::default(),
+            pmu: pmu::Pmu::default(),
+            silicon: false,
+            acr_done: false,
             ring_started: false,
             gsp_leaf_enabled: false,
+            pmu_leaf_enabled: false,
             gsp_subtree_enabled: false,
             nonstall_leaf_enabled: false,
             nonstall_subtree_enabled: false,
@@ -90,10 +104,17 @@ impl Default for Gpu {
 }
 
 impl Gpu {
-    pub fn read(&mut self, offset: u64, now: u64) -> u32 {
+    /// Report production silicon (secure fuses, LS PMU) instead of the QT platform.
+    pub fn set_silicon(&mut self, silicon: bool) {
+        self.silicon = silicon;
+    }
+
+    pub fn read(&mut self, offset: u64, now: u64, ram: &mut [u8]) -> u32 {
         let value = match offset {
             0 => BOOT0,
-            INTR_LEAF_STATUS => u32::from(self.gsp.irq()) * GSP_LEAF,
+            INTR_LEAF_STATUS => {
+                (u32::from(self.gsp.irq()) * GSP_LEAF) | (u32::from(self.pmu.irq()) * PMU_LEAF)
+            }
             NONSTALL_STATUS => u32::from(self.host.nonstall_pending) * COPY_NONSTALL_LEAF,
             INTR_TOP_STATUS => {
                 (u32::from(self.gsp_pending()) * GSP_SUBTREE)
@@ -107,9 +128,11 @@ impl Gpu {
             // gr_fecs_current_ctx: the resident context (pointer in 4 KiB units, valid bit 31), so
             // that nvgpu reads and writes a running channel's context registers directly
             FECS_CURRENT_CTX => self.host.gr_instance.map_or(0, |i| (i >> 12) as u32 & 0x0fff_ffff | 1 << 31),
+            _ if self.silicon && fuse::contains(offset) => fuse::read(offset).unwrap_or(0),
             _ => self
                 .fb
                 .read(offset)
+                .or_else(|| self.pmu.read(offset, ram))
                 .or_else(|| top::read(offset))
                 .or_else(|| host::read_config(offset))
                 .or_else(|| self.gr.read(offset))
@@ -140,11 +163,30 @@ impl Gpu {
             || self.gr.write(offset, value)
             || self.gsp.write(offset, value)
         {
+            if let Some(desc) = self.gsp.take_acr_request() {
+                self.run_acr(desc, ram);
+            }
+            return;
+        }
+        let mut effects = Vec::new();
+        self.pmu.work = self.host.submissions;
+        if self.pmu.write(offset, value, ram, self.acr_done, &mut effects) {
+            for effect in effects {
+                match effect {
+                    pmu::Effect::BootstrapFalcons(mask) => self.gr.bootstrap_light_secure(mask),
+                }
+            }
             return;
         }
         match offset {
-            INTR_LEAF_ENABLE_SET => self.gsp_leaf_enabled |= value & GSP_LEAF != 0,
-            INTR_LEAF_ENABLE_CLEAR => self.gsp_leaf_enabled &= value & GSP_LEAF == 0,
+            INTR_LEAF_ENABLE_SET => {
+                self.gsp_leaf_enabled |= value & GSP_LEAF != 0;
+                self.pmu_leaf_enabled |= value & PMU_LEAF != 0;
+            }
+            INTR_LEAF_ENABLE_CLEAR => {
+                self.gsp_leaf_enabled &= value & GSP_LEAF == 0;
+                self.pmu_leaf_enabled &= value & PMU_LEAF == 0;
+            }
             NONSTALL_STATUS => self.host.nonstall_pending &= value & COPY_NONSTALL_LEAF == 0,
             NONSTALL_ENABLE_SET => self.nonstall_leaf_enabled |= value & COPY_NONSTALL_LEAF != 0,
             NONSTALL_ENABLE_CLEAR => self.nonstall_leaf_enabled &= value & COPY_NONSTALL_LEAF == 0,
@@ -210,7 +252,47 @@ impl Gpu {
     }
 
     fn gsp_pending(&self) -> bool {
-        self.gsp.irq() && self.gsp_leaf_enabled
+        self.gsp.irq() && self.gsp_leaf_enabled || self.pmu.irq() && self.pmu_leaf_enabled
+    }
+
+    /// The ACR (`acr-gsp.*`, on the GSP's RISC-V core) at the level of its result. It reads its
+    /// descriptor (`flcn2_acr_desc`: the non-WPR ucode blob nvgpu built), would copy the blob
+    /// into the WPR carveout and check each light-secure falcon's signature, then halts with 0 in
+    /// mailbox 0. Here the blob's WPR header table is walked: the run succeeds when it lists
+    /// FECS and GPCCS (and nothing unreadable); signatures are taken as valid.
+    fn run_acr(&mut self, desc: u64, ram: &mut [u8]) {
+        const BLOB_SIZE: u64 = 68;
+        const BLOB_START: u64 = 72;
+        const WPR_HEADER: u64 = 24;
+        const FALCON_ID_INVALID: u32 = u32::MAX;
+        const FECS: u32 = 2;
+        const GPCCS: u32 = 3;
+        // ACR_ERROR codes are nonzero; 0x13 stands for a blob it could not parse.
+        const BLOB_ERROR: u32 = 0x13;
+        let word = |address: u64| mmu::word(ram, address);
+        let size = word(desc + BLOB_SIZE);
+        let start = word(desc + BLOB_START)
+            .zip(word(desc + BLOB_START + 4))
+            .map(|(lo, hi)| u64::from(lo) | u64::from(hi) << 32);
+        let mut falcons = 0u32;
+        if let (Some(size), Some(start)) = (size, start) {
+            for index in 0..u64::from(size) / WPR_HEADER {
+                match word(start + index * WPR_HEADER) {
+                    Some(FALCON_ID_INVALID) | None => break,
+                    Some(id) if id < 32 => falcons |= 1 << id,
+                    Some(_) => {}
+                }
+            }
+        }
+        self.acr_done = falcons & (1 << FECS | 1 << GPCCS) == (1 << FECS | 1 << GPCCS);
+        if self.trace {
+            eprintln!("[gpu] ACR desc {desc:#x}: WPR falcons {falcons:#x}");
+        }
+        if self.acr_done {
+            self.gsp.finish_acr(0, 0);
+        } else {
+            self.gsp.finish_acr(BLOB_ERROR, 0);
+        }
     }
 
     pub fn stall_irq(&self) -> bool {
@@ -231,8 +313,11 @@ impl Gpu {
         self.gr = gr::Gr::default();
         self.gsp = gsp::Gsp::default();
         self.host = host::Host::default();
+        self.pmu = pmu::Pmu::default();
+        self.acr_done = false;
         self.ring_started = false;
         self.gsp_leaf_enabled = false;
+        self.pmu_leaf_enabled = false;
         self.gsp_subtree_enabled = false;
         self.nonstall_leaf_enabled = false;
         self.nonstall_subtree_enabled = false;
