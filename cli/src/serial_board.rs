@@ -47,6 +47,11 @@ pub(crate) trait SerialBoard: gdb::Target {
     fn take_hdmi_audio(&mut self) -> (u32, Vec<i16>) {
         (0, Vec::new())
     }
+    /// Plug the HDMI monitor in or out (the `hdmi connect|disconnect` script command); false:
+    /// the board has no such port.
+    fn set_hdmi_connected(&mut self, _on: bool) -> bool {
+        false
+    }
 }
 
 /// Where `--audio-out` goes: a WAV file, or raw 16-bit little-endian stereo for any other
@@ -179,7 +184,7 @@ impl RunConfig {
             .map_err(|_| "invalid --timeout")?;
         let script = crate::script::load(arg(args, "--script")).map_err(|e| e.to_string())?;
         for line in &script {
-            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep" | "pointer" | "save")) {
+            if !matches!(line.split_whitespace().next(), Some("wait-serial" | "serial" | "quit" | "reset" | "screenshot" | "type" | "sleep" | "pointer" | "save" | "wait-pixel" | "wait-idle" | "hdmi")) {
                 return Err(format!("unsupported script command: {line}"));
             }
         }
@@ -285,6 +290,8 @@ pub(crate) fn run_with_io<B: SerialBoard>(
     let mut sleep_until: Option<u64> = None;
     // what the guest asked for while a debugger stepped it
     let mut owed: Option<Stop> = None;
+    // the last wall time the guest ran a full slice without going idle (`wait-idle`)
+    let mut last_busy = Instant::now();
     if let Some(g) = gdb.as_mut().filter(|_| config.gdb_wait) {
         g.wait_for_client();
         let core = m.stopped_core();
@@ -380,6 +387,31 @@ pub(crate) fn run_with_io<B: SerialBoard>(
                 }
                 "screenshot" => {
                     screenshot(&mut m, tag, rest);
+                    true
+                }
+                // wait-idle SECS: the guest has been idle (every core waiting) for SECS of wall time
+                "wait-idle" => last_busy.elapsed().as_secs_f64() >= rest.trim().parse().unwrap_or(5.0),
+                // wait-pixel X Y RRGGBB: the screen shows that colour at (X, Y), each channel
+                // within 8 (a 16-bit console framebuffer rounds colours)
+                "wait-pixel" => {
+                    let a: Vec<&str> = rest.split_whitespace().collect();
+                    let (x, y, rgb) = match (a.first().and_then(|v| v.parse::<u32>().ok()), a.get(1).and_then(|v| v.parse::<u32>().ok()), a.get(2).and_then(|v| u32::from_str_radix(v, 16).ok())) {
+                        (Some(x), Some(y), Some(c)) => (x, y, c),
+                        _ => return Err(format!("script: {line} (wait-pixel X Y RRGGBB)")),
+                    };
+                    let mut rgba = Vec::new();
+                    match m.screen().and_then(|s| s.render(&mut rgba)) {
+                        Some((w, h)) if x < w && y < h => {
+                            let o = ((y * w + x) * 4) as usize;
+                            (0..3).all(|k| (rgba[o + k] as i32 - ((rgb >> (16 - 8 * k)) & 0xff) as i32).abs() <= 8)
+                        }
+                        _ => false,
+                    }
+                }
+                // hdmi connect|disconnect: plug the monitor in or out
+                "hdmi" => {
+                    let on = match rest.trim() { "connect" => true, "disconnect" => false, _ => return Err(format!("script: {line} (hdmi connect|disconnect)")) };
+                    if !m.set_hdmi_connected(on) { eprintln!("[{tag}] script: this board has no HDMI hot-plug; '{line}' ignored"); }
                     true
                 }
                 "sleep" => {
@@ -520,7 +552,7 @@ pub(crate) fn run_with_io<B: SerialBoard>(
             stop = Stop::Budget;
         }
         match stop {
-            Stop::Budget => {}
+            Stop::Budget => last_busy = Instant::now(),
             Stop::Idle(deadline) if idle_skip() => {
                 // SBC_IDLE=skip: an idle guest's time jumps to its next deadline (a batch job
                 // that waits on timers, like CUDA's synchronization, need not wait them out)

@@ -1,14 +1,26 @@
-//! The BCM2711 display pipeline for Linux's `vc4` KMS driver (`dtoverlay=vc4-kms-v3d`, what
-//! Raspberry Pi OS asks for): the HVS compositor, pixel valve 2 and the HDMI0 encoder with its
-//! PHY, DVP and DDC bus, and a monitor on the HDMI0 port (EDID with 1920x1080, 1280x720 and
-//! 1024x768).
+//! The display pipeline of the BCM2711 and of the older BCM2835 family (the BCM2837 of the Pi 3)
+//! for Linux's `vc4` KMS driver (`dtoverlay=vc4-kms-v3d`, what Raspberry Pi OS asks for): the
+//! HVS compositor, the pixel valves and the HDMI encoder, and a monitor on the HDMI port (EDID
+//! with 1920x1080, 1280x720 and 1024x768).
+//!
+//! `Gen::Bcm2711`: the HVS5, pixel valve 2 and HDMI0 with its PHY, DVP and DDC bus (the BSC in
+//! the HDMI window). `Gen::Bcm2835`: the HVS of the BCM2835/6/7 (display lists at 0x2000, 12-bit
+//! sizes, 4-bit pixel formats, gamma), pixel valves 0..2 (PV2 feeds HDMI from HVS channel 1),
+//! and the BCM2835 HDMI block with its "hd" block; its DDC is the SoC's I²C controller BSC2,
+//! so the EDID EEPROM is a separate device there (`EdidEeprom`). Its CEC controller is modelled
+//! with a TV on the bus that answers polls and the usual queries (`Cec`).
 //!
 //! The HVS is modelled at the level of what reaches the screen: it reads the display list of
-//! the channel being shown (plane entries: format, position, size, pointer, pitch) and composes
-//! the planes when the host wants a picture. The pixel valve produces vblank at 60 Hz of guest
-//! time while it runs, and latches each HVS channel's display list then, as the hardware does
-//! at the start of a frame (that is how the driver sees a page flip complete). The HDMI blocks
-//! are registers; the handshakes the driver waits for complete at once.
+//! the channel being shown (plane entries: format, position, size, pointers, pitches, colour
+//! conversion) and composes the planes when the host wants a picture: RGB formats, YUV 4:2:0 and
+//! 4:2:2 in two or three planes, T-tiled RGB, nearest-neighbour scaling, alpha. The pixel valves
+//! produce vblank while they run (the BCM2711's at 60 Hz, the BCM2835's at the rate of the mode
+//! they were given and the pixel clock), and the HVS channel a valve reads latches its display
+//! list then, as the hardware does at the start of a frame (that is how the driver sees a page
+//! flip complete). The HDMI blocks are registers; the handshakes the driver waits for complete
+//! at once.
+
+use std::collections::VecDeque;
 
 pub const HVS: u64 = 0xfe40_0000;
 pub const HVS_SIZE: u64 = 0x8000;
@@ -23,11 +35,22 @@ pub const TXP: u64 = 0xfe00_4000;
 
 /// DMA request line of HDMI0's audio FIFO (MAI)
 pub const DREQ_HDMI0: u32 = 10;
-/// the HDMI audio clock (the DVP gate on the 108 MHz oscillator)
+/// DMA request line of the BCM2835's HDMI audio FIFO
+pub const DREQ_HDMI_BCM2835: u32 = 17;
+/// the BCM2711's HDMI audio clock (the DVP gate on the 108 MHz oscillator)
 const AUDIO_CLK_HZ: u64 = 108_000_000;
 
 pub const SPI_HVS: usize = 32 + 97;
 pub const SPI_PV2: usize = 32 + 101;
+
+/// Which SoC's display pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gen {
+    /// the Pi 4's: HVS5, pixel valve 2, HDMI0
+    Bcm2711,
+    /// the Pi 3's (and Pi 1/2/Zero's): HVS (4), pixel valves 0..2, the BCM2835 HDMI
+    Bcm2835,
+}
 
 // HVS registers (byte offsets)
 const DISPCTRL: usize = 0x00;
@@ -37,11 +60,17 @@ const DISPLIST0: usize = 0x20;
 const DISPLACT0: usize = 0x30;
 const DISPCTRL0: usize = 0x40;
 const DISPSTAT0: usize = 0x48;
-const DLIST: usize = 0x4000;
+/// the BCM2835's gamma LUT address and data ports
+const GAMADDR: usize = 0x78;
+const GAMDATA: usize = 0xe0;
 
 // pixel valve
 const PV_CONTROL: usize = 0x00;
 const PV_V_CONTROL: usize = 0x04;
+const PV_HORZA: usize = 0x0c;
+const PV_HORZB: usize = 0x10;
+const PV_VERTA: usize = 0x14;
+const PV_VERTB: usize = 0x18;
 const PV_INTEN: usize = 0x24;
 const PV_INTSTAT: usize = 0x28;
 const PV_INT_VFP_START: u32 = 1 << 7;
@@ -55,26 +84,139 @@ const HDMI_SCHEDULER_CONTROL: usize = HDMI + 0x0e0;
 const HDMI_HOTPLUG: usize = HDMI + 0x1a8;
 const BSC: usize = 0x4500;
 
+// the BCM2835 HDMI block (0x7e902000, 0x600 bytes)
+pub const HDMI_2835_SIZE: u64 = 0x600;
+const H_HOTPLUG: usize = 0x00c;
+const H_FIFO_CTL: usize = 0x05c;
+const H_RAM_PACKET_CONFIG: usize = 0x0a0;
+const H_RAM_PACKET_STATUS: usize = 0x0a4;
+const H_SCHEDULER_CONTROL: usize = 0x0c0;
+const H_CEC_CNTRL_1: usize = 0x0e8;
+const H_CEC_CNTRL_5: usize = 0x0f8;
+const H_CEC_TX_DATA_1: usize = 0x0fc;
+const H_CEC_RX_DATA_1: usize = 0x10c;
+const H_CPU_STATUS: usize = 0x340;
+const H_CPU_SET: usize = 0x344;
+const H_CPU_CLEAR: usize = 0x348;
+const H_CPU_MASK_STATUS: usize = 0x34c;
+const H_CPU_MASK_SET: usize = 0x350;
+const H_CPU_MASK_CLEAR: usize = 0x354;
+const CPU_CEC: u32 = 1 << 6;
+// CEC_CNTRL_1 / _5 bits
+const CEC_TX_EOM: u32 = 1 << 31;
+const CEC_TX_STATUS_GOOD: u32 = 1 << 30;
+const CEC_RX_EOM: u32 = 1 << 29;
+const CEC_RX_STATUS_GOOD: u32 = 1 << 28;
+const CEC_CLEAR_RECEIVE_OFF: u32 = 1 << 21;
+const CEC_START_XMIT_BEGIN: u32 = 1 << 20;
+const CEC_TX_SW_RESET: u32 = 1 << 27;
+const CEC_RX_SW_RESET: u32 = 1 << 26;
+const CEC_RX_CEC_INT: u32 = 1 << 23;
+
 const FRAME_NS: u64 = 16_666_667;
 /// how far behind an audio FIFO's consumer may fall before it counts as an underrun (ns)
 pub const MAX_CATCHUP_NS: u64 = 20_000_000;
+/// the BCM2835's HVS channel each pixel valve reads (PV0: 0, PV1: 2, PV2: 1)
+const PV_CHANNEL_2835: [usize; 3] = [0, 2, 1];
+/// a CEC message takes this long on the bus before its reply (ns)
+const CEC_REPLY_NS: u64 = 2_000_000;
+
+/// The TV on the HDMI port's CEC bus: logical address 0, physical address 0.0.0.0. It
+/// acknowledges what is sent to it (or broadcast) and answers the usual queries.
+#[derive(Clone, Debug)]
+pub struct Cec {
+    /// messages the TV sends, and the time the next may go
+    rx: VecDeque<Vec<u8>>,
+    rx_at: u64,
+    pub tv_on: bool,
+    /// messages seen on the bus (for the host's log)
+    pub log: Vec<String>,
+}
+
+impl Default for Cec { fn default() -> Self { Cec { rx: VecDeque::new(), rx_at: 0, tv_on: true, log: Vec::new() } } }
+
+/// The TV's name (`Give OSD Name`) and its vendor ID (a locally administered value).
+const TV_NAME: &[u8] = b"sbc-emu TV";
+const TV_VENDOR: [u8; 3] = [0x5b, 0xc0, 0xe0];
+
+impl Cec {
+    /// A message on the bus: whether it is acknowledged (a broadcast always is; a directed one
+    /// when it is for the TV), and the TV's answer to it.
+    fn sent(&mut self, msg: &[u8], now: u64) -> bool {
+        if msg.is_empty() { return false; }
+        let (from, to) = (msg[0] >> 4, msg[0] & 0xf);
+        let hex: Vec<String> = msg.iter().map(|b| format!("{b:02x}")).collect();
+        self.log.push(format!("{from:x}->{to:x}: {}", hex.join(":")));
+        if self.log.len() > 256 { self.log.drain(..128); }
+        if to != 0 && to != 0xf { return false; }
+        let Some(&op) = msg.get(1) else { return true }; // a poll
+        let reply: Option<Vec<u8>> = match op {
+            0x83 => Some(vec![0x0f, 0x84, 0x00, 0x00, 0x00]), // Give Physical Address -> Report (TV)
+            0x8c => Some([&[0x0f, 0x87][..], &TV_VENDOR].concat()),
+            0x46 if to == 0 => Some([&[from, 0x47][..], TV_NAME].concat()),
+            0x9f if to == 0 => Some(vec![from, 0x9e, 0x05]), // CEC 1.4
+            0x8f if to == 0 => Some(vec![from, 0x90, if self.tv_on { 0 } else { 1 }]),
+            0x91 if to == 0 => Some(vec![0x0f, 0x32, b'e', b'n', b'g']),
+            0x04 | 0x0d => { self.tv_on = true; None } // Image/Text View On
+            0x36 => { self.tv_on = false; None } // Standby
+            // a request the TV does not support: Feature Abort (unrecognized opcode); answers,
+            // announcements and key presses are taken silently
+            0x00 | 0x32 | 0x44 | 0x45 | 0x47 | 0x72 | 0x7a | 0x7e | 0x80..=0x82 | 0x84 | 0x86 | 0x87 | 0x89 | 0x8a | 0x8b | 0x8e | 0x90 | 0x9d | 0x9e | 0xa0 => None,
+            _ if to == 0 => Some(vec![from, 0x00, op, 0x00]),
+            _ => None,
+        };
+        if let Some(mut r) = reply {
+            if r[0] != 0x0f { r[0] = from; } // TV (0) to the initiator
+            self.rx.push_back(r);
+            if self.rx.len() == 1 { self.rx_at = now + CEC_REPLY_NS; }
+        }
+        true
+    }
+}
+
+/// The monitor's EDID EEPROM at DDC address 0x50, for boards whose DDC bus is an I²C controller
+/// (the BCM2835's BSC2): a write sets the address pointer, reads continue from it.
+pub struct EdidEeprom {
+    pub edid: Vec<u8>,
+    ptr: usize,
+    /// a monitor is plugged in (no EEPROM answers otherwise)
+    pub connected: bool,
+}
+
+impl EdidEeprom {
+    pub fn new(edid: Vec<u8>) -> Self { EdidEeprom { edid, ptr: 0, connected: true } }
+}
+
+impl crate::i2c::I2cDevice for EdidEeprom {
+    fn address(&self) -> u8 { if self.connected { 0x50 } else { 0xff } }
+    fn write(&mut self, data: &[u8]) { if let Some(&p) = data.first() { self.ptr = p as usize % self.edid.len().max(1); } }
+    fn read(&mut self, out: &mut [u8]) {
+        for b in out.iter_mut() {
+            *b = self.edid.get(self.ptr).copied().unwrap_or(0xff);
+            self.ptr = (self.ptr + 1) % self.edid.len().max(1);
+        }
+    }
+}
 
 pub struct Vc4 {
+    pub gen: Gen,
     hvs: Vec<u32>,
     /// frames shown on each HVS channel (6-bit counters in DISPSTAT1/2)
     frcnt: [u32; 3],
     /// DISPSTAT's end-of-frame flags (bit 8 + 8 * channel), raised as each channel starts a frame
     /// and cleared by writing them; not saved (the next frame raises them again)
     eof: u32,
-    pv: [u32; 64],
+    /// pixel valves 0..2 (the BCM2711 model has PV2 only)
+    pv: [[u32; 64]; 3],
+    /// the BCM2711's HDMI window; the BCM2835's HDMI block
     win: Vec<u32>,
     hd: [u32; 64],
     txp: [u32; 8],
     /// the DDC bus: the EDID's address pointer
     edid_ptr: usize,
     edid: Vec<u8>,
-    /// next vblank (ns of guest time)
-    next_vblank: u64,
+    /// next vblank of each pixel valve (ns of guest time)
+    next_vblank: [u64; 3],
     /// HDMI audio (MAI): play position (ns), fractional frames, the channel a word belongs to
     mai_played_to: u64,
     mai_frac: u64,
@@ -83,7 +225,18 @@ pub struct Vc4 {
     /// HDMI audio played, 16-bit interleaved stereo, and its rate
     pub audio: Vec<i16>,
     pub audio_rate: u32,
-    /// a monitor is plugged into HDMI0
+    /// the clock the MAI sample rate divides (Hz): the BCM2711's 108 MHz, the BCM2835's HDMI
+    /// state machine clock (the machine keeps it at the firmware clock's rate)
+    pub audio_clk_hz: u64,
+    /// the BCM2835's pixel clock (Hz, the firmware's PIXEL clock): pixel valve 2's frame rate
+    pub pixel_hz: u64,
+    /// the BCM2835 HVS's gamma LUT (3 channels x R, G, B x 256) and its address port
+    gamma: Vec<u32>,
+    gam_addr: u32,
+    pub cec: Cec,
+    /// the latest guest time seen (ns)
+    now: u64,
+    /// a monitor is plugged into HDMI
     pub connected: bool,
     pub frames: u64,
     pub trace: bool,
@@ -97,19 +250,44 @@ impl Vc4 {
     /// A monitor whose preferred mode is `w`x`h` (1920x1080, 1280x720, 1024x768, 800x600 or
     /// 640x480): the console, `kmscube` and `glmark2` use the preferred mode.
     pub fn with_mode(w: u32, h: u32) -> Self {
-        let mut v = Self::new_inner();
+        let mut v = Self::new_inner(Gen::Bcm2711);
         v.edid = edid_with((w, h));
         v
     }
 
-    fn new_inner() -> Self {
-        Vc4 { hvs: vec![0; (HVS_SIZE / 4) as usize], frcnt: [0; 3], eof: 0, pv: [0; 64], win: vec![0; (HDMI_WIN_SIZE / 4) as usize], hd: [0; 64], txp: [0; 8],
-              edid_ptr: 0, edid: edid(), next_vblank: FRAME_NS, connected: true, frames: 0,
+    /// The BCM2835-family pipeline (Pi 3) with a monitor whose preferred mode is `w`x`h`.
+    pub fn bcm2835(w: u32, h: u32) -> Self {
+        let mut v = Self::new_inner(Gen::Bcm2835);
+        v.edid = edid_with((w, h));
+        v
+    }
+
+    fn new_inner(gen: Gen) -> Self {
+        let win = match gen { Gen::Bcm2711 => HDMI_WIN_SIZE, Gen::Bcm2835 => HDMI_2835_SIZE } as usize / 4;
+        Vc4 { gen, hvs: vec![0; (HVS_SIZE / 4) as usize], frcnt: [0; 3], eof: 0, pv: [[0; 64]; 3], win: vec![0; win], hd: [0; 64], txp: [0; 8],
+              edid_ptr: 0, edid: edid(), next_vblank: [FRAME_NS; 3], connected: true, frames: 0,
               mai_played_to: 0, mai_frac: 0, mai_ch: 0, mai_left: 0, audio: Vec::new(), audio_rate: 0,
+              audio_clk_hz: AUDIO_CLK_HZ, pixel_hz: 0,
+              gamma: (0..9 * 256).map(|k| (k % 256) as u32).collect(), gam_addr: 0, cec: Cec::default(), now: 0,
               trace: std::env::var_os("SBC_TRACE_VC4").is_some() }
     }
 
+    /// The monitor's EDID (for a DDC bus outside this block).
+    pub fn edid(&self) -> &[u8] { &self.edid }
+
     // ------------------------------------------------------------------ HVS
+
+    fn dlist_base(&self) -> usize { match self.gen { Gen::Bcm2711 => 0x4000, Gen::Bcm2835 => 0x2000 } }
+
+    /// A channel's size from its DISPCTRLx.
+    fn chan_size(&self, c: u32) -> (u32, u32) {
+        match self.gen {
+            Gen::Bcm2711 => ((c >> 16) & 0x1fff, c & 0x1fff),
+            Gen::Bcm2835 => ((c >> 12) & 0xfff, c & 0xfff),
+        }
+    }
+
+    fn chan_on(&self, ch: usize) -> bool { self.hvs[(DISPCTRL0 + 0x10 * ch) / 4] & (1 << 31) != 0 }
 
     pub fn hvs_read(&self, off: u64) -> u32 {
         let o = off as usize & !3;
@@ -120,11 +298,11 @@ impl Vc4 {
             // the frame counters (FRCNT0/1 in DISPSTAT1, FRCNT2 in DISPSTAT2)
             o if (DISPSTAT0..DISPSTAT0 + 0x30).contains(&o) && (o - DISPSTAT0) % 0x10 == 0 => {
                 let ch = (o - DISPSTAT0) / 0x10;
-                let on = self.hvs[(DISPCTRL0 + 0x10 * ch) / 4] & (1 << 31) != 0;
-                let mut v = if on { 2 << 30 } else { 1 << 28 };
+                let mut v = if self.chan_on(ch) { 2 << 30 } else { 1 << 28 };
+                let (s0, s1) = match self.gen { Gen::Bcm2711 => (20, 14), Gen::Bcm2835 => (18, 12) };
                 match ch {
-                    1 => v |= (self.frcnt[0] & 63) << 20 | (self.frcnt[1] & 63) << 14,
-                    2 => v |= (self.frcnt[2] & 63) << 14,
+                    1 => v |= (self.frcnt[0] & 63) << s0 | (self.frcnt[1] & 63) << s1,
+                    2 => v |= (self.frcnt[2] & 63) << s1,
                     _ => {}
                 }
                 v
@@ -136,7 +314,7 @@ impl Vc4 {
 
     pub fn hvs_write(&mut self, off: u64, v: u32) {
         let o = off as usize & !3;
-        if self.trace && o < DLIST { eprintln!("[hvs] {o:#x} <- {v:#x}"); }
+        if self.trace && o < self.dlist_base() { eprintln!("[hvs] {o:#x} <- {v:#x}"); }
         match o {
             DISPSTAT => self.eof &= !v, // write-one-to-clear
             o if (DISPCTRL0..DISPCTRL0 + 0x30).contains(&o) && (o - DISPCTRL0) % 0x10 == 0 => {
@@ -144,63 +322,107 @@ impl Vc4 {
                 if v & (1 << 30) != 0 { self.frcnt[(o - DISPCTRL0) / 0x10] = 0; }
                 self.hvs[o / 4] = v & !(1 << 30);
             }
+            GAMADDR if self.gen == Gen::Bcm2835 => { self.gam_addr = v; self.hvs[o / 4] = v; }
+            GAMDATA if self.gen == Gen::Bcm2835 => {
+                let a = (self.gam_addr & 0xfff) as usize;
+                if let Some(g) = self.gamma.get_mut(a) { *g = v; }
+                if self.gam_addr & (1 << 31) != 0 { self.gam_addr = (self.gam_addr & !0xfff) | ((a as u32 + 1) & 0xfff); }
+            }
             o if o < HVS_SIZE as usize => self.hvs[o / 4] = v,
             _ => {}
         }
     }
 
-    // ------------------------------------------------------------------ pixel valve 2
+    // ------------------------------------------------------------------ pixel valves
 
-    fn pv_running(&self) -> bool { self.pv[PV_CONTROL / 4] & 1 != 0 && self.pv[PV_V_CONTROL / 4] & 1 != 0 }
+    fn pv_running(&self, n: usize) -> bool { self.pv[n][PV_CONTROL / 4] & 1 != 0 && self.pv[n][PV_V_CONTROL / 4] & 1 != 0 }
 
-    pub fn pv_read(&self, off: u64) -> u32 { self.pv[(off as usize / 4) & 63] }
+    /// Pixel valve 2's registers (the BCM2711's only one).
+    pub fn pv_read(&self, off: u64) -> u32 { self.pv_read_n(2, off) }
+    pub fn pv_write(&mut self, off: u64, v: u32) { self.pv_write_n(2, off, v) }
 
-    pub fn pv_write(&mut self, off: u64, v: u32) {
+    pub fn pv_read_n(&self, n: usize, off: u64) -> u32 { self.pv[n][(off as usize / 4) & 63] }
+
+    pub fn pv_write_n(&mut self, n: usize, off: u64, v: u32) {
         let r = (off as usize / 4) & 63;
-        if self.trace { eprintln!("[pv2] {:#x} <- {v:#x}", r * 4); }
+        if self.trace { eprintln!("[pv{n}] {:#x} <- {v:#x}", r * 4); }
+        let pv = &mut self.pv[n];
         match r * 4 {
-            PV_INTSTAT => self.pv[r] &= !v,
-            PV_CONTROL => self.pv[r] = v & !(1 << 1), // FIFO_CLR self-clears
-            _ => self.pv[r] = v,
+            PV_INTSTAT => pv[r] &= !v,
+            PV_CONTROL => pv[r] = v & !(1 << 1), // FIFO_CLR self-clears
+            _ => pv[r] = v,
         }
     }
 
-    pub fn irq_pv(&self) -> bool { self.pv[PV_INTSTAT / 4] & self.pv[PV_INTEN / 4] != 0 }
+    /// Pixel valve 2's interrupt.
+    pub fn irq_pv(&self) -> bool { self.irq_pv_n(2) }
+    pub fn irq_pv_n(&self, n: usize) -> bool { self.pv[n][PV_INTSTAT / 4] & self.pv[n][PV_INTEN / 4] != 0 }
 
     /// The HVS interrupt: an end of frame on a channel whose EOF interrupt is enabled
-    /// (DISPCTRL DSPEIEOF, bit 7 + 4 * channel on the BCM2711's HVS). Linux uses it to free the
-    /// display-list memory of frames that are no longer shown.
+    /// (DISPCTRL DSPEIEOF: bit 7 + 4 * channel on the BCM2711's HVS, 7 + 2 * channel on the
+    /// BCM2835's). Linux uses it to free the display-list memory of frames no longer shown.
     pub fn irq_hvs(&self) -> bool { self.eof_enabled() & self.eof != 0 }
 
     fn eof_enabled(&self) -> u32 {
         let c = self.hvs[DISPCTRL / 4];
-        (0..3).filter(|ch| c & (1 << (7 + 4 * ch)) != 0).fold(0, |m, ch| m | 1 << (8 + 8 * ch))
+        let step = match self.gen { Gen::Bcm2711 => 4, Gen::Bcm2835 => 2 };
+        (0..3).filter(|ch| c & (1 << (7 + step * ch)) != 0).fold(0, |m, ch| m | 1 << (8 + 8 * ch))
     }
 
-    /// Guest time passes: vblanks while the pixel valve runs.
-    pub fn tick(&mut self, now: u64) {
-        if !self.pv_running() { self.next_vblank = now + FRAME_NS; return; }
-        if now < self.next_vblank { return; }
-        let n = (now - self.next_vblank) / FRAME_NS + 1;
-        self.next_vblank += n * FRAME_NS;
-        self.frames += n;
-        // a new frame starts: each channel takes the display list it was given
-        for ch in 0..3 {
-            if self.hvs[(DISPCTRL0 + 0x10 * ch) / 4] & (1 << 31) != 0 {
-                self.hvs[(DISPLACT0 + 4 * ch) / 4] = self.hvs[(DISPLIST0 + 4 * ch) / 4];
-                self.frcnt[ch] = self.frcnt[ch].wrapping_add(n as u32);
-                self.eof |= 1 << (8 + 8 * ch);
-            }
+    /// The pixel valves that run, with the HVS channels they start frames on.
+    fn valves(&self) -> Vec<(usize, Vec<usize>)> {
+        match self.gen {
+            // PV2 starts a frame on every channel (one display, as before)
+            Gen::Bcm2711 => if self.pv_running(2) { vec![(2, vec![0, 1, 2])] } else { vec![] },
+            Gen::Bcm2835 => (0..3).filter(|&n| self.pv_running(n)).map(|n| (n, vec![PV_CHANNEL_2835[n]])).collect(),
         }
-        self.pv[PV_INTSTAT / 4] |= PV_INT_VFP_START;
     }
 
-    /// The next vblank, while the driver wants vblank interrupts.
+    /// A pixel valve's frame time (ns): the BCM2711's at 60 Hz; the BCM2835's from the mode it
+    /// was given (its timings) and the pixel clock (PV2, HDMI), else 60 Hz.
+    fn frame_ns(&self, n: usize) -> u64 {
+        if self.gen == Gen::Bcm2711 || n != 2 || self.pixel_hz == 0 { return FRAME_NS; }
+        let p = &self.pv[n];
+        let f = |r: usize| (p[r / 4] >> 16) as u64 + (p[r / 4] & 0xffff) as u64;
+        let (ht, vt) = (f(PV_HORZA) + f(PV_HORZB), f(PV_VERTA) + f(PV_VERTB));
+        let t = ht * vt * 1_000_000_000 / self.pixel_hz;
+        if (1_000_000..=200_000_000).contains(&t) { t } else { FRAME_NS }
+    }
+
+    /// Guest time passes: vblanks while the pixel valves run, CEC traffic.
+    pub fn tick(&mut self, now: u64) {
+        self.now = now;
+        if self.gen == Gen::Bcm2835 { self.cec_tick(now); }
+        for n in 0..3 {
+            if !self.pv_running(n) { self.next_vblank[n] = now + self.frame_ns(n); }
+        }
+        for (n, chans) in self.valves() {
+            if now < self.next_vblank[n] { continue; }
+            let frame = self.frame_ns(n);
+            let k = (now - self.next_vblank[n]) / frame + 1;
+            self.next_vblank[n] += k * frame;
+            if n == 2 { self.frames += k; }
+            // a new frame starts: each channel takes the display list it was given
+            for ch in chans {
+                if self.chan_on(ch) {
+                    self.hvs[(DISPLACT0 + 4 * ch) / 4] = self.hvs[(DISPLIST0 + 4 * ch) / 4];
+                    self.frcnt[ch] = self.frcnt[ch].wrapping_add(k as u32);
+                    self.eof |= 1 << (8 + 8 * ch);
+                }
+            }
+            self.pv[n][PV_INTSTAT / 4] |= PV_INT_VFP_START;
+        }
+    }
+
+    /// The next vblank the driver waits for, and CEC traffic due.
     pub fn next_event(&self) -> Option<u64> {
-        (self.pv_running() && (self.pv[PV_INTEN / 4] & PV_INT_VFP_START != 0 || self.eof_enabled() != 0)).then_some(self.next_vblank)
+        let eof = self.eof_enabled() != 0;
+        let vb = self.valves().into_iter().filter(|(n, _)| self.pv[*n][PV_INTEN / 4] & PV_INT_VFP_START != 0 || eof).map(|(n, _)| self.next_vblank[n]).min();
+        let cec = (self.gen == Gen::Bcm2835 && !self.cec.rx.is_empty()).then_some(self.cec.rx_at.max(self.now + 1));
+        [vb, cec].into_iter().flatten().min()
     }
 
-    // ------------------------------------------------------------------ HDMI0, DVP, DDC
+    // ------------------------------------------------------------------ HDMI0, DVP, DDC (BCM2711)
 
     pub fn win_read(&mut self, off: u64) -> u32 {
         let o = off as usize & !3;
@@ -225,43 +447,134 @@ impl Vc4 {
         if o == BSC + 0x2c { self.bsc_go(v); }
     }
 
+    // ------------------------------------------------------------------ the BCM2835 HDMI block
+
+    pub fn hdmi_read(&mut self, off: u64) -> u32 {
+        let o = off as usize & !3;
+        let w = |o: usize| self.win.get(o / 4).copied().unwrap_or(0);
+        let r = match o {
+            0x000 => 0x0000_0001, // CORE_REV
+            H_HOTPLUG => self.connected as u32,
+            H_RAM_PACKET_STATUS => w(H_RAM_PACKET_CONFIG) & 0xffff,
+            H_FIFO_CTL => w(o) | if w(o) & (1 << 6) != 0 { 1 << 14 } else { 0 }, // RECENTER_DONE
+            H_SCHEDULER_CONTROL => (w(o) & !2) | (w(o) & 1) << 1, // HDMI_ACTIVE follows MODE_HDMI
+            _ => w(o),
+        };
+        if self.trace { eprintln!("[hdmi] read {o:#x} = {r:#x}"); }
+        r
+    }
+
+    pub fn hdmi_write(&mut self, off: u64, v: u32) {
+        let o = off as usize & !3;
+        if self.trace { eprintln!("[hdmi] {o:#x} <- {v:#x}"); }
+        if o >= self.win.len() * 4 { return; }
+        match o {
+            H_CPU_SET => self.win[H_CPU_STATUS / 4] |= v,
+            H_CPU_CLEAR => self.win[H_CPU_STATUS / 4] &= !v,
+            H_CPU_MASK_SET => self.win[H_CPU_MASK_STATUS / 4] |= v,
+            H_CPU_MASK_CLEAR => self.win[H_CPU_MASK_STATUS / 4] &= !v,
+            H_CPU_STATUS | H_CPU_MASK_STATUS => {}
+            H_CEC_CNTRL_1 => self.cec_cntrl1(v),
+            H_CEC_CNTRL_5 => {
+                if v & CEC_RX_SW_RESET != 0 { self.win[o / 4] &= !CEC_RX_CEC_INT; }
+                self.win[o / 4] = (v & !CEC_RX_CEC_INT) | (self.win[o / 4] & CEC_RX_CEC_INT);
+            }
+            _ => self.win[o / 4] = v,
+        }
+    }
+
+    /// The HDMI block's interrupt (the CEC controller's, through the CPU status and mask).
+    pub fn irq_hdmi(&self) -> bool {
+        self.gen == Gen::Bcm2835 && self.win[H_CPU_STATUS / 4] & !self.win[H_CPU_MASK_STATUS / 4] & CPU_CEC != 0
+    }
+
+    /// CEC_CNTRL_1: START_XMIT_BEGIN sends the message in TX_DATA; CLEAR_RECEIVE_OFF frees the
+    /// receiver for the next message.
+    fn cec_cntrl1(&mut self, v: u32) {
+        let old = self.win[H_CEC_CNTRL_1 / 4];
+        // the status bits are the controller's
+        const STATUS: u32 = CEC_TX_EOM | CEC_TX_STATUS_GOOD | CEC_RX_EOM | CEC_RX_STATUS_GOOD | (0xf << 24);
+        let mut n = (v & !STATUS) | (old & STATUS);
+        if v & CEC_CLEAR_RECEIVE_OFF != 0 {
+            n &= !(CEC_RX_EOM | CEC_RX_STATUS_GOOD | (0xf << 24));
+            self.win[H_CEC_CNTRL_5 / 4] &= !CEC_RX_CEC_INT;
+        }
+        if v & CEC_START_XMIT_BEGIN != 0 && old & CEC_START_XMIT_BEGIN == 0 && self.win[H_CEC_CNTRL_5 / 4] & CEC_TX_SW_RESET == 0 {
+            let len = (((v >> 16) & 0xf) + 1) as usize;
+            let msg: Vec<u8> = (0..len).map(|i| (self.win[H_CEC_TX_DATA_1 / 4 + i / 4] >> (8 * (i % 4))) as u8).collect();
+            let ack = self.cec.sent(&msg, self.now);
+            n = (n & !CEC_TX_STATUS_GOOD) | CEC_TX_EOM | if ack { CEC_TX_STATUS_GOOD } else { 0 };
+            // the transmit-done interrupt (RX_CEC_INT clear says it is not a reception)
+            self.win[H_CEC_CNTRL_5 / 4] &= !CEC_RX_CEC_INT;
+            self.win[H_CPU_STATUS / 4] |= CPU_CEC;
+        }
+        self.win[H_CEC_CNTRL_1 / 4] = n;
+    }
+
+    /// The TV's next message reaches the receiver once it is free and the controller is idle.
+    fn cec_tick(&mut self, now: u64) {
+        if self.cec.rx.is_empty() || now < self.cec.rx_at { return; }
+        let c5 = self.win[H_CEC_CNTRL_5 / 4];
+        if self.win[H_CPU_STATUS / 4] & CPU_CEC != 0 || c5 & (CEC_RX_CEC_INT | CEC_RX_SW_RESET) != 0 { return; }
+        if self.win[H_CEC_CNTRL_1 / 4] & CEC_START_XMIT_BEGIN != 0 { return; }
+        let msg = self.cec.rx.pop_front().unwrap();
+        let hex: Vec<String> = msg.iter().map(|b| format!("{b:02x}")).collect();
+        self.cec.log.push(format!("{:x}->{:x}: {}", msg[0] >> 4, msg[0] & 0xf, hex.join(":")));
+        for k in 0..4 {
+            let w = (0..4).fold(0u32, |a, b| a | (msg.get(4 * k + b).copied().unwrap_or(0) as u32) << (8 * b));
+            self.win[H_CEC_RX_DATA_1 / 4 + k] = w;
+        }
+        let c1 = self.win[H_CEC_CNTRL_1 / 4] & !(0xf << 24);
+        self.win[H_CEC_CNTRL_1 / 4] = c1 | ((msg.len() as u32 - 1) << 24) | CEC_RX_EOM | CEC_RX_STATUS_GOOD;
+        self.win[H_CEC_CNTRL_5 / 4] |= CEC_RX_CEC_INT;
+        self.win[H_CPU_STATUS / 4] |= CPU_CEC;
+        self.cec.rx_at = now + CEC_REPLY_NS;
+    }
+
+    // ------------------------------------------------------------------ TXP, HD
+
     pub fn txp_read(&self, off: u64) -> u32 { self.txp[(off as usize / 4) & 7] }
     pub fn txp_write(&mut self, off: u64, v: u32) { self.txp[(off as usize / 4) & 7] = v & !(1 << 31); } // TXP_BUSY never set
 
+    /// The "hd" block's MAI registers: control, data, sample-rate divider.
+    fn mai_regs(&self) -> (usize, usize, usize) {
+        match self.gen { Gen::Bcm2711 => (0x10, 0x1c, 0x20), Gen::Bcm2835 => (0x14, 0x20, 0x2c) }
+    }
+
     pub fn hd_read(&self, off: u64) -> u32 {
         let r = (off as usize / 4) & 63;
-        match r * 4 {
-            0x10 => self.hd[r] | 1 << 10, // MAI_CTL: the FIFO drains as fast as it is filled (EMPTY)
-            _ => self.hd[r],
-        }
+        if r * 4 == self.mai_regs().0 { return self.hd[r] | 1 << 10; } // MAI_CTL: the FIFO drains as fast as it is filled (EMPTY)
+        self.hd[r]
     }
     pub fn hd_write(&mut self, off: u64, v: u32) {
         let r = (off as usize / 4) & 63;
-        match r * 4 {
-            0x10 => {
-                // MAI_CTL: RESET and FLUSH self-clear (and restart the channel order); error bits are W1C
-                if v & (1 | 1 << 9) != 0 { self.mai_ch = 0; }
-                self.hd[r] = v & !(1 | 1 << 9 | 1 << 1 | 1 << 2 | 1 << 15);
-            }
-            0x1c => self.mai_push(v),
-            _ => self.hd[r] = v,
+        let (ctl, data, _) = self.mai_regs();
+        if r * 4 == ctl {
+            // MAI_CTL: RESET and FLUSH self-clear (and restart the channel order); error bits are W1C
+            if v & (1 | 1 << 9) != 0 { self.mai_ch = 0; }
+            self.hd[r] = v & !(1 | 1 << 9 | 1 << 1 | 1 << 2 | 1 << 15);
+        } else if r * 4 == data {
+            self.mai_push(v);
+        } else {
+            self.hd[r] = v;
         }
     }
 
     // ------------------------------------------------------------------ HDMI audio
 
-    fn mai_channels(&self) -> u32 { ((self.hd[0x10 / 4] >> 4) & 0xf).max(1) }
+    fn mai_ctl(&self) -> u32 { self.hd[self.mai_regs().0 / 4] }
+    fn mai_channels(&self) -> u32 { ((self.mai_ctl() >> 4) & 0xf).max(1) }
 
     /// The audio sample rate: the audio clock * (M + 1) / N (MAI_SMP).
     pub fn mai_rate(&self) -> u32 {
-        let smp = self.hd[0x20 / 4];
+        let smp = self.hd[self.mai_regs().2 / 4];
         let (n, m) = ((smp >> 8) as u64, (smp & 0xff) as u64 + 1);
-        if n == 0 { 0 } else { (AUDIO_CLK_HZ * m / n) as u32 }
+        if n == 0 { 0 } else { (self.audio_clk_hz * m / n) as u32 }
     }
 
-    /// Words the MAI FIFO takes from the DMA engine between the last call and `now` (DREQ 10).
+    /// Words the MAI FIFO takes from the DMA engine between the last call and `now` (its DREQ).
     pub fn mai_demand(&mut self, now: u64) -> u64 {
-        let on = self.hd[0x10 / 4] & (1 << 3) != 0;
+        let on = self.mai_ctl() & (1 << 3) != 0;
         let rate = self.mai_rate() as u64;
         if !on || rate == 0 { self.mai_played_to = now; self.mai_frac = 0; return 0; }
         if now <= self.mai_played_to { return 0; }
@@ -277,7 +590,7 @@ impl Vc4 {
     /// preamble in bits 3:0 tells the channels apart (Y = 0x4: the second, right channel;
     /// X = 0x2 and Z = 0x8, a block start: the first).
     pub fn mai_push(&mut self, w: u32) {
-        if self.hd[0x10 / 4] & (1 << 3) == 0 { return; }
+        if self.mai_ctl() & (1 << 3) == 0 { return; }
         let s = (w >> 12) as u16 as i16;
         let ch = match w & 0xf { 0x4 => 1, 0x2 | 0x8 => 0, _ => self.mai_ch };
         self.mai_ch = (ch + 1) % self.mai_channels();
@@ -326,22 +639,24 @@ impl Vc4 {
 
     // ------------------------------------------------------------------ the picture
 
-    /// The channel shown on HDMI0: the enabled one (its size from DISPCTRLx).
+    /// The channel shown on HDMI: on the BCM2711 the enabled one, on the BCM2835 the one pixel
+    /// valve 2 reads (channel 1); its size from DISPCTRLx.
     fn shown(&self) -> Option<(usize, u32, u32)> {
-        if !self.pv_running() || self.hvs[DISPCTRL / 4] & (1 << 31) == 0 { return None; }
-        (0..3).find_map(|ch| {
+        if !self.pv_running(2) || self.hvs[DISPCTRL / 4] & (1 << 31) == 0 { return None; }
+        let chans: &[usize] = match self.gen { Gen::Bcm2711 => &[0, 1, 2], Gen::Bcm2835 => &[1] };
+        chans.iter().find_map(|&ch| {
             let c = self.hvs[(DISPCTRL0 + 0x10 * ch) / 4];
-            let (w, h) = ((c >> 16) & 0x1fff, c & 0x1fff);
+            let (w, h) = self.chan_size(c);
             (c & (1 << 31) != 0 && w > 0 && h > 0).then_some((ch, w, h))
         })
     }
 
     pub fn active(&self) -> bool { self.shown().is_some() }
 
-    /// The mode on HDMI0, while the pipeline runs.
+    /// The mode on HDMI, while the pipeline runs.
     pub fn size(&self) -> Option<(u32, u32)> { self.shown().map(|(_, w, h)| (w, h)) }
 
-    /// Compose the planes of the channel shown on HDMI0 into RGBA; None if HDMI shows nothing.
+    /// Compose the planes of the channel shown on HDMI into RGBA; None if HDMI shows nothing.
     pub fn render(&self, ram: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
         let (ch, w, h) = self.shown()?;
         let (wu, hu) = (w as usize, h as usize);
@@ -355,52 +670,112 @@ impl Vc4 {
         } else {
             for p in out.chunks_mut(4) { p[3] = 255; }
         }
+        let base = self.dlist_base() / 4;
         let mut i = (self.hvs[(DISPLACT0 + 4 * ch) / 4] as usize) & 0xfff;
-        let dl = |k: usize| self.hvs.get(DLIST / 4 + k).copied().unwrap_or(1 << 31);
+        let dl = |k: usize| if base + k < self.hvs.len() { self.hvs[base + k] } else { 1 << 31 };
         for n in 0..64 {
             let ctl0 = dl(i);
             if ctl0 & (1 << 31) != 0 || ctl0 & (1 << 30) == 0 { break; } // end of list
             let size = ((ctl0 >> 24) & 0x3f) as usize;
             if size == 0 { break; }
-            self.draw_plane(ram, &|k| dl(i + k), ctl0, n == 0, out, wu, hu);
+            if let Some(p) = self.decode_plane(&|k| dl(i + k), ctl0) { self.draw_plane(ram, &p, n == 0, out, wu, hu); }
             i += size;
+        }
+        // the BCM2835's gamma, when the channel has it on (the LUT the driver loaded)
+        if self.gen == Gen::Bcm2835 && bk & (1 << 29) != 0 {
+            let lut = &self.gamma[ch * 768..ch * 768 + 768];
+            for p in out.chunks_mut(4) {
+                for c in 0..3 { p[c] = lut[c * 256 + p[c] as usize].min(255) as u8; }
+            }
         }
         Some((w, h))
     }
 
-    /// One plane entry (HVS5 layout), RGB formats, nearest-neighbour scaling. The bottom plane
-    /// is opaque; planes above it blend with their per-pixel alpha (the cursor).
-    fn draw_plane(&self, ram: &[u8], e: &dyn Fn(usize) -> u32, ctl0: u32, bottom: bool, out: &mut [u8], w: usize, h: usize) {
-        let fmt = ctl0 & 0x1f; // SCALER5_CTL0_PIXEL_FORMAT: 5 bits on the HVS5
+    /// One display-list plane entry in this generation's layout.
+    fn decode_plane(&self, e: &dyn Fn(usize) -> u32, ctl0: u32) -> Option<Plane> {
         let order = (ctl0 >> 13) & 3;
-        let unity = ctl0 & (1 << 15) != 0;
         let tiling = (ctl0 >> 20) & 3;
+        let mut p = Plane { ctl0, order, tiling, ..Default::default() };
+        let mut k;
+        match self.gen {
+            Gen::Bcm2711 => {
+                p.fmt = ctl0 & 0x1f; // SCALER5_CTL0_PIXEL_FORMAT: 5 bits on the HVS5
+                p.unity = ctl0 & (1 << 15) != 0;
+                let pos0 = e(1);
+                (p.x0, p.y0) = ((pos0 & 0xfff) as usize, ((pos0 >> 16) & 0xfff) as usize);
+                k = 3; // control word 2 at 2
+                if !p.unity { let p1 = e(k); (p.dw, p.dh) = ((p1 & 0x1fff) as usize, ((p1 >> 16) & 0x1fff) as usize); k += 1; }
+                let pos2 = e(k);
+                (p.sw, p.sh) = ((pos2 & 0x1fff) as usize, ((pos2 >> 16) & 0x1fff) as usize);
+                // per-pixel alpha above the bottom plane, as before
+                p.alpha_mode = 0;
+                p.fixed_alpha = 255;
+                p.opaque_bottom = true;
+            }
+            Gen::Bcm2835 => {
+                p.fmt = ctl0 & 0xf;
+                p.unity = ctl0 & (1 << 4) != 0;
+                p.hflip = ctl0 & (1 << 16) != 0;
+                p.vflip = ctl0 & (1 << 15) != 0;
+                // the BCM2835's ABGR/ARGB orders are the HVS5's swapped (XRGB8888 is ABGR here)
+                if matches!(p.fmt, 1 | 3 | 7) && p.order >= 2 { p.order ^= 1; }
+                let pos0 = e(1);
+                (p.x0, p.y0) = ((pos0 & 0xfff) as usize, ((pos0 >> 12) & 0xfff) as usize);
+                p.fixed_alpha = (pos0 >> 24) as u8;
+                k = 2;
+                if !p.unity { let p1 = e(k); (p.dw, p.dh) = ((p1 & 0xfff) as usize, ((p1 >> 16) & 0xfff) as usize); k += 1; }
+                let pos2 = e(k);
+                (p.sw, p.sh) = ((pos2 & 0xfff) as usize, ((pos2 >> 16) & 0xfff) as usize);
+                p.alpha_mode = pos2 >> 30;
+                p.premult = pos2 & (1 << 29) != 0;
+                p.mix = pos2 & (1 << 28) != 0;
+            }
+        }
+        if p.unity { (p.dw, p.dh) = (p.sw, p.sh); }
+        // pointers (one per plane of the format), their context words, the pitches
+        let planes = match p.fmt { 8 | 10 => 3, 9 | 11 => 2, _ => 1 };
+        let mask = if self.gen == Gen::Bcm2835 { 0x3fff_ffff } else { u32::MAX }; // the bus alias
+        for j in 0..planes {
+            p.ptr[j] = (e(k + 2 + j) & mask) as usize;
+            p.pitch[j] = e(k + 2 + 2 * planes + j);
+        }
+        p.planes = planes;
+        if planes > 1 {
+            let c = k + 2 + 3 * planes;
+            p.csc = [e(c), e(c + 1), e(c + 2)];
+        }
+        Some(p)
+    }
+
+    /// Draw one plane: RGB and YUV formats, linear or (RGB) T-tiled, nearest-neighbour scaling,
+    /// alpha as the plane's mode says.
+    fn draw_plane(&self, ram: &[u8], p: &Plane, bottom: bool, out: &mut [u8], w: usize, h: usize) {
+        let (fmt, order, tiling, ctl0) = (p.fmt, p.order, p.tiling, p.ctl0);
         let skip = |why: &str| {
             // each kind of plane the model cannot show, once
             thread_local! { static SEEN: std::cell::RefCell<Vec<u32>> = Default::default(); }
-            let key = ctl0 & 0x0030_e00f;
+            let key = ctl0 & 0x0030_e01f;
             if SEEN.with(|s| { let mut s = s.borrow_mut(); let new = !s.contains(&key); if new { s.push(key); } new }) {
-                eprintln!("[vc4] HVS plane not shown ({why}): ctl0={ctl0:#010x} format {} order {} tiling {}", ctl0 & 0xf, (ctl0 >> 13) & 3, (ctl0 >> 20) & 3);
+                eprintln!("[vc4] HVS plane not shown ({why}): ctl0={ctl0:#010x} format {fmt} order {order} tiling {tiling}");
             }
         };
         if tiling != 0 && tiling != 3 { return skip("64/128/256-byte tiling"); }
-        let pos0 = e(1);
-        let (x0, y0) = ((pos0 & 0xfff) as usize, ((pos0 >> 16) & 0xfff) as usize);
-        let mut k = 3; // control word 2 at 2
-        let (mut sw, mut sh) = (0usize, 0usize);
-        if !unity { let p1 = e(k); sw = (p1 & 0x1fff) as usize; sh = ((p1 >> 16) & 0x1fff) as usize; k += 1; }
-        let pos2 = e(k);
-        let (pw, ph) = ((pos2 & 0x1fff) as usize, ((pos2 >> 16) & 0x1fff) as usize);
-        let ptr = e(k + 2) as usize;
-        let pitch0 = e(k + 4);
+        let (x0, y0, dw, dh, pw, ph) = (p.x0, p.y0, p.dw.max(1), p.dh.max(1), p.sw, p.sh);
+        if pw == 0 || ph == 0 { return; }
+        if p.planes > 1 {
+            if tiling != 0 { return skip("tiled YUV"); }
+            return self.draw_yuv(ram, p, out, w, h);
+        }
+        let ptr = p.ptr[0];
+        let pitch0 = p.pitch[0];
         let pitch = (pitch0 & 0xffff) as usize;
-        let (dw, dh) = if unity { (pw, ph) } else { (sw.max(1), sh.max(1)) };
-        let bpp = match fmt { 4 | 1 | 2 | 3 => 2, 5 => 3, 7 | 16 => 4, _ => return skip("pixel format") };
-        // T-tiled (DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED, what GNOME's compositor scans out): the
-        // pointer was advanced to the source origin; undo that to the start of its even row of
-        // 4 KiB tiles and address source pixels from there (vc4_plane.c, Mesa's vc4_tiling.c)
+        let bpp = match fmt { 0 => 1, 1..=4 => 2, 5 => 3, 7 | 16 => 4, _ => return skip("pixel format") };
+        // T-tiled (DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED, what GNOME's compositor and Mesa's vc4
+        // scan out): the pointer was advanced to the source origin; undo that to the start of its
+        // even row of 4 KiB tiles and address source pixels from there (vc4_plane.c, Mesa's
+        // vc4_tiling.c)
         let t = (tiling == 3).then(|| {
-            if bpp == 3 { return None; }
+            if bpp != 2 && bpp != 4 { return None; }
             let tw_px = if bpp == 2 { 64 } else { 32 };
             let (x_off, y_off) = ((pitch0 >> 26) as usize, ((pitch0 >> 8) & 63) as usize);
             let (tiles_l, tiles_r) = (((pitch0 >> 16) & 0x7f) as usize, (pitch0 & 0x7f) as usize);
@@ -414,79 +789,261 @@ impl Vc4 {
             Some((base, tiles_l * tw_px + x_off, y_off, tiles_w))
         }).flatten();
         if tiling == 3 && t.is_none() { return skip("T-tiled layout"); }
-        let addr = |sx: usize, sy: usize| -> usize {
-            match t {
+        let addr = |sx: usize, sy: usize| -> Option<usize> {
+            Some(match t {
                 Some((base, ox, oy, tiles_w)) => base + t_format_offset(ox + sx, oy + sy, bpp, tiles_w),
+                None if p.vflip => ptr.checked_sub(sy * pitch)? + sx * bpp,
                 None => ptr + sy * pitch + sx * bpp,
-            }
+            })
         };
+        let has_alpha = matches!(fmt, 1 | 3 | 7 | 16);
         for dy in 0..dh {
             let y = y0 + dy;
             if y >= h { break; }
-            let sy = if unity { dy } else { dy * ph / dh };
+            let sy = dy * ph / dh;
             for dx in 0..dw {
                 let x = x0 + dx;
                 if x >= w { break; }
-                let sx = if unity { dx } else { dx * pw / dw };
-                let a0 = addr(sx, sy);
-                let Some(p) = ram.get(a0..a0 + bpp) else { continue };
-                let (r, g, b, a) = match (fmt, order) {
-                    (7, 2) => (p[2], p[1], p[0], p[3]), // ARGB/XRGB8888: B, G, R, A in memory
-                    (7, 3) => (p[0], p[1], p[2], p[3]), // ABGR/XBGR8888
-                    (7, 0) => (p[3], p[2], p[1], p[0]),
-                    (7, _) => (p[1], p[2], p[3], p[0]),
-                    (16, _) => {
-                        // XRGB/ARGB2101010 (order ARGB) or XBGR/ABGR2101010: 10 bits a channel,
-                        // GNOME's choice when the display takes 30-bit colour
-                        let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                        let (hi, mid, lo) = (((v >> 22) & 255) as u8, ((v >> 12) & 255) as u8, ((v >> 2) & 255) as u8);
-                        let a = ((v >> 30) * 85) as u8;
-                        if order == 3 { (lo, mid, hi, a) } else { (hi, mid, lo, a) }
-                    }
-                    (5, 3) => (p[0], p[1], p[2], 255), // BGR888
-                    (5, _) => (p[2], p[1], p[0], 255), // RGB888
-                    (4, _) => {
-                        let v = u16::from_le_bytes([p[0], p[1]]);
-                        let (r5, g6, b5) = ((v >> 11) & 31, (v >> 5) & 63, v & 31);
-                        let (r, g, b) = (((r5 << 3) | (r5 >> 2)) as u8, ((g6 << 2) | (g6 >> 4)) as u8, ((b5 << 3) | (b5 >> 2)) as u8);
-                        if order == 3 { (b, g, r, 255) } else { (r, g, b, 255) }
-                    }
-                    _ => (0, 0, 0, 255),
-                };
+                let sx = dx * pw / dw;
+                let sx = if p.hflip { pw - 1 - sx } else { sx };
+                let Some(a0) = addr(sx, sy) else { continue };
+                let Some(px) = ram.get(a0..a0 + bpp) else { continue };
+                let (r, g, b, a) = rgb_pixel(fmt, order, px);
                 let o = (y * w + x) * 4;
-                if a == 255 || bottom || (fmt != 7 && fmt != 16) {
-                    out[o..o + 4].copy_from_slice(&[r, g, b, 255]);
+                blend(&mut out[o..o + 3], [r, g, b], a, p, bottom, has_alpha);
+            }
+        }
+    }
+
+    /// A plane in two (Y, CbCr) or three (Y, Cb, Cr) planes, 4:2:0 or 4:2:2, converted with the
+    /// display list's colour-space words.
+    fn draw_yuv(&self, ram: &[u8], p: &Plane, out: &mut [u8], w: usize, h: usize) {
+        let vsub = if matches!(p.fmt, 8 | 9) { 2 } else { 1 };
+        let pitch: [usize; 3] = std::array::from_fn(|j| (p.pitch[j] & 0xffff) as usize);
+        let csc = Csc::from_words(p.csc);
+        let swap = p.order & 1 != 0; // XYCRCB: Cr first
+        let (x0, y0, dw, dh, pw, ph) = (p.x0, p.y0, p.dw.max(1), p.dh.max(1), p.sw, p.sh);
+        for dy in 0..dh {
+            let y = y0 + dy;
+            if y >= h { break; }
+            let sy = dy * ph / dh;
+            let (ly, cy) = (sy, sy / vsub);
+            for dx in 0..dw {
+                let x = x0 + dx;
+                if x >= w { break; }
+                let sx = dx * pw / dw;
+                let cx = sx / 2;
+                let get = |a: usize| ram.get(a).copied();
+                let Some(yv) = get(p.ptr[0] + ly * pitch[0] + sx) else { continue };
+                let (c1, c2) = if p.planes == 2 {
+                    let a = p.ptr[1] + cy * pitch[1] + 2 * cx;
+                    (get(a).unwrap_or(128), get(a + 1).unwrap_or(128))
                 } else {
-                    let a = a as u32;
-                    for (c, s) in out[o..o + 3].iter_mut().zip([r, g, b]) { *c = ((s as u32 * a + *c as u32 * (255 - a)) / 255) as u8; }
-                }
+                    (get(p.ptr[1] + cy * pitch[1] + cx).unwrap_or(128), get(p.ptr[2] + cy * pitch[2] + cx).unwrap_or(128))
+                };
+                let (cb, cr) = if swap { (c2, c1) } else { (c1, c2) };
+                let o = (y * w + x) * 4;
+                let rgb = csc.convert(yv, cb, cr);
+                blend(&mut out[o..o + 3], rgb, 255, p, true, false);
             }
         }
     }
 
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
+        if self.gen == Gen::Bcm2835 { return self.save_2835(w); }
         // v2 adds the monitor's EDID, so a restore keeps the mode the guest chose from it
         w.tag("vc4-v2");
         for v in &self.hvs { w.u32(*v); }
         for v in self.frcnt { w.u32(v); }
-        for v in self.pv { w.u32(v); }
+        for v in self.pv[2] { w.u32(v); }
         for v in &self.win { w.u32(*v); }
         for v in self.hd { w.u32(v); }
-        w.u64(self.edid_ptr as u64); w.u64(self.next_vblank); w.bool(self.connected);
+        w.u64(self.edid_ptr as u64); w.u64(self.next_vblank[2]); w.bool(self.connected);
         w.u64(self.mai_played_to); w.u64(self.mai_frac); w.u32(self.mai_ch);
         w.bytes(&self.edid);
     }
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        if self.gen == Gen::Bcm2835 { return self.load_2835(r); }
         let v2 = match r.bytes()? { b"vc4-v2" => true, b"vc4-v1" => false, t => return Err(emu_core::snap::SnapError(format!("snapshot layout mismatch: expected vc4 state, found {}", String::from_utf8_lossy(t)))) };
         for v in self.hvs.iter_mut() { *v = r.u32()?; }
         for v in self.frcnt.iter_mut() { *v = r.u32()?; }
-        for v in self.pv.iter_mut() { *v = r.u32()?; }
+        for v in self.pv[2].iter_mut() { *v = r.u32()?; }
         for v in self.win.iter_mut() { *v = r.u32()?; }
         for v in self.hd.iter_mut() { *v = r.u32()?; }
-        self.edid_ptr = r.u64()? as usize; self.next_vblank = r.u64()?; self.connected = r.bool()?;
+        self.edid_ptr = r.u64()? as usize; self.next_vblank[2] = r.u64()?; self.connected = r.bool()?;
         self.mai_played_to = r.u64()?; self.mai_frac = r.u64()?; self.mai_ch = r.u32()?;
         if v2 { self.edid = r.bytes()?.to_vec(); }
         Ok(())
+    }
+
+    fn save_2835(&self, w: &mut emu_core::snap::W) {
+        w.tag("vc4-2835-v1");
+        for v in &self.hvs { w.u32(*v); }
+        for v in self.frcnt { w.u32(v); }
+        w.u32(self.eof);
+        for pv in &self.pv { for v in pv { w.u32(*v); } }
+        for v in &self.win { w.u32(*v); }
+        for v in self.hd { w.u32(v); }
+        for v in self.txp { w.u32(v); }
+        for v in self.next_vblank { w.u64(v); }
+        w.bool(self.connected);
+        w.u64(self.mai_played_to); w.u64(self.mai_frac); w.u32(self.mai_ch);
+        w.bytes(&self.edid);
+        for v in &self.gamma { w.u32(*v); }
+        w.u32(self.gam_addr);
+        w.u64(self.audio_clk_hz); w.u64(self.pixel_hz);
+        w.bool(self.cec.tv_on); w.u64(self.cec.rx_at);
+        w.u32(self.cec.rx.len() as u32);
+        for m in &self.cec.rx { w.bytes(m); }
+    }
+    fn load_2835(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+        r.tag("vc4-2835-v1")?;
+        for v in self.hvs.iter_mut() { *v = r.u32()?; }
+        for v in self.frcnt.iter_mut() { *v = r.u32()?; }
+        self.eof = r.u32()?;
+        for pv in self.pv.iter_mut() { for v in pv.iter_mut() { *v = r.u32()?; } }
+        for v in self.win.iter_mut() { *v = r.u32()?; }
+        for v in self.hd.iter_mut() { *v = r.u32()?; }
+        for v in self.txp.iter_mut() { *v = r.u32()?; }
+        for v in self.next_vblank.iter_mut() { *v = r.u64()?; }
+        self.connected = r.bool()?;
+        self.mai_played_to = r.u64()?; self.mai_frac = r.u64()?; self.mai_ch = r.u32()?;
+        self.edid = r.bytes()?.to_vec();
+        for v in self.gamma.iter_mut() { *v = r.u32()?; }
+        self.gam_addr = r.u32()?;
+        self.audio_clk_hz = r.u64()?; self.pixel_hz = r.u64()?;
+        self.cec.tv_on = r.bool()?; self.cec.rx_at = r.u64()?;
+        self.cec.rx.clear();
+        for _ in 0..r.u32()? { self.cec.rx.push_back(r.bytes()?.to_vec()); }
+        Ok(())
+    }
+}
+
+/// A display-list plane, decoded.
+#[derive(Default)]
+struct Plane {
+    ctl0: u32,
+    fmt: u32,
+    order: u32,
+    tiling: u32,
+    unity: bool,
+    hflip: bool,
+    vflip: bool,
+    /// position on the screen, size there, size in the source
+    x0: usize,
+    y0: usize,
+    dw: usize,
+    dh: usize,
+    sw: usize,
+    sh: usize,
+    planes: usize,
+    ptr: [usize; 3],
+    pitch: [u32; 3],
+    csc: [u32; 3],
+    /// the BCM2835's POS2 alpha mode (0 per pixel, 1 fixed), premultiplied, plane alpha mixed in
+    alpha_mode: u32,
+    premult: bool,
+    mix: bool,
+    fixed_alpha: u8,
+    /// the BCM2711 model's rule: the bottom plane is opaque
+    opaque_bottom: bool,
+}
+
+/// One RGB pixel of format `fmt` in `order` (the HVS5's meaning: 2 = ARGB, 3 = ABGR, 0 = RGBA,
+/// 1 = BGRA from the most significant bits down; XRGB/XBGR for the formats without alpha).
+fn rgb_pixel(fmt: u32, order: u32, p: &[u8]) -> (u8, u8, u8, u8) {
+    // a field widened to 8 bits: its top bits repeated below it (as the HVS's RGBA_EXPAND_ROUND
+    // and the BCM2711 model's 565 decode), or scaled for fields narrower than 4 bits
+    let x = |v: u32, bits: u32| -> u8 {
+        let v = v & ((1 << bits) - 1);
+        if bits >= 4 { ((v << (8 - bits)) | (v >> (2 * bits - 8))) as u8 } else { (v * 255 / ((1 << bits) - 1)) as u8 }
+    };
+    // a word with four fields of widths [a, r, g, b] in `order`
+    let quad = |v: u32, wa: u32, wc: u32| -> (u8, u8, u8, u8) {
+        let f = |k: u32| (v >> (k * wc)) & ((1 << wc) - 1); // k-th colour field from the LSB
+        match order {
+            2 => { let a = v >> (3 * wc); (x(f(2), wc), x(f(1), wc), x(f(0), wc), x(a, wa)) }   // A R G B
+            3 => { let a = v >> (3 * wc); (x(f(0), wc), x(f(1), wc), x(f(2), wc), x(a, wa)) }   // A B G R
+            0 => { let a = v & ((1 << wa) - 1); let c = v >> wa; (x(c >> (2 * wc), wc), x(c >> wc, wc), x(c, wc), x(a, wa)) } // R G B A
+            _ => { let a = v & ((1 << wa) - 1); let c = v >> wa; (x(c, wc), x(c >> wc, wc), x(c >> (2 * wc), wc), x(a, wa)) } // B G R A
+        }
+    };
+    match fmt {
+        7 => match order {
+            2 => (p[2], p[1], p[0], p[3]), // ARGB/XRGB8888: B, G, R, A in memory
+            3 => (p[0], p[1], p[2], p[3]), // ABGR/XBGR8888
+            0 => (p[3], p[2], p[1], p[0]),
+            _ => (p[1], p[2], p[3], p[0]),
+        },
+        16 => {
+            // XRGB/ARGB2101010 (order ARGB) or XBGR/ABGR2101010: 10 bits a channel,
+            // GNOME's choice when the display takes 30-bit colour
+            let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+            let (hi, mid, lo) = (((v >> 22) & 255) as u8, ((v >> 12) & 255) as u8, ((v >> 2) & 255) as u8);
+            let a = ((v >> 30) * 85) as u8;
+            if order == 3 { (lo, mid, hi, a) } else { (hi, mid, lo, a) }
+        }
+        5 => if order == 3 { (p[0], p[1], p[2], 255) } else { (p[2], p[1], p[0], 255) }, // BGR888 / RGB888
+        4 => {
+            let v = u16::from_le_bytes([p[0], p[1]]) as u32;
+            let (r, g, b) = (x(v >> 11, 5), x(v >> 5, 6), x(v, 5));
+            if order == 3 { (b, g, r, 255) } else { (r, g, b, 255) }
+        }
+        3 => quad(u16::from_le_bytes([p[0], p[1]]) as u32, 1, 5), // 5551
+        1 => quad(u16::from_le_bytes([p[0], p[1]]) as u32, 4, 4), // 4444
+        2 => { let v = u16::from_le_bytes([p[0], p[1]]) as u32; let (r, g, b) = (x(v >> 10, 5), x(v >> 5, 5), x(v, 5)); if order == 3 { (b, g, r, 255) } else { (r, g, b, 255) } }
+        0 => { let v = p[0] as u32; (x(v >> 5, 3), x(v >> 2, 3), x(v, 2), 255) }
+        _ => (0, 0, 0, 255),
+    }
+}
+
+/// Put a source pixel over what is below it, as the plane's alpha mode says.
+fn blend(dst: &mut [u8], src: [u8; 3], a: u8, p: &Plane, bottom: bool, has_alpha: bool) {
+    if p.opaque_bottom {
+        // the BCM2711 model: the bottom plane is opaque; planes above it blend with their
+        // per-pixel alpha (the cursor)
+        if a == 255 || bottom || !has_alpha { dst.copy_from_slice(&src); return; }
+        let a = a as u32;
+        for (c, s) in dst.iter_mut().zip(src) { *c = ((s as u32 * a + *c as u32 * (255 - a)) / 255) as u8; }
+        return;
+    }
+    // the BCM2835: fixed alpha, or per-pixel alpha (times the plane's when mixed)
+    let mut a = if p.alpha_mode == 1 || !has_alpha { p.fixed_alpha as u32 } else { a as u32 };
+    if p.alpha_mode != 1 && p.mix && has_alpha { a = a * p.fixed_alpha as u32 / 255; }
+    if a >= 255 { dst.copy_from_slice(&src); return; }
+    for (c, s) in dst.iter_mut().zip(src) {
+        let s = if p.premult && p.alpha_mode != 1 { s as u32 * 255 } else { s as u32 * a };
+        *c = ((s + *c as u32 * (255 - a)) / 255).min(255) as u8;
+    }
+}
+
+/// The HVS colour-space conversion from a display list's three CSC words: Y offset and gain,
+/// chroma offsets, and the Cb/Cr contributions to R, G and B in 2.8 fixed point (the green ones
+/// signed).
+struct Csc { yofs: i32, yall: i32, cbofs: i32, crofs: i32, cr_r: i32, cb_r: i32, cb_g: i32, cr_g: i32, cb_b: i32, cr_b: i32 }
+
+impl Csc {
+    fn from_words(w: [u32; 3]) -> Csc {
+        let s10 = |v: u32| { let v = (v & 0x3ff) as i32; if v >= 512 { v - 1024 } else { v } };
+        let s8 = |v: u32| (v & 0xff) as u8 as i8 as i32;
+        let yall = ((w[1] >> 2) & 0x3ff) as i32;
+        if yall == 0 {
+            // no conversion words: BT.601 limited range
+            return Csc::from_words([0x00f0_0000, 0xe733_04a8, 0x0006_6604]);
+        }
+        Csc {
+            yofs: s8(w[0] >> 16), yall, cbofs: s8(w[0] >> 8), crofs: s8(w[0]),
+            cr_b: (((w[0] >> 24) & 0xff) << 2 | (w[1] & 3)) as i32,
+            cb_g: s10(w[1] >> 22), cr_g: s10(w[1] >> 12),
+            cb_r: ((w[2] >> 20) & 0x3ff) as i32, cr_r: ((w[2] >> 10) & 0x3ff) as i32, cb_b: (w[2] & 0x3ff) as i32,
+        }
+    }
+
+    fn convert(&self, y: u8, cb: u8, cr: u8) -> [u8; 3] {
+        let yy = (y as i32 + self.yofs) * self.yall;
+        let (cb, cr) = (cb as i32 - 128 + self.cbofs, cr as i32 - 128 + self.crofs);
+        let c = |v: i32| ((v + 128) >> 8).clamp(0, 255) as u8;
+        [c(yy + self.cr_r * cr + self.cb_r * cb), c(yy + self.cb_g * cb + self.cr_g * cr), c(yy + self.cb_b * cb + self.cr_b * cr)]
     }
 }
 
@@ -633,6 +1190,106 @@ mod tests {
             assert_eq!(even_row + t_format_offset(tiles_l * 32 + x_off, y_off, cpp, tiles_w),
                        base + t_format_offset(sx, sy, cpp, tiles_w), "origin ({sx},{sy})");
         }
+    }
+
+    /// A BCM2835 pipeline showing `w`x`h` on HDMI (pixel valve 2, HVS channel 1) with the
+    /// display list `dl` at word 16 of the list memory.
+    fn bcm2835_with(dl: &[u32], w: u32, h: u32) -> Vc4 {
+        let mut v = Vc4::bcm2835(1920, 1080);
+        v.pv_write_n(2, PV_CONTROL as u64, 1);
+        v.pv_write_n(2, PV_V_CONTROL as u64, 1);
+        v.hvs_write(DISPCTRL as u64, 1 << 31);
+        v.hvs_write((DISPCTRL0 + 0x10) as u64, 1 << 31 | w << 12 | h);
+        for (k, &x) in dl.iter().enumerate() { v.hvs_write((0x2000 + 4 * (16 + k)) as u64, x); }
+        v.hvs_write((DISPLIST0 + 4) as u64, 16);
+        v.tick(FRAME_NS); // the frame start latches the list
+        v
+    }
+
+    #[test]
+    fn bcm2835_rgb_plane() {
+        // XRGB8888 (format 7, order ABGR on this HVS), 2x2 at (1, 0), fixed alpha 0xff, unity
+        let ctl0 = 1 << 30 | 7 | 3 << 13 | 1 << 4 | 7 << 24;
+        let dl = [ctl0, 0xff << 24 | 1, 1 << 30 | 2 << 16 | 2, 0xc0c0_c0c0, 0xc000_1000, 0xc0c0_c0c0, 8, 1 << 31];
+        let v = bcm2835_with(&dl, 4, 2);
+        let mut ram = vec![0u8; 0x2000];
+        // pixels as B, G, R, X in memory: red, green / blue, white
+        ram[0x1000..0x1010].copy_from_slice(&[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        let mut out = Vec::new();
+        assert_eq!(v.render(&ram, &mut out), Some((4, 2)));
+        let px = |x: usize, y: usize| &out[(y * 4 + x) * 4..(y * 4 + x) * 4 + 3];
+        assert_eq!(px(0, 0), [0, 0, 0]);
+        assert_eq!(px(1, 0), [255, 0, 0]);
+        assert_eq!(px(2, 0), [0, 255, 0]);
+        assert_eq!(px(1, 1), [0, 0, 255]);
+        assert_eq!(px(2, 1), [255, 255, 255]);
+    }
+
+    #[test]
+    fn bcm2835_nv12_plane_scaled() {
+        // NV12 (format 9, two planes), a 4x2 source scaled to 8x4 at (0, 0): Y = 128, Cb = Cr =
+        // 128 is grey; BT.601 limited range
+        let ctl0 = 1 << 30 | 9 | 18 << 24;
+        let dl = [ctl0, 0xff << 24, 4 << 16 | 8, 1 << 30 | 2 << 16 | 4, 0xc0c0_c0c0, 0xc000_1000, 0xc000_1100, 0xc0c0_c0c0, 0xc0c0_c0c0, 4, 4,
+                  0x00f0_0000, 0xe733_04a8, 0x0006_6604, 0, 0, 0, 0, 1 << 31];
+        let v = bcm2835_with(&dl, 8, 4);
+        let mut ram = vec![0u8; 0x2000];
+        ram[0x1000..0x1008].fill(128);
+        // chroma: (Cb, Cr) = (128, 128) left, (128, 255) right: red-ish
+        ram[0x1100..0x1104].copy_from_slice(&[128, 128, 128, 255]);
+        let mut out = Vec::new();
+        assert_eq!(v.render(&ram, &mut out), Some((8, 4)));
+        let px = |x: usize, y: usize| out[(y * 8 + x) * 4..(y * 8 + x) * 4 + 3].to_vec();
+        assert_eq!(px(0, 0), vec![130, 130, 130]);
+        assert_eq!(px(1, 3), vec![130, 130, 130]);
+        let r = px(7, 0);
+        assert!(r[0] > 230 && r[1] < 70 && r[2] == 130, "{r:?}");
+    }
+
+    #[test]
+    fn bcm2835_frame_rate_from_the_mode() {
+        let mut v = Vc4::bcm2835(1920, 1080);
+        // 1024x768@60: 1344 x 806 at 65 MHz
+        v.pv_write_n(2, PV_HORZA as u64, 160 << 16 | 136);
+        v.pv_write_n(2, PV_HORZB as u64, 24 << 16 | 1024);
+        v.pv_write_n(2, PV_VERTA as u64, 29 << 16 | 6);
+        v.pv_write_n(2, PV_VERTB as u64, 3 << 16 | 768);
+        v.pixel_hz = 65_000_000;
+        assert_eq!(v.frame_ns(2), 1344 * 806 * 1_000_000_000 / 65_000_000);
+        v.pixel_hz = 0;
+        assert_eq!(v.frame_ns(2), FRAME_NS);
+    }
+
+    #[test]
+    fn cec_tv_answers() {
+        let mut v = Vc4::bcm2835(1920, 1080);
+        let send = |v: &mut Vc4, msg: &[u8]| {
+            for (i, b) in msg.iter().enumerate() {
+                let o = H_CEC_TX_DATA_1 + 4 * (i / 4);
+                let w = v.hdmi_read(o as u64) & !(0xff << (8 * (i % 4))) | (*b as u32) << (8 * (i % 4));
+                v.hdmi_write(o as u64, w);
+            }
+            let c1 = v.hdmi_read(H_CEC_CNTRL_1 as u64) & !(CEC_START_XMIT_BEGIN | 0xf << 16);
+            v.hdmi_write(H_CEC_CNTRL_1 as u64, c1 | (msg.len() as u32 - 1) << 16 | CEC_START_XMIT_BEGIN);
+            let good = v.hdmi_read(H_CEC_CNTRL_1 as u64) & CEC_TX_STATUS_GOOD != 0;
+            // the driver's interrupt handler
+            assert!(v.hdmi_read(H_CPU_STATUS as u64) & CPU_CEC != 0);
+            let c1 = v.hdmi_read(H_CEC_CNTRL_1 as u64);
+            v.hdmi_write(H_CEC_CNTRL_1 as u64, c1 & !CEC_START_XMIT_BEGIN);
+            v.hdmi_write(H_CPU_CLEAR as u64, CPU_CEC);
+            good
+        };
+        v.hdmi_write(H_CPU_MASK_CLEAR as u64, CPU_CEC);
+        assert!(send(&mut v, &[0x40]), "the TV acknowledges a poll");
+        assert!(!send(&mut v, &[0x44]), "logical address 4 is free");
+        assert!(send(&mut v, &[0x40, 0x46]), "Give OSD Name");
+        v.tick(10_000_000);
+        assert!(v.irq_hdmi());
+        assert_ne!(v.hdmi_read(H_CEC_CNTRL_5 as u64) & CEC_RX_CEC_INT, 0);
+        let c1 = v.hdmi_read(H_CEC_CNTRL_1 as u64);
+        let len = ((c1 >> 24) & 0xf) as usize + 1;
+        let bytes: Vec<u8> = (0..len).map(|i| (v.hdmi_read((H_CEC_RX_DATA_1 + 4 * (i / 4)) as u64) >> (8 * (i % 4))) as u8).collect();
+        assert_eq!(bytes, [&[0x04, 0x47][..], TV_NAME].concat());
     }
 
     #[test]

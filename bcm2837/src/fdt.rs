@@ -18,6 +18,10 @@ pub struct BootInfo<'a> {
     /// firmware-allocated framebuffer: (base, width, height, stride)
     pub fb: Option<(u64, u32, u32, u32)>,
     pub cpus: u32,
+    /// the vc4 KMS pipeline (`dtoverlay=vc4-kms-v3d`): HVS, pixel valves, HDMI and its DDC bus
+    pub kms: bool,
+    /// the VideoCore IV 3D block (with `kms`)
+    pub v3d: bool,
 }
 
 /// Interrupt flags in the two controllers' second cell.
@@ -31,6 +35,7 @@ const fn bus(phys: u64) -> u32 { (phys as u32 - crate::machine::PERIPH as u32) +
 pub fn tree(b: &BootInfo) -> Vec<u8> {
     use crate::machine as m;
     let (armctrl, local, clk_core, clk_uart, clk_emmc, clk_tsens, mbox, thermal, aux, pm) = (1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32);
+    let (fwclk, power, gpio, dma, ddc, expgpio, firmware) = (11u32, 12u32, 13u32, 14u32, 15u32, 16u32, 17u32);
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &[b.model.compatible(), "brcm,bcm2837"]);
@@ -47,6 +52,9 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("uart0", &format!("/soc/serial@{}", node(m::UART0)));
     f.str("uart1", &format!("/soc/serial@{}", node(m::AUX + 0x40)));
     f.str("mmc0", &format!("/soc/mmc@{}", node(m::SDHCI)));
+    f.str("gpio", &format!("/soc/gpio@{}", node(m::GPIO)));
+    f.str("dma", &format!("/soc/dma-controller@{}", node(m::DMA)));
+    if b.kms { f.str("i2c2", &format!("/soc/i2c@{}", node(m::DDC))); }
     if b.model == crate::Model::B3Plus {
         f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/usb-port@1/ethernet@1", node(m::USB)));
     }
@@ -71,6 +79,22 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("device_type", "memory");
     f.cells("reg", &[0, b.ram as u32]);
     f.end();
+
+    if b.kms {
+        // contiguous memory for scanout buffers, as dtoverlay=vc4-kms-v3d sets it up (cma-256)
+        f.begin("reserved-memory");
+        f.cells("#address-cells", &[1]);
+        f.cells("#size-cells", &[1]);
+        f.empty("ranges");
+        f.begin("linux,cma");
+        f.str("compatible", "shared-dma-pool");
+        // (CMA areas are whole 4 MiB page blocks)
+        f.cells("size", &[(256u32 << 20).min((b.ram / 4) as u32 & !0x3f_ffff)]);
+        f.empty("reusable");
+        f.empty("linux,cma-default");
+        f.end();
+        f.end();
+    }
 
     f.begin("cpus");
     f.cells("#address-cells", &[1]);
@@ -163,6 +187,70 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.begin("firmware");
     f.strs("compatible", &["raspberrypi,bcm2835-firmware", "simple-mfd"]);
     f.cells("mboxes", &[mbox]);
+    f.cells("phandle", &[firmware]);
+    // the clocks the firmware manages (the HDMI pixel and state machine clocks, V3D, core)
+    f.begin("clocks");
+    f.str("compatible", "raspberrypi,firmware-clocks");
+    f.cells("#clock-cells", &[1]);
+    f.cells("phandle", &[fwclk]);
+    f.end();
+    // the firmware's GPIO expander (lines 128..135 of the mailbox's GPIO tags)
+    f.begin("expgpio");
+    f.str("compatible", "raspberrypi,firmware-gpio");
+    f.empty("gpio-controller");
+    f.cells("#gpio-cells", &[2]);
+    if b.model == crate::Model::B3 {
+        f.strs("gpio-line-names", &["BT_ON", "WL_ON", "STATUS_LED", "LAN_RUN", "HDMI_HPD_N", "CAM_GPIO0", "CAM_GPIO1", "PWR_LOW_N"]);
+    } else {
+        f.strs("gpio-line-names", &["BT_ON", "WL_ON", "PWR_LED_R", "LAN_RUN", "NC", "CAM_GPIO0", "CAM_GPIO1", "NC"]);
+    }
+    f.str("status", "okay");
+    f.cells("phandle", &[expgpio]);
+    f.end();
+    f.end();
+
+    // the power domains the firmware switches (HDMI, V3D, ...)
+    f.begin("power");
+    f.str("compatible", "raspberrypi,bcm2835-power");
+    f.cells("firmware", &[firmware]);
+    f.cells("#power-domain-cells", &[1]);
+    f.cells("phandle", &[power]);
+    f.end();
+
+    f.begin(&format!("gpio@{}", node(m::GPIO)));
+    f.str("compatible", "brcm,bcm2835-gpio");
+    f.cells("reg", &[bus(m::GPIO), 0xb4]);
+    f.cells("interrupts", &[gpu(m::GPU_GPIO0 as u32), gpu(m::GPU_GPIO0 as u32 + 1)].concat());
+    f.empty("gpio-controller");
+    f.cells("#gpio-cells", &[2]);
+    f.empty("interrupt-controller");
+    f.cells("#interrupt-cells", &[2]);
+    let mut names: Vec<String> = (0..54).map(|n| format!("GPIO{n}")).collect();
+    for (k, n) in [(0, "ID_SDA"), (1, "ID_SCL"), (28, "HDMI_HPD_N"), (29, "STATUS_LED_G"), (30, "CTS0"), (31, "RTS0"), (32, "TXD0"), (33, "RXD0"),
+                   (34, "SD1_CLK"), (35, "SD1_CMD"), (36, "SD1_DATA0"), (37, "SD1_DATA1"), (38, "SD1_DATA2"), (39, "SD1_DATA3"), (40, "PWM0_OUT"),
+                   (41, "PWM1_OUT"), (42, "ETH_CLK"), (43, "WIFI_CLK"), (44, "SDA0"), (45, "SCL0"), (46, "SMPS_SCL"), (47, "SMPS_SDA"),
+                   (48, "SD_CLK_R"), (49, "SD_CMD_R"), (50, "SD_DATA0_R"), (51, "SD_DATA1_R"), (52, "SD_DATA2_R"), (53, "SD_DATA3_R")] {
+        names[k] = n.into();
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    f.strs("gpio-line-names", &refs);
+    f.cells("phandle", &[gpio]);
+    f.end();
+
+    // the DMA controller: channels 0..10 with their own interrupts, 11..14 sharing one; the
+    // channels the firmware leaves to Linux
+    f.begin(&format!("dma-controller@{}", node(m::DMA)));
+    f.str("compatible", "brcm,bcm2835-dma");
+    f.cells("reg", &[bus(m::DMA), 0xf00]);
+    let irqs: Vec<u32> = (0..16u32).flat_map(|n| gpu(m::GPU_DMA0 as u32 + if n < 11 { n } else if n < 15 { 11 } else { 12 })).collect();
+    f.cells("interrupts", &irqs);
+    let mut names: Vec<String> = (0..15).map(|n| format!("dma{n}")).collect();
+    names.push("dma-shared-all".into());
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    f.strs("interrupt-names", &refs);
+    f.cells("#dma-cells", &[1]);
+    f.cells("brcm,dma-channel-mask", &[0x7f35]);
+    f.cells("phandle", &[dma]);
     f.end();
 
     // power management: the watchdog (reboot, poweroff) and the power domains behind the ASB
@@ -263,6 +351,8 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     }
     f.end();
 
+    if b.kms { display(&mut f, b, Phandles { fwclk, power, gpio, dma, ddc, expgpio, clk_core }); }
+
     f.end(); // soc
 
     if let Some((base, w, h, stride)) = b.fb {
@@ -281,13 +371,82 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.finish()
 }
 
+struct Phandles { fwclk: u32, power: u32, gpio: u32, dma: u32, ddc: u32, expgpio: u32, clk_core: u32 }
+
+/// The display pipeline as `dtoverlay=vc4-kms-v3d` enables it on the vendor tree: the HVS,
+/// pixel valves 0..2, the transposer, HDMI (fed by pixel valve 2) with its DDC bus (BSC2), and
+/// the V3D when it is modelled.
+fn display(f: &mut Fdt, b: &BootInfo, p: Phandles) {
+    use crate::machine as m;
+    let node = |a: u64| format!("{:x}", bus(a));
+    f.begin("gpu");
+    f.str("compatible", "brcm,bcm2835-vc4");
+    f.end();
+    f.begin(&format!("hvs@{}", node(m::HVS)));
+    f.str("compatible", "brcm,bcm2835-hvs");
+    f.cells("reg", &[bus(m::HVS), 0x6000]);
+    f.cells("interrupts", &gpu(m::GPU_HVS as u32));
+    f.end();
+    for (k, base, irq) in [(0, m::PV0, m::GPU_PV0), (1, m::PV1, m::GPU_PV1), (2, m::PV2, m::GPU_PV2)] {
+        f.begin(&format!("pixelvalve@{}", node(base)));
+        f.str("compatible", &format!("brcm,bcm2835-pixelvalve{k}"));
+        f.cells("reg", &[bus(base), 0x100]);
+        f.cells("interrupts", &gpu(irq as u32));
+        f.end();
+    }
+    f.begin(&format!("txp@{}", node(m::TXP)));
+    f.str("compatible", "brcm,bcm2835-txp");
+    f.cells("reg", &[bus(m::TXP), 0x20]);
+    f.cells("interrupts", &gpu(m::GPU_TXP as u32));
+    f.end();
+    f.begin(&format!("i2c@{}", node(m::DDC)));
+    f.str("compatible", "brcm,bcm2835-i2c");
+    f.cells("reg", &[bus(m::DDC), 0x1000]);
+    f.cells("interrupts", &gpu(m::GPU_I2C as u32));
+    f.cells("clocks", &[p.clk_core]);
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.cells("clock-frequency", &[100_000]);
+    f.str("status", "okay");
+    f.cells("phandle", &[p.ddc]);
+    f.end();
+    f.begin(&format!("hdmi@{}", node(m::HDMI)));
+    f.str("compatible", "brcm,bcm2835-hdmi");
+    f.cells("reg", &[bus(m::HDMI), bcm2711::vc4::HDMI_2835_SIZE as u32, bus(m::HD), 0x100]);
+    f.strs("reg-names", &["hdmi", "hd"]);
+    f.cells("interrupts", &[gpu(m::GPU_HDMI0 as u32), gpu(m::GPU_HDMI1 as u32)].concat());
+    f.cells("ddc", &[p.ddc]);
+    // the firmware's pixel clock and HDMI state machine (M2MC) clock
+    f.cells("clocks", &[p.fwclk, 9, p.fwclk, 13]);
+    f.strs("clock-names", &["pixel", "hdmi"]);
+    // audio through DREQ 17, with the vendor tree's flags (wait for write responses, burst)
+    f.cells("dmas", &[p.dma, 0x0900_0000 | bcm2711::vc4::DREQ_HDMI_BCM2835]);
+    f.str("dma-names", "audio-rx");
+    f.cells("power-domains", &[p.power, 5]);
+    // hot-plug: GPIO 28 (the 3B: the firmware's GPIO expander, line 4), active low
+    if b.model.hpd_on_expander() { f.cells("hpd-gpios", &[p.expgpio, 4, 1]); } else { f.cells("hpd-gpios", &[p.gpio, 28, 1]); }
+    f.str("status", "okay");
+    f.end();
+    if b.v3d {
+        // the VideoCore IV 3D block: one register page, GPU interrupt 10, the V3D power domain
+        // and the firmware's V3D clock
+        f.begin(&format!("v3d@{}", node(m::V3D)));
+        f.str("compatible", "brcm,vc4-v3d");
+        f.cells("reg", &[bus(m::V3D), 0x1000]);
+        f.cells("interrupts", &gpu(m::GPU_V3D as u32));
+        f.cells("power-domains", &[p.power, 10]);
+        f.cells("clocks", &[p.fwclk, 5]);
+        f.end();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn tree_parses_and_names_the_board() {
-        let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4 });
+        let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4, kms: true, v3d: true });
         let root = emu_core::fdt::Node::parse(&blob).unwrap();
         let model = root.prop("model").unwrap();
         assert!(model.starts_with(b"Raspberry Pi 3 Model B Plus Rev 1.3"));

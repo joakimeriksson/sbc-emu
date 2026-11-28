@@ -1,6 +1,8 @@
 //! Raspberry Pi 3 (BCM2837) adapter: the serial console on the mini UART, boot like the
 //! firmware from an SD card image (`config.txt` with its `[pi3]` sections, `cmdline.txt`,
-//! `kernel8.img`, the initramfs) or a kernel and initramfs given directly.
+//! `kernel8.img`, the initramfs) or a kernel and initramfs given directly. HDMI through the vc4
+//! KMS pipeline when `config.txt` asks for it (`--display kms|fb` decides otherwise), its audio
+//! to `--audio-out`.
 use crate::{arg, serial_board::{self, RunConfig, SerialBoard}, vnc::Screen};
 use bcm2837::{boot, Machine, Model};
 use sbc_machine::Machine as HostMachine;
@@ -24,6 +26,11 @@ impl SerialBoard for Machine {
         if self.soc.sd.reads + self.soc.sd.writes > 0 {
             eprintln!("[{tag}] SD card: {} reads, {} writes", self.soc.sd.reads, self.soc.sd.writes);
         }
+        if let Some(v) = self.soc.vc4.as_ref() {
+            let mode = v.size().map_or("off".to_string(), |(w, h)| format!("{w}x{h}"));
+            eprintln!("[{tag}] HDMI: {mode}, {} frames on pixel valve 2; {} CEC messages", v.frames, v.cec.log.len());
+            if std::env::var_os("SBC_CEC_LOG").is_some() { for l in &v.cec.log { eprintln!("[{tag}] CEC {l}"); } }
+        }
         if !self.soc.mbox.unknown.is_empty() {
             let tags: Vec<String> = self.soc.mbox.unknown.iter().map(|t| format!("{t:#x}")).collect();
             eprintln!("[{tag}] firmware property tags answered as unknown: {}", tags.join(" "));
@@ -32,11 +39,15 @@ impl SerialBoard for Machine {
     fn save(&self) -> Result<Vec<u8>, String> { Machine::save(self) }
     fn restore(&mut self, file: &[u8]) -> Result<(), String> { Machine::restore(self, file) }
     fn screen(&mut self) -> Option<&mut dyn Screen> { Some(self) }
+    // HDMI audio (the analogue jack's PWM is not modelled)
+    fn capture_audio(&mut self) -> bool { self.soc.capture_audio = true; self.soc.vc4.is_some() }
+    fn take_audio(&mut self) -> (u32, Vec<i16>) { (self.soc.audio_rate, std::mem::take(&mut self.soc.audio)) }
+    fn set_hdmi_connected(&mut self, on: bool) -> bool { if self.soc.vc4.is_none() { return false; } Machine::set_hdmi_connected(self, on); true }
 }
 
 impl Screen for Machine {
     fn shown_size(&self) -> Option<(u32, u32)> { self.soc.shown_size() }
-    fn display_size(&self) -> (u32, u32) { self.soc.mbox.fb_size() }
+    fn display_size(&self) -> (u32, u32) { self.soc.display_size() }
     fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.soc.render(out) }
     fn name(&self) -> &'static str { "sbc-emu: Raspberry Pi 3" }
     // the USB keyboard and tablet (behind the hub on a 3B+)
@@ -73,7 +84,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--sd", "--smp", "--model", "--threads", "--seed", "--screenshot", "--vnc", "--restore", "--snapshot", "--net", "--hostfwd"])?;
+    serial_board::validate_options(args, &["--sd", "--smp", "--model", "--threads", "--seed", "--screenshot", "--vnc", "--restore", "--snapshot", "--net", "--hostfwd",
+                                            "--display", "--hdmi-mode", "--audio-out"])?;
     let model = arg(args, "--model").map_or(Ok(Model::B3Plus), Model::parse)?;
     // the 3B+'s Ethernet on the virtual network: nat (default), local (DHCP and DNS only), none
     let net = arg(args, "--net").unwrap_or("nat");
@@ -96,6 +108,18 @@ fn execute(args: &[String]) -> Result<(), String> {
     let append = arg(args, "--append").map(str::to_string);
     if kernel.is_none() && arg(args, "--sd").is_none() { return Err("--kernel Image or --sd IMAGE is required".into()); }
     let display = !args.iter().any(|a| a == "--no-display");
+    // --display kms: the vc4 KMS pipeline on HDMI (the default when config.txt asks for it with
+    // dtoverlay=vc4-kms-v3d); fb: the firmware's framebuffer only (the default for --kernel)
+    let display_mode = arg(args, "--display");
+    if display_mode.is_some_and(|d| d != "kms" && d != "fb") { return Err("--display kms|fb".into()); }
+    if display_mode == Some("kms") && !display { return Err("--display kms and --no-display contradict each other".into()); }
+    // --hdmi-mode WxH: the monitor's preferred mode (default 1920x1080)
+    let hdmi_mode = match arg(args, "--hdmi-mode") {
+        None => (1920, 1080),
+        Some(s) => s.split_once('x').and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+            .filter(|m| [(1920, 1080), (1280, 720), (1024, 768), (800, 600), (640, 480)].contains(m))
+            .ok_or("--hdmi-mode 1920x1080|1280x720|1024x768|800x600|640x480")?,
+    };
     let no_jit = args.iter().any(|a| a == "--no-jit") || std::env::var("SBC_JIT").is_ok_and(|v| v == "0");
     // the card survives guest reboots (one disk shared by the successive machines)
     let persist = args.iter().any(|a| a == "--sd-persist");
@@ -113,15 +137,17 @@ fn execute(args: &[String]) -> Result<(), String> {
             None if multi => m.soc.rng.reseed(bcm2711::periph::Rng200::host_seed()),
             None => {}
         }
-        let (k, i, c) = match (&kernel, disk.clone()) {
-            (Some(k), _) => (k.clone(), initrd.clone(), append.clone().unwrap_or_else(|| boot::DEFAULT_CMDLINE.to_string())),
+        let (k, i, c, asked_kms) = match (&kernel, disk.clone()) {
+            (Some(k), _) => (k.clone(), initrd.clone(), append.clone().unwrap_or_else(|| boot::DEFAULT_CMDLINE.to_string()), false),
             (None, Some(mut d)) => {
                 let b = boot::read_sd_boot(&mut d, model)?;
                 if !announced.get() { for n in &b.notes { eprintln!("[pi3] firmware: {n}"); } }
-                (b.kernel, b.initramfs, append.clone().unwrap_or(b.cmdline))
+                (b.kernel, b.initramfs, append.clone().unwrap_or(b.cmdline), b.kms)
             }
             (None, None) => return Err("nothing to boot".into()),
         };
+        let kms = display && match display_mode { Some(d) => d == "kms", None => asked_kms };
+        if kms { m.enable_kms(hdmi_mode.0, hdmi_mode.1); }
         if let Some(d) = disk.clone() { m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(Box::new(d))); }
         // SBC_SD_TRACE=1: the SD host's commands and data on stderr; SBC_USB_TRACE=1: USB transfers
         m.soc.sd.trace = std::env::var("SBC_SD_TRACE").is_ok_and(|v| v == "1");
@@ -143,7 +169,7 @@ fn execute(args: &[String]) -> Result<(), String> {
                     Model::B3 => "a hub (the LAN9514's Ethernet is not modelled), USB keyboard and tablet".into(),
                     _ => "a USB keyboard".to_string(),
                 },
-                if display { ", firmware framebuffer" } else { "" }
+                if kms { format!(", HDMI through the vc4 KMS pipeline (HVS, pixel valves, HDMI with CEC and audio, a {}x{} monitor)", hdmi_mode.0, hdmi_mode.1) } else if display { ", firmware framebuffer".into() } else { String::new() }
             );
         }
         boot::boot_linux(&mut m, &k, i.as_deref(), &c, display)?;

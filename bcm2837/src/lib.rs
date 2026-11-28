@@ -70,9 +70,13 @@ impl Model {
             Model::Zero2W => &["pi02", "board-type=0x12"],
         }
     }
+    /// The ARM cores' clock (MHz) as the firmware reports it.
+    pub fn arm_mhz(self) -> u32 { match self { Model::B3Plus | Model::A3Plus => 1400, Model::B3 => 1200, Model::Zero2W => 1000 } }
+    /// HDMI's hot-plug line is on the firmware's GPIO expander (line 4) rather than GPIO 28.
+    pub fn hpd_on_expander(self) -> bool { self == Model::B3 }
     /// How this board's firmware reads `config.txt` and `cmdline.txt`: serial0 is the mini
     /// UART (the PL011 is wired to Bluetooth on every member), 32-bit kernels by default.
     pub fn firmware(self) -> bcm2711::boot::Firmware<'static> {
-        bcm2711::boot::Firmware { sections: self.config_sections(), arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: false }
+        bcm2711::boot::Firmware { sections: self.config_sections(), arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true }
     }
 }

@@ -155,6 +155,7 @@ Each ends with something a script checks, as on the other boards.
 4. **HDMI.** The HVS (RGB and YUV planes, scaling), pixel valves, HDMI with audio and CEC for
    `vc4`. *Check:* `HDMI-A-1` connected, the console at 1920×1080 over VNC, `kmstest` page flips at
    60 fps, `speaker-test -D hdmi` gives a 440 Hz tone on the host, `cec-ctl` finds the TV.
+   *Done* (`scripts/rpi3-hdmi.txt`); composite (VEC) stays with milestone 8.
 5. **Wi-Fi and Bluetooth.** `sdhost` for the card, the CYW43455 on the Arasan, Bluetooth on UART0.
    *Check:* `nmcli dev wifi connect`, DHCP over Wi-Fi; `bluetoothctl` scan finds the virtual sensor.
 6. **The rest of the platform.** `--threads multi`, snapshots, gdb, a browser page, the `3a+` and

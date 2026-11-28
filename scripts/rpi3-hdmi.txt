@@ -1,0 +1,84 @@
+# Raspberry Pi 3 Model B+ (milestone 4 of docs/rpi3-plan.md): HDMI through the stock vc4 KMS
+# driver, as the image's config.txt asks (dtoverlay=vc4-kms-v3d). The first-boot wizard runs on
+# the KMS console (1920x1080, the monitor's preferred mode from its EDID on the DDC bus), driven
+# with the USB keyboard; then, logged in on the serial console: the connector and its modes,
+# kmstest's page flips at the mode's rate, NV12 and YUV420 planes scaled, a 440 Hz tone on HDMI audio (DMA into the MAI FIFO,
+# written to --audio-out on the host), the TV found over CEC, a hot-plug out and back in.
+#   sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --audio-out out/rpi3-hdmi.wav \
+#       --script scripts/rpi3-hdmi.txt --timeout 900
+# Screenshots go to out/; after the logins a snapshot (out/rpi3-hdmi.snap) to resume from with
+# --restore (the same options, --display kms).
+wait-serial raspberrypi login:
+# the wizard's blue screen on HDMI (it starts a while after the serial login prompt)
+wait-pixel 10 700 0000aa
+wait-idle 3
+screenshot out/rpi3-hdmi-01-keyboard-layout.png
+type \n
+sleep 6
+type pi\n
+sleep 6
+type raspberry\n
+sleep 6
+type raspberry\n
+sleep 8
+type \n
+sleep 10
+type pi\n
+sleep 4
+type raspberry\n
+sleep 8
+type clear; echo tty1 on $(cat /sys/class/graphics/fb0/virtual_size) HDMI\n
+sleep 3
+screenshot out/rpi3-hdmi-02-tty1.png
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial echo raspberry | sudo -S true; echo SUDO_$((1))\r
+wait-serial SUDO_1
+save out/rpi3-hdmi.snap
+# the connector, its EDID's modes, the driver's view
+serial for f in status modes; do echo DRM_$f $(awk '!seen[$0]++' /sys/class/drm/card*-HDMI-A-1/$f | head -4); done\r
+wait-serial DRM_status connected
+wait-serial DRM_modes 1920x1080 1280x720 1024x768
+serial sudo dmesg | grep --color=never -iE 'vc4|hdmi|drm' | grep --color=never -viE 'firmware|v3d' | head -12\r
+serial kmsprint | head -8; echo KMSPRINT_$((2))\r
+wait-serial KMSPRINT_2
+# page flips at the mode's rate: 1024x768 at 60 Hz (65 MHz pixel clock), then 1920x1080 at 60 Hz
+serial sudo kmstest -r 1024x768 --flip=200 2>&1 | grep --color=never -E 'fps|1024x768' | tail -3; echo FLIP_$((3))\r
+wait-serial FLIP_3
+serial sudo kmstest --flip=200 2>&1 | grep --color=never -E 'fps|1920x1080' | tail -3; echo FLIP_$((4))\r
+wait-serial FLIP_4
+# YUV planes, scaled: kmstest's pattern as a 320x240 NV12 (then YUV420, three planes) frame buffer
+# on a 768x576 plane at (128, 96) of a 1024x768 mode; its blue top and red bottom bars on screen
+serial echo raspberry | sudo -S true; (sleep 12; echo) | sudo kmstest -r 1024x768 -p 128,96-768x576 -f 320x240-NV12 2>&1 | grep --color=never Fb; echo YUV_$((1))\r
+wait-pixel 500 110 0000ff
+wait-pixel 500 650 ff0000
+screenshot out/rpi3-hdmi-03-nv12.png
+wait-serial YUV_1
+serial echo raspberry | sudo -S true; (sleep 12; echo) | sudo kmstest -r 1024x768 -p 128,96-768x576 -f 320x240-YU12 2>&1 | grep --color=never Fb; echo YUV_$((2))\r
+wait-pixel 500 110 0000ff
+wait-pixel 500 650 ff0000
+wait-serial YUV_2
+# HDMI audio: the vc4-hdmi card, a 440 Hz sine at 48 kHz on both channels
+serial aplay -l | grep --color=never -i hdmi\r
+wait-serial vc4-hdmi
+serial speaker-test -D hdmi:CARD=vc4hdmi,DEV=0 -c 2 -r 48000 -t sine -f 440 -l 1 2>&1 | grep --color=never -E 'Rate|Front|rror'; echo AUDIO_$((5))\r
+wait-serial AUDIO_5
+# CEC: the adapter as a playback device, the TV (logical address 0) found on the bus
+serial cec-ctl -d /dev/cec0 --playback -S 2>&1 | sed -n '/device 0 (TV)/,/^$/p'; echo CEC_$((6))\r
+wait-serial System Information for device 0 (TV)
+wait-serial 'sbc-emu TV'
+wait-serial CEC_6
+# hot-plug: the monitor out, then back in (the driver polls the line)
+hdmi disconnect
+serial sleep 12; echo DRM_after_unplug $(cat /sys/class/drm/card*-HDMI-A-1/status)\r
+wait-serial DRM_after_unplug disconnected
+hdmi connect
+serial sleep 12; echo DRM_after_plug $(cat /sys/class/drm/card*-HDMI-A-1/status)\r
+wait-serial DRM_after_plug connected
+sleep 3
+screenshot out/rpi3-hdmi-04-console.png
+quit
