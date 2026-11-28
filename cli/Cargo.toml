@@ -22,3 +22,7 @@ riscv-rv32 = { path = "../riscv-rv32" }
 esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }
 tegra234 = { path = "../tegra234" }
+
+[features]
+# the Raspberry Pi 3's hardware H.264 decoder (opt-in: see docs/raspberry-pi-3.md)
+h264 = ["bcm2837/h264"]

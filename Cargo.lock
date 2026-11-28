@@ -55,6 +55,7 @@ dependencies = [
  "emu-core",
  "miniz_oxide",
  "peripherals",
+ "rust_h264",
  "sbc-net",
 ]
 
@@ -214,6 +215,12 @@ dependencies = [
  "peripherals",
  "sbc-net",
 ]
+
+[[package]]
+name = "rust_h264"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49a852e1544c48fba7d072620420c602f195092e3774655584ef5e4e6fd056a9"
 
 [[package]]
 name = "ruzstd"

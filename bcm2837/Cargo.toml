@@ -11,3 +11,17 @@ bcm2711 = { path = "../bcm2711" }
 peripherals = { path = "../peripherals" }
 sbc-net = { path = "../sbc-net" }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# the H.264 decoder behind ril.video_decode (opt-in: see docs/raspberry-pi-3.md); without it
+# the decoder is the stand-in that emits test pictures
+rust_h264 = { version = "=0.6.1", optional = true }
+
+[features]
+h264 = ["dep:rust_h264"]
+
+[[example]]
+name = "h264dec"
+required-features = ["h264"]
+
+[[test]]
+name = "h264_conformance"
+required-features = ["h264"]

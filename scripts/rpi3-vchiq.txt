@@ -4,9 +4,12 @@
 # first-boot wizard, logged in on the serial console:
 # - the media drivers bound over VCHIQ: bcm2835-codec's decoder, encoder, ISP, image-effects
 #   and JPEG devices, bcm2835-isp's nodes; vc-sm-cma's /dev/vcsm-cma;
-# - the decoder through V4L2 with v4l2-ctl: H.264 in (a 320x240 stream of parameter sets and
-#   empty slices written with printf), YU12 out; the stand-in decoder turns each coded
-#   picture into colour bars, so the first luma byte is the bars' white (180, 0xb4);
+# - the decoder through V4L2 with v4l2-ctl: H.264 in (a 320x240 Baseline stream written with
+#   printf: parameter sets whose VUI says no picture waits for reordering, a grey intra
+#   picture, three skipped P pictures), YU12 out. Built
+#   with the h264 feature the decoder decodes it (grey: luma 128, 0x80); without it the
+#   stand-in turns each coded picture into colour bars (the bars' white, 180, 0xb4). The
+#   decoder itself is checked by scripts/rpi3-h264.txt;
 # - the ISP: a red 64x32 RGB24 picture scaled to 32x16 YU12 (BT.601 red: Y 82 = 0x52);
 # - the headphone card (bcm2835 Headphones): a 440 Hz sine through the firmware's audio
 #   service, written to --audio-out on the host.
@@ -46,12 +49,12 @@ wait-serial LIST_/dev/video10_/dev/vcsm-cma_END
 # the decoder's input formats: H.264 (no MPEG-2 or VC-1: no licence key)
 serial v4l2-ctl -d /dev/video10 --list-formats-out | grep --color=never -E "'"; echo FMT_$(v4l2-ctl -d /dev/video10 --list-formats-out | grep -c -E "'(H264|MPG2|WVC1)'")_END\r
 wait-serial FMT_1_END
-# decode: four coded pictures in, YU12 out through the stand-in decoder, until the end of the
-# stream (v4l2-ctl stops the decoder at the end of its file and stops at the last buffer)
-serial printf '\x00\x00\x00\x01\x67\x42\x00\x1e\xf4\x0a\x0f\xc8\x00\x00\x00\x01\x65\x88\xc0\x00\x00\x00\x01\x41\x9b\x00\x00\x00\x01\x41\x9b\x00\x00\x00\x01\x41\x9b' > /tmp/t.h264; echo H264_$(stat -c %s /tmp/t.h264)_END\r
-wait-serial H264_37_END
-serial v4l2-ctl -d /dev/video10 --set-fmt-video-out=pixelformat=H264 --set-fmt-video=width=320,height=240,pixelformat=YU12 --stream-mmap --stream-out-mmap --stream-from=/tmp/t.h264 --stream-to=/tmp/out.yuv 2>&1 | tr -d '<>' | grep --color=never -E 'EVENT|STOP|rror'; echo DEC_$(stat -c %s /tmp/out.yuv)_$(od -An -tx1 -N1 /tmp/out.yuv | tr -d ' ')_END\r
-wait-serial DEC_460800_b4_END
+# decode: four coded pictures in, four YU12 pictures out, until the end of the stream
+# (v4l2-ctl stops the decoder at the end of its file and stops at the last buffer)
+serial { printf '\x00\x00\x00\x01\x67\x42\x00\x1e\xf4\x0a\x0f\xd0\x0f\x08\x84\x6a\x00\x00\x00\x01\x68\xce\x38\x80\x00\x00\x00\x01\x65\x88\x84\x09'; for i in $(seq 299); do printf 9; done; printf '\x3c\x00\x00\x00\x01\x41\x9a\x24\x20\x12\xd8\x00\x00\x00\x01\x41\x9a\x48\x20\x12\xd8\x00\x00\x00\x01\x41\x9a\x6c\x20\x12\xd8'; } > /tmp/t.h264; echo H264_$(stat -c %s /tmp/t.h264)_END\r
+wait-serial H264_362_END
+serial v4l2-ctl -d /dev/video10 --set-fmt-video-out=pixelformat=H264 --set-fmt-video=width=320,height=240,pixelformat=YU12 --stream-mmap --stream-out-mmap --stream-from=/tmp/t.h264 --stream-to=/tmp/out.yuv 2>&1 | tr -d '<>' | grep --color=never -E 'EVENT|STOP|rror'; echo LUMA $(od -An -tx1 -N1 /tmp/out.yuv); echo DEC_$(stat -c %s /tmp/out.yuv)_$(od -An -tx1 -N1 /tmp/out.yuv | tr -d ' ' | sed -e 's/^80$/ok/' -e 's/^b4$/ok/')_END\r
+wait-serial DEC_460800_ok_END
 # the ISP: red RGB24 64x32 -> YU12 32x16
 serial for i in $(seq 2048); do printf '\377\0\0'; done > /tmp/red.rgb; v4l2-ctl -d /dev/video12 --set-fmt-video-out=width=64,height=32,pixelformat=RGB3 --set-fmt-video=width=32,height=16,pixelformat=YU12 --stream-mmap --stream-out-mmap --stream-from=/tmp/red.rgb --stream-to=/tmp/isp.yuv --stream-count=1 2>&1 | tail -2; echo ISP_$(od -An -tx1 -N1 /tmp/isp.yuv | tr -d ' ')_END\r
 wait-serial ISP_52_END
