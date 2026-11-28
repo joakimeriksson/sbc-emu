@@ -77,6 +77,6 @@ impl Model {
     /// How this board's firmware reads `config.txt` and `cmdline.txt`: serial0 is the mini
     /// UART (the PL011 is wired to Bluetooth on every member), 32-bit kernels by default.
     pub fn firmware(self) -> bcm2711::boot::Firmware<'static> {
-        bcm2711::boot::Firmware { sections: self.config_sections(), arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true }
+        bcm2711::boot::Firmware { sections: self.config_sections(), arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true }
     }
 }

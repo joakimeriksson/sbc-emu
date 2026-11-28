@@ -22,6 +22,8 @@ pub struct BootInfo<'a> {
     pub kms: bool,
     /// the VideoCore IV 3D block (with `kms`)
     pub v3d: bool,
+    /// the outputs of the KMS pipeline: HDMI (unless `nohdmi`), composite (the VEC)
+    pub outputs: bcm2711::boot::KmsOutputs,
 }
 
 /// Interrupt flags in the two controllers' second cell.
@@ -54,7 +56,7 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("mmc0", &format!("/soc/mmc@{}", node(m::SDHCI)));
     f.str("gpio", &format!("/soc/gpio@{}", node(m::GPIO)));
     f.str("dma", &format!("/soc/dma-controller@{}", node(m::DMA)));
-    if b.kms { f.str("i2c2", &format!("/soc/i2c@{}", node(m::DDC))); }
+    if b.kms && b.outputs.hdmi { f.str("i2c2", &format!("/soc/i2c@{}", node(m::DDC))); }
     if b.model == crate::Model::B3Plus {
         f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/usb-port@1/ethernet@1", node(m::USB)));
     }
@@ -374,7 +376,8 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
 struct Phandles { fwclk: u32, power: u32, gpio: u32, dma: u32, ddc: u32, expgpio: u32, clk_core: u32 }
 
 /// The display pipeline as `dtoverlay=vc4-kms-v3d` enables it on the vendor tree: the HVS,
-/// pixel valves 0..2, the transposer, HDMI (fed by pixel valve 2) with its DDC bus (BSC2), and
+/// pixel valves 0..2, the transposer, HDMI (fed by pixel valve 2) with its DDC bus (BSC2) unless
+/// `nohdmi`, the composite encoder (VEC, pixel valve 2's other output) with `composite`, and
 /// the V3D when it is modelled.
 fn display(f: &mut Fdt, b: &BootInfo, p: Phandles) {
     use crate::machine as m;
@@ -399,34 +402,47 @@ fn display(f: &mut Fdt, b: &BootInfo, p: Phandles) {
     f.cells("reg", &[bus(m::TXP), 0x20]);
     f.cells("interrupts", &gpu(m::GPU_TXP as u32));
     f.end();
-    f.begin(&format!("i2c@{}", node(m::DDC)));
-    f.str("compatible", "brcm,bcm2835-i2c");
-    f.cells("reg", &[bus(m::DDC), 0x1000]);
-    f.cells("interrupts", &gpu(m::GPU_I2C as u32));
-    f.cells("clocks", &[p.clk_core]);
-    f.cells("#address-cells", &[1]);
-    f.cells("#size-cells", &[0]);
-    f.cells("clock-frequency", &[100_000]);
-    f.str("status", "okay");
-    f.cells("phandle", &[p.ddc]);
-    f.end();
-    f.begin(&format!("hdmi@{}", node(m::HDMI)));
-    f.str("compatible", "brcm,bcm2835-hdmi");
-    f.cells("reg", &[bus(m::HDMI), bcm2711::vc4::HDMI_2835_SIZE as u32, bus(m::HD), 0x100]);
-    f.strs("reg-names", &["hdmi", "hd"]);
-    f.cells("interrupts", &[gpu(m::GPU_HDMI0 as u32), gpu(m::GPU_HDMI1 as u32)].concat());
-    f.cells("ddc", &[p.ddc]);
-    // the firmware's pixel clock and HDMI state machine (M2MC) clock
-    f.cells("clocks", &[p.fwclk, 9, p.fwclk, 13]);
-    f.strs("clock-names", &["pixel", "hdmi"]);
-    // audio through DREQ 17, with the vendor tree's flags (wait for write responses, burst)
-    f.cells("dmas", &[p.dma, 0x0900_0000 | bcm2711::vc4::DREQ_HDMI_BCM2835]);
-    f.str("dma-names", "audio-rx");
-    f.cells("power-domains", &[p.power, 5]);
-    // hot-plug: GPIO 28 (the 3B: the firmware's GPIO expander, line 4), active low
-    if b.model.hpd_on_expander() { f.cells("hpd-gpios", &[p.expgpio, 4, 1]); } else { f.cells("hpd-gpios", &[p.gpio, 28, 1]); }
-    f.str("status", "okay");
-    f.end();
+    if b.outputs.composite {
+        // the VEC: the firmware's VEC clock, its power domain (RPI_POWER_DOMAIN_VEC)
+        f.begin(&format!("vec@{}", node(m::VEC)));
+        f.str("compatible", "brcm,bcm2835-vec");
+        f.cells("reg", &[bus(m::VEC), bcm2711::vc4::VEC_SIZE as u32]);
+        f.cells("clocks", &[p.fwclk, 15]);
+        f.cells("interrupts", &gpu(m::GPU_VEC as u32));
+        f.cells("power-domains", &[p.power, 7]);
+        f.str("status", "okay");
+        f.end();
+    }
+    if b.outputs.hdmi {
+        f.begin(&format!("i2c@{}", node(m::DDC)));
+        f.str("compatible", "brcm,bcm2835-i2c");
+        f.cells("reg", &[bus(m::DDC), 0x1000]);
+        f.cells("interrupts", &gpu(m::GPU_I2C as u32));
+        f.cells("clocks", &[p.clk_core]);
+        f.cells("#address-cells", &[1]);
+        f.cells("#size-cells", &[0]);
+        f.cells("clock-frequency", &[100_000]);
+        f.str("status", "okay");
+        f.cells("phandle", &[p.ddc]);
+        f.end();
+        f.begin(&format!("hdmi@{}", node(m::HDMI)));
+        f.str("compatible", "brcm,bcm2835-hdmi");
+        f.cells("reg", &[bus(m::HDMI), bcm2711::vc4::HDMI_2835_SIZE as u32, bus(m::HD), 0x100]);
+        f.strs("reg-names", &["hdmi", "hd"]);
+        f.cells("interrupts", &[gpu(m::GPU_HDMI0 as u32), gpu(m::GPU_HDMI1 as u32)].concat());
+        f.cells("ddc", &[p.ddc]);
+        // the firmware's pixel clock and HDMI state machine (M2MC) clock
+        f.cells("clocks", &[p.fwclk, 9, p.fwclk, 13]);
+        f.strs("clock-names", &["pixel", "hdmi"]);
+        // audio through DREQ 17, with the vendor tree's flags (wait for write responses, burst)
+        f.cells("dmas", &[p.dma, 0x0900_0000 | bcm2711::vc4::DREQ_HDMI_BCM2835]);
+        f.str("dma-names", "audio-rx");
+        f.cells("power-domains", &[p.power, 5]);
+        // hot-plug: GPIO 28 (the 3B: the firmware's GPIO expander, line 4), active low
+        if b.model.hpd_on_expander() { f.cells("hpd-gpios", &[p.expgpio, 4, 1]); } else { f.cells("hpd-gpios", &[p.gpio, 28, 1]); }
+        f.str("status", "okay");
+        f.end();
+    }
     if b.v3d {
         // the VideoCore IV 3D block: one register page, GPU interrupt 10, the V3D power domain
         // and the firmware's V3D clock
@@ -446,7 +462,8 @@ mod tests {
 
     #[test]
     fn tree_parses_and_names_the_board() {
-        let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4, kms: true, v3d: true });
+        let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4, kms: true, v3d: true,
+                                   outputs: bcm2711::boot::KmsOutputs { hdmi: true, composite: true } });
         let root = emu_core::fdt::Node::parse(&blob).unwrap();
         let model = root.prop("model").unwrap();
         assert!(model.starts_with(b"Raspberry Pi 3 Model B Plus Rev 1.3"));
@@ -456,5 +473,6 @@ mod tests {
         assert_eq!(bus(crate::machine::USB), 0x7e98_0000);
         assert!(blob.windows(b"usb424,7800".len()).any(|w| w == b"usb424,7800"));
         assert!(blob.windows(6).any(|w| w == crate::machine::ETH_MAC));
+        assert!(blob.windows(b"brcm,bcm2835-vec".len()).any(|w| w == b"brcm,bcm2835-vec"));
     }
 }

@@ -15,6 +15,9 @@
 //! valves and HDMI encoder of `bcm2711::vc4` (`Gen::Bcm2835`), the monitor's EDID on BSC2 (the
 //! DDC bus), hot-plug on GPIO 28 (the 3B's on the firmware's GPIO expander), HDMI audio through
 //! the DMA controller into the MAI FIFO (DREQ 17), and CEC; without it the firmware framebuffer.
+//! The composite encoder (VEC) is pixel valve 2's other output; the device tree lists it when
+//! `config.txt` asks (`dtoverlay=vc4-kms-v3d,composite`), and the host shows whichever of the
+//! two pixel valve 2 drives.
 use crate::intc::{ArmCtrl, LocalIntc};
 use crate::Model;
 use arm_a64::{Cpu, CpuProfile};
@@ -51,6 +54,8 @@ pub const PV1: u64 = 0x3f20_7000;
 pub const HVS: u64 = 0x3f40_0000;
 /// BSC2, the HDMI port's DDC bus
 pub const DDC: u64 = 0x3f80_5000;
+/// the composite video encoder
+pub const VEC: u64 = 0x3f80_6000;
 pub const PV2: u64 = 0x3f80_7000;
 /// the HDMI encoder's "hd" block (MAI audio, VID_CTL)
 pub const HD: u64 = 0x3f80_8000;
@@ -73,6 +78,7 @@ pub const GPU_HDMI1: usize = 41;
 pub const GPU_PV2: usize = 42;
 pub const GPU_PV0: usize = 45;
 pub const GPU_PV1: usize = 46;
+pub const GPU_VEC: usize = 59;
 pub const GPU_GPIO0: usize = 49;
 /// the BSC controllers' shared interrupt
 pub const GPU_I2C: usize = 53;
@@ -143,6 +149,8 @@ pub struct Soc {
     pub ddc: bcm2711::i2c::I2c,
     /// the KMS display pipeline (HVS, pixel valves, HDMI); None: the firmware framebuffer only
     pub vc4: Option<bcm2711::vc4::Vc4>,
+    /// the outputs the device tree lists with the KMS pipeline (HDMI, composite)
+    pub outputs: bcm2711::boot::KmsOutputs,
     /// HDMI audio played since the host last took it (16-bit stereo) and its rate, kept while
     /// the host wants it (`capture_audio`)
     pub audio: Vec<i16>,
@@ -182,6 +190,7 @@ impl Soc {
             PV2..=0x3f80_70ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().pv_read_n(2, a - PV2),
             HDMI..=0x3f90_25ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hdmi_read(a - HDMI),
             HD..=0x3f80_80ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().hd_read(a - HD),
+            VEC..=0x3f80_6fff if self.vc4.is_some() => self.vc4.as_ref().unwrap().vec_read(a - VEC),
             TXP..=0x3f00_401f if self.vc4.is_some() => self.vc4.as_ref().unwrap().txp_read(a - TXP),
             ASB..=0x3f00_a02f => match a & 0xff { 0x20 => 0x6272_6467, o => { let r = self.asb[(o / 4) as usize % 12]; (r & !2) | ((r & 1) << 1) } },
             LOCAL..=0x4000_00ff => self.local.read(a - LOCAL, self.armctrl.irq()),
@@ -214,6 +223,7 @@ impl Soc {
             PV2..=0x3f80_70ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().pv_write_n(2, a - PV2, v),
             HDMI..=0x3f90_25ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hdmi_write(a - HDMI, v),
             HD..=0x3f80_80ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hd_write(a - HD, v),
+            VEC..=0x3f80_6fff if self.vc4.is_some() => self.vc4.as_mut().unwrap().vec_write(a - VEC, v),
             TXP..=0x3f00_401f if self.vc4.is_some() => self.vc4.as_mut().unwrap().txp_write(a - TXP, v),
             LOCAL..=0x4000_00ff => self.local.write(a - LOCAL, v),
             PERIPH..=0x3fff_ffff | 0x4000_0100..=0x4003_ffff => self.note(a),
@@ -239,9 +249,11 @@ impl Soc {
         self.armctrl.set_gpu(GPU_GPIO0 + 1, banks[1]);
         self.armctrl.set_gpu(GPU_I2C, self.ddc.irq());
         if let Some(v) = self.vc4.as_mut() {
-            // the HDMI state machine clock paces the audio; the pixel clock pixel valve 2
+            // the HDMI state machine clock paces the audio; the pixel clock (HDMI) or the VEC
+            // clock (composite) pixel valve 2
             v.audio_clk_hz = self.mbox.rates[13] as u64;
             v.pixel_hz = self.mbox.rates[9] as u64;
+            v.vec_hz = self.mbox.rates[15] as u64;
             v.tick(now);
             for (n, line) in [GPU_PV0, GPU_PV1, GPU_PV2].into_iter().enumerate() { self.armctrl.set_gpu(line, v.irq_pv_n(n)); }
             self.armctrl.set_gpu(GPU_HVS, v.irq_hvs());
@@ -327,13 +339,13 @@ impl Soc {
         }
     }
 
-    /// What HDMI shows, as RGBA: the HVS's composition while the KMS driver drives the display,
-    /// else the firmware framebuffer.
+    /// What the display shows, as RGBA: the HVS's composition while the KMS driver drives HDMI
+    /// or composite, else the firmware framebuffer.
     pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         if let Some(v) = self.vc4.as_ref().filter(|v| v.active()) { return v.render(&self.ram, out); }
         self.mbox.render(&self.ram, out)
     }
-    /// The mode HDMI shows right now (None while the display is off).
+    /// The mode shown right now (None while the display is off).
     pub fn shown_size(&self) -> Option<(u32, u32)> {
         match self.vc4.as_ref() { Some(v) if v.active() => v.size(), _ => self.mbox.fb.allocated.then(|| self.mbox.fb_size()) }
     }
@@ -471,6 +483,7 @@ impl Machine {
             mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(),
             usb: { let mut d = Dwc2::new(); d.port = None; d }, devs: Devices::default(), tree: UsbTree::new(), net: None, asb: [0; 12],
             gpio: bcm2711::gpio::Gpio::new(), dma: bcm2711::dma::Dma::new(), pace_next: None, ddc: bcm2711::i2c::I2c::with_devices(Vec::new()), vc4: None,
+            outputs: Default::default(),
             audio: Vec::new(), audio_rate: 0, capture_audio: false,
             unknown: Vec::new(), dirty: true,
         };
@@ -480,8 +493,8 @@ impl Machine {
         m.soc.tree = usb_tree(model, &mut m.soc.devs);
         // the firmware clocks the BCM2837's firmware lists for Linux: ARM (cpufreq, one operating
         // point at the board's clock), core, V3D, pixel (HDMI's pixel clock), M2MC (the HDMI
-        // state machine)
-        m.soc.mbox.clocks = &[3, 4, 5, 9, 13];
+        // state machine), VEC (composite, 108 MHz)
+        m.soc.mbox.clocks = &[3, 4, 5, 9, 13, 15];
         m.soc.mbox.rates[3] = model.arm_mhz() * 1_000_000;
         // nothing on HDMI's hot-plug line until a monitor is plugged in (`enable_kms`)
         m.soc.gpio.set_input(28, Some(true));
@@ -492,9 +505,11 @@ impl Machine {
     }
 
     /// The KMS display pipeline (`dtoverlay=vc4-kms-v3d`) with a monitor whose preferred mode
-    /// is `w`x`h` plugged into HDMI.
-    pub fn enable_kms(&mut self, w: u32, h: u32) {
+    /// is `w`x`h` plugged into HDMI, and the outputs the device tree lists (the overlay's
+    /// `composite` adds the VEC).
+    pub fn enable_kms(&mut self, w: u32, h: u32, outputs: bcm2711::boot::KmsOutputs) {
         self.soc.vc4 = Some(bcm2711::vc4::Vc4::bcm2835(w, h));
+        self.soc.outputs = outputs;
         self.soc.set_hdmi_connected(self.model, true);
     }
 

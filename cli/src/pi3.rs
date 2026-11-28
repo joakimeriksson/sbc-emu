@@ -28,7 +28,8 @@ impl SerialBoard for Machine {
         }
         if let Some(v) = self.soc.vc4.as_ref() {
             let mode = v.size().map_or("off".to_string(), |(w, h)| format!("{w}x{h}"));
-            eprintln!("[{tag}] HDMI: {mode}, {} frames on pixel valve 2; {} CEC messages", v.frames, v.cec.log.len());
+            let out = match (v.output(), v.tv_norm()) { (Some(bcm2711::vc4::Output::Composite), n) => format!("composite ({})", n.unwrap_or("?")), _ => "HDMI".into() };
+            eprintln!("[{tag}] {out}: {mode}, {} frames on pixel valve 2; {} CEC messages", v.frames, v.cec.log.len());
             if std::env::var_os("SBC_CEC_LOG").is_some() { for l in &v.cec.log { eprintln!("[{tag}] CEC {l}"); } }
         }
         if !self.soc.mbox.unknown.is_empty() {
@@ -137,17 +138,17 @@ fn execute(args: &[String]) -> Result<(), String> {
             None if multi => m.soc.rng.reseed(bcm2711::periph::Rng200::host_seed()),
             None => {}
         }
-        let (k, i, c, asked_kms) = match (&kernel, disk.clone()) {
-            (Some(k), _) => (k.clone(), initrd.clone(), append.clone().unwrap_or_else(|| boot::DEFAULT_CMDLINE.to_string()), false),
+        let (k, i, c, asked_kms, outputs) = match (&kernel, disk.clone()) {
+            (Some(k), _) => (k.clone(), initrd.clone(), append.clone().unwrap_or_else(|| boot::DEFAULT_CMDLINE.to_string()), false, Default::default()),
             (None, Some(mut d)) => {
                 let b = boot::read_sd_boot(&mut d, model)?;
                 if !announced.get() { for n in &b.notes { eprintln!("[pi3] firmware: {n}"); } }
-                (b.kernel, b.initramfs, append.clone().unwrap_or(b.cmdline), b.kms)
+                (b.kernel, b.initramfs, append.clone().unwrap_or(b.cmdline), b.kms, b.outputs)
             }
             (None, None) => return Err("nothing to boot".into()),
         };
         let kms = display && match display_mode { Some(d) => d == "kms", None => asked_kms };
-        if kms { m.enable_kms(hdmi_mode.0, hdmi_mode.1); }
+        if kms { m.enable_kms(hdmi_mode.0, hdmi_mode.1, outputs); }
         if let Some(d) = disk.clone() { m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(Box::new(d))); }
         // SBC_SD_TRACE=1: the SD host's commands and data on stderr; SBC_USB_TRACE=1: USB transfers
         m.soc.sd.trace = std::env::var("SBC_SD_TRACE").is_ok_and(|v| v == "1");
@@ -169,7 +170,10 @@ fn execute(args: &[String]) -> Result<(), String> {
                     Model::B3 => "a hub (the LAN9514's Ethernet is not modelled), USB keyboard and tablet".into(),
                     _ => "a USB keyboard".to_string(),
                 },
-                if kms { format!(", HDMI through the vc4 KMS pipeline (HVS, pixel valves, HDMI with CEC and audio, a {}x{} monitor)", hdmi_mode.0, hdmi_mode.1) } else if display { ", firmware framebuffer".into() } else { String::new() }
+                if kms {
+                    format!(", {}through the vc4 KMS pipeline (HVS, pixel valves, HDMI with CEC and audio, a {}x{} monitor{})",
+                            if outputs.composite { "HDMI and composite " } else { "HDMI " }, hdmi_mode.0, hdmi_mode.1, if outputs.composite { "; the VEC" } else { "" })
+                } else if display { ", firmware framebuffer".into() } else { String::new() }
             );
         }
         boot::boot_linux(&mut m, &k, i.as_deref(), &c, display)?;

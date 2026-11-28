@@ -166,6 +166,8 @@ Each ends with something a script checks, as on the other boards.
    *Check:* Mesa reports `V3D 2.1`; `kmscube`; the GLES 2 scenes of the Pi 4's GL suite against
    llvmpipe; all `glmark2-es2-drm` scenes; the desktop (Pi OS with desktop, labwc) on the GPU.
 8. **Composite video** (VEC). *Check:* `modetest` lists `Composite-1`, a PAL picture over VNC.
+   *Done* (`scripts/rpi3-composite.txt`; the image has `kmsprint`, not `modetest`): PAL and NTSC
+   with `dtoverlay=vc4-kms-v3d,composite` and `sdtv_mode`; HDMI and composite share pixel valve 2.
 9. **Hardware video decode** through VCHIQ and `bcm2835-codec`, decoded on the host. *Check:*
    `v4l2-ctl --list-devices` shows `bcm2835-codec-decode`; `ffmpeg -c:v h264_v4l2m2m` decodes a test
    file bit-exactly against the host's decoder; `bcm2835-audio` plays to the host too.

@@ -306,6 +306,7 @@ fn clock_rate(id: u32) -> u32 {
         12 => 100_000_000,  // EMMC2
         13 => 200_000_000,  // M2MC
         14 => 75_000_000,   // pixel-BVB
+        15 => 108_000_000,  // VEC (the BCM2837's composite encoder): fixed at what vc4_vec.c asks
         _ => 0,
     }
 }

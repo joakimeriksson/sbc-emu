@@ -52,7 +52,16 @@ pub struct SdBoot {
     pub notes: Vec<String>,
     /// config.txt asks for the vc4 KMS driver (`dtoverlay=vc4-kms-v3d`)
     pub kms: bool,
+    /// the KMS outputs the overlay's parameters enable (`composite`, `nohdmi`)
+    pub outputs: KmsOutputs,
 }
+
+/// The outputs `dtoverlay=vc4-kms-v3d` enables: HDMI unless `nohdmi`, the composite encoder
+/// (VEC) with `composite` (the overlay's dormant fragment for the VEC node).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KmsOutputs { pub hdmi: bool, pub composite: bool }
+
+impl Default for KmsOutputs { fn default() -> Self { KmsOutputs { hdmi: true, composite: false } } }
 
 fn gunzip_if_needed(data: Vec<u8>) -> Result<Vec<u8>, String> {
     if data.len() > 18 && data[0] == 0x1f && data[1] == 0x8b {
@@ -83,12 +92,15 @@ pub struct Firmware<'a> {
     pub serial1: &'a str,
     /// the emulated device tree describes the vc4 KMS pipeline `dtoverlay=vc4-kms-v3d` asks for
     pub kms: bool,
+    /// ... and its composite output (`dtoverlay=vc4-kms-v3d,composite`), which the firmware
+    /// then sets up as `enable_tvout` and `sdtv_mode` say
+    pub composite: bool,
 }
 
 /// The Pi 4's firmware: `[pi4]`, serial0 is the PL011 here (the mini UART is the Bluetooth
 /// controller's, or `--serial1`).
 pub const PI4_FIRMWARE: Firmware<'static> = Firmware {
-    sections: &["pi4", "pi400", "board-type=0x11"], arm64_default: true, serial0: "ttyAMA0", serial1: "ttyS0", kms: true,
+    sections: &["pi4", "pi400", "board-type=0x11"], arm64_default: true, serial0: "ttyAMA0", serial1: "ttyS0", kms: true, composite: false,
 };
 
 /// Parse config.txt for a Pi 4 (sections [all] and [pi4] apply) and load kernel, initramfs and
@@ -111,6 +123,14 @@ pub struct BootConfig {
     pub arm64: Option<bool>,
     /// `dtoverlay=vc4-kms-v3d` (on a board whose emulated tree can describe it)
     pub kms: bool,
+    /// the overlay's `composite` and `nohdmi` parameters
+    pub outputs: KmsOutputs,
+    /// `sdtv_mode=` (the composite TV standard: 0 NTSC, 1 NTSC-J, 2 PAL, 3 PAL-M, 16 and 18
+    /// progressive NTSC and PAL), `enable_tvout=`, if given
+    pub sdtv_mode: Option<u32>,
+    pub enable_tvout: Option<bool>,
+    /// `disable_fw_kms_setup=1`: the firmware writes no `video=` options into the command line
+    pub disable_fw_kms_setup: bool,
     /// human-readable notes on what was applied or ignored
     pub notes: Vec<String>,
 }
@@ -142,10 +162,20 @@ pub fn parse_config(config: &str, fw: &Firmware) -> BootConfig {
             ("os_prefix", v) => c.os_prefix = v.to_string(),
             ("auto_initramfs", v) => c.auto_initramfs = v == "1",
             ("arm_64bit", v) => c.arm64 = Some(v != "0"),
-            ("dtoverlay", v) if v.starts_with("vc4-kms-v3d") && fw.kms => {
+            ("dtoverlay", v) if (v == "vc4-kms-v3d" || v.starts_with("vc4-kms-v3d,")) && fw.kms => {
                 c.kms = true;
-                c.notes.push("dtoverlay=vc4-kms-v3d: HDMI through the vc4 KMS driver (the device tree describes it unless --display fb)".into());
+                let params: Vec<&str> = v.split(',').skip(1).map(str::trim).collect();
+                c.outputs = KmsOutputs { hdmi: !params.contains(&"nohdmi"), composite: params.contains(&"composite") };
+                if c.outputs.composite && !fw.composite {
+                    c.outputs.composite = false;
+                    c.notes.push("ignored the composite parameter of vc4-kms-v3d (no composite encoder in this board's model)".into());
+                }
+                let outs = match (c.outputs.hdmi, c.outputs.composite) { (true, true) => "HDMI and composite", (true, false) => "HDMI", (false, true) => "composite", (false, false) => "no output" };
+                c.notes.push(format!("dtoverlay={v}: {outs} through the vc4 KMS driver (the device tree describes it unless --display fb)"));
             }
+            ("sdtv_mode", v) => c.sdtv_mode = v.parse().ok(),
+            ("enable_tvout", v) => c.enable_tvout = Some(v != "0"),
+            ("disable_fw_kms_setup", v) => c.disable_fw_kms_setup = v == "1",
             ("dtoverlay", v) | ("dtparam", v) => c.notes.push(format!("ignored {k}={v} (reduced device tree)", k = k.trim())),
             _ => {}
         }
@@ -160,7 +190,8 @@ pub fn read_sd_boot_for(disk: &mut dyn crate::sdhci::Disk, fw: &Firmware) -> Res
     let &(_, lba, _) = parts.iter().find(|p| matches!(p.0, 0x0b | 0x0c | 0x0e | 0x06 | 0x04)).ok_or("no FAT boot partition in the MBR")?;
     let mut fat = crate::fat::Fat::open(disk, lba).ok_or("boot partition is not FAT16/FAT32")?;
     let config = fat.read_file("config.txt").map(|c| String::from_utf8_lossy(&c).into_owned()).unwrap_or_default();
-    let BootConfig { kernel: mut kernel_name, kernel_set, initramfs: mut initramfs_name, cmdline: mut cmdline_name, os_prefix, auto_initramfs, arm64, mut notes, kms } = parse_config(&config, fw);
+    let BootConfig { kernel: mut kernel_name, kernel_set, initramfs: mut initramfs_name, cmdline: mut cmdline_name, os_prefix, auto_initramfs, arm64, mut notes, kms,
+                     outputs, sdtv_mode, enable_tvout, disable_fw_kms_setup } = parse_config(&config, fw);
     if arm64 == Some(false) {
         return Err("config.txt asks for a 32-bit kernel (arm_64bit=0): not supported".into());
     }
@@ -182,10 +213,34 @@ pub fn read_sd_boot_for(disk: &mut dyn crate::sdhci::Disk, fw: &Firmware) -> Res
     let initramfs = match &initramfs_name { Some(n) => Some(fat.read_file(n).ok_or(format!("{n} not found"))?), None => None };
     let cmdline = fat.read_file(&cmdline_name).map(|c| String::from_utf8_lossy(&c).trim().to_string()).unwrap_or_default();
     // the firmware resolves the serialN aliases
-    let cmdline = cmdline.replace("console=serial0", &format!("console={}", fw.serial0)).replace("console=serial1", &format!("console={}", fw.serial1));
+    let mut cmdline = cmdline.replace("console=serial0", &format!("console={}", fw.serial0)).replace("console=serial1", &format!("console={}", fw.serial1));
+    if kms && outputs.composite {
+        match composite_video(sdtv_mode, enable_tvout, disable_fw_kms_setup) {
+            Ok(video) => { notes.push(format!("composite: {video} added to the command line")); cmdline = format!("{cmdline} {video}"); }
+            Err(why) => notes.push(format!("composite: {why}")),
+        }
+    }
     notes.insert(0, format!("kernel {kernel_name} ({} bytes), initramfs {}, cmdline from {cmdline_name}", kernel.len(),
         initramfs_name.as_deref().unwrap_or("none")));
-    Ok(SdBoot { kernel, initramfs, cmdline, notes, kms })
+    Ok(SdBoot { kernel, initramfs, cmdline, notes, kms, outputs })
+}
+
+/// The firmware's `video=` option for the composite output (its format string is
+/// `video=Composite-1:%ux%u@%u%s`), from `sdtv_mode`: the mode Linux's `vc4` then prefers on
+/// `Composite-1`, and with it the TV standard (`vc4.tv_norm` defaults to PAL for a 50 Hz mode,
+/// to NTSC otherwise). None with `disable_fw_kms_setup=1` (the kernel's defaults apply) or
+/// `enable_tvout=0` (composite off in the firmware).
+pub fn composite_video(sdtv_mode: Option<u32>, enable_tvout: Option<bool>, disable_fw_kms_setup: bool) -> Result<String, String> {
+    if enable_tvout == Some(false) { return Err("enable_tvout=0: the firmware leaves the composite output unconfigured (no video= option)".into()); }
+    if disable_fw_kms_setup { return Err("disable_fw_kms_setup=1: no video= option from the firmware; Linux's defaults apply (NTSC unless vc4.tv_norm= says otherwise)".into()); }
+    let (h, rate, i) = match sdtv_mode.unwrap_or(0) {
+        0 | 1 | 3 => (480, 60, "i"), // NTSC, NTSC-J, PAL-M: 525 lines
+        2 => (576, 50, "i"),         // PAL
+        16 => (240, 60, ""),         // progressive NTSC
+        18 => (288, 50, ""),         // progressive PAL
+        n => return Err(format!("sdtv_mode={n} is not a TV standard the firmware knows; no video= option")),
+    };
+    Ok(format!("video=Composite-1:720x{h}@{rate}{i}"))
 }
 
 #[cfg(test)]
@@ -199,12 +254,27 @@ mod tests {
         let pi4 = parse_config(CONFIG, &PI4_FIRMWARE);
         assert_eq!((pi4.kernel.as_str(), pi4.cmdline.as_str(), pi4.initramfs.as_deref()), ("pi4.img", "cmdline.txt", Some("extra.cpio")));
         assert!(pi4.auto_initramfs && pi4.arm64 == Some(true));
-        let pi3 = Firmware { sections: &["pi3", "pi3+"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true };
+        let pi3 = Firmware { sections: &["pi3", "pi3+"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true };
         let c = parse_config(CONFIG, &pi3);
         assert!(!c.kms);
         assert!(parse_config("[pi3]\ndtoverlay=vc4-kms-v3d,cma-128\n", &pi3).kms);
         assert!(!parse_config("[pi4]\ndtoverlay=vc4-kms-v3d\n", &pi3).kms);
         assert_eq!((c.kernel.as_str(), c.cmdline.as_str(), c.initramfs.as_deref()), ("pi3.img", "plus.txt", Some("extra.cpio")));
         assert!(c.kernel_set);
+    }
+
+    #[test]
+    fn composite_from_the_overlay_and_sdtv_mode() {
+        let pi3 = Firmware { sections: &["pi3"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true };
+        let c = parse_config("dtoverlay=vc4-kms-v3d\ndisable_fw_kms_setup=1\n", &pi3);
+        assert_eq!((c.outputs, c.disable_fw_kms_setup), (KmsOutputs { hdmi: true, composite: false }, true));
+        let c = parse_config("dtoverlay=vc4-kms-v3d,cma-128,composite\nsdtv_mode=2\n", &pi3);
+        assert_eq!((c.outputs, c.sdtv_mode), (KmsOutputs { hdmi: true, composite: true }, Some(2)));
+        assert_eq!(parse_config("dtoverlay=vc4-kms-v3d,composite,nohdmi\n", &pi3).outputs, KmsOutputs { hdmi: false, composite: true });
+        // the Pi 4 model has no VEC: the parameter is reported and ignored
+        assert!(!parse_config("dtoverlay=vc4-kms-v3d,composite\n", &PI4_FIRMWARE).outputs.composite);
+        assert_eq!(composite_video(Some(2), None, false).as_deref(), Ok("video=Composite-1:720x576@50i"));
+        assert_eq!(composite_video(None, Some(true), false).as_deref(), Ok("video=Composite-1:720x480@60i"));
+        assert!(composite_video(Some(2), None, true).is_err() && composite_video(Some(2), Some(false), false).is_err());
     }
 }
