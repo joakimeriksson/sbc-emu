@@ -195,7 +195,7 @@ pub fn etc1_pixel(b: &[u8; 8], x: u32, y: u32) -> [u8; 4] {
 
 fn wrap(i: i32, n: i32, mode: u32) -> Option<i32> {
     match mode {
-        WRAP_REPEAT => Some(i.rem_euclid(n)),
+        WRAP_REPEAT => Some(if n & (n - 1) == 0 { i & (n - 1) } else { i.rem_euclid(n) }),
         WRAP_MIRROR => { let p = i.rem_euclid(2 * n); Some(if p < n { p } else { 2 * n - 1 - p }) }
         WRAP_BORDER => if i < 0 || i >= n { None } else { Some(i) },
         _ => Some(i.clamp(0, n - 1)),
@@ -247,16 +247,40 @@ pub fn cube_face(s: f32, t: f32, r: f32) -> (u32, f32, f32) {
     (face, (sc / ma + 1.0) * 0.5, (tc / ma + 1.0) * 0.5)
 }
 
+/// A texture setup: the decoded configuration and its levels' addresses and layouts.
+type Setup = std::rc::Rc<(Tex, Vec<(u32, Layout)>)>;
+
+thread_local! {
+    /// Setups by configuration words, per host thread. The VideoCore IV's texture state is all
+    /// in the words (no records in memory, no MMU), so an entry never goes stale.
+    static SETUPS: std::cell::RefCell<std::collections::HashMap<([u32; 4], usize), Setup>> = Default::default();
+}
+
+/// The setup of the configuration words `cfg` (decoded once, then from the cache).
+fn setup(cfg: &[u32]) -> Setup {
+    let mut key = ([0u32; 4], cfg.len().min(4));
+    key.0[..key.1].copy_from_slice(&cfg[..key.1]);
+    SETUPS.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(s) = c.get(&key) { return s.clone(); }
+        if c.len() >= 1024 { c.clear(); }
+        let t = Tex::new(cfg);
+        let s: Setup = std::rc::Rc::new((t, t.level_bases()));
+        c.insert(key, s.clone());
+        s
+    })
+}
+
 /// Run a texture request: coordinates S, T, R, B as written (lanes in `mask`), the
 /// configuration words, whether LODs come from fragment quads.
 pub fn lookup(coord: &[Option<V>; 4], cfg: &[u32], mask: u16, fragment: bool, mem: &mut Mem) -> V {
-    let t = Tex::new(cfg);
     if cfg.len() < 2 { crate::log_first("vc4: TMU request with fewer than two configuration words"); }
+    let setup = setup(cfg);
+    let (t, bases) = (&setup.0, &setup.1[..]);
     let s_in = coord[0].unwrap_or(ZERO);
     let t_in = coord[1].unwrap_or(ZERO);
     let r_in = coord[2];
     let b_in = coord[3];
-    let bases = t.level_bases();
     let mut ss = [0f32; 16];
     let mut ts = [0f32; 16];
     let mut faces = [0u32; 16];
@@ -295,22 +319,22 @@ pub fn lookup(coord: &[Option<V>; 4], cfg: &[u32], mask: u16, fragment: bool, me
             let face_off = faces[i].wrapping_mul(t.cube_stride);
             let maxl = t.levels as f32;
             let px: [f32; 4] = if lod <= 0.0 {
-                sample_level(&t, 0, &bases, face_off, ss[i], ts[i], !t.mag_nearest, border, mem)
+                sample_level(t, 0, bases, face_off, ss[i], ts[i], !t.mag_nearest, border, mem)
             } else {
                 let lod = lod.min(maxl);
                 match t.minfilt {
-                    0 | 1 => sample_level(&t, 0, &bases, face_off, ss[i], ts[i], t.minfilt == 0, border, mem),
+                    0 | 1 => sample_level(t, 0, bases, face_off, ss[i], ts[i], t.minfilt == 0, border, mem),
                     2 | 4 => {
                         let l = ((lod + 0.5).ceil() - 1.0).clamp(0.0, maxl) as u32;
-                        sample_level(&t, l, &bases, face_off, ss[i], ts[i], t.minfilt == 4, border, mem)
+                        sample_level(t, l, bases, face_off, ss[i], ts[i], t.minfilt == 4, border, mem)
                     }
                     _ => {
                         let lin = t.minfilt == 5;
                         let l = lod.floor() as u32;
                         let fr = lod - l as f32;
-                        let a = sample_level(&t, l, &bases, face_off, ss[i], ts[i], lin, border, mem);
+                        let a = sample_level(t, l, bases, face_off, ss[i], ts[i], lin, border, mem);
                         if l >= t.levels || fr == 0.0 { a } else {
-                            let b = sample_level(&t, l + 1, &bases, face_off, ss[i], ts[i], lin, border, mem);
+                            let b = sample_level(t, l + 1, bases, face_off, ss[i], ts[i], lin, border, mem);
                             std::array::from_fn(|c| a[c] * (1.0 - fr) + b[c] * fr)
                         }
                     }

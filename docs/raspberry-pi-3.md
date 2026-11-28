@@ -44,6 +44,40 @@ card.
 | Snapshot round trip | a snapshot saved after the first boot (`save` in a script) resumes with `--restore` on the image opened copy-on-write again: the sectors the first boot wrote come with it (the card's overlay is in the snapshot), new writes read back past the page cache, the USB keyboard and the network work | `scripts/rpi3-restore.txt` on the snapshots of `rpi3-firstboot.txt` (3B+) and the three model scripts; a unit test (`snapshots_carry_the_cards_written_sectors`) |
 | In the browser (`web/rpi3.html`) | the same machine as WebAssembly with the `arm-a64` JIT to WebAssembly: the four models; the Pi kernel with a BusyBox initramfs (the shell on the serial console, the framebuffer console on screen), or the visitor's own Pi OS card (`.img`, `.img.xz`, `.img.gz`, read where it is) booted like the firmware, HDMI through `vc4` KMS to a 1280×720 monitor, the USB keyboard and tablet, HDMI audio | `tools/wasm-smoke-rpi3.mjs`: the BusyBox shell and four cores busy in 4.0 s (415 MIPS); Pi OS Lite to `raspberrypi login:` in 202 s (29.7 G instructions, 147 MIPS, 219 MiB of the card read) with the first-boot wizard on the 720p screen; the page itself in headless Chrome (the 3B's shell answering on the serial console) |
 
+### 3D GPU speed
+
+The VideoCore IV model renders a job's tiles, and runs its vertex and coordinate shaders, on
+several host threads (`SBC_VC4_THREADS`, default the host's cores minus two, at most 16; the
+browser stays on one), as the Pi 4's V3D model does; the QPUs are interpreted, with a fast path
+for plain ALU instructions ([details](raspberry-pi-3-gpu.md#parallel-rendering)). Images are
+byte-identical with 1 and 16 threads and with `--threads multi`.
+
+glmark2-es2-drm at 1920×1080 (`scripts/rpi3-glmark2-scenes.txt`: the Pi 4's scenes, 5 s each,
+from the snapshot of `scripts/rpi3-v3d.txt`, `--threads multi` so the guest's clock is the host's;
+Apple M5 Max with 18 cores, shared with other sessions: load average 5–15 during the runs; the
+same in two rounds within 1–3 fps):
+
+| Scene | before (one thread, no fast path) | 1 thread | 16 threads |
+|---|---|---|---|
+| build | 46 fps | 62 fps | 232 fps |
+| texture (linear) | 23 fps | 30 fps | 208 fps |
+| shading (phong) | 11 fps | 19 fps | 99 fps |
+| bump (high-poly) | 9 fps | 16 fps | 54 fps |
+| effect2d (3×3 kernel) | 4 fps | 5 fps | 35 fps |
+| desktop (shadow) | 3 fps | 4 fps | 28 fps |
+| jellyfish | 4 fps | 5 fps | 33 fps |
+| shadow | 10 fps | 15 fps | 73 fps |
+| refract | 654 ms/frame | 442 ms/frame | 84 ms/frame |
+| terrain | 3818 ms/frame | 2629 ms/frame | 315 ms/frame |
+| Score | 10 | 15 | 76 |
+
+("before" is the first build of this work with the parallel rendering on one thread, before the QPU
+fast path, texture setup cache and faster tile stores, at load 13–16.) **What limits it now**, on
+every worker: the interpreted QPUs (35–63% of a frame's host time), the TMU in textured scenes
+(27–53%), and the binning after the coordinate shader, which stays on one thread and keeps the
+light scenes (build, bump, shadow) from scaling further. A QPU JIT would be worth 1.2–1.9x per
+frame by [this estimate](raspberry-pi-3-gpu.md#would-a-qpu-jit-be-next).
+
 ## The emulated hardware
 
 | Block | Model | Linux driver |

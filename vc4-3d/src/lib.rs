@@ -21,6 +21,7 @@ pub mod capture;
 pub mod cl;
 pub mod disasm;
 pub mod mem;
+pub mod par;
 pub mod qpu;
 pub mod render;
 pub mod shade;
@@ -150,6 +151,8 @@ const MAX_DELAY_NS: u64 = 50_000_000;
 /// thread.
 pub struct Exec {
     pub code: qpu::Code,
+    /// host threads for a job's work, and their instruction caches
+    pub par: par::Par,
     pub tb: tlb::TileBuffer,
     pub insns: u64,
     /// bin jobs, render jobs; host ns in each
@@ -181,7 +184,7 @@ pub enum Done {
 
 impl Exec {
     fn new() -> Exec {
-        Exec { code: qpu::Code::default(), tb: tlb::TileBuffer::new(), insns: 0, jobs: [0; 2], host_ns: [0; 2], fragments: 0, prims: 0,
+        Exec { code: qpu::Code::default(), par: par::Par::default(), tb: tlb::TileBuffer::new(), insns: 0, jobs: [0; 2], host_ns: [0; 2], fragments: 0, prims: 0,
                capture: std::env::var("SBC_VC4_CAPTURE").ok().filter(|s| !s.is_empty()), track: None,
                dump: std::env::var("SBC_VC4_DUMP").ok().filter(|s| !s.is_empty()), frames: 0 }
     }
@@ -193,9 +196,13 @@ impl Exec {
         if self.capture.is_some() { m.capture = Some(Default::default()); }
         m.written = self.track.take();
         self.code.clear();
+        self.par.clear();
+        // a job being captured runs on one thread (the capture records every page it touches)
+        let threads = self.par.threads;
+        if m.capture.is_some() { self.par.threads = 1; }
         let d = match *job {
             Job::Bin { start, end } => {
-                let out = bin::run(start, end, &mut m, &mut self.code, &mut self.insns);
+                let out = bin::run(start, end, &mut m, &mut self.code, &mut self.par, &mut self.insns);
                 self.jobs[0] += 1;
                 self.prims += out.prims;
                 let ns = t0.ns();
@@ -205,7 +212,7 @@ impl Exec {
             }
             Job::Render { start, end } => {
                 let mut s = sem;
-                let mut r = render::Render::new(&mut self.tb, &mut m, &mut self.code, &mut self.insns);
+                let mut r = render::Render::new(&mut self.tb, &mut m, &mut self.code, &mut self.insns, &mut self.par);
                 r.run(start, end, &mut s);
                 let out = r.out;
                 let frame = r.frame;
@@ -222,6 +229,7 @@ impl Exec {
                 Done::Render { end, out, sem_used: sem - s, ns }
             }
         };
+        self.par.threads = threads;
         self.track = m.written.take();
         if let (Some(dir), Some(pages)) = (self.capture.as_ref(), m.capture.take()) {
             capture::append(dir, job, sem, &pages);
@@ -501,6 +509,10 @@ impl V3d {
         }
         self.collect(ram);
     }
+
+    /// Wait for the job on the GPU thread to end (before guest RAM goes away: the thread reads
+    /// and writes it until the job is done).
+    pub fn stop(&mut self) { self.drain(); }
 
     /// Wait for the GPU thread and drop what it was doing (reset).
     fn drain(&mut self) {

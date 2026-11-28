@@ -199,6 +199,12 @@ pub struct Soc {
     pub dirty: bool,
 }
 
+impl Drop for Soc {
+    /// A GPU job may still be running on the V3D's thread: it uses `ram` (dropped before `v3d`)
+    /// until it ends.
+    fn drop(&mut self) { self.v3d.stop(); }
+}
+
 impl Soc {
     /// The RAM Linux gets (below the VideoCore's share).
     pub fn arm_ram(&self) -> u64 { self.arm_ram }

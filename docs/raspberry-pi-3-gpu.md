@@ -39,9 +39,57 @@ thread, CTnCA reads move, so the kernel's hang check sees progress. Snapshots ke
 pending interrupts, the clear values and a binning job waiting for memory (or finished on the GPU
 thread but not collected yet).
 
+### Parallel rendering
+
+The VideoCore IV's twelve QPUs shade several tiles at once, and the binning job has already
+written every tile's list, so the tiles of a rendering job are independent. The model renders them
+on several host threads, as the [Pi 4's V3D model](gpu.md#parallel-rendering) does
+(`vc4-3d/src/par.rs`; `SBC_VC4_THREADS`, default the host's cores minus two, at most 16; the
+browser build stays on one thread). The QPUs stay interpreted.
+
+- **Tiles:** the rendering list the kernel builds is walked first: each tile's packets (its
+  loads, tile coordinates, the branch into its list, its stores) up to the store that clears the
+  whole tile buffer become one work item; the tiles between two other packets (the configuration,
+  clear colours) are queued and rendered together, each worker taking the next tile with its own
+  tile buffer, fragment-shader QPU, view of guest memory and instruction cache. On one thread a
+  tile starts from the buffer the previous tile's last store cleared; a worker clears its buffer
+  before each tile, which is the same (the first tile of the queue starts from the buffer as it
+  is). A tile list that stops the job (a halt, a bad packet) is found before the tiles are
+  handed out, and nothing after it is rendered, as on one thread.
+- **Vertices:** before the tiles are rendered, their lists are scanned for the vertices they use,
+  and all workers run the vertex shader over them in 128-vertex chunks (8 batches of 16) into a
+  cache the render workers share. A binning job does the same for the coordinate shader over all
+  its draws before binning them (the binning itself stays on one thread). A vertex's outputs do
+  not depend on the other vertices of its batch, so this gives the same outputs as one thread,
+  which shades vertices as the primitives ask for them.
+- **No thread indices or shared VPM:** unlike the V3D 4.2, the VideoCore IV has no per-thread
+  scratch memory (Mesa's `vc4` compiler does not spill to memory), each vertex batch gets a VPM of
+  its own, and the GL pipeline's shaders use no semaphores; user QPU programs (which do) are not
+  part of this and still run in turns. The TMU and the uniform streams are per QPU, as before.
+- **Capture:** a job being captured (`SBC_VC4_CAPTURE`) runs on one thread, so the capture
+  records each page as it was before the job.
+
+**Check:** a unit test (`threads_render_the_same`) renders five scenes (depth-tested Gouraud
+quads with Z stores; additive blending over loaded tiles; mipmapped textures, points, lines and a
+clipped triangle; 4x multisampling with stencil; a tile list that halts) with 1, 2, 5 and 16
+threads and compares all of memory byte for byte. In the guest, see [results](#results-in-the-guest).
+
+### QPU fast path and caches
+
+As in the Pi 4's model, the instruction cache keeps a pre-decoded flag with each instruction: an
+ALU instruction without pack, unpack or vector rotation (most of what Mesa emits outside colour
+packing and texture results) runs a lean path (`Qpu::alu_fast`) that reads registers in place and
+writes plain registers directly; the rest takes the general path. `SBC_VC4_QPU_FAST=0` sends
+everything to the general path; a test (`fast_path_matches_general_path`) runs random fast-path
+instructions on random registers (special floats included) through both and compares registers,
+flags, uniforms and the VPM. Texture setups (the decoded configuration words and the mip levels'
+addresses and layouts) are cached per host thread by their configuration words (the VideoCore IV
+keeps no texture state in memory, so an entry never goes stale), the shaded-vertex cache hashes
+with a multiplicative hash instead of SipHash, and the T and LT addressing uses shifts.
+
 ## Tests
 
-`cargo test -p vc4-3d` (57 tests) and `cargo test -p bcm2837` (`v3d_on_the_bus`):
+`cargo test -p vc4-3d` (59 tests) and `cargo test -p bcm2837` (`v3d_on_the_bus`):
 
 - QPU: every add and multiply operation against Rust references, flags and all conditions
   (integer carry and borrow, float sign), packs and unpacks (16-bit float and integer halves,
@@ -63,7 +111,8 @@ thread but not collected yet).
   lines; 4x multisampling resolved; the out-of-memory wait with the kernel's overflow chunks; done
   interrupts after host time; jobs on the GPU thread (`--threads multi`); a snapshot while waiting
   for memory; identification as Mesa reads it;
-  capture and replay.
+  capture and replay; the same memory, byte for byte, with 1, 2, 5 and 16 render threads
+  (`threads_render_the_same`); the QPU fast path against the general path.
 - The machine: the registers at 0x3fc0_0000, a job writing RAM through the 0xc000_0000 alias, the
   interrupt at the ARM-side controller and its acknowledgement, a snapshot round trip.
 
@@ -73,6 +122,8 @@ thread but not collected yet).
 - `SBC_VC4_CL=1`: every control-list packet both threads execute (tile lists included).
 - `SBC_VC4_TRACE=N`: the first N QPU instructions, disassembled.
 - `SBC_VC4_DUMP=dir`: each finished frame as a PPM.
+- `SBC_VC4_THREADS=N`: host threads for a job's tiles and vertices (default: cores − 2, at most 16).
+- `SBC_VC4_QPU_FAST=0`: every QPU instruction on the general interpreter path.
 - `SBC_VC4_CAPTURE=dir`: every job with the RAM pages it touches (as they were before it ran) in
   `dir/jobs.bin`; `vc4-replay dir/jobs.bin [first] [count]` (`cargo run --release -p vc4-3d
   --bin vc4-replay`) runs them again on the host in milliseconds, with the options above. This is
@@ -80,14 +131,66 @@ thread but not collected yet).
 
 ## Performance
 
-The interpreter: a 1920x1080 frame of 7680 Gouraud-shaded, depth-tested triangles with 4x overdraw
-(8.3 M fragments, 10 M QPU instructions of 16 lanes) renders in about 310 ms of host time on an
-M-series Mac (`cargo test --release -p vc4-3d -- --ignored bench --nocapture`); the QPU
-interpreter takes about two thirds of it, rasterization and the tile buffer the rest. By that
-measure a frame with one screen's worth of simple shading (kmscube's scale) should take some
-40–80 ms; guest workloads will tell. A QPU JIT
-(to AArch64 and WebAssembly, as the Maxwell shader JIT) would take the larger part away; it is
-worth doing once guest workloads (glmark2, the desktop) show where the time goes.
+A 1920x1080 frame of 7680 Gouraud-shaded, depth-tested triangles with 4x overdraw (8.3 M
+fragments, 10 M QPU instructions of 16 lanes; `cargo test --release -p vc4-3d -- --ignored bench
+--nocapture`): about 310 ms of host time before the work below, 237 ms on one thread with the QPU
+fast path, 50 ms with 16 threads (Apple M5 Max, 18 cores, shared with other jobs: load 9–13).
+
+**Replays** of glmark2's scenes captured in the guest (1 s of each at 1920x1080,
+`SBC_VC4_CAPTURE`, then `vc4-replay` with `SBC_VC4_THREADS=1` and `16`; whole replay including
+page restores, best of two, host load 16–17). Every frame and every job's statistics are the
+same with 1 and 16 threads:
+
+| Scene | jobs | 1 thread | 16 threads | |
+|---|---|---|---|---|
+| build | 54 | 706 ms | 297 ms | 2.4x |
+| texture (linear) | 32 | 704 ms | 168 ms | 4.2x |
+| shading (phong) | 21 | 727 ms | 191 ms | 3.8x |
+| bump (high-poly) | 21 | 797 ms | 285 ms | 2.8x |
+| effect2d (3×3 kernel) | 11 | 1195 ms | 173 ms | 6.9x |
+| desktop (shadow) | 38 | 1253 ms | 239 ms | 5.3x |
+| jellyfish | 13 | 1087 ms | 199 ms | 5.5x |
+| shadow | 47 | 769 ms | 243 ms | 3.2x |
+| refract | 57 | 855 ms | 212 ms | 4.0x |
+| terrain | 276 | 4186 ms | 510 ms | 8.2x |
+
+The scenes with little work per frame (build, bump, shadow) gain least: their binning (after
+the coordinate shader) and the tile stores between jobs stay on one thread, and short jobs pay
+for starting the workers. A 1080p rendering job alone scales 8–10x (terrain's 1177 ms to
+113 ms, a 1080p job of 3.2 M fragments 263 ms to 35 ms).
+
+**Where the time goes now**, one thread, by scene (samply on the replays):
+
+| Scene | QPU (fragment) | QPU (vertex, coordinate) | TMU | tile loads/stores | rasterization, TLB, varyings | binning, vertex cache |
+|---|---|---|---|---|---|---|
+| shading (phong) | 56% | 7% | – | 10% | 13% | 9% |
+| effect2d | 48% | – | 39% | 4% | 9% | – |
+| jellyfish | 44% | 2% | 27% | 4% | 21% | 1% |
+| terrain | 35% | 2% | 53% | 2% | 5% | 2% |
+| build | 12% | 12% | – | 33% | 23% | 11% |
+
+(build's tile stores were measured before they went a utile row at a time, which took its replay
+from 706 to 478 ms on one thread.) The fast path takes 63% (effect2d) to 96% (phong) of the ALU
+instructions; the rest are colour packs and texture-result unpacks on the general path.
+
+### Would a QPU JIT be next?
+
+The QPUs are still interpreted, on every worker. A shader JIT like the Jetson Nano's
+(`maxwell-shader/`: AArch64 and WebAssembly backends) would compile each QPU program once per job
+(Mesa's are tens to a few hundred instructions), keep
+each 16-lane register in four NEON registers, and resolve operands, conditions, flags and
+packs at compile time. Of the QPU time above, a third to a half is the lane arithmetic itself;
+the rest is dispatch, operand copies and the general path's packing. Estimate: QPU time 2.5–4x
+lower, so frames on one thread about **1.6–1.9x faster in ALU-bound scenes** (phong), **1.4–1.55x** in
+texture-heavy ones (effect2d, jellyfish), **1.2–1.4x** in terrain and build, where the TMU and the tile stores remain. With 16 threads the rendering
+jobs gain about as much, the frame rate a little less (binning stays serial): roughly a
+glmark2 score of 90–110 instead of 70. In the browser, which renders on one thread, the
+WebAssembly backend matters more than the native one.
+
+So the JIT is the largest single step left, but the TMU (texel addressing, format decoding,
+filtering per lane: up to half of a frame in texture-heavy scenes) is a cheaper one of a similar
+size there: fetch paths per format and layout and integer bilinear filtering would take a good
+part of it without a code generator.
 
 ## Results in the guest
 
@@ -128,6 +231,14 @@ gouraud 41; ideas 25; pulsar 26; desktop blur 2, shadow 10; terrain 3; refract 5
 jellyfish 21. The pictures were not compared against a reference (glmark2's own `--validate`
 references do not match llvmpipe either, as on the Pi 4).
 
+**On several host threads** (the [parallel rendering](#parallel-rendering)): the GLES 2 scenes
+above give byte-identical images (the same checksum over all of them) with the default threads,
+with `SBC_VC4_THREADS=1` and with `--threads multi`, and still 23 of 24 against llvmpipe. glmark2
+frame by frame through `vc4-replay`: see [Performance](#performance). Frame rates with 1 thread
+and with the default (16 here), `--threads multi` so the guest's clock is the host's and nothing
+caps a job's time: the table in [raspberry-pi-3.md](raspberry-pi-3.md#3d-gpu-speed)
+(`scripts/rpi3-glmark2-scenes.txt`, the Pi 4's scenes, 5 s each).
+
 ## Not modelled or not verified yet
 
 - Early Z is not used to skip fragments (results are the same: the late test decides).
@@ -141,4 +252,5 @@ references do not match llvmpipe either, as on the Pi 4).
 ## Remaining
 
 - The desktop (Pi OS with desktop, labwc) on the GPU.
-- A QPU JIT (AArch64 and WebAssembly) once workloads show the interpreter is the bottleneck.
+- A QPU JIT (AArch64 and WebAssembly): 1.2–1.9x per frame by the [estimate](#would-a-qpu-jit-be-next); faster TMU paths.
+- Binning after the coordinate shader is serial.

@@ -1,0 +1,12 @@
+# glmark2-es2-drm on the Raspberry Pi 3's VideoCore IV (vc4-3d): the scenes of the Pi 4's table
+# in docs/gpu.md, 5 s each, 1920x1080 on HDMI, from the snapshot of scripts/rpi3-v3d.txt. For the
+# per-scene frame rates in docs/raspberry-pi-3-gpu.md: with --threads multi guest time follows
+# the host's clock, so the rates are what the host manages; SBC_VC4_THREADS sets the GPU's
+# host threads (1 against the default).
+#   sbc-emu run --board pi3b --sd cache/os/raspios-gpu.img --restore out/rpi3-v3d.snap \
+#       --threads multi --script scripts/rpi3-glmark2-scenes.txt --timeout 3600
+serial \r
+wait-serial pi@raspberrypi
+serial glmark2-es2-drm -b build:duration=5 -b texture:texture-filter=linear:duration=5 -b shading:shading=phong:duration=5 -b bump:bump-render=high-poly:duration=5 -b 'effect2d:kernel=0,1,0;1,-4,1;0,1,0;:duration=5' -b desktop:effect=shadow:windows=4:duration=5 -b jellyfish:duration=5 -b shadow:duration=5 -b refract:duration=5 -b terrain:duration=5 2>&1 | grep --color=never -E 'GL_RENDERER|FPS|Score|rror'; echo GLMARK-$((6*7))\r
+wait-serial GLMARK-42
+quit
