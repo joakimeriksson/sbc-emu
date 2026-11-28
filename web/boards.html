@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sbc-emu: single-board computers emulated in Rust</title>
-<meta name="description" content="Seven single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. All of them boot in your browser.">
+<meta name="description" content="Eight single-board computers emulated instruction by instruction in Rust, running their own operating systems unmodified. All of them boot in your browser.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
@@ -177,6 +177,17 @@
       <rect class="port" x="6.5" y="48.5" width="9" height="7.2" rx="2.5"/><rect class="port" x="22" y="50" width="7" height="5.7" rx="1"/><rect class="port" x="35.5" y="50" width="7" height="5.7" rx="1"/><rect class="port" x="50" y="47" width="7" height="8.7" rx="3.5"/>
     </symbol>
 
+    <symbol id="b-pi3" viewBox="0 0 85 56">
+      <rect class="pcb" x=".3" y=".3" width="84.4" height="55.4" rx="3"/>
+      <circle class="hole" cx="3.5" cy="3.5" r="1.4"/><circle class="hole" cx="61.5" cy="3.5" r="1.4"/><circle class="hole" cx="3.5" cy="52.5" r="1.4"/><circle class="hole" cx="61.5" cy="52.5" r="1.4"/>
+      <rect class="hdr" transform="translate(7.6 1)" width="50.8" height="5.08"/>
+      <path class="trace" d="M37 30h8l4 4h14M37 22h6l3-3h20M27 33v10l-4 4v2M33 33v12M22 25h-8l-4 4v12"/>
+      <rect class="chip" x="22" y="18" width="15" height="15" rx=".6"/><text class="lbl" x="29.5" y="26.4">BCM2837</text>
+      <rect class="ram" x="44" y="24" width="9" height="9" rx=".5"/>
+      <rect class="port" x="66" y="3" width="18.7" height="14" rx=".6"/><rect class="port" x="66" y="20.5" width="18.7" height="14" rx=".6"/><rect class="port" x="63.5" y="38" width="21.2" height="16" rx=".6"/>
+      <rect class="port" x="6.5" y="50" width="8" height="5.7" rx="1"/><rect class="port" x="25" y="44" width="15" height="11.7" rx="1"/><rect class="port" x="50" y="47" width="7" height="8.7" rx="3.5"/>
+    </symbol>
+
     <symbol id="b-opi1" viewBox="0 0 69 48">
       <rect class="pcb" x=".3" y=".3" width="68.4" height="47.4" rx="2.5"/>
       <circle class="hole" cx="3" cy="3" r="1.4"/><circle class="hole" cx="66" cy="3" r="1.4"/><circle class="hole" cx="3" cy="45" r="1.4"/><circle class="hole" cx="66" cy="45" r="1.4"/>
@@ -266,17 +277,17 @@
       <div class="actions">
         <a class="pad-btn" href="hello.html"><span class="via" aria-hidden="true"></span>Power on a Raspberry Pi 4</a>
         <a class="quiet" href="gpu.html">3D on its GPU</a>
-        <a class="quiet" href="#boards">See all seven boards</a>
+        <a class="quiet" href="#boards">See all eight boards</a>
       </div>
     </div>
     <div>
       <a class="film" href="https://www.youtube.com/watch?v=LDYEcrK_I24"><img src="film-thumbnail.jpg" width="960" height="540" alt="">The 0.1.0 announcement film, 70 seconds, on YouTube</a>
-      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. All seven boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
+      <p>sbc-emu runs each board’s own operating system, unmodified, on CPU cores and SoC models written from scratch in Rust. All eight boot right here, compiled to WebAssembly and running on your computer, not on a server.</p>
       <dl class="tally">
-        <dt>7</dt><dd>boards</dd>
+        <dt>8</dt><dd>boards</dd>
         <dt>4</dt><dd>instruction sets</dd>
-        <dt>6</dt><dd>GPUs</dd>
-        <dt>7</dt><dd>boot in your browser</dd>
+        <dt>7</dt><dd>GPUs</dd>
+        <dt>8</dt><dd>boot in your browser</dd>
       </dl>
     </div>
   </section>
@@ -285,12 +296,13 @@
     <span class="fid a" aria-hidden="true"></span><span class="fid b" aria-hidden="true"></span><span class="fid c" aria-hidden="true"></span>
     <ul class="lineup">
       <li><a class="unit on" href="#pi4" style="--w:85;--i:0"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-pi4"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Raspberry Pi 4</a></li>
-      <li><a class="unit on" href="#orangepi-one" style="--w:69;--i:1"><svg viewBox="0 0 69 48" aria-hidden="true"><use href="#b-opi1"/><circle class="glow" cx="5" cy="37" r="4"/><circle class="led" cx="5" cy="37" r="1.1"/></svg>Orange Pi One</a></li>
-      <li><a class="unit on" href="#orangepi-rv" style="--w:89;--i:2"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
-      <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:3"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
-      <li><a class="unit on" href="#orangepi5" style="--w:100;--i:4"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
-      <li><a class="unit on" href="#jetson-nano" style="--w:100;--i:5"><svg viewBox="0 0 100 80" aria-hidden="true"><use href="#b-nano"/><circle class="glow" cx="6" cy="64" r="4"/><circle class="led" cx="6" cy="64" r="1.1"/></svg>Jetson Nano</a></li>
-      <li><a class="unit on" href="#esp32s31" style="--w:26;--i:6"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
+      <li><a class="unit on" href="#pi3" style="--w:85;--i:1"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-pi3"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Raspberry Pi 3</a></li>
+      <li><a class="unit on" href="#orangepi-one" style="--w:69;--i:2"><svg viewBox="0 0 69 48" aria-hidden="true"><use href="#b-opi1"/><circle class="glow" cx="5" cy="37" r="4"/><circle class="led" cx="5" cy="37" r="1.1"/></svg>Orange Pi One</a></li>
+      <li><a class="unit on" href="#orangepi-rv" style="--w:89;--i:3"><svg viewBox="0 0 89 56" aria-hidden="true"><use href="#b-rv"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg>Orange Pi RV</a></li>
+      <li><a class="unit on" href="#tinkerboard" style="--w:85;--i:4"><svg viewBox="0 0 85 56" aria-hidden="true"><use href="#b-tinker"/><circle class="glow" cx="5" cy="44" r="4"/><circle class="led" cx="5" cy="44" r="1.1"/></svg>Tinker Board S</a></li>
+      <li><a class="unit on" href="#orangepi5" style="--w:100;--i:5"><svg viewBox="0 0 100 62" aria-hidden="true"><use href="#b-opi5"/><circle class="glow" cx="6" cy="48" r="4"/><circle class="led" cx="6" cy="48" r="1.1"/></svg>Orange Pi 5</a></li>
+      <li><a class="unit on" href="#jetson-nano" style="--w:100;--i:6"><svg viewBox="0 0 100 80" aria-hidden="true"><use href="#b-nano"/><circle class="glow" cx="6" cy="64" r="4"/><circle class="led" cx="6" cy="64" r="1.1"/></svg>Jetson Nano</a></li>
+      <li><a class="unit on" href="#esp32s31" style="--w:26;--i:7"><svg viewBox="0 0 26 58" aria-hidden="true"><use href="#b-s31"/><circle class="glow" cx="13" cy="29" r="4"/><circle class="led" cx="13" cy="29" r="1.1"/></svg>ESP32-S31</a></li>
     </ul>
     <p class="legend"><span><i aria-hidden="true"></i>Boots in your browser, on this site</span></p>
   </section>
@@ -322,6 +334,25 @@
         <div class="run">
           <a class="pad-btn" href="pi4.html"><span class="via" aria-hidden="true"></span>Your own SD card</a>
           <small>Drop an Ubuntu Server or Raspberry Pi OS image, as downloaded, and boot it. Nothing is uploaded.</small>
+        </div>
+      </div>
+    </article>
+
+    <article class="sheet live" id="pi3">
+      <div class="art"><svg viewBox="0 0 85 56" style="--w:85" aria-hidden="true"><use href="#b-pi3"/><circle class="glow" cx="5" cy="42" r="4"/><circle class="led" cx="5" cy="42" r="1.1"/></svg></div>
+      <div>
+        <h3>Raspberry Pi 3 Model B+, 3B, 3A+, Zero 2 W</h3>
+        <p class="status"><i aria-hidden="true"></i>Boots in your browser</p>
+        <dl class="spec">
+          <div><dt>SoC</dt><dd>Broadcom BCM2837</dd></div>
+          <div><dt>CPU</dt><dd>4 × Cortex-A53</dd></div>
+          <div><dt>Instruction set</dt><dd>64-bit Arm</dd></div>
+          <div><dt>GPU</dt><dd>VideoCore IV: GLES 2 on Mesa’s vc4</dd></div>
+        </dl>
+        <p>The same unmodified Raspberry Pi OS card as the Pi 4, on the older SoC: HDMI and composite video on the stock KMS driver, USB through the LAN7515’s or LAN9514’s hub, Ethernet, Wi-Fi and Bluetooth, the VideoCore’s media services, and kmscube and glmark2 on its 3D GPU.</p>
+        <div class="run">
+          <a class="pad-btn" href="rpi3.html"><span class="via" aria-hidden="true"></span>Power on</a>
+          <small>The Pi kernel boots from scratch to a BusyBox shell in a few seconds, or drop your own Raspberry Pi OS card. Pick the model first.</small>
         </div>
       </div>
     </article>

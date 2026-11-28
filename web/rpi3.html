@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raspberry Pi 3 in your browser – sbc-emu</title>
+<meta name="description" content="A Raspberry Pi 3 (BCM2837, four Cortex-A53s) emulated instruction by instruction in your browser: the Pi kernel with a BusyBox shell, or your own Raspberry Pi OS card.">
+<style>
+  :root { --bg: #f4f4f1; --fg: #1d1d1b; --muted: #6b6b66; --panel: #ffffff; --line: #d9d9d3; --accent: #c51a4a; --term-bg: #111; --term-fg: #d6d6d6; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; --accent: #e8517c; } }
+  :root[data-theme="dark"] { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --panel: #1f1f1d; --line: #33332f; --accent: #e8517c; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  h1 span { color: var(--accent); }
+  .muted { color: var(--muted); }
+  #status { font-variant-numeric: tabular-nums; min-height: 1.45em; }
+  .models { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin: 0 0 12px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  .models legend { float: left; margin-right: 6px; font-weight: 600; padding: 0; }
+  .models label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .models small { color: var(--muted); }
+  fieldset.models { min-inline-size: 0; }
+  .screen { background: #000; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; outline: none; aspect-ratio: 16 / 9; }
+  .screen:focus { box-shadow: 0 0 0 2px var(--accent); }
+  canvas { display: block; width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; }
+  .hint { margin: 6px 0 14px; font-size: 13px; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  summary { cursor: pointer; padding: 8px 12px; }
+  pre { margin: 0; padding: 10px 12px; background: var(--term-bg); color: var(--term-fg); height: 300px; overflow: auto; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; outline: none; }
+  pre:focus { box-shadow: inset 0 0 0 2px var(--accent); }
+  .chooser { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .chooser button { text-align: left; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .chooser button span { color: var(--muted); font-size: 13px; }
+  .chooser button:hover { border-color: var(--accent); }
+  .chooser button[hidden] { display: none; }
+  .drop { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 8px; padding: 16px; border: 2px dashed var(--line); border-radius: 6px; background: var(--panel); }
+  .drop.over { border-color: var(--accent); }
+  .drop h2 { margin: 0; font-size: 16px; }
+  .drop p, .drop li { margin: 0; color: var(--muted); font-size: 13px; }
+  .drop ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+  .drop label.pick { align-self: flex-start; padding: 8px 14px; border: 1px solid var(--accent); border-radius: 4px; color: var(--accent); font-weight: 600; cursor: pointer; }
+  .drop input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .drop a { color: var(--accent); }
+  .serialform { display: flex; gap: 8px; padding: 8px 12px; }
+  .serialform input { flex: 1; min-width: 0; font: 13px ui-monospace, Menlo, monospace; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--fg); }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 4px; cursor: pointer; }
+  code { font: 12.5px ui-monospace, Menlo, monospace; }
+  footer { margin-top: 16px; font-size: 13px; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="./" style="color:inherit;text-decoration:none">sbc-emu</a> <span>Raspberry Pi 3</span></h1>
+    <span class="muted">Broadcom BCM2837, four 64-bit Cortex-A53s, emulated instruction by instruction in your browser</span>
+  </header>
+  <div id="setup">
+    <fieldset class="models" id="models">
+      <legend>Board</legend>
+      <label><input type="radio" name="model" value="0" checked> 3 Model B+ <small>1 GiB, LAN7515 USB hub + Ethernet, Wi-Fi</small></label>
+      <label><input type="radio" name="model" value="1"> 3 Model B <small>1 GiB, LAN9514 USB hub + Ethernet</small></label>
+      <label><input type="radio" name="model" value="2"> 3 Model A+ <small>512 MiB, one USB port, Wi-Fi</small></label>
+      <label><input type="radio" name="model" value="3"> Zero 2 W <small>512 MiB, USB OTG port</small></label>
+    </fieldset>
+    <div id="chooser" class="chooser">
+      <section class="drop" id="drop" aria-labelledby="drop-h">
+        <h2 id="drop-h">Your own SD card</h2>
+        <p>Drop a 64-bit Raspberry Pi OS card image here, as you downloaded it (<code>.img.xz</code>, <code>.img.gz</code> or <code>.img</code>), or choose it. It stays on your computer: the emulator reads it where it is, and what the Pi writes is kept in memory until you close the tab.</p>
+        <label class="pick">Choose an image… <input type="file" id="sdfile" accept=".img,.xz,.gz,application/x-xz,application/gzip"></label>
+        <ul>
+          <li><strong>Raspberry Pi OS Lite (64-bit)</strong> from <a href="https://www.raspberrypi.com/software/operating-systems/">raspberrypi.com</a> (0.5 GB). The page unpacks it once into your browser’s storage (3 GB, about a minute) and reuses that on your next visit. The firmware’s part is emulated: it reads <code>config.txt</code> with the board’s sections, the kernel and its initramfs from the card. On first boot the screen asks for your keyboard layout, then a user name and password: click the screen and type.</li>
+          <li>64-bit Lite images, not desktops: the Pi here runs at a fraction of a real one’s speed. 32-bit images (<code>kernel7.img</code>) do not boot.</li>
+        </ul>
+      </section>
+      <button type="button" data-os="pi3-busybox" hidden><strong>Quick demo: Pi kernel + BusyBox</strong><span>The Raspberry Pi kernel with a tiny initramfs: a shell on the serial console below in seconds.</span></button>
+      <button type="button" data-os="pi3-raspios" hidden><strong>Raspberry Pi OS Lite</strong><span>The unmodified trixie card image served next to this page: firmware-style boot, systemd, first-boot setup on HDMI.</span></button>
+    </div>
+  </div>
+  <p id="status" class="muted" aria-live="polite">choose a board, then a system to boot</p>
+  <div class="screen" id="screen" tabindex="0" role="application" aria-label="The HDMI monitor; typing here goes to the Pi's USB keyboard"><canvas id="fb" width="1280" height="720" role="img" aria-label="The picture on the HDMI monitor"></canvas></div>
+  <p class="hint muted">Click the screen to type on the Pi’s USB keyboard (the DWC2 USB host, behind the LAN7515’s or LAN9514’s hub on the B models). The screen is the HDMI monitor: Raspberry Pi OS drives it with the stock <code>vc4</code> KMS driver, the quick demo with the firmware’s framebuffer. Sound played on HDMI comes out here. The A53s’ code is translated to WebAssembly as it runs (<code>?jit=0</code> interprets it).</p>
+  <details open>
+    <summary>Serial console (the mini UART, <code>ttyS0</code>, 115200 baud) <button id="clear" type="button">clear</button></summary>
+    <pre id="term" tabindex="0" aria-label="Serial console. Typing here goes to the board."></pre>
+    <form id="serialform" class="serialform"><input id="serialin" placeholder="send a line to the serial console" autocomplete="off"><button type="submit">send</button></form>
+  </details>
+  <footer class="muted"><a href="./">All boards</a> · <a href="https://github.com/joakimeriksson/sbc-emu/blob/main/docs/raspberry-pi-3.md">How the Pi 3 is emulated</a> · <a href="sources.html">What runs here, and its licences</a> · Raspberry Pi is a trademark of Raspberry Pi Ltd; Broadcom is a trademark of Broadcom Inc. sbc-emu is not affiliated with either.</footer>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const canvas = $('fb'), ctx = canvas.getContext('2d'), term = $('term'), status = $('status'), screen = $('screen');
+const worker = new Worker('worker.js');
+const params = new URLSearchParams(location.search);
+let state = '', started = false;
+const strip = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\x1b[()][A-Z0-9]/g, '').replace(/\r/g, '');
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'status') {
+    state = m.text; status.textContent = state;
+    if (m.text === 'booting…' || m.text === 'resumed') started = true;
+    if (m.phase === 'error' && !started) $('setup').hidden = false; // try another image
+  } else if (m.type === 'uart') {
+    const atEnd = term.scrollTop + term.clientHeight >= term.scrollHeight - 4;
+    let text = term.textContent;
+    for (const ch of strip(m.text)) text = ch === '\b' ? text.slice(0, -1) : text + ch;
+    term.textContent = text.length > 200000 ? text.slice(-150000) : text;
+    if (atEnd) term.scrollTop = term.scrollHeight;
+  } else if (m.type === 'frame') {
+    if (canvas.width !== m.w || canvas.height !== m.h) { canvas.width = m.w; canvas.height = m.h; }
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(m.data.buffer), m.w, m.h), 0, 0);
+  } else if (m.type === 'audio') {
+    play(m.rate, m.samples);
+  } else if (m.type === 'stats') {
+    if (state === 'booting…' || state === 'running') state = 'running';
+    status.textContent = `${state} · ${m.mips.toFixed(0)} M instructions/s · ${(m.insns / 1e9).toFixed(2)} G instructions · guest time ${m.simS.toFixed(1)} s` + (m.diskMiB ? ` · SD read ${m.diskMiB.toFixed(0)} MiB` : '') + (m.jit ? ` · JIT ${m.jit} blocks` : '');
+  }
+};
+// HDMI audio: queued buffers, started on the first click or key press (browsers start audio only
+// after a user gesture)
+let audio = null, audioAt = 0;
+const startAudio = () => { if (!audio) { try { audio = new AudioContext(); } catch { audio = null; } } };
+function play(rate, s) {
+  if (!audio || !rate || s.length < 2) return;
+  const frames = s.length >> 1, buf = audio.createBuffer(2, frames, rate);
+  const l = buf.getChannelData(0), r = buf.getChannelData(1);
+  for (let i = 0; i < frames; i++) { l[i] = s[2 * i] / 32768; r[i] = s[2 * i + 1] / 32768; }
+  const src = audio.createBufferSource();
+  src.buffer = buf;
+  src.connect(audio.destination);
+  audioAt = Math.max(audioAt, audio.currentTime + 0.05);
+  if (audioAt > audio.currentTime + 2) audioAt = audio.currentTime + 0.05; // the guest ran ahead: drop the backlog
+  src.start(audioAt);
+  audioAt += frames / rate;
+}
+// the mouse on the screen is the USB tablet on the B models (absolute position, buttons, wheel)
+const pointer = (e, wheel = 0) => {
+  const b = canvas.getBoundingClientRect();
+  const x = Math.round(Math.min(Math.max((e.clientX - b.left) / b.width, 0), 1) * 32767);
+  const y = Math.round(Math.min(Math.max((e.clientY - b.top) / b.height, 0), 1) * 32767);
+  worker.postMessage({ type: 'pointer', buttons: e.buttons & 7, x, y, wheel });
+};
+canvas.addEventListener('pointermove', (e) => pointer(e));
+canvas.addEventListener('pointerdown', (e) => { startAudio(); screen.focus(); pointer(e); });
+canvas.addEventListener('pointerup', (e) => pointer(e));
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+$('clear').onclick = (e) => { e.preventDefault(); term.textContent = ''; };
+// the screen: KeyboardEvent.code -> USB HID usage (keyboard page)
+const HID = { Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
+  Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39, PrintScreen: 0x46,
+  ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f,
+  ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53, IntlBackslash: 0x64, ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2,
+  MetaLeft: 0xe3, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6, MetaRight: 0xe7 };
+for (let i = 0; i < 26; i++) HID['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
+for (let i = 1; i <= 9; i++) HID['Digit' + i] = 0x1d + i;
+HID.Digit0 = 0x27;
+for (let i = 1; i <= 12; i++) HID['F' + i] = 0x39 + i;
+const held = new Set();
+const sendKey = (usage, down) => worker.postMessage({ type: 'key', usage, down });
+screen.addEventListener('keydown', (e) => {
+  startAudio();
+  const u = HID[e.code];
+  if (u === undefined || (e.metaKey && e.code !== 'MetaLeft' && e.code !== 'MetaRight')) return;
+  e.preventDefault();
+  if (!held.has(u)) { held.add(u); sendKey(u, true); }
+});
+screen.addEventListener('keyup', (e) => { const u = HID[e.code]; if (u === undefined) return; e.preventDefault(); if (held.delete(u)) sendKey(u, false); });
+screen.addEventListener('blur', () => { for (const u of held) sendKey(u, false); held.clear(); });
+// the terminal: keys -> the bytes a serial terminal sends
+const SEQ = { Enter: [13], Backspace: [127], Tab: [9], Escape: [27], ArrowUp: [27, 91, 65], ArrowDown: [27, 91, 66], ArrowRight: [27, 91, 67],
+  ArrowLeft: [27, 91, 68], Home: [27, 91, 72], End: [27, 91, 70], Delete: [27, 91, 51, 126], PageUp: [27, 91, 53, 126], PageDown: [27, 91, 54, 126] };
+const serial = (bytes) => worker.postMessage({ type: 'serial', bytes });
+term.addEventListener('keydown', (e) => {
+  if (e.metaKey) return;
+  let bytes = SEQ[e.key];
+  if (!bytes && e.ctrlKey && /^[a-z]$/i.test(e.key)) bytes = [e.key.toUpperCase().charCodeAt(0) - 64];
+  else if (!bytes && e.key.length === 1 && !e.ctrlKey) bytes = [...new TextEncoder().encode(e.key)];
+  if (!bytes) return;
+  e.preventDefault();
+  serial(bytes);
+});
+$('serialform').onsubmit = (e) => {
+  e.preventDefault();
+  serial([...new TextEncoder().encode($('serialin').value + '\r')]);
+  $('serialin').value = '';
+};
+// ?model=3b+|3b|3a+|zero2w picks the board, ?os=pi3-busybox|pi3-raspios boots at once
+const IDS = ['3b+', '3b', '3a+', 'zero2w'];
+if (IDS.includes(params.get('model'))) document.querySelector(`input[name=model][value="${IDS.indexOf(params.get('model'))}"]`).checked = true;
+const model = () => Number(document.querySelector('input[name=model]:checked').value);
+const boot = (os, file) => {
+  $('setup').hidden = true;
+  const names = ['Raspberry Pi 3 Model B+', 'Raspberry Pi 3 Model B', 'Raspberry Pi 3 Model A+', 'Raspberry Pi Zero 2 W'];
+  document.querySelector('h1 span').textContent = names[model()];
+  worker.postMessage({ type: 'start', os, file, model: model(), ramMb: 0, jit: params.get('jit') !== '0' });
+  if (os === 'pi3-busybox') term.focus(); else screen.focus();
+};
+document.querySelectorAll('#chooser button').forEach((b) => b.onclick = () => boot(b.dataset.os));
+// your own SD card: chosen or dropped anywhere on the page
+const drop = $('drop');
+$('sdfile').onchange = (e) => { const f = e.target.files[0]; if (f) boot('pi3-sd-file', f); };
+addEventListener('dragover', (e) => { if (!$('setup').hidden) { e.preventDefault(); drop.classList.add('over'); } });
+addEventListener('dragleave', (e) => { if (!e.relatedTarget) drop.classList.remove('over'); });
+addEventListener('drop', (e) => {
+  e.preventDefault(); drop.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f && !$('setup').hidden) boot('pi3-sd-file', f);
+});
+// the other choices need files the site or a local build stages (tools/site-build.sh,
+// tools/wasm-build.sh): shown when they are there
+const need = { 'pi3-busybox': ['assets/kernel8.img', 'assets/rpi3/initramfs.cpio.gz'], 'pi3-raspios': ['assets/raspios-lite.img'] };
+const ready = Object.entries(need).map(([os, files]) => {
+  const b = document.querySelector(`#chooser button[data-os="${os}"]`);
+  return Promise.all(files.map((f) => fetch(f, { method: 'HEAD' }).then((r) => r.ok, () => false))).then((ok) => { b.hidden = !ok.every(Boolean); });
+});
+if (params.get('os')) Promise.all(ready).then(() => boot(params.get('os')));
+</script>
+</body>
+</html>

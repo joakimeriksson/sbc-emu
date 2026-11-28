@@ -15,6 +15,10 @@ ls -la web/wasm/sbc-emu.wasm
 # guest: the pinned Pi kernel (gzip, decompressed in the page) and the busybox initramfs
 [ -f cache/fw/kernel8.img ] && cp cache/fw/kernel8.img web/assets/kernel8.img
 [ -f cache/initramfs.cpio ] && gzip -9 -c cache/initramfs.cpio > web/assets/initramfs.cpio.gz
+# the Raspberry Pi 3's BusyBox initramfs (its shell on the mini UART: mkinitramfs --board pi3b)
+# for web/rpi3.html, with the same kernel8.img; and the Pi OS card both Pi pages boot, if present
+if [ -f cache/rpi3/initramfs.cpio ]; then mkdir -p web/assets/rpi3; gzip -9n -c cache/rpi3/initramfs.cpio > web/assets/rpi3/initramfs.cpio.gz; fi
+[ -f cache/os/raspios-lite.img ] && [ ! -e web/assets/raspios-lite.img ] && ln -s ../../cache/os/raspios-lite.img web/assets/raspios-lite.img
 # the Tinker Board's quick demo (scripts/tinker-board-fixture.sh) and, if present, its
 # Armbian card (scripts/armbian-tinkerboard-fixture.sh) for web/tinker.html
 if [ -f cache/tinker-board/zImage ]; then

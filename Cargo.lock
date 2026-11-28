@@ -253,6 +253,7 @@ dependencies = [
  "arm-a32",
  "arm-a64",
  "bcm2711",
+ "bcm2837",
  "emu-core",
  "esp-soc",
  "esp32s31",
