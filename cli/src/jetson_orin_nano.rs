@@ -91,8 +91,15 @@ fn execute(args: &[String]) -> Result<(), String> {
             "--gpu",
             "--vnc",
             "--screenshot",
+            "--threads",
         ],
     )?;
+    // --threads multi: a host thread per core (faster, not repeatable); single (default): turns
+    let multi = match crate::arg(args, "--threads") {
+        None | Some("single") => false,
+        Some("multi") => true,
+        Some(_) => return Err("--threads expects single or multi".into()),
+    };
     let config = RunConfig::from_args(TAG, args)?;
     let display = config.vnc.is_some()
         || config.screenshot.is_some()
@@ -194,11 +201,13 @@ fn execute(args: &[String]) -> Result<(), String> {
             if usb_serial.is_some() {
                 machine.attach_usb_serial(emu_core::usb::Serial::new("Virtual USB Serial"));
             }
+            machine.multi = multi;
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
                 eprintln!(
-                "[{TAG}] experimental Tegra234: {cores} Cortex-A78AE cores ({}), GICv3, ARM timer and SBSA UART",
+                "[{TAG}] experimental Tegra234: {cores} Cortex-A78AE cores ({}, {}), GICv3, ARM timer and SBSA UART",
                 crate::cpu_backend(jit),
+                if multi { "a host thread each" } else { "one host thread" },
             );
             }
             boot::boot_linux(&mut machine, &kernel, initrd.as_deref(), cmdline)?;

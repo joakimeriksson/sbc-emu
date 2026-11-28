@@ -47,6 +47,11 @@ impl Uart {
         true
     }
 
+    /// Bytes received and not read yet.
+    pub fn rx_len(&self) -> usize {
+        self.rx.len()
+    }
+
     /// Whether `push_rx` would accept a byte now.
     pub fn rx_room(&self) -> bool {
         self.rx.len() < RX_CAPACITY

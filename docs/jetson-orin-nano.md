@@ -22,9 +22,44 @@ target/release/sbc-emu run --board jetson-orin-nano-4gb \
 The fixture uses the checksummed Alpine packages shared with the Tegra210
 fixture. For interactive use, omit `--script` and `--timeout`. Use
 `--ram-mb 768` for a smaller interactive guest, `--smp 1` for single-core bring-up,
-or `--no-jit` for the interpreter. The scripted check expects six cores and 4 GiB.
+or `--no-jit` for the interpreter, and `--threads single|multi` to run the cores
+on one host thread or one each ([below](#speed)). The scripted check expects six cores and 4 GiB.
 It checks an architectural timer interrupt and a GIC IPI on every core, then
 offlines and onlines CPU 5.
+
+## Speed
+
+`--threads single|multi` chooses how the six cores run. `single` (the default, and the only
+way in the browser): they take turns on one host thread in rounds of virtual time, and a run
+with the same inputs is repeatable. `multi`: a host thread per core, with the design of the
+Jetson Nano's ([jetson-nano.md](jetson-nano.md#speed), `tegra234/src/mt.rs`): RAM is shared
+directly, barriers and acquire/release are host fences and store-exclusive a host
+compare-and-swap, TLB and instruction-cache invalidations reach the other cores before the
+issuing core goes on, and the devices (GICv3 and its ICC system registers, HSP and BPMP,
+the UARTs, xHCI and its USB devices, host1x, the GPU) sit behind one lock. Guest time follows
+the host's clock, and runs are not repeatable. Linux ticks on the arch timer: a core asleep in
+WFI waits for its timer, an interrupt or the next device event (the rover UART's receive
+timeout, USB, the network). A GPU doorbell or BPMP request is served on the thread of the
+core that rang it, holding the lock meanwhile. The host side of the rover UART and the USB
+serial port is served between slices of about 10 ms; a slice ends early when the guest has
+drained the rover UART's receive FIFO or written to it, so the link keeps its rate. A
+debugger's breakpoints, watchpoints and single steps run on one thread.
+
+Six CPU-bound jobs in the Alpine fixture, host seconds on an 18-core Apple M5 Max
+(`--threads single` / `multi`):
+
+| Guest work | single | multi |
+|---|---|---|
+| one `dd if=/dev/zero bs=1M count=480 \| md5sum` | 1.39 | 1.09 |
+| six of them at once | 9.17 | 1.61 |
+| one busybox `sh` loop of 400,000 increments | 1.98 | 1.99 |
+| six of them at once | 15.18 | 5.51 |
+
+The shell loops scale less: they make the kernel shoot down TLB entries about 4,000 times a
+second, and each shootdown waits until every running core has applied it.
+
+The boot scripts (shell, rover UART, USB with BPMP and the Tegra UART driver, GPU probe and
+power-on) and `tests/gpu/run-orin-cuda.sh` pass in both modes.
 
 ## USB
 

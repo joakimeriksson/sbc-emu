@@ -36,6 +36,24 @@ impl UartA {
         }
     }
 
+    /// Bytes received and not read by the guest yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rx_len(&self) -> usize {
+        match self {
+            Self::Legacy(uart) => uart.rx_len(),
+            Self::HighSpeed(uart) => uart.rx.len(),
+        }
+    }
+
+    /// Whether the guest sent bytes that `take_output` has not taken.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn has_output(&self) -> bool {
+        match self {
+            Self::Legacy(uart) => !uart.out.is_empty(),
+            Self::HighSpeed(uart) => !uart.out.is_empty(),
+        }
+    }
+
     pub fn take_output(&mut self) -> Vec<u8> {
         match self {
             Self::Legacy(uart) => std::mem::take(&mut uart.out),

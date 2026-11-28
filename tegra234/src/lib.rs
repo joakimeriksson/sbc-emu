@@ -6,6 +6,8 @@ mod host1x;
 mod hsp;
 mod mc;
 mod mss_nvlink;
+#[cfg(not(target_arch = "wasm32"))]
+mod mt;
 mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -175,6 +177,56 @@ impl Soc {
                 .is_none_or(|firmware| firmware.bpmp.gpu_available())
     }
 
+    /// The devices' time-driven work at `now` (the network, the xHCI host) and their interrupt
+    /// lines to the GIC; the cores' timers are the machine's.
+    fn service(&mut self, now: u64) {
+        if let Some(firmware) = &self.firmware {
+            self.gic.set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
+        }
+        self.pump_network(now);
+        if let Some(xhci) = self.xhci.as_mut() {
+            let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
+            xhci.tick(now, &mut dma, &mut self.usb);
+            let irq = xhci.irq();
+            self.gic.set_line((XHCI_SPI + 32) as usize, irq);
+        }
+        self.gic.set_line((UART_SPI + 32) as usize, self.uart.irq());
+        self.gic.set_line((UARTA_SPI + 32) as usize, self.uarta.irq(now));
+        self.gic.set_line((gpu::GSP_STALL_SPI + 32) as usize, self.gpu.stall_irq());
+        self.gic.set_line((gpu::NONSTALL_SPI + 32) as usize, self.gpu.nonstall_irq());
+        if self.gpu_node {
+            let mask = self.host1x.irq_mask();
+            for index in 0..host1x::IRQ_COUNT {
+                self.gic.set_line(host1x::FIRST_IRQ + index, mask & (1 << index) != 0);
+            }
+        }
+    }
+
+    /// The devices' next timed event after `now` (ns): the rover UART's receive timeout, xHCI
+    /// work, the network's next poll.
+    fn next_event(&self, now: u64) -> Option<u64> {
+        self.uarta
+            .next_event(now)
+            .into_iter()
+            .chain(self.xhci.as_ref().and_then(|x| x.next_event(&self.usb)))
+            .chain((self.net.is_some() && self.usb.net.as_ref().is_some_and(|n| n.up())).then_some(self.net_next))
+            .min()
+    }
+
+    /// Exchange frames between the USB Ethernet adapter and the network: what the guest sent goes
+    /// out at once, the network is polled every millisecond with NAT (10 ms without).
+    fn pump_network(&mut self, now: u64) {
+        let (Some(net), Some(dev)) = (self.net.as_mut(), self.usb.net.as_mut()) else { return };
+        let now_us = now / 1000;
+        for frame in dev.take_tx() {
+            dev.deliver(net.handle(&frame, now_us));
+        }
+        if now >= self.net_next {
+            dev.deliver(net.poll(now_us));
+            self.net_next = now + if net.nat.is_some() { 1_000_000 } else { 10_000_000 };
+        }
+    }
+
     fn sram_offset(addr: u64, size: usize) -> Option<usize> {
         let offset = addr.checked_sub(bpmp::SRAM)?;
         (offset.checked_add(size as u64)? <= bpmp::SRAM_SIZE).then_some(offset as usize)
@@ -283,6 +335,11 @@ pub struct Machine {
     exception_streak: Vec<u32>,
     pub interrupts: u64,
     display: bool,
+    /// run the cores on their own host threads (`--threads multi`: faster, not repeatable;
+    /// `mt.rs`); a debugger's breakpoints, watchpoints and steps run on one thread
+    pub multi: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    mt: Option<mt::Mt>,
 }
 
 impl Machine {
@@ -346,6 +403,9 @@ impl Machine {
             exception_streak: vec![0; cores],
             interrupts: 0,
             display: false,
+            multi: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            mt: None,
         })
     }
 
@@ -537,60 +597,12 @@ impl Machine {
             // 31.25 MHz is one count per 32 ns.
             .map(|(timer, offset)| timer.cval.wrapping_add(offset).saturating_mul(32))
             .filter(|&deadline| deadline > self.now)
-            .chain(self.soc.uarta.next_event(self.now))
-            .chain(self.soc.xhci.as_ref().and_then(|x| x.next_event(&self.soc.usb)))
-            .chain((self.soc.net.is_some() && self.soc.usb.net.as_ref().is_some_and(|n| n.up())).then_some(self.soc.net_next))
+            .chain(self.soc.next_event(self.now))
             .min()
     }
 
-    /// Exchange frames between the USB Ethernet adapter and the network: what the guest sent goes
-    /// out at once, the network is polled every millisecond with NAT (10 ms without).
-    fn pump_network(&mut self) {
-        let (Some(net), Some(dev)) = (self.soc.net.as_mut(), self.soc.usb.net.as_mut()) else { return };
-        let now_us = self.now / 1000;
-        for frame in dev.take_tx() {
-            dev.deliver(net.handle(&frame, now_us));
-        }
-        if self.now >= self.soc.net_next {
-            dev.deliver(net.poll(now_us));
-            self.soc.net_next = self.now + if net.nat.is_some() { 1_000_000 } else { 10_000_000 };
-        }
-    }
-
     fn update_interrupts(&mut self) {
-        if let Some(firmware) = &self.soc.firmware {
-            self.soc
-                .gic
-                .set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
-        }
-        self.pump_network();
-        if let Some(xhci) = self.soc.xhci.as_mut() {
-            let mut dma = peripherals::dma::Dma { ram: &mut self.soc.ram, base: RAM_BASE };
-            xhci.tick(self.now, &mut dma, &mut self.soc.usb);
-            let irq = xhci.irq();
-            self.soc.gic.set_line((XHCI_SPI + 32) as usize, irq);
-        }
-        self.soc
-            .gic
-            .set_line((UART_SPI + 32) as usize, self.soc.uart.irq());
-        self.soc
-            .gic
-            .set_line((UARTA_SPI + 32) as usize, self.soc.uarta.irq(self.now));
-        self.soc
-            .gic
-            .set_line((gpu::GSP_STALL_SPI + 32) as usize, self.soc.gpu.stall_irq());
-        self.soc.gic.set_line(
-            (gpu::NONSTALL_SPI + 32) as usize,
-            self.soc.gpu.nonstall_irq(),
-        );
-        if self.soc.gpu_node {
-            let mask = self.soc.host1x.irq_mask();
-            for index in 0..host1x::IRQ_COUNT {
-                self.soc
-                    .gic
-                    .set_line(host1x::FIRST_IRQ + index, mask & (1 << index) != 0);
-            }
-        }
+        self.soc.service(self.now);
         for (core, (cpu, state)) in self.cpus.iter_mut().zip(&mut self.state).enumerate() {
             if *state == CoreState::Off {
                 continue;
@@ -638,10 +650,17 @@ impl Machine {
         Self::catch_up(&mut self.cpus[core], self.now);
     }
 
+    /// Run up to `budget` instructions over all cores (with `multi`, about 10 ms of host time
+    /// on a thread per core instead).
     pub fn run(&mut self, budget: u64) -> Stop {
+        let debugging = !self.breakpoint.at.is_empty() || !self.cpus[0].watch.is_empty();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.multi && !debugging {
+            return self.run_threaded(std::time::Duration::from_millis(10));
+        }
+        self.single_thread();
         let mut remaining = budget;
         let mut attempts = budget;
-        let debugging = !self.breakpoint.at.is_empty() || !self.cpus[0].watch.is_empty();
         while remaining != 0 && attempts != 0 {
             self.update_interrupts();
             // WFE is also allowed to return spuriously. Giving a parked core a
@@ -694,6 +713,16 @@ impl Machine {
             }
         }
         Stop::Budget
+    }
+
+    /// Back on one thread after a threaded run (a debugger is attached): turn-taking
+    /// semantics again.
+    fn single_thread(&mut self) {
+        if self.cpus[0].mt {
+            for cpu in &mut self.cpus {
+                cpu.mt = false;
+            }
+        }
     }
 
     fn execute(&mut self, core: usize, interpreting: bool) -> Option<Stop> {
@@ -759,10 +788,16 @@ impl Machine {
         None
     }
 
-    fn psci(&mut self, core: usize) -> Option<Stop> {
+    /// The PSCI core a call's target affinity names.
+    fn psci_target(cores: usize, arg: u64) -> Option<usize> {
+        let affinity = arg & 0xff_00ff_ffff;
+        AFFINITIES[..cores].iter().position(|&value| value == affinity)
+    }
+
+    /// The PSCI calls that need no core or device state: the result for `id` (shared with the
+    /// threaded machine's PSCI).
+    fn psci_simple(id: u32, arg: u64) -> u64 {
         const NOT_SUPPORTED: u64 = u64::MAX;
-        const INVALID_PARAMETERS: u64 = -2i64 as u64;
-        const ALREADY_ON: u64 = -4i64 as u64;
         fn supported(id: u32) -> bool {
             matches!(
                 id,
@@ -778,13 +813,19 @@ impl Machine {
                     | 0x8400_000a
             )
         }
-        let [id, arg, entry, context, ..] = self.cpus[core].x;
-        let affinity = arg & 0xff_00ff_ffff;
-        let target = AFFINITIES[..self.cpus.len()]
-            .iter()
-            .position(|&value| value == affinity);
-        self.cpus[core].x[0] = match id as u32 {
+        match id {
             0x8000_0000 | 0x8400_0000 => 0x1_0001, // SMCCC / PSCI 1.1
+            0x8400_000a if supported(arg as u32) => 0,
+            _ => NOT_SUPPORTED,
+        }
+    }
+
+    fn psci(&mut self, core: usize) -> Option<Stop> {
+        const INVALID_PARAMETERS: u64 = -2i64 as u64;
+        const ALREADY_ON: u64 = -4i64 as u64;
+        let [id, arg, entry, context, ..] = self.cpus[core].x;
+        let target = Self::psci_target(self.cpus.len(), arg);
+        self.cpus[core].x[0] = match id as u32 {
             0x8400_0002 => {
                 self.state[core] = CoreState::Off;
                 self.cpus[core].set_irq(false, false);
@@ -809,14 +850,22 @@ impl Machine {
             0x8400_0004 | 0xc400_0004 => INVALID_PARAMETERS,
             0x8400_0008 => return Some(Stop::PowerOff),
             0x8400_0009 => return Some(Stop::Reset),
-            0x8400_000a if supported(arg as u32) => 0,
-            _ => NOT_SUPPORTED,
+            id => Self::psci_simple(id, arg),
         };
         None
     }
 
     fn start_core(&mut self, core: usize, entry: u64, context: u64) {
-        let old = &mut self.cpus[core];
+        Self::reset_core(&mut self.cpus[core], entry, context, self.now);
+        self.exception_streak[core] = 0;
+        self.state[core] = CoreState::Running;
+        self.soc.interrupts_changed = true;
+    }
+
+    /// Core `old` as PSCI CPU_ON leaves it: at `entry` in EL1 with `context` in X0, its clock
+    /// at `now`; it keeps its JIT (threaded runs give each core its own), watchpoints and the
+    /// threaded machine's settings.
+    fn reset_core(old: &mut Cpu, entry: u64, context: u64, now: u64) {
         let mut cpu = Cpu::new();
         cpu.profile = old.profile;
         cpu.ram = old.ram;
@@ -828,7 +877,7 @@ impl Machine {
         cpu.instret = old.instret;
         cpu.sys.mpidr = old.sys.mpidr;
         cpu.sys.cntfrq = COUNTER_HZ;
-        cpu.sys.time_base_ns = self.now;
+        cpu.sys.time_base_ns = now;
         cpu.sys.time_base_instret = cpu.instret;
         cpu.firmware_calls_to_host = true;
         cpu.el = 1;
@@ -836,10 +885,10 @@ impl Machine {
         cpu.daif = 0x3c0;
         cpu.x[0] = context;
         cpu.pc = entry;
+        cpu.mt = old.mt;
+        cpu.wall_clock = old.wall_clock;
+        old.hand_jit_to(&mut cpu);
         *old = cpu;
-        self.exception_streak[core] = 0;
-        self.state[core] = CoreState::Running;
-        self.soc.interrupts_changed = true;
     }
 
     pub fn debug_breakpoint(&mut self, addr: u64, insert: bool) {
@@ -859,6 +908,7 @@ impl Machine {
         if self.state[core] == CoreState::Off {
             return None;
         }
+        self.single_thread();
         self.switch_to(core);
         self.state[core] = CoreState::Running;
         self.update_interrupts();
@@ -1195,6 +1245,143 @@ mod tests {
         assert_eq!(soc.read32(page + 0x24), Ok(0x1234_ab78));
         soc.gpu.reset();
         assert_eq!(soc.read32(bar), Ok(0));
+    }
+
+    fn load(machine: &mut Machine, at: u64, code: &[u32]) {
+        for (index, word) in code.iter().enumerate() {
+            machine.soc.write32(RAM_BASE + at + 4 * index as u64, *word).unwrap();
+        }
+    }
+
+    fn word(machine: &Machine, offset: usize) -> u32 {
+        u32::from_le_bytes(machine.soc.ram[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// Run until `done` or 30 s of host time, as the CLI does (an idle machine's time moves on).
+    fn run_until(machine: &mut Machine, done: impl Fn(&Machine) -> bool) {
+        let start = std::time::Instant::now();
+        while !done(machine) && start.elapsed().as_secs() < 30 {
+            match machine.run(1_000_000) {
+                Stop::Budget => {}
+                Stop::Idle(deadline) => machine.idle_until(deadline),
+                stop => panic!("{stop:?}"),
+            }
+        }
+    }
+
+    /// Six cores add 100,000 each to one counter with LDXR/STXR (interpreted and compiled), then
+    /// sleep; no increment is lost. With `--threads multi` they run on their own host threads.
+    #[test]
+    fn six_cores_count_with_exclusives() {
+        for multi in [false, true] {
+            if multi && cfg!(target_arch = "wasm32") {
+                continue;
+            }
+            for jit in [false, true] {
+                let mut machine = Machine::new(256 << 20, 6).unwrap();
+                if machine.set_jit(jit) != jit {
+                    continue;
+                }
+                machine.multi = multi;
+                load(&mut machine, 0, &[
+                    0xd2b0_0201, // mov x1, #0x80100000
+                    0xd290_d402, // mov x2, #0x86a0
+                    0xf2a0_0022, // movk x2, #1, lsl #16 (100,000)
+                    0x885f_7c23, // 1: ldxr w3, [x1]
+                    0x1100_0463, // add w3, w3, #1
+                    0x8804_7c23, // stxr w4, w3, [x1]
+                    0x35ff_ffa4, // cbnz w4, 1b
+                    0xf100_0442, // subs x2, x2, #1
+                    0x54ff_ff61, // b.ne 1b
+                    0xd503_207f, // 2: wfi
+                    0x17ff_ffff, // b 2b
+                ]);
+                for core in 0..6 {
+                    machine.cpus[core].pc = RAM_BASE;
+                    machine.cpus[core].el = 1;
+                    machine.state[core] = CoreState::Running;
+                }
+                run_until(&mut machine, |m| m.state.iter().all(|&s| s == CoreState::Wfi));
+                assert_eq!(machine.state, [CoreState::Wfi; 6], "multi {multi} jit {jit}");
+                assert_eq!(word(&machine, 0x10_0000), 600_000, "multi {multi} jit {jit}");
+                // the threaded runs gave every core its own JIT
+                assert_eq!(machine.cpus.iter().all(|c| c.mt && (c.jit.is_some() || !jit)), multi);
+            }
+        }
+    }
+
+    /// Interrupts wake cores that sleep in WFI, through the GICv3. Core 0 arms its virtual arch
+    /// timer (100 us, PPI 27) and sleeps; when it wakes it sends SGI 1 to core 1 (Aff1 1) through
+    /// ICC_SGI1R_EL1; core 1 has slept since it started. Each stores the INTID it acknowledges.
+    #[test]
+    fn cores_wake_from_wfi_on_the_arch_timer_and_an_sgi() {
+        for multi in [false, true] {
+            if multi && cfg!(target_arch = "wasm32") {
+                continue;
+            }
+            let mut machine = Machine::new(256 << 20, 2).unwrap();
+            machine.multi = multi;
+            let core0 = [
+                0xd2a1_e800, // movz x0, #0x0f40, lsl #16 (GICD)
+                0x5280_0041, // mov w1, #2
+                0xb900_0001, // str w1, [x0] (GICD_CTLR: EnableGrp1NS)
+                0xd2a1_e882, // movz x2, #0x0f44, lsl #16 (core 0's GICR)
+                0xb900_145f, // str wzr, [x2, #0x14] (GICR_WAKER)
+                0x9140_4043, // add x3, x2, #0x10, lsl #12 (its SGI frame)
+                0x52a1_0001, // mov w1, #0x8000000
+                0xb900_8061, // str w1, [x3, #0x80] (IGROUPR0: PPI 27)
+                0xb901_0061, // str w1, [x3, #0x100] (ISENABLER0)
+                0xd280_1fe1, // mov x1, #0xff
+                0xd518_4601, // msr ICC_PMR_EL1, x1
+                0xd280_0021, // mov x1, #1
+                0xd518_cce1, // msr ICC_IGRPEN1_EL1, x1
+                0xd281_86a1, // mov x1, #3125 (100 us at 31.25 MHz)
+                0xd51b_e301, // msr cntv_tval_el0, x1
+                0xd280_0021, // mov x1, #1
+                0xd51b_e321, // msr cntv_ctl_el0, x1
+                0xd503_207f, // 1: wfi
+                0xd538_cc08, // mrs x8, ICC_IAR1_EL1
+                0xf10f_fd1f, // cmp x8, #1023
+                0x54ff_ffa0, // b.eq 1b
+                0xd2b0_0207, // movz x7, #0x8010, lsl #16
+                0xb900_00e8, // str w8, [x7]
+                0xd280_0061, // mov x1, #3
+                0xd51b_e321, // msr cntv_ctl_el0, x1 (masked)
+                0xd2a0_2029, // movz x9, #0x0101, lsl #16
+                0xf280_0029, // movk x9, #1 (SGI 1 to Aff1 1, Aff0 0)
+                0xd518_cba9, // msr ICC_SGI1R_EL1, x9
+                0xd503_207f, // 2: wfi
+                0x17ff_ffff, // b 2b
+            ];
+            let core1 = [
+                0xd2a1_e8c2, // movz x2, #0x0f46, lsl #16 (core 1's GICR)
+                0xb900_145f, // str wzr, [x2, #0x14] (GICR_WAKER)
+                0x9140_4043, // add x3, x2, #0x10, lsl #12
+                0x5280_0041, // mov w1, #2
+                0xb900_8061, // str w1, [x3, #0x80] (IGROUPR0: SGI 1)
+                0xb901_0061, // str w1, [x3, #0x100] (ISENABLER0)
+                0xd280_1fe1, // mov x1, #0xff
+                0xd518_4601, // msr ICC_PMR_EL1, x1
+                0xd280_0021, // mov x1, #1
+                0xd518_cce1, // msr ICC_IGRPEN1_EL1, x1
+                0xd503_207f, // 1: wfi
+                0xd538_cc08, // mrs x8, ICC_IAR1_EL1
+                0xf10f_fd1f, // cmp x8, #1023
+                0x54ff_ffa0, // b.eq 1b
+                0xd2b0_0207, // movz x7, #0x8010, lsl #16
+                0xb900_04e8, // str w8, [x7, #4]
+                0xd503_207f, // 2: wfi
+                0x17ff_ffff, // b 2b
+            ];
+            for (core, (at, code)) in [(0, &core0[..]), (0x200, &core1[..])].into_iter().enumerate() {
+                load(&mut machine, at, code);
+                machine.cpus[core].pc = RAM_BASE + at;
+                machine.cpus[core].el = 1;
+                machine.state[core] = CoreState::Running;
+            }
+            run_until(&mut machine, |m| word(m, 0x10_0004) != 0);
+            assert_eq!((word(&machine, 0x10_0000), word(&machine, 0x10_0004)), (27, 1), "multi {multi}: the INTIDs each core acknowledged");
+        }
     }
 
     #[test]
