@@ -39,18 +39,27 @@ pub struct I2c {
     rx: VecDeque<u8>,
     /// a write in progress: bytes collected so far
     wr: Option<Vec<u8>>,
-    /// the board's BME280 at 0x76
+    /// the board's BME280 at 0x76 (when `bme280_present`)
     pub bme280: Bme280,
+    pub bme280_present: bool,
+    /// other devices on the bus
+    pub devices: Vec<Box<dyn I2cDevice + Send>>,
 }
 
 impl I2c {
     pub fn new() -> Self {
-        I2c { c: 0, s: 0, dlen: 0, a: 0, div: 0x5dc, del: 0x0030_0030, clkt: 0x40, rx: VecDeque::new(), wr: None, bme280: Bme280::new() }
+        I2c { c: 0, s: 0, dlen: 0, a: 0, div: 0x5dc, del: 0x0030_0030, clkt: 0x40, rx: VecDeque::new(), wr: None, bme280: Bme280::new(), bme280_present: true, devices: Vec::new() }
+    }
+
+    /// A bus with only `devices` on it (no BME280).
+    pub fn with_devices(devices: Vec<Box<dyn I2cDevice + Send>>) -> Self {
+        I2c { bme280_present: false, devices, ..Self::new() }
     }
 
     fn device(&mut self) -> Option<&mut dyn I2cDevice> {
         let a = (self.a & 0x7f) as u8;
-        if self.bme280.address() == a { Some(&mut self.bme280) } else { None }
+        if self.bme280_present && self.bme280.address() == a { return Some(&mut self.bme280); }
+        match self.devices.iter_mut().find(|d| d.address() == a) { Some(d) => Some(d.as_mut()), None => None }
     }
 
     fn status(&self) -> u32 {

@@ -1,9 +1,10 @@
-//! BCM2835 DMA controller (the legacy channels 0..14 at 0xfe007000, `brcm,bcm2835-dma`).
-//! A channel set ACTIVE walks its chain of 32-byte control blocks (TI, SOURCE_AD, DEST_AD,
-//! TXFR_LEN, STRIDE, NEXTCONBK). A block that waits for a peripheral's DREQ (TI.DEST_DREQ or
-//! SRC_DREQ with a PERMAP) moves data only as fast as that peripheral asks for it, with the
-//! channel registers showing its progress (`Soc::dma_pace`); other blocks complete at once.
-//! The SoC performs the memory accesses (`Soc::dma_run`); this holds the register state.
+//! BCM2835 DMA controller (the legacy channels 0..14, `brcm,bcm2835-dma`: at 0xfe007000 on the
+//! BCM2711, 0x3f007000 on the BCM2837). A channel set ACTIVE walks its chain of 32-byte control
+//! blocks (TI, SOURCE_AD, DEST_AD, TXFR_LEN, STRIDE, NEXTCONBK). A block that waits for a
+//! peripheral's DREQ (TI.DEST_DREQ or SRC_DREQ with a PERMAP) moves data only as fast as that
+//! peripheral asks for it, with the channel registers showing its progress (`Dma::pace`); other
+//! blocks complete at once (`Dma::run`). The SoC's bus (`DmaBus`) performs the accesses and
+//! translates the VideoCore bus addresses the control blocks hold.
 
 pub const CHANNELS: usize = 15;
 
@@ -30,6 +31,12 @@ pub const TI_SRC_DREQ: u32 = 1 << 10;
 pub fn paced(ti: u32) -> Option<u32> {
     let permap = (ti >> 16) & 0x1f;
     (ti & (TI_DEST_DREQ | TI_SRC_DREQ) != 0 && permap != 0).then_some(permap)
+}
+
+/// The SoC as a DMA channel sees it: memory and peripherals at physical addresses, and how the
+/// VideoCore bus addresses in control blocks map to them.
+pub trait DmaBus: emu_core::Bus {
+    fn phys(&self, bus: u32) -> u64;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -113,6 +120,108 @@ impl Dma {
     }
 
     pub fn irq(&self, n: usize) -> bool { self.ch[n].cs & INT != 0 }
+
+    /// Some channel is active on a block that waits for a DREQ.
+    pub fn paced_active(&self) -> bool { self.ch.iter().any(|c| c.cs & ACTIVE != 0 && paced(c.ti).is_some()) }
+
+    /// Load channel `n`'s next control block into its registers; false at the end of the chain.
+    fn load_cb(&mut self, n: usize, bus: &mut impl DmaBus) -> bool {
+        let cb = self.ch[n].conblk & !31;
+        if cb == 0 { return false; }
+        let base = bus.phys(cb);
+        let mut w = [0u32; 8];
+        for (k, x) in w.iter_mut().enumerate() { *x = bus.read32(base + 4 * k as u64).unwrap_or(0); }
+        let c = &mut self.ch[n];
+        [c.ti, c.src, c.dst, c.len, c.stride, c.next] = [w[0], w[1], w[2], w[3], w[4], w[5]];
+        true
+    }
+
+    /// The current block of channel `n` is done: interrupt, then on to the next one.
+    fn block_done(&mut self, n: usize, bus: &mut impl DmaBus) -> bool {
+        let c = &mut self.ch[n];
+        if c.ti & TI_INTEN != 0 { c.cs |= INT; }
+        c.conblk = c.next;
+        if c.conblk == 0 || !self.load_cb(n, bus) {
+            let c = &mut self.ch[n];
+            c.cs = (c.cs & !ACTIVE) | END;
+            return false;
+        }
+        true
+    }
+
+    /// Channel `n` was made active: walk its control blocks now, up to one that waits for a
+    /// DREQ. Returns true if it stopped at such a block (`pace` moves it on).
+    pub fn run(&mut self, n: usize, bus: &mut impl DmaBus) -> bool {
+        for _ in 0..4096 {
+            let cb = self.ch[n].conblk & !31;
+            if cb == 0 { break; }
+            if !self.load_cb(n, bus) { break; }
+            let c = self.ch[n];
+            if paced(c.ti).is_some() { return true; } // runs as its peripheral asks
+            let [ti, src, dst, len, stride, next] = [c.ti, c.src, c.dst, c.len, c.stride, c.next];
+            let (xlen, rows) = if ti & TI_TDMODE != 0 { (len & 0xffff, (len >> 16) & 0x3fff) } else { (len & 0x3fff_ffff, 1) };
+            let (sstride, dstride) = ((stride & 0xffff) as i16 as i64, (stride >> 16) as i16 as i64);
+            let (mut s, mut d) = (bus.phys(src), bus.phys(dst));
+            for row in 0..rows {
+                let mut off = 0;
+                while off < xlen {
+                    let n4 = (xlen - off).min(4);
+                    if n4 == 4 {
+                        let v = if ti & TI_SRC_IGNORE != 0 { 0 } else { bus.read32(s).unwrap_or(0) };
+                        if ti & TI_DEST_IGNORE == 0 { let _ = bus.write32(d, v); }
+                    } else {
+                        for b in 0..n4 as u64 {
+                            let v = if ti & TI_SRC_IGNORE != 0 { 0 } else { bus.read8(s + b).unwrap_or(0) };
+                            if ti & TI_DEST_IGNORE == 0 { let _ = bus.write8(d + b, v); }
+                        }
+                    }
+                    if ti & TI_SRC_INC != 0 { s += n4 as u64; }
+                    if ti & TI_DEST_INC != 0 { d += n4 as u64; }
+                    off += n4;
+                }
+                if ti & TI_TDMODE != 0 && row + 1 < rows { s = s.wrapping_add(sstride as u64); d = d.wrapping_add(dstride as u64); }
+            }
+            let c = &mut self.ch[n];
+            c.ti = ti; c.src = src; c.dst = dst; c.len = 0; c.stride = stride; c.next = next;
+            if ti & TI_INTEN != 0 { c.cs |= INT; }
+            c.conblk = next;
+        }
+        let c = &mut self.ch[n];
+        c.cs = (c.cs & !ACTIVE) | END;
+        false
+    }
+
+    /// Feed DREQ-paced channels what their peripherals asked for: `demands` holds (DREQ, words
+    /// wanted) and is decremented by what was moved; the words read, with their DREQ, are
+    /// appended to `out` in order for the caller to hand to the peripherals. A chain that
+    /// reaches a block without a DREQ runs it at once.
+    pub fn pace(&mut self, demands: &mut [(u32, u64)], bus: &mut impl DmaBus, out: &mut Vec<(u32, u32)>) {
+        for n in 0..CHANNELS {
+            let Some(dreq) = paced(self.ch[n].ti) else { continue };
+            if self.ch[n].cs & ACTIVE == 0 { continue; }
+            let Some(slot) = demands.iter().position(|d| d.0 == dreq) else { continue };
+            let mut demand = demands[slot].1;
+            let mut guard = 0;
+            while demand > 0 && guard < 1 << 20 {
+                guard += 1;
+                let c = self.ch[n];
+                if c.len < 4 {
+                    if !self.block_done(n, bus) { break; }
+                    if paced(self.ch[n].ti).is_none() { self.run(n, bus); break; }
+                    continue;
+                }
+                let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { bus.read32(bus.phys(c.src)).unwrap_or(0) };
+                out.push((dreq, v));
+                let c = &mut self.ch[n];
+                if c.ti & TI_SRC_INC != 0 { c.src = c.src.wrapping_add(4); }
+                c.len -= 4;
+                demand -= 1;
+            }
+            // the block that just ran dry completes now, not at the next demand
+            if self.ch[n].cs & ACTIVE != 0 && self.ch[n].len < 4 { self.block_done(n, bus); }
+            demands[slot].1 = demand;
+        }
+    }
 
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
         w.tag("dma-v1");

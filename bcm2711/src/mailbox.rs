@@ -45,7 +45,18 @@ pub struct Mailbox {
     pub rates: [u32; 32],
     /// the board revision code GET_BOARD_REVISION reports (the Pi 3 machine sets its own)
     pub revision: u32,
+    /// the firmware clocks GET_CLOCKS lists (ids), the ones `clk-raspberrypi` registers
+    pub clocks: &'static [u32],
+    /// the firmware's GPIO expander (`raspberrypi,firmware-gpio`, lines 128..135): output
+    /// levels as set, and the levels of its input lines (bit per line)
+    pub exp_gpio_out: u8,
+    pub exp_gpio_in: u8,
+    exp_gpio_dir: u8,
 }
+
+/// The firmware clocks the Pi 4's firmware lists: ARM (cpufreq: one operating point, 1.5 GHz),
+/// core (the HVS), V3D, M2MC (HDMI state machine), pixel-BVB (HDMI), and the audio clock.
+pub const PI4_CLOCKS: &[u32] = &[3, 4, 5, 13, 14, AUDIO_CLK];
 
 impl Mailbox {
     pub fn new(fb_base: u64, fb_max: u64, width: u32, height: u32) -> Self {
@@ -54,6 +65,8 @@ impl Mailbox {
             audio_clk: 0,
             rates: std::array::from_fn(|k| clock_rate(k as u32)),
             revision: BOARD_REVISION,
+            clocks: PI4_CLOCKS,
+            exp_gpio_out: 0, exp_gpio_in: 0, exp_gpio_dir: 0,
             rd: VecDeque::new(),
             cfg: 0,
             fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
@@ -131,10 +144,8 @@ impl Mailbox {
             0x0000_0001 => set(v, &[FW_REVISION]),
             0x0000_0002 => set(v, &[0]), // firmware variant: none
             0x0000_0003 => set(v, &[0x5bc0_e000, 0, 0, 0, 0]), // firmware git hash (20 bytes)
-            // clocks for `raspberrypi,firmware-clocks`, (parent, id): ARM (cpufreq: one operating
-            // point, 1.5 GHz), core (the HVS), V3D, M2MC (HDMI state machine), pixel-BVB (HDMI), and
-            // the audio clock
-            0x0001_0007 => set(v, &[0, 3, 0, 4, 0, 5, 0, 13, 0, 14, 0, AUDIO_CLK]),
+            // clocks for `raspberrypi,firmware-clocks`: (parent, id) pairs
+            0x0001_0007 => { let l: Vec<u32> = self.clocks.iter().flat_map(|&id| [0, id]).collect(); set(v, &l) }
             0x0001_0001 => set(v, &[0]),
             0x0001_0002 => set(v, &[self.revision]),
             0x0001_0003 => set(v, &[0x5bc0_e0b8, 0x0000_2700]), // MAC b8:27:eb..? (stable placeholder)
@@ -150,16 +161,28 @@ impl Mailbox {
             0x0003_0007 if arg(v, 0) == AUDIO_CLK => set(v, &[AUDIO_CLK, 0]),
             0x0003_8002 if arg(v, 0) == AUDIO_CLK => { self.audio_clk = arg(v, 1); set(v, &[AUDIO_CLK, self.audio_clk]) }
             0x0003_0002 | 0x0003_0047 => { let id = arg(v, 0); set(v, &[id, self.rates.get(id as usize).copied().unwrap_or(0)]) }
+            // the ARM clock is fixed at the board's rate (one operating point)
+            0x0003_0004 | 0x0003_0007 if arg(v, 0) == 3 => set(v, &[3, self.rates[3]]),
             0x0003_0004 => { let id = arg(v, 0); set(v, &[id, clock_range(id).1]) }
             0x0003_0007 => { let id = arg(v, 0); set(v, &[id, clock_range(id).0]) }
             0x0003_8001 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
             0x0003_8002 => {
                 let (id, r) = (arg(v, 0), arg(v, 1));
-                let (lo, hi) = clock_range(id);
+                let (lo, hi) = if id == 3 { (self.rates[3], self.rates[3]) } else { clock_range(id) };
                 let r = r.clamp(lo, hi.max(lo));
                 if let Some(x) = self.rates.get_mut(id as usize) { *x = r; }
                 set(v, &[id, r])
             }
+            // the GPIO expander (lines 128..135): state and config; a status of 0 in the first
+            // word is success, as the firmware answers
+            0x0003_0041 => { let g = arg(v, 0).wrapping_sub(128) & 7; let out = self.exp_gpio_dir >> g & 1 != 0;
+                             let l = if out { self.exp_gpio_out } else { self.exp_gpio_in } >> g & 1; set(v, &[0, l as u32]) }
+            0x0003_8041 => { let g = arg(v, 0).wrapping_sub(128) & 7; let b = 1u8 << g;
+                             if arg(v, 1) != 0 { self.exp_gpio_out |= b } else { self.exp_gpio_out &= !b } set(v, &[0, arg(v, 1)]) }
+            0x0003_0043 => { let g = arg(v, 0).wrapping_sub(128) & 7; set(v, &[0, (self.exp_gpio_dir >> g & 1) as u32, 0, 0, 0]) }
+            0x0003_8043 => { let g = arg(v, 0).wrapping_sub(128) & 7; let b = 1u8 << g;
+                             if arg(v, 1) != 0 { self.exp_gpio_dir |= b; if arg(v, 5) != 0 { self.exp_gpio_out |= b } else { self.exp_gpio_out &= !b } } else { self.exp_gpio_dir &= !b }
+                             set(v, &[0]) }
             0x0003_0066 => set(v, &[]), // NOTIFY_DISPLAY_DONE: the kernel's display driver takes over
             0x0003_0006 => { let id = arg(v, 0); set(v, &[id, temp_mc]) }
             0x0003_000a => { let id = arg(v, 0); set(v, &[id, 85_000]) }
@@ -260,6 +283,7 @@ fn clock_range(id: u32) -> (u32, u32) {
         3 => (1_500_000_000, 1_500_000_000), // ARM: fixed
         4 => (200_000_000, 500_000_000),     // core
         5 => (250_000_000, 550_000_000),     // V3D
+        9 => (0, 600_000_000),               // pixel (the BCM2837's HDMI)
         13 => (120_000_000, 600_000_000),    // M2MC (HDMI)
         14 => (0, 300_000_000),              // pixel-BVB
         AUDIO_CLK => (0, 100_000_000),

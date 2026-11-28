@@ -10,6 +10,11 @@
 //! USB: the DWC2 OTG core (the Pi 4's model) with the board's USB tree behind its root port:
 //! on the 3B+ the LAN7515's two hubs, its LAN7800 Ethernet (connected to `sbc-net`) and the
 //! keyboard and tablet on two of the USB-A ports (`usb_tree`).
+//!
+//! Display: with `dtoverlay=vc4-kms-v3d` (`Machine::enable_kms`) the BCM2835-family HVS, pixel
+//! valves and HDMI encoder of `bcm2711::vc4` (`Gen::Bcm2835`), the monitor's EDID on BSC2 (the
+//! DDC bus), hot-plug on GPIO 28 (the 3B's on the firmware's GPIO expander), HDMI audio through
+//! the DMA controller into the MAI FIFO (DREQ 17), and CEC; without it the firmware framebuffer.
 use crate::intc::{ArmCtrl, LocalIntc};
 use crate::Model;
 use arm_a64::{Cpu, CpuProfile};
@@ -38,12 +43,39 @@ pub const AUX: u64 = 0x3f21_5000;
 pub const SDHCI: u64 = 0x3f30_0000;
 /// the DWC2 USB 2.0 OTG controller
 pub const USB: u64 = 0x3f98_0000;
+pub const TXP: u64 = 0x3f00_4000;
+pub const DMA: u64 = 0x3f00_7000;
+pub const GPIO: u64 = 0x3f20_0000;
+pub const PV0: u64 = 0x3f20_6000;
+pub const PV1: u64 = 0x3f20_7000;
+pub const HVS: u64 = 0x3f40_0000;
+/// BSC2, the HDMI port's DDC bus
+pub const DDC: u64 = 0x3f80_5000;
+pub const PV2: u64 = 0x3f80_7000;
+/// the HDMI encoder's "hd" block (MAI audio, VID_CTL)
+pub const HD: u64 = 0x3f80_8000;
+pub const HDMI: u64 = 0x3f90_2000;
+/// the VideoCore IV 3D block (`brcm,vc4-v3d`): its model is the `vc4-3d` crate's
+pub const V3D: u64 = 0x3fc0_0000;
 /// the ARM-local block: the per-core interrupt controller and mailboxes
 pub const LOCAL: u64 = 0x4000_0000;
 /// ARM-side interrupt numbers (bank 0)
 pub const ARM_MAILBOX: usize = 1;
 /// GPU interrupt numbers (banks 1 and 2 of the ARM-side controller)
 pub const GPU_USB: usize = 9;
+pub const GPU_V3D: usize = 10;
+pub const GPU_TXP: usize = 11;
+/// DMA channels 0..10 on 16..26, 11..14 share 27
+pub const GPU_DMA0: usize = 16;
+pub const GPU_HVS: usize = 33;
+pub const GPU_HDMI0: usize = 40;
+pub const GPU_HDMI1: usize = 41;
+pub const GPU_PV2: usize = 42;
+pub const GPU_PV0: usize = 45;
+pub const GPU_PV1: usize = 46;
+pub const GPU_GPIO0: usize = 49;
+/// the BSC controllers' shared interrupt
+pub const GPU_I2C: usize = 53;
 pub const GPU_AUX: usize = 29;
 pub const GPU_UART0: usize = 57;
 pub const GPU_RNG: usize = 61;
@@ -103,6 +135,19 @@ pub struct Soc {
     pub net: Option<sbc_net::net::VirtualNet>,
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
+    pub gpio: bcm2711::gpio::Gpio,
+    pub dma: bcm2711::dma::Dma,
+    /// when DREQ-paced DMA wants another look (ns; Some(0): now)
+    pace_next: Option<u64>,
+    /// BSC2: the HDMI port's DDC bus with the monitor's EDID EEPROM
+    pub ddc: bcm2711::i2c::I2c,
+    /// the KMS display pipeline (HVS, pixel valves, HDMI); None: the firmware framebuffer only
+    pub vc4: Option<bcm2711::vc4::Vc4>,
+    /// HDMI audio played since the host last took it (16-bit stereo) and its rate, kept while
+    /// the host wants it (`capture_audio`)
+    pub audio: Vec<i16>,
+    pub audio_rate: u32,
+    pub capture_audio: bool,
     pub unknown: Vec<u64>,
     /// a device register was touched: interrupt lines must be re-derived
     pub dirty: bool,
@@ -128,6 +173,16 @@ impl Soc {
             THERMAL..=0x3f21_2007 => self.thermal.read(a - THERMAL),
             PM..=0x3f10_0113 => self.pm.read(a - PM),
             // AXI bridges (ASB): the ID register; a stop request (bit 0) is acknowledged (bit 1) at once
+            GPIO..=0x3f20_00b3 => self.gpio.read(a - GPIO),
+            DMA..=0x3f00_7fff => self.dma.read(a - DMA),
+            DDC..=0x3f80_5fff => self.ddc.read(a - DDC),
+            HVS..=0x3f40_5fff if self.vc4.is_some() => self.vc4.as_ref().unwrap().hvs_read(a - HVS),
+            PV0..=0x3f20_60ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().pv_read_n(0, a - PV0),
+            PV1..=0x3f20_70ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().pv_read_n(1, a - PV1),
+            PV2..=0x3f80_70ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().pv_read_n(2, a - PV2),
+            HDMI..=0x3f90_25ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hdmi_read(a - HDMI),
+            HD..=0x3f80_80ff if self.vc4.is_some() => self.vc4.as_ref().unwrap().hd_read(a - HD),
+            TXP..=0x3f00_401f if self.vc4.is_some() => self.vc4.as_ref().unwrap().txp_read(a - TXP),
             ASB..=0x3f00_a02f => match a & 0xff { 0x20 => 0x6272_6467, o => { let r = self.asb[(o / 4) as usize % 12]; (r & !2) | ((r & 1) << 1) } },
             LOCAL..=0x4000_00ff => self.local.read(a - LOCAL, self.armctrl.irq()),
             PERIPH..=0x3fff_ffff | 0x4000_0100..=0x4003_ffff => { self.note(a); 0 }
@@ -150,6 +205,16 @@ impl Soc {
             THERMAL..=0x3f21_2007 => self.thermal.write(a - THERMAL, v),
             PM..=0x3f10_0113 => self.pm.write(a - PM, v),
             ASB..=0x3f00_a02f => self.asb[((a & 0xff) / 4) as usize % 12] = v & 0x00ff_ffff,
+            GPIO..=0x3f20_00b3 => self.gpio.write(a - GPIO, v),
+            DMA..=0x3f00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
+            DDC..=0x3f80_5fff => self.ddc.write(a - DDC, v),
+            HVS..=0x3f40_5fff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hvs_write(a - HVS, v),
+            PV0..=0x3f20_60ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().pv_write_n(0, a - PV0, v),
+            PV1..=0x3f20_70ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().pv_write_n(1, a - PV1, v),
+            PV2..=0x3f80_70ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().pv_write_n(2, a - PV2, v),
+            HDMI..=0x3f90_25ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hdmi_write(a - HDMI, v),
+            HD..=0x3f80_80ff if self.vc4.is_some() => self.vc4.as_mut().unwrap().hd_write(a - HD, v),
+            TXP..=0x3f00_401f if self.vc4.is_some() => self.vc4.as_mut().unwrap().txp_write(a - TXP, v),
             LOCAL..=0x4000_00ff => self.local.write(a - LOCAL, v),
             PERIPH..=0x3fff_ffff | 0x4000_0100..=0x4003_ffff => self.note(a),
             _ => return Err(Fault::Unmapped),
@@ -164,6 +229,24 @@ impl Soc {
         self.armctrl.set_gpu(GPU_SDHCI, self.sd.irq());
         self.armctrl.set_gpu(GPU_USB, self.usb.irq());
         self.armctrl.set_arm(ARM_MAILBOX, self.mbox.irq());
+        if self.pace_next.is_some_and(|t| now >= t) { self.dma_pace(now); }
+        for n in 0..11 { self.armctrl.set_gpu(GPU_DMA0 + n, self.dma.irq(n)); }
+        self.armctrl.set_gpu(GPU_DMA0 + 11, (11..15).any(|k| self.dma.irq(k)));
+        // GPIO interrupt groups 0 (lines 0..27) and 1 (28..45), the two the device tree lists
+        self.gpio.now_ns = now;
+        let banks = self.gpio.irq();
+        self.armctrl.set_gpu(GPU_GPIO0, banks[0]);
+        self.armctrl.set_gpu(GPU_GPIO0 + 1, banks[1]);
+        self.armctrl.set_gpu(GPU_I2C, self.ddc.irq());
+        if let Some(v) = self.vc4.as_mut() {
+            // the HDMI state machine clock paces the audio; the pixel clock pixel valve 2
+            v.audio_clk_hz = self.mbox.rates[13] as u64;
+            v.pixel_hz = self.mbox.rates[9] as u64;
+            v.tick(now);
+            for (n, line) in [GPU_PV0, GPU_PV1, GPU_PV2].into_iter().enumerate() { self.armctrl.set_gpu(line, v.irq_pv_n(n)); }
+            self.armctrl.set_gpu(GPU_HVS, v.irq_hvs());
+            self.armctrl.set_gpu(GPU_HDMI0, v.irq_hdmi());
+        }
         self.pm.now = now;
         // nothing reads the spare UART's output yet: keep it from growing without bound
         if self.uart.out.len() > 1 << 16 { self.uart.out.clear(); }
@@ -171,7 +254,55 @@ impl Soc {
     }
 
     /// The next device deadline.
-    pub(crate) fn next_event(&self) -> Option<u64> { [self.pm.next_event(), self.usb.next_event()].into_iter().flatten().min() }
+    pub(crate) fn next_event(&self) -> Option<u64> {
+        let vc4 = self.vc4.as_ref().and_then(|v| v.next_event());
+        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4].into_iter().flatten().min()
+    }
+
+    /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns): the HDMI
+    /// audio FIFO (DREQ 17).
+    pub(crate) fn dma_pace(&mut self, now: u64) {
+        use bcm2711::vc4::DREQ_HDMI_BCM2835 as DREQ;
+        let mut demands = [(DREQ, self.vc4.as_mut().map_or(0, |v| v.mai_demand(now)))];
+        let mut words = Vec::new();
+        let mut dma = std::mem::take(&mut self.dma);
+        dma.pace(&mut demands, self, &mut words);
+        self.dma = dma;
+        if let Some(vc) = self.vc4.as_mut() {
+            for (_, v) in words { vc.mai_push(v); }
+            if !vc.audio.is_empty() {
+                if self.capture_audio { self.audio_rate = vc.audio_rate; self.audio.extend(vc.audio.drain(..)); } else { vc.audio.clear(); }
+            }
+        }
+        if self.audio.len() > 2 * 48_000 * 10 { self.audio.drain(..self.audio.len() / 4 * 2); }
+        self.pace_next = if self.dma.paced_active() { Some(now + 500_000) } else { None };
+    }
+
+    /// DMA channel `n` was made active: walk its control blocks now, up to one that waits for
+    /// a DREQ.
+    fn dma_run(&mut self, n: usize) {
+        let mut dma = std::mem::take(&mut self.dma);
+        let paced = dma.run(n, self);
+        self.dma = dma;
+        if paced { self.pace_next = Some(0); }
+    }
+
+    /// Plug the monitor in or out: its EDID on the DDC bus, the HDMI block's hot-plug status,
+    /// and the hot-plug line the driver reads (GPIO 28 on most models, line 4 of the firmware's
+    /// GPIO expander on the 3B; both active low).
+    pub fn set_hdmi_connected(&mut self, model: Model, on: bool) {
+        let Some(v) = self.vc4.as_mut() else { return };
+        v.connected = on;
+        let mut eeprom = bcm2711::vc4::EdidEeprom::new(v.edid().to_vec());
+        eeprom.connected = on;
+        self.ddc.devices = vec![Box::new(eeprom)];
+        if model.hpd_on_expander() {
+            if on { self.mbox.exp_gpio_in &= !(1 << 4) } else { self.mbox.exp_gpio_in |= 1 << 4 }
+        } else {
+            self.gpio.set_input(28, Some(!on));
+        }
+        self.dirty = true;
+    }
 
     /// USB time: frames (SOF), and held transfers whose devices have data now.
     pub(crate) fn usb_tick(&mut self, now: u64) {
@@ -196,9 +327,18 @@ impl Soc {
         }
     }
 
-    /// What the display shows, as RGBA: the firmware framebuffer.
-    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> { self.mbox.render(&self.ram, out) }
-    pub fn shown_size(&self) -> Option<(u32, u32)> { self.mbox.fb.allocated.then(|| self.mbox.fb_size()) }
+    /// What HDMI shows, as RGBA: the HVS's composition while the KMS driver drives the display,
+    /// else the firmware framebuffer.
+    pub fn render(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        if let Some(v) = self.vc4.as_ref().filter(|v| v.active()) { return v.render(&self.ram, out); }
+        self.mbox.render(&self.ram, out)
+    }
+    /// The mode HDMI shows right now (None while the display is off).
+    pub fn shown_size(&self) -> Option<(u32, u32)> {
+        match self.vc4.as_ref() { Some(v) if v.active() => v.size(), _ => self.mbox.fb.allocated.then(|| self.mbox.fb_size()) }
+    }
+    /// The size the display has (or last had): what a VNC viewer and the pointer scale to.
+    pub fn display_size(&self) -> (u32, u32) { self.vc4.as_ref().and_then(|v| v.size()).unwrap_or_else(|| self.mbox.fb_size()) }
 
     fn note(&mut self, a: u64) {
         let page = a & !0xfff;
@@ -228,6 +368,16 @@ macro_rules! ram_rw {
             self.mmio_write(a, v as u32, $n)
         }
     };
+}
+
+/// DMA bus addresses: the peripherals at 0x7e.., RAM through any of the VideoCore's aliases
+/// (Linux uses 0xc000_0000, the device tree's `dma-ranges`).
+pub(crate) fn dma_phys(a: u32) -> u64 {
+    if (0x7e00_0000..0x7f00_0000).contains(&a) { (a - 0x3f00_0000) as u64 } else { (a & 0x3fff_ffff) as u64 }
+}
+
+impl bcm2711::dma::DmaBus for Soc {
+    fn phys(&self, bus: u32) -> u64 { dma_phys(bus) }
 }
 
 impl Bus for Soc {
@@ -320,16 +470,40 @@ impl Machine {
             ram: vec![0; ram_arm_visible], arm_ram, cur: 0, local: LocalIntc::new(), armctrl: ArmCtrl::new(), uart: Pl011::new(), aux: AuxUart::new(),
             mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(),
             usb: { let mut d = Dwc2::new(); d.port = None; d }, devs: Devices::default(), tree: UsbTree::new(), net: None, asb: [0; 12],
+            gpio: bcm2711::gpio::Gpio::new(), dma: bcm2711::dma::Dma::new(), pace_next: None, ddc: bcm2711::i2c::I2c::with_devices(Vec::new()), vc4: None,
+            audio: Vec::new(), audio_rate: 0, capture_audio: false,
             unknown: Vec::new(), dirty: true,
         };
         let mut m = Machine { model, cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0,
                               round_end: u64::MAX, breakpoints: Default::default(), idle_target: 0, multi: false,
                               #[cfg(not(target_arch = "wasm32"))] mt: None };
         m.soc.tree = usb_tree(model, &mut m.soc.devs);
+        // the firmware clocks the BCM2837's firmware lists for Linux: ARM (cpufreq, one operating
+        // point at the board's clock), core, V3D, pixel (HDMI's pixel clock), M2MC (the HDMI
+        // state machine)
+        m.soc.mbox.clocks = &[3, 4, 5, 9, 13];
+        m.soc.mbox.rates[3] = model.arm_mhz() * 1_000_000;
+        // nothing on HDMI's hot-plug line until a monitor is plugged in (`enable_kms`)
+        m.soc.gpio.set_input(28, Some(true));
+        m.soc.mbox.exp_gpio_in = 1 << 4;
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
         m
     }
+
+    /// The KMS display pipeline (`dtoverlay=vc4-kms-v3d`) with a monitor whose preferred mode
+    /// is `w`x`h` plugged into HDMI.
+    pub fn enable_kms(&mut self, w: u32, h: u32) {
+        self.soc.vc4 = Some(bcm2711::vc4::Vc4::bcm2835(w, h));
+        self.soc.set_hdmi_connected(self.model, true);
+    }
+
+    /// The VideoCore IV 3D block is modelled (the device tree then lists it next to the display
+    /// pipeline). Not yet: the `vc4-3d` crate hooks in here.
+    pub fn has_v3d(&self) -> bool { false }
+
+    /// Plug the HDMI monitor in or out (the driver polls the hot-plug line).
+    pub fn set_hdmi_connected(&mut self, on: bool) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
 
     /// Plug the Ethernet port into sbc-net's virtual network (DHCP, DNS); `nat` also relays
     /// guest TCP/UDP to the host's network (native builds only). Boards without Ethernet
@@ -769,7 +943,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Result<Vec<u8>, String> {
         let mut w = emu_core::snap::W::default();
-        w.tag("pi3-machine-v2");
+        w.tag("pi3-machine-v3");
         w.u8(self.model as u8);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -788,6 +962,11 @@ impl Machine {
         self.soc.usb.save_state(&mut w);
         { use emu_core::snap::Snap; self.soc.devs.save(&mut w); self.soc.tree.save(&mut w); }
         for r in self.soc.asb { w.u32(r); }
+        // v3: GPIO, DMA, the display pipeline
+        self.soc.gpio.save_state(&mut w);
+        self.soc.dma.save_state(&mut w);
+        w.bool(self.soc.vc4.is_some());
+        if let Some(v) = self.soc.vc4.as_ref() { v.save_state(&mut w); }
         emu_core::snap::save_ram(&mut w, &self.soc.ram);
         let mut out = SNAP_MAGIC.to_vec();
         out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&w.0, 1));
@@ -800,7 +979,7 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("the snapshot is damaged ({:?})", e.status))?;
         let e = |e: emu_core::snap::SnapError| e.0;
         let mut r = emu_core::snap::R::new(&raw);
-        r.tag("pi3-machine-v2").map_err(e)?;
+        let v3 = match r.bytes().map_err(e)? { b"pi3-machine-v3" => true, b"pi3-machine-v2" => false, _ => return Err("snapshot layout mismatch: not a Raspberry Pi 3 machine state".into()) };
         let model = r.u8().map_err(e)?;
         if model != self.model as u8 { return Err(format!("the snapshot is of another model (this machine: --model {})", self.model.id())); }
         let (now, exceptions, irqs) = (r.u64().map_err(e)?, r.u64().map_err(e)?, r.u64().map_err(e)?);
@@ -831,6 +1010,18 @@ impl Machine {
         self.soc.usb.load_state(&mut r, &mut self.soc.devs.kbd, false).map_err(e)?;
         { use emu_core::snap::Snap; self.soc.devs.load(&mut r).map_err(e)?; self.soc.tree.load(&mut r).map_err(e)?; }
         for x in self.soc.asb.iter_mut() { *x = r.u32().map_err(e)?; }
+        if v3 {
+            self.soc.gpio.load_state(&mut r).map_err(e)?;
+            self.soc.dma.load_state(&mut r).map_err(e)?;
+            let kms = r.bool().map_err(e)?;
+            if kms != self.soc.vc4.is_some() {
+                return Err(format!("the snapshot was taken with --display {} (this machine: --display {})", if kms { "kms" } else { "fb" }, if kms { "fb" } else { "kms" }));
+            }
+            if let Some(v) = self.soc.vc4.as_mut() { v.load_state(&mut r).map_err(e)?; }
+            // the DDC bus's EEPROM follows the restored monitor
+            if let Some(on) = self.soc.vc4.as_ref().map(|v| v.connected) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
+            self.soc.pace_next = Some(0);
+        }
         emu_core::snap::load_ram(&mut r, &mut self.soc.ram).map_err(e)?;
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }
         self.next_check = 0;

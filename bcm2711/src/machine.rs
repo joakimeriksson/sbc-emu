@@ -108,6 +108,10 @@ pub(crate) fn dma_phys(a: u32, ram_len: u64) -> u64 {
     else if a >= 0x4000_0000 && a < 0xfc00_0000 { a & 0x3fff_ffff } else { a }
 }
 
+impl crate::dma::DmaBus for Soc {
+    fn phys(&self, bus: u32) -> u64 { dma_phys(bus, self.ram.len() as u64) }
+}
+
 impl Soc {
     pub(crate) fn mmio_read(&mut self, a: u64) -> Result<u32, Fault> {
         self.dirty = true;
@@ -263,111 +267,31 @@ impl Soc {
         self.dirty = false;
     }
 
-    /// Load channel `n`'s next control block into its registers; false at the end of the chain.
-    fn dma_load_cb(&mut self, n: usize) -> bool {
-        let cb = self.dma.ch[n].conblk & !31;
-        if cb == 0 { return false; }
-        let base = dma_phys(cb, self.ram.len() as u64);
-        let mut w = [0u32; 8];
-        for (k, x) in w.iter_mut().enumerate() { *x = self.read32(base + 4 * k as u64).unwrap_or(0); }
-        let c = &mut self.dma.ch[n];
-        [c.ti, c.src, c.dst, c.len, c.stride, c.next] = [w[0], w[1], w[2], w[3], w[4], w[5]];
-        true
-    }
-
-    /// The current block of channel `n` is done: interrupt, then on to the next one.
-    fn dma_block_done(&mut self, n: usize) -> bool {
-        use crate::dma::*;
-        let c = &mut self.dma.ch[n];
-        if c.ti & TI_INTEN != 0 { c.cs |= INT; }
-        c.conblk = c.next;
-        if c.conblk == 0 || !self.dma_load_cb(n) {
-            let c = &mut self.dma.ch[n];
-            c.cs = (c.cs & !ACTIVE) | END;
-            return false;
-        }
-        true
-    }
-
     /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns): the
     /// PCM's transmit FIFO (DREQ 2) and HDMI0's audio FIFO (DREQ 10).
     pub(crate) fn dma_pace(&mut self, now: u64) {
-        use crate::dma::*;
         let mut demands = [(crate::i2s::DREQ_TX, self.i2s.tx_demand(now)), (crate::vc4::DREQ_HDMI0, self.vc4.as_mut().map_or(0, |v| v.mai_demand(now)))];
-        for n in 0..CHANNELS {
-            let Some(dreq) = paced(self.dma.ch[n].ti) else { continue };
-            if self.dma.ch[n].cs & ACTIVE == 0 { continue; }
-            let Some(slot) = demands.iter().position(|d| d.0 == dreq) else { continue };
-            let mut demand = demands[slot].1;
-            let mut guard = 0;
-            while demand > 0 && guard < 1 << 20 {
-                guard += 1;
-                let c = self.dma.ch[n];
-                if c.len < 4 {
-                    if !self.dma_block_done(n) { break; }
-                    if paced(self.dma.ch[n].ti).is_none() { self.dma_run(n); break; }
-                    continue;
-                }
-                let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(dma_phys(c.src, self.ram.len() as u64)).unwrap_or(0) };
-                if dreq == crate::i2s::DREQ_TX { self.i2s.push(v); } else if let Some(vc) = self.vc4.as_mut() { vc.mai_push(v); }
-                let c = &mut self.dma.ch[n];
-                if c.ti & TI_SRC_INC != 0 { c.src = c.src.wrapping_add(4); }
-                c.len -= 4;
-                demand -= 1;
-            }
-            // the block that just ran dry completes now, not at the next demand
-            if self.dma.ch[n].cs & ACTIVE != 0 && self.dma.ch[n].len < 4 { self.dma_block_done(n); }
-            demands[slot].1 = demand;
+        let mut words = Vec::new();
+        let mut dma = std::mem::take(&mut self.dma);
+        dma.pace(&mut demands, self, &mut words);
+        self.dma = dma;
+        for (dreq, v) in words {
+            if dreq == crate::i2s::DREQ_TX { self.i2s.push(v); } else if let Some(vc) = self.vc4.as_mut() { vc.mai_push(v); }
         }
         // HDMI audio comes out where the DAC's does
         if let Some(vc) = self.vc4.as_mut() {
             if !vc.audio.is_empty() { self.i2s.rate = vc.audio_rate; self.i2s.out.extend(vc.audio.drain(..)); }
         }
-        self.pace_next = if (0..CHANNELS).any(|n| self.dma.ch[n].cs & ACTIVE != 0 && paced(self.dma.ch[n].ti).is_some()) { Some(now + 500_000) } else { None };
+        self.pace_next = if self.dma.paced_active() { Some(now + 500_000) } else { None };
     }
 
     /// DMA channel `n` was made active: walk its control blocks now, up to one that waits
     /// for a DREQ.
     fn dma_run(&mut self, n: usize) {
-        use crate::dma::*;
-        let ram_len = self.ram.len() as u64;
-        let phys = |a: u32| dma_phys(a, ram_len);
-        for _ in 0..4096 {
-            let cb = self.dma.ch[n].conblk & !31;
-            if cb == 0 { break; }
-            if !self.dma_load_cb(n) { break; }
-            let c = self.dma.ch[n];
-            if paced(c.ti).is_some() { self.pace_next = Some(0); return; } // runs as its peripheral asks
-            let [ti, src, dst, len, stride, next] = [c.ti, c.src, c.dst, c.len, c.stride, c.next];
-            let (xlen, rows) = if ti & TI_TDMODE != 0 { (len & 0xffff, (len >> 16) & 0x3fff) } else { (len & 0x3fff_ffff, 1) };
-            let (sstride, dstride) = ((stride & 0xffff) as i16 as i64, (stride >> 16) as i16 as i64);
-            let (mut s, mut d) = (phys(src), phys(dst));
-            for row in 0..rows {
-                let mut off = 0;
-                while off < xlen {
-                    let n4 = (xlen - off).min(4);
-                    if n4 == 4 {
-                        let v = if ti & TI_SRC_IGNORE != 0 { 0 } else { self.read32(s).unwrap_or(0) };
-                        if ti & TI_DEST_IGNORE == 0 { let _ = self.write32(d, v); }
-                    } else {
-                        for b in 0..n4 as u64 {
-                            let v = if ti & TI_SRC_IGNORE != 0 { 0 } else { self.read8(s + b).unwrap_or(0) };
-                            if ti & TI_DEST_IGNORE == 0 { let _ = self.write8(d + b, v); }
-                        }
-                    }
-                    if ti & TI_SRC_INC != 0 { s += n4 as u64; }
-                    if ti & TI_DEST_INC != 0 { d += n4 as u64; }
-                    off += n4;
-                }
-                if ti & TI_TDMODE != 0 && row + 1 < rows { s = s.wrapping_add(sstride as u64); d = d.wrapping_add(dstride as u64); }
-            }
-            let c = &mut self.dma.ch[n];
-            c.ti = ti; c.src = src; c.dst = dst; c.len = 0; c.stride = stride; c.next = next;
-            if ti & TI_INTEN != 0 { c.cs |= INT; }
-            c.conblk = next;
-        }
-        let c = &mut self.dma.ch[n];
-        c.cs = (c.cs & !ACTIVE) | END;
+        let mut dma = std::mem::take(&mut self.dma);
+        let paced = dma.run(n, self);
+        self.dma = dma;
+        if paced { self.pace_next = Some(0); }
     }
 
     /// The size of what the HDMI output shows now.

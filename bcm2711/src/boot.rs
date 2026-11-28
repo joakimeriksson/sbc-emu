@@ -50,6 +50,8 @@ pub struct SdBoot {
     pub cmdline: String,
     /// human-readable notes on how config.txt was interpreted
     pub notes: Vec<String>,
+    /// config.txt asks for the vc4 KMS driver (`dtoverlay=vc4-kms-v3d`)
+    pub kms: bool,
 }
 
 fn gunzip_if_needed(data: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -107,6 +109,8 @@ pub struct BootConfig {
     pub auto_initramfs: bool,
     /// `arm_64bit=` if given
     pub arm64: Option<bool>,
+    /// `dtoverlay=vc4-kms-v3d` (on a board whose emulated tree can describe it)
+    pub kms: bool,
     /// human-readable notes on what was applied or ignored
     pub notes: Vec<String>,
 }
@@ -138,7 +142,10 @@ pub fn parse_config(config: &str, fw: &Firmware) -> BootConfig {
             ("os_prefix", v) => c.os_prefix = v.to_string(),
             ("auto_initramfs", v) => c.auto_initramfs = v == "1",
             ("arm_64bit", v) => c.arm64 = Some(v != "0"),
-            ("dtoverlay", v) if v.starts_with("vc4-kms-v3d") && fw.kms => c.notes.push("dtoverlay=vc4-kms-v3d: HDMI through the vc4 KMS driver (the device tree describes it unless --display fb)".into()),
+            ("dtoverlay", v) if v.starts_with("vc4-kms-v3d") && fw.kms => {
+                c.kms = true;
+                c.notes.push("dtoverlay=vc4-kms-v3d: HDMI through the vc4 KMS driver (the device tree describes it unless --display fb)".into());
+            }
             ("dtoverlay", v) | ("dtparam", v) => c.notes.push(format!("ignored {k}={v} (reduced device tree)", k = k.trim())),
             _ => {}
         }
@@ -153,7 +160,7 @@ pub fn read_sd_boot_for(disk: &mut dyn crate::sdhci::Disk, fw: &Firmware) -> Res
     let &(_, lba, _) = parts.iter().find(|p| matches!(p.0, 0x0b | 0x0c | 0x0e | 0x06 | 0x04)).ok_or("no FAT boot partition in the MBR")?;
     let mut fat = crate::fat::Fat::open(disk, lba).ok_or("boot partition is not FAT16/FAT32")?;
     let config = fat.read_file("config.txt").map(|c| String::from_utf8_lossy(&c).into_owned()).unwrap_or_default();
-    let BootConfig { kernel: mut kernel_name, kernel_set, initramfs: mut initramfs_name, cmdline: mut cmdline_name, os_prefix, auto_initramfs, arm64, mut notes } = parse_config(&config, fw);
+    let BootConfig { kernel: mut kernel_name, kernel_set, initramfs: mut initramfs_name, cmdline: mut cmdline_name, os_prefix, auto_initramfs, arm64, mut notes, kms } = parse_config(&config, fw);
     if arm64 == Some(false) {
         return Err("config.txt asks for a 32-bit kernel (arm_64bit=0): not supported".into());
     }
@@ -178,7 +185,7 @@ pub fn read_sd_boot_for(disk: &mut dyn crate::sdhci::Disk, fw: &Firmware) -> Res
     let cmdline = cmdline.replace("console=serial0", &format!("console={}", fw.serial0)).replace("console=serial1", &format!("console={}", fw.serial1));
     notes.insert(0, format!("kernel {kernel_name} ({} bytes), initramfs {}, cmdline from {cmdline_name}", kernel.len(),
         initramfs_name.as_deref().unwrap_or("none")));
-    Ok(SdBoot { kernel, initramfs, cmdline, notes })
+    Ok(SdBoot { kernel, initramfs, cmdline, notes, kms })
 }
 
 #[cfg(test)]
@@ -192,8 +199,11 @@ mod tests {
         let pi4 = parse_config(CONFIG, &PI4_FIRMWARE);
         assert_eq!((pi4.kernel.as_str(), pi4.cmdline.as_str(), pi4.initramfs.as_deref()), ("pi4.img", "cmdline.txt", Some("extra.cpio")));
         assert!(pi4.auto_initramfs && pi4.arm64 == Some(true));
-        let pi3 = Firmware { sections: &["pi3", "pi3+"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: false };
+        let pi3 = Firmware { sections: &["pi3", "pi3+"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true };
         let c = parse_config(CONFIG, &pi3);
+        assert!(!c.kms);
+        assert!(parse_config("[pi3]\ndtoverlay=vc4-kms-v3d,cma-128\n", &pi3).kms);
+        assert!(!parse_config("[pi4]\ndtoverlay=vc4-kms-v3d\n", &pi3).kms);
         assert_eq!((c.kernel.as_str(), c.cmdline.as_str(), c.initramfs.as_deref()), ("pi3.img", "plus.txt", Some("extra.cpio")));
         assert!(c.kernel_set);
     }
