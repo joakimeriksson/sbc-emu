@@ -3,10 +3,10 @@
 An instruction-level BCM2837 that boots the unmodified **Raspberry Pi OS Lite (trixie, arm64)
 SD-card image**, the same image the [Raspberry Pi 4](raspberry-pi-4.md) boots, on four Cortex-A53
 cores: its first-boot wizard runs on the framebuffer console with the USB keyboard, and the
-network works over the LAN7515's USB Ethernet, and HDMI runs on the stock `vc4` KMS driver the
-image's `config.txt` asks for. **Experimental**: milestones 1–4 of the [plan](rpi3-plan.md) are
-done (serial shell, Pi OS from the SD card, USB and Ethernet, HDMI); Wi-Fi, Bluetooth and the 3D
-GPU are not modelled yet.
+network works over the LAN7515's USB Ethernet, and HDMI and composite video run on the stock
+`vc4` KMS driver the image's `config.txt` asks for. **Experimental**: milestones 1–4 and 8 of the
+[plan](rpi3-plan.md) are done (serial shell, Pi OS from the SD card, USB and Ethernet, HDMI,
+composite video); Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 
 ## What runs today
 
@@ -25,6 +25,7 @@ GPU are not modelled yet.
 | YUV planes and scaling | `kmstest` with a 320×240 NV12 or YUV420 (three-plane) frame buffer on a 768×576 plane: the pattern scaled, the colours converted with the display list's matrix | `wait-pixel` on its blue and red bars; `out/rpi3-hdmi-03-nv12.png` |
 | HDMI audio | the `vc4-hdmi` ALSA card: DMA (DREQ 17) into the MAI FIFO, paced at the rate the HDMI clock and the MAI divider give; `--audio-out FILE.wav` | `speaker-test -D hdmi:CARD=vc4hdmi,DEV=0 -t sine -f 440 -c 2`: the WAV holds a 440.0 Hz tone, 3.000 s per channel at 48 kHz |
 | CEC | the adapter (`/dev/cec0`, physical address 1.0.0.0 from the EDID) and a TV on the bus | `cec-ctl --playback -S`: device 0 (TV), CEC 1.4, physical address 0.0.0.0, OSD name `sbc-emu TV`, power on |
+| Composite video (`dtoverlay=vc4-kms-v3d,composite`) | the VEC on pixel valve 2's other output: `Composite-1` (status `unknown`, as on a real Pi: composite has no load detection) next to `HDMI-A-1`, with the driver's TV standards (NTSC, NTSC-J, NTSC-443, PAL, PAL-M, PAL-N, PAL-60, SECAM, monochrome); `sdtv_mode` becomes the firmware's `video=Composite-1:…` option; the console on composite when no monitor is on HDMI; the 720×576 (PAL) or 720×480 (NTSC) frame over VNC and in screenshots | `scripts/rpi3-composite.txt`: `kmsprint` lists `Composite-1`; PAL: `720x576i@50.00`, `VEC_CONFIG0 = 0x00000001`, `kmstest --flip` at 50.00 fps, its pattern on screen; NTSC: `720x480i@59.94`, `VEC_CONFIG0 = 0x00000040`, 59.94 fps |
 | Hot-plug | GPIO 28 (active low; the 3B's line 4 of the firmware's GPIO expander), polled by the driver; the `hdmi disconnect`/`hdmi connect` script commands | `HDMI-A-1` `disconnected`, then `connected` again |
 | Interpreter, threads, snapshots, gdb | the shell script passes without the JIT (57 s) and with `--threads multi` (4 s); a snapshot (`save FILE` in a script, `--restore`) resumes with the shell's state, also onto `--threads multi`; `--gdb PORT` shows the four cores as threads | runs listed in the pull request |
 
@@ -46,10 +47,11 @@ GPU are not modelled yet.
 | HVS (`0x3f40_0000`, GPU interrupt 33) | the BCM2835-family HVS of `bcm2711/src/vc4.rs` (`Gen::Bcm2835`): display lists in its memory at 0x2000, the list latched at each frame start of the channel's pixel valve, per-channel frame counters and end-of-frame interrupts, RGB planes (8888, 565, 5551, 4444, 555, 888, 332; linear and T-tiled), YUV 4:2:0 and 4:2:2 in two or three planes with the list's colour matrix, nearest-neighbour scaling, fixed and per-pixel alpha, the gamma table; composed when the host wants a picture | `vc4` |
 | Pixel valves 0–2 (`0x3f20_6000`, `0x3f20_7000`, `0x3f80_7000`) | timings, vblank (VFP start) at the mode's rate: pixel valve 2 (HDMI, HVS channel 1) from its timings and the firmware's pixel clock, the others at 60 Hz | `vc4` |
 | HDMI (`0x3f90_2000`, `hd` at `0x3f80_8000`) | the BCM2835 HDMI block: reset, PHY, scheduler and FIFO handshakes that complete at once, infoframe RAM, hot-plug status; the MAI audio FIFO (DREQ 17); CEC with a TV on the bus (GPU interrupt 40) | `vc4` (`vc4_hdmi`, its CEC and audio) |
+| VEC (`0x3f80_6000`) | the composite encoder: the registers `vc4_vec.c` programs (TV standard, subcarrier, DAC), resets that complete at once; it encodes while VEC_CFG enables it and pixel valve 2 selects its clock; fields at the VEC clock / 8 (13.5 MHz): 50 a second for 625 lines, 59.94 for 525; the host gets the decoded frame (both fields; luma only in the monochrome standard), not a signal. Listed in the device tree with `dtoverlay=vc4-kms-v3d,composite`, as the overlay's dormant fragment does | `vc4` (`vc4_vec`) |
 | DDC | BSC2 (`0x3f80_5000`, the BCM2835 I²C controller of `bcm2711/src/i2c.rs`) with the monitor's EDID EEPROM at 0x50 (the Pi 4's 1080p monitor, `--hdmi-mode` for others) | `i2c-bcm2835` |
 | DMA controller (`0x3f00_7000`, GPU interrupts 16–27) | the Pi 4's BCM2835 DMA engine (`bcm2711/src/dma.rs`): control-block chains, 2D mode, DREQ-paced blocks fed as the peripheral asks; channels 0x7f35 for Linux | `bcm2835-dma` |
 | GPIO (`0x3f20_0000`, GPU interrupts 49, 50) | the Pi 4's GPIO block as `brcm,bcm2835-gpio`: function select, levels, events; GPIO 28 is HDMI's hot-plug line | `pinctrl-bcm2835` |
-| Firmware clocks, power, GPIO expander | ARM (one operating point), core, V3D, pixel and HDMI state machine clocks through the mailbox; the firmware's power domains; its GPIO expander (lines 128–135) | `clk-raspberrypi`, `raspberrypi-power`, `gpio-raspberrypi-exp` |
+| Firmware clocks, power, GPIO expander | ARM (one operating point), core, V3D, pixel, HDMI state machine and VEC (108 MHz) clocks through the mailbox; the firmware's power domains; its GPIO expander (lines 128–135) | `clk-raspberrypi`, `raspberrypi-power`, `gpio-raspberrypi-exp` |
 | USB host (`0x3f98_0000`, GPU interrupt 9) | the Pi 4's DWC2 model (`bcm2711/src/dwc2.rs`): buffer DMA through the `0xc000_0000` bus alias, a high-speed root port (frame number in microframes, SOF every 1 ms), start/complete split transactions (HCSPLT), bulk and interrupt IN transfers held while the device NAKs. `brcm,bcm2835-usb`, `dr_mode = "host"` | `dwc2` (not the vendor `dwc_otg`, which needs the FIQ) |
 | Hubs | two USB 2.0 hubs (`emu-core/src/usb_hub.rs`): 0424:2514 with 4 and 3 ports, self-powered, one transaction translator; port power, reset, enable, suspend/resume, change bits, the status-change interrupt endpoint; port 1 of each marked non-removable | `hub` |
 | Ethernet | LAN7800 (`emu-core/src/lan78xx.rs`, 0424:7800): registers through vendor control requests, no EEPROM and a blank OTP (the MAC comes from the device tree), the internal LAN88xx PHY at MDIO address 1 (IEEE, paged and MMD registers, 1000BASE-T full-duplex partner), bulk frames with RX command words A/B/C and the FCS, TX command words with checksum insertion, TCP segmentation and VLAN insertion done by the model, the interrupt endpoint for the PHY | `lan78xx`, `microchip` PHY (polled) |
@@ -82,8 +84,14 @@ Compatibility labels in the plan's terms:
   `bcm2710-rpi-3-b-plus.dtb` (bus addresses at 0x7e…, `dma-ranges` through 0xc000_0000) but listing
   only modelled devices, with fixed clocks for the UARTs, SD host and I²C, firmware clocks for the
   display. `dtoverlay=vc4-kms-v3d` adds what the overlay enables (the HVS, pixel valves, HDMI, its
-  DDC bus, the transposer, 256 MiB of CMA); other `dtoverlay`/`dtparam` lines are reported and
-  ignored.
+  DDC bus, the transposer, 256 MiB of CMA), and its `composite` parameter the VEC (`nohdmi` leaves
+  HDMI and its DDC bus out); other `dtoverlay`/`dtparam` lines are reported and ignored.
+- **composite and `config.txt`**: with the VEC listed, the emulated firmware writes
+  `video=Composite-1:720x576@50i` (`sdtv_mode=2`; `720x480@60i` for 0, 1 and 3, `720x288@50` and
+  `720x240@60` for 18 and 16) into the command line, the format string the Pi 3's `start.elf`
+  carries, unless `disable_fw_kms_setup=1` (as in the stock `config.txt`) or `enable_tvout=0`.
+  The kernel then defaults the TV standard to PAL for a 50 Hz `video=` mode and to NTSC
+  otherwise (`vc4.tv_norm=` overrides it). The firmware adds no `vc4.tv_norm` itself.
 - **vendor_image_compatibility**: the stock Raspberry Pi OS Lite image boots unmodified (writes go
   to a copy-on-write overlay).
 - **tested_cpu_count**: 4 (`--smp 1..4`).
@@ -95,6 +103,13 @@ Where the model differs from a real 3B+:
   Wi-Fi arrives (milestone 5).
 - Secondary cores start through PSCI (`enable-method = "psci"`), not the vendor tree's spin table;
   Linux at EL1, as on the Pi 4 machine.
+- HDMI and composite share pixel valve 2 (HVS channel 1), as on the SoC: one of them shows a
+  picture at a time. With a monitor on HDMI the console stays there and `kmstest -c Composite-1`
+  fails its atomic test (the CRTC is HDMI's); unplugged (`hdmi disconnect`), the console moves to
+  composite.
+- Composite: no analogue signal; the WSS/VPS inserter, colour-bar generator and interrupt are
+  registers without an effect, and `enable_tvout=0` only drops the firmware's `video=` option.
+  The firmware's `video=` option for HDMI (with `disable_fw_kms_setup=0`) is not written.
 - HDMI: the HVS composes the picture when the host asks for one (a screenshot, a VNC update),
   not line by line; its line counter reads 0, underruns never happen, the transposer (writeback)
   writes nothing. Scaling is nearest-neighbour (the hardware filters). The HDMI handshakes complete
@@ -127,6 +142,8 @@ python3 -m http.server 8731 --bind 127.0.0.1 --directory scripts &
 # HDMI: the wizard on the KMS console, the connector, page flips, YUV planes, audio, CEC, hot-plug
 ./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --audio-out out/rpi3-hdmi.wav \
     --script scripts/rpi3-hdmi.txt --timeout 900
+# composite: config.txt edited in the guest (copy-on-write), PAL and NTSC on Composite-1
+./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-composite.txt --timeout 900
 
 # the Pi kernel with a BusyBox initramfs (console on ttyS0)
 mkdir -p cache/rpi3
@@ -162,8 +179,8 @@ transfers, `SBC_NET_LOG=1` the virtual network, `SBC_TRACE_VC4=1` the display re
 - Ethernet: the statistics counters (`ethtool -S`) read zero, wake-on-LAN and EEE do nothing,
   the receive filters (perfect, hash, VLAN) are not applied: every frame from the network is
   delivered.
-- No VideoCore IV 3D (the device tree's V3D node waits for its model), no composite output (VEC),
-  no DSI or DPI displays, no video decode.
+- No VideoCore IV 3D (the device tree's V3D node waits for its model), no DSI or DPI displays, no
+  video decode.
 - No Wi-Fi or Bluetooth (the PL011 is a plain serial port), no `sdhost`.
 - No I²C on the header, no SPI, PCM/I²S or system timer in the device tree; the GPIO block has no
   pull-up/down state (`GPPUD`) and nothing on the header pins.

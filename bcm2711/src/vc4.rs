@@ -5,10 +5,17 @@
 //!
 //! `Gen::Bcm2711`: the HVS5, pixel valve 2 and HDMI0 with its PHY, DVP and DDC bus (the BSC in
 //! the HDMI window). `Gen::Bcm2835`: the HVS of the BCM2835/6/7 (display lists at 0x2000, 12-bit
-//! sizes, 4-bit pixel formats, gamma), pixel valves 0..2 (PV2 feeds HDMI from HVS channel 1),
-//! and the BCM2835 HDMI block with its "hd" block; its DDC is the SoC's I²C controller BSC2,
+//! sizes, 4-bit pixel formats, gamma), pixel valves 0..2 (PV2 feeds HDMI or the composite
+//! encoder from HVS channel 1), the BCM2835 HDMI block with its "hd" block, and the VEC (the
+//! composite video encoder, `brcm,bcm2835-vec`); HDMI's DDC is the SoC's I²C controller BSC2,
 //! so the EDID EEPROM is a separate device there (`EdidEeprom`). Its CEC controller is modelled
 //! with a TV on the bus that answers polls and the usual queries (`Cec`).
+//!
+//! The VEC is registers plus what they select: the TV standard (PAL, NTSC and their variants,
+//! as `vc4_vec.c` writes them) and whether the encoder runs. Pixel valve 2 drives either HDMI
+//! or the VEC (its clock select); the host's picture is the output it drives, and with the VEC
+//! its fields come at the composite rate (the VEC clock / 8 = 13.5 MHz, 50 or 59.94 fields a
+//! second). The picture is the decoded frame (720x576 or 720x480, both fields), not a signal.
 //!
 //! The HVS is modelled at the level of what reaches the screen: it reads the display list of
 //! the channel being shown (plane entries: format, position, size, pointers, pitches, colour
@@ -121,6 +128,33 @@ const PV_CHANNEL_2835: [usize; 3] = [0, 2, 1];
 /// a CEC message takes this long on the bus before its reply (ns)
 const CEC_REPLY_NS: u64 = 2_000_000;
 
+// pixel valve: the even field's vertical timings (interlaced modes), the clock (encoder) select
+const PV_VERTA_EVEN: usize = 0x1c;
+const PV_VERTB_EVEN: usize = 0x20;
+const PV_VCONTROL_INTERLACE: u32 = 1 << 4;
+const PV_CLK_SELECT_HDMI: u32 = 1;
+const PV_CLK_SELECT_VEC: u32 = 2;
+
+// the VEC (0x7e806000, 0x1000 bytes): the registers vc4_vec.c uses
+pub const VEC_SIZE: u64 = 0x1000;
+const VEC_WSE_RESET: usize = 0xc0;
+const VEC_REVID: usize = 0x100;
+const VEC_CONFIG0: usize = 0x104;
+const VEC_SOFT_RESET: usize = 0x10c;
+const VEC_CONFIG1: usize = 0x188;
+const VEC_INTERRUPT_STATUS: usize = 0x194;
+const VEC_CFG: usize = 0x208;
+const VEC_CFG_VEC_EN: u32 = 1 << 3;
+const VEC_CONFIG0_SECAM_STD: u32 = 1 << 21;
+const VEC_CONFIG0_CHRDIS: u32 = 1 << 7;
+const VEC_CONFIG1_CUSTOM_FREQ: u32 = 1;
+/// the VEC's clock (Hz) as the driver sets it; its pixel clock is an eighth of it
+pub const VEC_CLK_HZ: u64 = 108_000_000;
+
+/// What pixel valve 2 drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output { Hdmi, Composite }
+
 /// The TV on the HDMI port's CEC bus: logical address 0, physical address 0.0.0.0. It
 /// acknowledges what is sent to it (or broadcast) and answers the usual queries.
 #[derive(Clone, Debug)]
@@ -230,6 +264,10 @@ pub struct Vc4 {
     pub audio_clk_hz: u64,
     /// the BCM2835's pixel clock (Hz, the firmware's PIXEL clock): pixel valve 2's frame rate
     pub pixel_hz: u64,
+    /// the BCM2835's VEC clock (Hz, the firmware's VEC clock): the composite pixel rate is 1/8
+    pub vec_hz: u64,
+    /// the VEC's registers (BCM2835 family)
+    vec: Vec<u32>,
     /// the BCM2835 HVS's gamma LUT (3 channels x R, G, B x 256) and its address port
     gamma: Vec<u32>,
     gam_addr: u32,
@@ -267,7 +305,7 @@ impl Vc4 {
         Vc4 { gen, hvs: vec![0; (HVS_SIZE / 4) as usize], frcnt: [0; 3], eof: 0, pv: [[0; 64]; 3], win: vec![0; win], hd: [0; 64], txp: [0; 8],
               edid_ptr: 0, edid: edid(), next_vblank: [FRAME_NS; 3], connected: true, frames: 0,
               mai_played_to: 0, mai_frac: 0, mai_ch: 0, mai_left: 0, audio: Vec::new(), audio_rate: 0,
-              audio_clk_hz: AUDIO_CLK_HZ, pixel_hz: 0,
+              audio_clk_hz: AUDIO_CLK_HZ, pixel_hz: 0, vec_hz: VEC_CLK_HZ, vec: vec![0; (VEC_SIZE / 4) as usize],
               gamma: (0..9 * 256).map(|k| (k % 256) as u32).collect(), gam_addr: 0, cec: Cec::default(), now: 0,
               trace: std::env::var_os("SBC_TRACE_VC4").is_some() }
     }
@@ -379,13 +417,22 @@ impl Vc4 {
     }
 
     /// A pixel valve's frame time (ns): the BCM2711's at 60 Hz; the BCM2835's from the mode it
-    /// was given (its timings) and the pixel clock (PV2, HDMI), else 60 Hz.
+    /// was given (its timings) and the pixel clock of the encoder it drives (PV2: HDMI's pixel
+    /// clock, or the VEC's 13.5 MHz), else 60 Hz. Interlaced, a "frame" is a field (vblank comes
+    /// once per field): the two fields' lines (the even one's from VERTA/B_EVEN) halved.
     fn frame_ns(&self, n: usize) -> u64 {
-        if self.gen == Gen::Bcm2711 || n != 2 || self.pixel_hz == 0 { return FRAME_NS; }
+        if self.gen == Gen::Bcm2711 || n != 2 { return FRAME_NS; }
+        let hz = match self.pv_output() { Some(Output::Composite) => self.vec_hz / 8, _ => self.pixel_hz };
+        if hz == 0 { return FRAME_NS; }
         let p = &self.pv[n];
         let f = |r: usize| (p[r / 4] >> 16) as u64 + (p[r / 4] & 0xffff) as u64;
-        let (ht, vt) = (f(PV_HORZA) + f(PV_HORZB), f(PV_VERTA) + f(PV_VERTB));
-        let t = ht * vt * 1_000_000_000 / self.pixel_hz;
+        let ht = f(PV_HORZA) + f(PV_HORZB);
+        let vt2 = if p[PV_V_CONTROL / 4] & PV_VCONTROL_INTERLACE != 0 {
+            f(PV_VERTA) + f(PV_VERTB) + f(PV_VERTA_EVEN) + f(PV_VERTB_EVEN)
+        } else {
+            2 * (f(PV_VERTA) + f(PV_VERTB))
+        };
+        let t = ht * vt2 * 1_000_000_000 / (2 * hz);
         if (1_000_000..=200_000_000).contains(&t) { t } else { FRAME_NS }
     }
 
@@ -531,6 +578,71 @@ impl Vc4 {
         self.cec.rx_at = now + CEC_REPLY_NS;
     }
 
+    // ------------------------------------------------------------------ the VEC (BCM2835)
+
+    pub fn vec_read(&self, off: u64) -> u32 {
+        let o = off as usize & !3;
+        let r = match o {
+            // the revision Linux does not check; the value is the model's
+            VEC_REVID => 0x0000_2708,
+            o if o < VEC_SIZE as usize => self.vec[o / 4],
+            _ => 0,
+        };
+        if self.trace { eprintln!("[vec] read {o:#x} = {r:#x}"); }
+        r
+    }
+
+    pub fn vec_write(&mut self, off: u64, v: u32) {
+        let o = off as usize & !3;
+        if self.trace { eprintln!("[vec] {o:#x} <- {v:#x}"); }
+        match o {
+            // the resets complete at once
+            VEC_WSE_RESET | VEC_SOFT_RESET | VEC_REVID => {}
+            VEC_INTERRUPT_STATUS => self.vec[o / 4] &= !v,
+            o if o < VEC_SIZE as usize => self.vec[o / 4] = v,
+            _ => {}
+        }
+    }
+
+    /// The VEC encodes (VEC_CFG's VEC_EN, as the driver's enable leaves it).
+    fn vec_on(&self) -> bool { self.gen == Gen::Bcm2835 && self.vec[VEC_CFG / 4] & VEC_CFG_VEC_EN != 0 }
+
+    /// The TV standard the VEC was set up for, by the names `vc4_vec.c` gives its modes.
+    pub fn tv_norm(&self) -> Option<&'static str> {
+        if !self.vec_on() { return None; }
+        let (c0, c1) = (self.vec[VEC_CONFIG0 / 4], self.vec[VEC_CONFIG1 / 4]);
+        let custom = c1 & VEC_CONFIG1_CUSTOM_FREQ != 0;
+        Some(if c0 & VEC_CONFIG0_SECAM_STD != 0 { "SECAM" } else if c0 & VEC_CONFIG0_CHRDIS != 0 { "monochrome" } else {
+            match (c0 & 3, custom) {
+                (0, false) => "NTSC",
+                (0, true) => "NTSC-443",
+                (1, _) => "PAL",
+                (2, false) => "PAL-M",
+                (2, true) => "PAL-60",
+                _ => "PAL-N",
+            }
+        })
+    }
+
+    /// The encoder pixel valve 2 drives (its clock select) while it runs: HDMI or the VEC.
+    fn pv_output(&self) -> Option<Output> {
+        if self.gen == Gen::Bcm2711 { return Some(Output::Hdmi); }
+        match (self.pv[2][PV_CONTROL / 4] >> 2) & 3 {
+            PV_CLK_SELECT_HDMI => Some(Output::Hdmi),
+            PV_CLK_SELECT_VEC => Some(Output::Composite),
+            _ => None,
+        }
+    }
+
+    /// The output the host shows: HDMI, or composite while pixel valve 2 drives a running VEC.
+    pub fn output(&self) -> Option<Output> {
+        self.shown()?;
+        match self.pv_output()? {
+            Output::Composite if !self.vec_on() => None,
+            o => Some(o),
+        }
+    }
+
     // ------------------------------------------------------------------ TXP, HD
 
     pub fn txp_read(&self, off: u64) -> u32 { self.txp[(off as usize / 4) & 7] }
@@ -651,13 +763,16 @@ impl Vc4 {
         })
     }
 
-    pub fn active(&self) -> bool { self.shown().is_some() }
+    pub fn active(&self) -> bool { self.output().is_some() }
 
-    /// The mode on HDMI, while the pipeline runs.
-    pub fn size(&self) -> Option<(u32, u32)> { self.shown().map(|(_, w, h)| (w, h)) }
+    /// The mode on the output shown (HDMI or composite), while the pipeline runs.
+    pub fn size(&self) -> Option<(u32, u32)> { self.output().and(self.shown()).map(|(_, w, h)| (w, h)) }
 
-    /// Compose the planes of the channel shown on HDMI into RGBA; None if HDMI shows nothing.
+    /// Compose the planes of the channel shown into RGBA; None if no output shows anything.
+    /// An interlaced mode's channel holds the whole frame (both fields); a monochrome TV
+    /// standard shows the luma only.
     pub fn render(&self, ram: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let output = self.output()?;
         let (ch, w, h) = self.shown()?;
         let (wu, hu) = (w as usize, h as usize);
         out.clear();
@@ -686,6 +801,12 @@ impl Vc4 {
             let lut = &self.gamma[ch * 768..ch * 768 + 768];
             for p in out.chunks_mut(4) {
                 for c in 0..3 { p[c] = lut[c * 256 + p[c] as usize].min(255) as u8; }
+            }
+        }
+        if output == Output::Composite && self.vec[VEC_CONFIG0 / 4] & VEC_CONFIG0_CHRDIS != 0 {
+            for p in out.chunks_mut(4) {
+                let y = ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8;
+                p[..3].fill(y);
             }
         }
         Some((w, h))
@@ -877,7 +998,8 @@ impl Vc4 {
     }
 
     fn save_2835(&self, w: &mut emu_core::snap::W) {
-        w.tag("vc4-2835-v1");
+        // v2 adds the VEC
+        w.tag("vc4-2835-v2");
         for v in &self.hvs { w.u32(*v); }
         for v in self.frcnt { w.u32(v); }
         w.u32(self.eof);
@@ -895,9 +1017,11 @@ impl Vc4 {
         w.bool(self.cec.tv_on); w.u64(self.cec.rx_at);
         w.u32(self.cec.rx.len() as u32);
         for m in &self.cec.rx { w.bytes(m); }
+        for v in &self.vec { w.u32(*v); }
+        w.u64(self.vec_hz);
     }
     fn load_2835(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
-        r.tag("vc4-2835-v1")?;
+        let v2 = match r.bytes()? { b"vc4-2835-v2" => true, b"vc4-2835-v1" => false, t => return Err(emu_core::snap::SnapError(format!("snapshot layout mismatch: expected vc4 state, found {}", String::from_utf8_lossy(t)))) };
         for v in self.hvs.iter_mut() { *v = r.u32()?; }
         for v in self.frcnt.iter_mut() { *v = r.u32()?; }
         self.eof = r.u32()?;
@@ -915,6 +1039,11 @@ impl Vc4 {
         self.cec.tv_on = r.bool()?; self.cec.rx_at = r.u64()?;
         self.cec.rx.clear();
         for _ in 0..r.u32()? { self.cec.rx.push_back(r.bytes()?.to_vec()); }
+        self.vec.fill(0);
+        if v2 {
+            for v in self.vec.iter_mut() { *v = r.u32()?; }
+            self.vec_hz = r.u64()?;
+        }
         Ok(())
     }
 }
@@ -1196,7 +1325,7 @@ mod tests {
     /// display list `dl` at word 16 of the list memory.
     fn bcm2835_with(dl: &[u32], w: u32, h: u32) -> Vc4 {
         let mut v = Vc4::bcm2835(1920, 1080);
-        v.pv_write_n(2, PV_CONTROL as u64, 1);
+        v.pv_write_n(2, PV_CONTROL as u64, 1 | PV_CLK_SELECT_HDMI << 2);
         v.pv_write_n(2, PV_V_CONTROL as u64, 1);
         v.hvs_write(DISPCTRL as u64, 1 << 31);
         v.hvs_write((DISPCTRL0 + 0x10) as u64, 1 << 31 | w << 12 | h);
@@ -1258,6 +1387,59 @@ mod tests {
         assert_eq!(v.frame_ns(2), 1344 * 806 * 1_000_000_000 / 65_000_000);
         v.pixel_hz = 0;
         assert_eq!(v.frame_ns(2), FRAME_NS);
+    }
+
+    #[test]
+    fn composite_pal_on_the_vec() {
+        // what vc4_crtc.c and vc4_vec.c write for 720x576i (PAL): 864 x 625 lines, two fields
+        // of 313 and 312 lines at the VEC's 13.5 MHz
+        let mut v = bcm2835_with(&[1 << 31], 720, 576);
+        v.pv_write_n(2, PV_CONTROL as u64, 1 | PV_CLK_SELECT_VEC << 2);
+        v.pv_write_n(2, PV_V_CONTROL as u64, 1 | PV_VCONTROL_INTERLACE);
+        v.pv_write_n(2, PV_HORZA as u64, 69 << 16 | 63);
+        v.pv_write_n(2, PV_HORZB as u64, 12 << 16 | 720);
+        v.pv_write_n(2, PV_VERTA as u64, 20 << 16 | 3);
+        v.pv_write_n(2, PV_VERTB as u64, 2 << 16 | 288);
+        v.pv_write_n(2, PV_VERTA_EVEN as u64, 19 << 16 | 3);
+        v.pv_write_n(2, PV_VERTB_EVEN as u64, 2 << 16 | 288);
+        // the VEC is off: nothing is shown
+        assert_eq!(v.output(), None);
+        assert_eq!(v.frame_ns(2), 20_000_000);
+        v.vec_write(VEC_CONFIG0 as u64, 1);
+        v.vec_write(VEC_CONFIG1 as u64, 7 << 10);
+        v.vec_write(VEC_CFG as u64, VEC_CFG_VEC_EN);
+        assert_eq!((v.output(), v.size(), v.tv_norm()), (Some(Output::Composite), Some((720, 576)), Some("PAL")));
+        // PAL-60 and NTSC (59.94 fields a second: 858 x 525 / 2 at 13.5 MHz)
+        v.vec_write(VEC_CONFIG0 as u64, 2);
+        v.vec_write(VEC_CONFIG1 as u64, 7 << 10 | 1);
+        assert_eq!(v.tv_norm(), Some("PAL-60"));
+        v.vec_write(VEC_CONFIG0 as u64, 0x40);
+        v.vec_write(VEC_CONFIG1 as u64, 7 << 10);
+        assert_eq!(v.tv_norm(), Some("NTSC"));
+        v.pv_write_n(2, PV_HORZA as u64, 57 << 16 | 62);
+        v.pv_write_n(2, PV_HORZB as u64, 19 << 16 | 720);
+        v.pv_write_n(2, PV_VERTA as u64, 15 << 16 | 3);
+        v.pv_write_n(2, PV_VERTB as u64, 4 << 16 | 240);
+        v.pv_write_n(2, PV_VERTA_EVEN as u64, 15 << 16 | 3);
+        v.pv_write_n(2, PV_VERTB_EVEN as u64, 5 << 16 | 240);
+        assert_eq!(v.frame_ns(2), 858 * 525 * 1_000_000_000 / (2 * 13_500_000));
+        // the background colour, then monochrome (no chroma): grey
+        v.hvs_write((0x44 + 0x10) as u64, 1 << 24 | 0x00ff_0000);
+        let mut out = Vec::new();
+        v.render(&[], &mut out).unwrap();
+        assert_eq!(&out[..3], &[255, 0, 0]);
+        v.vec_write(VEC_CONFIG0 as u64, 1 | VEC_CONFIG0_CHRDIS | 1 << 8);
+        v.render(&[], &mut out).unwrap();
+        assert_eq!((&out[..3], v.tv_norm()), (&[76u8, 76, 76][..], Some("monochrome")));
+        // a snapshot keeps the VEC
+        let mut w = emu_core::snap::W::default();
+        v.save_state(&mut w);
+        let mut u = Vc4::bcm2835(1920, 1080);
+        u.load_state(&mut emu_core::snap::R::new(&w.0)).unwrap();
+        assert_eq!((u.output(), u.tv_norm()), (Some(Output::Composite), Some("monochrome")));
+        // back to HDMI
+        v.pv_write_n(2, PV_CONTROL as u64, 1 | PV_CLK_SELECT_HDMI << 2);
+        assert_eq!(v.output(), Some(Output::Hdmi));
     }
 
     #[test]

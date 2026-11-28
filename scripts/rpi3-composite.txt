@@ -1,0 +1,108 @@
+# Raspberry Pi 3 Model B+ (milestone 8 of docs/rpi3-plan.md): composite video through the VEC,
+# with the stock vc4 KMS driver, the way a Pi 3 user turns it on: the first-boot wizard on HDMI,
+# then in config.txt the overlay's composite parameter (dtoverlay=vc4-kms-v3d,composite) and
+# sdtv_mode=2 (PAL), which the firmware passes on as video=Composite-1:720x576@50i unless
+# disable_fw_kms_setup=1 (the image's default) stops it, and a reboot. HDMI and composite share
+# pixel valve 2: the console stays on HDMI while a monitor is plugged in and moves to composite
+# when it is unplugged. Then PAL: 720x576i at 50 fields a second, kmstest's pattern over VNC and
+# in screenshots; sdtv_mode=0 and another reboot: NTSC, 720x480i at 59.94.
+#   sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-composite.txt --timeout 900
+# Screenshots go to out/. The image's own config.txt is untouched (the card is copy-on-write).
+wait-serial raspberrypi login:
+# the first-boot wizard's blue screen on HDMI
+wait-pixel 10 700 0000aa
+wait-idle 3
+type \n
+sleep 6
+type pi\n
+sleep 6
+type raspberry\n
+sleep 6
+type raspberry\n
+sleep 8
+type \n
+sleep 10
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial sudo -k; sudo -s\r
+wait-serial password for pi
+serial raspberry\r
+wait-serial root@raspberrypi
+# the stock image: HDMI only, no composite connector
+serial echo NOCOMP_$(kmsprint | grep --color=never -c Composite)_$((1))\r
+wait-serial NOCOMP_0_1
+# composite on, PAL, the firmware's video= option allowed; reboot
+serial sed -i -e 's/^dtoverlay=vc4-kms-v3d$/dtoverlay=vc4-kms-v3d,composite/' -e 's/^disable_fw_kms_setup=1/disable_fw_kms_setup=0/' /boot/firmware/config.txt; echo sdtv_mode=2 >> /boot/firmware/config.txt; grep --color=never -E 'vc4-kms|sdtv|fw_kms' /boot/firmware/config.txt; echo CFG_$((2))\r
+wait-serial CFG_2
+serial reboot\r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial sudo -k; sudo -s\r
+wait-serial password for pi
+serial raspberry\r
+wait-serial root@raspberrypi
+serial cat /proc/cmdline\r
+wait-serial video=Composite-1:720x576@50i
+serial dmesg | grep --color=never -E 'bound .*(vec|hdmi)'; echo BOUND_$((3))\r
+wait-serial bound 3f806000.vec
+wait-serial BOUND_3
+# both connectors; composite's status is unknown (no load detection), its modes PAL first
+serial kmsprint | grep --color=never Connector; for c in HDMI-A-1 Composite-1; do echo DRM_$c $(cat /sys/class/drm/card0-$c/status) $(head -4 /sys/class/drm/card0-$c/modes); done\r
+wait-serial Composite-1 (unknown)
+wait-serial DRM_Composite-1 unknown 720x576i 720x480i
+# the monitor out: fbcon moves to composite (720x576i, PAL)
+hdmi disconnect
+serial sleep 12; kmsprint | grep --color=never -A2 Composite-1; grep --color=never -E 'CONFIG0|VEC_CFG' /sys/kernel/debug/dri/0/vec_regs; echo UNPLUG_$((4))\r
+wait-serial 720x576i@50.00
+wait-serial VEC_CONFIG0 = 0x00000001
+wait-serial UNPLUG_4
+sleep 3
+screenshot out/rpi3-composite-01-console.png
+# kmstest's pattern on composite: the blue top and red bottom edges of the 720x576 frame
+serial (sleep 12; echo) | kmstest -c Composite-1 -r 720x576i 2>&1 | grep --color=never -E 'Crtc|Fb'; echo PAT_$((5))\r
+wait-pixel 360 10 0000ff
+wait-pixel 360 566 ff0000
+screenshot out/rpi3-composite-02-pal.png
+wait-serial PAT_5
+# page flips at the field rate: 50 a second
+serial kmstest -c Composite-1 -r 720x576i --flip=150 2>&1 | grep --color=never fps; echo FLIP_$((6))\r
+wait-serial fps 50.00
+wait-serial FLIP_6
+# NTSC: sdtv_mode=0, video=Composite-1:720x480@60i, so vc4.tv_norm defaults to NTSC
+serial sed -i 's/^sdtv_mode=2/sdtv_mode=0/' /boot/firmware/config.txt; reboot\r
+wait-serial raspberrypi login:
+hdmi disconnect
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial sudo -k; sudo -s\r
+wait-serial password for pi
+serial raspberry\r
+wait-serial root@raspberrypi
+serial cat /proc/cmdline; sleep 8; kmsprint | grep --color=never -A2 Composite-1; grep --color=never -E 'CONFIG0|VEC_CFG' /sys/kernel/debug/dri/0/vec_regs; echo NTSC_$((7))\r
+wait-serial video=Composite-1:720x480@60i
+wait-serial 720x480i@59.94
+wait-serial VEC_CONFIG0 = 0x00000040
+wait-serial NTSC_7
+serial (sleep 12; echo) | kmstest -c Composite-1 -r 720x480i 2>&1 | grep --color=never -E 'Crtc|Fb'; echo PAT_$((8))\r
+wait-pixel 360 10 0000ff
+wait-pixel 360 470 ff0000
+screenshot out/rpi3-composite-03-ntsc.png
+wait-serial PAT_8
+serial kmstest -c Composite-1 -r 720x480i --flip=150 2>&1 | grep --color=never fps; echo FLIP_$((9))\r
+wait-serial fps 59.94
+wait-serial FLIP_9
+# the monitor back in: the console returns to HDMI
+hdmi connect
+serial sleep 12; kmsprint | grep --color=never -A2 HDMI-A-1; echo PLUG_$((10))\r
+wait-serial 1920x1080@60.00
+wait-serial PLUG_10
+quit
