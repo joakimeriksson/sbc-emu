@@ -497,6 +497,8 @@ impl V3d {
     pub fn tick(&mut self, now: u64, ram: &mut [u8]) {
         self.now = now;
         if self.running != [false; 2] { self.collect(ram); }
+        // a bin job restored from a snapshot before its lists were laid out
+        if self.pending_bin.as_ref().is_some_and(|p| !p.w.started) { self.continue_bin(ram); }
         if self.pending.is_empty() { return; }
         let mut bits = 0;
         self.pending.retain(|&(t, b)| { if t <= now { bits |= b; false } else { true } });
@@ -509,12 +511,30 @@ impl V3d {
     pub fn busy(&self) -> bool { self.running != [false; 2] || self.pending_bin.is_some() }
 
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
-        // a job still on the GPU thread is waited for by the machine (`settle`) before saving
+        // jobs the GPU thread finished but nobody collected yet count as finished: wait for it,
+        // then fold their results into what is written (saving takes the device by reference)
+        let (mut regs, mut intctl, mut sem) = (self.regs.clone(), self.intctl, self.sem);
+        let mut bin_done: Option<(u32, bin::BinOutput, u64)> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(wk) = self.worker.as_ref() {
+            while wk.busy.load(Ordering::Acquire) != 0 { std::thread::sleep(std::time::Duration::from_micros(50)); }
+            for (gen, d) in wk.done.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                if *gen != self.gen { continue; }
+                match d {
+                    Done::Render { end, out, sem_used, .. } => {
+                        regs[CT1CA / 4] = *end;
+                        sem = sem.saturating_sub(*sem_used);
+                        if out.eof { regs[RFC / 4] = (regs[RFC / 4] + 1) & 0xff; intctl |= INT_FRDONE; }
+                    }
+                    Done::Bin { end, out, .. } => bin_done = Some((*end, (**out).clone(), 0)),
+                }
+            }
+        }
         w.tag("vc4-3d-v1");
-        for r in &self.regs { w.u32(*r); }
-        w.u32(self.intctl);
+        for r in &regs { w.u32(*r); }
+        w.u32(intctl);
         w.u32(self.intena);
-        w.u32(self.sem);
+        w.u32(sem);
         w.u64(self.pending.len() as u64);
         for &(t, b) in &self.pending { w.u64(t); w.u32(b); }
         let e = self.exec();
@@ -524,11 +544,16 @@ impl V3d {
         w.u8(e.tb.clear_s);
         w.u8(e.tb.clear_vg);
         drop(e);
-        w.bool(self.pending_bin.is_some());
-        if let Some(p) = &self.pending_bin {
-            w.u32(p.end);
-            w.u64(p.ns);
-            let o = &p.out;
+        let fresh = bin::Writer::default();
+        let pb: Option<(u32, &bin::BinOutput, &bin::Writer, u64)> = match (&self.pending_bin, &bin_done) {
+            (Some(p), _) => Some((p.end, &p.out, &p.w, p.ns)),
+            (None, Some((end, out, ns))) => Some((*end, out, &fresh, *ns)),
+            _ => None,
+        };
+        w.bool(pb.is_some());
+        if let Some((end, o, wr, ns)) = pb {
+            w.u32(end);
+            w.u64(ns);
             let c = o.cfg.unwrap_or_default();
             for x in [c.alloc, c.alloc_size, c.tsda, c.tiles_x, c.tiles_y, c.init_block, c.block] { w.u32(x); }
             w.bool(c.ms);
@@ -541,7 +566,6 @@ impl V3d {
                 w.u64(s.len() as u64);
                 for &x in s { w.u32(x); }
             }
-            let wr = &p.w;
             for x in [wr.tile as u32, wr.rec as u32, wr.cur, wr.room, wr.pool, wr.pool_left] { w.u32(x); }
             w.bool(wr.started);
             w.bool(wr.spilled);

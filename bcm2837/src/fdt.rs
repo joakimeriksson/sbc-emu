@@ -18,6 +18,9 @@ pub struct BootInfo<'a> {
     /// firmware-allocated framebuffer: (base, width, height, stride)
     pub fb: Option<(u64, u32, u32, u32)>,
     pub cpus: u32,
+    /// the VideoCore IV 3D GPU's node enabled: Linux's `vc4` binds it as a component of its DRM
+    /// device, together with the HVS, pixel valves and HDMI, so it is useful only with them
+    pub v3d: bool,
 }
 
 /// Interrupt flags in the two controllers' second cell.
@@ -223,6 +226,14 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("status", "okay");
     f.end();
 
+    // the 3D GPU (vc4-3d); its driver is a component of vc4's DRM device
+    f.begin(&format!("v3d@{}", node(m::V3D)));
+    f.str("compatible", "brcm,vc4-v3d");
+    f.cells("reg", &[bus(m::V3D), 0x1000]);
+    f.cells("interrupts", &gpu(m::GPU_V3D as u32));
+    f.str("status", if b.v3d { "okay" } else { "disabled" });
+    f.end();
+
     f.end(); // soc
 
     if let Some((base, w, h, stride)) = b.fb {
@@ -247,12 +258,14 @@ mod tests {
 
     #[test]
     fn tree_parses_and_names_the_board() {
-        let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4 });
+        let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4, v3d: true });
         let root = emu_core::fdt::Node::parse(&blob).unwrap();
         let model = root.prop("model").unwrap();
         assert!(model.starts_with(b"Raspberry Pi 3 Model B Plus Rev 1.3"));
         assert_eq!(gpu(29), [1, 29]);
         assert_eq!(gpu(62), [2, 30]);
         assert_eq!(bus(crate::machine::AUX), 0x7e21_5000);
+        assert_eq!(bus(crate::machine::V3D), 0x7ec0_0000);
+        assert_eq!(gpu(crate::machine::GPU_V3D as u32), [1, 10]);
     }
 }
