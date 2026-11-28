@@ -21,6 +21,8 @@ rk3588 = { path = "../rk3588" }
 tegra210 = { path = "../tegra210" }
 tegra234 = { path = "../tegra234" }
 maxwell-shader = { path = "../maxwell-shader" }
+vc4-3d = { path = "../vc4-3d" }
+simd-jit = { path = "../simd-jit" }
 peripherals = { path = "../peripherals" }
 esp32s31 = { path = "../espressif/esp32s31" }
 esp-soc = { path = "../espressif/esp-soc" }

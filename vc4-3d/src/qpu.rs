@@ -491,6 +491,8 @@ pub enum Stop {
 pub struct Code {
     tags: Vec<u32>,
     insts: Vec<Inst>,
+    /// the JIT's blocks by address
+    pub jit: crate::jit::Cache,
     /// a shader of this job ran out of its instruction budget (an endless loop): the rest of
     /// the job skips its shaders, as the kernel's reset would end it on the hardware, instead
     /// of spending the budget again on every batch
@@ -500,7 +502,7 @@ pub struct Code {
 const CODE_SLOTS: usize = 8192;
 
 impl Default for Code {
-    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![Inst::default(); CODE_SLOTS], runaway: false } }
+    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![Inst::default(); CODE_SLOTS], jit: Default::default(), runaway: false } }
 }
 
 impl Code {
@@ -514,11 +516,13 @@ impl Code {
         }
         self.insts[k]
     }
-    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); self.runaway = false; }
+    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); self.jit.clear(); self.runaway = false; }
 }
 
-/// One QPU thread's state.
+/// One QPU thread's state. (The register files and accumulators come first, in this order:
+/// the JIT sees them as one array of 70 vectors, `regs_mut`.)
 #[derive(Clone)]
+#[repr(C)]
 pub struct Qpu {
     pub ra: [V; 32],
     pub rb: [V; 32],
@@ -565,7 +569,15 @@ impl Qpu {
         for t in self.tmu.iter_mut() { *t = Tmu::default(); }
     }
 
-    fn uniform(&mut self, mem: &mut Mem) -> u32 {
+    /// Regfile A, regfile B and r0..r5 as one array (the JIT's registers).
+    pub(crate) fn regs_mut(&mut self) -> &mut [V] {
+        const _: () = assert!(std::mem::offset_of!(Qpu, rb) == 32 * 64 && std::mem::offset_of!(Qpu, acc) == 64 * 64 && std::mem::offset_of!(Qpu, ra) == 0);
+        // SAFETY: Qpu is repr(C) with ra, rb and acc first and contiguous (checked above): 70
+        // vectors from its start, borrowed through `self` for as long as the slice lives
+        unsafe { std::slice::from_raw_parts_mut(self as *mut Qpu as *mut V, crate::jit::NREGS) }
+    }
+
+    pub(crate) fn uniform(&mut self, mem: &mut Mem) -> u32 {
         let v = mem.r32(self.unif);
         self.unif = self.unif.wrapping_add(4);
         v
@@ -1007,7 +1019,14 @@ impl Qpu {
     /// Run until the program ends, waits, or `budget` instructions have run.
     pub fn run(&mut self, code: &mut Code, mem: &mut Mem, env: &mut dyn Env, budget: u64) -> Stop {
         let start = self.insns;
+        // (not while tracing: the trace is of the interpreter's instructions)
+        let jit = crate::jit::enabled() && crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) <= 0;
         loop {
+            // a block of compiled instructions where one starts, outside delay slots
+            if jit && self.br.is_none() && self.end == 0 && code.jit.run(self, mem, env, budget - (self.insns - start)) > 0 {
+                if self.insns - start >= budget { return Stop::Budget; }
+                continue;
+            }
             if let Some(s) = self.step(code, mem, env) { return s; }
             if self.insns - start >= budget { return Stop::Budget; }
         }

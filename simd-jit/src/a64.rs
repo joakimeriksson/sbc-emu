@@ -7,8 +7,9 @@
 //! not see each other, except through flags, of which each pass reads and writes its own four
 //! bits. A shuffle needs all 16 lanes of its operand: it starts a new phase (a loop of four
 //! passes of its own), and values a later phase reads are kept in "wide" stack slots of 16
-//! lanes. Values live in v0..v27 (v28..v31 are scratch); when there are more, the one used
-//! furthest ahead goes to a stack slot.
+//! lanes. Values live in v0..v25 (v26 and v27 hold the masks of a float's exponent and sign,
+//! v28..v31 are scratch); when there are more, the one used furthest ahead goes to a stack
+//! slot.
 //!
 //! The arithmetic is IEEE as NEON does it with the default FPCR (`ieee` sets it around the
 //! call: the guest's may be live when a GPU job runs within a CPU's register write), with the
@@ -24,6 +25,7 @@ use crate::ir::*;
 /// A compiled block.
 pub struct Func {
     entry: *const u8,
+    pub bytes: usize,
 }
 
 // SAFETY: the code is written once, before the value is made, and then only executed
@@ -36,7 +38,7 @@ impl Func {
     pub fn new(b: &Block) -> Option<Func> {
         let words = compile(b)?;
         let entry = arena_put(&words)?;
-        Some(Func { entry })
+        Some(Func { entry, bytes: words.len() * 4 })
     }
 
     /// # Safety
@@ -165,8 +167,11 @@ const XO: u32 = 28; // this pass's lanes of the outputs
 const X9: u32 = 9;
 const X10: u32 = 10;
 const X11: u32 = 11;
-// vector registers: 0..ALLOC for values, then scratch
-const ALLOC: usize = 28;
+// vector registers: 0..ALLOC for values, two constants, then scratch
+const ALLOC: usize = 26;
+/// 0x7f80_0000 (a float's exponent) and 0x8000_0000 (its sign) in every lane, for `Un::Ftz`
+const VEXP: u32 = 26;
+const VSIGN: u32 = 27;
 const T0: u32 = 28;
 const T1: u32 = 29;
 const T2: u32 = 30;
@@ -323,7 +328,6 @@ const UQADD8: u32 = 0x6e20_0c00;
 const UQSUB8: u32 = 0x6e20_2c00;
 const UMIN8: u32 = 0x6e20_6c00;
 const UMAX8: u32 = 0x6e20_6400;
-const CMEQ0: u32 = 0x4ea0_9800;
 const CMLT0: u32 = 0x4ea0_a800;
 const NOT: u32 = 0x6e20_5800;
 const NEG: u32 = 0x6ea0_b800;
@@ -528,6 +532,7 @@ fn compile(b: &Block) -> Option<Vec<u32>> {
     a.put(0xd140_03ff); // sub sp, sp, #hi, lsl #12 (patched)
     a.put(0xd100_03ff); // sub sp, sp, #lo (patched)
     a.put(0x9100_03e0 | XS); // mov x23, sp
+    consts(&mut a);
     let mut k = 0;
     while k < n {
         // one phase: nodes k..end, a loop of four passes
@@ -574,6 +579,12 @@ fn compile(b: &Block) -> Option<Vec<u32>> {
         return None;
     }
     Some(a.w)
+}
+
+/// The constant registers (again after a call, which may change them).
+fn consts(a: &mut Asm) {
+    a.lit(VEXP, [0x7f80_0000; 4]);
+    a.put(0x4f04_6400 | VSIGN); // movi v27.4s, #0x80, lsl #24
 }
 
 /// Saves what the code uses of what a call must keep (x19..x28, d8..d15).
@@ -767,13 +778,9 @@ fn un(a: &mut Asm, op: Un, d: u32, x: u32) {
         Un::ShrS(s) => a.v2(0x4f00_0400 | (64 - s as u32) << 16, d, x),
         Un::Ftz => {
             // the sign alone where the exponent is zero
-            a.v2(0x4f00_5400 | 33 << 16, T0, x); // shl t0, x, #1
-            a.v2(0x6f00_0400 | (64 - 24) << 16, T0, T0); // ushr t0, t0, #24
-            a.v2(CMEQ0, T0, T0);
-            a.splat(T1, 0x8000_0000);
-            a.v3(AND, T1, x, T1);
-            a.mov(d, T0);
-            a.v3(BSL, d, T1, x);
+            a.v3(CMTST, T0, x, VEXP);
+            a.v3(ORR, T0, T0, VSIGN);
+            a.v3(AND, d, x, T0);
         }
         Un::HalfToF => {
             a.v2(0x0e61_2800, T0, x); // xtn t0.4h, x.4s
@@ -908,6 +915,7 @@ fn call(a: &mut Asm, ra: &mut Ra, k: usize, code: u32, xs: &[Id]) -> Option<()> 
     a.put(0x9100_0000 | XS << 5 | 1); // add x1, x23, #0
     a.mov_x(X9, helper as extern "C" fn(u32, *mut [u32; 8]) as usize as u64);
     a.put(0xd63f_0000 | X9 << 5); // blr x9
+    consts(a);
     ra.pinned = 0;
     let d = ra.def(a, k);
     a.ldst_q(true, d, XS, 0);
@@ -938,7 +946,7 @@ mod tests {
         for op in [ADD, SUB, MUL, CMGT, CMHI, CMEQ, CMTST, SSHL, USHL, AND, BIC, ORR, 0x4ee0_1c00, EOR, BSL, FADD, FSUB, FMUL, FDIV, FCMEQ, FCMGT, FCMGE, FMINNM, FMAXNM, SMIN, SMAX, UMIN, UMAX, UQADD8, UQSUB8, UMIN8, UMAX8, UMULL8, UMULL8_2, ADD16, TBL4] {
             a.v3(op, 1, 2, 3);
         }
-        for op in [CMEQ0, CMLT0, 0x4ea0_c800, NOT, NEG, CLZ, 0x6f18_1400, 0x0f08_8400, 0x4f08_8400] {
+        for op in [0x4ea0_9800, CMLT0, 0x4ea0_c800, NOT, NEG, CLZ, 0x6f18_1400, 0x0f08_8400, 0x4f08_8400] {
             a.v2(op, 1, 2);
         }
         a.put(0x4f04_8400 | 1);

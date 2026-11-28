@@ -265,10 +265,12 @@ dependencies = [
  "rk3588",
  "rockchip-rk3288",
  "ruzstd",
+ "simd-jit",
  "starfive-jh7110",
  "tegra210",
  "tegra234",
  "v3d",
+ "vc4-3d",
 ]
 
 [[package]]
@@ -345,4 +347,5 @@ name = "vc4-3d"
 version = "0.1.0"
 dependencies = [
  "emu-core",
+ "simd-jit",
 ]

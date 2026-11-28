@@ -625,6 +625,37 @@ pub extern "C" fn sbc_shader_jit_report_len() -> usize {
     SHADER_JIT_REPORT.with(|s| s.borrow().len())
 }
 
+/// Turn the Raspberry Pi 3's QPU JIT on (1) or off (0) (vc4-3d/src/jit.rs); returns whether it
+/// is on.
+#[no_mangle]
+pub extern "C" fn sbc_vc4_jit(on: u32) -> u32 {
+    vc4_3d::jit::set_enabled(on != 0);
+    vc4_3d::jit::enabled() as u32
+}
+
+/// Blocks of QPU code the Raspberry Pi 3's JIT has compiled.
+#[no_mangle]
+pub extern "C" fn sbc_vc4_jit_blocks() -> u32 {
+    vc4_3d::jit::blocks() as u32
+}
+
+/// The shared QPU JIT (`simd-jit`) against its IR's evaluation on `cases` random blocks, then
+/// the Raspberry Pi 3's QPU JIT against its interpreter on `cases` random programs
+/// (tools/wasm-qpu-jit-check.mjs): 0 if every one agreed. The report is at
+/// `sbc_shader_jit_report` (the Jetson's check shares it).
+#[no_mangle]
+pub extern "C" fn sbc_qpu_jit_check(seed: f64, cases: u32) -> u32 {
+    let (r, text) = match simd_jit::check::check(seed as u64, cases as usize) {
+        Err(e) => (1, format!("simd-jit: {e}")),
+        Ok(n) => match vc4_3d::jit_check::check(seed as u64, cases as usize) {
+            Ok(ops) => (0, format!("simd-jit: {n} of {cases} blocks compiled; vc4: {ops:?}")),
+            Err(e) => (1, format!("vc4: {e}")),
+        },
+    };
+    SHADER_JIT_REPORT.with(|s| *s.borrow_mut() = text);
+    r
+}
+
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
 #[no_mangle]
 pub extern "C" fn sbc_jit(on: u32) -> u32 {

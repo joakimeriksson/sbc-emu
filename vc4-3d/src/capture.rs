@@ -61,6 +61,11 @@ pub fn parse(data: &[u8]) -> Result<Vec<Captured>, String> {
 /// their replayed contents (a later job's captured copy of them is the original run's).
 /// Returns the frame each rendering job stored.
 pub fn replay(jobs: &[Captured], ram: &mut [u8]) -> Vec<crate::tlb::Frame> {
+    replay_counted(jobs, ram).0
+}
+
+/// [`replay`], and the QPU instructions the jobs ran.
+pub fn replay_counted(jobs: &[Captured], ram: &mut [u8]) -> (Vec<crate::tlb::Frame>, u64) {
     use crate::*;
     let mut v = V3d::new();
     v.time_scale = 0.0;
@@ -108,7 +113,8 @@ pub fn replay(jobs: &[Captured], ram: &mut [u8]) -> Vec<crate::tlb::Frame> {
         }
         v.write(INTCTL as u64, !0, ram);
     }
-    frames
+    let insns = v.exec().insns + v.user.insns;
+    (frames, insns)
 }
 
 /// A frame (as `TILE_RENDERING_MODE_CONFIG` describes it) as a binary PPM.

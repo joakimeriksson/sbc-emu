@@ -23,8 +23,11 @@ fn main() {
         .filter(|(k, _)| *k < first.saturating_add(count))
         .map(|(_, j)| j).collect();
     let t = std::time::Instant::now();
-    let frames = vc4_3d::capture::replay(&sel, &mut ram);
+    let (frames, insns) = vc4_3d::capture::replay_counted(&sel, &mut ram);
     eprintln!("replayed in {:.1} ms; {} frames", t.elapsed().as_secs_f64() * 1e3, frames.len());
+    if vc4_3d::jit::enabled() {
+        eprintln!("QPU JIT: {} blocks compiled, {} runs, {} of {} instructions in blocks (up to the last job)", vc4_3d::jit::blocks(), vc4_3d::jit::runs(), vc4_3d::jit::insns(), insns);
+    }
     for f in &frames {
         eprintln!("  frame at {:#010x}: {}x{} {} {}", f.addr, f.width, f.height, if f.format == 1 { "RGBA8888" } else { "BGR565" },
                   ["raster", "T", "LT", "?"][f.tiling as usize & 3]);

@@ -20,6 +20,8 @@ pub mod bin;
 pub mod capture;
 pub mod cl;
 pub mod disasm;
+pub mod jit;
+pub mod jit_check;
 pub mod mem;
 pub mod par;
 pub mod qpu;

@@ -7,3 +7,4 @@ description = "Broadcom VideoCore IV 3D (V3D 2.1) GPU model: control lists, binn
 
 [dependencies]
 emu-core = { path = "../emu-core" }
+simd-jit = { path = "../simd-jit" }

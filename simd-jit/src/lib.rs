@@ -27,6 +27,7 @@ mod wasm;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::set_reset_count;
 
+pub mod check;
 #[cfg(test)]
 mod tests;
 
@@ -148,6 +149,14 @@ impl Code {
         }
         #[cfg(not(any(target_arch = "wasm32", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))))]
         Code { block }
+    }
+
+    /// The size of the block's code in bytes (0 if it has none).
+    pub fn code_bytes(&self) -> usize {
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+        return self.native.as_ref().map_or(0, |f| f.bytes);
+        #[allow(unreachable_code)]
+        0
     }
 
     /// Whether the block has code (else `run` evaluates the IR).

@@ -618,6 +618,9 @@ impl Machine {
         // outputs are the same
         mbox.exp_gpio_out = 1 << EXP_WL_ON | 1 << EXP_PWR_LED | 1 << EXP_LAN_RUN;
         mbox.exp_gpio_in = mbox.exp_gpio_out;
+        // the QPU JIT shares the page's function table with the CPU's
+        #[cfg(target_arch = "wasm32")]
+        vc4_3d::jit::set_reset_count(arm_a64::wasm_jit_resets);
         let soc = Soc {
             ram: vec![0; ram_arm_visible], arm_ram, cur: 0, local: LocalIntc::new(), armctrl: ArmCtrl::new(), uart: Pl011::new(), aux: AuxUart::new(),
             mbox, sd: Sdhost::new(None), sdhci: Sdhci::new(None), wireless: model.wireless(), wifi_trace: false, wifi_net: None, bt: None,

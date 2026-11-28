@@ -874,8 +874,18 @@ fn fold(ir: &[Node]) -> Vec<Node> {
     let mut dirty = vec![false; nflags];
     let mut stores = Vec::new();
     fn make(out: &mut Vec<Node>, seen: &mut HashMap<Node, Id>, n: Node) -> Id {
+        // shifts by 0; flushing what has no denormals
+        match n {
+            Node::Un(Un::Shl(0) | Un::ShrU(0) | Un::ShrS(0), a) => return a,
+            Node::Un(Un::Ftz, a) if flushed(out, a, 8) => return a,
+            _ => {}
+        }
         // constants: integer operations of immediates, lane masks of constants
         let n = match n {
+            Node::Un(Un::Ftz, a) => match out[a as usize] {
+                Node::Imm(x) => Node::Imm(unary(Un::Ftz, x)),
+                _ => n,
+            },
             Node::Bin(op @ (Bin::And | Bin::Or | Bin::Xor | Bin::Add | Bin::Sub | Bin::Mul | Bin::IEq | Bin::ILt | Bin::ULt), a, b) => {
                 match (out[a as usize], out[b as usize]) {
                     (Node::Imm(x), Node::Imm(y)) => Node::Imm(binary(op, x, y)),
@@ -979,6 +989,21 @@ fn fold(ir: &[Node]) -> Vec<Node> {
         }
     }
     prune(out)
+}
+
+/// Whether value `a` can have no denormal lane (`Un::Ftz` would not change it).
+fn flushed(out: &[Node], a: Id, depth: u32) -> bool {
+    let f = |b: Id| depth > 0 && flushed(out, b, depth - 1);
+    match out[a as usize] {
+        Node::Un(Un::Ftz | Un::IToF | Un::UToF | Un::HalfToF, _) => true,
+        Node::Imm(x) => x & 0x7f80_0000 != 0 || x & 0x7fff_ffff == 0,
+        Node::Const(_) => false,
+        // (one of the operands, or a NaN)
+        Node::Bin(Bin::FMin | Bin::FMax | Bin::FMinNum | Bin::FMaxNum, x, y) | Node::Sel(_, x, y) => f(x) && f(y),
+        // (a flushed value with its sign cleared)
+        Node::Bin(Bin::And, x, y) => matches!(out[y as usize], Node::Imm(0x7fff_ffff)) && f(x),
+        _ => false,
+    }
 }
 
 /// Drops the nodes nothing reads (and that write nothing), renumbering the rest.
