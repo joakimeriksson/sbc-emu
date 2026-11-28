@@ -834,3 +834,38 @@ fn derivatives_on_partly_covered_quads() {
     } }
     assert!(n > 2000, "{n} pixels drawn");
 }
+
+/// Random control lists, shader records and QPU programs: the model may draw garbage, but
+/// must neither panic (overflow checks in debug builds) nor hang.
+#[test]
+fn random_input_does_not_panic() {
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+    for round in 0..120 {
+        let mut ram = vec![0u8; 4 << 20];
+        // a mix of random bytes and valid packet opcodes
+        for k in 0..4096 {
+            let r = rnd();
+            ram[0x1000 + k] = if r & 3 == 0 { [0u8, 1, 4, 6, 7, 16, 17, 18, 24, 25, 26, 28, 29, 32, 33, 48, 49, 56, 64, 96, 102, 112, 113, 114, 115][(r >> 8) as usize % 25] } else { (r >> 16) as u8 };
+        }
+        for k in (0x8000..0x40_0000).step_by(8) { let r = rnd(); if r & 15 == 0 { ram[k..k + 8].copy_from_slice(&rnd().to_le_bytes()); } }
+        let mut v = V3d::new();
+        v.time_scale = 0.0;
+        v.write(BPOA as u64, 0x30_0000, &mut ram);
+        v.write(BPOS as u64, 0x1000, &mut ram);
+        let (start, len) = (0x1000u32 + (rnd() % 64) as u32, (rnd() % 4000) as u32);
+        if round % 2 == 0 {
+            v.write(CT0CA as u64, start, &mut ram);
+            v.write(CT0EA as u64, start + len, &mut ram);
+            v.write(BPOS as u64, 0x8000, &mut ram);
+        } else {
+            v.write(CT1CA as u64, start, &mut ram);
+            v.write(CT1EA as u64, start + len, &mut ram);
+        }
+        // a random user program, now and then
+        if round % 20 != 0 { continue; }
+        for k in (0x2_0000..0x2_0400).step_by(8) { ram[k..k + 8].copy_from_slice(&rnd().to_le_bytes()); }
+        v.write(crate::SRQUA as u64, 0x3_0000, &mut ram);
+        v.write(crate::SRQPC as u64, 0x2_0000, &mut ram);
+    }
+}

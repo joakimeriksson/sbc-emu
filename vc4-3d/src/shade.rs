@@ -45,6 +45,7 @@ pub fn shade_batch(rec: &ShaderRec, coord: bool, idx: &[u32], mem: &mut Mem, cod
         }
         return out;
     }
+    if code.runaway { return out; }
     let mut env = VertexEnv { vpm: vec![0; (IN_ROWS + OUT_ROWS) * 16] };
     let sel = if coord { rec.cs_sel } else { rec.vs_sel };
     for (a, at) in rec.attrs.iter().enumerate() {
@@ -68,6 +69,7 @@ pub fn shade_batch(rec: &ShaderRec, coord: bool, idx: &[u32], mem: &mut Mem, cod
     let stop = q.run(code, mem, &mut env, BUDGET);
     *insns += q.insns;
     crate::progress(q.insns);
+    if stop == Stop::Budget { code.runaway = true; }
     if stop != Stop::End {
         crate::log_first(&format!("vc4: {} shader at {pc:#x} did not end ({stop:?})", if coord { "coordinate" } else { "vertex" }));
     }

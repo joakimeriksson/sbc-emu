@@ -463,6 +463,7 @@ impl<'a, 'm> Render<'a, 'm> {
     fn shade(&mut self, rec: &ShaderRec, p: &Prim, lanes: &[Lane; 16], active: u16, rev: bool) {
         // varying interpolation uses barycentrics by the primitive's original vertex order;
         // vertex 2 is C's source, so the weights are applied as given
+        if self.code.runaway { return; }
         let q = &mut *self.fsq;
         for i in 0..16 {
             q.ra[15][i] = fo(lanes[i].w);
@@ -480,6 +481,7 @@ impl<'a, 'm> Render<'a, 'm> {
         let ran = q.insns - before;
         *self.insns += ran;
         crate::progress(ran);
+        if stop == Stop::Budget { self.code.runaway = true; }
         if stop != Stop::End { crate::log_first(&format!("vc4: fragment shader at {:#x} did not end ({stop:?})", rec.fs_code)); }
     }
 
@@ -506,6 +508,11 @@ impl<'a, 'm> Render<'a, 'm> {
                     }
                 },
             };
+            if n as usize > buf.len() {
+                crate::log_first(&format!("vc4: rendering list: bad record {op} at {pc:#x}"));
+                self.out.error = true;
+                break;
+            }
             let p = &mut buf[..n as usize];
             self.mem.read(pc, p);
             let p: Vec<u8> = p.to_vec();

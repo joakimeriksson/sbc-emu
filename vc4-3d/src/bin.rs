@@ -224,6 +224,9 @@ fn idx_record(idx: &[u32]) -> Vec<u8> {
     r
 }
 
+/// Vertices of one draw the model takes (Mesa splits draws far below this).
+const MAX_DRAW: u32 = 1 << 20;
+
 /// Run a binning control list from `start` to `end`.
 pub fn run(start: u32, end: u32, mem: &mut Mem, code: &mut Code, insns: &mut u64) -> BinOutput {
     let mut out = BinOutput::default();
@@ -285,13 +288,13 @@ pub fn run(start: u32, end: u32, mem: &mut Mem, code: &mut Code, insns: &mut u64
                 let idx: Vec<u32> = if op == cl::GL_INDEXED_PRIMITIVE {
                     let (len, addr, max) = (cl::le32(&p[2..]), cl::le32(&p[6..]), cl::le32(&p[10..]));
                     let wide = p[1] >> 4 != 0;
-                    (0..len.min(1 << 24)).map(|k| {
-                        let v = if wide { mem.r16(addr.wrapping_add(2 * k)) as u32 } else { mem.r8(addr.wrapping_add(k)) as u32 };
-                        v.min(max.max(v))
-                    }).collect()
+                    {
+                        let _ = max;
+                        (0..len.min(MAX_DRAW)).map(|k| if wide { mem.r16(addr.wrapping_add(2 * k)) as u32 } else { mem.r8(addr.wrapping_add(k)) as u32 }).collect()
+                    }
                 } else {
                     let (len, first) = (cl::le32(&p[2..]), cl::le32(&p[6..]));
-                    (0..len.min(1 << 24)).map(|k| first.wrapping_add(k)).collect()
+                    (0..len.min(MAX_DRAW)).map(|k| first.wrapping_add(k)).collect()
                 };
                 let mut b = Binner { cfg: c, st, out: &mut out, cur, ver, tile_ver: std::mem::take(&mut tile_ver), tile_state: std::mem::take(&mut tile_state) };
                 b.set_state(st);

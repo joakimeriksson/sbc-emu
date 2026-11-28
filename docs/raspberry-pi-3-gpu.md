@@ -40,7 +40,7 @@ thread but not collected yet).
 
 ## Tests
 
-`cargo test -p vc4-3d` (53 tests) and `cargo test -p bcm2837` (`v3d_on_the_bus`):
+`cargo test -p vc4-3d` (57 tests) and `cargo test -p bcm2837` (`v3d_on_the_bus`):
 
 - QPU: every add and multiply operation against Rust references, flags and all conditions
   (integer carry and borrow, float sign), packs and unpacks (16-bit float and integer halves,

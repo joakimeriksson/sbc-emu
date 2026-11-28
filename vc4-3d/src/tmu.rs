@@ -292,7 +292,7 @@ pub fn lookup(coord: &[Option<V>; 4], cfg: &[u32], mask: u16, fragment: bool, me
                 if t.bias_is_lod { lod = b } else { lod += b }
             }
             let border = if t.cube { [0; 4] } else { r_in.map_or([0; 4], |r| r[i].to_le_bytes()) };
-            let face_off = faces[i] * t.cube_stride;
+            let face_off = faces[i].wrapping_mul(t.cube_stride);
             let maxl = t.levels as f32;
             let px: [f32; 4] = if lod <= 0.0 {
                 sample_level(&t, 0, &bases, face_off, ss[i], ts[i], !t.mag_nearest, border, mem)

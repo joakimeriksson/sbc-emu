@@ -35,6 +35,7 @@ impl<'a> Mem<'a> {
     #[cold]
     fn fault(&mut self, a: u32, write: bool) {
         self.faults += 1;
+        if self.faults > 4 { return; }
         crate::log_first(&format!("vc4: {} outside RAM at {a:#010x}", if write { "write" } else { "read" }));
     }
 

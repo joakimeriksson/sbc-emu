@@ -78,7 +78,7 @@ impl Sched {
     pub fn run(&mut self, mem: &mut Mem) {
         self.code.clear();
         const SLICE: u64 = 4096;
-        let mut budget: u64 = 200_000_000;
+        let mut budget: u64 = 50_000_000;
         loop {
             // start queued programs on free QPUs
             for k in 0..QPUS {

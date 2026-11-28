@@ -480,12 +480,16 @@ pub enum Stop {
 pub struct Code {
     tags: Vec<u32>,
     insts: Vec<Inst>,
+    /// a shader of this job ran out of its instruction budget (an endless loop): the rest of
+    /// the job skips its shaders, as the kernel's reset would end it on the hardware, instead
+    /// of spending the budget again on every batch
+    pub runaway: bool,
 }
 
 const CODE_SLOTS: usize = 8192;
 
 impl Default for Code {
-    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![Inst::default(); CODE_SLOTS] } }
+    fn default() -> Self { Code { tags: vec![u32::MAX; CODE_SLOTS], insts: vec![Inst::default(); CODE_SLOTS], runaway: false } }
 }
 
 impl Code {
@@ -499,7 +503,7 @@ impl Code {
         }
         self.insts[k]
     }
-    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); }
+    pub fn clear(&mut self) { self.tags.iter_mut().for_each(|t| *t = u32::MAX); self.runaway = false; }
 }
 
 /// One QPU thread's state.
