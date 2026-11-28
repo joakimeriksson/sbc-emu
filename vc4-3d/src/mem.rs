@@ -5,8 +5,14 @@
 //!
 //! With capture on (`SBC_VC4_CAPTURE`), every 4 KiB page a job touches is recorded as it was
 //! before the job first touched it, for `vc4-replay`.
+//!
+//! Guest RAM is held as a raw pointer, not a slice: render workers on several host threads
+//! (`par`) each have their own `Mem` over the same RAM, as the hardware's QPUs and TMUs share
+//! the bus. They write disjoint tiles of the frame; where shaders write the same memory from
+//! several tiles (VPM DMA stores) the order is unspecified, as on the hardware.
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 pub const PAGE: usize = 4096;
 
@@ -14,23 +20,59 @@ pub const PAGE: usize = 4096;
 pub type Pages = BTreeMap<u32, Vec<u8>>;
 
 pub struct Mem<'a> {
-    ram: &'a mut [u8],
+    ram: *mut u8,
+    len: usize,
+    _ram: PhantomData<&'a mut [u8]>,
     pub capture: Option<Pages>,
     /// pages written (replay: these keep their replayed contents)
     pub written: Option<std::collections::BTreeSet<u32>>,
     /// accesses outside RAM in this job
     pub faults: u32,
+    /// the last page put into `written` (+1; 0: none)
+    last_written: usize,
 }
 
 /// The RAM offset of bus address `a`.
 #[inline(always)]
 pub fn pa(a: u32) -> usize { (a & 0x3fff_ffff) as usize }
 
-impl<'a> Mem<'a> {
-    pub fn new(ram: &'a mut [u8]) -> Self { Mem { ram, capture: None, written: None, faults: 0 } }
+// SAFETY: a Mem is a view of guest RAM that the machine keeps alive for the whole job; the
+// workers that share it are joined before the job returns.
+unsafe impl Send for Mem<'_> {}
 
-    pub fn len(&self) -> usize { self.ram.len() }
-    pub fn is_empty(&self) -> bool { self.ram.is_empty() }
+impl<'a> Mem<'a> {
+    pub fn new(ram: &'a mut [u8]) -> Self { Mem { ram: ram.as_mut_ptr(), len: ram.len(), _ram: PhantomData, capture: None, written: None, faults: 0, last_written: 0 } }
+
+    /// Another view of the same memory, for a worker on another host thread: its own fault
+    /// count and written-page set (merged back with [`Mem::merge`]); no capture (jobs being
+    /// captured run on one thread).
+    pub fn share(&self) -> Mem<'a> {
+        Mem { ram: self.ram, len: self.len, _ram: PhantomData, capture: None, written: self.written.as_ref().map(|_| Default::default()), faults: 0, last_written: 0 }
+    }
+
+    /// Take back what a worker's view recorded.
+    pub fn merge(&mut self, w: Mem) {
+        self.faults += w.faults;
+        if let (Some(a), Some(b)) = (self.written.as_mut(), w.written) { a.extend(b); }
+    }
+
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    #[inline(always)]
+    fn bytes(&self, p: usize, n: usize) -> &[u8] {
+        debug_assert!(p + n <= self.len);
+        // SAFETY: callers check p + n against len
+        unsafe { std::slice::from_raw_parts(self.ram.add(p), n) }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    fn bytes_mut(&mut self, p: usize, n: usize) -> &mut [u8] {
+        debug_assert!(p + n <= self.len);
+        // SAFETY: as in `bytes`
+        unsafe { std::slice::from_raw_parts_mut(self.ram.add(p), n) }
+    }
 
     #[cold]
     fn fault(&mut self, a: u32, write: bool) {
@@ -39,14 +81,20 @@ impl<'a> Mem<'a> {
         crate::log_first(&format!("vc4: {} outside RAM at {a:#010x}", if write { "write" } else { "read" }));
     }
 
-    #[inline]
+    #[inline(always)]
     fn touch(&mut self, p: usize, n: usize) {
+        if self.capture.is_some() { self.record(p, n); }
+    }
+
+    #[cold]
+    fn record(&mut self, p: usize, n: usize) {
         if let Some(c) = self.capture.as_mut() {
             let (first, last) = (p / PAGE, (p + n.max(1) - 1) / PAGE);
             for pg in first..=last {
                 let base = pg * PAGE;
-                if base + PAGE > self.ram.len() { continue; }
-                c.entry(base as u32).or_insert_with(|| self.ram[base..base + PAGE].to_vec());
+                if base + PAGE > self.len { continue; }
+                // SAFETY: inside RAM (checked above)
+                c.entry(base as u32).or_insert_with(|| unsafe { std::slice::from_raw_parts(self.ram.add(base), PAGE) }.to_vec());
             }
         }
     }
@@ -55,18 +103,24 @@ impl<'a> Mem<'a> {
     #[inline]
     pub fn slice(&mut self, a: u32, n: usize) -> Option<&[u8]> {
         let p = pa(a);
-        if p + n > self.ram.len() { self.fault(a, false); return None; }
+        if p + n > self.len { self.fault(a, false); return None; }
         self.touch(p, n);
-        Some(&self.ram[p..p + n])
+        Some(self.bytes(p, n))
     }
 
     #[inline]
     pub fn slice_mut(&mut self, a: u32, n: usize) -> Option<&mut [u8]> {
         let p = pa(a);
-        if p + n > self.ram.len() { self.fault(a, true); return None; }
+        if p + n > self.len { self.fault(a, true); return None; }
         self.touch(p, n);
-        if let Some(w) = self.written.as_mut() { for pg in p / PAGE..=(p + n.max(1) - 1) / PAGE { w.insert((pg * PAGE) as u32); } }
-        Some(&mut self.ram[p..p + n])
+        if let Some(w) = self.written.as_mut() {
+            let (first, last) = (p / PAGE, (p + n.max(1) - 1) / PAGE);
+            if first + 1 != self.last_written || last != first {
+                for pg in first..=last { w.insert((pg * PAGE) as u32); }
+                self.last_written = last + 1;
+            }
+        }
+        Some(self.bytes_mut(p, n))
     }
 
     #[inline]

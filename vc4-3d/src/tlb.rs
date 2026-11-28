@@ -101,55 +101,74 @@ impl TileBuffer {
 
     /// Store one buffer of the tile at (tx, ty) into the frame-sized image at `addr`.
     /// `buffer`: 1 colour, 2 Z+stencil, 3 Z, 4 VG mask; `format`: 0 RGBA8888, else BGR565.
+    /// Pixels go out a run at a time: a tile row (raster) or a utile row (T, LT), which are
+    /// contiguous in memory.
     #[allow(clippy::too_many_arguments)]
     pub fn store(&self, frame: &Frame, tile: (u32, u32), addr: u32, buffer: u32, tiling: u8, format: u32, average: bool, mem: &mut Mem) {
         let cpp = match buffer { 1 if format != 0 => 2, 4 => 1, _ => 4 };
+        if !matches!(buffer, 1..=4) { return; }
         let lay = Layout::new(tiling, cpp, frame.width);
         let ts = self.size;
+        let run = if tiling == crate::tiling::RASTER { ts } else { crate::tiling::utile_w(cpp) };
+        let mut buf = [0u8; 64 * 4];
         for py in 0..ts {
             let y = tile.1 * ts + py;
             if y >= frame.height { break; }
-            for px in 0..ts {
+            let mut px = 0;
+            while px < ts {
                 let x = tile.0 * ts + px;
                 if x >= frame.width { break; }
-                let a = addr.wrapping_add(lay.offset(x, y));
-                match buffer {
-                    1 => {
-                        let c = self.resolved(px, py, average);
-                        if cpp == 2 { mem.w16(a, to565(c)) } else { mem.w32(a, c) }
+                let n = run.min(frame.width - x) as usize;
+                for k in 0..n {
+                    let (qx, b) = (px + k as u32, &mut buf[k * cpp as usize..]);
+                    match buffer {
+                        1 => {
+                            let c = self.resolved(qx, py, average);
+                            if cpp == 2 { b[..2].copy_from_slice(&to565(c).to_le_bytes()) } else { b[..4].copy_from_slice(&c.to_le_bytes()) }
+                        }
+                        2 | 3 => b[..4].copy_from_slice(&self.zs[self.idx(qx, py, 0)].to_le_bytes()),
+                        _ => b[0] = self.vg[self.idx(qx, py, 0)],
                     }
-                    2 | 3 => mem.w32(a, self.zs[self.idx(px, py, 0)]),
-                    4 => mem.w8(a, self.vg[self.idx(px, py, 0)]),
-                    _ => {}
                 }
+                mem.write(addr.wrapping_add(lay.offset(x, y)), &buf[..n * cpp as usize]);
+                px += run;
             }
         }
     }
 
     /// Load one buffer of the tile at (tx, ty) from the frame-sized image at `addr` (every
-    /// sample gets the pixel's value).
+    /// sample gets the pixel's value), a run of contiguous pixels at a time.
     #[allow(clippy::too_many_arguments)]
     pub fn load(&mut self, frame: &Frame, tile: (u32, u32), addr: u32, buffer: u32, tiling: u8, format: u32, mem: &mut Mem) {
         let cpp = match buffer { 1 if format != 0 => 2, 4 => 1, _ => 4 };
+        if !matches!(buffer, 1..=4) { return; }
         let lay = Layout::new(tiling, cpp, frame.width);
         let ts = self.size;
+        let run = if tiling == crate::tiling::RASTER { ts } else { crate::tiling::utile_w(cpp) };
+        let mut buf = [0u8; 64 * 4];
         for py in 0..ts {
             let y = tile.1 * ts + py;
             if y >= frame.height { break; }
-            for px in 0..ts {
+            let mut px = 0;
+            while px < ts {
                 let x = tile.0 * ts + px;
                 if x >= frame.width { break; }
-                let a = addr.wrapping_add(lay.offset(x, y));
-                for s in 0..self.samples {
-                    let i = self.idx(px, py, s);
-                    match buffer {
-                        1 => self.color[i] = if cpp == 2 { from565(mem.r16(a)) } else { mem.r32(a) },
-                        2 => self.zs[i] = mem.r32(a),
-                        3 => self.zs[i] = (mem.r32(a) & !0xff) | (self.zs[i] & 0xff),
-                        4 => self.vg[i] = mem.r8(a),
-                        _ => {}
+                let n = run.min(frame.width - x) as usize;
+                mem.read(addr.wrapping_add(lay.offset(x, y)), &mut buf[..n * cpp as usize]);
+                for k in 0..n {
+                    let b = &buf[k * cpp as usize..];
+                    let w = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    for s in 0..self.samples {
+                        let i = self.idx(px + k as u32, py, s);
+                        match buffer {
+                            1 => self.color[i] = if cpp == 2 { from565(u16::from_le_bytes([b[0], b[1]])) } else { w(b) },
+                            2 => self.zs[i] = w(b),
+                            3 => self.zs[i] = (w(b) & !0xff) | (self.zs[i] & 0xff),
+                            _ => self.vg[i] = b[0],
+                        }
                     }
                 }
+                px += run;
             }
         }
     }

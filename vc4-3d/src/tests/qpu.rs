@@ -491,3 +491,61 @@ fn decode_fields() {
     assert_eq!((d.raddr_a, d.raddr_b, d.ws, d.sf, d.cond_add, d.pack, d.pm), (3, 4, true, true, COND_ZS, 4, true));
     let _ = ZERO;
 }
+
+/// The fast path (`Qpu::alu_fast`) against the general one (`Qpu::alu`): random instruction
+/// words that decode as fast-path instructions, on random registers and flags (special floats
+/// and integers), through both; registers, flags, uniform pointer and VPM must agree. NaN
+/// results may differ only in sign or payload (none of the operations here produce them
+/// differently, but a NaN's bits are not compared).
+#[test]
+fn fast_path_matches_general_path() {
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+    const SPECIAL: [u32; 12] = [0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x0000_0001, 0x8040_0000, 0x4effffff, 1, 0xffff_ffff];
+    let mut ram = vec![0u8; 0x10_0000];
+    for k in 0..256u32 { let a = (UNIF + 4 * k) as usize; ram[a..a + 4].copy_from_slice(&(k.wrapping_mul(0x9e37_79b9)).to_le_bytes()); }
+    let mut tested = 0;
+    for _ in 0..200_000 {
+        // an ALU instruction without pack or unpack, reading registers, uniforms, the element
+        // number, the VPM, nothing or a small immediate, writing registers, accumulators, r5,
+        // the VPM or nothing
+        let r = rnd();
+        const SRC: [u8; 6] = [raddr::UNIF, raddr::NOP, raddr::ELEM_QPU, raddr::VPM, 3, 17];
+        const DST: [u8; 6] = [waddr::R5, waddr::NOP, waddr::VPM, waddr::R0, waddr::R3, 9];
+        let pick = |x: u64, set: &[u8]| -> u64 { if x & 1 == 0 { (x >> 1) % 32 } else { set[(x >> 1) as usize % set.len()] as u64 } };
+        let small = r & 1 != 0;
+        let sigv = if small { sig::SMALL_IMM } else { sig::NONE } as u64;
+        let ra = pick(r >> 1 & 0xff, &SRC);
+        let rb = if small { r >> 9 & 0x3f } else { pick(r >> 9 & 0xff, &SRC) };
+        if small && rb >= 48 { continue; }
+        let wa = pick(r >> 17 & 0xff, &DST);
+        let wm = pick(r >> 25 & 0xff, &DST);
+        let r2 = rnd();
+        let w = sigv << 60 | (r2 & 1) << 56 | (r2 >> 1 & 7) << 49 | (r2 >> 4 & 7) << 46 | (r2 >> 7 & 1) << 45 | (r2 >> 8 & 1) << 44
+            | wa << 38 | wm << 32 | (r2 >> 9 & 7) << 29 | (r2 >> 12 & 31) << 24 | ra << 18 | rb << 12 | (r2 >> 17 & 0xfff);
+        let i = qpu::decode(w);
+        assert!(i.fast, "{w:#x}");
+        let mut q = Qpu::new();
+        let mut val = || { let r = rnd(); if r & 3 == 0 { SPECIAL[(r >> 8) as usize % SPECIAL.len()] } else { (r >> 16) as u32 } };
+        for r in 0..32 { for l in 0..16 { q.ra[r][l] = val(); q.rb[r][l] = val(); } }
+        for r in 0..6 { for l in 0..16 { q.acc[r][l] = val(); } }
+        let f = rnd();
+        (q.z, q.n, q.c) = (f as u16, (f >> 16) as u16, (f >> 32) as u16);
+        q.unif = UNIF + 4 * (f >> 48 & 63) as u32;
+        q.vrd.setup = 0x0000_1a00; q.vrd.left = 16;
+        q.vwr.setup = 0x0000_1a00;
+        let mut q2 = q.clone();
+        let mut m = Mem::new(&mut ram);
+        let (mut e1, mut e2) = (NoEnv { vpm: vec![0; 192 * 16] }, NoEnv { vpm: vec![0; 192 * 16] });
+        q.alu(&i, &mut m, &mut e1);
+        q2.alu_fast(&i, &mut m, &mut e2);
+        let same = |a: &V, b: &V| a.iter().zip(b).all(|(x, y)| x == y || (f32::from_bits(*x).is_nan() && f32::from_bits(*y).is_nan()));
+        let d = crate::disasm::disasm(w);
+        for r in 0..32 { assert!(same(&q.ra[r], &q2.ra[r]) && same(&q.rb[r], &q2.rb[r]), "{d}: register {r}"); }
+        for r in 0..6 { assert!(same(&q.acc[r], &q2.acc[r]), "{d}: r{r}"); }
+        assert_eq!((q.z, q.n, q.c, q.unif), (q2.z, q2.n, q2.c, q2.unif), "{d}: flags, uniforms");
+        assert_eq!(e1.vpm, e2.vpm, "{d}: VPM");
+        tested += 1;
+    }
+    assert!(tested > 10_000, "only {tested} instructions tested");
+}

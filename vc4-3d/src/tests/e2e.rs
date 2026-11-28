@@ -166,6 +166,10 @@ struct Scene {
     tile_alloc_size: u32,
     clear: u32,
     tiling: u8,
+    /// load each tile's colour from the frame before drawing (as for a partial redraw)
+    load: bool,
+    /// a tile whose list is overwritten with a halt after binning (it stops the rendering job)
+    halt_tile: Option<u32>,
     /// where the next draw's vertices go
     vat: u32,
 }
@@ -180,7 +184,7 @@ fn px(w: u32, h: u32, x: f32, y: f32, z: f32) -> [f32; 4] { [x / (w as f32 / 2.0
 impl Scene {
     fn new(w: u32, h: u32) -> Scene {
         let mut s = Scene { ram: vec![0u8; 48 << 20], vat: 0x100_0000, w, h, bcl: Cl::default(), nrec: 0, unif_at: UNIF, depth: false, ms: false,
-                            tile_alloc_size: 0x8_0000, clear: 0xff20_1008, tiling: tiling::RASTER };
+                            tile_alloc_size: 0x8_0000, clear: 0xff20_1008, tiling: tiling::RASTER, load: false, halt_tile: None };
         put(&mut s.ram, CS, &bytes(&{ let mut p = coord_shader(); p.extend(end()); p }));
         s
     }
@@ -263,6 +267,7 @@ impl Scene {
         for y in 0..ty {
             for x in 0..tx {
                 let last = x == tx - 1 && y == ty - 1;
+                if self.load { r.u8(cl::LOAD_TILE_BUFFER_GENERAL).u16(1 | (self.tiling as u16) << 4).u32(COLOR | BUS); }
                 r.u8(cl::TILE_COORDINATES).u8(x as u8).u8(y as u8);
                 if x == 0 && y == 0 && has_bin { r.u8(cl::WAIT_ON_SEMAPHORE); }
                 if has_bin { r.u8(cl::BRANCH_TO_SUB_LIST).u32(TILE_ALLOC + (y * tx + x) * 32 | BUS); }
@@ -285,6 +290,15 @@ impl Scene {
         v
     }
 
+    /// The same on `threads` host threads.
+    fn run_threads(&mut self, threads: usize) -> V3d {
+        let mut v = V3d::new();
+        v.time_scale = 0.0;
+        v.exec().par.threads = threads;
+        self.run_on(&mut v);
+        v
+    }
+
     fn run_on(&mut self, v: &mut V3d) {
         let has_bin = self.nrec > 0;
         self.bcl.u8(cl::INCREMENT_SEMAPHORE).u8(cl::FLUSH);
@@ -303,8 +317,10 @@ impl Scene {
             assert_eq!(v.read(CT0CA as u64), (BCL + bcl.len() as u32) | BUS);
             v.write(INTCTL as u64, INT_FLDONE, ram);
         }
+        if let Some(t) = self.halt_tile { ram[(TILE_ALLOC + 32 * t) as usize] = cl::HALT; }
         v.write(CT1CA as u64, RCL | BUS, ram);
         v.write(CT1EA as u64, (RCL + rcl.len() as u32) | BUS, ram);
+        if self.halt_tile.is_some() { return; }
         assert_ne!(v.read(INTCTL as u64) & INT_FRDONE, 0, "frame done");
         assert!(v.irq());
         v.write(INTCTL as u64, INT_FRDONE, ram);
@@ -869,5 +885,129 @@ fn random_input_does_not_panic() {
         for k in (0x2_0000..0x2_0400).step_by(8) { ram[k..k + 8].copy_from_slice(&rnd().to_le_bytes()); }
         v.write(crate::SRQUA as u64, 0x3_0000, &mut ram);
         v.write(crate::SRQPC as u64, 0x2_0000, &mut ram);
+    }
+}
+
+/// Scenes for the thread-count check: (name, frame size, setup). Each has more vertices than
+/// one 128-vertex chunk and spans many tiles.
+#[allow(clippy::type_complexity)]
+fn par_scenes() -> Vec<(&'static str, (u32, u32), Box<dyn Fn(&mut Scene)>)> {
+    let mut v: Vec<(&'static str, (u32, u32), Box<dyn Fn(&mut Scene)>)> = Vec::new();
+    // overlapping gouraud quads with a depth test and Z stores, triangles crossing tile edges
+    v.push(("depth", (500, 300), Box::new(|s: &mut Scene| {
+        let (w, h) = (s.w, s.h);
+        s.depth = true;
+        s.begin(ALL_FACES & !(7 << 12) | 1 << 12 | cl::config::Z_UPDATE);
+        let mut verts = Vec::new();
+        for layer in 0..3 {
+            let z = 0.6 - layer as f32 * 0.3;
+            for cy in 0..9 { for cx in 0..13 {
+                let (x0, y0) = (cx as f32 * 37.0 + layer as f32 * 11.0, cy as f32 * 33.0 + layer as f32 * 7.0);
+                let c = [cx as f32 / 13.0, cy as f32 / 9.0, layer as f32 / 3.0, 1.0];
+                let q = |x: f32, y: f32| Vx { p: px(w, h, x, y, z + (x - y) / 4000.0), a: c };
+                verts.extend([q(x0, y0), q(x0 + 50.0, y0), q(x0 + 50.0, y0 + 45.0), q(x0, y0), q(x0 + 50.0, y0 + 45.0), q(x0, y0 + 45.0)]);
+            } }
+        }
+        let mut fs = vec![mov(waddr::TLB_Z, B).rb(15)];
+        fs.extend_from_slice(&gouraud_fs());
+        for chunk in verts.chunks(300) { s.draw(chunk, 4, &fs, &[], cl::PRIM_TRIANGLES, None); }
+    })));
+    // additive blending (the shader reads the tile buffer) over a loaded frame, and a fan
+    v.push(("blend+load", (300, 200), Box::new(|s: &mut Scene| {
+        let (w, h) = (s.w, s.h);
+        s.load = true;
+        for y in 0..h { for x in 0..w { put32(&mut s.ram, COLOR + 4 * (y * w + x), &[0xff00_0000 | x | y << 8]); } }
+        s.begin(ALL_FACES);
+        for k in 0..40 {
+            let (x0, y0) = ((k * 7 % 250) as f32, (k * 13 % 160) as f32);
+            s.draw(&rect(w, h, x0, y0, x0 + 60.0, y0 + 40.0, 0.0), 0, &additive_fs(), &[0x0010_0804 * (k % 3 + 1)], cl::PRIM_TRIANGLES, None);
+        }
+        let mut fan = vec![vx(px(w, h, 150.0, 100.0, 0.0))];
+        for k in 0..=200 { let a = k as f32 * std::f32::consts::TAU / 200.0; fan.push(vx(px(w, h, 150.0 + 140.0 * a.cos(), 100.0 + 95.0 * a.sin(), 0.0))); }
+        s.draw(&fan, 0, &additive_fs(), &[0x0002_0202], cl::PRIM_TRIANGLE_FAN, None);
+    })));
+    // a mipmapped texture (LOD from the quads), points and lines, a clipped triangle
+    v.push(("texture+points", (256, 256), Box::new(|s: &mut Scene| {
+        let (w, h) = (s.w, s.h);
+        let mut base = TEX + 0x10_0000;
+        let mut levels = Vec::new();
+        for l in (0..7).rev() {
+            let n = 64u32 >> l;
+            let lay = tiling::Layout::new(if n >= 32 { tiling::T } else { tiling::LT }, 4, n);
+            let (aw, ah) = tiling::aligned(n, n, 4, lay.tiling);
+            levels.push((base, lay, n, l));
+            base += aw * ah * 4;
+        }
+        for &(b, ref lay, n, l) in &levels { for y in 0..n { for x in 0..n { put32(&mut s.ram, b + lay.offset(x, y), &[0xff00_0000 | (x * 4) | (y * 4) << 8 | (l * 40) << 16]); } } }
+        let p0 = levels.last().unwrap().0 | BUS | 6;
+        let p1 = 64 << 20 | 64 << 8 | 5 << 4;
+        s.begin(ALL_FACES);
+        let t = |x, y, u: f32, v: f32| Vx { p: px(w, h, x, y, 0.5), a: [u, v, 0.0, 0.0] };
+        for k in 0..30 {
+            let (x0, y0, sz) = ((k * 37 % 200) as f32, (k * 53 % 200) as f32, 20.0 + (k % 5) as f32 * 30.0);
+            let q = [t(x0, y0, 0.0, 0.0), t(x0 + sz, y0, 1.0, 0.0), t(x0 + sz, y0 + sz, 1.0, 1.0), t(x0, y0, 0.0, 0.0), t(x0 + sz, y0 + sz, 1.0, 1.0), t(x0, y0 + sz, 0.0, 1.0)];
+            s.draw(&q, 2, &texture_fs(), &[p0, p1], cl::PRIM_TRIANGLES, None);
+        }
+        s.state(&[cl::POINT_SIZE, 0, 0, 0x40, 0x40]); // 3.0
+        let pts: Vec<Vx> = (0..300).map(|k| vx(px(w, h, (k * 31 % 256) as f32 + 0.3, (k * 17 % 256) as f32, 0.0))).collect();
+        s.draw(&pts, 0, &flat_fs(false), &[RED], cl::PRIM_POINTS, None);
+        let lines: Vec<Vx> = (0..200).map(|k| vx(px(w, h, (k * 29 % 256) as f32, (k * 43 % 256) as f32 + 0.5, 0.0))).collect();
+        s.draw(&lines, 0, &flat_fs(false), &[GREEN], cl::PRIM_LINE_STRIP, None);
+        s.draw(&[vx([-0.5, 0.5, 0.0, 1.0]), vx([0.9, 0.7, 0.0, 1.0]), vx([0.0, -0.9, -3.0, 1.0])], 0, &flat_fs(false), &[BLUE], cl::PRIM_TRIANGLES, None);
+    })));
+    // a tile list that halts (stale lists): the job stops there, the later tiles stay unrendered
+    v.push(("halt", (500, 300), Box::new(|s: &mut Scene| {
+        let (w, h) = (s.w, s.h);
+        s.halt_tile = Some(17);
+        s.begin(ALL_FACES);
+        let mut verts = Vec::new();
+        for k in 0..60 { let (x, y) = ((k * 37 % 450) as f32, (k * 23 % 260) as f32); verts.extend(rect(w, h, x, y, x + 50.0, y + 40.0, 0.0)); }
+        s.draw(&verts, 0, &flat_fs(false), &[RED], cl::PRIM_TRIANGLES, None);
+    })));
+    // 4x multisampling (32x32 tiles), stencil
+    v.push(("msaa+stencil", (200, 120), Box::new(|s: &mut Scene| {
+        let (w, h) = (s.w, s.h);
+        s.ms = true;
+        s.begin(ALL_FACES | cl::config::OVERSAMPLE_4X);
+        let always_replace = 3 << 30 | 3 << 28 | 2 << 22 | 7 << 16 | 1 << 8 | 0xff;
+        let equal_one = 3 << 30 | 3 << 28 | 1 << 25 | 1 << 22 | 1 << 19 | 2 << 16 | 1 << 8 | 0xff;
+        let mut tris = Vec::new();
+        for k in 0..60 {
+            let (x, y) = ((k * 23 % 190) as f32, (k * 41 % 110) as f32);
+            tris.extend([vx(px(w, h, x, y, 0.0)), vx(px(w, h, x + 37.3, y + 5.1, 0.0)), vx(px(w, h, x + 3.7, y + 29.9, 0.0))]);
+        }
+        s.draw(&tris, 0, &stencil_fs(), &[always_replace, RED], cl::PRIM_TRIANGLES, None);
+        s.draw(&rect(w, h, 0.0, 0.0, 200.0, 120.0, 0.0), 0, &stencil_fs(), &[equal_one, GREEN], cl::PRIM_TRIANGLES, None);
+    })));
+    v
+}
+
+/// Rendering on several host threads gives the same memory, byte for byte, as on one: the
+/// frame, depth buffer, and everything else.
+#[test]
+fn threads_render_the_same() {
+    for (name, (w, h), setup) in par_scenes() {
+        let mut want: Option<(Vec<u8>, String)> = None;
+        for threads in [1, 2, 5, 16] {
+            let mut s = Scene::new(w, h);
+            setup(&mut s);
+            let v = s.run_threads(threads);
+            // primitives and fragments (not QPU instructions: one thread shades a few vertices
+            // ahead of those used, to fill batches)
+            let stats = v.stats();
+            let got = (s.ram.clone(), stats[stats.rfind("ms), ").unwrap() + 5..stats.find(';').unwrap()].to_string());
+            match &want {
+                None => {
+                    assert!((0..h).any(|y| s.pixel(w / 2, y) != 0), "{name}: something drawn");
+                    if s.halt_tile.is_some() { assert_eq!(s.pixel(w - 1, h - 1), 0, "{name}: nothing after the halt"); }
+                    want = Some(got);
+                }
+                Some(w0) => {
+                    assert_eq!(w0.1, got.1, "{name}: statistics with {threads} threads");
+                    let diff = w0.0.iter().zip(&got.0).position(|(a, b)| a != b);
+                    assert!(diff.is_none(), "{name}: memory differs with {threads} threads at {:#x}", diff.unwrap());
+                }
+            }
+        }
     }
 }

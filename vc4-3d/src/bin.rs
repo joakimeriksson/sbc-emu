@@ -234,9 +234,15 @@ fn idx_record(idx: &[u32]) -> Vec<u8> {
 const MAX_DRAW: u32 = 1 << 20;
 
 /// Run a binning control list from `start` to `end`.
-pub fn run(start: u32, end: u32, mem: &mut Mem, code: &mut Code, insns: &mut u64) -> BinOutput {
+pub fn run(start: u32, end: u32, mem: &mut Mem, code: &mut Code, par: &mut crate::par::Par, insns: &mut u64) -> BinOutput {
     let mut out = BinOutput::default();
     let mut cache = shade::Cache::default();
+    // with several workers, every draw's vertices go through the coordinate shader first, all
+    // workers taking chunks of them; binning then finds them shaded
+    if par.threads > 1 {
+        let want = draws(start, end, mem);
+        shade::shade_parallel(want, true, &mut cache, mem, code, par, insns);
+    }
     let mut st = GlState::default();
     let mut pc = start;
     let mut stack: Vec<u32> = Vec::new();
@@ -319,6 +325,50 @@ pub fn run(start: u32, end: u32, mem: &mut Mem, code: &mut Code, insns: &mut u64
         pc = next;
     }
     out
+}
+
+/// The vertices the draws of a binning list use, by shader record (what [`run`] will shade, so
+/// it can be shaded ahead in parallel). Records with pre-shaded vertices are left out.
+fn draws(start: u32, end: u32, mem: &mut Mem) -> Vec<(ShaderRec, Vec<u32>)> {
+    let mut want: Vec<(ShaderRec, Vec<u32>)> = Vec::new();
+    let mut st = GlState::default();
+    let mut pc = start;
+    let mut stack: Vec<u32> = Vec::new();
+    let mut steps = 0u64;
+    while pc != end && steps < 50_000_000 {
+        steps += 1;
+        let op = mem.r8(pc);
+        let Some(n) = cl::size(op) else { break };
+        let mut p = [0u8; 16];
+        mem.read(pc, &mut p[..n as usize]);
+        let next = pc.wrapping_add(n);
+        match op {
+            cl::HALT => break,
+            cl::BRANCH => { pc = cl::le32(&p[1..]); continue; }
+            cl::BRANCH_TO_SUB_LIST if stack.len() < 2 => { stack.push(next); pc = cl::le32(&p[1..]); continue; }
+            cl::RETURN_FROM_SUB_LIST => { if let Some(r) = stack.pop() { pc = r; continue; } }
+            cl::GL_INDEXED_PRIMITIVE | cl::GL_ARRAY_PRIMITIVE if st.shader.0 != 0 => {
+                let addr = st.shader.1 & !0xf;
+                let k = match want.iter().position(|w| w.0.addr == addr) {
+                    Some(k) => k,
+                    None => { want.push((ShaderRec::read(st.shader.0, st.shader.1, mem), Vec::new())); want.len() - 1 }
+                };
+                if want[k].0.nv.is_some() { pc = next; continue; }
+                let idx = &mut want[k].1;
+                if op == cl::GL_INDEXED_PRIMITIVE {
+                    let (len, addr) = (cl::le32(&p[2..]), cl::le32(&p[6..]));
+                    let wide = p[1] >> 4 != 0;
+                    idx.extend((0..len.min(MAX_DRAW)).map(|k| if wide { mem.r16(addr.wrapping_add(2 * k)) as u32 } else { mem.r8(addr.wrapping_add(k)) as u32 }));
+                } else {
+                    let (len, first) = (cl::le32(&p[2..]), cl::le32(&p[6..]));
+                    idx.extend((0..len.min(MAX_DRAW)).map(|k| first.wrapping_add(k)));
+                }
+            }
+            _ => { st.apply(&p[..n as usize]); }
+        }
+        pc = next;
+    }
+    want
 }
 
 /// Bin one draw: shade its vertices, assemble, clip, cull, bin.

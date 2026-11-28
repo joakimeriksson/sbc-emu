@@ -40,40 +40,45 @@ pub struct Layout {
     pub width: u32,
     /// raster: bytes per row
     pub stride: u32,
+    /// log2 of the bytes per pixel and of the utile's width and height (all powers of two)
+    cpp_s: u32,
+    uw_s: u32,
+    uh_s: u32,
+    /// utiles per row (LT), 4 KiB tiles per row (T)
+    utiles_per_row: u32,
+    tiles_per_row: u32,
 }
 
 impl Layout {
     /// The layout of a `w` pixels wide image (the stride and padding the hardware derives).
     pub fn new(tiling: u8, cpp: u32, w: u32) -> Layout {
         let (aw, _) = aligned(w, 1, cpp, tiling);
-        Layout { tiling, cpp, width: aw, stride: aw * cpp }
+        let (uw, uh) = (utile_w(cpp), utile_h(cpp));
+        Layout { tiling, cpp, width: aw, stride: aw * cpp, cpp_s: cpp.trailing_zeros(), uw_s: uw.trailing_zeros(), uh_s: uh.trailing_zeros(),
+                 utiles_per_row: aw / uw, tiles_per_row: (aw / (uw * 8)).max(1) }
     }
 
     /// Byte offset of pixel (x, y).
     #[inline]
     pub fn offset(&self, x: u32, y: u32) -> u32 {
-        let cpp = self.cpp;
-        match self.tiling {
-            RASTER => y * self.stride + x * cpp,
-            _ => {
-                let (uw, uh) = (utile_w(cpp), utile_h(cpp));
-                let inside = ((y % uh) * uw + (x % uw)) * cpp;
-                let (ux, uy) = (x / uw, y / uh);
-                if self.tiling == LT {
-                    return (uy * (self.width / uw) + ux) * 64 + inside;
-                }
-                let tiles_per_row = (self.width / (uw * 8)).max(1);
-                let (tx, ty) = (ux >> 3, uy >> 3);
-                let odd = ty & 1 != 0;
-                let tx = if odd { tiles_per_row.saturating_sub(tx + 1) } else { tx };
-                let tile = 4096 * (ty * tiles_per_row + tx);
-                let si = (((uy >> 2) & 1) << 1) | ((ux >> 2) & 1);
-                const EVEN: [u32; 4] = [0, 3, 1, 2];
-                const ODD: [u32; 4] = [2, 1, 3, 0];
-                let sub = 1024 * if odd { ODD[si as usize] } else { EVEN[si as usize] };
-                tile + sub + ((uy & 3) * 4 + (ux & 3)) * 64 + inside
-            }
+        if self.tiling == RASTER { return y * self.stride + x * self.cpp; }
+        let (uw_s, uh_s) = (self.uw_s, self.uh_s);
+        let inside = ((y & ((1 << uh_s) - 1)) << uw_s | (x & ((1 << uw_s) - 1))) << self.cpp_s;
+        let (ux, uy) = (x >> uw_s, y >> uh_s);
+        if self.tiling == LT {
+            return (uy * self.utiles_per_row + ux) * 64 + inside;
         }
+        let tiles_per_row = self.tiles_per_row;
+        let (tx, ty) = (ux >> 3, uy >> 3);
+        let odd = ty & 1 != 0;
+        let tx = if odd { tiles_per_row.saturating_sub(tx + 1) } else { tx };
+        let tile = 4096 * (ty * tiles_per_row + tx);
+        let si = (((uy >> 2) & 1) << 1) | ((ux >> 2) & 1);
+        // sub-tile order by row parity, two bits each: even 0 3 1 2, odd 2 1 3 0
+        const EVEN: u32 = 0b10_01_11_00;
+        const ODD: u32 = 0b00_11_01_10;
+        let sub = 1024 * ((if odd { ODD } else { EVEN }) >> (2 * si) & 3);
+        tile + sub + ((uy & 3) * 4 + (ux & 3)) * 64 + inside
     }
 }
 

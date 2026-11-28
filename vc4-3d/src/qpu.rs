@@ -156,6 +156,9 @@ pub struct Inst {
     pub bcond: u8,
     pub rel: bool,
     pub reg: bool,
+    /// pre-decoded: an ALU instruction without unpack, pack or vector rotation, which
+    /// [`Qpu::alu_fast`] runs (`imm` then holds the small immediate's value)
+    pub fast: bool,
 }
 
 #[inline]
@@ -201,9 +204,17 @@ pub fn decode(w: u64) -> Inst {
             i.add_b = f(w, 8, 6);
             i.mul_a = f(w, 5, 3);
             i.mul_b = f(w, 2, 0);
+            if sig == sig::SMALL_IMM { i.imm = small_imm(i.raddr_b); }
+            i.fast = fast_path() && i.unpack == 0 && i.pack == 0 && !(sig == sig::SMALL_IMM && i.raddr_b >= 48);
         }
     }
     i
+}
+
+/// Whether ALU instructions take the fast path (`SBC_VC4_QPU_FAST=0`: all take the general one).
+fn fast_path() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SBC_VC4_QPU_FAST").map_or(true, |v| v != "0"))
 }
 
 /// The value of a small immediate (raddr_b with the small-immediate signal); 48..63 are the
@@ -804,7 +815,7 @@ impl Qpu {
                 self.write_result(i.waddr_mul, i.ws, &v, mm, &i, false, false, None, mem, env);
                 if i.sf { self.set_flags(&v, false, None, ma); }
             }
-            _ => self.alu(&i, mem, env),
+            _ => if i.fast { self.alu_fast(&i, mem, env) } else { self.alu(&i, mem, env) },
         }
         if tracing {
             let show = |w: u8, a: bool| -> String {
@@ -892,7 +903,7 @@ impl Qpu {
         }
     }
 
-    fn alu(&mut self, i: &Inst, mem: &mut Mem, env: &mut dyn Env) {
+    pub(crate) fn alu(&mut self, i: &Inst, mem: &mut Mem, env: &mut dyn Env) {
         let mut r5_vary = None;
         let small = i.sig == sig::SMALL_IMM;
         let va = if i.raddr_a != raddr::NOP { self.read(i.raddr_a, false, mem, env, &mut r5_vary) } else { ZERO };
@@ -945,6 +956,51 @@ impl Qpu {
         if i.sf {
             if let Some((r, carry, _)) = &add_res { self.set_flags(r, add_float_out(i.op_add), carry.as_ref(), self.cond_mask(i.cond_add)); }
             else if let Some(r) = &mul_res { self.set_flags(r, i.op_mul == op::FMUL, None, self.cond_mask(i.cond_mul)); }
+        }
+    }
+
+    /// An operand by its mux: an accumulator or a port's value.
+    #[inline(always)]
+    fn mux<'s>(&'s self, m: u8, va: &'s V, vb: &'s V) -> &'s V {
+        match m { 0..=5 => &self.acc[m as usize], 6 => va, _ => vb }
+    }
+
+    /// A result to a destination: registers and accumulators here, the rest through `write`.
+    #[inline(always)]
+    fn put(&mut self, w: u8, a: bool, v: &V, mask: u16, mem: &mut Mem, env: &mut dyn Env) {
+        if w == waddr::NOP || mask == 0 { return; }
+        let r = match w {
+            0..=31 => if a { &mut self.ra[w as usize] } else { &mut self.rb[w as usize] },
+            waddr::R0..=waddr::R3 => &mut self.acc[(w - waddr::R0) as usize],
+            _ => return self.write(w, a, v, mask, mem, env),
+        };
+        if mask == ALL { *r = *v } else { for l in 0..16 { if mask >> l & 1 != 0 { r[l] = v[l]; } } }
+    }
+
+    /// [`Qpu::alu`] for instructions without unpack, pack or rotation (`Inst::fast`): the same
+    /// reads, operations, writes and flags in the same order, without the general path's
+    /// per-operand unpacking and packing.
+    #[inline(always)]
+    pub(crate) fn alu_fast(&mut self, i: &Inst, mem: &mut Mem, env: &mut dyn Env) {
+        let mut r5_vary = None;
+        let va = match i.raddr_a { r @ 0..=31 => self.ra[r as usize], raddr::NOP => ZERO, r => self.read(r, false, mem, env, &mut r5_vary) };
+        let vb = if i.sig == sig::SMALL_IMM { [i.imm; 16] } else {
+            match i.raddr_b { r @ 0..=31 => self.rb[r as usize], raddr::NOP => ZERO, r => self.read(r, true, mem, env, &mut r5_vary) }
+        };
+        let (has_add, has_mul) = (i.op_add != op::A_NOP, i.op_mul != op::M_NOP);
+        let add = if has_add { add_vec(i.op_add, self.mux(i.add_a, &va, &vb), self.mux(i.add_b, &va, &vb)) } else { ZERO };
+        let carry: Option<V> = if i.sf && has_add && (i.op_add == op::ADD || i.op_add == op::SUB) {
+            let (a, b) = (self.mux(i.add_a, &va, &vb), self.mux(i.add_b, &va, &vb));
+            Some(if i.op_add == op::ADD { std::array::from_fn(|l| a[l].overflowing_add(b[l]).1 as u32) } else { std::array::from_fn(|l| (a[l] < b[l]) as u32) })
+        } else { None };
+        let mul = if has_mul { mul_vec(i.op_mul, self.mux(i.mul_a, &va, &vb), self.mux(i.mul_b, &va, &vb)) } else { ZERO };
+        let (ma, mm) = (self.cond_mask(i.cond_add), self.cond_mask(i.cond_mul));
+        if has_add { self.put(i.waddr_add, !i.ws, &add, ma, mem, env); }
+        if has_mul { self.put(i.waddr_mul, i.ws, &mul, mm, mem, env); }
+        if let Some(c) = r5_vary { self.acc[5] = c; }
+        if i.sf {
+            if has_add { self.set_flags(&add, add_float_out(i.op_add), carry.as_ref(), ma); }
+            else if has_mul { self.set_flags(&mul, i.op_mul == op::FMUL, None, mm); }
         }
     }
 
