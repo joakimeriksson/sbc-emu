@@ -16,6 +16,10 @@ const GPC0_PES0_TPC_MASK: u64 = 0x500c30;
 const FE_POWER_MODE: u64 = 0x404170;
 const FE_POWER_MODE_REQUEST: u32 = 1 << 4;
 const FECS_CPUCTL: u64 = 0x409100;
+/// The CPU control alias, the only one writable once a falcon runs light-secure.
+const FECS_CPUCTL_ALIAS: u64 = 0x409130;
+const GPCCS_CPUCTL_ALIAS: u64 = 0x41a130;
+const FECS_MAILBOX4: u64 = 0x409810;
 const FECS_IMEM_DATA: u64 = 0x409184;
 const FECS_DMEM_DATA: u64 = 0x4091c4;
 const FECS_METHOD_DATA: u64 = 0x409500;
@@ -39,6 +43,14 @@ const DISCOVER_PM_SIZE: u32 = 0x25;
 /// driver waits for 1 in mailbox 1.
 const STOP_CTXSW: u32 = 0x38;
 const START_CTXSW: u32 = 0x39;
+/// ELPG's register list: its size, then binding the PMU's buffer (instance, virtual address,
+/// passed in mailbox 4); the binds complete with 1 in mailbox 0.
+const DISCOVER_REGLIST_SIZE: u32 = 0x30;
+const SET_REGLIST_BIND_INSTANCE: u32 = 0x31;
+const SET_REGLIST_VIRTUAL_ADDRESS: u32 = 0x32;
+const REGLIST_BYTES: u32 = 0x8000;
+const FALCON_ID_FECS: u32 = 2;
+const FALCON_ID_GPCCS: u32 = 3;
 const CONTEXT_BYTES: u32 = 0x20_000;
 const ZCULL_BYTES: u32 = 0x1000;
 // Reserve space for the R36 netlist's aligned SYS, FBP and GPC HWPM register lists.
@@ -53,12 +65,20 @@ pub(super) struct Gr {
     fecs_started: bool,
     mailbox0: u32,
     mailbox1: u32,
+    mailbox4: u32,
     method_data: u32,
     fe_power_mode: u32,
     context_instance: Option<u32>,
 }
 
 impl Gr {
+    /// The PMU's ACR unit loaded the light-secure FECS and GPCCS images from the WPR (a mask of
+    /// falcon IDs); nvgpu then starts them through their CPU control aliases.
+    pub fn bootstrap_light_secure(&mut self, falcons: u32) {
+        self.fecs_uploaded |= falcons & (1 << FALCON_ID_FECS) != 0;
+        self.gpccs_uploaded |= falcons & (1 << FALCON_ID_GPCCS) != 0;
+    }
+
     pub fn firmware_data_port(offset: u64) -> bool {
         matches!(
             offset,
@@ -76,6 +96,7 @@ impl Gr {
             FE_POWER_MODE => Some(self.fe_power_mode),
             FECS_MAILBOX0 => Some(self.mailbox0),
             FECS_MAILBOX1 => Some(self.mailbox1),
+            FECS_MAILBOX4 => Some(self.mailbox4),
             FECS_METHOD_DATA => Some(self.method_data),
             _ => None,
         }
@@ -94,10 +115,10 @@ impl Gr {
             GPCCS_IMEM_DATA => self.gpccs_uploaded = true,
             FECS_IMEM_DATA => self.fecs_uploaded = true,
             GPCCS_DMEM_DATA | FECS_DMEM_DATA => {}
-            GPCCS_CPUCTL | FECS_CPUCTL => {
+            GPCCS_CPUCTL | FECS_CPUCTL | GPCCS_CPUCTL_ALIAS | FECS_CPUCTL_ALIAS => {
                 let was_running = self.fecs_started && self.gpccs_started;
                 let start = self.released != 0 && value & CPU_START != 0;
-                if offset == FECS_CPUCTL {
+                if matches!(offset, FECS_CPUCTL | FECS_CPUCTL_ALIAS) {
                     self.fecs_started = self.fecs_uploaded && start;
                 } else {
                     self.gpccs_started = self.gpccs_uploaded && start;
@@ -119,11 +140,14 @@ impl Gr {
                 DISCOVER_ZCULL_SIZE => self.mailbox0 = ZCULL_BYTES,
                 DISCOVER_PM_SIZE => self.mailbox0 = PM_BYTES,
                 STOP_CTXSW | START_CTXSW => self.mailbox1 = 1,
+                DISCOVER_REGLIST_SIZE => self.mailbox0 = REGLIST_BYTES,
+                SET_REGLIST_BIND_INSTANCE | SET_REGLIST_VIRTUAL_ADDRESS => self.mailbox0 = 1,
                 _ => {}
             },
             FECS_METHOD_PUSH => {}
             FECS_MAILBOX0 => self.mailbox0 = value,
             FECS_MAILBOX1 => self.mailbox1 = value,
+            FECS_MAILBOX4 => self.mailbox4 = value,
             _ => return false,
         }
         true

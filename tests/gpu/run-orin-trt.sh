@@ -126,7 +126,7 @@ LD_LIBRARY_PATH="$rustlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 
 scale=$(cat "$yolo/input.scale")
 sed -e '$d' -e 's/host1x mc-utils/host1x host1x-fence host1x-nvhost mc-utils/' \
-    -e 's/nvmap nvgpu/nvmap nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
+    -e 's/governor_pod_scaling nvgpu/governor_pod_scaling nvgpu cec drm drm_kms_helper nvhwpm tegra_wmark governor_userspace tegra-drm/' \
     scripts/jetson-orin-nano-gpu-power.txt > "$work/trt.txt"
 # an interpreted kernel takes longer than nvgpu's channel watchdog allows
 cat >> "$work/trt.txt" <<EOF

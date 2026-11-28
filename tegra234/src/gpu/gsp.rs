@@ -14,6 +14,13 @@ const MESSAGE_INTERRUPT: u32 = 1 << 6;
 const BROM_STATUS: u64 = 0x11165c;
 const BROM_CONFIG: u64 = 0x111668;
 const ENGINE_RESET: u64 = BASE + 0x3c0;
+const MAILBOX0: u64 = BASE + 0x040;
+const MAILBOX1: u64 = BASE + 0x044;
+/// The RISC-V core's control register (falcon2 base 0x111000): STARTCPU (bit 0), HALTED (bit 4).
+/// With the GSP fused to its RISC-V core, nvgpu starts it here instead of the Falcon CPUCTL.
+const RISCV_CPUCTL: u64 = 0x111388;
+const RISCV_STARTCPU: u32 = 1;
+const RISCV_HALTED: u32 = 1 << 4;
 const IMEM_CONTROL: u64 = BASE + 0x180;
 const IMEM_DATA: u64 = BASE + 0x184;
 const IMEM_TAG: u64 = BASE + 0x188;
@@ -110,6 +117,10 @@ pub(super) struct Gsp {
     imem_tags: [u32; IMEM_BYTES / BLOCK],
     brom_config: u32,
     brom_status: u32,
+    mailbox: [u32; 2],
+    halted: bool,
+    /// The ACR descriptor's address (mailbox 0/1 at start) of an ACR run the GPU still has to do.
+    acr_request: Option<u64>,
 }
 
 impl Default for Gsp {
@@ -131,6 +142,9 @@ impl Default for Gsp {
             imem_tags: [0; IMEM_BYTES / BLOCK],
             brom_config: 0,
             brom_status: 0,
+            mailbox: [0; 2],
+            halted: false,
+            acr_request: None,
         }
     }
 }
@@ -160,6 +174,39 @@ impl Gsp {
         self.irq_mask = MESSAGE_INTERRUPT;
         self.irq_dest = MESSAGE_INTERRUPT;
         self.irq_status |= MESSAGE_INTERRUPT;
+    }
+
+    /// The boot ROM checks what the driver staged (text, data and the manifest) and starts the
+    /// image. The firmware is not executed: a nonzero mailbox (the ACR descriptor's address,
+    /// `nvgpu_riscv_hs_ucode_load_bootstrap`) selects the ACR, which the GPU runs at the level of
+    /// its result (`take_acr_request`); otherwise it is the scheduler, which posts its init message.
+    fn start(&mut self) {
+        let staged = self.brom_config != 0
+            && self.imem.first_word_loaded
+            && self.dmem.first_word_loaded
+            && self.dmem.last_word_loaded;
+        self.brom_status = if staged { BROM_PASSED } else { BROM_FAILED };
+        self.halted = false;
+        if !staged {
+            return;
+        }
+        let desc = u64::from(self.mailbox[0]) | u64::from(self.mailbox[1]) << 32;
+        if desc != 0 {
+            self.acr_request = Some(desc);
+        } else {
+            self.publish_init_message();
+        }
+    }
+
+    pub fn take_acr_request(&mut self) -> Option<u64> {
+        self.acr_request.take()
+    }
+
+    /// The ACR's exit: it halts with its status in mailbox 0 (0: success) and the failing
+    /// falcon's error in mailbox 1.
+    pub fn finish_acr(&mut self, status: u32, error: u32) {
+        self.mailbox = [status, error];
+        self.halted = true;
     }
 
     fn process_commands(&mut self) {
@@ -236,6 +283,9 @@ impl Gsp {
             MESSAGE_HEAD => self.message_head,
             MESSAGE_TAIL => self.message_tail,
             BROM_STATUS => self.brom_status,
+            MAILBOX0 => self.mailbox[0],
+            MAILBOX1 => self.mailbox[1],
+            RISCV_CPUCTL => u32::from(self.halted) * RISCV_HALTED,
             BROM_CONFIG => self.brom_config,
             IMEM_CONTROL => self.imem.control,
             IMEM_DATA => self.imem.read(),
@@ -276,19 +326,17 @@ impl Gsp {
             BROM_CONFIG => self.brom_config = value,
             CPU_CONTROL => {
                 if value & START_CPU != 0 {
-                    // Model the boot handshake after the driver stages text, data and the
-                    // manifest. The firmware instructions aren't executed by the simulator.
-                    let staged = self.brom_config != 0
-                        && self.imem.first_word_loaded
-                        && self.dmem.first_word_loaded
-                        && self.dmem.last_word_loaded;
-                    self.brom_status = if staged { BROM_PASSED } else { BROM_FAILED };
-                    if staged {
-                        self.publish_init_message();
-                    }
+                    self.start();
                 }
                 return false; // Preserve CPU control readback in the register aperture.
             }
+            RISCV_CPUCTL => {
+                if value & RISCV_STARTCPU != 0 {
+                    self.start();
+                }
+            }
+            MAILBOX0 => self.mailbox[0] = value,
+            MAILBOX1 => self.mailbox[1] = value,
             ENGINE_RESET => {
                 if value & 1 != 0 {
                     *self = Self::default();

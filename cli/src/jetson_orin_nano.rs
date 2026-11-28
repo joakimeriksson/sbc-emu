@@ -115,10 +115,13 @@ fn execute(args: &[String]) -> Result<(), String> {
         Some("tegra") => true,
         Some(_) => return Err("--uart-driver expects 8250 or tegra".into()),
     };
-    let gpu = match crate::arg(args, "--gpu") {
-        None | Some("off") => false,
-        Some("on") => true,
-        Some(_) => return Err("--gpu expects on or off".into()),
+    // --gpu on: the GA10B as on a production module (secure boot, PMU, devfreq); qt: NVIDIA's QT
+    // pre-silicon platform (non-secure falcons, no PMU)
+    let (gpu, gpu_qt) = match crate::arg(args, "--gpu") {
+        None | Some("off") => (false, false),
+        Some("on") => (true, false),
+        Some("qt") => (true, true),
+        Some(_) => return Err("--gpu expects on, qt or off".into()),
     };
     let bpmp = match crate::arg(args, "--bpmp") {
         None => gpu,
@@ -167,7 +170,9 @@ fn execute(args: &[String]) -> Result<(), String> {
             if display {
                 machine.enable_display();
             }
-            if gpu {
+            if gpu_qt {
+                machine.enable_gpu_qt();
+            } else if gpu {
                 machine.enable_gpu();
             } else if bpmp {
                 machine.enable_bpmp();

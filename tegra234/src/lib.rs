@@ -27,7 +27,8 @@ const APB_STRAPS: u64 = 0x0010_f000;
 const EFUSE: u64 = 0x0381_0000;
 const EFUSE_SIZE: u64 = 0x1_0000;
 const CHIP_ID_A01: u32 = 0x0001_2310;
-// Use NVIDIA's QT platform ID for the GPU model, where nvgpu skips the silicon PMU.
+// NVIDIA's QT pre-silicon platform ID (`--gpu qt`), where nvgpu skips the secure boot, the PMU
+// and devfreq.
 const CHIP_ID_A01_QT: u32 = CHIP_ID_A01 | (1 << 20);
 const GICD: u64 = 0x0f40_0000;
 const GICD_SIZE: u64 = 0x1_0000;
@@ -61,6 +62,8 @@ struct Soc {
     host1x: host1x::Host1x,
     mss_nvlink: mss_nvlink::MssNvlink,
     gpu_node: bool,
+    /// The GPU reports the QT pre-silicon platform instead of production silicon.
+    gpu_qt: bool,
     firmware: Option<Firmware>,
     /// thermal sensors, power monitor, fan and CPU clocks (with the BPMP; `power.rs`)
     power: Option<power::Power>,
@@ -85,7 +88,7 @@ impl Soc {
         } else if (GICR..GICR + GICR_SIZE).contains(&addr) {
             self.gic.redist_read(addr - GICR)
         } else if addr == APB_MISC + 4 {
-            if self.gpu_node {
+            if self.gpu_node && self.gpu_qt {
                 CHIP_ID_A01_QT
             } else {
                 CHIP_ID_A01
@@ -125,7 +128,7 @@ impl Soc {
         } else if self.gpu_node && host1x::contains(addr) {
             self.host1x.read(addr)
         } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
-            self.gpu.read(addr - gpu::BAR0, self.now)
+            self.gpu.read(addr - gpu::BAR0, self.now, &mut self.ram)
         } else if self.gpu_bar_accessible(addr, gpu::BAR1) {
             self.gpu.bar1_read(addr - gpu::BAR1, &mut self.ram)
         } else {
@@ -386,6 +389,7 @@ impl Machine {
             host1x: host1x::Host1x::default(),
             mss_nvlink: Default::default(),
             gpu_node: false,
+            gpu_qt: false,
             firmware: None,
             power: None,
             xhci: None,
@@ -435,9 +439,21 @@ impl Machine {
         self.soc.power.get_or_insert_with(|| power::Power::new(cores));
     }
 
+    /// The GA10B as on a production module: secure fuses, the ACR, the light-secure falcons and
+    /// the PMU, so nvgpu takes its silicon path (with devfreq).
     pub fn enable_gpu(&mut self) {
         self.enable_bpmp();
         self.soc.gpu_node = true;
+        self.soc.gpu_qt = false;
+        self.soc.gpu.set_silicon(true);
+    }
+
+    /// The GA10B on NVIDIA's QT pre-silicon platform: nvgpu boots the falcons non-secure and
+    /// without the PMU (and without devfreq).
+    pub fn enable_gpu_qt(&mut self) {
+        self.enable_gpu();
+        self.soc.gpu_qt = true;
+        self.soc.gpu.set_silicon(false);
     }
 
     /// An xHCI host with nothing plugged in; `attach_usb_drive` and `attach_camera` add devices.
@@ -1186,7 +1202,7 @@ mod tests {
         let mut ram = [];
         let mut host1x = host1x::Host1x::default();
         gpu.write(0x110100, 2, &mut ram, &mut host1x, 0);
-        assert_eq!(gpu.read(0x11165c, 0), 2);
+        assert_eq!(gpu.read(0x11165c, 0, &mut ram), 2);
         assert!(!gpu.stall_irq());
 
         gpu.write(0x111668, 0x11, &mut ram, &mut host1x, 0);
@@ -1194,14 +1210,14 @@ mod tests {
         gpu.write(0x110184, 0x0123_4567, &mut ram, &mut host1x, 0);
         gpu.write(0x110184, 0x89ab_cdef, &mut ram, &mut host1x, 0);
         gpu.write(0x110180, 1 << 25, &mut ram, &mut host1x, 0);
-        assert_eq!(gpu.read(0x110184, 0), 0x0123_4567);
-        assert_eq!(gpu.read(0x110184, 0), 0x89ab_cdef);
+        assert_eq!(gpu.read(0x110184, 0, &mut ram), 0x0123_4567);
+        assert_eq!(gpu.read(0x110184, 0, &mut ram), 0x89ab_cdef);
         gpu.write(0x1101c0, 1 << 24, &mut ram, &mut host1x, 0);
         gpu.write(0x1101c4, 1, &mut ram, &mut host1x, 0);
         gpu.write(0x1101c0, 0x7ffc, &mut ram, &mut host1x, 0);
         gpu.write(0x1101c4, 2, &mut ram, &mut host1x, 0);
         gpu.write(0x110100, 2, &mut ram, &mut host1x, 0);
-        assert_eq!(gpu.read(0x11165c, 0), 3);
+        assert_eq!(gpu.read(0x11165c, 0, &mut ram), 3);
         assert!(!gpu.stall_irq());
 
         gpu.write(0xb81210, 1 << 27, &mut ram, &mut host1x, 0);
@@ -1209,31 +1225,66 @@ mod tests {
         assert!(gpu.stall_irq());
         gpu.write(0xb81610, 1 << 2, &mut ram, &mut host1x, 0);
         assert!(!gpu.stall_irq());
-        assert_eq!(gpu.read(0xb81600, 0), 1 << 2);
-        assert_eq!(gpu.read(0xb81010, 0), 1 << 27);
+        assert_eq!(gpu.read(0xb81600, 0, &mut ram), 1 << 2);
+        assert_eq!(gpu.read(0xb81010, 0, &mut ram), 1 << 27);
         gpu.write(0x110004, 1 << 6, &mut ram, &mut host1x, 0);
         gpu.write(0xb81608, 1 << 2, &mut ram, &mut host1x, 0);
         assert!(!gpu.stall_irq());
 
-        assert_eq!(gpu.read(0x110c84, 0), 0x8800);
+        assert_eq!(gpu.read(0x110c84, 0, &mut ram), 0x8800);
         gpu.write(0x110ac0, (1 << 25) | 0x800, &mut ram, &mut host1x, 0);
         for word in [0x1802, 0, 0x8000, 0x0800, 0x8800, 0x0100_0800] {
-            assert_eq!(gpu.read(0x110ac4, 0), word);
+            assert_eq!(gpu.read(0x110ac4, 0, &mut ram), word);
         }
         gpu.write(0x110c84, 0x8818, &mut ram, &mut host1x, 0);
         gpu.write(0x110ac0, 1 << 24, &mut ram, &mut host1x, 0);
         gpu.write(0x110ac4, 0x2a01_040e, &mut ram, &mut host1x, 0);
         gpu.write(0x110c00, 0x8004, &mut ram, &mut host1x, 0);
         assert!(gpu.stall_irq());
-        assert_eq!(gpu.read(0x110c04, 0), 0x8004);
-        assert_eq!(gpu.read(0x110c80, 0), 0x881c);
+        assert_eq!(gpu.read(0x110c04, 0, &mut ram), 0x8004);
+        assert_eq!(gpu.read(0x110c80, 0, &mut ram), 0x881c);
         gpu.write(0x110ac0, 0x818, &mut ram, &mut host1x, 0);
-        assert_eq!(gpu.read(0x110ac4, 0), 0x2a00_040e);
+        assert_eq!(gpu.read(0x110ac4, 0, &mut ram), 0x2a00_040e);
 
         gpu.write(0x1103c0, 1, &mut ram, &mut host1x, 0);
-        assert_eq!(gpu.read(0x11165c, 0), 0);
+        assert_eq!(gpu.read(0x11165c, 0, &mut ram), 0);
         assert!(!gpu.stall_irq());
-        assert_eq!(gpu.read(0x110c80, 0), 0);
+        assert_eq!(gpu.read(0x110c80, 0, &mut ram), 0);
+    }
+
+    #[test]
+    fn ga10b_acr_on_the_gsp_checks_the_wpr_blob_and_halts() {
+        // RAM offsets: the ACR descriptor and the ucode blob with its WPR header table.
+        let desc = 0x1000u64;
+        let blob = 0x2000u64;
+        let run = |falcons: &[u32]| {
+            let mut gpu = gpu::Gpu::default();
+            gpu.set_silicon(true);
+            let mut ram = vec![0u8; 0x10000];
+            let mut host1x = host1x::Host1x::default();
+            ram[desc as usize + 68..][..4].copy_from_slice(&0x1000u32.to_le_bytes());
+            ram[desc as usize + 72..][..8].copy_from_slice(&(RAM_BASE + blob).to_le_bytes());
+            for (i, id) in falcons.iter().chain([&u32::MAX]).enumerate() {
+                ram[blob as usize + 24 * i..][..4].copy_from_slice(&id.to_le_bytes());
+            }
+            // The GSP is fused to RISC-V; the driver stages the ACR and starts it there.
+            assert_eq!(gpu.read(0x820b1c, 0, &mut ram), 1);
+            gpu.write(0x111668, 0x11, &mut ram, &mut host1x, 0);
+            gpu.write(0x110180, 1 << 24, &mut ram, &mut host1x, 0);
+            gpu.write(0x110184, 1, &mut ram, &mut host1x, 0);
+            gpu.write(0x1101c0, 1 << 24, &mut ram, &mut host1x, 0);
+            gpu.write(0x1101c4, 1, &mut ram, &mut host1x, 0);
+            gpu.write(0x1101c0, 0x7ffc, &mut ram, &mut host1x, 0);
+            gpu.write(0x1101c4, 2, &mut ram, &mut host1x, 0);
+            gpu.write(0x110040, (RAM_BASE + desc) as u32, &mut ram, &mut host1x, 0);
+            gpu.write(0x110044, 0, &mut ram, &mut host1x, 0);
+            gpu.write(0x111388, 1, &mut ram, &mut host1x, 0);
+            assert_eq!(gpu.read(0x11165c, 0, &mut ram), 3, "BROM passed");
+            assert_eq!(gpu.read(0x111388, 0, &mut ram) & 1 << 4, 1 << 4, "halted");
+            gpu.read(0x110040, 0, &mut ram)
+        };
+        assert_eq!(run(&[13, 2, 3]), 0);
+        assert_ne!(run(&[13]), 0);
     }
 
     #[test]
