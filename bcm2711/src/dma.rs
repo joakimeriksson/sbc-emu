@@ -37,6 +37,8 @@ pub fn paced(ti: u32) -> Option<u32> {
 /// VideoCore bus addresses in control blocks map to them.
 pub trait DmaBus: emu_core::Bus {
     fn phys(&self, bus: u32) -> u64;
+    /// Peripheral `dreq` asks for a transfer now (a FIFO with data or room: `Dma::serve`).
+    fn dreq(&self, _dreq: u32) -> bool { false }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -223,6 +225,37 @@ impl Dma {
         }
     }
 
+    /// Move data for the channels waiting on `dreq` while the peripheral asserts it
+    /// (`DmaBus::dreq`): a FIFO in either direction (TI.SRC_DREQ reads it, TI.DEST_DREQ fills
+    /// it), word by word through the bus. A block that runs dry completes (its interrupt, then
+    /// the next block); the chain goes on while the peripheral keeps asking. Returns whether
+    /// anything moved.
+    pub fn serve(&mut self, dreq: u32, bus: &mut impl DmaBus) -> bool {
+        let mut moved = false;
+        for n in 0..CHANNELS {
+            let mut guard = 0u32;
+            while self.ch[n].cs & ACTIVE != 0 && paced(self.ch[n].ti) == Some(dreq) && guard < 1 << 24 {
+                guard += 1;
+                let c = self.ch[n];
+                if c.len < 4 {
+                    moved = true;
+                    if !self.block_done(n, bus) { break; }
+                    if paced(self.ch[n].ti).is_none() { self.run(n, bus); }
+                    continue;
+                }
+                if !bus.dreq(dreq) { break; }
+                let v = if c.ti & TI_SRC_IGNORE != 0 { 0 } else { bus.read32(bus.phys(c.src)).unwrap_or(0) };
+                if c.ti & TI_DEST_IGNORE == 0 { let _ = bus.write32(bus.phys(c.dst), v); }
+                let c = &mut self.ch[n];
+                if c.ti & TI_SRC_INC != 0 { c.src = c.src.wrapping_add(4); }
+                if c.ti & TI_DEST_INC != 0 { c.dst = c.dst.wrapping_add(4); }
+                c.len -= 4;
+                moved = true;
+            }
+        }
+        moved
+    }
+
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
         w.tag("dma-v1");
         w.u32(self.enable);
@@ -253,5 +286,45 @@ mod tests {
         assert_eq!(d.ch[2].cs & (INT | ACTIVE), ACTIVE);
         d.write(0x200, 0);
         assert_eq!(d.write(0x200, ACTIVE), Some(2), "paused, it starts again");
+    }
+
+    /// RAM at 0..0x1000, a peripheral FIFO register at 0x2000 that hands out `fifo` (DREQ 13).
+    struct FifoBus { ram: Vec<u8>, fifo: std::collections::VecDeque<u32> }
+    impl emu_core::Bus for FifoBus {
+        fn read8(&mut self, a: u64) -> Result<u8, emu_core::Fault> { Ok(self.ram[a as usize]) }
+        fn read16(&mut self, _: u64) -> Result<u16, emu_core::Fault> { Ok(0) }
+        fn read32(&mut self, a: u64) -> Result<u32, emu_core::Fault> {
+            if a == 0x2000 { return Ok(self.fifo.pop_front().unwrap_or(0)); }
+            Ok(u32::from_le_bytes(self.ram[a as usize..a as usize + 4].try_into().unwrap()))
+        }
+        fn read64(&mut self, _: u64) -> Result<u64, emu_core::Fault> { Ok(0) }
+        fn write8(&mut self, a: u64, v: u8) -> Result<(), emu_core::Fault> { self.ram[a as usize] = v; Ok(()) }
+        fn write16(&mut self, _: u64, _: u16) -> Result<(), emu_core::Fault> { Ok(()) }
+        fn write32(&mut self, a: u64, v: u32) -> Result<(), emu_core::Fault> { self.ram[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes()); Ok(()) }
+        fn write64(&mut self, _: u64, _: u64) -> Result<(), emu_core::Fault> { Ok(()) }
+    }
+    impl DmaBus for FifoBus {
+        fn phys(&self, bus: u32) -> u64 { bus as u64 }
+        fn dreq(&self, dreq: u32) -> bool { dreq == 13 && !self.fifo.is_empty() }
+    }
+
+    #[test]
+    fn serve_reads_a_fifo_while_its_dreq_is_up() {
+        use emu_core::Bus;
+        let mut bus = FifoBus { ram: vec![0; 0x1000], fifo: (1..=6).collect() };
+        // one block: 8 words from the FIFO (SRC_DREQ, PERMAP 13) to RAM at 0x100, interrupt at the end
+        let cb = [TI_INTEN | TI_SRC_DREQ | TI_DEST_INC | (13 << 16), 0x2000, 0x100, 32, 0, 0];
+        for (k, w) in cb.iter().enumerate() { bus.write32(0x40 + 4 * k as u64, *w).unwrap(); }
+        let mut d = Dma::new();
+        d.write(0x404, 0x40);
+        let n = d.write(0x400, ACTIVE).unwrap();
+        assert!(d.run(n, &mut bus), "the block waits for its DREQ");
+        assert!(d.serve(13, &mut bus));
+        assert_eq!(d.ch[4].len, 8, "six words moved, the FIFO ran dry");
+        assert_eq!(bus.read32(0x114).unwrap(), 6);
+        bus.fifo.extend([7, 8]);
+        d.serve(13, &mut bus);
+        assert_eq!(bus.read32(0x11c).unwrap(), 8);
+        assert_eq!(d.ch[4].cs & (ACTIVE | END | INT), END | INT, "done, with its interrupt");
     }
 }

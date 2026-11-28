@@ -10,6 +10,7 @@ pub mod sdcard;
 pub mod usb;
 pub mod usb_hub;
 pub mod lan78xx;
+pub mod smsc95xx;
 pub mod ext4;
 pub mod fdt;
 pub mod arm64_image;

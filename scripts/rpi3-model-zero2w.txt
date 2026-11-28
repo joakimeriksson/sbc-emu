@@ -1,0 +1,55 @@
+# Raspberry Pi Zero 2 W (milestone 6 of docs/rpi3-plan.md): the unmodified Raspberry Pi OS Lite image
+# with `--model zero2w`: the firmware's revision code and model string, the RAM, the board's USB
+# tree, its network; the first-boot wizard on HDMI with the USB keyboard, then a login on the
+# serial console. Saves a snapshot after logging in (--restore it with the same options).
+# The Zero 2 W: the SoC's USB OTG port in host mode with the keyboard on it (no hub, no
+# Ethernet), 512 MiB, `[pi02]` in config.txt; its CYW43436 Wi-Fi is not modelled.
+#   sbc-emu run --board pi3b --model zero2w --sd cache/os/raspios-lite.img --script scripts/rpi3-model-zero2w.txt --timeout 900
+# The wizard's dialogs drop input typed before they open: each step waits for the guest to go
+# idle.
+wait-serial Machine model: Raspberry Pi Zero 2 W Rev 1.0
+wait-serial smp: Brought up 1 node, 4 CPUs
+wait-serial raspberrypi login:
+wait-pixel 10 700 0000aa
+wait-idle 5
+screenshot out/rpi3-zero2w-01-keyboard-layout.png
+type \n
+sleep 2
+wait-idle 5
+screenshot out/rpi3-zero2w-02-username.png
+type pi\n
+sleep 2
+wait-idle 5
+type raspberry\n
+sleep 2
+wait-idle 5
+type raspberry\n
+sleep 2
+wait-idle 8
+type \n
+sleep 2
+wait-idle 4
+screenshot out/rpi3-zero2w-03-login-prompt.png
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+save out/rpi3-zero2w.snap
+# the board's identity: the device tree's model, the revision code the firmware reports, cores, RAM
+serial echo $(tr -d '\0' < /proc/device-tree/model) $(awk '/^Revision/ { print $3 }' /proc/cpuinfo) $(nproc) MODEL\r
+wait-serial Raspberry Pi Zero 2 W Rev 1.0 (sbc-emu reduced DT) 902120 4 MODEL
+serial echo MEM_$(( $(awk '/MemTotal/ { print $2 }' /proc/meminfo) / 1024 ))\r
+wait-serial MEM_414
+# the USB tree
+serial lsusb -t\r
+wait-serial Port 001: Dev 002, If 0, Class=Human Interface Device, Driver=usbhid, 12M
+serial echo $(lsusb | wc -l) LSUSB\r
+wait-serial 2 LSUSB
+# the network
+serial echo $(ls /sys/class/net) NETS\r
+wait-serial lo NETS
+serial echo MODEL_$((6 * 7))_OK\r
+wait-serial MODEL_42_OK
+quit

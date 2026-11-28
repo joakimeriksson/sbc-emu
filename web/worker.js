@@ -1,6 +1,8 @@
 // Runs the emulator off the main thread.
 // In:  {type:'start', os:'raspios'|'raspios-snap'|'gpu-demo'|'busybox'|'hello'|'tinker-armbian'|'tinker-busybox'|'orangepi-one'|'orangepi-rv'|'orangepi5'|'jetson-nano'|'jetson-nano-gpu'|'jetson-orin-nano-gpu'|'esp32s31', ramMb},
 //      {type:'start', os:'sd-file', file, ramMb} (a Raspberry Pi SD image the visitor chose: .img, .img.xz, .img.gz),
+//      {type:'start', os:'pi3-busybox'|'pi3-raspios'|'pi3-sd-file', model, file, ramMb} (a Raspberry Pi 3: model 0 3B+,
+//      1 3B, 2 3A+, 3 Zero 2 W; ramMb 0 = the model's),
 //      {type:'key', usage, down},
 //      {type:'serial', bytes}, {type:'type', text} (typed on the USB keyboard)
 // Out: {type:'status', text}, {type:'uart', text}, {type:'frame', w, h, data}, {type:'stats', ...}
@@ -234,10 +236,44 @@ function jitReset() {
   jitUsed = [];
 }
 
-async function start(os, ramMb, jit, file) {
+async function start(os, ramMb, jit, file, model = 0) {
   postMessage({ type: 'status', text: 'loading emulator…' });
   const { instance } = await WebAssembly.instantiateStreaming(fetch('wasm/sbc-emu.wasm'), { env: { sbc_disk_read: diskRead, sbc_jit_compile: jitCompile, sbc_jit_reset: jitReset, sbc_host_now_ms: () => performance.now() } });
   ex = instance.exports;
+  if (os.startsWith('pi3-')) {
+    // Raspberry Pi 3 family (BCM2837, four Cortex-A53s): the Pi kernel with a BusyBox initramfs
+    // (its shell on the mini UART), or an SD card image booted like the firmware does
+    // (config.txt with the model's sections; HDMI through the vc4 KMS driver to a 720p monitor,
+    // the USB keyboard)
+    ex.sbc_kms(1280, 720);
+    let r;
+    if (os === 'pi3-busybox') {
+      postMessage({ type: 'status', text: 'loading the Raspberry Pi kernel (kernel8.img) and a BusyBox initramfs…' });
+      const [kernel, initrd] = await Promise.all([fetchBytes('assets/kernel8.img', true), fetchBytes('assets/rpi3/initramfs.cpio.gz', false)]);
+      r = ex.sbc_boot_pi3(model, ramMb, copyIn(kernel), kernel.length, copyIn(initrd), initrd.length, 0, 0);
+    } else {
+      let size, name;
+      if (os === 'pi3-sd-file') {
+        const c = await openCard(file);
+        card = c.card; size = c.size; name = `${file.name} (${(c.size / 2 ** 30).toFixed(2)} GiB card, ${c.how})`;
+      } else {
+        imageUrl = 'assets/raspios-lite.img';
+        const head = await fetch(imageUrl, { method: 'HEAD' });
+        size = Number(head.headers.get('Content-Length'));
+        if (!head.ok || !size) throw new Error('SD image assets/raspios-lite.img not found (tools/wasm-build.sh stages it)');
+        name = `the SD card (${(size / 2 ** 30).toFixed(2)} GiB image)`;
+      }
+      postMessage({ type: 'status', text: `firmware: reading config.txt and kernel8.img from ${name}…` });
+      r = ex.sbc_boot_pi3_sd(model, ramMb, size / 512);
+      if (r === -2) throw new Error(`${file ? file.name : 'the image'} has no Raspberry Pi boot partition (config.txt and a kernel on a FAT partition): is it a 64-bit image for the Pi 3?`);
+    }
+    if (r !== 0) throw new Error(`the kernel did not start (${r})`);
+    if (jit) ex.sbc_jit(1);
+    frameEvery = 66;
+    postMessage({ type: 'status', text: 'booting…' });
+    loop();
+    return;
+  }
   if (os === 'orangepi-one') {
     // Orange Pi One (Allwinner H3, four 32-bit Cortex-A7s): Alpine's kernel and device tree and
     // a BusyBox initramfs (scripts/orangepi-one-fixture.sh), shell on the serial console
@@ -487,7 +523,7 @@ function loop() {
 
 onmessage = (e) => {
   const m = e.data;
-  if (m.type === 'start') start(m.os, m.ramMb, m.jit, m.file).catch((err) => postMessage({ type: 'status', text: String(err), phase: 'error' }));
+  if (m.type === 'start') start(m.os, m.ramMb, m.jit, m.file, m.model ?? 0).catch((err) => postMessage({ type: 'status', text: String(err), phase: 'error' }));
   else if (m.type === 'key' && ex) ex.sbc_key(m.usage, m.down ? 1 : 0);
   else if (m.type === 'pointer' && ex) ex.sbc_pointer(m.buttons, m.x, m.y, m.wheel);
   else if (m.type === 'serial') serialQueue.push(...m.bytes);

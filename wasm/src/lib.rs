@@ -1,5 +1,5 @@
 //! C ABI over the emulated boards for the browser (no wasm-bindgen; see web/worker.js): the
-//! Pi 4B (`sbc_boot`, `sbc_boot_sd`), the Tinker Board S (RK3288, `sbc_boot_tinker*`), the Orange
+//! Pi 4B (`sbc_boot`, `sbc_boot_sd`), the Pi 3 family (BCM2837, `sbc_boot_pi3*`), the Tinker Board S (RK3288, `sbc_boot_tinker*`), the Orange
 //! Pi One (Allwinner H3, `sbc_boot_opi1`), the Orange Pi RV (StarFive JH7110, `sbc_boot_opirv`),
 //! the Orange Pi 5 (RK3588S, `sbc_boot_opi5`), the Jetson Nano (Tegra X1, `sbc_boot_nano`), the
 //! Jetson Orin Nano (Tegra234, `sbc_boot_orin_gpu_demo`) and the ESP32-S31 (`sbc_boot_s31`). Single-threaded: one machine per module instance, driven from a Web
@@ -54,6 +54,8 @@ impl Disk for WebDisk {
 /// The board this module instance runs.
 enum Board {
     Pi(Machine),
+    /// A Raspberry Pi 3 (3B+, 3B, 3A+ or Zero 2 W) with how it was started.
+    Pi3(Box<bcm2837::Machine>, Pi3Boot),
     Tinker(Box<rockchip_rk3288::Machine>, TinkerBoot),
     /// The Orange Pi One with what it was booted from (kernel, stock DTB, initrd, command line).
     OrangePiOne(Box<allwinner_h3::Machine>, DirectBoot),
@@ -77,6 +79,15 @@ type Opi5Boot = (Vec<u8>, Option<Vec<u8>>, String);
 /// command line.
 type DirectBoot = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, String);
 
+/// How a Raspberry Pi 3 was started, so a reset (`reboot`) starts it the same way.
+struct Pi3Boot {
+    model: bcm2837::Model,
+    /// the RAM asked for (0: the model's)
+    ram_mb: u32,
+    /// Direct boot (kernel, initramfs, command line); None = from the SD card, like the firmware.
+    direct: Option<(Vec<u8>, Option<Vec<u8>>, String)>,
+}
+
 /// How a Tinker Board was started, so a reset (`reboot`) starts it the same way.
 struct TinkerBoot {
     /// The RTC's time at power-on (Unix seconds).
@@ -87,16 +98,16 @@ struct TinkerBoot {
 
 impl Board {
     fn run(&mut self, budget: u64) -> Stop {
-        match self { Board::Pi(m) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget), Board::OrangePi5(m, _) => m.run(budget), Board::JetsonNano(m, ..) => m.run(budget), Board::JetsonOrinNano(m) => m.run(budget), Board::Esp32S31(m, rx) => s31_run(m, rx, budget) }
+        match self { Board::Pi(m) => m.run(budget), Board::Pi3(m, _) => m.run(budget), Board::Tinker(m, _) => m.run(budget), Board::OrangePiOne(m, _) => m.run(budget), Board::OrangePiRv(m, ..) => m.run(budget), Board::OrangePi5(m, _) => m.run(budget), Board::JetsonNano(m, ..) => m.run(budget), Board::JetsonOrinNano(m) => m.run(budget), Board::Esp32S31(m, rx) => s31_run(m, rx, budget) }
     }
     fn now(&self) -> u64 {
-        match self { Board::Pi(m) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now(), Board::OrangePi5(m, _) => m.now(), Board::JetsonNano(m, ..) => m.now(), Board::JetsonOrinNano(m) => m.now(), Board::Esp32S31(m, _) => { use esp_soc::SocBus as _; m.bus.cycles() * 25 / 8 } }
+        match self { Board::Pi(m) => m.now, Board::Pi3(m, _) => m.now, Board::Tinker(m, _) => m.now(), Board::OrangePiOne(m, _) => m.now(), Board::OrangePiRv(m, ..) => m.now(), Board::OrangePi5(m, _) => m.now(), Board::JetsonNano(m, ..) => m.now(), Board::JetsonOrinNano(m) => m.now(), Board::Esp32S31(m, _) => { use esp_soc::SocBus as _; m.bus.cycles() * 25 / 8 } }
     }
     fn idle_until(&mut self, t: u64) {
-        match self { Board::Pi(m) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t), Board::OrangePi5(m, _) => m.idle_until(t), Board::JetsonNano(m, ..) => m.idle_until(t), Board::JetsonOrinNano(m) => m.idle_until(t), Board::Esp32S31(..) => {} }
+        match self { Board::Pi(m) => m.idle_until(t), Board::Pi3(m, _) => m.idle_until(t), Board::Tinker(m, _) => m.idle_until(t), Board::OrangePiOne(m, _) => m.idle_until(t), Board::OrangePiRv(m, ..) => m.idle_until(t), Board::OrangePi5(m, _) => m.idle_until(t), Board::JetsonNano(m, ..) => m.idle_until(t), Board::JetsonOrinNano(m) => m.idle_until(t), Board::Esp32S31(..) => {} }
     }
     fn instret(&self) -> u64 {
-        match self { Board::Pi(m) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret(), Board::OrangePi5(m, _) => m.instret(), Board::JetsonNano(m, ..) => m.instret(), Board::JetsonOrinNano(m) => m.instret(), Board::Esp32S31(m, _) => m.cores.iter().map(|c| c.insn_count).sum() }
+        match self { Board::Pi(m) => m.instret(), Board::Pi3(m, _) => m.instret(), Board::Tinker(m, _) => m.instret(), Board::OrangePiOne(m, _) => m.instret(), Board::OrangePiRv(m, ..) => m.instret(), Board::OrangePi5(m, _) => m.instret(), Board::JetsonNano(m, ..) => m.instret(), Board::JetsonOrinNano(m) => m.instret(), Board::Esp32S31(m, _) => m.cores.iter().map(|c| c.insn_count).sum() }
     }
 }
 
@@ -241,6 +252,98 @@ pub unsafe extern "C" fn sbc_boot_sd(ram_mb: u32, sectors: f64) -> i32 {
     if bcm2711::boot::boot_linux(&mut m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true).is_err() { return -1; }
     ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi(m), Some(0.0))));
     0
+}
+
+/// The Pi 3 model by index (`bcm2837::Model::ALL`: 0 3B+, 1 3B, 2 3A+, 3 Zero 2 W).
+fn pi3_model(i: u32) -> bcm2837::Model { bcm2837::Model::ALL.get(i as usize).copied().unwrap_or_default() }
+
+/// The HDMI monitor of a Pi 3 whose `config.txt` asks for the KMS driver: `sbc_kms`'s mode if it
+/// is one the emulated monitor offers, else 1280x720.
+fn pi3_monitor() -> (u32, u32) {
+    let m = KMS.with(|c| c.get());
+    if [(1920, 1080), (1280, 720), (1024, 768), (800, 600), (640, 480)].contains(&m) { m } else { (1280, 720) }
+}
+
+/// A Pi 3 as the CLI's `--board pi3b --model ...` builds it for the browser: the card, the
+/// virtual network (DHCP and DNS, no NAT), Bluetooth on the boards that have it, the audio for
+/// the page. `ram_mb` 0: the model's RAM.
+fn pi3_machine(model: bcm2837::Model, ram_mb: u32, disk: Option<Box<dyn Disk>>) -> bcm2837::Machine {
+    let ram = if ram_mb == 0 { model.ram_mb() } else { (ram_mb as usize).min(1024) };
+    let mut m = bcm2837::Machine::new(model, ram << 20, smp());
+    m.soc.sd = bcm2837::sdhost::Sdhost::new(disk);
+    m.connect_network(false, false);
+    m.enable_bluetooth();
+    m.soc.capture_audio = true;
+    m
+}
+
+/// Start a Pi 3: its kernel directly, or from the card like the firmware (`config.txt` with the
+/// model's sections, the KMS display pipeline when it asks for it).
+fn pi3_boot(m: &mut bcm2837::Machine, how: &Pi3Boot) -> Result<(), String> {
+    match &how.direct {
+        Some((k, i, c)) => bcm2837::boot::boot_linux(m, k, i.as_deref(), c, true),
+        None => {
+            let d = m.soc.sd.disk.as_mut().ok_or("no SD card")?;
+            let b = bcm2837::boot::read_sd_boot(d.as_mut(), how.model).map_err(|e| format!("card: {e}"))?;
+            if b.kms { let (w, h) = pi3_monitor(); m.enable_kms(w, h, b.outputs); }
+            bcm2837::boot::boot_linux(m, &b.kernel, b.initramfs.as_deref(), &b.cmdline, true)
+        }
+    }
+}
+
+/// Boot a Raspberry Pi 3 (`model`, see `pi3_model`) from a kernel (an uncompressed arm64 Image),
+/// an optional initramfs and command line (empty: the shell on the serial console). 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_pi3(model: u32, ram_mb: u32, k: *const u8, klen: usize, i: *const u8, ilen: usize, c: *const u8, clen: usize) -> i32 {
+    let kernel = std::slice::from_raw_parts(k, klen).to_vec();
+    let initrd = (ilen > 0).then(|| std::slice::from_raw_parts(i, ilen).to_vec());
+    let cmdline = if clen > 0 { String::from_utf8_lossy(std::slice::from_raw_parts(c, clen)).into_owned() } else { bcm2837::boot::DEFAULT_CMDLINE.to_string() };
+    let model = pi3_model(model);
+    let how = Pi3Boot { model, ram_mb, direct: Some((kernel, initrd, cmdline)) };
+    let mut m = pi3_machine(model, ram_mb, None);
+    if pi3_boot(&mut m, &how).is_err() { return -1; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi3(Box::new(m), how), Some(0.0))));
+    0
+}
+
+/// Boot a Raspberry Pi 3 from an SD card image of `sectors` sectors served by the page, as the
+/// firmware does. -2: no Raspberry Pi boot partition on it; -1: the kernel did not start.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_boot_pi3_sd(model: u32, ram_mb: u32, sectors: f64) -> i32 {
+    let Some(disk) = WebDisk::card(sectors) else { return -2 };
+    let model = pi3_model(model);
+    let how = Pi3Boot { model, ram_mb, direct: None };
+    let mut m = pi3_machine(model, ram_mb, Some(disk));
+    match pi3_boot(&mut m, &how) {
+        Ok(()) => {}
+        Err(e) if e.starts_with("card: ") => return -2,
+        Err(_) => return -1,
+    }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi3(Box::new(m), how), Some(0.0))));
+    0
+}
+
+/// Resume a Raspberry Pi 3 snapshot made natively (`--board pi3b --model ...` with the same card
+/// image of `sectors` sectors, and `--display kms` when `sbc_kms` gave a mode). 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn sbc_restore_pi3(model: u32, ram_mb: u32, sectors: f64, snap: *const u8, len: usize) -> i32 {
+    let model = pi3_model(model);
+    let mut m = pi3_machine(model, ram_mb, WebDisk::card(sectors));
+    if KMS.with(|c| c.get()).0 > 0 { let (w, h) = pi3_monitor(); m.enable_kms(w, h, Default::default()); }
+    if m.restore(std::slice::from_raw_parts(snap, len)).is_err() { return -1; }
+    ST.with(|s| *s.borrow_mut() = Some(State::new(Board::Pi3(Box::new(m), Pi3Boot { model, ram_mb, direct: None }), None)));
+    0
+}
+
+/// Start a Pi 3 again the way it was started, with the same card (after `reboot`).
+fn pi3_restart(old: &mut bcm2837::Machine, how: &mut Pi3Boot) -> Option<Board> {
+    let disk = old.soc.sd.disk.take();
+    let mut m = pi3_machine(how.model, how.ram_mb, disk);
+    let jit = old.cpus.iter().any(|c| c.jit.is_some());
+    let how = Pi3Boot { model: how.model, ram_mb: how.ram_mb, direct: how.direct.take() };
+    pi3_boot(&mut m, &how).ok()?;
+    if jit { m.enable_jit(); }
+    Some(Board::Pi3(Box::new(m), how))
 }
 
 /// A Tinker Board S as the CLI's `--board tinkerboard` builds it: the RK808 PMIC with its RTC
@@ -477,7 +580,7 @@ fn s31_run(m: &mut esp32s31::Machine, rx: &mut std::collections::VecDeque<u8>, b
 /// Orange Pi RV, 5 the Orange Pi 5, 6 the ESP32-S31, 7 the Jetson Nano, 8 the Jetson Orin Nano.
 #[no_mangle]
 pub extern "C" fn sbc_board() -> u32 {
-    with(|s| match s.m { Board::Pi(_) => 1, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4, Board::OrangePi5(..) => 5, Board::Esp32S31(..) => 6, Board::JetsonNano(..) => 7, Board::JetsonOrinNano(_) => 8 }).unwrap_or(0)
+    with(|s| match s.m { Board::Pi(_) => 1, Board::Pi3(..) => 9, Board::Tinker(..) => 2, Board::OrangePiOne(..) => 3, Board::OrangePiRv(..) => 4, Board::OrangePi5(..) => 5, Board::Esp32S31(..) => 6, Board::JetsonNano(..) => 7, Board::JetsonOrinNano(_) => 8 }).unwrap_or(0)
 }
 
 /// Turn the Jetson Nano's shader JIT on (1) or off (0) (maxwell-shader/src/jit); returns whether
@@ -527,6 +630,7 @@ pub extern "C" fn sbc_shader_jit_report_len() -> usize {
 pub extern "C" fn sbc_jit(on: u32) -> u32 {
     with(|s| match &mut s.m {
         Board::Pi(m) => if on != 0 { m.enable_jit() as u32 } else { m.disable_jit(); 0 },
+        Board::Pi3(m, _) => if on != 0 { m.enable_jit() as u32 } else { m.disable_jit(); 0 },
         Board::Tinker(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiOne(m, _) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
         Board::OrangePiRv(m, ..) => { m.set_jit(on != 0); m.jit_enabled() as u32 }
@@ -555,6 +659,7 @@ pub unsafe extern "C" fn sbc_jit_fallbacks(out: *mut u64, n: usize) -> usize {
 pub extern "C" fn sbc_jit_hot(n: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => { if let Some(j) = m.jit_mut() { j.hot = n.max(1); } }
+        Board::Pi3(m, _) => for c in &mut m.cpus { if let Some(j) = c.jit.as_deref_mut() { j.hot = n.max(1); } },
         Board::Tinker(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiOne(m, _) => for c in &mut m.cpus { c.jit_set_hot(n) },
         Board::OrangePiRv(m, ..) => m.set_jit_hot(n),
@@ -590,6 +695,7 @@ pub extern "C" fn sbc_jit_report(out: *mut u8, cap: usize) -> usize {
 pub extern "C" fn sbc_jit_blocks() -> f64 {
     with(|s| match &s.m {
         Board::Pi(m) => m.jit().map(|j| j.compiled as f64).unwrap_or(0.0),
+        Board::Pi3(m, _) => m.cpus.iter().filter_map(|c| c.jit.as_ref()).map(|j| j.compiled as f64).sum(),
         Board::Tinker(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiOne(m, _) => m.cpus.iter().filter_map(|c| c.jit_stats()).map(|(c, _, _)| c as f64).sum(),
         Board::OrangePiRv(m, ..) => m.jit_compiled() as f64,
@@ -605,6 +711,7 @@ pub extern "C" fn sbc_jit_blocks() -> f64 {
 pub extern "C" fn sbc_key(usage: u32, down: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => m.soc.devs.kbd.key(usage as u8, down != 0),
+        Board::Pi3(m, _) => { m.soc.devs.kbd.key(usage as u8, down != 0); m.soc.dirty = true; }
         Board::OrangePiRv(m, ..) => m.soc.usb.kbd.key(usage as u8, down != 0),
         Board::OrangePi5(m, _) => { m.soc.usb.kbd.key(usage as u8, down != 0); m.soc.dirty = true; }
         Board::JetsonNano(m, ..) => { m.soc.usb.kbd.key(usage as u8, down != 0); m.soc.dirty = true; }
@@ -618,6 +725,7 @@ pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
     let (b, x, y, w) = (buttons as u8 & 7, x.min(32767) as u16, y.min(32767) as u16, wheel.clamp(-127, 127) as i8);
     with(|s| match &mut s.m {
         Board::Pi(m) => m.soc.devs.tablet.pointer(b, x, y, w),
+        Board::Pi3(m, _) => { m.soc.devs.tablet.pointer(b, x, y, w); m.soc.dirty = true; }
         Board::OrangePiRv(m, ..) => m.soc.usb.tablet.pointer(b, x, y, w),
         Board::OrangePi5(m, _) => { m.soc.usb.tablet.pointer(b, x, y, w); m.soc.dirty = true; }
         Board::JetsonNano(m, ..) => { m.soc.usb.tablet.pointer(b, x, y, w); m.soc.dirty = true; }
@@ -630,20 +738,28 @@ pub extern "C" fn sbc_pointer(buttons: u32, x: u32, y: u32, wheel: i32) {
 #[no_mangle]
 pub extern "C" fn sbc_audio_take() -> usize {
     with(|s| {
-        s.audio = match &mut s.m { Board::Pi(m) => std::mem::take(&mut m.soc.i2s.out), _ => Vec::new() };
+        s.audio = match &mut s.m {
+            Board::Pi(m) => std::mem::take(&mut m.soc.i2s.out),
+            // HDMI audio and the headphone jack's (the firmware's audio service)
+            Board::Pi3(m, _) => std::mem::take(&mut m.soc.audio),
+            _ => Vec::new(),
+        };
         s.audio.len()
     }).unwrap_or(0)
 }
 #[no_mangle]
 pub extern "C" fn sbc_audio_ptr() -> *const i16 { with(|s| s.audio.as_ptr()).unwrap_or(std::ptr::null()) }
 #[no_mangle]
-pub extern "C" fn sbc_audio_rate() -> u32 { with_pi(|m| m.soc.i2s.rate).unwrap_or(0) }
+pub extern "C" fn sbc_audio_rate() -> u32 {
+    with(|s| match &s.m { Board::Pi(m) => m.soc.i2s.rate, Board::Pi3(m, _) => m.soc.audio_rate, _ => 0 }).unwrap_or(0)
+}
 
 /// USB keyboard: type one byte of text (US layout).
 #[no_mangle]
 pub extern "C" fn sbc_type(b: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => m.soc.devs.kbd.type_byte(b as u8),
+        Board::Pi3(m, _) => { m.soc.devs.kbd.type_byte(b as u8); m.soc.dirty = true; }
         Board::OrangePiRv(m, ..) => m.soc.usb.kbd.type_byte(b as u8),
         Board::OrangePi5(m, _) => { m.soc.usb.kbd.type_byte(b as u8); m.soc.dirty = true; }
         Board::JetsonNano(m, ..) => { m.soc.usb.kbd.type_byte(b as u8); m.soc.dirty = true; }
@@ -680,6 +796,7 @@ pub extern "C" fn sbc_run(budget: f64, wall_ns: f64) -> i32 {
                 Stop::Reset => {
                     let restarted = match &mut s.m {
                         Board::Pi(old) => pi_restart(old).map(Board::Pi),
+                        Board::Pi3(old, how) => pi3_restart(old, how),
                         Board::Tinker(old, how) => tinker_restart(old, how),
                         Board::OrangePiOne(old, how) => opi1_restart(old, how),
                         Board::OrangePiRv(old, fw, how) => opirv_restart(old, fw, how),
@@ -799,6 +916,7 @@ pub unsafe extern "C" fn sbc_restore(ram_mb: u32, sectors: f64, snap: *const u8,
 pub extern "C" fn sbc_uart_in(b: u32) {
     with(|s| match &mut s.m {
         Board::Pi(m) => { if m.soc.uart.rx_room() { m.soc.uart.push_rx(b as u8); m.soc.dirty = true; } }
+        Board::Pi3(m, _) => { m.serial_input(b as u8); }
         Board::Tinker(m, _) => { m.serial_input(b as u8); }
         Board::OrangePiOne(m, _) => { m.serial_input(b as u8); }
         Board::OrangePiRv(m, ..) => { m.serial_input(b as u8); }
@@ -813,6 +931,7 @@ pub extern "C" fn sbc_uart_in(b: u32) {
 pub extern "C" fn sbc_uart_room() -> i32 {
     with(|s| match &s.m {
         Board::Pi(m) => m.soc.uart.rx_room() as i32,
+        Board::Pi3(m, _) => m.soc.aux.rx_room() as i32,
         Board::Tinker(m, _) => m.soc.uart.rx_room() as i32,
         Board::OrangePiOne(m, _) => m.soc.uart.rx_room() as i32,
         Board::OrangePiRv(m, ..) => m.soc.uart.rx_room() as i32,
@@ -829,6 +948,7 @@ pub extern "C" fn sbc_uart_take() -> usize {
     with(|s| {
         s.uart = match &mut s.m {
             Board::Pi(m) => std::mem::take(&mut m.soc.uart.out),
+            Board::Pi3(m, _) => m.take_serial_output(),
             Board::Tinker(m, _) => m.take_serial_output(),
             Board::OrangePiOne(m, _) => m.take_serial_output(),
             Board::OrangePiRv(m, ..) => m.take_serial_output(),
@@ -849,6 +969,7 @@ pub extern "C" fn sbc_fb_render() -> *const u8 {
     with(|s| {
         let size = match &s.m {
             Board::Pi(m) => m.soc.render(&mut s.fb),
+            Board::Pi3(m, _) => m.soc.render(&mut s.fb),
             Board::Tinker(m, _) => m.soc.render(&mut s.fb),
             Board::OrangePiOne(m, _) => m.soc.render(&mut s.fb),
             Board::OrangePiRv(m, ..) => m.soc.render(&mut s.fb),
@@ -888,6 +1009,7 @@ pub extern "C" fn sbc_stop_pc() -> f64 {
         Some(Stop::Unimplemented(pc, _)) => pc as f64,
         _ => match &s.m {
             Board::Pi(m) => m.cpu().pc as f64,
+            Board::Pi3(m, _) => m.cpu().pc as f64,
             Board::Tinker(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
             Board::OrangePiOne(m, _) => m.cpus[m.last_stop_core].r[15] as f64,
             Board::OrangePiRv(m, ..) => m.harts.iter().map(|h| h.pc).next().unwrap_or(0) as f64,

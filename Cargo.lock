@@ -56,6 +56,7 @@ dependencies = [
  "miniz_oxide",
  "peripherals",
  "sbc-net",
+ "vc4-3d",
 ]
 
 [[package]]
@@ -252,6 +253,7 @@ dependencies = [
  "arm-a32",
  "arm-a64",
  "bcm2711",
+ "bcm2837",
  "emu-core",
  "esp-soc",
  "esp32s31",
@@ -329,6 +331,13 @@ dependencies = [
 
 [[package]]
 name = "v3d"
+version = "0.1.0"
+dependencies = [
+ "emu-core",
+]
+
+[[package]]
+name = "vc4-3d"
 version = "0.1.0"
 dependencies = [
  "emu-core",

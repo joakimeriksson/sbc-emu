@@ -1,0 +1,26 @@
+# Raspberry Pi 3 snapshot round trip (milestone 6 of docs/rpi3-plan.md): resume the snapshot a
+# first-boot script saved after logging in (rpi3-firstboot.txt, rpi3-model-*.txt) with the same
+# options, on the same image opened copy-on-write again (no --sd-persist). The sectors the first
+# boot wrote (the user it made, its home) come back with the snapshot; the card then takes new
+# writes, which read back past the page cache; the whole of /usr/bin reads without an error; a
+# key on the USB keyboard arrives; no I/O or file system errors.
+#   sbc-emu run --board pi3b --model 3b --sd cache/os/raspios-lite.img --restore out/rpi3-3b.snap \
+#     --script scripts/rpi3-restore.txt --timeout 300
+#   (or --restore out/rpi3-firstboot.snap with the 3B+, out/rpi3-3aplus.snap with --model 3a+, ...)
+serial \r
+wait-serial pi@raspberrypi
+serial echo $(tr -d '\0' < /proc/device-tree/model | cut -d' ' -f1-2) RESTORED_$((1))\r
+wait-serial Raspberry Pi RESTORED_1
+serial ls -d /home/*; echo written-$((6 * 7)) > ~/after.txt; echo raspberry | sudo -S sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'; cat ~/after.txt\r
+wait-serial /home/pi
+wait-serial written-42
+serial cat /usr/bin/* > /dev/null && echo READ_ALL_$((2))\r
+wait-serial READ_ALL_2
+# a key on the keyboard: its scan code, key and sync events (3 x 24 bytes) from its event device
+serial (echo EVENTS_$(sudo timeout 30 head -c 72 /dev/input/by-id/*-event-kbd | wc -c)) & sleep 3; echo TYPE_$((3))\r
+wait-serial TYPE_3
+type a
+wait-serial EVENTS_72
+serial echo ERRORS_$(dmesg | grep -c -E 'I/O error|EXT4-fs error|Call trace')\r
+wait-serial ERRORS_0
+quit

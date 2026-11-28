@@ -1,0 +1,63 @@
+# Raspberry Pi 3 Model B (milestone 6 of docs/rpi3-plan.md): the unmodified Raspberry Pi OS Lite image
+# with `--model 3b`: the firmware's revision code and model string, the RAM, the board's USB
+# tree, its network; the first-boot wizard on HDMI with the USB keyboard, then a login on the
+# serial console. Saves a snapshot after logging in (--restore it with the same options).
+# The 3B's LAN9514: a 5-port USB 2.0 hub with its 100 Mb/s Ethernet (LAN9500, `smsc95xx`) on port 1
+# and the keyboard and tablet on two of the USB-A ports; 1 GiB; its BCM43438 Wi-Fi is not modelled.
+#   sbc-emu run --board pi3b --model 3b --sd cache/os/raspios-lite.img --script scripts/rpi3-model-3b.txt --timeout 900
+# The wizard's dialogs drop input typed before they open: each step waits for the guest to go
+# idle.
+wait-serial Machine model: Raspberry Pi 3 Model B Rev 1.2
+wait-serial smp: Brought up 1 node, 4 CPUs
+wait-serial raspberrypi login:
+wait-pixel 10 700 0000aa
+wait-idle 5
+screenshot out/rpi3-3b-01-keyboard-layout.png
+type \n
+sleep 2
+wait-idle 5
+screenshot out/rpi3-3b-02-username.png
+type pi\n
+sleep 2
+wait-idle 5
+type raspberry\n
+sleep 2
+wait-idle 5
+type raspberry\n
+sleep 2
+wait-idle 8
+type \n
+sleep 2
+wait-idle 4
+screenshot out/rpi3-3b-03-login-prompt.png
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+save out/rpi3-3b.snap
+# the board's identity: the device tree's model, the revision code the firmware reports, cores, RAM
+serial echo $(tr -d '\0' < /proc/device-tree/model) $(awk '/^Revision/ { print $3 }' /proc/cpuinfo) $(nproc) MODEL\r
+wait-serial Raspberry Pi 3 Model B Rev 1.2 (sbc-emu reduced DT) a02082 4 MODEL
+serial echo MEM_$(( $(awk '/MemTotal/ { print $2 }' /proc/meminfo) / 1024 ))\r
+wait-serial MEM_905
+# the USB tree
+serial lsusb -t\r
+wait-serial Driver=smsc95xx, 480M
+serial lsusb | sort\r
+wait-serial ID 0424:9514
+wait-serial ID 0424:ec00
+# the network
+serial echo $(cat /sys/class/net/eth0/address /sys/class/net/eth0/speed /sys/class/net/eth0/carrier) LINK\r
+wait-serial 02:5b:c0:00:03:01 100 1 LINK
+# NetworkManager has the DHCP lease by now
+serial ip -4 -o addr show eth0 | awk '{ print $3, $4 }'\r
+wait-serial inet 10.0.2.15/24
+serial ping -c 3 -W 2 $(ip route | awk '/default/ { print $3 }') | tail -2 | head -1\r
+wait-serial 3 received, 0% packet loss
+serial echo $(ls /sys/class/net) NETS\r
+wait-serial eth0 lo NETS
+serial echo MODEL_$((6 * 7))_OK\r
+wait-serial MODEL_42_OK
+quit

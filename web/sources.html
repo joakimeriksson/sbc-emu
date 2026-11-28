@@ -28,22 +28,22 @@
   <h2>The emulator: sbc-emu</h2>
   <p>Written for this project, BSD 3-Clause licence. Source: <a href="https://github.com/joakimeriksson/sbc-emu">github.com/joakimeriksson/sbc-emu</a>. The page and the snapshot are built from it by <code>tools/site-build.sh</code>.</p>
 
-  <h2>Raspberry Pi 4: Linux kernel</h2>
+  <h2>Raspberry Pi 4 and Raspberry Pi 3: Linux kernel</h2>
   <ul>
     <li><strong>Linux 6.18.50-v8+</strong>, the Raspberry Pi kernel <code>kernel8.img</code> from Raspberry Pi firmware release <a href="https://github.com/raspberrypi/firmware/tree/1.20260915">1.20260915</a>, unmodified (SHA-256 <code>f80aa8bb…da68b</code>).</li>
     <li>Licence: GNU GPL version 2.</li>
     <li>Source: <a href="https://github.com/raspberrypi/linux/tree/cff533aec2fa601846766b32ff57204e0a61bed7">raspberrypi/linux at commit cff533a</a>, the commit that release names in <code>extra/git_hash</code>.</li>
   </ul>
 
-  <h2>Raspberry Pi 4: BusyBox</h2>
+  <h2>Raspberry Pi 4 and Raspberry Pi 3: BusyBox</h2>
   <ul>
     <li><strong>BusyBox 1.36.1</strong>, Alpine Linux's <code>busybox-static-1.36.1-r31</code> package for aarch64, unmodified (SHA-256 <code>1d8e7a7f…cfac70</code>).</li>
     <li>Licence: GNU GPL version 2.</li>
     <li>Source: <a href="https://busybox.net/downloads/busybox-1.36.1.tar.bz2">busybox-1.36.1.tar.bz2</a>, with Alpine's build recipe and patches in <a href="https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.20-stable/main/busybox">aports, 3.20-stable</a>.</li>
   </ul>
 
-  <h2>Raspberry Pi 4: start-up script</h2>
-  <p>The initramfs's <code>/init</code> is a short shell script written for sbc-emu (<code>sbc-emu mkinitramfs</code>), under the project's BSD licence.</p>
+  <h2>Raspberry Pi 4 and Raspberry Pi 3: start-up script</h2>
+  <p>The initramfs's <code>/init</code> is a short shell script written for sbc-emu (<code>sbc-emu mkinitramfs</code>; for the Pi 3 with <code>--board pi3b</code>, its shell on the mini UART), under the project's BSD licence. The Pi 3 page runs the same kernel and BusyBox; a Raspberry Pi OS card dropped on it stays on the visitor's computer.</p>
 
   <h2>Raspberry Pi 4 3D demos: the snapshot</h2>
   <p>The 3D demo page resumes a snapshot of an emulated Pi 4’s memory. It holds the programs below as they were running, and parts of many others from the same system.</p>

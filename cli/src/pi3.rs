@@ -18,10 +18,17 @@ impl SerialBoard for Machine {
             self.cpu().pc, self.cpu().el, Machine::instret(self), self.now as f64 / 1e9, self.irqs, self.exceptions, self.state
         );
         if let Some(l) = self.soc.tree.lan_ref() {
-            eprintln!("[{tag}] USB: {} channel transfers; Ethernet: {} frames out, {} in, {} dropped", self.soc.usb.transfers, l.tx_frames, l.rx_frames, l.rx_dropped);
+            let (tx, rx, dropped) = l.counters();
+            eprintln!("[{tag}] USB: {} channel transfers; Ethernet: {tx} frames out, {rx} in, {dropped} dropped", self.soc.usb.transfers);
         }
         if let Some(n) = self.soc.net.as_ref() {
             eprintln!("[{tag}] network: {} DHCP acks, {} DNS answers, {} pings answered", n.dhcp_acks, n.dns_answers, n.pings);
+        }
+        if let Some(n) = self.soc.wifi_net.as_ref().filter(|n| n.dhcp_acks + n.dns_answers + n.pings > 0) {
+            eprintln!("[{tag}] Wi-Fi network: {} DHCP acks, {} DNS answers, {} pings answered", n.dhcp_acks, n.dns_answers, n.pings);
+        }
+        if let Some(bt) = self.soc.bt.as_ref().filter(|b| b.commands > 0) {
+            eprintln!("[{tag}] Bluetooth: {} HCI commands", bt.commands);
         }
         if self.soc.sd.reads + self.soc.sd.writes > 0 {
             eprintln!("[{tag}] SD card: {} reads, {} writes", self.soc.sd.reads, self.soc.sd.writes);
@@ -90,8 +97,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    serial_board::validate_options(args, &["--sd", "--smp", "--model", "--threads", "--seed", "--screenshot", "--vnc", "--restore", "--snapshot", "--net", "--hostfwd",
-                                            "--display", "--hdmi-mode", "--audio-out"])?;
+    // the Pi 3's flags (no value), then the valued options
+    const FLAGS: [&str; 3] = ["--no-bluetooth", "--trace-wifi", "--trace-sdio"];
+    let valued: Vec<String> = args.iter().filter(|a| !FLAGS.contains(&a.as_str())).cloned().collect();
+    serial_board::validate_options(&valued, &["--sd", "--smp", "--model", "--threads", "--seed", "--screenshot", "--vnc", "--restore", "--snapshot", "--net", "--hostfwd",
+                                              "--display", "--hdmi-mode", "--audio-out"])?;
     let model = arg(args, "--model").map_or(Ok(Model::B3Plus), Model::parse)?;
     // the 3B+'s Ethernet on the virtual network: nat (default), local (DHCP and DNS only), none
     let net = arg(args, "--net").unwrap_or("nat");
@@ -154,11 +164,14 @@ fn execute(args: &[String]) -> Result<(), String> {
         };
         let kms = display && match display_mode { Some(d) => d == "kms", None => asked_kms };
         if kms { m.enable_kms(hdmi_mode.0, hdmi_mode.1, outputs); }
-        if let Some(d) = disk.clone() { m.soc.sd = bcm2711::sdhci::Sdhci::new(Some(Box::new(d))); }
+        if let Some(d) = disk.clone() { m.soc.sd = bcm2837::sdhost::Sdhost::new(Some(Box::new(d))); }
         // SBC_SD_TRACE=1: the SD host's commands and data on stderr; SBC_USB_TRACE=1: USB transfers
         m.soc.sd.trace = std::env::var("SBC_SD_TRACE").is_ok_and(|v| v == "1");
         m.soc.usb.trace = std::env::var("SBC_USB_TRACE").is_ok_and(|v| v == "1");
-        if net != "none" && m.soc.tree.lan_ref().is_some() { m.connect_network(net == "nat", trace_net); }
+        if net != "none" { m.connect_network(net == "nat", trace_net); }
+        // the CYW43455's Bluetooth on UART0 (3B+, 3A+), unless --no-bluetooth; its Wi-Fi traces
+        if !args.iter().any(|a| a == "--no-bluetooth") { m.enable_bluetooth(); }
+        m.trace_wifi(args.iter().any(|a| a == "--trace-wifi"), args.iter().any(|a| a == "--trace-sdio"));
         for &(host, guest) in &forwards {
             m.forward_tcp(host, guest)?;
             if !announced.get() { eprintln!("[pi3] forwarding {host} -> guest port {guest}"); }
@@ -166,14 +179,19 @@ fn execute(args: &[String]) -> Result<(), String> {
         if !announced.replace(true) {
             eprintln!(
                 "[pi3] {} (BCM2837): {smp} Cortex-A53 core(s) ({}, {}), {} MiB RAM ({} MiB for Linux), per-core and ARM-side interrupt controllers, \
-                 generic timer at 19.2 MHz, mini UART console, PL011, mailbox, SD card on the Arasan SDHCI, RNG, thermal sensor, watchdog, \
+                 generic timer at 19.2 MHz, mini UART console, mailbox, GPIO, SD card on sdhost, {}, RNG, thermal sensor, watchdog, \
                  DWC2 USB host with {}{}",
                 model.name(), crate::cpu_backend(jit), if multi { "a host thread each" } else { "one host thread" },
                 ram >> 20, m.soc.arm_ram() >> 20,
+                match (model.wireless(), m.soc.bt.is_some()) {
+                    (true, true) => "CYW43455 Wi-Fi on the Arasan SDHCI and Bluetooth on the PL011",
+                    (true, false) => "CYW43455 Wi-Fi on the Arasan SDHCI, PL011",
+                    (false, _) => "PL011 (this model's Wi-Fi chip is not modelled)",
+                },
                 match model {
                     Model::B3Plus => format!("the LAN7515 (two hubs, LAN7800 gigabit Ethernet: {}), USB keyboard and tablet", if net == "none" { "no network".into() } else { format!("--net {net}") }),
-                    Model::B3 => "a hub (the LAN9514's Ethernet is not modelled), USB keyboard and tablet".into(),
-                    _ => "a USB keyboard".to_string(),
+                    Model::B3 => format!("the LAN9514 (a hub, LAN9500 100 Mb/s Ethernet: {}), USB keyboard and tablet", if net == "none" { "no network".into() } else { format!("--net {net}") }),
+                    _ => "a USB keyboard on its port".to_string(),
                 },
                 if kms {
                     format!(", {}through the vc4 KMS pipeline (HVS, pixel valves, HDMI with CEC and audio, a {}x{} monitor{})",

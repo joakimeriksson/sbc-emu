@@ -514,33 +514,38 @@ impl Sdhci {
         let _ = ERR_DATA_TIMEOUT;
     }
 
-    fn cid(&self) -> u128 {
-        // MID 0x5b, OID "SE", PNM "SBCEM", PRV 1.0, PSN, MDT 2026-11
-        let mut v: u128 = 0x5b << 120;
-        v |= (u16::from_be_bytes(*b"SE") as u128) << 104;
-        for (k, c) in b"SBCEM".iter().enumerate() { v |= (*c as u128) << (96 - 8 * k); }
-        v |= 0x10 << 56;
-        v |= 0x5bc0_0001u128 << 24;
-        v |= ((26u128 << 4) | 11) << 8;
-        v | 1
-    }
+    fn cid(&self) -> u128 { cid() }
 
-    fn csd(&self) -> u128 {
-        let sectors = self.disk.as_ref().map(|d| d.sectors()).unwrap_or(0);
-        // whole 512 KiB units, never more than the disk stores (an image of another size is
-        // padded where it is opened)
-        let c_size = (sectors / 1024).saturating_sub(1) as u128 & 0x3f_ffff;
-        let mut v: u128 = 1 << 126; // CSD 2.0
-        v |= 0x0e << 112; // TAAC
-        v |= 0x32 << 96; // TRAN_SPEED 25 MHz
-        v |= 0x5b5 << 84; // CCC
-        v |= 9 << 80; // READ_BL_LEN 512
-        v |= c_size << 48;
-        v |= 0x7f << 39; // SECTOR_SIZE
-        v |= 2 << 26; // R2W_FACTOR
-        v |= 9 << 22; // WRITE_BL_LEN
-        v | 1
-    }
+    fn csd(&self) -> u128 { csd(self.disk.as_ref().map(|d| d.sectors()).unwrap_or(0)) }
+}
+
+/// The card's CID register (R2 bits 127:0, CRC left zero): the same card on every SD host.
+pub fn cid() -> u128 {
+    // MID 0x5b, OID "SE", PNM "SBCEM", PRV 1.0, PSN, MDT 2026-11
+    let mut v: u128 = 0x5b << 120;
+    v |= (u16::from_be_bytes(*b"SE") as u128) << 104;
+    for (k, c) in b"SBCEM".iter().enumerate() { v |= (*c as u128) << (96 - 8 * k); }
+    v |= 0x10 << 56;
+    v |= 0x5bc0_0001u128 << 24;
+    v |= ((26u128 << 4) | 11) << 8;
+    v | 1
+}
+
+/// The card's CSD register (version 2.0) for a disk of `sectors` 512-byte sectors.
+pub fn csd(sectors: u64) -> u128 {
+    // whole 512 KiB units, never more than the disk stores (an image of another size is
+    // padded where it is opened)
+    let c_size = (sectors / 1024).saturating_sub(1) as u128 & 0x3f_ffff;
+    let mut v: u128 = 1 << 126; // CSD 2.0
+    v |= 0x0e << 112; // TAAC
+    v |= 0x32 << 96; // TRAN_SPEED 25 MHz
+    v |= 0x5b5 << 84; // CCC
+    v |= 9 << 80; // READ_BL_LEN 512
+    v |= c_size << 48;
+    v |= 0x7f << 39; // SECTOR_SIZE
+    v |= 2 << 26; // R2W_FACTOR
+    v |= 9 << 22; // WRITE_BL_LEN
+    v | 1
 }
 
 impl Sdhci {
@@ -554,12 +559,7 @@ impl Sdhci {
         w.bool(self.special.is_some()); w.bytes(self.special.as_deref().unwrap_or(&[]));
         w.opt_u32(self.pre_count);
         if let Some(c) = self.sdio.as_ref() { c.save_state(w); }
-        if self.disk.as_ref().is_some_and(|d| !d.snapshots_disk()) {
-            eprintln!("[sd] snapshot does not include the SD card: --sd-persist writes go to the image");
-        }
-        let ov = self.disk.as_ref().map(|d| d.overlay()).unwrap_or_default();
-        w.u64(ov.len() as u64);
-        for (lba, data) in ov { w.u64(lba); w.bytes(&data); }
+        save_card(&self.disk, w);
     }
     pub fn load_state(&mut self, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
         r.tag("sdhci-v1")?;
@@ -571,28 +571,44 @@ impl Sdhci {
         let has = r.bool()?; let sp = r.bytes()?.to_vec(); self.special = has.then_some(sp);
         self.pre_count = r.opt_u32()?;
         if let Some(c) = self.sdio.as_mut() { c.load_state(r)?; }
-        let n = r.u64()?;
-        // `n` comes from the snapshot: no pre-allocation from an untrusted count.
-        let mut sectors = Vec::new();
-        for _ in 0..n {
-            let lba = r.u64()?;
-            sectors.push((lba, r.bytes()?.to_vec()));
-        }
-        // Exactly the snapshot's sectors: writes made after it was taken are dropped.
-        if let Some(d) = self.disk.as_mut() {
-            if !d.snapshots_disk() {
-                // sectors that cannot go onto the image: the guest would go on with caches of them
-                // and write what does not fit the rest into it
-                if !sectors.is_empty() {
-                    return Err(emu_core::snap::SnapError(format!("the snapshot has {} written SD sectors, which --sd-persist would not bring back: restore without it", sectors.len())));
-                }
-                // saved with --sd-persist: right if nothing has written to the image since
-                eprintln!("[sd] restored onto --sd-persist: the image must be as it was when the snapshot was taken");
-            }
-            d.restore_overlay(sectors);
-        }
-        Ok(())
+        load_card(&mut self.disk, r)
     }
+}
+
+/// A snapshot's record of the card behind a host: the sectors written since the image was
+/// opened (copy-on-write), or a note that `--sd-persist` writes are not in it.
+pub fn save_card(disk: &Option<Box<dyn Disk>>, w: &mut emu_core::snap::W) {
+    if disk.as_ref().is_some_and(|d| !d.snapshots_disk()) {
+        eprintln!("[sd] snapshot does not include the SD card: --sd-persist writes go to the image");
+    }
+    let ov = disk.as_ref().map(|d| d.overlay()).unwrap_or_default();
+    w.u64(ov.len() as u64);
+    for (lba, data) in ov { w.u64(lba); w.bytes(&data); }
+}
+
+/// Bring back what `save_card` wrote.
+pub fn load_card(disk: &mut Option<Box<dyn Disk>>, r: &mut emu_core::snap::R) -> Result<(), emu_core::snap::SnapError> {
+    let n = r.u64()?;
+    // `n` comes from the snapshot: no pre-allocation from an untrusted count.
+    let mut sectors = Vec::new();
+    for _ in 0..n {
+        let lba = r.u64()?;
+        sectors.push((lba, r.bytes()?.to_vec()));
+    }
+    // Exactly the snapshot's sectors: writes made after it was taken are dropped.
+    if let Some(d) = disk.as_mut() {
+        if !d.snapshots_disk() {
+            // sectors that cannot go onto the image: the guest would go on with caches of them
+            // and write what does not fit the rest into it
+            if !sectors.is_empty() {
+                return Err(emu_core::snap::SnapError(format!("the snapshot has {} written SD sectors, which --sd-persist would not bring back: restore without it", sectors.len())));
+            }
+            // saved with --sd-persist: right if nothing has written to the image since
+            eprintln!("[sd] restored onto --sd-persist: the image must be as it was when the snapshot was taken");
+        }
+        d.restore_overlay(sectors);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

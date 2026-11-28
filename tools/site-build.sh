@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the public demo site into out/site (.github/workflows/site.yml deploys it to GitHub Pages):
 # the browser build; the snapshot hello.html resumes (the Raspberry Pi 4), made here from pinned,
-# checksummed downloads; the Orange Pi One's Alpine kernel and initramfs
+# checksummed downloads, and the Raspberry Pi 3's quick demo from the same kernel and BusyBox; the Orange Pi One's Alpine kernel and initramfs
 # (scripts/orangepi-one-fixture.sh), the Tinker Board's Debian kernel and BusyBox initramfs
 # (scripts/tinker-board-fixture.sh), the Orange Pi RV's OpenSBI, Alpine kernel and initramfs
 # (scripts/orangepi-rv-fixture.sh) and the Orange Pi 5's Debian kernel and initramfs
@@ -68,6 +68,10 @@ rm -f web/assets/hello.snap
 ./target/release/sbc-emu run --kernel "$DL/Image" --initrd "$DL/initramfs.cpio" --shell fb --input usb --ram-mb 512 \
     --script scripts/web-hello-snapshot.txt --timeout 900
 [ -s web/assets/hello.snap ] || { echo "no snapshot: the boot did not reach the shell" >&2; exit 1; }
+# the Raspberry Pi 3's quick demo (rpi3.html): the same kernel, BusyBox with its shell on the mini UART
+mkdir -p "$DL/rpi3"
+./target/release/sbc-emu mkinitramfs --board pi3b --busybox "$DL/busybox.static" -o "$DL/rpi3/initramfs.cpio"
+ln -sf ../Image "$DL/rpi3/Image"
 
 # the Orange Pi One and the Tinker Board (wasm-build.sh stages them into web/assets)
 sh scripts/orangepi-one-fixture.sh cache/orangepi-one
@@ -83,15 +87,19 @@ DOWNLOADS="$PWD/$DL" sh scripts/jetson-nano-gpu-demo-fixture.sh cache/jetson-nan
 tools/wasm-build.sh
 # this build must still restore the 3D snapshot and draw with it, without an SD card
 SBC_SNAP="$DL/gpu-demo.snap.zst" SBC_SD=/nonexistent node tools/wasm-gpu-bench.mjs 3 cube
+# the Raspberry Pi 3 must boot to its shell on all four cores
+node tools/wasm-smoke-rpi3.mjs 300 "$DL/rpi3"
 # and its xz decoder must unpack the Jetson Nano's demos
 SBC_GPU=cache/jetson-nano/gpu-demo/gpu-demo.cpio.xz node tools/wasm-smoke-nano.mjs unpack
 
 rm -rf "$OUT"
-mkdir -p "$OUT/wasm" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/jetson-nano" "$OUT/assets/esp32s31"
+mkdir -p "$OUT/wasm" "$OUT/assets/rpi3" "$OUT/assets/orangepi-one" "$OUT/assets/tinker" "$OUT/assets/orangepi-rv" "$OUT/assets/orangepi5" "$OUT/assets/jetson-nano" "$OUT/assets/esp32s31"
 cp web/boards.html "$OUT/index.html"
-cp web/hello.html web/board.html web/gpu.html web/pi4.html web/sources.html web/worker.js web/film-thumbnail.jpg "$OUT/"
+cp web/hello.html web/board.html web/gpu.html web/pi4.html web/rpi3.html web/sources.html web/worker.js web/film-thumbnail.jpg "$OUT/"
 cp web/wasm/sbc-emu.wasm "$OUT/wasm/"
 cp web/assets/hello.snap "$OUT/assets/"
+cp "$DL/kernel8.img" "$OUT/assets/"
+gzip -9n -c "$DL/rpi3/initramfs.cpio" > "$OUT/assets/rpi3/initramfs.cpio.gz"
 # GitHub Pages takes files up to 100 MB: the snapshot goes in parts, which a manifest lists
 split -b 90000000 -a 1 "$DL/gpu-demo.snap.zst" "$OUT/assets/gpu-demo.snap."
 python3 -I -c 'import json, os, sys

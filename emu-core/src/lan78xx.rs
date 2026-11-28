@@ -390,13 +390,13 @@ impl UsbDevice for Lan78xx {
 
 // ---------------------------------------------------------------------- offloads
 
-fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
+pub(crate) fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
     let mut c = data.chunks_exact(2);
     for w in &mut c { sum += u16::from_be_bytes([w[0], w[1]]) as u32; }
     if let [b] = c.remainder() { sum += (*b as u32) << 8; }
     sum
 }
-fn csum_fold(mut sum: u32) -> u16 {
+pub(crate) fn csum_fold(mut sum: u32) -> u16 {
     while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16); }
     !(sum as u16)
 }

@@ -417,6 +417,8 @@ impl Machine {
             let off = self.now as i64 - sh.t0.elapsed().as_nanos() as i64;
             sh.offset.store(off, SeqCst);
             for c in self.cpus.iter_mut() { c.wall_clock = Some((sh.t0, off)); }
+            // GPU jobs on a thread of their own, done when they are done
+            self.soc.v3d.wall_clock = true;
             for k in 0..n { sh.state[k].store(enc(self.state[k]), SeqCst); }
             *sh.event.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.soc.device_lines(self.now);
@@ -450,6 +452,7 @@ impl Machine {
         while sh.running.load(SeqCst) != 0 { std::thread::yield_now(); }
         let _g = sh.guard();
         self.now = self.now.max(sh.now());
+        self.soc.v3d.wall_clock = false;
         self.exceptions += sh.exceptions.swap(0, Relaxed);
         self.irqs += sh.irqs.swap(0, Relaxed);
         for k in 0..n {

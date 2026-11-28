@@ -9,7 +9,11 @@
 //! the driver enables the channel, moving data through the channel's DMA address, and reports
 //! through HCINT/HAINT/GINTSTS as the core does. A bulk or interrupt IN transfer the device
 //! NAKs is held (the channel stays enabled, as the core keeps retrying) until the device has
-//! data (`poll`): the driver sees one completion instead of a NAK per (micro)frame.
+//! data (`poll`): the driver sees one completion instead of a NAK per (micro)frame. An
+//! interrupt IN is held at most half a second, then NAKed: the driver keeps the endpoint's place
+//! in its periodic schedule in 14-bit frame numbers, which a longer hold would let fall more
+//! than half the counter behind (and the next transfer would wait for the counter to come
+//! round: seconds, in which a held-down key repeats).
 //!
 //! The root port runs at the device's speed. Behind a high-speed hub, full-speed devices are
 //! reached with split transactions (HCSPLT): the start split is acknowledged at once (an OUT
@@ -70,6 +74,9 @@ const SPLT_COMPL: u32 = 1 << 16;
 const EP_BULK: u32 = 2;
 const EP_INTR: u32 = 3;
 
+/// The longest an interrupt IN is held before the core's NAK is reported (ms of frames).
+const MAX_INTR_HOLD_MS: u64 = 500;
+
 const PID_DATA0: u32 = 0;
 const PID_DATA1: u32 = 2;
 const PID_SETUP: u32 = 3;
@@ -94,6 +101,9 @@ pub struct Dwc2 {
     /// frame number (1 ms frames) and when the next one starts (ns)
     frame: u32,
     next_frame_ns: u64,
+    /// milliseconds of frames since power-on, and when each held interrupt IN began (in them)
+    ms: u64,
+    held_since: [Option<u64>; NCHAN],
     pub transfers: u64,
     pub trace: bool,
 }
@@ -105,7 +115,7 @@ impl Default for Dwc2 {
 impl Dwc2 {
     pub fn new() -> Self {
         let mut d = Dwc2 { g: [0; 0x60], hprt: 0, hcfg: 0, hfir: 48000, haintmsk: 0, gintsts: GINT_CURMOD_HOST, chan: [Chan::default(); NCHAN], split: Vec::new(),
-                           port: Some(DevId::Keyboard), frame: 0, next_frame_ns: 0, transfers: 0, trace: false };
+                           port: Some(DevId::Keyboard), frame: 0, next_frame_ns: 0, ms: 0, held_since: [None; NCHAN], transfers: 0, trace: false };
         d.reset();
         d
     }
@@ -124,6 +134,7 @@ impl Dwc2 {
         self.gintsts = GINT_CURMOD_HOST;
         self.hprt = 0;
         self.chan = [Chan::default(); NCHAN];
+        self.held_since = [None; NCHAN];
         self.split.clear();
     }
 
@@ -154,6 +165,18 @@ impl Dwc2 {
         self.frame = (self.frame + frames as u32 * step) & 0x3fff;
         self.next_frame_ns += frames * 1_000_000;
         self.gintsts |= GINT_SOF;
+        self.ms += frames;
+        // interrupt INs held too long: the NAK the core would have reported long ago
+        for n in 0..NCHAN {
+            let Some(t) = self.held_since[n] else { continue };
+            let ch = &mut self.chan[n];
+            if ch.hcchar & CH_ENA == 0 { self.held_since[n] = None; continue; }
+            if self.ms - t >= MAX_INTR_HOLD_MS {
+                ch.hcchar &= !(CH_ENA | CH_DIS);
+                ch.hcint |= HC_NAK | HC_CHHLTD;
+                self.held_since[n] = None;
+            }
+        }
         true
     }
 
@@ -323,7 +346,8 @@ impl Dwc2 {
             (Some((bits, moved, pid_next)), true) => done(self, bits, moved, pid_next),
             // the device has nothing: a bulk or interrupt IN waits for it, enabled; through a
             // TT the complete split returns the NAK
-            (None, false) if eptype == EP_BULK || eptype == EP_INTR => {}
+            (None, false) if eptype == EP_BULK => {}
+            (None, false) if eptype == EP_INTR => self.held_since[n] = Some(self.ms),
             (None, _) => done(self, HC_NAK, 0, pid),
         }
     }
@@ -390,6 +414,12 @@ impl Dwc2 {
         }
         self.split.clear();
         if v3 { for _ in 0..r.u32()?.min(64) { let k = r.u32()?; let v = r.u32()?; self.split.push((k, v)); } }
+        // held interrupt INs (not saved): their half second starts again
+        for n in 0..NCHAN {
+            let c = self.chan[n];
+            let held = c.hcchar & CH_ENA != 0 && (c.hcchar >> 18) & 3 == EP_INTR && c.hcchar & (1 << 15) != 0 && c.hcsplt & SPLT_ENA == 0;
+            self.held_since[n] = held.then_some(self.ms);
+        }
         Ok(())
     }
 }

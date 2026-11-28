@@ -18,13 +18,19 @@
 //! The composite encoder (VEC) is pixel valve 2's other output; the device tree lists it when
 //! `config.txt` asks (`dtoverlay=vc4-kms-v3d,composite`), and the host shows whichever of the
 //! two pixel valve 2 drives.
+//!
+//! Storage and wireless as on a real Pi 3: the SD card on the `sdhost` controller; on the 3B+
+//! and 3A+ the CYW43455 on the Arasan SDHCI (Wi-Fi over SDIO, the Pi 4's model) and its
+//! Bluetooth core on UART0 (H4); both chips powered by the firmware's GPIO expander (WL_ON,
+//! BT_ON), which Linux drives through mailbox property tags.
 use crate::intc::{ArmCtrl, LocalIntc};
+use crate::sdhost::Sdhost;
 use crate::Model;
 use arm_a64::{Cpu, CpuProfile};
 use bcm2711::dwc2::Dwc2;
 use bcm2711::mailbox::Mailbox;
 use bcm2711::periph::{AuxUart, Pm};
-use bcm2711::sdhci::Sdhci;
+use bcm2711::sdhci::{SdioCard, Sdhci};
 use emu_core::lan78xx::Lan78xx;
 use emu_core::usb::{DevId, Devices};
 use emu_core::usb_hub::{Hub, Node, TreeBus, UsbTree};
@@ -42,9 +48,11 @@ pub const VCHIQ: u64 = 0x3f00_b840;
 pub const PM: u64 = 0x3f10_0000;
 pub const RNG: u64 = 0x3f10_4000;
 pub const UART0: u64 = 0x3f20_1000;
+/// the SD card's host (`brcm,bcm2835-sdhost`)
+pub const SDHOST: u64 = 0x3f20_2000;
 pub const THERMAL: u64 = 0x3f21_2000;
 pub const AUX: u64 = 0x3f21_5000;
-/// the Arasan SD host (`brcm,bcm2835-sdhci`, "mmcnr" in the vendor tree)
+/// the Arasan SD host (`brcm,bcm2835-sdhci`, "mmcnr" in the vendor tree): the Wi-Fi's SDIO
 pub const SDHCI: u64 = 0x3f30_0000;
 /// the DWC2 USB 2.0 OTG controller
 pub const USB: u64 = 0x3f98_0000;
@@ -87,6 +95,7 @@ pub const GPU_GPIO0: usize = 49;
 /// the BSC controllers' shared interrupt
 pub const GPU_I2C: usize = 53;
 pub const GPU_AUX: usize = 29;
+pub const GPU_SDHOST: usize = 56;
 pub const GPU_UART0: usize = 57;
 pub const GPU_RNG: usize = 61;
 pub const GPU_SDHCI: usize = 62;
@@ -94,6 +103,13 @@ pub const GPU_SDHCI: usize = 62;
 /// The Ethernet's MAC address: locally administered (the firmware of a real Pi 3B+ writes the
 /// board's own into the device tree's `local-mac-address`).
 pub const ETH_MAC: [u8; 6] = [0x02, 0x5b, 0xc0, 0x00, 0x03, 0x01];
+/// The Wi-Fi interface's MAC address (the firmware's OTP holds the real board's).
+pub const WIFI_MAC: [u8; 6] = [0x02, 0x5b, 0xc0, 0x00, 0x03, 0x02];
+/// Lines of the firmware's GPIO expander (the vendor tree's `expgpio`).
+pub const EXP_BT_ON: u8 = 0;
+pub const EXP_WL_ON: u8 = 1;
+pub const EXP_PWR_LED: u8 = 2;
+pub const EXP_LAN_RUN: u8 = 3;
 
 /// What hangs off the root port, by model: the 3B+'s LAN7515 (a 4-port hub, behind its port 1
 /// a 3-port hub with the LAN7800 on its port 1), the 3B's LAN9514 hub (its Ethernet is not
@@ -110,7 +126,9 @@ pub fn usb_tree(model: Model, devs: &mut Devices) -> UsbTree {
             t.add(Node::Dev(DevId::Tablet), Some((h1, 3)), devs);
         }
         Model::B3 => {
+            // the LAN9514: a 5-port hub with the Ethernet controller on port 1
             let h = t.add(Node::Hub(Hub::new(5, 0x0424, 0x9514, 1 << 1, true)), None, devs);
+            t.add(Node::Smsc(Box::new(emu_core::smsc95xx::Smsc95xx::new())), Some((h, 1)), devs);
             t.add(Node::Dev(DevId::Keyboard), Some((h, 2)), devs);
             t.add(Node::Dev(DevId::Tablet), Some((h, 3)), devs);
         }
@@ -127,13 +145,23 @@ pub struct Soc {
     pub cur: usize,
     pub local: LocalIntc,
     pub armctrl: ArmCtrl,
-    /// UART0 (PL011): Bluetooth's on a real 3B+, a spare serial port here (ttyAMA0)
+    /// UART0 (PL011): Bluetooth's (3B+, 3A+), else a spare serial port
     pub uart: Pl011,
     /// the mini UART: the serial console (ttyS0)
     pub aux: AuxUart,
     pub mbox: Mailbox,
     /// the SD card's host
-    pub sd: Sdhci,
+    pub sd: Sdhost,
+    /// the Arasan SDHCI: the CYW43455's SDIO bus (its card is there while WL_ON powers it)
+    pub sdhci: Sdhci,
+    /// the board has the CYW43455 (3B+, 3A+; the 3B's and Zero 2 W's chips are not modelled)
+    pub wireless: bool,
+    /// the Wi-Fi chip logs its host interface (`--trace-wifi`)
+    pub wifi_trace: bool,
+    /// the Wi-Fi access point's network
+    pub wifi_net: Option<sbc_net::net::VirtualNet>,
+    /// the Bluetooth controller on UART0 (None: UART0 is a plain serial port)
+    pub bt: Option<bcm2711::bluetooth::Bluetooth>,
     pub rng: crate::periph::Rng,
     pub thermal: crate::periph::Thermal,
     pub pm: Pm,
@@ -143,6 +171,8 @@ pub struct Soc {
     pub tree: UsbTree,
     /// the network behind the Ethernet port (`connect_network`)
     pub net: Option<sbc_net::net::VirtualNet>,
+    /// the VideoCore IV 3D GPU (`vc4-3d`)
+    pub v3d: vc4_3d::V3d,
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
     pub gpio: bcm2711::gpio::Gpio,
@@ -177,18 +207,20 @@ impl Soc {
     pub fn irq_out(&self, k: usize) -> bool { self.local.irq_out(k, self.armctrl.irq()) }
 
     pub(crate) fn mmio_read(&mut self, a: u64) -> Result<u32, Fault> {
+        if (SDHOST..=0x3f20_20ff).contains(&a) { return Ok(self.sdhost_access(|sd| sd.read(a - SDHOST))); }
         self.dirty = true;
         Ok(match a {
-            UART0..=0x3f20_1fff => self.uart.read(a - UART0),
+            UART0..=0x3f20_1fff => { let v = self.uart.read(a - UART0); self.bt_pump(); v }
             AUX..=0x3f21_50ff => self.aux.read(a - AUX),
             MBOX..=0x3f00_b8bf => self.mbox.read(a - MBOX),
             VCHIQ..=0x3f00_b87f => self.vchiq.read(a - VCHIQ),
             ARMCTRL..=0x3f00_b3ff => self.armctrl.read(a - ARMCTRL),
-            SDHCI..=0x3f30_00ff => self.sd.read(a - SDHCI),
+            SDHCI..=0x3f30_00ff => self.sdhci.read(a - SDHCI),
             USB..=0x3f98_ffff => self.usb.read(a - USB),
             RNG..=0x3f10_400f => self.rng.read(a - RNG),
             THERMAL..=0x3f21_2007 => self.thermal.read(a - THERMAL),
             PM..=0x3f10_0113 => self.pm.read(a - PM),
+            V3D..=0x3fc0_0fff => self.v3d.read(a - V3D),
             // AXI bridges (ASB): the ID register; a stop request (bit 0) is acknowledged (bit 1) at once
             GPIO..=0x3f20_00b3 => self.gpio.read(a - GPIO),
             DMA..=0x3f00_7fff => self.dma.read(a - DMA),
@@ -210,15 +242,17 @@ impl Soc {
 
     /// `size`-byte write of `v` at `a` (unshifted value, any alignment within the word).
     fn mmio_write(&mut self, a: u64, v: u32, size: u32) -> Result<(), Fault> {
+        if (SDHOST..=0x3f20_20ff).contains(&a) { self.sdhost_access(|sd| sd.write(a & !3 & 0xff, v)); self.sdhost_dma(); return Ok(()); }
         self.dirty = true;
-        if (SDHCI..=0x3f30_00ff).contains(&a) { self.sd.write(a - SDHCI, v, size, &mut self.ram); return Ok(()); }
+        if (SDHCI..=0x3f30_00ff).contains(&a) { self.sdhci.write(a - SDHCI, v, size, &mut self.ram); return Ok(()); }
         let a = a & !3;
         match a {
-            UART0..=0x3f20_1fff => self.uart.write(a - UART0, v),
+            UART0..=0x3f20_1fff => { self.uart.write(a - UART0, v); self.bt_pump(); }
             AUX..=0x3f21_50ff => self.aux.write(a - AUX, v),
             MBOX..=0x3f00_b8bf => {
                 self.mbox.write(a - MBOX, v, &mut self.ram);
                 if let Some(base) = self.mbox.vchiq_init.take() { self.vchiq.init(&mut self.ram, base); }
+                self.power_lines();
             }
             VCHIQ..=0x3f00_b87f => self.vchiq.write(a - VCHIQ, v, &mut self.ram, self.now),
             ARMCTRL..=0x3f00_b3ff => self.armctrl.write(a - ARMCTRL, v),
@@ -226,6 +260,7 @@ impl Soc {
             RNG..=0x3f10_400f => self.rng.write(a - RNG, v),
             THERMAL..=0x3f21_2007 => self.thermal.write(a - THERMAL, v),
             PM..=0x3f10_0113 => self.pm.write(a - PM, v),
+            V3D..=0x3fc0_0fff => self.v3d.write(a - V3D, v, &mut self.ram),
             ASB..=0x3f00_a02f => self.asb[((a & 0xff) / 4) as usize % 12] = v & 0x00ff_ffff,
             GPIO..=0x3f20_00b3 => self.gpio.write(a - GPIO, v),
             DMA..=0x3f00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
@@ -245,11 +280,22 @@ impl Soc {
         Ok(())
     }
 
+    /// An access to `sdhost`: PIO moves a block as 128 data-register accesses plus FIFO-level
+    /// polls, so only an access that changes its interrupt line has the lines re-derived.
+    #[inline]
+    fn sdhost_access<R>(&mut self, f: impl FnOnce(&mut Sdhost) -> R) -> R {
+        let irq = self.sd.irq();
+        let r = f(&mut self.sd);
+        if self.sd.irq() != irq { self.dirty = true; }
+        r
+    }
+
     /// Device interrupt lines into the ARM-side controller at virtual time `now` (ns).
     pub(crate) fn device_lines(&mut self, now: u64) {
         self.armctrl.set_gpu(GPU_AUX, self.aux.irq());
         self.armctrl.set_gpu(GPU_UART0, self.uart.irq());
-        self.armctrl.set_gpu(GPU_SDHCI, self.sd.irq());
+        self.armctrl.set_gpu(GPU_SDHOST, self.sd.irq());
+        self.armctrl.set_gpu(GPU_SDHCI, self.sdhci.irq());
         self.armctrl.set_gpu(GPU_USB, self.usb.irq());
         self.armctrl.set_arm(ARM_MAILBOX, self.mbox.irq());
         self.now = self.now.max(now);
@@ -280,16 +326,20 @@ impl Soc {
             self.armctrl.set_gpu(GPU_HVS, v.irq_hvs());
             self.armctrl.set_gpu(GPU_HDMI0, v.irq_hdmi());
         }
+        self.v3d.tick(now, &mut self.ram);
+        self.armctrl.set_gpu(GPU_V3D, self.v3d.irq());
         self.pm.now = now;
-        // nothing reads the spare UART's output yet: keep it from growing without bound
+        // nothing reads a spare UART0's output: keep it from growing without bound
         if self.uart.out.len() > 1 << 16 { self.uart.out.clear(); }
+        if self.gpio.events.len() > 1024 { self.gpio.events.clear(); }
         self.dirty = false;
     }
 
     /// The next device deadline.
     pub(crate) fn next_event(&self) -> Option<u64> {
         let vc4 = self.vc4.as_ref().and_then(|v| v.next_event());
-        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4, self.vchiq.next_event()].into_iter().flatten().min()
+        let bt = self.bt.as_ref().and_then(|b| b.next_event());
+        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4, bt, self.vchiq.next_event(), self.v3d.next_event()].into_iter().flatten().min()
     }
 
     /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns): the HDMI
@@ -318,6 +368,18 @@ impl Soc {
         let paced = dma.run(n, self);
         self.dma = dma;
         if paced { self.pace_next = Some(0); }
+        self.sdhost_dma();
+    }
+
+    /// sdhost's DMA (DREQ 13): while its FIFO has data (a read) or room (a write), a channel
+    /// waiting for it moves the words now. Transfers take no time, so a request's blocks are in
+    /// memory (or on the card) as soon as both the command and the channel are under way.
+    fn sdhost_dma(&mut self) {
+        use crate::sdhost::DREQ;
+        if !self.sd.dreq() || !self.dma.ch.iter().any(|c| c.cs & bcm2711::dma::ACTIVE != 0 && bcm2711::dma::paced(c.ti) == Some(DREQ)) { return; }
+        let mut dma = std::mem::take(&mut self.dma);
+        if dma.serve(DREQ, self) { self.dirty = true; }
+        self.dma = dma;
     }
 
     /// Plug the monitor in or out: its EDID on the DDC bus, the HDMI block's hot-plug status,
@@ -337,26 +399,70 @@ impl Soc {
         self.dirty = true;
     }
 
-    /// USB time: frames (SOF), and held transfers whose devices have data now.
+    /// The firmware GPIO expander's power lines, after a mailbox request: WL_ON powers the
+    /// Wi-Fi chip (off, it leaves the SDIO bus; on again, it is a fresh chip whose firmware
+    /// must be downloaded again), BT_ON the Bluetooth core (off, it is reset and hears nothing).
+    pub(crate) fn power_lines(&mut self) {
+        if !self.wireless { return; }
+        let wl = self.mbox.exp_gpio_out & (1 << EXP_WL_ON) != 0;
+        if wl != self.sdhci.sdio.is_some() {
+            self.sdhci.sdio = wl.then(|| {
+                let mut c = bcm2711::wifi::Cyw43455::new();
+                c.mac = WIFI_MAC;
+                c.set_trace(self.wifi_trace);
+                Box::new(c) as Box<dyn SdioCard>
+            });
+        }
+        if !self.bt_on() {
+            if let Some(bt) = self.bt.as_mut().filter(|b| b.commands > 0 || !b.tx.is_empty()) {
+                let trace = bt.trace;
+                *bt = bcm2711::bluetooth::Bluetooth::new();
+                bt.trace = trace;
+            }
+        }
+    }
+
+    fn bt_on(&self) -> bool { self.mbox.exp_gpio_out & (1 << EXP_BT_ON) != 0 }
+
+    /// Bluetooth on UART0: what the host sent goes to the controller (while BT_ON powers it),
+    /// the controller's bytes fill the receive FIFO as it empties.
+    pub(crate) fn bt_pump(&mut self) {
+        let on = self.bt_on();
+        let Some(bt) = self.bt.as_mut() else { return };
+        if !self.uart.out.is_empty() { let b = std::mem::take(&mut self.uart.out); if on { bt.receive(&b); } }
+        while self.uart.rx_room() { match bt.tx.pop_front() { Some(b) => self.uart.push_rx(b), None => break } }
+    }
+
+    /// USB time: frames (SOF), and held transfers whose devices have data now (and the
+    /// Bluetooth controller's advertising reports).
     pub(crate) fn usb_tick(&mut self, now: u64) {
+        if let Some(bt) = self.bt.as_mut() { bt.tick(now); }
+        self.bt_pump();
         if self.usb.tick(now) { self.dirty = true; }
         if self.usb.held() != 0 {
             self.usb.poll(&mut self.ram, &mut TreeBus { tree: &mut self.tree, devs: &mut self.devs });
         }
     }
 
-    /// Exchange frames between the USB Ethernet and the virtual network.
+    /// Exchange frames between the USB Ethernet and the virtual network, and between the
+    /// associated Wi-Fi interface and the access point's network.
     pub(crate) fn pump_network(&mut self, now: u64) {
-        let Some(lan) = self.tree.lan() else { return };
         let now_us = now / 1000;
+        if let (Some(card), Some(wnet)) = (self.sdhci.sdio.as_mut(), self.wifi_net.as_mut()) {
+            let mut replies = Vec::new();
+            for f in card.take_tx() { replies.extend(wnet.handle(&f, now_us)); }
+            replies.extend(wnet.poll(now_us));
+            for r in replies { card.deliver(&r); }
+        }
+        let Some(lan) = self.tree.lan() else { return };
         match self.net.as_mut() {
             Some(net) => {
                 let mut replies = Vec::new();
-                for f in std::mem::take(&mut lan.tx_out) { replies.extend(net.handle(&f, now_us)); }
+                for f in lan.take_tx() { replies.extend(net.handle(&f, now_us)); }
                 replies.extend(net.poll(now_us));
                 for f in replies { lan.receive(&f); }
             }
-            None => lan.tx_out.clear(),
+            None => { lan.take_tx(); }
         }
     }
 
@@ -411,6 +517,7 @@ pub(crate) fn dma_phys(a: u32) -> u64 {
 
 impl bcm2711::dma::DmaBus for Soc {
     fn phys(&self, bus: u32) -> u64 { dma_phys(bus) }
+    fn dreq(&self, dreq: u32) -> bool { dreq == crate::sdhost::DREQ && self.sd.dreq() }
 }
 
 impl Bus for Soc {
@@ -499,9 +606,16 @@ impl Machine {
         let fb_max = (ram_arm_visible as u64).saturating_sub(arm_ram);
         let mut mbox = Mailbox::new(arm_ram, fb_max, 1024, 768);
         mbox.revision = model.revision();
+        // the expander as the firmware leaves it: the LAN chip running, the power LED on, the
+        // Wi-Fi chip powered (the vendor tree has no power sequence for it), Bluetooth off until
+        // `hci_bcm` drives BT_ON; the levels the lines read back while Linux has not made them
+        // outputs are the same
+        mbox.exp_gpio_out = 1 << EXP_WL_ON | 1 << EXP_PWR_LED | 1 << EXP_LAN_RUN;
+        mbox.exp_gpio_in = mbox.exp_gpio_out;
         let soc = Soc {
             ram: vec![0; ram_arm_visible], arm_ram, cur: 0, local: LocalIntc::new(), armctrl: ArmCtrl::new(), uart: Pl011::new(), aux: AuxUart::new(),
-            mbox, sd: Sdhci::new(None), rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(),
+            mbox, sd: Sdhost::new(None), sdhci: Sdhci::new(None), wireless: model.wireless(), wifi_trace: false, wifi_net: None, bt: None,
+            rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(), v3d: vc4_3d::V3d::new(),
             usb: { let mut d = Dwc2::new(); d.port = None; d }, devs: Devices::default(), tree: UsbTree::new(), net: None, asb: [0; 12],
             gpio: bcm2711::gpio::Gpio::new(), dma: bcm2711::dma::Dma::new(), pace_next: None, ddc: bcm2711::i2c::I2c::with_devices(Vec::new()), vc4: None,
             outputs: Default::default(),
@@ -520,7 +634,8 @@ impl Machine {
         m.soc.mbox.vchiq = true;
         // nothing on HDMI's hot-plug line until a monitor is plugged in (`enable_kms`)
         m.soc.gpio.set_input(28, Some(true));
-        m.soc.mbox.exp_gpio_in = 1 << 4;
+        m.soc.mbox.exp_gpio_in |= 1 << 4;
+        m.soc.power_lines();
         for k in 0..ncpu { let c = m.fresh_cpu(k); m.cpus.push(c); }
         m.state[0] = CoreState::Run;
         m
@@ -535,22 +650,36 @@ impl Machine {
         self.soc.set_hdmi_connected(self.model, true);
     }
 
-    /// The VideoCore IV 3D block is modelled (the device tree then lists it next to the display
-    /// pipeline). Not yet: the `vc4-3d` crate hooks in here.
-    pub fn has_v3d(&self) -> bool { false }
+    /// The VideoCore IV 3D block is modelled (`vc4-3d`): the device tree lists it next to the
+    /// display pipeline, for vc4's DRM device to bind as one of its components.
+    pub fn has_v3d(&self) -> bool { true }
 
     /// Plug the HDMI monitor in or out (the driver polls the hot-plug line).
     pub fn set_hdmi_connected(&mut self, on: bool) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
 
     /// Plug the Ethernet port into sbc-net's virtual network (DHCP, DNS); `nat` also relays
     /// guest TCP/UDP to the host's network (native builds only). Boards without Ethernet
-    /// ignore it.
+    /// ignore it. The Wi-Fi's access points get a network of their own (isolated: DHCP, DNS
+    /// and local services), as on the Pi 4.
     pub fn connect_network(&mut self, nat: bool, log: bool) {
-        let mut net = sbc_net::net::VirtualNet::new(log);
-        #[cfg(not(target_arch = "wasm32"))]
-        if nat { net.nat = Some(sbc_net::nat::Nat::new(log)); }
+        if self.soc.tree.lan_ref().is_some() {
+            let mut net = sbc_net::net::VirtualNet::new(log);
+            #[cfg(not(target_arch = "wasm32"))]
+            if nat { net.nat = Some(sbc_net::nat::Nat::new(log)); }
+            self.soc.net = Some(net);
+        }
         let _ = nat;
-        self.soc.net = Some(net);
+        if self.soc.wireless { self.soc.wifi_net = Some(sbc_net::net::VirtualNet::new(log)); }
+    }
+
+    /// Bluetooth on UART0, as on the board (`--no-bluetooth` leaves UART0 a serial port).
+    pub fn enable_bluetooth(&mut self) { if self.soc.wireless { self.soc.bt = Some(bcm2711::bluetooth::Bluetooth::new()); } }
+
+    /// Log the Wi-Fi chip's host interface (`--trace-wifi`) and the SDIO commands (`--trace-sdio`).
+    pub fn trace_wifi(&mut self, wifi: bool, sdio: bool) {
+        self.soc.wifi_trace = wifi;
+        self.soc.sdhci.trace = sdio;
+        if let Some(c) = self.soc.sdhci.sdio.as_mut() { c.set_trace(wifi); }
     }
 
     /// Relay host TCP address `host` to the guest's TCP `guest_port` (QEMU's hostfwd); needs
@@ -980,7 +1109,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Result<Vec<u8>, String> {
         let mut w = emu_core::snap::W::default();
-        w.tag("pi3-machine-v4");
+        w.tag("pi3-machine-v6");
         w.u8(self.model as u8);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -994,18 +1123,25 @@ impl Machine {
         self.soc.aux.save_state(&mut w);
         self.soc.mbox.save_state(&mut w);
         self.soc.sd.save_state(&mut w);
+        // the expander's lines (the Wi-Fi chip's power), the Wi-Fi's host and chip, Bluetooth
+        w.u8(self.soc.mbox.exp_gpio_out); w.u8(self.soc.mbox.exp_gpio_in);
+        w.bool(self.soc.sdhci.sdio.is_some());
+        self.soc.sdhci.save_state(&mut w);
+        w.bool(self.soc.bt.is_some());
+        if let Some(bt) = self.soc.bt.as_ref() { bt.save_state(&mut w); }
         self.soc.rng.save_state(&mut w);
         self.soc.pm.save_state(&mut w);
         self.soc.usb.save_state(&mut w);
         { use emu_core::snap::Snap; self.soc.devs.save(&mut w); self.soc.tree.save(&mut w); }
         for r in self.soc.asb { w.u32(r); }
-        // v3: GPIO, DMA, the display pipeline
+        // GPIO, DMA, the display pipeline
         self.soc.gpio.save_state(&mut w);
         self.soc.dma.save_state(&mut w);
         w.bool(self.soc.vc4.is_some());
         if let Some(v) = self.soc.vc4.as_ref() { v.save_state(&mut w); }
-        // v4: VCHIQ and the VideoCore's services
+        // VCHIQ and the VideoCore's services, the 3D GPU
         self.soc.vchiq.save_state(&mut w);
+        self.soc.v3d.save_state(&mut w);
         emu_core::snap::save_ram(&mut w, &self.soc.ram);
         let mut out = SNAP_MAGIC.to_vec();
         out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&w.0, 1));
@@ -1018,12 +1154,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("the snapshot is damaged ({:?})", e.status))?;
         let e = |e: emu_core::snap::SnapError| e.0;
         let mut r = emu_core::snap::R::new(&raw);
-        let (v3, v4) = match r.bytes().map_err(e)? {
-            b"pi3-machine-v4" => (true, true),
-            b"pi3-machine-v3" => (true, false),
-            b"pi3-machine-v2" => (false, false),
-            _ => return Err("snapshot layout mismatch: not a Raspberry Pi 3 machine state".into()),
-        };
+        // v6: the card on sdhost, the wireless chips, VCHIQ and the VideoCore's services, the 3D
+        // GPU (older layouts had the card on the Arasan, no VCHIQ or no V3D)
+        r.tag("pi3-machine-v6").map_err(e)?;
         let model = r.u8().map_err(e)?;
         if model != self.model as u8 { return Err(format!("the snapshot is of another model (this machine: --model {})", self.model.id())); }
         let (now, exceptions, irqs) = (r.u64().map_err(e)?, r.u64().map_err(e)?, r.u64().map_err(e)?);
@@ -1049,29 +1182,83 @@ impl Machine {
         self.soc.aux.load_state(&mut r).map_err(e)?;
         self.soc.mbox.load_state(&mut r).map_err(e)?;
         self.soc.sd.load_state(&mut r).map_err(e)?;
+        self.soc.mbox.exp_gpio_out = r.u8().map_err(e)?; self.soc.mbox.exp_gpio_in = r.u8().map_err(e)?;
+        let wifi_on = r.bool().map_err(e)?;
+        if wifi_on && !self.soc.wireless { return Err("the snapshot has a Wi-Fi chip this machine lacks".into()); }
+        // the chip as the snapshot has it: powered (its state follows) or not
+        self.soc.sdhci.sdio = None;
+        self.soc.power_lines();
+        if wifi_on != self.soc.sdhci.sdio.is_some() { return Err("the snapshot's Wi-Fi power does not match its expander".into()); }
+        self.soc.sdhci.load_state(&mut r).map_err(e)?;
+        if r.bool().map_err(e)? {
+            let bt = self.soc.bt.get_or_insert_with(bcm2711::bluetooth::Bluetooth::new);
+            bt.load_state(&mut r).map_err(e)?;
+        } else {
+            self.soc.bt = None;
+        }
         self.soc.rng.load_state(&mut r).map_err(e)?;
         self.soc.pm.load_state(&mut r).map_err(e)?;
         self.soc.usb.load_state(&mut r, &mut self.soc.devs.kbd, false).map_err(e)?;
         { use emu_core::snap::Snap; self.soc.devs.load(&mut r).map_err(e)?; self.soc.tree.load(&mut r).map_err(e)?; }
         for x in self.soc.asb.iter_mut() { *x = r.u32().map_err(e)?; }
-        if v3 {
-            self.soc.gpio.load_state(&mut r).map_err(e)?;
-            self.soc.dma.load_state(&mut r).map_err(e)?;
-            let kms = r.bool().map_err(e)?;
-            if kms != self.soc.vc4.is_some() {
-                return Err(format!("the snapshot was taken with --display {} (this machine: --display {})", if kms { "kms" } else { "fb" }, if kms { "fb" } else { "kms" }));
-            }
-            if let Some(v) = self.soc.vc4.as_mut() { v.load_state(&mut r).map_err(e)?; }
-            // the DDC bus's EEPROM follows the restored monitor
-            if let Some(on) = self.soc.vc4.as_ref().map(|v| v.connected) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
-            self.soc.pace_next = Some(0);
+        self.soc.gpio.load_state(&mut r).map_err(e)?;
+        self.soc.dma.load_state(&mut r).map_err(e)?;
+        let kms = r.bool().map_err(e)?;
+        if kms != self.soc.vc4.is_some() {
+            return Err(format!("the snapshot was taken with --display {} (this machine: --display {})", if kms { "kms" } else { "fb" }, if kms { "fb" } else { "kms" }));
         }
+        if let Some(v) = self.soc.vc4.as_mut() { v.load_state(&mut r).map_err(e)?; }
+        // the DDC bus's EEPROM follows the restored monitor
+        if let Some(on) = self.soc.vc4.as_ref().map(|v| v.connected) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
+        self.soc.pace_next = Some(0);
         self.soc.vchiq = crate::vchiq::Vchiq::new();
-        if v4 { self.soc.vchiq.load_state(&mut r).map_err(e)?; }
+        self.soc.vchiq.load_state(&mut r).map_err(e)?;
+        self.soc.v3d.load_state(&mut r).map_err(e)?;
         emu_core::snap::load_ram(&mut r, &mut self.soc.ram).map_err(e)?;
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }
         self.next_check = 0;
         self.soc.dirty = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_core::disk::{Disk, Overlay};
+
+    /// An image that stays unchanged under a copy-on-write overlay, as `--sd` without
+    /// `--sd-persist` opens it; the overlay is shared with the test so it can look at it.
+    struct Cow(std::rc::Rc<std::cell::RefCell<Overlay>>);
+    impl Disk for Cow {
+        fn sectors(&self) -> u64 { 2048 }
+        fn read(&mut self, lba: u64, out: &mut [u8]) { out.fill(0xaa); self.0.borrow().apply(lba, out); }
+        fn write(&mut self, lba: u64, data: &[u8]) { self.0.borrow_mut().store(lba, data, 2048); }
+        fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.0.borrow().sorted() }
+        fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { self.0.borrow_mut().replace(sectors, 2048); }
+    }
+
+    /// A snapshot of a copy-on-write card carries what the guest wrote: a restore brings those
+    /// sectors back and drops the ones written after the snapshot (else the restored guest's
+    /// page cache and the card disagree).
+    #[test]
+    fn snapshots_carry_the_cards_written_sectors() {
+        let ov = std::rc::Rc::new(std::cell::RefCell::new(Overlay::default()));
+        let mut m = Machine::new(Model::B3Plus, 128 << 20, 1);
+        m.soc.sd = Sdhost::new(Some(Box::new(Cow(ov.clone()))));
+        m.soc.sd.disk.as_mut().unwrap().write(7, &[1; 512]);
+        let snap = m.save().unwrap();
+        m.soc.sd.disk.as_mut().unwrap().write(7, &[2; 512]);
+        m.soc.sd.disk.as_mut().unwrap().write(9, &[3; 512]);
+        m.restore(&snap).unwrap();
+        assert_eq!(ov.borrow().sorted(), vec![(7, vec![1; 512])]);
+        // into a fresh machine on the same image (another run): the sectors come with it
+        let ov2 = std::rc::Rc::new(std::cell::RefCell::new(Overlay::default()));
+        let mut m2 = Machine::new(Model::B3Plus, 128 << 20, 1);
+        m2.soc.sd = Sdhost::new(Some(Box::new(Cow(ov2.clone()))));
+        m2.restore(&snap).unwrap();
+        let mut s = [0u8; 512];
+        m2.soc.sd.disk.as_mut().unwrap().read(7, &mut s);
+        assert_eq!(s, [1; 512]);
     }
 }
