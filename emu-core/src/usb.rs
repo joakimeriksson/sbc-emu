@@ -439,7 +439,7 @@ impl UsbDevice for Storage {
 
 /// The devices that exist, and which controller port each one is plugged into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum DevId { #[default] Keyboard, Tablet, Storage, Camera, Net }
+pub enum DevId { #[default] Keyboard, Tablet, Storage, Camera, Net, Serial }
 
 #[derive(Default)]
 pub struct Devices {
@@ -448,6 +448,7 @@ pub struct Devices {
     pub storage: Option<Storage>,
     pub camera: Option<Camera>,
     pub net: Option<Net>,
+    pub serial: Option<Serial>,
 }
 
 impl Devices {
@@ -458,6 +459,7 @@ impl Devices {
             DevId::Storage => self.storage.as_mut().map(|s| s as &mut dyn UsbDevice),
             DevId::Camera => self.camera.as_mut().map(|s| s as &mut dyn UsbDevice),
             DevId::Net => self.net.as_mut().map(|s| s as &mut dyn UsbDevice),
+            DevId::Serial => self.serial.as_mut().map(|s| s as &mut dyn UsbDevice),
         }
     }
 
@@ -470,13 +472,14 @@ impl Devices {
             DevId::Storage => false,
             DevId::Camera => self.camera.as_ref().is_some_and(|c| c.has_input()),
             DevId::Net => self.net.as_ref().is_some_and(|n| n.has_input()),
+            DevId::Serial => self.serial.as_ref().is_some_and(|n| n.has_input()),
         }
     }
 }
 
 // ---------------------------------------------------------------------- snapshots
 
-crate::snap_enum!(DevId { Keyboard, Tablet, Storage, Camera, Net });
+crate::snap_enum!(DevId { Keyboard, Tablet, Storage, Camera, Net, Serial });
 crate::snap_struct!(Std { address, pending_address, configured, pending_in });
 crate::snap_struct!(Keyboard { st, held, modifiers, events, last, leds });
 crate::snap_struct!(Tablet { st, events, last, state });
@@ -497,18 +500,18 @@ impl crate::snap::Snap for Storage {
 /// All of it, pending input included (`save_state` is the Pi 4's older format).
 impl crate::snap::Snap for Devices {
     fn save(&self, w: &mut crate::snap::W) {
-        let Self { kbd, tablet, storage, camera, net } = self;
+        let Self { kbd, tablet, storage, camera, net, serial } = self;
         kbd.save(w); tablet.save(w);
         crate::snap::save_fitted(w, storage);
         // one flag for the devices this format leaves out (refused on load)
-        w.bool(camera.is_some() || net.is_some());
+        w.bool(camera.is_some() || net.is_some() || serial.is_some());
     }
     fn load(&mut self, r: &mut crate::snap::R) -> Result<(), crate::snap::SnapError> {
-        let Self { kbd, tablet, storage, camera, net } = self;
+        let Self { kbd, tablet, storage, camera, net, serial } = self;
         kbd.load(r)?; tablet.load(r)?;
         crate::snap::load_fitted(r, storage, "a USB stick (--usb-drive)")?;
-        if r.bool()? || camera.is_some() || net.is_some() {
-            return Err(crate::snap::SnapError("the USB camera and the USB Ethernet adapter are not in this snapshot format".into()));
+        if r.bool()? || camera.is_some() || net.is_some() || serial.is_some() {
+            return Err(crate::snap::SnapError("the USB camera, Ethernet adapter and serial port are not in this snapshot format".into()));
         }
         Ok(())
     }
@@ -922,5 +925,119 @@ mod net_tests {
         assert_eq!(d.take_tx(), vec![vec![5; 1514]]);
         d.bus_reset();
         assert!(!d.has_input());
+    }
+}
+
+// ---------------------------------------------------------------------- the serial port
+
+/// A USB serial port of the CDC-ACM class (Linux's `cdc-acm`: `/dev/ttyACM0`), as USB lidars,
+/// GPS receivers and microcontroller boards present themselves. A byte stream each way on bulk
+/// endpoints; the line coding is kept and reported but does not pace the bytes.
+pub struct Serial {
+    pub st: Std,
+    product: &'static str,
+    /// bytes for the guest, and from it
+    rx: VecDeque<u8>,
+    tx: Vec<u8>,
+    /// SET_LINE_CODING's 7 bytes: rate (LE u32), stop bits, parity, data bits
+    line: [u8; 7],
+    /// SET_CONTROL_LINE_STATE: DTR (bit 0), RTS (bit 1)
+    pub lines: u8,
+}
+
+/// Bytes held for the guest at most; more are dropped, as a UART's overrun would.
+const SERIAL_QUEUE: usize = 1 << 16;
+
+impl Serial {
+    /// `product` is the product string, which Linux shows (and udev rules match).
+    pub fn new(product: &'static str) -> Self {
+        Serial { st: Std::default(), product, rx: VecDeque::new(), tx: Vec::new(), line: [0x00, 0xc2, 0x01, 0x00, 0, 0, 8], lines: 0 }
+    }
+    /// Bytes from outside, for the guest; dropped while it has not configured the port.
+    pub fn push_rx(&mut self, bytes: &[u8]) {
+        if !self.st.configured { return; }
+        let room = SERIAL_QUEUE - self.rx.len();
+        self.rx.extend(&bytes[..bytes.len().min(room)]);
+    }
+    /// The bytes the guest wrote since the last call.
+    pub fn take_tx(&mut self) -> Vec<u8> { std::mem::take(&mut self.tx) }
+    /// The rate the guest set, in baud.
+    pub fn baud(&self) -> u32 { u32::from_le_bytes([self.line[0], self.line[1], self.line[2], self.line[3]]) }
+}
+
+impl UsbDevice for Serial {
+    fn std(&mut self) -> &mut Std { &mut self.st }
+    fn device_desc(&self) -> Vec<u8> { let mut d = device_desc(0x0006, 64, 0x0200); d[4] = 2; d } // class: communications
+    fn config_desc(&self) -> Vec<u8> {
+        let mut d = vec![9, 2, 0, 0, 2, 1, 0, 0x80, 50]; // 2 interfaces, 100 mA
+        d.extend_from_slice(&[9, 4, 0, 0, 1, 0x02, 0x02, 0, 0]); // interface 0: communications, ACM, 1 endpoint
+        d.extend_from_slice(&[5, 0x24, 0x00, 0x10, 0x01]); // CDC header 1.10
+        d.extend_from_slice(&[5, 0x24, 0x01, 0, 1]); // call management: none, data interface 1
+        d.extend_from_slice(&[4, 0x24, 0x02, 0x02]); // ACM: line coding and line state requests
+        d.extend_from_slice(&[5, 0x24, 0x06, 0, 1]); // union: control 0, data 1
+        d.extend_from_slice(&[7, 5, 0x83, 3, 16, 0, 8]); // interrupt IN 3 (serial state; never sent)
+        d.extend_from_slice(&[9, 4, 1, 0, 2, 0x0a, 0, 0, 0]); // interface 1: data, 2 endpoints
+        d.extend_from_slice(&[7, 5, 0x81, 2, 0x00, 0x02, 0]); // bulk IN 1, 512 bytes
+        d.extend_from_slice(&[7, 5, 0x02, 2, 0x00, 0x02, 0]); // bulk OUT 2, 512 bytes
+        let n = d.len() as u16;
+        d[2..4].copy_from_slice(&n.to_le_bytes());
+        d
+    }
+    fn string(&self, i: u8) -> Option<&'static str> { match i { 1 => Some("sbc-emu"), 2 => Some(self.product), 3 => Some("ACM0001"), _ => None } }
+    fn speed(&self) -> Speed { Speed::High }
+    fn class_setup(&mut self, s: [u8; 8]) -> Option<Vec<u8>> {
+        match (s[0], s[1]) {
+            (0x21, 0x20) => Some(Vec::new()), // SET_LINE_CODING: the 7 bytes follow (class_out)
+            (0xa1, 0x21) => Some(self.line.to_vec()), // GET_LINE_CODING
+            (0x21, 0x22) => { self.lines = s[2] & 3; Some(Vec::new()) } // SET_CONTROL_LINE_STATE
+            (0x21, 0x23) => Some(Vec::new()), // SEND_BREAK
+            _ => None,
+        }
+    }
+    fn class_out(&mut self, data: &[u8]) { if let Ok(l) = <[u8; 7]>::try_from(data) { self.line = l; } }
+    fn data_in(&mut self, ep: u8, max: usize) -> Option<Vec<u8>> {
+        if ep != 1 || !self.st.configured || self.rx.is_empty() || max == 0 { return None; }
+        let n = self.rx.len().min(max);
+        Some(self.rx.drain(..n).collect())
+    }
+    fn data_out(&mut self, ep: u8, data: &[u8]) { if ep == 2 && self.tx.len() < SERIAL_QUEUE { self.tx.extend_from_slice(data); } }
+    fn has_input(&self) -> bool { self.st.configured && !self.rx.is_empty() }
+    fn bus_reset(&mut self) { self.st = Std::default(); self.rx.clear(); self.tx.clear(); self.lines = 0; }
+}
+
+#[cfg(test)]
+mod serial_tests {
+    use super::*;
+
+    fn setup(d: &mut Serial, s: [u8; 8]) -> Vec<u8> { assert!(d.setup(s)); d.control_in(4096) }
+
+    /// Enumeration and the requests cdc-acm makes, then bytes both ways.
+    #[test]
+    fn an_acm_port_keeps_its_line_coding_and_passes_bytes() {
+        let mut d = Serial::new("Virtual Lidar");
+        let cfg = setup(&mut d, [0x80, 6, 0, 2, 0, 0, 0xff, 0]);
+        assert_eq!(u16::from_le_bytes([cfg[2], cfg[3]]) as usize, cfg.len());
+        assert_eq!(&cfg[9..18], &[9, 4, 0, 0, 1, 2, 2, 0, 0], "interface 0 is CDC ACM");
+        let name = setup(&mut d, [0x80, 6, 2, 3, 9, 4, 0xff, 0]);
+        assert_eq!(name[2..].chunks(2).map(|c| c[0] as char).collect::<String>(), "Virtual Lidar");
+        d.push_rx(b"early");
+        setup(&mut d, [0x00, 9, 1, 0, 0, 0, 0, 0]);
+        assert!(!d.has_input(), "bytes before the port was configured are dropped");
+        // 230400 baud, 8N1
+        assert!(d.setup([0x21, 0x20, 0, 0, 0, 0, 7, 0]));
+        d.control_out(&[0x00, 0x84, 0x03, 0x00, 0, 0, 8]);
+        assert_eq!(d.baud(), 230_400);
+        assert_eq!(setup(&mut d, [0xa1, 0x21, 0, 0, 0, 0, 7, 0]), [0x00, 0x84, 0x03, 0x00, 0, 0, 8]);
+        setup(&mut d, [0x21, 0x22, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(d.lines, 3);
+        // bytes in, split by the transfer size; bytes out, in order
+        d.push_rx(&[0x54; 100]);
+        assert_eq!(d.data_in(1, 64).map(|b| b.len()), Some(64));
+        assert_eq!(d.data_in(1, 64).map(|b| b.len()), Some(36));
+        assert!(!d.has_input() && d.data_in(1, 64).is_none());
+        d.data_out(2, b"ab");
+        d.data_out(2, b"c");
+        assert_eq!(d.take_tx(), b"abc");
+        assert!(d.take_tx().is_empty());
     }
 }

@@ -415,12 +415,32 @@ impl Machine {
         }
     }
 
+    /// Plug a USB serial port in (CDC-ACM, port 4: `/dev/ttyACM0`).
+    pub fn attach_usb_serial(&mut self, serial: emu_core::usb::Serial) {
+        self.soc.usb.serial = Some(serial);
+        self.enable_usb();
+        self.plug_usb();
+    }
+
+    /// Bytes for the guest on the USB serial port (dropped while the guest has not opened it).
+    pub fn usb_serial_input(&mut self, bytes: &[u8]) {
+        if let Some(s) = self.soc.usb.serial.as_mut() {
+            s.push_rx(bytes);
+        }
+    }
+
+    /// What the guest wrote to the USB serial port since the last call.
+    pub fn take_usb_serial_output(&mut self) -> Vec<u8> {
+        self.soc.usb.serial.as_mut().map(|s| s.take_tx()).unwrap_or_default()
+    }
+
     fn plug_usb(&mut self) {
         use emu_core::usb::DevId;
         let devs = [
             self.soc.usb.storage.is_some().then_some(DevId::Storage),
             self.soc.usb.camera.is_some().then_some(DevId::Camera),
             self.soc.usb.net.is_some().then_some(DevId::Net),
+            self.soc.usb.serial.is_some().then_some(DevId::Serial),
         ];
         if let Some(xhci) = self.soc.xhci.as_mut() {
             xhci.attach(&devs);
