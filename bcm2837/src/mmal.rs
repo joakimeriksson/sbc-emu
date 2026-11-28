@@ -267,6 +267,8 @@ pub struct Mmal {
     pub pictures: u64,
     pub buffers: u64,
     pub trace: bool,
+    /// where `ril.video_decode` gets its decoder (`video::decoder_for`; the tests pin the stand-in)
+    pub decoders: fn(u32) -> Option<Box<dyn VideoDecoder>>,
 }
 
 impl Default for Mmal { fn default() -> Self { Self::new() } }
@@ -282,7 +284,7 @@ fn reply(req: &[u8], body: &[u8]) -> Vec<u8> {
 
 impl Mmal {
     pub fn new() -> Self {
-        Mmal { components: Vec::new(), next_handle: 1, smem: Smem::default(), pictures: 0, buffers: 0, trace: std::env::var_os("SBC_MMAL_TRACE").is_some() }
+        Mmal { components: Vec::new(), next_handle: 1, smem: Smem::default(), pictures: 0, buffers: 0, trace: std::env::var_os("SBC_MMAL_TRACE").is_some(), decoders: video::decoder_for }
     }
 
     /// The connection on `port` closed: its components go.
@@ -318,7 +320,11 @@ impl Mmal {
                             ports.push(Port::new(PORT_OUTPUT, k as u32, handle << 4 | (1 + ni + k) as u32, f));
                         }
                         for p in ports.iter_mut().filter(|p| p.ptype != PORT_CONTROL) { p.es[ES_COLOUR] = video::BT601; p.es[8] = 1; p.es[9] = 1; }
-                        self.components.push(Component { handle, owner: port, client: w(0), kind, enabled: false, ports, inputs: ni, decoder: None, frames: VecDeque::new(), announced: None, eos: false, held: VecDeque::new() });
+                        // a new component moves buffers as soon as its ports are enabled: Linux's
+                        // mmal-vchiq reuses its component slots without clearing their `enabled`
+                        // flag, so the second codec session after a boot never sends
+                        // COMPONENT_ENABLE (and works on a real Pi all the same)
+                        self.components.push(Component { handle, owner: port, client: w(0), kind, enabled: true, ports, inputs: ni, decoder: None, frames: VecDeque::new(), announced: None, eos: false, held: VecDeque::new() });
                         if self.trace { eprintln!("[mmal] {name}: component {handle}"); }
                         out.data(port, reply(m, &words(&[ST_SUCCESS, handle, ni as u32, no as u32, 0])));
                     }
@@ -419,8 +425,9 @@ impl Mmal {
             }
             BUFFER_FROM_HOST => {
                 let (ch, ph) = (get32(m, buf::DRV_COMPONENT), get32(m, buf::DRV_PORT));
-                let Some(k) = self.components.iter().position(|c| c.handle == ch) else { return };
-                let Some(i) = self.components[k].ports.iter().position(|p| p.handle == ph) else { return };
+                let found = self.components.iter().position(|c| c.handle == ch).and_then(|k| Some((k, self.components[k].ports.iter().position(|p| p.handle == ph)?)));
+                if self.trace { eprintln!("[mmal] buffer for component {ch} port {ph:#x}: {}", if found.is_some() { "queued" } else { "no such port" }); }
+                let Some((k, i)) = found else { return };
                 let mut msg = m.to_vec();
                 msg.resize(buf::SIZE, 0);
                 self.components[k].ports[i].bufs.push_back(msg);
@@ -541,12 +548,15 @@ impl Mmal {
             let data = self.input_data(k, inp, &b, ram);
             let flags = get32(&b, buf::FLAGS);
             let pts = Some(get64(&b, buf::PTS)).filter(|&t| t != TIME_UNKNOWN);
+            let trace = self.trace;
             let c = &mut self.components[k];
-            if c.decoder.is_none() { c.decoder = video::decoder_for(c.ports[inp].encoding); }
+            if c.decoder.is_none() { c.decoder = (self.decoders)(c.ports[inp].encoding); }
             if let Some(d) = c.decoder.as_mut() {
                 if !data.is_empty() { d.push(&data, pts); }
                 if flags & FLAG_EOS != 0 { d.flush(); }
+                let before = c.frames.len();
                 while let Some(p) = d.pop() { c.frames.push_back(p); }
+                if trace { eprintln!("[mmal] component {}: {} bytes in (flags {flags:#x}, pts {pts:?}), {} pictures out", c.handle, data.len(), c.frames.len() - before); }
             }
             if flags & FLAG_EOS != 0 { c.eos = true; }
             // the buffer comes back once what it gave is out (after the format-changed event,
@@ -557,6 +567,30 @@ impl Mmal {
         self.decoder_output(k, ram, out);
     }
 
+    /// The format-changed event for pictures of `w` x `h` (`visible` of it shown), unless that
+    /// is the format announced last: the output port then has it.
+    fn announce(&mut self, k: usize, w: u32, h: u32, visible: (u32, u32), out: &mut Outbox) {
+        let outp = 2;
+        let c = &mut self.components[k];
+        let coded = ((w + 31) & !31, h);
+        let key = (coded.0, coded.1, visible.0, visible.1);
+        if c.announced == Some(key) { return; }
+        c.announced = Some(key);
+        let enc = c.ports[outp].encoding;
+        let po = &mut c.ports[outp];
+        po.es[ES_W] = coded.0;
+        po.es[ES_H] = coded.1;
+        po.es[2] = 0;
+        po.es[3] = 0;
+        po.es[ES_CROP_W] = visible.0;
+        po.es[ES_CROP_H] = visible.1;
+        let size = video::frame_size(enc, coded.0, coded.1).unwrap_or(0);
+        let mut ev = words(&[size, 1, size, 3, 0]);
+        ev.extend(po.format_bytes());
+        let (client, owner) = (c.client, c.owner);
+        out.data(owner, event(client, PORT_OUTPUT, 0, EVENT_FORMAT_CHANGED, &ev));
+    }
+
     /// Decoded pictures into the output port's buffers; the format-changed event first when the
     /// stream's size is new; the end of stream once every picture before it is out.
     fn decoder_output(&mut self, k: usize, ram: &mut [u8], out: &mut Outbox) {
@@ -564,25 +598,8 @@ impl Mmal {
         loop {
             let c = &mut self.components[k];
             let Some(p) = c.frames.front() else { break };
-            let coded = ((p.width + 31) & !31, p.height);
-            let key = (coded.0, coded.1, p.visible.0, p.visible.1);
-            if c.announced != Some(key) {
-                // the stream's format, as the decoder's output port now has it
-                c.announced = Some(key);
-                let enc = c.ports[outp].encoding;
-                let po = &mut c.ports[outp];
-                po.es[ES_W] = coded.0;
-                po.es[ES_H] = coded.1;
-                po.es[2] = 0;
-                po.es[3] = 0;
-                po.es[ES_CROP_W] = p.visible.0;
-                po.es[ES_CROP_H] = p.visible.1;
-                let size = video::frame_size(enc, coded.0, coded.1).unwrap_or(0);
-                let mut ev = words(&[size, 1, size, 3, 0]);
-                ev.extend(po.format_bytes());
-                let (client, owner) = (c.client, c.owner);
-                out.data(owner, event(client, PORT_OUTPUT, 0, EVENT_FORMAT_CHANGED, &ev));
-            }
+            let (w, h, visible) = (p.width, p.height, p.visible);
+            self.announce(k, w, h, visible, out);
             let c = &self.components[k];
             let p = c.frames.front().unwrap();
             let po = &c.ports[outp];
@@ -602,6 +619,11 @@ impl Mmal {
             let flags = FLAG_FRAME_END | if p.keyframe { FLAG_KEYFRAME } else { 0 };
             self.pictures += 1;
             self.emit(k, outp, b, &data, flags, p.pts, ram, out);
+        }
+        // the pictures to come: their format as soon as the decoder knows it
+        let c = &self.components[k];
+        if let (true, Some((w, h, visible))) = (c.frames.is_empty(), c.decoder.as_ref().and_then(|d| d.format())) {
+            self.announce(k, w, h, visible, out);
         }
         let c = &mut self.components[k];
         if c.eos && c.frames.is_empty() && c.ports[outp].enabled {
@@ -763,7 +785,13 @@ mod tests {
     struct Client { mmal: Mmal, ram: Vec<u8>, ctx: u32 }
 
     impl Client {
-        fn new() -> Client { Client { mmal: Mmal::new(), ram: vec![0; 16 << 20], ctx: 0 } }
+        fn new() -> Client {
+            // these tests are about the plumbing: the stand-in's one picture per coded picture,
+            // with or without the h264 feature
+            let mut mmal = Mmal::new();
+            mmal.decoders = |e| (e == video::H264).then(|| Box::new(video::TestPatternDecoder::default()) as Box<dyn VideoDecoder>);
+            Client { mmal, ram: vec![0; 16 << 20], ctx: 0 }
+        }
         fn msg(&mut self, t: u32, body: &[u8]) -> Vec<u8> {
             self.ctx += 1;
             let mut m = words(&[MAGIC, t, 0, self.ctx, 0, 0]);
@@ -960,6 +988,52 @@ mod tests {
         let outs = c.buffer(dec, pout, out_h, 1 << 16, 0, 0, TIME_UNKNOWN);
         let ports: Vec<u32> = outs.iter().map(|o| match o { Out::Data(d) => get32(d, buf::DRV_PORT), _ => 0 }).collect();
         assert_eq!(ports, vec![pout, pin]);
+    }
+
+    /// With the real decoder: the format is announced once the first picture starts, though
+    /// reordering holds that picture back (as the firmware does; v4l2-ctl and the codec driver
+    /// set up the capture side on that event, and would not after the end of stream).
+    #[cfg(feature = "h264")]
+    #[test]
+    fn h264_announces_its_format_before_the_first_picture_is_out() {
+        let mut c = Client::new();
+        c.mmal.decoders = video::decoder_for;
+        let (dec, _, _) = c.create("ril.video_decode");
+        let pin = port_handle(&c.port(dec, PORT_INPUT, 0));
+        let pout = port_handle(&c.port(dec, PORT_OUTPUT, 0));
+        assert_eq!(c.set_format(dec, PORT_INPUT, 0, video::H264, 0, 0, 512 << 10), ST_SUCCESS);
+        for p in [pin, pout] { c.param_set(dec, p, PARAM_ZERO_COPY, &words(&[1])); }
+        c.action(dec, pin, ACTION_ENABLE);
+        c.action(dec, pout, ACTION_ENABLE);
+        // our 96x64 High-profile stream (B-pyramid): its first access unit alone
+        let stream: &[u8] = include_bytes!("../tests/data/h264-high-96x64.264");
+        let aud: Vec<usize> = (0..stream.len() - 4).filter(|&k| stream[k..k + 4] == [0, 0, 1, 9]).collect();
+        let first = aud[1] - 1;
+        let in_h = c.import(0x10_0000, 1 << 16);
+        write_bytes(&mut c.ram, 0x10_0000, &stream[..first]);
+        let outs = c.buffer(dec, pin, in_h, 1 << 16, first as u32, 0, 0);
+        let msgs: Vec<&Vec<u8>> = outs.iter().map(|o| match o { Out::Data(d) => d, _ => panic!("zero copy") }).collect();
+        assert_eq!(msgs.len(), 2, "the event and the input buffer back, no picture yet");
+        let ev = msgs[0];
+        assert_eq!((get32(ev, 4), get32(ev, 36)), (EVENT_TO_HOST, EVENT_FORMAT_CHANGED));
+        let d = &ev[44..];
+        assert_eq!((get32(d, 0x34), get32(d, 0x38), get32(d, 0x44), get32(d, 0x48)), (96, 64, 96, 64));
+        assert_eq!(get32(msgs[1], buf::DRV_PORT), pin);
+        // the rest and the end of stream: all 30 pictures, then the end of stream
+        write_bytes(&mut c.ram, 0x10_0000, &stream[first..]);
+        c.buffer(dec, pin, in_h, 1 << 16, (stream.len() - first) as u32, 0, 0);
+        c.buffer(dec, pin, in_h, 1 << 16, 0, FLAG_EOS, TIME_UNKNOWN);
+        let out_h = c.import(0x40_0000, 1 << 16);
+        let (mut pictures, mut eos) = (0, false);
+        for _ in 0..31 {
+            for o in c.buffer(dec, pout, out_h, 1 << 16, 0, 0, TIME_UNKNOWN) {
+                let Out::Data(m) = o else { continue };
+                if get32(&m, 4) != BUFFER_TO_HOST || get32(&m, buf::DRV_PORT) != pout { continue; }
+                if get32(&m, buf::LENGTH) == 96 * 64 * 3 / 2 { pictures += 1; }
+                if get32(&m, buf::FLAGS) & FLAG_EOS != 0 { eos = true; }
+            }
+        }
+        assert_eq!((pictures, eos), (30, true));
     }
 
     #[test]

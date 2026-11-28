@@ -194,6 +194,8 @@ Each ends with something a script checks, as on the other boards.
 - ~~Start with the 3 Model B+ or the 3 Model B?~~ Decided 2026-11-27: the 3 Model B+.
 - ~~Is VideoCore IV 3D in scope?~~ Decided 2026-11-27: full support for HDMI, the 3D GPU and video.
 - ~~Video decode on the host: Rust or ffmpeg?~~ Decided 2026-11-27: an H.264 decoder in Rust; a
-  crate if one passes the evaluation above, our own otherwise.
+  crate if one passes the evaluation above, our own otherwise. Evaluated 2026-11-28
+  ([results](h264-decoder-eval.md)): `rust_h264` 0.6.1 decodes all 176 8-bit 4:2:0 conformance
+  streams as FFmpeg does, interlaced included; it is the decoder, behind the opt-in `h264` feature.
 - 32-bit Raspberry Pi OS: worth doing?
 - Who owns it: add a row to the areas table in `AGENTS.md` when work starts.

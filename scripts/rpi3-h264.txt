@@ -1,0 +1,66 @@
+# Raspberry Pi 3 Model B+ (milestone 9 of docs/rpi3-plan.md): H.264 decode through the firmware's
+# decoder (VCHIQ, MMAL ril.video_decode, bcm2835-codec's /dev/video10), decoded on the host by
+# the h264 feature's decoder (docs/h264-decoder-eval.md), on the stock Raspberry Pi OS Lite:
+# - bit-exact: our own 320x240 High-profile stream (bcm2837/tests/data/h264-high-320x240.264:
+#   CABAC, 8x8 transforms, weighted prediction, B-pyramid; 60 pictures) through v4l2-ctl to YU12,
+#   the MD5 of what FFmpeg decodes from it on the host;
+# - bit-exact at 1080p: a 1920x1080 High-profile stream from libx264 through the player below
+#   writing every picture's visible part, against FFmpeg's decode on the host;
+# - playback: tools/rpi3-h264-play.c (built in the guest with its gcc) decodes the 1080p stream
+#   into buffers it hands to the vc4 driver as YUV420 framebuffers (dma-buf, no copy) and shows
+#   one per frame period on an HVS overlay plane: all 300 pictures at 30 fps, none late; a
+#   screenshot of one in out/rpi3-h264-play.png.
+#
+# Needs the emulator built with the h264 feature, the 1080p stream and its reference MD5 made
+# on the host (FFmpeg with libx264; the stream is not in git), and an HTTP server on the host's
+# IPv4 loopback serving the repository, which the guest reaches through the NAT's gateway:
+#   cargo build --release --features h264
+#   ffmpeg -f lavfi -i testsrc2=s=1920x1080:r=30:d=10 -c:v libx264 -profile:v high -preset fast \
+#       -b:v 6M -pix_fmt yuv420p out/rpi3-h264-1080p.264
+#   ffmpeg -i out/rpi3-h264-1080p.264 -f rawvideo -pix_fmt yuv420p - | md5sum | cut -c 1-32 \
+#       > out/rpi3-h264-1080p.md5          (macOS: md5 -q instead of md5sum | cut)
+#   python3 -m http.server 8733 --bind 127.0.0.1 --directory . &
+#   sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-h264.txt --timeout 1200
+wait-serial raspberrypi login:
+# the first-boot wizard on HDMI, answered with the USB keyboard
+wait-pixel 10 700 0000aa
+wait-idle 3
+type \n
+sleep 6
+type pi\n
+sleep 6
+type raspberry\n
+sleep 6
+type raspberry\n
+sleep 8
+type \n
+sleep 10
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial sudo -k; sudo -s\r
+wait-serial password for pi
+serial raspberry\r
+wait-serial root@raspberrypi
+# the streams, the reference and the player from the host
+serial cd /tmp; H=http://$(ip route | awk '/default/ { print $3 }'):8733; wget -q -O q.264 $H/bcm2837/tests/data/h264-high-320x240.264 && wget -q -O hd.264 $H/out/rpi3-h264-1080p.264 && wget -q -O hd.md5 $H/out/rpi3-h264-1080p.md5 && wget -q -O play.c $H/tools/rpi3-h264-play.c && gcc -O2 -Wall -o play play.c && echo FETCH_$((1))_OK\r
+wait-serial FETCH_1_OK
+# 320x240 through v4l2-ctl, against FFmpeg's decode (6912000 bytes: 60 pictures)
+serial v4l2-ctl -d /dev/video10 --set-fmt-video-out=pixelformat=H264 --set-fmt-video=width=320,height=240,pixelformat=YU12 --stream-mmap --stream-out-mmap --stream-from=q.264 --stream-to=q.yuv 2>&1 | tr -d '<>KPB' | grep --color=never -E 'EVENT|rror'; echo QVGA_$(md5sum < q.yuv | cut -c 1-32)_$(stat -c %s q.yuv)_END\r
+wait-serial QVGA_5de407d726168b09997594653af1d7aa_6912000_END
+# 1080p, every picture, against FFmpeg's decode
+serial ./play -o - hd.264 | md5sum | cut -c 1-32 > hd.got; cat hd.got; [ "$(cat hd.got)" = "$(cut -c 1-32 hd.md5)" ] && echo HD_BITEXACT_$((1))\r
+wait-serial HD_BITEXACT_1
+# playback on an HVS YUV plane at the stream's rate
+serial (./play hd.264 30 > play.log 2>&1 &); sleep 4; echo PLANE_YU12_$(grep -c 'format=YU12' /sys/kernel/debug/dri/0/state)\r
+wait-serial PLANE_YU12_1
+screenshot out/rpi3-h264-play.png
+serial while pgrep -x play > /dev/null; do sleep 1; done; cat play.log; grep -q 'PLAYED frames=300 .* late=0 ' play.log && echo PLAY_$((2))_OK\r
+wait-serial PLAY_2_OK
+serial echo FAIL_$(dmesg | grep -ciE 'oops|vchiq.*(fail|error)|mmal.*(fail|error)|codec.*fail')_END\r
+wait-serial FAIL_0_END
+sleep 1
+quit

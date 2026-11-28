@@ -29,6 +29,11 @@ jobs:
         run: SBC_JIT=1 cargo test --release -p arm-a64
       - name: Release build
         run: cargo build --release
+      # the Raspberry Pi 3's H.264 decoder (opt-in: docs/raspberry-pi-3.md#video-decode)
+      - name: With the h264 feature
+        run: |
+          cargo test --release -p bcm2837 --features h264
+          cargo build --release --features h264
 
   linux:
     name: Linux x86-64 - tests, A64 JIT to x86-64
@@ -40,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --release --workspace
+      - name: Tests with the h264 feature (the decoder's x86-64 paths)
+        run: cargo test --release -p bcm2837 --features h264
       # the A64 JIT's x86-64 backend: every arm-a64 test with it on (its differential test
       # against the interpreter and its encoder test against llvm-mc run in the step above)
       - name: JIT on for the CPU tests too
@@ -57,6 +64,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the browser build
         run: cargo check --target wasm32-unknown-unknown -p sbc-emu-wasm
+      - name: The Raspberry Pi 3 crate, without and with the h264 feature
+        run: |
+          cargo check --target wasm32-unknown-unknown -p bcm2837
+          cargo check --target wasm32-unknown-unknown -p bcm2837 --features h264
       - uses: actions/setup-node@v4
         with:
           node-version: 22

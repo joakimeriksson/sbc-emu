@@ -2,11 +2,11 @@
 //! carry, conversion and scaling between them (the ISP), and the interface the video decoder
 //! behind `ril.video_decode` implements.
 //!
-//! The H.264 decoder itself is not here yet. `TestPatternDecoder` stands in for it: it reads
-//! the stream's sequence parameter sets for the picture size and emits one test picture (colour
-//! bars with a moving marker) per coded picture, so the whole V4L2 path (`bcm2835-codec`,
-//! format negotiation, the source-change event, buffer exchange, end of stream) runs as it will
-//! with the real decoder.
+//! The H.264 decoder is in `h264.rs`, behind the `h264` cargo feature. Without it
+//! `TestPatternDecoder` stands in: it reads the stream's sequence parameter sets for the picture
+//! size and emits one test picture (colour bars with a moving marker) per coded picture, so the
+//! whole V4L2 path (`bcm2835-codec`, format negotiation, the source-change event, buffer
+//! exchange, end of stream) runs as with the real decoder.
 
 /// MMAL four-character codes (`MMAL_FOURCC`: first character in the low byte).
 pub const fn mmal_fourcc(s: &[u8; 4]) -> u32 { s[0] as u32 | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24 }
@@ -327,11 +327,20 @@ pub trait VideoDecoder: Send {
     /// Forget the stream (the port was flushed or disabled): the next data starts afresh and
     /// must begin with parameter sets.
     fn reset(&mut self);
+    /// The format of the pictures to come, once the stream's parameter sets say it: coded width
+    /// and height, and the visible size. The firmware announces a new format when it starts on
+    /// a picture, before that picture is out (a decoder that holds pictures for reordering
+    /// would otherwise announce it late); None if not known (the first picture announces it).
+    fn format(&self) -> Option<(u32, u32, (u32, u32))> { None }
 }
 
-/// The decoders this build has, by input encoding.
+/// The decoders this build has, by input encoding: H.264 with the `h264` feature (`h264.rs`),
+/// otherwise the stand-in.
 pub fn decoder_for(encoding: u32) -> Option<Box<dyn VideoDecoder>> {
     match encoding {
+        #[cfg(feature = "h264")]
+        H264 => Some(Box::new(crate::h264::H264Decoder::default())),
+        #[cfg(not(feature = "h264"))]
         H264 => Some(Box::new(TestPatternDecoder::default())),
         _ => None,
     }

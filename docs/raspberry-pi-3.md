@@ -6,9 +6,9 @@ cores: its first-boot wizard runs on the framebuffer console with the USB keyboa
 network works over the LAN7515's USB Ethernet, and HDMI and composite video run on the stock
 `vc4` KMS driver the image's `config.txt` asks for. **Experimental**: milestones 1–4 and 8 of the
 [plan](rpi3-plan.md) are done (serial shell, Pi OS from the SD card, USB and Ethernet, HDMI,
-composite video), and of milestone 9 everything but the H.264 decoder: VCHIQ, the firmware's
-MMAL media components behind `bcm2835-codec` and `bcm2835-isp`, and its audio service behind
-the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
+composite video) and milestone 9: VCHIQ, the firmware's MMAL media components behind
+`bcm2835-codec` and `bcm2835-isp` with H.264 decoded on the host ([opt-in](#video-decode)), and
+its audio service behind the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 
 ## What runs today
 
@@ -29,8 +29,8 @@ the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 | CEC | the adapter (`/dev/cec0`, physical address 1.0.0.0 from the EDID) and a TV on the bus | `cec-ctl --playback -S`: device 0 (TV), CEC 1.4, physical address 0.0.0.0, OSD name `sbc-emu TV`, power on |
 | Composite video (`dtoverlay=vc4-kms-v3d,composite`) | the VEC on pixel valve 2's other output: `Composite-1` (status `unknown`, as on a real Pi: composite has no load detection) next to `HDMI-A-1`, with the driver's TV standards (NTSC, NTSC-J, NTSC-443, PAL, PAL-M, PAL-N, PAL-60, SECAM, monochrome); `sdtv_mode` becomes the firmware's `video=Composite-1:…` option; the console on composite when no monitor is on HDMI; the 720×576 (PAL) or 720×480 (NTSC) frame over VNC and in screenshots | `scripts/rpi3-composite.txt`: `kmsprint` lists `Composite-1`; PAL: `720x576i@50.00`, `VEC_CONFIG0 = 0x00000001`, `kmstest --flip` at 50.00 fps, its pattern on screen; NTSC: `720x480i@59.94`, `VEC_CONFIG0 = 0x00000040`, 59.94 fps |
 | VCHIQ (`brcm,bcm2836-vchiq`) | the VideoCore's side of the message queue: `VCHIQ_INIT` through the mailbox, the slot protocol (messages, slot recycling both ways, events and both doorbells), services opened by four-character code, bulk transfers through page lists (with the fragments for unaligned receives); `vchiq`, `vc-sm-cma`, `bcm2835-mmal-vchiq`, `bcm2835-codec`, `bcm2835-isp` and `snd-bcm2835` bind on the unmodified image | `scripts/rpi3-vchiq.txt`: the drivers' probe messages, no failures in `dmesg`; the slot protocol and MMAL messages also in unit tests (`cargo test -p bcm2837`) |
-| Media devices (`bcm2835-codec`, `bcm2835-isp`) | `v4l2-ctl --list-devices`: `bcm2835-codec-decode` with `/dev/video10` (decode), 11 (encode), 12 (ISP), 18 (image effects), 31 (JPEG encode), two `bcm2835-isp` instances (`/dev/video13`–`16`, `20`–`23`), `/dev/vcsm-cma`; the decoder's input formats are H.264 only (no MPEG-2 or VC-1: no licence key) | `scripts/rpi3-vchiq.txt` |
-| Video decode | **the H.264 decoder itself is pending.** The rest of the path works with a stand-in (`video::TestPatternDecoder`): it reads the stream's sequence parameter set for the picture size and turns every coded picture into colour bars, so `v4l2-ctl` streams H.264 into `/dev/video10` and YU12 pictures out, with the firmware's format-changed event (V4L2's source change) and end of stream | `scripts/rpi3-vchiq.txt`: a 320×240 stream of parameter sets and four empty slices in, four 320×240 YU12 pictures of the bars out (460800 bytes, first luma byte 180), then the end of stream (`EOS EVENT`) |
+| Media devices (`bcm2835-codec`, `bcm2835-isp`) | `v4l2-ctl --list-devices`: `bcm2835-codec-decode` with `/dev/video10` (decode), 11 (encode), 12 (ISP), 18 (image effects), 31 (JPEG encode), two `bcm2835-isp` instances (`/dev/video13`–`16`, `20`–`23`), `/dev/vcsm-cma`; the decoder's input formats are H.264 only (no MPEG-2 or VC-1: no licence key) | `scripts/rpi3-vchiq.txt`, which also decodes a 320×240 stream written with `printf` (a grey intra picture, three skipped ones) to four YU12 pictures with either decoder: grey with the `h264` feature, the stand-in's bars without |
+| Video decode ([`h264` feature](#video-decode)) | H.264 Baseline, Main and High profile, progressive and interlaced (field pictures, PAFF, MBAFF), decoded on the host by the `rust_h264` crate (`bcm2837/src/h264.rs`; [evaluation](h264-decoder-eval.md)): the stream in whatever pieces the guest queues, pictures in display order with their timestamps through reordering, the coded size and cropping on the output port as the firmware gives them (1920×1088, 1920×1080 visible), announced when the first picture starts (before reordering lets it out), key frames flagged. Without the feature a stand-in (`video::TestPatternDecoder`) turns every coded picture into colour bars of the stream's size | `scripts/rpi3-h264.txt`: `v4l2-ctl` decodes our 320×240 High-profile stream (CABAC, 8×8 transforms, weighted prediction, B-pyramid) to YU12 with FFmpeg's MD5; a 1080p High-profile stream bit-exact too; played by `tools/rpi3-h264-play.c` on an HVS YUV420 plane straight from the decoder's buffers: 300 pictures at 29.96 fps, none late. 176 JVT conformance streams identical to FFmpeg (`cargo test --release -p bcm2837 --features h264 --test h264_conformance`, with the streams fetched) |
 | ISP | `ril.isp`: YUV 4:2:0 (I420, YV12, NV12, NV21), 4:2:2 packed and RGB (RGB24, BGR24, RGBA, BGRA, RGB565) in and out, bilinear scaling | `v4l2-ctl` on `/dev/video12`: a red 64×32 RGB24 picture to a 32×16 YU12 one, Y = 82 (BT.601 red) |
 | Headphone audio (`dtparam=audio=on`) | the firmware's audio service (`AUDS`): the `bcm2835 Headphones` card; the data played at the configured rate in guest time, each write reported back once played; `--audio-out FILE.wav` | `speaker-test -D plughw:CARD=Headphones,DEV=0 -t sine -f 440 -c 2 -r 48000`: the WAV holds a 440 Hz tone, 3.000 s per channel at 48 kHz |
 | Hot-plug | GPIO 28 (active low; the 3B's line 4 of the firmware's GPIO expander), polled by the driver; the `hdmi disconnect`/`hdmi connect` script commands | `HDMI-A-1` `disconnected`, then `connected` again |
@@ -65,7 +65,7 @@ the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 | VCHIQ doorbells (`0x3f00_b840`, ARM interrupt 2) | the VideoCore's side of VCHIQ (`bcm2837/src/vchiq.rs`): Linux's slot memory read and written as the VideoCore firmware does, BELL2 (Linux rings the VideoCore) handled at once, BELL0 (the VideoCore rings Linux) set with each event it signals and cleared by the read; services `mmal`, `SMEM` and `AUDS`, any other refused (`CLOSE`) | `vchiq` |
 | VideoCore shared memory (`SMEM`) | imports of Linux's buffers (bus address, size) answered with a handle; MMAL buffers then pass by handle and the model reads and writes guest RAM directly; frees dropped (the firmware's version message is not sent, so the kernel does not wait for releases) | `vc-sm-cma` |
 | MMAL (`mmal`) | `bcm2837/src/mmal.rs`: components `ril.video_decode` (H.264 in; I420, YV12, NV12, NV21, RGB565 out), `ril.video_encode` and `ril.image_encode` (formats and buffers, no encoder: empty output buffers), `ril.isp` (one input, two image outputs, statistics), `ril.image_fx` (pictures pass through), `camera_info` (no camera); ports with formats, buffer sizes, parameters (`SUPPORTED_ENCODINGS`, `ZERO_COPY`, the rest stored), enable, disable and flush (buffers returned), buffers in both directions (by handle, or as bulk data), the `EFCH` format-changed event | `bcm2835-mmal-vchiq`, `bcm2835-codec`, `bcm2835-isp`, `bcm2835-v4l2` (finds no camera) |
-| Decoder interface | `video::VideoDecoder` (`push` stream bytes with a timestamp, `flush` at end of stream, `pop` pictures in display order, `reset`); `video::decoder_for` picks one by MMAL encoding. Today the stand-in `TestPatternDecoder` | — |
+| Decoder interface | `video::VideoDecoder` (`push` stream bytes with a timestamp, `flush` at end of stream, `pop` pictures in display order, `reset`); `video::decoder_for` picks one by MMAL encoding: `h264::H264Decoder` with the `h264` feature, the stand-in `TestPatternDecoder` without | — |
 | Audio service (`AUDS`, version 2) | `bcm2837/src/vcaudio.rs`: `CONFIG`, `CONTROL` (volume), `OPEN`/`CLOSE`, `START`/`STOP` (with draining), `WRITE` with its data in messages or a bulk transfer; 8-, 16-, 24- and 32-bit samples, 1–8 channels (the first two played); `COMPLETE` per write once its frames have played | `snd-bcm2835` |
 | Keyboard, tablet | the shared USB HID keyboard and absolute pointer (`emu-core/src/usb.rs`), full speed, on hub ports 2 and 3; the script `type` command and a VNC viewer drive them | `usbhid` |
 
@@ -137,12 +137,20 @@ Where the model differs from a real 3B+:
   messages (no kernel driver here uses them) are dropped, PAUSE/RESUME (VideoCore suspend) are
   ignored. Services other than MMAL, shared memory and audio are refused, as firmware without
   them would: `vcgencmd` (`GCMD`), the TV service and the camera are not there.
-- Video: H.264 decode itself is not implemented yet (see the plan); the stand-in decoder emits
-  colour bars of the stream's size for each coded picture. The encoders accept pictures and
-  return empty output buffers. MPEG-2 and VC-1 are not offered (they need a licence key on a
-  real Pi 3). Deinterlacing (`image_fx`) passes pictures through. Port tunnelling (`CONNECT`)
-  is refused; kernel drivers do not use it. After a snapshot restore a decoder starts again at
-  the stream's next parameter sets.
+- Video: H.264 decode needs the `h264` feature (without it the stand-in emits colour bars of the
+  stream's size for each coded picture). It runs on the emulator's thread when the guest queues
+  a buffer (1080p at about 85 pictures per second of host time natively, 45 in WebAssembly).
+  Not decoded: flexible macroblock ordering, arbitrary slice order and SP/SI slices (Extended
+  profile, which the Pi's decoder does not offer either); High 10 and 4:2:2 streams come out
+  converted to 8-bit 4:2:0 (the Pi's own decoder handles 8-bit 4:2:0 only). Pictures wait for
+  reordering as long as the stream's VUI says (`max_num_reorder_frames`; libx264 and most
+  encoders write it), otherwise as many as the level's DPB holds (up to 16): a clip shorter
+  than that comes out only at its end, and `v4l2-ctl`, which stops the decoder when its file
+  ends, gives up on such a clip. The encoders
+  accept pictures and return empty output buffers. MPEG-2 and VC-1 are not offered (they need a
+  licence key on a real Pi 3). Deinterlacing (`image_fx`) passes pictures through. Port
+  tunnelling (`CONNECT`) is refused; kernel drivers do not use it. After a snapshot restore a
+  decoder starts again at the stream's next parameter sets.
 - Headphone audio leaves as 16-bit stereo on `--audio-out`, together with HDMI audio (both at
   the rate of whichever played last); the jack's PWM output and its DMA are not modelled.
 - No FIQs (Linux on arm64 does not use them), the ARM timer, the local timer and the PMU interrupt
@@ -171,9 +179,11 @@ python3 -m http.server 8731 --bind 127.0.0.1 --directory scripts &
 # HDMI: the wizard on the KMS console, the connector, page flips, YUV planes, audio, CEC, hot-plug
 ./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --audio-out out/rpi3-hdmi.wav \
     --script scripts/rpi3-hdmi.txt --timeout 900
-# VCHIQ: the media devices, the decoder (with its stand-in), the ISP, the headphone card
+# VCHIQ: the media devices, the decoder, the ISP, the headphone card
 ./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --audio-out out/rpi3-vchiq.wav \
     --script scripts/rpi3-vchiq.txt --timeout 900
+# H.264 decode and playback (the h264 feature; the script says what to prepare on the host)
+./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-h264.txt --timeout 1200
 # composite: config.txt edited in the guest (copy-on-write), PAL and NTSC on Composite-1
 ./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-composite.txt --timeout 900
 
@@ -204,6 +214,19 @@ transfers, `SBC_NET_LOG=1` the virtual network, `SBC_TRACE_VC4=1` the display re
 `SBC_CEC_LOG=1` the CEC messages (at the end of the run), `SBC_VCHIQ_TRACE=1` the VCHIQ
 messages, `SBC_MMAL_TRACE=1` the MMAL calls.
 
+## Video decode
+
+The H.264 decoder is opt-in because of the codec's patent status. Build with the `h264` feature
+to have it:
+
+```sh
+cargo build --release --features h264
+cargo test --release -p bcm2837 --features h264
+```
+
+Without the feature `/dev/video10` still works, with the stand-in decoder's test pictures. How
+the decoder was chosen, and its conformance results: [H.264 decoder evaluation](h264-decoder-eval.md).
+
 ## What does not work yet
 
 - USB: no USB stick or camera option on the Pi 3 yet (the shared devices exist; nothing plugs
@@ -213,8 +236,8 @@ messages, `SBC_MMAL_TRACE=1` the MMAL calls.
   the receive filters (perfect, hash, VLAN) are not applied: every frame from the network is
   delivered.
 - No VideoCore IV 3D (the device tree's V3D node waits for its model), no DSI or DPI displays.
-- No H.264 decoder yet (the stand-in emits test pictures), no video or JPEG encoder, no
-  camera, no `vcgencmd`.
+- H.264 decode only with the `h264` feature; no video or JPEG encoder, no camera, no
+  `vcgencmd`.
 - No Wi-Fi or Bluetooth (the PL011 is a plain serial port), no `sdhost`.
 - No I²C on the header, no SPI, PCM/I²S or system timer in the device tree; the GPIO block has no
   pull-up/down state (`GPPUD`) and nothing on the header pins.

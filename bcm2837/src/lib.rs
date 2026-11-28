@@ -8,6 +8,8 @@
 //! shared memory, audio) are modelled on the host side of that queue.
 pub mod boot;
 pub mod fdt;
+#[cfg(feature = "h264")]
+pub mod h264;
 pub mod intc;
 pub mod machine;
 pub mod mmal;

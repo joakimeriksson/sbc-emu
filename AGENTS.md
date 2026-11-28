@@ -42,7 +42,7 @@ Who is working where right now (update this table when you start or finish somet
 | Area | Crates / paths | Agent |
 |---|---|---|
 | Raspberry Pi 4: SoC, GPU (V3D), display, Ubuntu | `bcm2711/`, `v3d/`, `cli/src/vnc*.rs`, `web/` | Claude Code |
-| Raspberry Pi 3 (BCM2837), plan: `docs/rpi3-plan.md` | `bcm2837/`, `cli/src/pi3.rs`, `scripts/rpi3-*`; uses `bcm2711/`'s blocks (changes there go through the Raspberry Pi 4 row) | Claude Code |
+| Raspberry Pi 3 (BCM2837), plan: `docs/rpi3-plan.md` | `bcm2837/` (its H.264 decoder behind the `h264` feature: `docs/h264-decoder-eval.md`), `cli/src/pi3.rs`, `scripts/rpi3-*`, `tools/rpi3-h264-play.c`; uses `bcm2711/`'s blocks (changes there go through the Raspberry Pi 4 row) | Claude Code |
 | Multi-board foundation, Orange Pi 5 (RK3588S) and its Mali-G610 GPU (`docs/orangepi5.md`, `docs/orangepi5-gpu.md`) | `sbc-machine/`, `rk3588/` | Claude Code |
 | Orange Pi One (H3), its Mali-400 GPU and the 32-bit core | `allwinner-h3/`, `mali400/`, `arm-a32/`, `cli/src/orangepi_one.rs` | Claude Code |
 | RK3288 / Tinker Board (`docs/tinkerboard.md`; plan: `docs/history/rk3288-tinker-board-plan.md`) | `rockchip-rk3288/` (storage, I²C, PMIC: `dwmmc.rs`, `i2c.rs`, `rk808.rs`), `cli/src/tinkerboard.rs`, the RK3288's display (`vop.rs`, `dsi.rs`), RGA, audio (`i2s.rs`, `peripherals/src/pl330.rs`), GPIO, and its browser page `web/tinker.html` (with `wasm/`); `arm-a32` changes (also its WebAssembly JIT, `jit_wasm.rs`) go through its owner | Claude Code (the Orange Pi One session, through a sub-agent on `claude/tinkerboard-*` branches) |
