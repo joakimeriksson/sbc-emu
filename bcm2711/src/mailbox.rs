@@ -196,6 +196,8 @@ impl Mailbox {
             0x0003_0030 => { let id = arg(v, 0); set(v, &[id, 1]) } // domain state
             0x0003_8030 => { let id = arg(v, 0); let s = arg(v, 1); set(v, &[id, s]) }
             0x0003_0058 | 0x0003_8058 => set(v, &[0, 0]), // POE / misc: nothing attached
+            // SET_SDHOST_CLOCK: the divider stays the driver's (the answer leaves the request as is)
+            0x0003_8042 => v.len() * 4,
             // ---- framebuffer
             0x0004_0001 => {
                 if fb.size() as u64 > fb.max_size { set(v, &[0, 0]) } else {

@@ -2,13 +2,14 @@
 
 An instruction-level BCM2837 that boots the unmodified **Raspberry Pi OS Lite (trixie, arm64)
 SD-card image**, the same image the [Raspberry Pi 4](raspberry-pi-4.md) boots, on four Cortex-A53
-cores: its first-boot wizard runs on the framebuffer console with the USB keyboard, and the
-network works over the LAN7515's USB Ethernet, and HDMI and composite video run on the stock
-`vc4` KMS driver the image's `config.txt` asks for. **Experimental**: milestones 1–4 and 8 of the
-[plan](rpi3-plan.md) are done (serial shell, Pi OS from the SD card, USB and Ethernet, HDMI,
-composite video), and of milestone 9 everything but the H.264 decoder: VCHIQ, the firmware's
-MMAL media components behind `bcm2835-codec` and `bcm2835-isp`, and its audio service behind
-the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
+cores: its first-boot wizard runs on the framebuffer console with the USB keyboard, the
+network works over the LAN7515's USB Ethernet and over Wi-Fi, Bluetooth finds a virtual LE
+sensor, and HDMI and composite video run on the stock `vc4` KMS driver the image's `config.txt`
+asks for. **Experimental**: milestones 1–5 and 8 of the [plan](rpi3-plan.md) are done (serial
+shell, Pi OS from the SD card, USB and Ethernet, HDMI, Wi-Fi and Bluetooth, composite video),
+and of milestone 9 everything but the H.264 decoder: VCHIQ, the firmware's MMAL media components
+behind `bcm2835-codec` and `bcm2835-isp`, and its audio service behind the headphone card. The
+3D GPU is not modelled yet.
 
 ## What runs today
 
@@ -17,8 +18,10 @@ the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 | Raspberry Pi kernel 6.18 (`kernel8.img` from the Pi OS image) with a BusyBox initramfs | boots to a shell on the mini UART | `scripts/rpi3-shell.txt`: shell in about 5 s of host time |
 | Four cores | four Cortex-A53s (MIDR `0x410fd034`) started through PSCI; each core's generic timer through the per-core interrupt controller, IPIs through its mailboxes | `smp: Brought up 1 node, 4 CPUs`; `/proc/interrupts`: `arch_timer` ticks and `IPI0` on all four cores; four busy loops in parallel |
 | Board identity | revision code `a020d3` from the mailbox and in `/proc/cpuinfo`, model string `Raspberry Pi 3 Model B Plus Rev 1.3 (sbc-emu reduced DT)`, 1 GiB with 76 MiB for the VideoCore (948 MiB for Linux) | `scripts/rpi3-shell.txt` |
-| Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | firmware-style SD boot (`config.txt` with the Pi 3's sections, `cmdline.txt`, `kernel8.img`, `initramfs8`) → initramfs → ext4 root on the card → systemd 257 → `raspberrypi login:` on ttyS0 | `scripts/rpi3-raspios.txt`: login prompt in 31 s of host time on one thread (21 s of guest time, 33 G instructions; USB enumeration and NetworkManager's DHCP lease happen during that boot), 24 s with `--threads multi`, on an M-series Mac |
+| Raspberry Pi OS Lite 2026-10-06 (unmodified `.img`) | firmware-style SD boot (`config.txt` with the Pi 3's sections, `cmdline.txt`, `kernel8.img`, `initramfs8`) → initramfs → ext4 root on the card (on `sdhost`, as on a real Pi 3) → systemd 257 → `raspberrypi login:` on ttyS0 | `scripts/rpi3-raspios.txt`: login prompt in 30 s of host time on one thread (20 s of guest time, 28 G instructions, 69 k interrupts; USB enumeration, NetworkManager's DHCP lease, the HDMI console, the Wi-Fi firmware download and Bluetooth's patch RAM happen during that boot), 23 s with `--threads multi`, on an M-series Mac shared with other jobs |
 | First boot | the image's first-boot wizard (keyboard layout, user name, password) on tty1, answered with the USB keyboard; a login on tty1 typed with the keyboard, then on the serial console | `scripts/rpi3-firstboot.txt`: wizard, both logins and all the USB and network checks in 94 s of host time (55 s of CPU; 93.5 s of guest time, which includes the script's waits and a 10 s idle measurement) |
+| Wi-Fi | the CYW43455 on the Arasan SDHCI (SDIO), the Pi 4's model: `brcmfmac` downloads the image's own `brcmfmac43455-sdio.bin` and the 3B+'s NVRAM, then talks to the emulated FullMAC firmware; NetworkManager scans, joins the open `sbc-emu` and the WPA2-PSK `sbc-emu-wpa2` (passphrase `raspberry-pi`) access points, DHCP and ping over `wlan0` | `scripts/rpi3-wireless.txt`: the first-boot wizard, Wi-Fi and Bluetooth (an 8 s LE scan) in 101 s of host time (101 s of guest time, mostly the script's waits) |
+| Bluetooth | the CYW43455's HCI controller on UART0 (H4), `hci_bcm` over serdev as the vendor tree has it: Broadcom vendor commands, the image's `BCM4345C0.raspberrypi,3-model-b-plus.hcd` patch RAM; a virtual BLE peripheral "sbc-emu sensor" nearby | `bluetoothctl` powers `hci0` on, an LE scan finds `sbc-emu sensor` (`scripts/rpi3-wireless.txt`) |
 | More peripherals | BCM2835 RNG, thermal sensor, PM watchdog, PL011 | `/dev/hwrng` reads, `thermal_zone0` reads 45 °C, `bcm2835-wdt` binds; `reboot -f` (PSCI) boots again, `poweroff -f` stops |
 | USB | the DWC2 OTG core with a high-speed root port, split transactions for full-speed devices behind the hub, NAKed bulk/interrupt IN transfers held until the device has data; behind it the LAN7515 as on a 3B+: a 4-port hub, a 3-port hub on its port 1, the LAN7800 on that hub's port 1; the keyboard and tablet on two USB-A ports | `lsusb -t` (below); typing on tty1: the first-boot wizard and a login there; `scripts/rpi3-usb.txt` |
 | Ethernet | LAN7800 (`lan78xx`) with its internal PHY, gigabit link, MAC address `02:5b:c0:00:03:01` from the device tree's `local-mac-address`; on sbc-net's virtual network (DHCP, DNS, user-mode NAT, `--hostfwd`) | NetworkManager's DHCP lease, ping of the gateway (3/3), `getent hosts`, `wget` of a file from the host through the NAT (`scripts/rpi3-firstboot.txt`) |
@@ -44,9 +47,11 @@ the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 | Per-core interrupt controller (`0x4000_0000`) | BCM2836 "QA7" block: per-core timer interrupt enables and pending registers, four 32-bit mailboxes per core (write-set, read and write-clear), GPU interrupt routing to one core, PMU routing bits | `brcm,bcm2836-l1-intc` |
 | ARM-side interrupt controller (`0x3f00_b200`) | 64 GPU interrupts and 8 ARM ones, enable/disable registers, basic pending with its bank summaries and shortcut bits; its output is the per-core controller's GPU input | `brcm,bcm2836-armctrl-ic` |
 | Mini UART | AUX + mini UART as a 16550: the serial console (`serial0` → `ttyS0`, as on a 3B+), on before Linux as the firmware's `enable_uart=1` leaves it | `8250_bcm2835aux` |
-| UART0 | PL011 (`serial1`, numbered `ttyAMA1` by that alias); on a real 3B+ it carries Bluetooth | `amba-pl011` |
+| UART0 | PL011 with the CYW43455's Bluetooth controller on it (H4, the vendor tree's `bluetooth` child, `shutdown-gpios` on the expander's BT_ON); `--no-bluetooth` leaves it a plain serial port. Linux numbers it `ttyAMA1` after its `serial1` alias (the vendor tree's aliases); while Bluetooth holds it, it is a serdev port without a tty | `amba-pl011`, `hci_uart` (`hci_bcm`, `btbcm`), BlueZ |
 | Mailbox | VideoCore property channel (board revision, memory split, clocks, power, framebuffer) | `bcm2835-mbox`, `raspberrypi-firmware` |
-| SD card | the Arasan SDHCI (`brcm,bcm2835-sdhci`, PIO, 32-bit register access) with an SDHC card on the image (copy-on-write unless `--sd-persist`) | `sdhci-iproc` |
+| SD card (`0x3f20_2000`, GPU interrupt 56) | the BCM2835 `sdhost` controller (`bcm2837/src/sdhost.rs`): command register with its NEW/FAIL flags, host status, the data FSM and FIFO level in SDEDM, block size/count, the 16-word FIFO, by DMA on DREQ 13 or by PIO; data, block and busy interrupts. The SDHC card is the Arasan model's (copy-on-write unless `--sd-persist`); `mmc0`, `mmcblk0` | `sdhost-bcm2835` (DMA for more than one block, as the vendor tree's `brcm,pio-limit` says) |
+| Arasan SDHCI (`0x3f30_0000`, GPU interrupt 62) | the Pi 4's SDHCI model as the BCM2835's "mmcnr" (`brcm,bcm2835-sdhci`, 32-bit register access, PIO), with the CYW43455's SDIO functions behind it while WL_ON powers the chip (`mmc1`) | `sdhci-iproc`, `brcmfmac` |
+| GPIO expander | the firmware's eight-line expander (lines 128–135) through the mailbox's GPIO property tags (GET/SET_GPIO_STATE, GET/SET_GPIO_CONFIG); on the 3B its line 4 is HDMI's hot-plug; BT_ON powers the Bluetooth core (off: it is reset and hears nothing), WL_ON the Wi-Fi chip (on at boot as the firmware leaves it; off, the chip leaves the SDIO bus) | `gpio-raspberrypi-exp` |
 | RNG | BCM2835 RNG: status word count, data register | `bcm2835-rng` |
 | Thermal | BCM2835-family sensor: TSENSCTL set up as the firmware leaves it, TSENSSTAT code for the zone's slope and offset | `bcm2835_thermal` |
 | PM | watchdog (65536 Hz; expiry resets the machine), power domains behind the AXI bridges | `bcm2835-wdt`, `bcm2835-power` |
@@ -56,8 +61,8 @@ the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 | HDMI (`0x3f90_2000`, `hd` at `0x3f80_8000`) | the BCM2835 HDMI block: reset, PHY, scheduler and FIFO handshakes that complete at once, infoframe RAM, hot-plug status; the MAI audio FIFO (DREQ 17); CEC with a TV on the bus (GPU interrupt 40) | `vc4` (`vc4_hdmi`, its CEC and audio) |
 | VEC (`0x3f80_6000`) | the composite encoder: the registers `vc4_vec.c` programs (TV standard, subcarrier, DAC), resets that complete at once; it encodes while VEC_CFG enables it and pixel valve 2 selects its clock; fields at the VEC clock / 8 (13.5 MHz): 50 a second for 625 lines, 59.94 for 525; the host gets the decoded frame (both fields; luma only in the monochrome standard), not a signal. Listed in the device tree with `dtoverlay=vc4-kms-v3d,composite`, as the overlay's dormant fragment does | `vc4` (`vc4_vec`) |
 | DDC | BSC2 (`0x3f80_5000`, the BCM2835 I²C controller of `bcm2711/src/i2c.rs`) with the monitor's EDID EEPROM at 0x50 (the Pi 4's 1080p monitor, `--hdmi-mode` for others) | `i2c-bcm2835` |
-| DMA controller (`0x3f00_7000`, GPU interrupts 16–27) | the Pi 4's BCM2835 DMA engine (`bcm2711/src/dma.rs`): control-block chains, 2D mode, DREQ-paced blocks fed as the peripheral asks; channels 0x7f35 for Linux | `bcm2835-dma` |
-| GPIO (`0x3f20_0000`, GPU interrupts 49, 50) | the Pi 4's GPIO block as `brcm,bcm2835-gpio`: function select, levels, events; GPIO 28 is HDMI's hot-plug line | `pinctrl-bcm2835` |
+| DMA controller (`0x3f00_7000`, GPU interrupts 16–27) | the Pi 4's BCM2835 DMA engine (`bcm2711/src/dma.rs`): control-block chains, 2D mode, DREQ-paced blocks fed as the peripheral asks (HDMI audio, DREQ 17) or as far as its FIFO allows (sdhost, DREQ 13); channels 0x7f35 for Linux | `bcm2835-dma` |
+| GPIO (`0x3f20_0000`, GPU interrupts 49, 50) | the Pi 4's GPIO block as `brcm,bcm2835-gpio`: function select, levels, events; the vendor tree's line names; GPIO 28 is HDMI's hot-plug line; the pin groups the SD hosts and UART0 select (`sdhost_gpio48`, `sdio_pins`, `uart0_pins`, `bt_pins`) | `pinctrl-bcm2835` |
 | Firmware clocks, power, GPIO expander | ARM (one operating point), core, V3D, pixel, HDMI state machine and VEC (108 MHz) clocks through the mailbox; the firmware's power domains; its GPIO expander (lines 128–135) | `clk-raspberrypi`, `raspberrypi-power`, `gpio-raspberrypi-exp` |
 | USB host (`0x3f98_0000`, GPU interrupt 9) | the Pi 4's DWC2 model (`bcm2711/src/dwc2.rs`): buffer DMA through the `0xc000_0000` bus alias, a high-speed root port (frame number in microframes, SOF every 1 ms), start/complete split transactions (HCSPLT), bulk and interrupt IN transfers held while the device NAKs. `brcm,bcm2835-usb`, `dr_mode = "host"` | `dwc2` (not the vendor `dwc_otg`, which needs the FIQ) |
 | Hubs | two USB 2.0 hubs (`emu-core/src/usb_hub.rs`): 0424:2514 with 4 and 3 ports, self-powered, one transaction translator; port power, reset, enable, suspend/resume, change bits, the status-change interrupt endpoint; port 1 of each marked non-removable | `hub` |
@@ -69,11 +74,12 @@ the headphone card. Wi-Fi, Bluetooth and the 3D GPU are not modelled yet.
 | Audio service (`AUDS`, version 2) | `bcm2837/src/vcaudio.rs`: `CONFIG`, `CONTROL` (volume), `OPEN`/`CLOSE`, `START`/`STOP` (with draining), `WRITE` with its data in messages or a bulk transfer; 8-, 16-, 24- and 32-bit samples, 1–8 channels (the first two played); `COMPLETE` per write once its frames have played | `snd-bcm2835` |
 | Keyboard, tablet | the shared USB HID keyboard and absolute pointer (`emu-core/src/usb.rs`), full speed, on hub ports 2 and 3; the script `type` command and a VNC viewer drive them | `usbhid` |
 
-The mini UART, PL011, mailbox, SD host, watchdog, USB host, DMA controller, GPIO and I²C are the
-Pi 4's models (`bcm2711`) at this SoC's addresses and interrupt numbers, and the display pipeline
-is the Pi 4's `vc4.rs` in its BCM2835 mode; the hubs and the Ethernet are shared devices in
-`emu-core`; the interrupt controllers, RNG, thermal sensor, device tree, USB topology, boot and
-the VideoCore firmware's services over VCHIQ are in `bcm2837/`.
+The mini UART, PL011, mailbox, Arasan SD host, watchdog, USB host, DMA controller, GPIO, I²C and
+the CYW43455's Wi-Fi and Bluetooth are the Pi 4's models (`bcm2711`) at this SoC's addresses and
+interrupt numbers, and the display pipeline is the Pi 4's `vc4.rs` in its BCM2835 mode; the hubs
+and the Ethernet are shared devices in `emu-core`; the interrupt controllers, `sdhost`, RNG,
+thermal sensor, device tree, USB topology, boot and the VideoCore firmware's services over VCHIQ
+are in `bcm2837/`.
 
 `lsusb -t` on the emulated 3B+ (as on a real one, except that the root hub is `dwc2`'s):
 
@@ -114,9 +120,13 @@ Compatibility labels in the plan's terms:
 
 Where the model differs from a real 3B+:
 
-- The SD card is on the Arasan host; a real Pi 3 has it on the `sdhost` controller
-  (`brcm,bcm2835-sdhost`) and the Arasan drives the Wi-Fi chip. The card moves to `sdhost` when
-  Wi-Fi arrives (milestone 5).
+- `sdhost` transfers take no time: a read's blocks are in the FIFO as the command completes, and
+  a DMA channel on DREQ 13 moves them all as soon as it is started. The card's SCR offers CMD23,
+  so reads go as CMD23 + CMD18 without a CMD12.
+- The Wi-Fi chip runs no firmware: `brcmfmac` downloads the real one, then the emulated FullMAC
+  answers (see the [Pi 4](raspberry-pi-4.md)'s Wi-Fi); no radio, the access points' network is
+  isolated (DHCP, DNS and the host's services, no NAT). As on a real board, Pi OS keeps Wi-Fi
+  and Bluetooth rfkill-blocked on a first boot until the country is set (`rfkill unblock`).
 - Secondary cores start through PSCI (`enable-method = "psci"`), not the vendor tree's spin table;
   Linux at EL1, as on the Pi 4 machine.
 - HDMI and composite share pixel valve 2 (HVS channel 1), as on the SoC: one of them shows a
@@ -176,6 +186,8 @@ python3 -m http.server 8731 --bind 127.0.0.1 --directory scripts &
     --script scripts/rpi3-vchiq.txt --timeout 900
 # composite: config.txt edited in the guest (copy-on-write), PAL and NTSC on Composite-1
 ./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-composite.txt --timeout 900
+# first boot, then Wi-Fi (scan, open and WPA2 networks, DHCP, ping) and a Bluetooth LE scan
+./target/release/sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-wireless.txt --timeout 900
 
 # the Pi kernel with a BusyBox initramfs (console on ttyS0)
 mkdir -p cache/rpi3
@@ -191,7 +203,9 @@ Options: `--model 3b+|3b|3a+|zero2w` (default `3b+`; the others change the RAM s
 code, model string, `config.txt` sections and USB topology: the 3B gets a 5-port hub without its
 Ethernet, the 3A+ and Zero 2 W the keyboard on the root port; they are untested), `--smp N`,
 `--threads single|multi`, `--ram-mb N`, `--seed N`, `--no-jit`, `--no-display`, `--sd-persist`,
-`--net nat|local|none` (default `nat`), `--display kms|fb` (default: `kms` when `config.txt` has
+`--net nat|local|none` (default `nat`; Wi-Fi gets its own isolated network), `--no-bluetooth`,
+`--trace-wifi` (the Wi-Fi chip's host interface), `--trace-sdio` (the Arasan's SDIO commands),
+`--display kms|fb` (default: `kms` when `config.txt` has
 `dtoverlay=vc4-kms-v3d`, as the image's does; `fb` for `--kernel`), `--hdmi-mode WxH` (the
 monitor's preferred mode: 1920x1080, 1280x720, 1024x768, 800x600 or 640x480), `--audio-out FILE`
 (HDMI and headphone audio: a `.wav`, or raw 16-bit stereo for any other path), `--hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT`,
@@ -215,7 +229,10 @@ messages, `SBC_MMAL_TRACE=1` the MMAL calls.
 - No VideoCore IV 3D (the device tree's V3D node waits for its model), no DSI or DPI displays.
 - No H.264 decoder yet (the stand-in emits test pictures), no video or JPEG encoder, no
   camera, no `vcgencmd`.
-- No Wi-Fi or Bluetooth (the PL011 is a plain serial port), no `sdhost`.
+- Wireless only on the 3B+ and 3A+ (CYW43455). The 3B's BCM43438 and the Zero 2 W's CYW43436
+  are another chip family (a Cortex-M3 with SOCRAM instead of the CR4, another backplane layout
+  and download path in `brcmfmac`), not just another chip ID: those models come up without Wi-Fi
+  and Bluetooth.
 - No I²C on the header, no SPI, PCM/I²S or system timer in the device tree; the GPIO block has no
   pull-up/down state (`GPPUD`) and nothing on the header pins.
 - 32-bit kernels (`kernel7.img`, `arm_64bit=0`) are not supported.

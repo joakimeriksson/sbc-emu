@@ -6,6 +6,9 @@
 //! through the 0xc000_0000 alias (`dma-ranges`), the two interrupt controllers (no GIC), the
 //! generic timer on the per-core controller. Cores start through PSCI (the vendor tree uses a
 //! spin table; with our own tree either works), clocks are fixed instead of the CPRMAN's.
+//! Storage and wireless as in the vendor tree: the SD card on `sdhost` (mmc0), the Wi-Fi chip on
+//! the Arasan (mmc1), Bluetooth as a serdev child of UART0, both powered through the firmware's
+//! GPIO expander, pins muxed by the GPIO controller's groups.
 
 pub use emu_core::fdt::Fdt;
 
@@ -24,6 +27,8 @@ pub struct BootInfo<'a> {
     pub v3d: bool,
     /// the outputs of the KMS pipeline: HDMI (unless `nohdmi`), composite (the VEC)
     pub outputs: bcm2711::boot::KmsOutputs,
+    /// the Bluetooth controller on UART0 (else UART0 is a plain serial port)
+    pub bluetooth: bool,
 }
 
 /// Interrupt flags in the two controllers' second cell.
@@ -38,6 +43,9 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     use crate::machine as m;
     let (armctrl, local, clk_core, clk_uart, clk_emmc, clk_tsens, mbox, thermal, aux, pm) = (1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32);
     let (fwclk, power, gpio, dma, ddc, expgpio, firmware) = (11u32, 12u32, 13u32, 14u32, 15u32, 16u32, 17u32);
+    let (pins_uart0, pins_bt, pins_sdhost, pins_sdio) = (18u32, 19u32, 20u32, 21u32);
+    let wireless = b.model.wireless();
+    let bluetooth = wireless && b.bluetooth;
     let mut f = Fdt::default();
     f.begin("");
     f.strs("compatible", &[b.model.compatible(), "brcm,bcm2837"]);
@@ -48,15 +56,21 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
 
     let node = |p: u64| format!("{:x}", bus(p));
     f.begin("aliases");
-    // the 3B+'s console is the mini UART: the PL011 belongs to Bluetooth (not modelled yet)
+    // the console is the mini UART, the PL011 belongs to Bluetooth: the vendor tree's aliases
+    // (Linux numbers the PL011 after its `serial1` alias: ttyAMA1, a serdev port without a tty
+    // while Bluetooth holds it)
     f.str("serial0", &format!("/soc/serial@{}", node(m::AUX + 0x40)));
     f.str("serial1", &format!("/soc/serial@{}", node(m::UART0)));
     f.str("uart0", &format!("/soc/serial@{}", node(m::UART0)));
     f.str("uart1", &format!("/soc/serial@{}", node(m::AUX + 0x40)));
-    f.str("mmc0", &format!("/soc/mmc@{}", node(m::SDHCI)));
     f.str("gpio", &format!("/soc/gpio@{}", node(m::GPIO)));
     f.str("dma", &format!("/soc/dma-controller@{}", node(m::DMA)));
     if b.kms && b.outputs.hdmi { f.str("i2c2", &format!("/soc/i2c@{}", node(m::DDC))); }
+    // the card is mmc0 (mmcblk0) on sdhost, the Wi-Fi's SDIO host mmc1
+    f.str("mmc0", &format!("/soc/mmc@{}", node(m::SDHOST)));
+    f.str("sdhost", &format!("/soc/mmc@{}", node(m::SDHOST)));
+    f.str("mmc1", &format!("/soc/mmc@{}", node(m::SDHCI)));
+    if bluetooth { f.str("bluetooth", &format!("/soc/serial@{}/bluetooth", node(m::UART0))); }
     if b.model == crate::Model::B3Plus {
         f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/usb-port@1/ethernet@1", node(m::USB)));
     }
@@ -228,6 +242,8 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.cells("phandle", &[power]);
     f.end();
 
+    // the GPIO controller and pin multiplexer (`pinctrl-bcm2835`) with the vendor tree's line
+    // names, HDMI's hot-plug input (GPIO 28) and the pin groups the SD hosts and UART0 select
     f.begin(&format!("gpio@{}", node(m::GPIO)));
     f.str("compatible", "brcm,bcm2835-gpio");
     f.cells("reg", &[bus(m::GPIO), 0xb4]);
@@ -236,6 +252,7 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.cells("#gpio-cells", &[2]);
     f.empty("interrupt-controller");
     f.cells("#interrupt-cells", &[2]);
+    f.cells("gpio-ranges", &[gpio, 0, 0, 54]);
     let mut names: Vec<String> = (0..54).map(|n| format!("GPIO{n}")).collect();
     for (k, n) in [(0, "ID_SDA"), (1, "ID_SCL"), (28, "HDMI_HPD_N"), (29, "STATUS_LED_G"), (30, "CTS0"), (31, "RTS0"), (32, "TXD0"), (33, "RXD0"),
                    (34, "SD1_CLK"), (35, "SD1_CMD"), (36, "SD1_DATA0"), (37, "SD1_DATA1"), (38, "SD1_DATA2"), (39, "SD1_DATA3"), (40, "PWM0_OUT"),
@@ -246,6 +263,20 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     f.strs("gpio-line-names", &refs);
     f.cells("phandle", &[gpio]);
+    // function numbers: 4 = ALT0, 7 = ALT3; pulls: 0 none, 2 up
+    for (name, pins, func, pulls, ph) in [
+        ("uart0_pins", &[32u32, 33][..], 7, &[0u32, 2][..], pins_uart0),
+        ("bt_pins", &[43][..], 4, &[0][..], pins_bt),
+        ("sdhost_gpio48", &[48, 49, 50, 51, 52, 53][..], 4, &[][..], pins_sdhost),
+        ("sdio_pins", &[34, 35, 36, 37, 38, 39][..], 7, &[0, 2, 2, 2, 2, 2][..], pins_sdio),
+    ] {
+        f.begin(name);
+        f.cells("brcm,pins", pins);
+        f.cells("brcm,function", &[func]);
+        if !pulls.is_empty() { f.cells("brcm,pull", pulls); }
+        f.cells("phandle", &[ph]);
+        f.end();
+    }
     f.end();
 
     // the DMA controller: channels 0..10 with their own interrupts, 11..14 sharing one; the
@@ -287,6 +318,36 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.cells("clocks", &[clk_uart, clk_uart]);
     f.strs("clock-names", &["uartclk", "apb_pclk"]);
     f.cells("arm,primecell-periphid", &[0x0024_1011]);
+    f.str("pinctrl-names", "default");
+    f.cells("pinctrl-0", &[pins_uart0, pins_bt]);
+    f.str("status", "okay");
+    if bluetooth {
+        // the CYW43455's Bluetooth core (`hci_bcm` over serdev), powered by BT_ON
+        f.begin("bluetooth");
+        f.str("compatible", "brcm,bcm43438-bt");
+        f.cells("max-speed", &[3_000_000]);
+        f.cells("shutdown-gpios", &[expgpio, m::EXP_BT_ON as u32, 0]);
+        f.str("status", "okay");
+        f.end();
+    }
+    f.end();
+
+    // the SD card's host: PIO for single blocks, DMA for more
+    f.begin(&format!("mmc@{}", node(m::SDHOST)));
+    f.str("compatible", "brcm,bcm2835-sdhost");
+    f.cells("reg", &[bus(m::SDHOST), 0x100]);
+    f.cells("interrupts", &gpu(m::GPU_SDHOST as u32));
+    f.cells("clocks", &[clk_core]);
+    f.cells("bus-width", &[4]);
+    f.cells("brcm,overclock-50", &[0]);
+    f.cells("brcm,pio-limit", &[1]);
+    // DMA on DREQ 13 (with the vendor tree's flags) for transfers of more than one block
+    f.cells("dmas", &[dma, 0x2000_0000 | crate::sdhost::DREQ]);
+    f.str("dma-names", "rx-tx");
+    f.cells("firmware", &[firmware]);
+    f.str("pinctrl-names", "default");
+    f.cells("pinctrl-0", &[pins_sdhost]);
+    f.str("status", "okay");
     f.end();
 
     f.begin(&format!("thermal@{}", node(m::THERMAL)));
@@ -313,8 +374,8 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("status", "okay");
     f.end();
 
-    // the SD card on the Arasan SDHCI (on a real Pi 3 this host has the Wi-Fi chip and the
-    // card is on the `sdhost` controller; until Wi-Fi is modelled the card sits here)
+    // the Arasan SDHCI ("mmcnr") with the CYW43455's Wi-Fi on SDIO function 1/2 (powered by
+    // WL_ON); off on the boards whose wireless chip is not modelled
     f.begin(&format!("mmc@{}", node(m::SDHCI)));
     f.str("compatible", "brcm,bcm2835-sdhci");
     f.cells("reg", &[bus(m::SDHCI), 0x100]);
@@ -322,7 +383,17 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.cells("clocks", &[clk_emmc]);
     f.cells("bus-width", &[4]);
     f.empty("non-removable");
-    f.str("status", "okay");
+    f.str("pinctrl-names", "default");
+    f.cells("pinctrl-0", &[pins_sdio]);
+    f.cells("#address-cells", &[1]);
+    f.cells("#size-cells", &[0]);
+    f.str("status", if wireless { "okay" } else { "disabled" });
+    if wireless {
+        f.begin("wifi@1");
+        f.cells("reg", &[1]);
+        f.str("compatible", "brcm,bcm4329-fmac");
+        f.end();
+    }
     f.end();
 
     // the DWC2 OTG core, host only (the 3B+'s USB ports are behind the LAN7515's hubs), for
@@ -472,7 +543,7 @@ mod tests {
     #[test]
     fn tree_parses_and_names_the_board() {
         let blob = tree(&BootInfo { model: crate::Model::B3Plus, ram: 948 << 20, bootargs: "console=ttyS0", initrd: Some((0x400_0000, 0x410_0000)), fb: None, cpus: 4, kms: true, v3d: true,
-                                   outputs: bcm2711::boot::KmsOutputs { hdmi: true, composite: true } });
+                                   outputs: bcm2711::boot::KmsOutputs { hdmi: true, composite: true }, bluetooth: true });
         let root = emu_core::fdt::Node::parse(&blob).unwrap();
         let model = root.prop("model").unwrap();
         assert!(model.starts_with(b"Raspberry Pi 3 Model B Plus Rev 1.3"));
@@ -484,5 +555,11 @@ mod tests {
         assert!(blob.windows(6).any(|w| w == crate::machine::ETH_MAC));
         assert!(blob.windows(b"brcm,bcm2835-vec".len()).any(|w| w == b"brcm,bcm2835-vec"));
         assert!(blob.windows(b"brcm,bcm2836-vchiq".len()).any(|w| w == b"brcm,bcm2836-vchiq"));
+        let child = |n: &'_ emu_core::fdt::Node, name: &str| n.children.iter().find(|c| c.name == name).cloned();
+        let soc = child(&root, "soc").unwrap();
+        let sdhost = child(&soc, "mmc@7e202000").unwrap();
+        assert_eq!(sdhost.prop("compatible").unwrap(), b"brcm,bcm2835-sdhost\0");
+        assert!(child(&child(&soc, "serial@7e201000").unwrap(), "bluetooth").is_some());
+        assert!(child(&child(&soc, "mmc@7e300000").unwrap(), "wifi@1").is_some());
     }
 }

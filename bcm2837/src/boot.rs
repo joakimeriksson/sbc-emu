@@ -48,7 +48,7 @@ pub fn boot_linux(m: &mut Machine, kernel: &[u8], initrd: Option<&[u8]>, cmdline
     let cmdline = if cmdline.contains("8250.nr_uarts") { cmdline.to_string() } else { format!("8250.nr_uarts=1 {cmdline}") };
     let kms = m.soc.vc4.is_some();
     let dtb = crate::fdt::tree(&crate::fdt::BootInfo { model: m.model, ram: linux_ram, bootargs: &cmdline, initrd: initrd_range, fb, cpus: m.cpus.len() as u32,
-                                                       kms, v3d: kms && m.has_v3d(), outputs: m.soc.outputs });
+                                                       kms, v3d: kms && m.has_v3d(), outputs: m.soc.outputs, bluetooth: m.soc.bt.is_some() });
     m.load(DTB, &dtb);
     m.boot_linux(entry, DTB);
     Ok(())
