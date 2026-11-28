@@ -364,11 +364,20 @@ impl UsbSerialLink {
                 Err(e) => closed = !busy(&e),
             }
         }
+        // everything the peer has sent (up to 64 KiB a poll): polls are far apart while the guest is busy
         let mut buffer = [0; 4096];
-        match stream.read(&mut buffer) {
-            Ok(0) => closed = true,
-            Ok(n) => machine.usb_serial_input(&buffer[..n]),
-            Err(e) => closed |= !busy(&e),
+        for _ in 0..16 {
+            match stream.read(&mut buffer) {
+                Ok(0) => closed = true,
+                Ok(n) => {
+                    machine.usb_serial_input(&buffer[..n]);
+                    if n == buffer.len() {
+                        continue;
+                    }
+                }
+                Err(e) => closed |= !busy(&e),
+            }
+            break;
         }
         if closed {
             eprintln!("[{TAG}] USB serial: {addr} went away");
