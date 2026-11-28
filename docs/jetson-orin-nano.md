@@ -70,7 +70,8 @@ power-on) and `tests/gpu/run-orin-cuda.sh` pass in both modes.
 - **The controller:** sbc-emu's shared xHCI core at the Orin's XUSB host address `0x03610000`,
   on SPI 163. The device tree names it `generic-xhci`, so Linux's platform xHCI driver runs it.
   The JetPack kernel builds that driver in, together with USB storage and ext4.
-- **Not modelled:** NVIDIA's XUSB firmware, the pad controller and the device-mode port.
+- **Not modelled:** NVIDIA's XUSB firmware and the host side of the pad controller (the
+  device-mode port has [its own section](#usb-device-mode-port-a-pc-on-the-usb-c-cable)).
   The webcam needs the `uvcvideo` module from the kernel's module package.
 
 ```sh
@@ -128,6 +129,61 @@ goes to the peer. A peer that goes away leaves the port idle, and the emulator r
 The guest's line coding (baud rate, framing) is kept and reported back, but it does not pace the
 bytes: they arrive as the peer sends them. A guest that has not opened the port loses what the peer
 sends meanwhile, as a real device's output is lost before the host listens.
+
+## USB device-mode port (a PC on the USB-C cable)
+
+`--usb-device on` plugs a PC into the Orin's USB-C port, the one NVIDIA's images turn into a
+USB gadget: JetPack's `nv-l4t-usb-device-mode` service makes a composite device (RNDIS and NCM
+networking bridged as `l4tbr0` at 192.168.55.1, an ACM serial port, a read-only mass-storage
+disk), and its runtime script serves DHCP on the bridge. On the robot you reach the Orin at
+192.168.55.1 from a PC on that cable; here the emulated PC does.
+
+- `--usb-device-fwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (repeatable, QEMU's syntax)
+  forwards a host TCP port to the board's 192.168.55.1 over the cable, once the PC has its
+  DHCP lease. `--usb-device-fwd tcp::12222-:22` makes `ssh -p 12222 jetson@127.0.0.1` reach the
+  board's SSH server through its USB gadget.
+- `--usb-device-serial HOST:PORT` listens for a terminal on the gadget's serial port (the
+  board's `/dev/ttyGS0`, where JetPack runs a login): `nc 127.0.0.1 PORT` is the PC's
+  `/dev/ttyACM0`. One client at a time.
+
+Both imply `--usb-device on`, which needs BPMP (on by default with it). An unmodified
+JetPack 6 image (Waveshare's UGV Rover image, L4T R36.3) comes up as on the robot:
+`tegra-xudc` binds as `/sys/class/udc/3550000.usb`, the role switch
+`/sys/class/usb_role/usb2-0-role-switch` reads `device`, the gadget reaches `configured`,
+`l4tbr0` holds 192.168.55.1/24 with `usb0` (RNDIS) and `usb1` (NCM) in it, and the PC leases
+192.168.55.100 from the board's `dhcpd`. The PC prints `[usb-device]` lines when it has
+enumerated the gadget and when it takes its lease.
+
+The model (`tegra234/src/xudc.rs`, `tegra234/src/usb_pc.rs`):
+
+- **The controller:** the XUSB device controller at `0x03550000` (FPCI window `0x03558000`,
+  SPI 166), as `drivers/usb/gadget/udc/tegra-xudc.c` programs it: its event ring of two
+  segments, endpoint contexts in memory, a transfer ring per endpoint, the doorbell, endpoint
+  halt and pause, the port's status and change bits. SETUP packets reach the driver as
+  setup-packet events.
+- **The pad controller** (`0x03520000`, AO `0x03540000`): registers that keep what is written,
+  tracking calibration done at once. Its VBUS override is the cable's VBUS for the controller.
+  BPMP provides the USB clocks, the pad controller's reset and the XUSBA/XUSBB power domains;
+  the fuse block is in the device tree for the pad calibration.
+- **The cable:** the device tree starts port usb2-0 in the device role
+  (`role-switch-default-mode = "peripheral"`). On the module a Type-C controller (FUSB301 on
+  I²C) switches the role when a cable goes in; that chip is not modelled, so the PC is always
+  plugged in. The link is high speed (the device tree gives the controller no USB3 PHY).
+- **The PC:** a USB host that enumerates the gadget as Linux does and drives two of its
+  functions: NCM (NTB16 transfer blocks; ECM if a gadget offers that instead) and ACM (115200
+  8N1, DTR raised). RNDIS and the mass-storage disk are left alone, as on a PC without an RNDIS
+  driver; their endpoints are never polled. The PC's network stack is sbc-net's
+  `client::Client`: a DHCP client (renewing NVIDIA's 15 s lease halfway), ARP and ping, and the
+  forwards through sbc-net's NAT relay with the PC as their source. The board's connections to
+  the PC are refused (nothing listens there).
+
+Known differences from the robot: no SuperSpeed, no cable unplug or replug, the PC does not
+bind RNDIS or the disk, and it has no route to the host's network for the board (the runtime
+script's low-priority default route via 192.168.55.100 leads nowhere). `dnsmasq.service` fails
+on that image with or without the port: it has no configuration of its own, so it tries to
+listen on port 53, which `systemd-resolved` already holds (`failed to create listening socket
+for port 53: Address already in use`). DHCP on `l4tbr0` comes from NVIDIA's `dhcpd`, as the
+runtime script starts it.
 
 ## Rover UART
 

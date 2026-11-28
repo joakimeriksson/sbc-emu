@@ -5,6 +5,8 @@
 //!   exchanging Ethernet II frames;
 //! - `nat::Nat`: user-mode NAT relaying guest TCP/UDP through host sockets (native only);
 //! - `wifi`: a virtual 802.11 access point (beacons, probe/auth/assoc, WPA2 handshake).
+//! - `client::Client`: the opposite role, a DHCP client host on a link the board serves (the PC
+//!   on a Jetson's USB device-mode port), with TCP forwards onto the board through the NAT relay.
 pub mod net;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod nat;
@@ -23,6 +25,7 @@ pub mod nat {
     }
 }
 pub mod crypto;
+pub mod client;
 pub mod wifi;
 
 /// Host clock for SNTP answers.
