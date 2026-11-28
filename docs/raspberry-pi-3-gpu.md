@@ -3,10 +3,11 @@
 The BCM2837's 3D GPU, "V3D 2.1" to Mesa, modelled in `vc4-3d/` from Broadcom's *VideoCore IV 3D
 Architecture Reference Guide* (2013) and the Mesa and Linux sources (Mesa's `vc4` Gallium driver,
 its copy of the kernel's validator in `src/gallium/drivers/vc4/kernel/`, Linux's `vc4_regs.h`).
-This is milestone 7 of the [plan](rpi3-plan.md), first part: the GPU core, verified without the
-guest. Linux's `vc4` binds the V3D as one component of its DRM device, together with the HVS,
-pixel valves and HDMI, so the guest can use it only once milestone 4 (HDMI through `vc4` KMS)
-exists. Until then the device is on the bus and its device-tree node is disabled.
+This is milestone 7 of the [plan](rpi3-plan.md). Linux's `vc4` binds the V3D as one component of
+its DRM device, together with the HVS, pixel valves and HDMI (milestone 4): on the unmodified Pi OS
+image (`dtoverlay=vc4-kms-v3d`) `vc4-drm` binds `3fc00000.v3d`, Mesa 26.2 reports
+`VC4 V3D 2.1 / OpenGL ES 2.0`, and kmscube, the GLES 2 scenes of the GL suite and glmark2 run on
+it ([results](#results-in-the-guest)).
 
 ## What is modelled
 
@@ -88,11 +89,47 @@ measure a frame with one screen's worth of simple shading (kmscube's scale) shou
 (to AArch64 and WebAssembly, as the Maxwell shader JIT) would take the larger part away; it is
 worth doing once guest workloads (glmark2, the desktop) show where the time goes.
 
+## Results in the guest
+
+Raspberry Pi OS Lite (trixie, kernel 6.18.50, Mesa 26.2.6) with Mesa, kmscube, glmark2 and gcc
+(the GPU image of `scripts/raspios-gpu-setup.txt`, copy-on-write), HDMI at 1920x1080 through vc4 KMS.
+
+**Bring-up and kmscube** (`scripts/rpi3-v3d.txt`, from the first boot, saves `out/rpi3-v3d.snap`):
+`vc4-drm soc:gpu: bound 3fc00000.v3d (ops vc4_v3d_ops [vc4])`; `eglinfo` on GBM: `OpenGL ES
+profile renderer: VC4 V3D 2.1`, `OpenGL ES 2.0 Mesa 26.2.6`; kmscube's lit cube on HDMI,
+600 frames at 58.8 fps (guest time; each 1080p frame takes about 14 ms of host time).
+
+![kmscube on the emulated VideoCore IV](img/rpi3-kmscube.png)
+
+**The GLES 2 scenes of the GL suite** (`tests/gpu/gles2test.c`, 128x128) on the V3D against
+llvmpipe in the same guest, a scene at a time (`tools/serial_test_script.py` writes the script:
+the source goes in over the serial console, it is built with gcc in the guest):
+
+| Scene | Result |
+|---|---|
+| clear, blend_modes, tex_nearest, tex_formats, tex_etc1, stencil, scissor, polygon_offset, branches | pass, exact |
+| colormask, discard_fragcoord, vs_math, near_clip, loop_fragdepth | pass (max difference 1–2) |
+| tri_color, depth, blend, cube, points_lines, indexed, cubemap, fbo_texture | pass (under 0.2% of pixels differ: edges) |
+| tex_linear_mip | pass (0.12% of pixels, max 17: filtering at level transitions) |
+| many_tris | differs (22% of pixels): 20000 sub-pixel triangles; the image matches a model of the hardware's 12.4 snapping to 3 of 16384 pixels, llvmpipe snaps to 1/256 pixel |
+| derivatives_math | not run: Mesa's vc4 does not offer `GL_OES_standard_derivatives` |
+
+The guest runs found three model bugs, all fixed with unit tests: the configuration's "clockwise"
+bit means clockwise with y up (kmscube showed the cube's back faces), a conditional instruction sets
+the flags only in the lanes where it executes (Mesa's loops ended after one pass), and ETC1's
+differential base colours wrap as Mesa's decoder does.
+
+**glmark2-es2-drm** (`scripts/rpi3-glmark2.txt`, 2023.01, 1920x1080 on HDMI, all scenes at their
+default durations): every scene runs to its end, `GL_RENDERER: VC4 V3D 2.1`, **glmark2 Score: 21**.
+The frame rates are guest-time rates: a job's done interrupt waits for the host time it took, but
+at most 50 ms (well inside the kernel's hang check), so scenes whose frames take longer report about
+20 fps (most of the shading scenes; their real host cost is higher). build 57 fps; texture 31/24/23;
+gouraud 41; ideas 25; pulsar 26; desktop blur 2, shadow 10; terrain 3; refract 5; shadow 14;
+jellyfish 21. The pictures were not compared against a reference (glmark2's own `--validate`
+references do not match llvmpipe either, as on the Pi 4).
+
 ## Not modelled or not verified yet
 
-- Guest Mesa: nothing has run on the model from Mesa yet (that needs milestone 4). Mesa reports
-  `V3D 2.1` from these IDENT values by its own arithmetic (tested), but `kmscube`, the GLES 2 scenes
-  of `tests/gpu/gles2test.c` against softpipe/llvmpipe and `glmark2-es2-drm` remain to be run.
 - Early Z is not used to skip fragments (results are the same: the late test decides).
 - BGR565 stores do not dither; the 64-bit (HDR) tile buffer has only its tile size.
 - Per-sample Z in 4x mode is the pixel centre's; sample positions are a standard rotated grid.
@@ -101,13 +138,7 @@ worth doing once guest workloads (glmark2, the desktop) show where the time goes
 - VPM DMA in 16- and 8-bit modes; VG shader state; the alpha-mask and VG-mask paths are minimal.
 - Performance counters read 0.
 
-## Remaining for milestone 7 once HDMI exists
+## Remaining
 
-1. Enable the node with the rest of the `vc4` pipeline (`fdt::BootInfo::v3d`, set where the M4
-   work describes the HVS and HDMI): `dmesg` shows `vc4-drm gpu: bound 3fc00000.v3d`, and Mesa's
-   `eglinfo`/`es2_info` report `V3D 2.1`.
-2. `kmscube` on HDMI (a script like the Pi 4's `scripts/gpu-kmscube.txt`).
-3. `tests/gpu/gles2test.c` (the GLES 2 scenes of the GL suite) against softpipe in the same guest;
-   capture failing scenes with `SBC_VC4_CAPTURE` and fix them on the host with `vc4-replay`.
-4. All `glmark2-es2-drm` scenes, then the desktop (labwc) on the GPU.
-5. Profile those; then the QPU JIT if the interpreter is the bottleneck.
+- The desktop (Pi OS with desktop, labwc) on the GPU.
+- A QPU JIT (AArch64 and WebAssembly) once workloads show the interpreter is the bottleneck.
