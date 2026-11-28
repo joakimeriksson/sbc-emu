@@ -46,7 +46,9 @@ Options: `--net nat|local|none` (default `nat`: DHCP, DNS and NAT to the host's 
 
 ## Webcam
 
-`--camera` plugs a USB webcam (UVC, 640×480 YUYV at 30 frames a second of guest time) into a
+`--camera` plugs a USB webcam (UVC; by default 640×480 YUYV at 30 frames a second of guest time,
+and the modes of a common USB webcam besides: YUYV 320×240 and 1280×720, MJPEG 320×240, 640×480
+and 1280×720 at 30 or 15 frames a second; [jetson-orin-nano.md](jetson-orin-nano.md#webcam-modes)) into a
 USB 2.0 port; Debian's `uvcvideo` makes it `/dev/video0`. On its own it shows a test pattern;
 `--camera-source SPEC` gives it pictures from the host through `ffmpeg`, scaled to fit:
 

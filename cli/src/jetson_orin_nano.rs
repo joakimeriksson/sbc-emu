@@ -27,6 +27,14 @@ impl SerialBoard for Machine {
         Some(self)
     }
 
+    fn capture_audio(&mut self) -> bool {
+        self.capture_usb_audio()
+    }
+
+    fn take_audio(&mut self) -> (u32, Vec<i16>) {
+        self.take_usb_audio()
+    }
+
     fn report(&self, tag: &str) {
         eprintln!(
             "[{tag}] pc={:#x} el={} insns={} virtual={:.3}s irqs={}",
@@ -74,8 +82,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 }
 
 fn execute(args: &[String]) -> Result<(), String> {
-    // (--camera takes no value)
-    let valued: Vec<String> = args.iter().filter(|a| *a != "--camera").cloned().collect();
+    // (--camera and --usb-audio take no value)
+    let valued: Vec<String> = args.iter().filter(|a| *a != "--camera" && *a != "--usb-audio").cloned().collect();
     serial_board::validate_options(
         &valued,
         &[
@@ -84,6 +92,8 @@ fn execute(args: &[String]) -> Result<(), String> {
             "--net",
             "--hostfwd",
             "--usb-serial",
+            "--audio-in",
+            "--audio-out",
             "--smp",
             "--rover-uart",
             "--uart-driver",
@@ -160,6 +170,13 @@ fn execute(args: &[String]) -> Result<(), String> {
         .map(|a| a.parse().map_err(|_| "--usb-serial expects a numeric HOST:PORT"))
         .transpose()?;
     let mut serial = UsbSerialLink::new(usb_serial);
+    // --usb-audio: a USB sound card; --audio-out FILE.wav keeps what it plays, --audio-in FILE.wav
+    // is what its microphone hears (from its start in each recording; silence after it, and without it)
+    let audio_in = crate::arg(args, "--audio-in").map(crate::wav::read_mono).transpose()?;
+    let usb_audio = args.iter().any(|a| a == "--usb-audio");
+    if !usb_audio && (audio_in.is_some() || crate::arg(args, "--audio-out").is_some()) {
+        return Err("--audio-in and --audio-out need --usb-audio (the board's own audio is not modelled)".into());
+    }
     serial_board::run_with_io(
         config,
         || {
@@ -200,6 +217,13 @@ fn execute(args: &[String]) -> Result<(), String> {
             // --usb-serial HOST:PORT: a USB serial port (/dev/ttyACM0) whose bytes a TCP peer sends and reads
             if usb_serial.is_some() {
                 machine.attach_usb_serial(emu_core::usb::Serial::new("Virtual USB Serial"));
+            }
+            if usb_audio {
+                let mut audio = emu_core::usb::Audio::new();
+                if let Some((rate, samples)) = audio_in.clone() {
+                    audio.set_input(rate, samples);
+                }
+                machine.attach_usb_audio(audio);
             }
             machine.multi = multi;
             let jit = machine.set_jit(!no_jit);

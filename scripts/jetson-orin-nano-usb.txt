@@ -1,8 +1,11 @@
-# Tegra234 xHCI with a USB drive and a webcam plugged in. Run with --usb-drive on an image whose
-# first bytes are SBC_EMU_USB_DRIVE (docs/jetson-orin-nano.md, "USB") and --camera.
+# Tegra234 xHCI with a USB drive, a webcam and a sound card plugged in. Run with --usb-drive on an
+# image whose first bytes are SBC_EMU_USB_DRIVE (docs/jetson-orin-nano.md, "USB"), --camera and
+# --usb-audio.
 wait-serial TEGRA234_BOOT_OK
 serial for i in $(seq 1 50); do [ -b /dev/sda ] && break; sleep 0.2; done; [ "$(head -c 17 /dev/sda)" = SBC_EMU_USB_DRIVE ] && echo "DRIVE_" "OK"\r
 wait-serial DRIVE_ OK
 serial grep -qx 'Virtual USB Camera' /sys/bus/usb/devices/*/product && echo "CAMERA_" "ENUMERATED"\r
 wait-serial CAMERA_ ENUMERATED
+serial for i in $(seq 1 50); do grep -q 'USB PnP Audio Device' /proc/asound/cards && break; sleep 0.2; done; cat /proc/asound/cards; grep -q 'USB PnP Audio Device' /proc/asound/cards && ls /dev/snd/pcmC0D0p /dev/snd/pcmC0D0c && echo "AUDIO_" "ENUMERATED"\r
+wait-serial AUDIO_ ENUMERATED
 quit

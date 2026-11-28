@@ -7,7 +7,9 @@
 //! always empty. One interrupter, 32 device slots, 32-byte contexts, no scratchpad. Commands
 //! complete the moment the command doorbell rings; a transfer descriptor runs the moment its
 //! doorbell rings, except an IN transfer the device has nothing for (a NAK), which waits and is
-//! retried every millisecond of virtual time while the device has input.
+//! retried every millisecond of virtual time while the device has input. Isochronous endpoints
+//! (USB audio) run on the controller's clock instead: one TD per service interval of virtual
+//! time, from the first doorbell on (Start Isoch ASAP; the controller offers no frame IDs).
 use crate::dma::Dma;
 use emu_core::usb::{DevId, Devices, Speed, UsbDevice};
 
@@ -57,6 +59,7 @@ const T_NORMAL: u32 = 1;
 const T_SETUP: u32 = 2;
 const T_DATA: u32 = 3;
 const T_STATUS: u32 = 4;
+const T_ISOCH: u32 = 5;
 const T_LINK: u32 = 6;
 const T_EVENT_DATA: u32 = 7;
 const T_TRANSFER_EV: u32 = 32;
@@ -79,7 +82,17 @@ const EP_HALTED: u8 = 2;
 const EP_STOPPED: u8 = 3;
 
 #[derive(Clone, Copy, Default)]
-struct Ep { state: u8, deq: u64, ccs: bool }
+struct Ep {
+    state: u8,
+    deq: u64,
+    ccs: bool,
+    /// an isochronous endpoint: its service interval (ns), when its next TD is due, and whether
+    /// it has TDs (false once its ring ran dry: the next doorbell starts it again)
+    isoch: bool,
+    period: u64,
+    next: u64,
+    active: bool,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Slot { enabled: bool, port: u8, eps: [Ep; 32] }
@@ -545,7 +558,7 @@ impl Xhci {
                 let s = &mut self.slots[slot];
                 s.port = port as u8;
                 s.eps = [Ep::default(); 32];
-                s.eps[1] = Ep { state: EP_RUNNING, deq: ep0 & !0xf, ccs: ep0 & 1 != 0 };
+                s.eps[1] = Ep { state: EP_RUNNING, deq: ep0 & !0xf, ccs: ep0 & 1 != 0, ..Ep::default() };
                 self.set_slot_state(ram, slot, if bsr { 1 } else { 2 }, addr);
                 self.set_ep_ctx(ram, slot, 1);
                 CC_SUCCESS
@@ -567,7 +580,11 @@ impl Xhci {
                     if add >> d & 1 != 0 {
                         for k in (0..32).step_by(4) { let w = rd32(ram, input + 32 * (d as u64 + 1) + k); wr32(ram, out + 32 * d as u64 + k, w); }
                         let deq = rd64(ram, input + 32 * (d as u64 + 1) + 8);
-                        self.slots[slot].eps[d] = Ep { state: EP_RUNNING, deq: deq & !0xf, ccs: deq & 1 != 0 };
+                        let (info, info2) = (rd32(ram, input + 32 * (d as u64 + 1)), rd32(ram, input + 32 * (d as u64 + 1) + 4));
+                        // EP Type 1 and 5: isochronous OUT and IN; Interval: 125 us << n
+                        let isoch = matches!((info2 >> 3) & 7, 1 | 5);
+                        let period = 125_000u64 << ((info >> 16) & 0xff).min(15);
+                        self.slots[slot].eps[d] = Ep { state: EP_RUNNING, deq: deq & !0xf, ccs: deq & 1 != 0, isoch, period, ..Ep::default() };
                         self.set_ep_ctx(ram, slot, d);
                     }
                 }
@@ -590,6 +607,7 @@ impl Xhci {
                 if dci == 0 || dci > 31 { return (CC_TRB_ERROR, slot); }
                 let ep = &mut self.slots[slot].eps[dci];
                 if ep.state != EP_DISABLED { ep.state = EP_STOPPED; }
+                ep.active = false;
                 self.set_ep_ctx(ram, slot, dci);
                 CC_SUCCESS
             }
@@ -598,6 +616,7 @@ impl Xhci {
                 let ep = &mut self.slots[slot].eps[dci];
                 ep.deq = t.param & ADDRESS & !0xf;
                 ep.ccs = t.param & 1 != 0;
+                ep.active = false;
                 if ep.state == EP_DISABLED { ep.state = EP_STOPPED; }
                 self.set_ep_ctx(ram, slot, dci);
                 CC_SUCCESS
@@ -621,6 +640,13 @@ impl Xhci {
         if slot > MAX_SLOTS || !(1..32).contains(&dci) || !self.slots[slot].enabled { return; }
         let port = self.slots[slot].port as usize;
         let Some(id) = port.checked_sub(1).and_then(|k| self.ports.get(k)).and_then(|p| p.dev) else { return };
+        let now = self.now;
+        let ep = &mut self.slots[slot].eps[dci];
+        if ep.isoch {
+            // its TDs wait for their time (tick); a stream that had stopped starts now
+            if ep.state == EP_RUNNING && !ep.active { ep.active = true; ep.next = ep.next.max(now); }
+            return;
+        }
         let mut ran_out = false;
         for _ in 0..4096 {
             if self.slots[slot].eps[dci].state != EP_RUNNING { break; }
@@ -666,10 +692,10 @@ impl Xhci {
             let param = t.addr;
             x.post(ram, if ed != 0 { t.param } else { param }, cc << 24 | residue as u32 & 0xff_ffff, T_TRANSFER_EV << 10 | (dci as u32) << 16 | (slot as u32) << 24 | ed);
         };
-        let buf_len = |t: &Trb| if matches!(t.ty(), T_NORMAL | T_DATA) { t.len() } else { 0 };
+        let buf_len = |t: &Trb| if matches!(t.ty(), T_NORMAL | T_DATA | T_ISOCH) { t.len() } else { 0 };
         let gather = |ram: &Dma, ts: &[Trb]| -> Vec<u8> {
             let mut d = Vec::new();
-            for t in ts.iter().filter(|t| matches!(t.ty(), T_NORMAL | T_DATA)) {
+            for t in ts.iter().filter(|t| matches!(t.ty(), T_NORMAL | T_DATA | T_ISOCH)) {
                 if t.idt() { d.extend_from_slice(&t.param.to_le_bytes()[..t.len().min(8)]); }
                 else { d.extend_from_slice(ram.get(t.param, t.len()).unwrap_or(&vec![0; t.len()])); }
             }
@@ -722,14 +748,19 @@ impl Xhci {
             }
             if !data_in { dev.control_in(0); } // the IN status stage of an OUT or no-data request
             for t in status { if t.ioc() { ev(self, ram, t, CC_SUCCESS, 0); } }
-        } else if !td.iter().any(|t| matches!(t.ty(), T_NORMAL | T_DATA)) {
+        } else if !td.iter().any(|t| matches!(t.ty(), T_NORMAL | T_DATA | T_ISOCH)) {
             // no buffers (No-op TRBs: a cancelled transfer): nothing reaches the device
             complete(self, ram, &td, 0);
         } else {
             let epn = (dci / 2) as u8;
             if dci % 2 == 1 {
                 let want: usize = td.iter().map(buf_len).sum();
-                let Some(got) = dev.data_in(epn, want) else { self.transfers -= 1; return Some(false) };
+                // (an isochronous IN TD is never NAKed: nothing to send is a zero-length packet)
+                let got = match dev.data_in(epn, want) {
+                    Some(got) => got,
+                    None if ep.isoch => Vec::new(),
+                    None => { self.transfers -= 1; return Some(false) }
+                };
                 self.scatter(ram, &td, &got);
                 complete(self, ram, &td, got.len());
             } else {
@@ -749,7 +780,7 @@ impl Xhci {
     }
 
     fn scatter(&self, ram: &mut Dma, ts: &[Trb], mut data: &[u8]) {
-        for t in ts.iter().filter(|t| matches!(t.ty(), T_NORMAL | T_DATA)) {
+        for t in ts.iter().filter(|t| matches!(t.ty(), T_NORMAL | T_DATA | T_ISOCH)) {
             let n = t.len().min(data.len());
             if let Some(b) = ram.slice(t.param, n) { b.copy_from_slice(&data[..n]); }
             data = &data[n..];
@@ -762,6 +793,7 @@ impl Xhci {
     pub fn tick(&mut self, now: u64, ram: &mut Dma, devs: &mut Devices) {
         self.now = now;
         devs.set_time(now);
+        if self.usbcmd & CMD_RS != 0 { self.run_isoch(ram, devs); }
         if now < self.next_poll { return; }
         self.next_poll = now + 1_000_000;
         if self.usbcmd & CMD_RS == 0 { return; }
@@ -776,15 +808,39 @@ impl Xhci {
         }
     }
 
-    /// The next poll, while an attached device has input waiting.
+    /// Run the isochronous TDs that are due: one per endpoint per service interval. A guest that
+    /// fell behind gets its late TDs at once, up to 64 intervals; beyond that the schedule restarts.
+    fn run_isoch(&mut self, ram: &mut Dma, devs: &mut Devices) {
+        for s in 1..=MAX_SLOTS {
+            if !self.slots[s].enabled { continue; }
+            let port = self.slots[s].port as usize;
+            let Some(id) = port.checked_sub(1).and_then(|k| self.ports.get(k)).and_then(|p| p.dev) else { continue };
+            for d in 2..32 {
+                for _ in 0..64 {
+                    let ep = self.slots[s].eps[d];
+                    if !(ep.isoch && ep.active && ep.state == EP_RUNNING && ep.next <= self.now) { break; }
+                    let Some(dev) = devs.get(id) else { break };
+                    match self.run_td(s, d, ram, dev) {
+                        Some(_) => self.slots[s].eps[d].next += ep.period,
+                        None => { self.slots[s].eps[d].active = false; break; }
+                    }
+                }
+                let now = self.now;
+                let ep = &mut self.slots[s].eps[d];
+                if ep.isoch && ep.active && ep.next <= now { ep.next = now + ep.period; }
+            }
+        }
+    }
+
+    /// The next poll, while an attached device has input waiting or an isochronous TD is due.
     pub fn next_event(&self, devs: &Devices) -> Option<u64> {
-        let waiting = self.usbcmd & CMD_RS != 0 && self.ports.iter().any(|p| p.dev.is_some_and(|d| devs.has_input(d)));
+        let running = self.usbcmd & CMD_RS != 0;
+        let waiting = running && self.ports.iter().any(|p| p.dev.is_some_and(|d| devs.has_input(d)));
+        let isoch = self.slots.iter().filter(|s| running && s.enabled).flat_map(|s| s.eps.iter())
+            .filter(|e| e.isoch && e.active && e.state == EP_RUNNING).map(|e| e.next).min();
         // a pending interrupt held back by moderation
         let held = (self.usbcmd & CMD_INTE != 0 && self.iman & 3 == 3 && self.now < self.irq_hold).then_some(self.irq_hold);
-        match (waiting.then_some(self.next_poll), held) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [waiting.then_some(self.next_poll), held, isoch].into_iter().flatten().min()
     }
 }
 
@@ -868,5 +924,63 @@ mod tests {
         assert!(!x.irq() && x.next_event(&devs) == Some(MIN_HOLD_NS));
         x.tick(MIN_HOLD_NS, &mut d, &mut devs);
         assert!(x.irq());
+    }
+    /// An isochronous OUT endpoint (a USB sound card's speaker): one TD a service interval of
+    /// virtual time from the doorbell on, a transfer event each, and a ring that runs dry stops
+    /// the schedule until the next doorbell.
+    #[test]
+    fn isochronous_tds_run_one_per_interval() {
+        let (mut ram, mut devs) = (vec![0u8; 0x10000], Devices { audio: Some(emu_core::usb::Audio::new()), ..Default::default() });
+        let mut x = Xhci::new(Layout { usb3: 0..1, usb2: 1..2 });
+        x.trace = false;
+        x.attach(&[Some(DevId::Audio)]);
+        let (dcbaa, out, input, ring, buf) = (0x4000u64, 0x5000u64, 0x6000u64, 0x7000u64, 0x8000u64);
+        let mut d = Dma { ram: &mut ram, base: 0 };
+        wr64(&mut d, ERST, EVENTS);
+        wr32(&mut d, ERST + 8, 64);
+        wr64(&mut d, dcbaa + 8, out);
+        for (o, v) in [(0x58, 8), (0x50, dcbaa as u32), (0x54, 0), (0x38, RING as u32 | 1), (0x3c, 0), (0x628, 1), (0x638, EVENTS as u32), (0x630, ERST as u32), (0x634, 0), (0x620, 2), (0x20, 5)] {
+            x.write(o, v, &mut d, &mut devs);
+        }
+        x.write(PORTS + 0x10, PS_PR | PS_PP, &mut d, &mut devs);
+        // Enable Slot, Address Device (root port 2), Configure Endpoint (EP 1 OUT, isochronous, 1 ms)
+        wr32(&mut d, input + 4, 3);
+        wr32(&mut d, input + 32 + 4, 2 << 16);
+        wr64(&mut d, input + 64 + 8, 0x7800 | 1);
+        let cmd = |d: &mut Dma, k: u64, param: u64, control: u32| { wr64(d, RING + 16 * k, param); wr32(d, RING + 16 * k + 12, control | 1); };
+        cmd(&mut d, 0, 0, 9 << 10);
+        cmd(&mut d, 1, input, 11 << 10 | 1 << 24);
+        x.write(DB, 0, &mut d, &mut devs);
+        wr32(&mut d, input + 4, 1 << 2);
+        wr32(&mut d, input + 96, 3 << 16);
+        wr32(&mut d, input + 96 + 4, 1 << 3);
+        wr64(&mut d, input + 96 + 8, ring | 1);
+        cmd(&mut d, 2, input, 12 << 10 | 1 << 24);
+        x.write(DB, 0, &mut d, &mut devs);
+        let a = devs.audio.as_mut().unwrap();
+        assert!(a.setup([0, 9, 1, 0, 0, 0, 0, 0]) && a.setup([1, 11, 1, 0, 1, 0, 0, 0]));
+        a.keep_output = true;
+        // three TDs of 48 stereo frames (1 ms at 48 kHz)
+        for k in 0..3 {
+            wr64(&mut d, ring + 16 * k, buf);
+            wr32(&mut d, ring + 16 * k + 8, 192);
+            wr32(&mut d, ring + 16 * k + 12, T_ISOCH << 10 | 1 << 5 | 1);
+        }
+        x.tick(10_000_000, &mut d, &mut devs);
+        x.write(DB + 4, 2, &mut d, &mut devs);
+        assert_eq!(devs.audio.as_ref().unwrap().played, 0, "a TD waits for its interval");
+        x.tick(10_000_000, &mut d, &mut devs);
+        assert_eq!(devs.audio.as_ref().unwrap().played, 48);
+        assert_eq!(x.next_event(&devs), Some(11_000_000));
+        x.tick(10_900_000, &mut d, &mut devs);
+        assert_eq!(devs.audio.as_ref().unwrap().played, 48);
+        x.tick(13_500_000, &mut d, &mut devs);
+        assert_eq!(devs.audio.as_ref().unwrap().played, 144);
+        // the ring ran dry: nothing is due until the next doorbell
+        assert_eq!(x.next_event(&devs), None);
+        let events = (0..64).map(|k| (rd64(&d, EVENTS + 16 * k), rd32(&d, EVENTS + 16 * k + 8), rd32(&d, EVENTS + 16 * k + 12)))
+            .filter(|e| e.2 & 1 == 1 && (e.2 >> 10) & 0x3f == T_TRANSFER_EV).collect::<Vec<_>>();
+        assert_eq!(events.iter().map(|e| (e.0, e.1 >> 24, (e.2 >> 16) & 0x1f)).collect::<Vec<_>>(), [(ring, 1, 2), (ring + 16, 1, 2), (ring + 32, 1, 2)]);
+        assert_eq!(devs.audio.as_mut().unwrap().take_output().1.len(), 288);
     }
 }

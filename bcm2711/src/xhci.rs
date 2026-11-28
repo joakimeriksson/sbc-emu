@@ -696,5 +696,5 @@ impl Xhci {
     }
 }
 
-pub(crate) fn dev_code(d: Option<DevId>) -> u8 { match d { None => 0, Some(DevId::Keyboard) => 1, Some(DevId::Tablet) => 2, Some(DevId::Storage) => 3, Some(DevId::Camera) => 4, Some(DevId::Net) => 5, Some(DevId::Serial) => 6 } }
-pub(crate) fn dev_of(c: u8) -> Option<DevId> { match c { 1 => Some(DevId::Keyboard), 2 => Some(DevId::Tablet), 3 => Some(DevId::Storage), 4 => Some(DevId::Camera), 5 => Some(DevId::Net), 6 => Some(DevId::Serial), _ => None } }
+pub(crate) fn dev_code(d: Option<DevId>) -> u8 { match d { None => 0, Some(DevId::Keyboard) => 1, Some(DevId::Tablet) => 2, Some(DevId::Storage) => 3, Some(DevId::Camera) => 4, Some(DevId::Net) => 5, Some(DevId::Serial) => 6, Some(DevId::Audio) => 7 } }
+pub(crate) fn dev_of(c: u8) -> Option<DevId> { match c { 1 => Some(DevId::Keyboard), 2 => Some(DevId::Tablet), 3 => Some(DevId::Storage), 4 => Some(DevId::Camera), 5 => Some(DevId::Net), 6 => Some(DevId::Serial), 7 => Some(DevId::Audio), _ => None } }
