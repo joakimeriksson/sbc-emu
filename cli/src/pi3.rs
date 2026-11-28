@@ -18,7 +18,8 @@ impl SerialBoard for Machine {
             self.cpu().pc, self.cpu().el, Machine::instret(self), self.now as f64 / 1e9, self.irqs, self.exceptions, self.state
         );
         if let Some(l) = self.soc.tree.lan_ref() {
-            eprintln!("[{tag}] USB: {} channel transfers; Ethernet: {} frames out, {} in, {} dropped", self.soc.usb.transfers, l.tx_frames, l.rx_frames, l.rx_dropped);
+            let (tx, rx, dropped) = l.counters();
+            eprintln!("[{tag}] USB: {} channel transfers; Ethernet: {tx} frames out, {rx} in, {dropped} dropped", self.soc.usb.transfers);
         }
         if let Some(n) = self.soc.net.as_ref() {
             eprintln!("[{tag}] network: {} DHCP acks, {} DNS answers, {} pings answered", n.dhcp_acks, n.dns_answers, n.pings);
@@ -189,8 +190,8 @@ fn execute(args: &[String]) -> Result<(), String> {
                 },
                 match model {
                     Model::B3Plus => format!("the LAN7515 (two hubs, LAN7800 gigabit Ethernet: {}), USB keyboard and tablet", if net == "none" { "no network".into() } else { format!("--net {net}") }),
-                    Model::B3 => "a hub (the LAN9514's Ethernet is not modelled), USB keyboard and tablet".into(),
-                    _ => "a USB keyboard".to_string(),
+                    Model::B3 => format!("the LAN9514 (a hub, LAN9500 100 Mb/s Ethernet: {}), USB keyboard and tablet", if net == "none" { "no network".into() } else { format!("--net {net}") }),
+                    _ => "a USB keyboard on its port".to_string(),
                 },
                 if kms {
                     format!(", {}through the vc4 KMS pipeline (HVS, pixel valves, HDMI with CEC and audio, a {}x{} monitor{})",

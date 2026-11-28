@@ -126,7 +126,9 @@ pub fn usb_tree(model: Model, devs: &mut Devices) -> UsbTree {
             t.add(Node::Dev(DevId::Tablet), Some((h1, 3)), devs);
         }
         Model::B3 => {
+            // the LAN9514: a 5-port hub with the Ethernet controller on port 1
             let h = t.add(Node::Hub(Hub::new(5, 0x0424, 0x9514, 1 << 1, true)), None, devs);
+            t.add(Node::Smsc(Box::new(emu_core::smsc95xx::Smsc95xx::new())), Some((h, 1)), devs);
             t.add(Node::Dev(DevId::Keyboard), Some((h, 2)), devs);
             t.add(Node::Dev(DevId::Tablet), Some((h, 3)), devs);
         }
@@ -456,11 +458,11 @@ impl Soc {
         match self.net.as_mut() {
             Some(net) => {
                 let mut replies = Vec::new();
-                for f in std::mem::take(&mut lan.tx_out) { replies.extend(net.handle(&f, now_us)); }
+                for f in lan.take_tx() { replies.extend(net.handle(&f, now_us)); }
                 replies.extend(net.poll(now_us));
                 for f in replies { lan.receive(&f); }
             }
-            None => lan.tx_out.clear(),
+            None => { lan.take_tx(); }
         }
     }
 
@@ -1217,5 +1219,46 @@ impl Machine {
         self.next_check = 0;
         self.soc.dirty = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_core::disk::{Disk, Overlay};
+
+    /// An image that stays unchanged under a copy-on-write overlay, as `--sd` without
+    /// `--sd-persist` opens it; the overlay is shared with the test so it can look at it.
+    struct Cow(std::rc::Rc<std::cell::RefCell<Overlay>>);
+    impl Disk for Cow {
+        fn sectors(&self) -> u64 { 2048 }
+        fn read(&mut self, lba: u64, out: &mut [u8]) { out.fill(0xaa); self.0.borrow().apply(lba, out); }
+        fn write(&mut self, lba: u64, data: &[u8]) { self.0.borrow_mut().store(lba, data, 2048); }
+        fn overlay(&self) -> Vec<(u64, Vec<u8>)> { self.0.borrow().sorted() }
+        fn restore_overlay(&mut self, sectors: Vec<(u64, Vec<u8>)>) { self.0.borrow_mut().replace(sectors, 2048); }
+    }
+
+    /// A snapshot of a copy-on-write card carries what the guest wrote: a restore brings those
+    /// sectors back and drops the ones written after the snapshot (else the restored guest's
+    /// page cache and the card disagree).
+    #[test]
+    fn snapshots_carry_the_cards_written_sectors() {
+        let ov = std::rc::Rc::new(std::cell::RefCell::new(Overlay::default()));
+        let mut m = Machine::new(Model::B3Plus, 128 << 20, 1);
+        m.soc.sd = Sdhost::new(Some(Box::new(Cow(ov.clone()))));
+        m.soc.sd.disk.as_mut().unwrap().write(7, &[1; 512]);
+        let snap = m.save().unwrap();
+        m.soc.sd.disk.as_mut().unwrap().write(7, &[2; 512]);
+        m.soc.sd.disk.as_mut().unwrap().write(9, &[3; 512]);
+        m.restore(&snap).unwrap();
+        assert_eq!(ov.borrow().sorted(), vec![(7, vec![1; 512])]);
+        // into a fresh machine on the same image (another run): the sectors come with it
+        let ov2 = std::rc::Rc::new(std::cell::RefCell::new(Overlay::default()));
+        let mut m2 = Machine::new(Model::B3Plus, 128 << 20, 1);
+        m2.soc.sd = Sdhost::new(Some(Box::new(Cow(ov2.clone()))));
+        m2.restore(&snap).unwrap();
+        let mut s = [0u8; 512];
+        m2.soc.sd.disk.as_mut().unwrap().read(7, &mut s);
+        assert_eq!(s, [1; 512]);
     }
 }

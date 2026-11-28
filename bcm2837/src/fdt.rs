@@ -71,8 +71,10 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.str("sdhost", &format!("/soc/mmc@{}", node(m::SDHOST)));
     f.str("mmc1", &format!("/soc/mmc@{}", node(m::SDHCI)));
     if bluetooth { f.str("bluetooth", &format!("/soc/serial@{}/bluetooth", node(m::UART0))); }
-    if b.model == crate::Model::B3Plus {
-        f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/usb-port@1/ethernet@1", node(m::USB)));
+    match b.model {
+        crate::Model::B3Plus => f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/usb-port@1/ethernet@1", node(m::USB))),
+        crate::Model::B3 => f.str("ethernet0", &format!("/soc/usb@{}/usb-port@1/ethernet@1", node(m::USB))),
+        _ => {}
     }
     f.end();
 
@@ -431,6 +433,20 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
         f.end();
         f.end();
     }
+    if b.model == crate::Model::B3 {
+        // the LAN9514: its hub on the root port, the Ethernet controller on the hub's port 1
+        f.begin("usb-port@1");
+        f.str("compatible", "usb424,9514");
+        f.cells("reg", &[1]);
+        f.cells("#address-cells", &[1]);
+        f.cells("#size-cells", &[0]);
+        f.begin("ethernet@1");
+        f.str("compatible", "usb424,ec00");
+        f.cells("reg", &[1]);
+        f.prop("local-mac-address", &m::ETH_MAC);
+        f.end();
+        f.end();
+    }
     f.end();
 
     if b.kms { display(&mut f, b, Phandles { fwclk, power, gpio, dma, ddc, expgpio, clk_core }); }
@@ -563,5 +579,18 @@ mod tests {
         assert!(child(&child(&soc, "mmc@7e300000").unwrap(), "wifi@1").is_some());
         assert_eq!(bus(crate::machine::V3D), 0x7ec0_0000);
         assert_eq!(gpu(crate::machine::GPU_V3D as u32), [1, 10]);
+    }
+
+    #[test]
+    fn each_model_lists_its_usb_devices() {
+        let out = bcm2711::boot::KmsOutputs { hdmi: true, composite: false };
+        for model in crate::Model::ALL {
+            let blob = tree(&BootInfo { model, ram: 400 << 20, bootargs: "", initrd: None, fb: None, cpus: 4, kms: false, v3d: false, outputs: out, bluetooth: false });
+            let has = |s: &[u8]| blob.windows(s.len()).any(|w| w == s);
+            assert_eq!(has(b"usb424,7800"), model == crate::Model::B3Plus);
+            assert_eq!(has(b"usb424,ec00") && has(b"usb424,9514"), model == crate::Model::B3);
+            let root = emu_core::fdt::Node::parse(&blob).unwrap();
+            assert!(root.prop("model").unwrap().starts_with(model.name().as_bytes()));
+        }
     }
 }

@@ -202,8 +202,32 @@ pub enum Node {
     Hub(Hub),
     /// one of the shared devices (`Devices`: keyboard, tablet, ...)
     Dev(DevId),
-    /// a LAN78xx USB Ethernet adapter
+    /// a LAN78xx USB Ethernet adapter (the 3B+'s LAN7515)
     Lan(Box<crate::lan78xx::Lan78xx>),
+    /// a LAN95xx USB Ethernet adapter (the 3B's LAN9514)
+    Smsc(Box<crate::smsc95xx::Smsc95xx>),
+}
+
+/// A USB Ethernet adapter in the tree, as the machine connects it to the network.
+pub trait UsbNic {
+    /// Frames the guest sent since the last call.
+    fn take_tx(&mut self) -> Vec<Vec<u8>>;
+    /// A frame from the network for the guest.
+    fn receive(&mut self, frame: &[u8]);
+    /// Frames sent, received, dropped.
+    fn counters(&self) -> (u64, u64, u64);
+}
+
+impl UsbNic for crate::lan78xx::Lan78xx {
+    fn take_tx(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.tx_out) }
+    fn receive(&mut self, frame: &[u8]) { crate::lan78xx::Lan78xx::receive(self, frame) }
+    fn counters(&self) -> (u64, u64, u64) { (self.tx_frames, self.rx_frames, self.rx_dropped) }
+}
+
+impl UsbNic for crate::smsc95xx::Smsc95xx {
+    fn take_tx(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.tx_out) }
+    fn receive(&mut self, frame: &[u8]) { crate::smsc95xx::Smsc95xx::receive(self, frame) }
+    fn counters(&self) -> (u64, u64, u64) { (self.tx_frames, self.rx_frames, self.rx_dropped) }
 }
 
 pub struct Slot {
@@ -224,7 +248,7 @@ impl UsbTree {
     /// Add `node` behind port `up.1` of the hub at `up.0` (None: on the root port); returns its index.
     pub fn add(&mut self, node: Node, up: Option<(usize, u8)>, devs: &mut Devices) -> usize {
         let speed = match &node {
-            Node::Hub(_) | Node::Lan(_) => Speed::High,
+            Node::Hub(_) | Node::Lan(_) | Node::Smsc(_) => Speed::High,
             Node::Dev(d) => devs.get(*d).map_or(Speed::Full, |d| d.speed()),
         };
         if let Some((h, p)) = up {
@@ -235,11 +259,19 @@ impl UsbTree {
     }
 
     /// The Ethernet adapter, if the tree has one.
-    pub fn lan(&mut self) -> Option<&mut crate::lan78xx::Lan78xx> {
-        self.slots.iter_mut().find_map(|s| match &mut s.node { Node::Lan(l) => Some(l.as_mut()), _ => None })
+    pub fn lan(&mut self) -> Option<&mut dyn UsbNic> {
+        self.slots.iter_mut().find_map(|s| match &mut s.node {
+            Node::Lan(l) => Some(l.as_mut() as &mut dyn UsbNic),
+            Node::Smsc(l) => Some(l.as_mut() as &mut dyn UsbNic),
+            _ => None,
+        })
     }
-    pub fn lan_ref(&self) -> Option<&crate::lan78xx::Lan78xx> {
-        self.slots.iter().find_map(|s| match &s.node { Node::Lan(l) => Some(l.as_ref()), _ => None })
+    pub fn lan_ref(&self) -> Option<&dyn UsbNic> {
+        self.slots.iter().find_map(|s| match &s.node {
+            Node::Lan(l) => Some(l.as_ref() as &dyn UsbNic),
+            Node::Smsc(l) => Some(l.as_ref() as &dyn UsbNic),
+            _ => None,
+        })
     }
 
     fn root(&self) -> Option<usize> { self.slots.iter().position(|s| s.up.is_none()) }
@@ -262,6 +294,7 @@ impl UsbTree {
         match &mut self.slots.get_mut(i)?.node {
             Node::Hub(h) => Some(h),
             Node::Lan(l) => Some(l.as_mut()),
+            Node::Smsc(l) => Some(l.as_mut()),
             Node::Dev(d) => devs.get(*d),
         }
     }
@@ -327,6 +360,7 @@ impl crate::snap::Snap for UsbTree {
                 Node::Hub(h) => { w.u8(1); h.save(w); }
                 Node::Lan(l) => { w.u8(2); l.save(w); }
                 Node::Dev(_) => w.u8(3),
+                Node::Smsc(l) => { w.u8(4); l.save(w); }
             }
         }
     }
@@ -338,6 +372,7 @@ impl crate::snap::Snap for UsbTree {
                 (1, Node::Hub(h)) => h.load(r)?,
                 (2, Node::Lan(l)) => l.load(r)?,
                 (3, Node::Dev(_)) => {}
+                (4, Node::Smsc(l)) => l.load(r)?,
                 _ => return Err(crate::snap::SnapError("another USB topology".into())),
             }
         }
