@@ -95,12 +95,15 @@ pub struct Firmware<'a> {
     /// ... and its composite output (`dtoverlay=vc4-kms-v3d,composite`), which the firmware
     /// then sets up as `enable_tvout` and `sdtv_mode` say
     pub composite: bool,
+    /// the firmware's audio service is modelled: `dtparam=audio=on` turns on `snd_bcm2835`'s
+    /// headphone output as the real firmware does, through the command line
+    pub audio: bool,
 }
 
 /// The Pi 4's firmware: `[pi4]`, serial0 is the PL011 here (the mini UART is the Bluetooth
 /// controller's, or `--serial1`).
 pub const PI4_FIRMWARE: Firmware<'static> = Firmware {
-    sections: &["pi4", "pi400", "board-type=0x11"], arm64_default: true, serial0: "ttyAMA0", serial1: "ttyS0", kms: true, composite: false,
+    sections: &["pi4", "pi400", "board-type=0x11"], arm64_default: true, serial0: "ttyAMA0", serial1: "ttyS0", kms: true, composite: false, audio: false,
 };
 
 /// Parse config.txt for a Pi 4 (sections [all] and [pi4] apply) and load kernel, initramfs and
@@ -131,6 +134,8 @@ pub struct BootConfig {
     pub enable_tvout: Option<bool>,
     /// `disable_fw_kms_setup=1`: the firmware writes no `video=` options into the command line
     pub disable_fw_kms_setup: bool,
+    /// `dtparam=audio=on|off` if given (on a board whose firmware audio is modelled)
+    pub audio: Option<bool>,
     /// human-readable notes on what was applied or ignored
     pub notes: Vec<String>,
 }
@@ -176,6 +181,11 @@ pub fn parse_config(config: &str, fw: &Firmware) -> BootConfig {
             ("sdtv_mode", v) => c.sdtv_mode = v.parse().ok(),
             ("enable_tvout", v) => c.enable_tvout = Some(v != "0"),
             ("disable_fw_kms_setup", v) => c.disable_fw_kms_setup = v == "1",
+            ("dtparam", v) if fw.audio && v.starts_with("audio=") => {
+                let on = matches!(&v[6..], "on" | "yes" | "true" | "y" | "1");
+                c.audio = Some(on);
+                c.notes.push(format!("dtparam={v}: the firmware's audio service ({})", if on { "snd_bcm2835 headphones on" } else { "off" }));
+            }
             ("dtoverlay", v) | ("dtparam", v) => c.notes.push(format!("ignored {k}={v} (reduced device tree)", k = k.trim())),
             _ => {}
         }
@@ -191,7 +201,7 @@ pub fn read_sd_boot_for(disk: &mut dyn crate::sdhci::Disk, fw: &Firmware) -> Res
     let mut fat = crate::fat::Fat::open(disk, lba).ok_or("boot partition is not FAT16/FAT32")?;
     let config = fat.read_file("config.txt").map(|c| String::from_utf8_lossy(&c).into_owned()).unwrap_or_default();
     let BootConfig { kernel: mut kernel_name, kernel_set, initramfs: mut initramfs_name, cmdline: mut cmdline_name, os_prefix, auto_initramfs, arm64, mut notes, kms,
-                     outputs, sdtv_mode, enable_tvout, disable_fw_kms_setup } = parse_config(&config, fw);
+                     outputs, sdtv_mode, enable_tvout, disable_fw_kms_setup, audio } = parse_config(&config, fw);
     if arm64 == Some(false) {
         return Err("config.txt asks for a 32-bit kernel (arm_64bit=0): not supported".into());
     }
@@ -219,6 +229,17 @@ pub fn read_sd_boot_for(disk: &mut dyn crate::sdhci::Disk, fw: &Firmware) -> Res
             Ok(video) => { notes.push(format!("composite: {video} added to the command line")); cmdline = format!("{cmdline} {video}"); }
             Err(why) => notes.push(format!("composite: {why}")),
         }
+    }
+    if fw.audio {
+        // the base tree's `audio` parameter and vc4-kms-v3d's override (HDMI audio is vc4's
+        // then), ahead of cmdline.txt as the firmware writes them
+        let mut fw_args: Vec<&str> = match audio {
+            Some(true) => vec!["snd_bcm2835.enable_headphones=1", "snd_bcm2835.enable_hdmi=1"],
+            Some(false) => vec!["snd_bcm2835.enable_headphones=0", "snd_bcm2835.enable_hdmi=0"],
+            None => Vec::new(),
+        };
+        if kms { fw_args.push("snd_bcm2835.enable_hdmi=0"); }
+        if !fw_args.is_empty() { cmdline = format!("{} {cmdline}", fw_args.join(" ")); }
     }
     notes.insert(0, format!("kernel {kernel_name} ({} bytes), initramfs {}, cmdline from {cmdline_name}", kernel.len(),
         initramfs_name.as_deref().unwrap_or("none")));
@@ -254,18 +275,20 @@ mod tests {
         let pi4 = parse_config(CONFIG, &PI4_FIRMWARE);
         assert_eq!((pi4.kernel.as_str(), pi4.cmdline.as_str(), pi4.initramfs.as_deref()), ("pi4.img", "cmdline.txt", Some("extra.cpio")));
         assert!(pi4.auto_initramfs && pi4.arm64 == Some(true));
-        let pi3 = Firmware { sections: &["pi3", "pi3+"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true };
+        let pi3 = Firmware { sections: &["pi3", "pi3+"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true, audio: true };
         let c = parse_config(CONFIG, &pi3);
         assert!(!c.kms);
         assert!(parse_config("[pi3]\ndtoverlay=vc4-kms-v3d,cma-128\n", &pi3).kms);
         assert!(!parse_config("[pi4]\ndtoverlay=vc4-kms-v3d\n", &pi3).kms);
+        assert_eq!(c.audio, Some(true), "dtparam=audio=on");
+        assert_eq!(pi4.audio, None, "the Pi 4's firmware audio is not modelled");
         assert_eq!((c.kernel.as_str(), c.cmdline.as_str(), c.initramfs.as_deref()), ("pi3.img", "plus.txt", Some("extra.cpio")));
         assert!(c.kernel_set);
     }
 
     #[test]
     fn composite_from_the_overlay_and_sdtv_mode() {
-        let pi3 = Firmware { sections: &["pi3"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true };
+        let pi3 = Firmware { sections: &["pi3"], arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true, audio: true };
         let c = parse_config("dtoverlay=vc4-kms-v3d\ndisable_fw_kms_setup=1\n", &pi3);
         assert_eq!((c.outputs, c.disable_fw_kms_setup), (KmsOutputs { hdmi: true, composite: false }, true));
         let c = parse_config("dtoverlay=vc4-kms-v3d,cma-128,composite\nsdtv_mode=2\n", &pi3);

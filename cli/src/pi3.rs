@@ -32,6 +32,11 @@ impl SerialBoard for Machine {
             eprintln!("[{tag}] {out}: {mode}, {} frames on pixel valve 2; {} CEC messages", v.frames, v.cec.log.len());
             if std::env::var_os("SBC_CEC_LOG").is_some() { for l in &v.cec.log { eprintln!("[{tag}] CEC {l}"); } }
         }
+        let vq = &self.soc.vchiq;
+        if vq.connected() {
+            eprintln!("[{tag}] VCHIQ: {} messages in, {} out; MMAL: {} components, {} pictures decoded, {} buffers returned, {} shared-memory handles; audio: {} writes played",
+                      vq.rx_msgs, vq.tx_msgs, vq.mmal.component_kinds().len(), vq.mmal.pictures, vq.mmal.buffers, vq.mmal.smem.len(), vq.audio.completed);
+        }
         if !self.soc.mbox.unknown.is_empty() {
             let tags: Vec<String> = self.soc.mbox.unknown.iter().map(|t| format!("{t:#x}")).collect();
             eprintln!("[{tag}] firmware property tags answered as unknown: {}", tags.join(" "));
@@ -40,8 +45,8 @@ impl SerialBoard for Machine {
     fn save(&self) -> Result<Vec<u8>, String> { Machine::save(self) }
     fn restore(&mut self, file: &[u8]) -> Result<(), String> { Machine::restore(self, file) }
     fn screen(&mut self) -> Option<&mut dyn Screen> { Some(self) }
-    // HDMI audio (the analogue jack's PWM is not modelled)
-    fn capture_audio(&mut self) -> bool { self.soc.capture_audio = true; self.soc.vc4.is_some() }
+    // HDMI audio and the headphone jack's (the firmware's audio service over VCHIQ)
+    fn capture_audio(&mut self) -> bool { self.soc.capture_audio = true; true }
     fn take_audio(&mut self) -> (u32, Vec<i16>) { (self.soc.audio_rate, std::mem::take(&mut self.soc.audio)) }
     fn set_hdmi_connected(&mut self, on: bool) -> bool { if self.soc.vc4.is_none() { return false; } Machine::set_hdmi_connected(self, on); true }
 }

@@ -52,6 +52,10 @@ pub struct Mailbox {
     pub exp_gpio_out: u8,
     pub exp_gpio_in: u8,
     exp_gpio_dir: u8,
+    /// the board's firmware runs VCHIQ (the Pi 3 machine models its services): `VCHIQ_INIT`
+    /// is accepted and its slot memory's bus address left in `vchiq_init` for the machine
+    pub vchiq: bool,
+    pub vchiq_init: Option<u32>,
 }
 
 /// The firmware clocks the Pi 4's firmware lists: ARM (cpufreq: one operating point, 1.5 GHz),
@@ -67,6 +71,7 @@ impl Mailbox {
             revision: BOARD_REVISION,
             clocks: PI4_CLOCKS,
             exp_gpio_out: 0, exp_gpio_in: 0, exp_gpio_dir: 0,
+            vchiq: false, vchiq_init: None,
             rd: VecDeque::new(),
             cfg: 0,
             fb: Framebuffer { base: fb_base, max_size: fb_max, allocated: false, width, height, vwidth: width, vheight: height,
@@ -235,6 +240,8 @@ impl Mailbox {
             0x0004_000f => set(v, &[0]), // vsync / wait: immediate
             0x0003_0020 => set(v, &[arg(v, 0), 0]), // GET_DMA? -> none
             0x0006_0001 => set(v, &[0x7f35]), // DMA channel mask (firmware default)
+            // VCHIQ_INIT: the slots' bus address; 0 back is success
+            0x0004_8010 if self.vchiq => { self.vchiq_init = Some(arg(v, 0)); set(v, &[0]) }
             _ => return None,
         })
     }

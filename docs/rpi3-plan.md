@@ -171,6 +171,10 @@ Each ends with something a script checks, as on the other boards.
 9. **Hardware video decode** through VCHIQ and `bcm2835-codec`, decoded on the host. *Check:*
    `v4l2-ctl --list-devices` shows `bcm2835-codec-decode`; `ffmpeg -c:v h264_v4l2m2m` decodes a test
    file bit-exactly against the host's decoder; `bcm2835-audio` plays to the host too.
+   *Done except the decoder* (`scripts/rpi3-vchiq.txt`): VCHIQ, `vc-sm-cma`, the MMAL components
+   behind `bcm2835-codec` and `bcm2835-isp`, the ISP's conversions, the headphone card; the
+   decoder is a stand-in behind `video::VideoDecoder` that emits test pictures until the H.264
+   decoder is chosen and plugged in.
 10. *Stretch:* **32-bit Raspberry Pi OS** on `arm-a32` with the ARMv8 AArch32 additions.
 
 ## Risks

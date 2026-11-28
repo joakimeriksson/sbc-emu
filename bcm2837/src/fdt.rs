@@ -186,6 +186,15 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.cells("phandle", &[mbox]);
     f.end();
 
+    // VCHIQ, the message queue to the VideoCore firmware's services (MMAL, audio, shared
+    // memory): its doorbells and the ARM's doorbell 0 interrupt, the BCM2836-family
+    // compatible (64-byte cache lines for bulk transfers) as the vendor tree has it
+    f.begin(&format!("mailbox@{}", node(m::VCHIQ)));
+    f.strs("compatible", &["brcm,bcm2836-vchiq", "brcm,bcm2835-vchiq"]);
+    f.cells("reg", &[bus(m::VCHIQ), 0x3c]);
+    f.cells("interrupts", &[0, m::ARM_DOORBELL0 as u32]);
+    f.end();
+
     f.begin("firmware");
     f.strs("compatible", &["raspberrypi,bcm2835-firmware", "simple-mfd"]);
     f.cells("mboxes", &[mbox]);
@@ -474,5 +483,6 @@ mod tests {
         assert!(blob.windows(b"usb424,7800".len()).any(|w| w == b"usb424,7800"));
         assert!(blob.windows(6).any(|w| w == crate::machine::ETH_MAC));
         assert!(blob.windows(b"brcm,bcm2835-vec".len()).any(|w| w == b"brcm,bcm2835-vec"));
+        assert!(blob.windows(b"brcm,bcm2836-vchiq".len()).any(|w| w == b"brcm,bcm2836-vchiq"));
     }
 }
