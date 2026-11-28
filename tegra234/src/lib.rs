@@ -8,6 +8,8 @@ mod mc;
 mod mss_nvlink;
 #[cfg(not(target_arch = "wasm32"))]
 mod mt;
+mod pmc;
+mod tcu;
 mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -59,6 +61,11 @@ struct Soc {
     mss_nvlink: mss_nvlink::MssNvlink,
     gpu_node: bool,
     firmware: Option<Firmware>,
+    /// the Tegra Combined UART (ttyTCU0): AON HSP, TOP0's shared mailboxes, the SPE's side
+    tcu: tcu::Tcu,
+    /// console input goes to the TCU (the kernel command line names ttyTCU0), else the PL011
+    console_tcu: bool,
+    pmc_scratch: pmc::Scratch,
     xhci: Option<peripherals::xhci::Xhci>,
     usb: emu_core::usb::Devices,
     /// the network behind the USB Ethernet adapter, and when it is next polled
@@ -108,12 +115,18 @@ impl Soc {
                 .reset_asserted()
                 .map(u32::from)
                 .ok_or(Fault::Unmapped)?
+        } else if (tcu::AON_BASE..tcu::AON_BASE + tcu::AON_SIZE).contains(&addr) {
+            self.tcu.aon_read(addr - tcu::AON_BASE)
+        } else if pmc::Scratch::contains(addr) {
+            self.pmc_scratch.read(addr)
         } else if (hsp::BASE..hsp::BASE + hsp::SIZE).contains(&addr) {
-            self.firmware
-                .as_ref()
-                .ok_or(Fault::Unmapped)?
-                .hsp
-                .read(addr - hsp::BASE)
+            let offset = addr - hsp::BASE;
+            match (self.tcu.top0_read(offset), &self.firmware) {
+                (Some(value), _) => value,
+                (None, Some(firmware)) => firmware.hsp.read(offset),
+                // without the BPMP the doorbells have no peer: they read as reset
+                (None, None) => hsp::Hsp::default().read(offset),
+            }
         } else if self.gpu_node && host1x::contains(addr) {
             self.host1x.read(addr)
         } else if self.gpu_bar_accessible(addr, gpu::BAR0) {
@@ -141,12 +154,23 @@ impl Soc {
         } else if addr == uart::FIXTURE_RESET && self.uarta.high_speed() && self.firmware.is_none()
         {
             self.uarta.set_reset(value & 1 != 0);
+        } else if (tcu::AON_BASE..tcu::AON_BASE + tcu::AON_SIZE).contains(&addr) {
+            // the console's output buffer is the PL011's: both consoles feed the one host console
+            let bytes = self.tcu.aon_write(addr - tcu::AON_BASE, value);
+            self.uart.out.extend_from_slice(&bytes);
+        } else if pmc::Scratch::contains(addr) {
+            self.pmc_scratch.write(addr, value);
         } else if (hsp::BASE..hsp::BASE + hsp::SIZE).contains(&addr) {
-            let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
-            if firmware.hsp.write(addr - hsp::BASE, value)
-                && firmware.bpmp.service(&mut self.uarta, &mut self.gpu)
-            {
-                firmware.hsp.ring_ccplex();
+            let offset = addr - hsp::BASE;
+            // TOP0's shared mailboxes are the TCU's; the doorbells reach the BPMP, if any
+            if !self.tcu.top0_write(offset, value) {
+                if let Some(firmware) = self.firmware.as_mut() {
+                    if firmware.hsp.write(offset, value)
+                        && firmware.bpmp.service(&mut self.uarta, &mut self.gpu)
+                    {
+                        firmware.hsp.ring_ccplex();
+                    }
+                }
             }
         } else if self.mss_nvlink.write(addr, value) {
             return Ok(());
@@ -182,6 +206,9 @@ impl Soc {
     fn service(&mut self, now: u64) {
         if let Some(firmware) = &self.firmware {
             self.gic.set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
+        }
+        for (spi, level) in self.tcu.lines() {
+            self.gic.set_line((spi + 32) as usize, level);
         }
         self.pump_network(now);
         if let Some(xhci) = self.xhci.as_mut() {
@@ -368,6 +395,9 @@ impl Machine {
             mss_nvlink: Default::default(),
             gpu_node: false,
             firmware: None,
+            tcu: Default::default(),
+            console_tcu: false,
+            pmc_scratch: Default::default(),
             xhci: None,
             usb: Default::default(),
             net: None,
@@ -553,14 +583,28 @@ impl Machine {
     }
 
     pub fn serial_room(&self) -> bool {
-        self.soc.uart.rx_room()
+        if self.soc.console_tcu {
+            self.soc.tcu.rx_room()
+        } else {
+            self.soc.uart.rx_room()
+        }
+    }
+
+    /// Route console input to the TCU (ttyTCU0) instead of the PL011; output from both always
+    /// reaches the console. `boot::boot_linux` sets it from the command line.
+    pub fn set_console_tcu(&mut self, tcu: bool) {
+        self.soc.console_tcu = tcu;
     }
 
     pub fn serial_input(&mut self, byte: u8) -> bool {
         if !self.serial_room() {
             return false;
         }
-        self.soc.uart.push_rx(byte);
+        if self.soc.console_tcu {
+            self.soc.tcu.push_rx(byte);
+        } else {
+            self.soc.uart.push_rx(byte);
+        }
         self.soc.interrupts_changed = true;
         true
     }

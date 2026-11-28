@@ -205,7 +205,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             let jit = machine.set_jit(!no_jit);
             if !announced.replace(true) {
                 eprintln!(
-                "[{TAG}] experimental Tegra234: {cores} Cortex-A78AE cores ({}, {}), GICv3, ARM timer and SBSA UART",
+                "[{TAG}] experimental Tegra234: {cores} Cortex-A78AE cores ({}, {}), GICv3, ARM timer, SBSA UART and TCU",
                 crate::cpu_backend(jit),
                 if multi { "a host thread each" } else { "one host thread" },
             );

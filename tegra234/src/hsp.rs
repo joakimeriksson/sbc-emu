@@ -5,9 +5,10 @@ pub const SPI: u32 = 176;
 pub const BPMP_MASTER: u32 = 19;
 const CCPLEX_MASTER: u32 = 17;
 const DIMENSIONING: u64 = 0x380;
-// Linux registers a shared mailbox controller even when only a doorbell is
-// wired. Its registers are reserved here and the device tree has no clients.
+// The shared mailboxes and shared interrupts (TCU receive) are modelled in tcu.rs;
+// this file is the doorbell bank.
 const SHARED_MAILBOXES: u32 = 8;
+const SHARED_INTERRUPTS: u32 = 8;
 const DOORBELL_BANK: u64 = (1 + SHARED_MAILBOXES as u64 / 2) * 0x10000;
 const CCPLEX: u64 = DOORBELL_BANK + 0x100;
 const BPMP: u64 = DOORBELL_BANK + 0x300;
@@ -21,7 +22,7 @@ pub struct Hsp {
 impl Hsp {
     pub fn read(&self, offset: u64) -> u32 {
         match offset {
-            DIMENSIONING => (7 << 12) | SHARED_MAILBOXES,
+            DIMENSIONING => (SHARED_INTERRUPTS << 16) | (7 << 12) | SHARED_MAILBOXES,
             o if o == CCPLEX + 4 => self.enable,
             o if o == CCPLEX + 8 => self.pending,
             o if o == CCPLEX + 12 => self.pending & self.enable,
