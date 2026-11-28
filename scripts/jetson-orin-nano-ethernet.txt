@@ -1,0 +1,22 @@
+# Jetson Orin Nano: the carrier's onboard Ethernet (RTL8111H on PCIe C8, NVIDIA's r8168.ko) on a
+# full JetPack 6 image with NetworkManager, e.g. Waveshare's UGV Rover image (login jetson/jetson,
+# its documented default). docs/jetson-orin-nano.md, "Network":
+#   sbc-emu run --board jetson-orin-nano-4gb --bpmp on --threads multi --uart-driver tegra \
+#     --usb-drive IMG --kernel Image --initrd initrd --append "... console=ttyAMA0 net.ifnames=0" \
+#     --net nat --script scripts/jetson-orin-nano-ethernet.txt --timeout 1200
+wait-serial login:
+serial jetson\r
+wait-serial Password:
+serial jetson\r
+wait-serial $ 
+serial lspci -n -s 0008:01:00.0 | grep -q '10ec:8168' && echo "PCI_" "OK"\r
+wait-serial PCI_ OK
+serial [ "$(basename $(readlink /sys/class/net/eth0/device/driver))" = r8168 ] && echo "DRIVER_" "OK"\r
+wait-serial DRIVER_ OK
+serial for i in $(seq 90); do ip -4 addr show eth0 | grep -q inet && break; sleep 2; done; nmcli -t -f NAME,DEVICE,STATE con show --active | grep -q '^Wired connection 1:eth0:activated' && echo "DHCP_" "OK"\r
+wait-serial DHCP_ OK
+serial ping -c 3 $(ip route | awk '/^default/ {print $3; exit}') | grep -q ' 0% packet loss' && echo "PING_" "OK"\r
+wait-serial PING_ OK
+serial grep -q 'PCI-MSI.*eth0' /proc/interrupts && echo "MSI_" "OK"\r
+wait-serial MSI_ OK
+quit

@@ -212,7 +212,10 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
     }
 
     if machine.wifi_enabled() {
-        pcie_nodes(&mut dt);
+        pcie_nodes(&mut dt, &crate::pcie::C1);
+    }
+    if machine.ethernet_enabled() {
+        pcie_nodes(&mut dt, &crate::pcie::C8);
     }
 
     dt.begin("serial@3100000");
@@ -294,31 +297,36 @@ fn bpmp_nodes(dt: &mut Fdt) {
     dt.end();
 }
 
-const P2U_HANDLE: u32 = 24;
+/// The phandle of a P2U PHY brick (made from its address).
+fn p2u_handle(base: u64) -> u32 {
+    0x1_0000 + (base >> 16) as u32
+}
 
-/// PCIe controller C1 and its lane's P2U PHY, as in the Orin Nano's own device tree
-/// (`tegra234-p3768-0000+p3767-0004.dtb`) less the SMMU (`iommu-map`), the memory
-/// interconnects and the regulator (a dummy stands in).
-fn pcie_nodes(dt: &mut Fdt) {
-    use crate::{bpmp, pcie};
-    dt.begin("phy@3e30000");
-    dt.str("compatible", "nvidia,tegra234-p2u");
-    dt.cells("reg", &range(pcie::P2U, pcie::P2U_SIZE));
-    dt.str("reg-names", "ctl");
-    dt.cells("#phy-cells", &[0]);
-    dt.cells("phandle", &[P2U_HANDLE]);
-    dt.end();
+/// A PCIe controller and its lanes' P2U PHYs, as in the Orin Nano's own device tree
+/// (`tegra234-p3768-0000+p3767-0004-nv.dtb`) less the SMMU (`iommu-map`), the memory
+/// interconnects, the ECAM region and the regulators (dummies stand in).
+fn pcie_nodes(dt: &mut Fdt, inst: &crate::pcie::Instance) {
+    use crate::pcie;
+    for &base in inst.p2u {
+        dt.begin(&format!("phy@{base:x}"));
+        dt.str("compatible", "nvidia,tegra234-p2u");
+        dt.cells("reg", &range(base, pcie::P2U_SIZE));
+        dt.str("reg-names", "ctl");
+        dt.cells("#phy-cells", &[0]);
+        dt.cells("phandle", &[p2u_handle(base)]);
+        dt.end();
+    }
 
-    dt.begin("pcie@14100000");
+    dt.begin(&format!("pcie@{:x}", inst.appl));
     dt.str("compatible", "nvidia,tegra234-pcie");
-    dt.cells("power-domains", &[BPMP_HANDLE, bpmp::PCIEX1A]);
+    dt.cells("power-domains", &[BPMP_HANDLE, inst.power_domain]);
     dt.cells(
         "reg",
         &[
-            range(pcie::APPL, pcie::APPL_SIZE),
-            range(pcie::CONFIG, pcie::CONFIG_SIZE),
-            range(pcie::ATU_DMA, pcie::ATU_DMA_SIZE),
-            range(pcie::DBI, pcie::DBI_SIZE),
+            range(inst.appl, pcie::APPL_SIZE),
+            range(inst.config, pcie::CONFIG_SIZE),
+            range(inst.atu_dma, pcie::ATU_DMA_SIZE),
+            range(inst.dbi, pcie::DBI_SIZE),
         ]
         .concat(),
     );
@@ -326,36 +334,39 @@ fn pcie_nodes(dt: &mut Fdt) {
     dt.cells("#address-cells", &[3]);
     dt.cells("#size-cells", &[2]);
     dt.str("device_type", "pci");
-    dt.cells("num-lanes", &[1]);
+    dt.cells("num-lanes", &[inst.lanes]);
     dt.cells("num-viewport", &[8]);
-    dt.cells("linux,pci-domain", &[1]);
-    dt.cells("clocks", &[BPMP_HANDLE, bpmp::CLK_PEX1_C1_CORE]);
+    dt.cells("linux,pci-domain", &[inst.domain]);
+    dt.cells("clocks", &[BPMP_HANDLE, inst.clock]);
     dt.str("clock-names", "core");
-    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_PEX1_C1_APB, BPMP_HANDLE, bpmp::RESET_PEX1_C1_CORE]);
+    dt.cells("resets", &[BPMP_HANDLE, inst.apb_reset, BPMP_HANDLE, inst.core_reset]);
     dt.strs("reset-names", &["apb", "core"]);
-    dt.cells("interrupts", &[0, pcie::INTR_SPI, 4, 0, pcie::MSI_SPI, 4]);
+    dt.cells("interrupts", &[0, inst.intr_spi, 4, 0, inst.msi_spi, 4]);
     dt.strs("interrupt-names", &["intr", "msi"]);
     dt.cells("#interrupt-cells", &[1]);
     dt.cells("interrupt-map-mask", &[0, 0, 0, 0]);
-    dt.cells("interrupt-map", &[0, 0, 0, 0, 1, 0, pcie::INTR_SPI, 4]);
-    dt.cells("nvidia,bpmp", &[BPMP_HANDLE, pcie::CONTROLLER]);
+    dt.cells("interrupt-map", &[0, 0, 0, 0, 1, 0, inst.intr_spi, 4]);
+    dt.cells("nvidia,bpmp", &[BPMP_HANDLE, inst.controller]);
     dt.cells("nvidia,aspm-cmrt-us", &[60]);
     dt.cells("nvidia,aspm-pwr-on-t-us", &[20]);
     dt.cells("nvidia,aspm-l0s-entrance-latency-us", &[3]);
     dt.cells("bus-range", &[0, 0xff]);
-    let [pref_hi, pref_lo] = address(pcie::PREF);
-    let [mem_hi, mem_lo] = address(pcie::MEM);
+    let [pref_hi, pref_lo] = address(inst.pref);
+    let [pref_size_hi, pref_size_lo] = address(inst.pref_size);
+    let [mem_hi, mem_lo] = address(inst.mem);
     dt.cells(
         "ranges",
         &[
-            0x4300_0000, pref_hi, pref_lo, pref_hi, pref_lo, 0, pcie::PREF_SIZE as u32,
+            0x4300_0000, pref_hi, pref_lo, pref_hi, pref_lo, pref_size_hi, pref_size_lo,
             0x0200_0000, 0, pcie::MEM_BUS as u32, mem_hi, mem_lo, 0, pcie::MEM_SIZE as u32,
-            0x0100_0000, 0, pcie::IO as u32, 0, pcie::IO as u32, 0, pcie::IO_SIZE as u32,
+            0x0100_0000, 0, inst.io as u32, 0, inst.io as u32, 0, pcie::IO_SIZE as u32,
         ],
     );
     dt.empty("dma-coherent");
-    dt.cells("phys", &[P2U_HANDLE]);
-    dt.str("phy-names", "p2u-0");
+    let phys: Vec<u32> = inst.p2u.iter().map(|&b| p2u_handle(b)).collect();
+    dt.cells("phys", &phys);
+    let names: Vec<String> = (0..inst.p2u.len()).map(|k| format!("p2u-{k}")).collect();
+    dt.strs("phy-names", &names.iter().map(String::as_str).collect::<Vec<_>>());
     dt.end();
 }
 

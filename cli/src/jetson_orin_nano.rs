@@ -82,6 +82,7 @@ fn execute(args: &[String]) -> Result<(), String> {
             "--usb-drive",
             "--camera-source",
             "--net",
+            "--usb-net",
             "--hostfwd",
             "--usb-serial",
             "--smp",
@@ -122,20 +123,27 @@ fn execute(args: &[String]) -> Result<(), String> {
         Some(_) => return Err("--gpu expects on or off".into()),
     };
     let bpmp = match crate::arg(args, "--bpmp") {
-        None => gpu || crate::arg(args, "--wifi").is_some(),
+        None => gpu || crate::arg(args, "--wifi").is_some() || matches!(crate::arg(args, "--net"), Some("nat" | "local")),
         Some("off") if gpu => return Err("--gpu on requires BPMP".into()),
         Some("off") => false,
         Some("on") => true,
         Some(_) => return Err("--bpmp expects on or off".into()),
     };
-    // --net nat|local plugs in a USB Ethernet adapter (none by default: the board's own Ethernet
-    // is not modelled); --hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT, repeatable, needs nat
-    let net = match crate::arg(args, "--net") {
-        None | Some("none") => None,
-        Some("nat") => Some(true),
-        Some("local") => Some(false),
-        Some(_) => return Err("--net expects nat, local or none".into()),
+    // --net nat|local plugs the carrier's own Ethernet port (the RTL8111 on PCIe C8) into the
+    // virtual network (none by default); --usb-net nat|local plugs a USB Ethernet adapter
+    // (CDC-ECM) in, on a network of its own; --hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT,
+    // repeatable, needs nat (on the onboard port's network, else the adapter's, else the Wi-Fi's)
+    let network = |flag: &str| match crate::arg(args, flag) {
+        None | Some("none") => Ok(None),
+        Some("nat") => Ok(Some(true)),
+        Some("local") => Ok(Some(false)),
+        Some(_) => Err(format!("{flag} expects nat, local or none")),
     };
+    let net = network("--net")?;
+    let usb_net = network("--usb-net")?;
+    if net.is_some() && !bpmp {
+        return Err("--net needs the BPMP (--bpmp on): PCIe power, clocks and resets".into());
+    }
     let forwards = args
         .iter()
         .enumerate()
@@ -153,8 +161,13 @@ fn execute(args: &[String]) -> Result<(), String> {
         return Err("--wifi needs the BPMP (--bpmp on): PCIe power, clocks and resets".into());
     }
     let wifi_nat = net != Some(false);
-    if !forwards.is_empty() && net != Some(true) && !(net.is_none() && wifi.is_some()) {
-        return Err("--hostfwd needs --net nat (or --wifi without --net)".into());
+    let forward_nat = match (net, usb_net) {
+        (Some(nat), _) => nat,
+        (None, Some(nat)) => nat,
+        (None, None) => wifi.is_some(),
+    };
+    if !forwards.is_empty() && !forward_nat {
+        return Err("--hostfwd needs --net nat (or --usb-net nat, or --wifi without --net)".into());
     }
     let ram = serial_board::ram_bytes(args, 4096)?;
     let read = |path: &str| std::fs::read(path).map_err(|err| format!("{path}: {err}"));
@@ -195,6 +208,9 @@ fn execute(args: &[String]) -> Result<(), String> {
                 machine.attach_camera(emu_core::usb::Camera::new());
             }
             if let Some(nat) = net {
+                machine.connect_ethernet(nat, std::env::var_os("SBC_NET_LOG").is_some());
+            }
+            if let Some(nat) = usb_net {
                 machine.connect_usb_network(nat, std::env::var_os("SBC_NET_LOG").is_some());
             }
             if let Some(network) = &wifi {

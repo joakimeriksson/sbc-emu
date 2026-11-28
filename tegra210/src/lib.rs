@@ -19,7 +19,7 @@ mod mt;
 pub mod padctl;
 pub mod pcie;
 pub mod pmc;
-pub mod rtl8168;
+pub use peripherals::rtl8168;
 pub mod sdhci;
 pub mod smmu;
 pub mod sor;

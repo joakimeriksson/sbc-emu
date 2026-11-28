@@ -1,11 +1,20 @@
-//! Realtek RTL8111H Gigabit Ethernet (`10ec:8168` revision 0x15, MAC version XID 0x541) as Linux's
-//! `r8169` drives it: the 256-byte register window, the indirect spaces behind it (PHY and MAC
-//! OCP, ERI, CSI, EPHY), the normal-priority transmit ring and the receive ring with 16-byte
-//! descriptors, transmit checksum and segmentation offload, the receive checksum flags, and the
-//! interrupt status. The PHY is the chip's own (`0x001cc800`), with a Gigabit link partner.
+//! Realtek RTL8111H Gigabit Ethernet (`10ec:8168` revision 0x15, MAC version XID 0x541) as
+//! Linux's `r8169` and Realtek's own `r8168` (CFG_METHOD_30) drive it: the 256-byte register
+//! window, the indirect spaces behind it (PHY and MAC OCP, ERI, CSI, EPHY), the normal-priority
+//! transmit ring and the receive ring with 16-byte descriptors, transmit checksum and
+//! segmentation offload, the receive checksum flags, and the interrupt status. The PHY is the
+//! chip's own (`0x001cc800`), with a Gigabit link partner: its state machine (always "LAN on"
+//! unless powered down), the microcontroller's patch-request handshake and the parameter space
+//! behind `0xa436`/`0xa438`, which the drivers' PHY RAM code is written to. The MAC address is
+//! the one the chip loads from its eFuse: in the ID registers and their backup at ERI `0xe0`;
+//! there is no EEPROM (MAC OCP `0xdc00` bit 3).
 //!
-//! Not modelled: the high-priority ring, wake-on-LAN, VLAN tagging, jumbo frames, flow control.
-use crate::sdhci::Dma;
+//! [`Rtl8111`] puts it behind a PCI Express function (configuration space, BARs, MSI and MSI-X)
+//! for a host bridge built on [`crate::pci`].
+//!
+//! Not modelled: the high-priority ring, wake-on-LAN, VLAN tagging, jumbo frames, flow control,
+//! the PHY RAM code itself (it is kept, not run).
+use crate::dma::Dma;
 use std::collections::{HashMap, VecDeque};
 
 pub const SIZE: u64 = 0x1000;
@@ -42,6 +51,13 @@ const RX_OK: u16 = 1 << 0;
 const TX_OK: u16 = 1 << 2;
 const RX_OVERFLOW: u16 = 1 << 4;
 const LINK_CHANGE: u16 = 1 << 5;
+/// The timer reached TimeInt0 (r8168 runs its receive and transmit work off it).
+const PCS_TIMEOUT: u16 = 1 << 14;
+/// The timer: TCTR counts from its last write, TimeInt0 is where it interrupts.
+const TCTR: usize = 0x48;
+const TIME_INT0: usize = 0x58;
+/// TCTR's clock: 125 MHz.
+const TICK_NS: u64 = 8;
 
 const OWN: u32 = 1 << 31;
 const RING_END: u32 = 1 << 30;
@@ -50,6 +66,14 @@ const LAST: u32 = 1 << 28;
 
 /// The PHY's Clause 22 registers in OCP space.
 const PHY_BASE: u32 = 0xa400;
+/// The PHY's state (page 0xa42, register 0x10, bits 2:0): 3 is "LAN on", 5 powered down.
+const PHY_STATE: u32 = 0xa420;
+/// The parameter space: an address, then its data.
+const PHY_PARAM_ADDR: u32 = 0xa436;
+const PHY_PARAM_DATA: u32 = 0xa438;
+/// The PHY microcontroller: patch request (0xb820 bit 4) and its grant (0xb800 bit 6).
+const PHY_PATCH_REQUEST: u32 = 0xb820;
+const PHY_PATCH_READY: u32 = 0xb800;
 const PHY_ID: u32 = 0x001c_c800;
 
 pub struct Rtl8168 {
@@ -68,11 +92,16 @@ pub struct Rtl8168 {
     pub rx_queue: VecDeque<Vec<u8>>,
     pub tx_frames: u64,
     pub rx_frames: u64,
+    /// the time (ns) as the bus last said, when TCTR was last written, and whether TimeInt0
+    /// was reached since
+    now: u64,
+    timer_start: u64,
+    timer_fired: bool,
 }
 
 impl Rtl8168 {
     pub fn new(mac: [u8; 6]) -> Self {
-        let mut s = Self { regs: [0; 256], indirect: HashMap::new(), phy: [0; 32], cable: false, mac, tx_index: 0, rx_index: 0, partial: Vec::new(), tx_out: Vec::new(), rx_queue: VecDeque::new(), tx_frames: 0, rx_frames: 0 };
+        let mut s = Self { regs: [0; 256], indirect: HashMap::new(), phy: [0; 32], cable: false, mac, tx_index: 0, rx_index: 0, partial: Vec::new(), tx_out: Vec::new(), rx_queue: VecDeque::new(), tx_frames: 0, rx_frames: 0, now: 0, timer_start: 0, timer_fired: false };
         s.power_on();
         s
     }
@@ -82,6 +111,11 @@ impl Rtl8168 {
         self.regs[..6].copy_from_slice(&self.mac);
         self.put32(TX_CONFIG, TX_CONFIG_FIXED);
         self.indirect.clear();
+        // the eFuse's MAC address in its backup (ERI 0xe0, 0xe4), and no EEPROM
+        let m = self.mac;
+        self.indirect.insert((b'e', 0xe0), u32::from_le_bytes([m[0], m[1], m[2], m[3]]));
+        self.indirect.insert((b'e', 0xe4), u32::from_le_bytes([m[4], m[5], 0, 0]));
+        self.indirect.insert((b'm', 0xdc00), 1 << 3);
         self.phy = [0; 32];
         self.phy[0] = 0x1140;
         self.phy[4] = 0x01e1;
@@ -191,6 +225,16 @@ impl Rtl8168 {
 
     fn ocp_read(&self, reg: u32) -> u16 {
         match reg {
+            PHY_STATE => self.phy[16] & !7 | if self.phy[0] & 1 << 11 != 0 { 5 } else { 3 },
+            PHY_PARAM_ADDR => self.indirect.get(&(b'o', reg)).copied().unwrap_or(0) as u16,
+            PHY_PARAM_DATA => {
+                let at = self.indirect.get(&(b'o', PHY_PARAM_ADDR)).copied().unwrap_or(0);
+                self.indirect.get(&(b'x', at)).copied().unwrap_or(0) as u16
+            }
+            PHY_PATCH_READY => {
+                let granted = self.indirect.get(&(b'o', PHY_PATCH_REQUEST)).is_some_and(|v| v & 1 << 4 != 0);
+                (self.indirect.get(&(b'o', reg)).copied().unwrap_or(0) as u16) & !(1 << 6) | (granted as u16) << 6
+            }
             // page 0xa43: the speed and duplex
             0xa434 if self.link() => {
                 let (speed, full) = self.speed();
@@ -233,6 +277,10 @@ impl Rtl8168 {
                     0x62 | (match speed { 1000 => 0x10, 100 => 0x08, _ => 0x04 }) | full as u8
                 }
                 PHY_STATUS => 0,
+                r if (TCTR..TCTR + 4).contains(&r) => {
+                    let ticks = (self.now.saturating_sub(self.timer_start) / TICK_NS) as u32;
+                    ticks.to_le_bytes()[r - TCTR]
+                }
                 // commands are done at once; the receive buffer is empty
                 CHIP_CMD => self.regs[CHIP_CMD] | 1,
                 r => self.regs[r],
@@ -272,6 +320,13 @@ impl Rtl8168 {
         if touches(TX_LO, 4) {
             self.tx_index = 0;
         }
+        if touches(TCTR, 4) || touches(TIME_INT0, 4) {
+            self.timer_fired = false;
+            if touches(TCTR, 4) {
+                self.timer_start = self.now;
+            }
+            self.tick(self.now);
+        }
         if touches(RX_LO, 4) {
             self.rx_index = 0;
         }
@@ -280,7 +335,14 @@ impl Rtl8168 {
                 GPHY_OCP => {
                     let reg = value >> 15 & 0xfffe;
                     let done = if value & FLAG != 0 {
-                        if (PHY_BASE..PHY_BASE + 0x40).contains(&reg) && reg != 0xa434 {
+                        if reg == PHY_PARAM_DATA {
+                            let at = self.indirect.get(&(b'o', PHY_PARAM_ADDR)).copied().unwrap_or(0);
+                            self.indirect.insert((b'x', at), value & 0xffff);
+                        } else if reg == PHY_PARAM_ADDR {
+                            self.indirect.insert((b'o', reg), value & 0xffff);
+                        } else if reg == PHY_STATE {
+                            self.phy[16] = value as u16 & !7;
+                        } else if (PHY_BASE..PHY_BASE + 0x40).contains(&reg) && reg != 0xa434 {
                             self.phy_write((reg - PHY_BASE) as usize / 2, value as u16);
                         } else {
                             self.indirect.insert((b'o', reg), value & 0xffff);
@@ -341,6 +403,23 @@ impl Rtl8168 {
         if touches(CHIP_CMD, 1) || touches(TX_POLL, 1) {
             self.service(dma);
         }
+    }
+
+    /// The time now (ns), from the bus; the timer counts against it.
+    pub fn tick(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        if let Some(due) = self.next_event() {
+            if self.now >= due {
+                self.timer_fired = true;
+                self.raise(PCS_TIMEOUT);
+            }
+        }
+    }
+
+    /// When the timer reaches TimeInt0 (if it is set and has not been reached yet).
+    pub fn next_event(&self) -> Option<u64> {
+        let limit = self.get32(TIME_INT0) as u64;
+        (limit != 0 && !self.timer_fired).then(|| self.timer_start + limit * TICK_NS)
     }
 
     pub fn receiving(&self) -> bool {
@@ -446,11 +525,247 @@ impl Rtl8168 {
             };
             let d = dma.slice(at, 16).unwrap();
             d[..4].copy_from_slice(&(opts1 & RING_END | FIRST | LAST | proto | (len as u32 + 4)).to_le_bytes());
-            d[4..8].fill(0);
+            // opts2: an IPv4 or IPv6 packet (the flags r8168 checks before trusting opts1's)
+            let version = match frame.get(12..14) {
+                Some([8, 0]) => 1u32 << 30,
+                Some([0x86, 0xdd]) => 1 << 31,
+                _ => 0,
+            };
+            d[4..8].copy_from_slice(&version.to_le_bytes());
             self.rx_index = if opts1 & RING_END != 0 { 0 } else { self.rx_index + 1 };
             self.rx_frames += 1;
             self.raise(RX_OK);
         }
+    }
+}
+
+// ---------------------------------------------------------------------- the PCI Express function
+
+/// Configuration space offsets of the RTL8111H's capabilities.
+const CAP_PM: usize = 0x40;
+const CAP_MSI: usize = 0x50;
+const CAP_PCIE: usize = 0x70;
+const CAP_MSIX: usize = 0xb0;
+/// MSI-X: four vectors, the table at the start of BAR4 and the pending bits at 0x800 in it.
+const MSIX_VECTORS: usize = 4;
+const MSIX_PBA: u64 = 0x800;
+const MSIX_ENABLE: u16 = 1 << 15;
+const MSIX_FUNCTION_MASK: u16 = 1 << 14;
+
+/// The RTL8111H as a PCI Express function: its configuration space as the chip presents it
+/// (I/O BAR0 of 256 bytes, the registers in 64-bit memory BAR2, the MSI-X table and pending
+/// bits in BAR4; power management, MSI, PCI Express and MSI-X capabilities) and its interrupt
+/// as a message (MSI-X vector 0 or MSI) when the chip's interrupt rises. The host bridge gives
+/// it bus mastering through [`crate::pci::Master`], with RAM reachable directly.
+pub struct Rtl8111 {
+    cfg: crate::pci::Config,
+    pub nic: Rtl8168,
+    /// the MSI-X table: address low, high, data, vector control per entry
+    msix: [u32; 4 * MSIX_VECTORS],
+    /// MSI-X vectors waiting on a mask
+    pending: u64,
+    level: bool,
+    /// messages sent
+    pub messages: u64,
+}
+
+impl Rtl8111 {
+    pub fn new(mac: [u8; 6]) -> Self {
+        use crate::pci::Config;
+        let mut c = Config::endpoint(0x10ec, 0x8168, 0x02_0000, 0x15);
+        c.set16(0x06, 0x0010); // a capability list
+        c.set32(0x10, 1); // I/O, 256 bytes
+        c.writable(0x10, 4, 0xffff_ff00);
+        c.memory_bar(0x18, 0x1000, true, false);
+        c.memory_bar(0x20, 0x4000, true, false);
+        c.set32(0x2c, 0x0123_10ec); // subsystem
+        c.set8(0x34, CAP_PM as u8);
+        c.set8(0x3d, 1); // INTA
+        // power management v3: D1, D2, PME from every state
+        c.capability(CAP_PM, 0x01, CAP_MSI as u8);
+        c.set16(CAP_PM + 2, 0xffc3);
+        c.writable(CAP_PM + 4, 2, 0x0103);
+        c.clearable(CAP_PM + 4, 2, 0x8000);
+        // MSI: one vector, 64-bit
+        c.capability(CAP_MSI, 0x05, CAP_PCIE as u8);
+        c.set16(CAP_MSI + 2, 0x0080);
+        c.writable(CAP_MSI + 2, 2, 0x0071);
+        c.writable(CAP_MSI + 4, 4, 0xffff_fffc);
+        c.writable(CAP_MSI + 8, 4, 0xffff_ffff);
+        c.writable(CAP_MSI + 12, 2, 0xffff);
+        // PCI Express v2 endpoint: x1 at 2.5 GT/s, ASPM L0s and L1, clock PM
+        c.capability(CAP_PCIE, 0x10, CAP_MSIX as u8);
+        c.set16(CAP_PCIE + 2, 0x0002);
+        c.set32(CAP_PCIE + 4, 0x0000_8fc0);
+        c.writable(CAP_PCIE + 8, 2, 0x7fff);
+        c.clearable(CAP_PCIE + 10, 2, 0x000f);
+        c.set32(CAP_PCIE + 0x0c, 0x0007_7c11);
+        c.writable(CAP_PCIE + 0x10, 2, 0x01fb);
+        c.set16(CAP_PCIE + 0x12, 0x1011);
+        c.set32(CAP_PCIE + 0x24, 0x0000_081f); // DEVCAP2: LTR, completion timeouts
+        c.writable(CAP_PCIE + 0x28, 2, 0x0c1f);
+        c.set32(CAP_PCIE + 0x2c, 0x0000_0002); // LNKCAP2: 2.5 GT/s
+        c.writable(CAP_PCIE + 0x30, 2, 0x007f);
+        // MSI-X: four vectors in BAR4
+        c.capability(CAP_MSIX, 0x11, 0);
+        c.set16(CAP_MSIX + 2, MSIX_VECTORS as u16 - 1);
+        c.writable(CAP_MSIX + 2, 2, (MSIX_ENABLE | MSIX_FUNCTION_MASK) as u32);
+        c.set32(CAP_MSIX + 4, 4);
+        c.set32(CAP_MSIX + 8, MSIX_PBA as u32 | 4);
+        let mut msix = [0; 4 * MSIX_VECTORS];
+        for k in 0..MSIX_VECTORS {
+            msix[4 * k + 3] = 1; // masked
+        }
+        Self { cfg: c, nic: Rtl8168::new(mac), msix, pending: 0, level: false, messages: 0 }
+    }
+
+    fn master_enabled(&self) -> bool {
+        self.cfg.command() & crate::pci::CMD_MASTER != 0
+    }
+
+    /// The chip's registers and rings with the RAM bus mastering reaches (none when it is off).
+    fn with_dma<R>(&mut self, master: &mut dyn crate::pci::Master, f: impl FnOnce(&mut Rtl8168, &mut Dma) -> R) -> R {
+        let enabled = self.master_enabled();
+        let mut ram = if enabled { master.ram() } else { None };
+        let mut none = Dma { ram: &mut [], base: 0 };
+        f(&mut self.nic, ram.as_mut().unwrap_or(&mut none))
+    }
+
+    /// Run both rings (frames the network delivered, descriptors the driver handed over), then
+    /// the interrupt.
+    pub fn service(&mut self, master: &mut dyn crate::pci::Master) {
+        self.with_dma(master, |nic, dma| nic.service(dma));
+        self.update(master);
+    }
+
+    fn msix_control(&self) -> u16 {
+        self.cfg.get16(CAP_MSIX + 2)
+    }
+
+    /// A message when the chip's interrupt rises; an MSI-X vector that is masked then stays
+    /// pending until it is unmasked.
+    fn update(&mut self, master: &mut dyn crate::pci::Master) {
+        let level = self.nic.irq();
+        if level && !std::mem::replace(&mut self.level, level) {
+            if self.msix_control() & MSIX_ENABLE != 0 {
+                self.pending |= 1;
+            } else if let Some((addr, data)) = crate::pci::msi_target(&self.cfg, CAP_MSI).filter(|_| self.master_enabled()) {
+                master.write(addr, &data.to_le_bytes());
+                self.messages += 1;
+            }
+        }
+        self.level = level;
+        self.deliver_pending(master);
+    }
+
+    fn deliver_pending(&mut self, master: &mut dyn crate::pci::Master) {
+        let control = self.msix_control();
+        if self.pending == 0 || control & MSIX_ENABLE == 0 || control & MSIX_FUNCTION_MASK != 0 || !self.master_enabled() {
+            return;
+        }
+        for k in 0..MSIX_VECTORS {
+            let e = &self.msix[4 * k..4 * k + 4];
+            if self.pending & 1 << k != 0 && e[3] & 1 == 0 {
+                let addr = (e[1] as u64) << 32 | e[0] as u64;
+                master.write(addr, &e[2].to_le_bytes());
+                self.pending &= !(1 << k);
+                self.messages += 1;
+            }
+        }
+    }
+
+    /// The legacy INTA line (with neither MSI nor MSI-X enabled).
+    pub fn intx(&self) -> bool {
+        self.level
+            && self.msix_control() & MSIX_ENABLE == 0
+            && crate::pci::msi_target(&self.cfg, CAP_MSI).is_none()
+            && self.cfg.command() & 1 << 10 == 0
+    }
+}
+
+impl crate::pci::Function for Rtl8111 {
+    fn config(&mut self) -> &mut crate::pci::Config {
+        &mut self.cfg
+    }
+
+    fn config_written(&mut self, _offset: usize, master: &mut dyn crate::pci::Master) {
+        // MSI-X unmasked or bus mastering switched on with a vector pending
+        self.deliver_pending(master);
+    }
+
+    fn bar_size(&self, bar: usize) -> u64 {
+        // (BAR0 is I/O space, which the memory windows do not decode)
+        match bar {
+            2 => 0x1000,
+            4 => 0x4000,
+            _ => 0,
+        }
+    }
+
+    fn bar_read(&mut self, bar: usize, offset: u64, len: usize, master: &mut dyn crate::pci::Master) -> u64 {
+        self.nic.tick(master.now());
+        match bar {
+            2 if len == 8 => self.nic.read(offset, 4) as u64 | (self.nic.read(offset + 4, 4) as u64) << 32,
+            2 => self.nic.read(offset, len.min(4)) as u64,
+            4 => {
+                let word = |s: &Self, o: u64| match o {
+                    o if o < 16 * MSIX_VECTORS as u64 => s.msix[o as usize / 4],
+                    MSIX_PBA => s.pending as u32,
+                    _ => 0,
+                } as u64;
+                let v = word(self, offset & !3) | if len == 8 { word(self, (offset & !3) + 4) << 32 } else { 0 };
+                let v = v >> (8 * (offset & 3));
+                if len >= 8 { v } else { v & ((1u64 << (8 * len)) - 1) }
+            }
+            _ => 0,
+        }
+    }
+
+    fn bar_write(&mut self, bar: usize, offset: u64, value: u64, len: usize, master: &mut dyn crate::pci::Master) {
+        self.nic.tick(master.now());
+        match bar {
+            2 => {
+                if len == 8 {
+                    self.with_dma(master, |nic, dma| {
+                        nic.write(offset, value as u32, 4, dma);
+                        nic.write(offset + 4, (value >> 32) as u32, 4, dma);
+                    });
+                } else {
+                    self.with_dma(master, |nic, dma| nic.write(offset, value as u32, len.min(4), dma));
+                }
+                self.update(master);
+            }
+            4 if offset < 16 * MSIX_VECTORS as u64 => {
+                let words = if len == 8 { 2 } else { 1 };
+                for k in 0..words {
+                    let o = (offset & !3) as usize / 4 + k;
+                    let v = (value >> (32 * k)) as u32;
+                    let w = &mut self.msix[o];
+                    *w = if len >= 4 {
+                        v
+                    } else {
+                        let shift = 8 * (offset & 3) as u32;
+                        let mask = (((1u64 << (8 * len)) - 1) as u32) << shift;
+                        *w & !mask | (v << shift) & mask
+                    };
+                }
+                self.deliver_pending(master);
+            }
+            _ => {}
+        }
+    }
+
+    fn tick(&mut self, now: u64, master: &mut dyn crate::pci::Master) {
+        self.nic.tick(now);
+        self.service(master);
+    }
+
+    fn next_event(&self) -> Option<u64> {
+        self.nic.next_event()
+    }
+
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -622,6 +937,67 @@ mod tests {
     }
 
     #[test]
+    fn what_r8168_reads_back() {
+        let mut ram = vec![0; 16];
+        let mut n = Rtl8168::new(MAC);
+        let mut d = Dma { ram: &mut ram, base: BASE };
+        // the MAC address's backup in ERI 0xe0/0xe4, no EEPROM
+        n.write(ERIAR as u64, 0xf << 12 | 0xe0, 4, &mut d);
+        assert_eq!(n.read(ERIDR as u64, 4).to_le_bytes(), MAC[..4]);
+        n.write(ERIAR as u64, 0xf << 12 | 0xe4, 4, &mut d);
+        assert_eq!(n.read(ERIDR as u64, 4) & 0xffff, u16::from_le_bytes([MAC[4], MAC[5]]) as u32);
+        n.write(OCPDR as u64, 0xdc00 << 15, 4, &mut d);
+        assert_eq!(n.read(OCPDR as u64, 4) & 8, 8);
+        let mut phy = |n: &mut Rtl8168, reg: u32, write: Option<u16>| {
+            n.write(GPHY_OCP as u64, reg << 15 | write.map_or(0, |v| FLAG | v as u32), 4, &mut d);
+            n.read(GPHY_OCP as u64, 4) & 0xffff
+        };
+        // the PHY's state: LAN on, powered down
+        assert_eq!(phy(&mut n, PHY_STATE, None) & 7, 3);
+        phy(&mut n, 0xa400, Some(0x0800));
+        assert_eq!(phy(&mut n, PHY_STATE, None) & 7, 5);
+        phy(&mut n, 0xa400, Some(0x1040));
+        // the patch request is granted while it is up
+        assert_eq!(phy(&mut n, PHY_PATCH_READY, None) & 0x40, 0);
+        phy(&mut n, PHY_PATCH_REQUEST, Some(0x10));
+        assert_eq!(phy(&mut n, PHY_PATCH_READY, None) & 0x40, 0x40);
+        phy(&mut n, PHY_PATCH_REQUEST, Some(0));
+        assert_eq!(phy(&mut n, PHY_PATCH_READY, None) & 0x40, 0);
+        // the parameter space keeps each address's data (the RAM code version at 0x801e)
+        phy(&mut n, PHY_PARAM_ADDR, Some(0x801e));
+        phy(&mut n, PHY_PARAM_DATA, Some(0x0b33));
+        phy(&mut n, PHY_PARAM_ADDR, Some(0x8010));
+        phy(&mut n, PHY_PARAM_DATA, Some(0x0800));
+        phy(&mut n, PHY_PARAM_ADDR, Some(0x801e));
+        assert_eq!(phy(&mut n, PHY_PARAM_DATA, None), 0x0b33);
+        assert_eq!(phy(&mut n, PHY_PARAM_ADDR, None), 0x801e);
+    }
+
+    #[test]
+    fn timer_interrupt() {
+        let mut ram = vec![0; 16];
+        let mut n = Rtl8168::new(MAC);
+        let mut d = Dma { ram: &mut ram, base: BASE };
+        n.write(INTR_MASK as u64, PCS_TIMEOUT as u32, 2, &mut d);
+        assert_eq!(n.next_event(), None, "off while TimeInt0 is zero");
+        n.tick(1000);
+        n.write(TIME_INT0 as u64, 0x2600, 4, &mut d);
+        n.write(TCTR as u64, 0x2600, 4, &mut d);
+        assert_eq!(n.next_event(), Some(1000 + 0x2600 * TICK_NS));
+        n.tick(1000 + 800);
+        assert_eq!(n.read(TCTR as u64, 4), 100);
+        assert!(!n.irq());
+        n.tick(1000 + 0x2600 * TICK_NS);
+        assert!(n.irq());
+        assert_eq!(n.next_event(), None, "once until TCTR is written again");
+        n.write(INTR_STATUS as u64, PCS_TIMEOUT as u32, 2, &mut d);
+        n.tick(1_000_000);
+        assert!(!n.irq());
+        n.write(TCTR as u64, 0, 4, &mut d);
+        assert_eq!(n.next_event(), Some(1_000_000 + 0x2600 * TICK_NS));
+    }
+
+    #[test]
     fn frames_go_both_ways() {
         let mut ram = vec![0; 0x10000];
         let mut n = started(&mut ram);
@@ -644,6 +1020,7 @@ mod tests {
         let opts1 = u32::from_le_bytes(ram[0x2000..0x2004].try_into().unwrap());
         assert_eq!(opts1, RING_END | FIRST | LAST | 68);
         assert_eq!(ram[0x5000..0x5040], frame[..]);
+        assert_eq!(ram[0x2004..0x2008], [0; 4], "not IP");
         assert_eq!(n.status() & (RX_OK | RX_OVERFLOW), RX_OK | RX_OVERFLOW);
         assert_eq!((n.rx_frames, n.rx_queue.len()), (1, 1));
     }
