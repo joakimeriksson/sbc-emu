@@ -1,5 +1,6 @@
 //! `--camera-source SPEC`: pictures for the emulated USB camera from the host, through `ffmpeg`
-//! (which must be on the PATH), scaled to the camera's 640x480 YUYV:
+//! (which must be on the PATH), scaled to the camera's 1280x960 YUYV source picture (the camera
+//! scales and crops that to the mode the guest streams, YUYV or MJPEG):
 //!
 //! - `avfoundation:N`: the Mac's camera N (`ffmpeg -f avfoundation -list_devices true -i ""`
 //!   lists them; macOS asks once whether the terminal may use the camera);
@@ -8,7 +9,7 @@
 //!
 //! A host thread reads ffmpeg's frames and keeps the latest; the camera sends it at its own
 //! 30 frames a second of guest time, so a slow guest skips pictures rather than lagging.
-use emu_core::usb::{FrameSource, CAM_FRAME, CAM_H, CAM_W};
+use emu_core::usb::{FrameSource, CAM_SOURCE_FRAME as CAM_FRAME, CAM_SOURCE_H as CAM_H, CAM_SOURCE_W as CAM_W};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};

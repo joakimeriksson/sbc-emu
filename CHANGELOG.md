@@ -19,6 +19,14 @@ in an earlier repository whose history was rewritten; it is summarised here with
 - Maxwell GPU: compute workgroups in 32-lane warps on several host threads (Mesa's OpenCL YOLOv8n
   54 -> 6.5 s per image); LEA, VADD, P2R, R2P and FCHK in the shader core.
 
+- Jetson Orin Nano: a USB sound card (`--usb-audio`: USB Audio Class 1.0, stereo speaker and mono
+  microphone at 48/44.1/16 kHz; `--audio-out FILE.wav`, `--audio-in FILE.wav`) on a fifth USB 2.0
+  root port, so Waveshare's UGV Rover software plays and records through it. Isochronous transfers
+  in the shared xHCI core (`peripherals/src/xhci.rs`), paced by guest time.
+- USB webcam (every board with one): MJPEG at 320x240, 640x480 and 1280x720, and YUYV 320x240 and
+  1280x720 besides the default YUYV 640x480, at 30/15 (YUYV 720p: 10/5) frames a second, chosen by
+  UVC probe/commit; a baseline JPEG encoder in `emu-core/src/jpeg.rs`. `--camera-source` now
+  delivers a 1280x960 picture that the camera scales or crops to the mode.
 - USB webcam pictures from the host: `--camera-source avfoundation:N|v4l2:DEV|FILE` (through
   ffmpeg) on the Raspberry Pi 4 and the Jetson Nano; the Jetson Nano gets `--camera`. A demo finds
   objects in them with YOLOv8n on the emulated GPU (`demos/jetson-yolo-cam/`).

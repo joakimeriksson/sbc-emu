@@ -8,6 +8,7 @@ pub mod disk;
 pub mod gpt;
 pub mod sdcard;
 pub mod usb;
+pub mod jpeg;
 pub mod ext4;
 pub mod fdt;
 pub mod arm64_image;

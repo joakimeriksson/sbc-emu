@@ -419,9 +419,10 @@ impl Machine {
     }
 
     /// An xHCI host with nothing plugged in; `attach_usb_drive` and `attach_camera` add devices.
+    /// Five USB 2.0 root ports (one device each, no hub model) and four USB 3.0 ones (empty).
     pub fn enable_usb(&mut self) {
         if self.soc.xhci.is_none() {
-            self.soc.xhci = Some(peripherals::xhci::Xhci::new(peripherals::xhci::Layout { usb2: 0..4, usb3: 4..8 }));
+            self.soc.xhci = Some(peripherals::xhci::Xhci::new(peripherals::xhci::Layout { usb2: 0..5, usb3: 5..9 }));
             self.plug_usb();
         }
     }
@@ -494,6 +495,23 @@ impl Machine {
         self.soc.usb.serial.as_mut().map(|s| s.take_tx()).unwrap_or_default()
     }
 
+    /// Plug a USB sound card in (UAC1 speaker and microphone, port 5).
+    pub fn attach_usb_audio(&mut self, audio: emu_core::usb::Audio) {
+        self.soc.usb.audio = Some(audio);
+        self.enable_usb();
+        self.plug_usb();
+    }
+
+    /// Keep what the guest plays on the USB sound card (for `take_usb_audio`); false: none plugged in.
+    pub fn capture_usb_audio(&mut self) -> bool {
+        self.soc.usb.audio.as_mut().map(|a| a.keep_output = true).is_some()
+    }
+
+    /// The USB sound card's playback rate and the stereo samples played since the last call.
+    pub fn take_usb_audio(&mut self) -> (u32, Vec<i16>) {
+        self.soc.usb.audio.as_mut().map(|a| a.take_output()).unwrap_or_default()
+    }
+
     fn plug_usb(&mut self) {
         use emu_core::usb::DevId;
         let devs = [
@@ -501,6 +519,7 @@ impl Machine {
             self.soc.usb.camera.is_some().then_some(DevId::Camera),
             self.soc.usb.net.is_some().then_some(DevId::Net),
             self.soc.usb.serial.is_some().then_some(DevId::Serial),
+            self.soc.usb.audio.is_some().then_some(DevId::Audio),
         ];
         if let Some(xhci) = self.soc.xhci.as_mut() {
             xhci.attach(&devs);

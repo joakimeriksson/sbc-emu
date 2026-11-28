@@ -63,7 +63,8 @@ power-on) and `tests/gpu/run-orin-cuda.sh` pass in both modes.
 
 ## USB
 
-`--usb-drive IMAGE` plugs a USB stick into the board, and `--camera` plugs in a webcam.
+`--usb-drive IMAGE` plugs a USB stick into the board, `--camera` plugs in a webcam
+([its modes](#webcam-modes)) and `--usb-audio` a sound card ([below](#usb-sound-card)).
 `--camera-source SPEC` gives the webcam pictures from the host, as on the
 [Jetson Nano](jetson-nano.md). The drive is copy-on-write: each boot starts from the image.
 
@@ -76,12 +77,98 @@ power-on) and `tests/gpu/run-orin-cuda.sh` pass in both modes.
 ```sh
 printf SBC_EMU_USB_DRIVE > /tmp/usb.img && truncate -s 64m /tmp/usb.img
 target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver tegra \
-  --usb-drive /tmp/usb.img --camera \
+  --usb-drive /tmp/usb.img --camera --usb-audio \
   --kernel cache/jetson-r3644/Image --initrd cache/jetson-orin-nano/initramfs.cpio.gz \
   --script scripts/jetson-orin-nano-usb.txt --timeout 300
 ```
 
-The script reads the drive's first bytes through `/dev/sda` and finds the camera in sysfs.
+The script reads the drive's first bytes through `/dev/sda`, finds the camera in sysfs and the
+sound card in `/proc/asound/cards`.
+
+The root hub has five USB 2.0 ports, one device each (there is no hub model): the drive on port 1,
+the camera on 2, the Ethernet adapter on 3, the serial port on 4 and the sound card on 5. Its four
+USB 3.0 ports stay empty.
+
+### Webcam modes
+
+The webcam offers what a common USB 2.0 webcam does, and Linux's `uvcvideo` negotiates the mode
+with the camera's probe and commit controls (an unknown format or frame becomes the default, an
+interval the nearest offered):
+
+| Format | Sizes | Frames a second |
+|---|---|---|
+| YUYV (format 1, the default) | 640×480 (the default), 320×240 | 30, 15 |
+| YUYV | 1280×720 | 10, 5 (what a real one fits in USB 2.0) |
+| MJPEG (format 2) | 640×480, 320×240, 1280×720 | 30, 15 |
+
+The frames come at the mode's rate in guest time, over one bulk endpoint. MJPEG frames are baseline
+JPEG (4:2:2, quality 85), made by a small encoder in `emu-core/src/jpeg.rs` that also runs in the
+browser build. `--camera-source` feeds every mode: ffmpeg scales the host's pictures to a 1280×960
+source picture, which the camera scales down for the 4:3 sizes and crops to its middle rows for
+1280×720, as a webcam's sensor does. OpenCV's V4L2 backend (`cv2.VideoCapture`) prefers YUYV; ask
+for MJPEG with `CAP_PROP_FOURCC`, or in GStreamer with `image/jpeg` caps.
+
+### USB sound card
+
+`--usb-audio` plugs in a USB sound card: USB Audio Class 1.0 at full speed, which the JetPack
+kernel's built-in `snd-usb-audio` runs. It has a stereo speaker output and a mono microphone input,
+16-bit, at 48, 44.1 or 16 kHz, each on an isochronous endpoint with a sampling-rate control, and
+mute and volume controls (ALSA's `Speaker Playback` and `Mic Capture`).
+
+- `--audio-out FILE.wav` keeps what the guest plays, with the speaker's mute and volume applied,
+  as 48 kHz stereo whatever rate the guest plays at (any other path gets raw 16-bit little-endian
+  48 kHz stereo, for a named pipe and a live player).
+- `--audio-in FILE.wav` (16-bit PCM, any rate, mixed to mono) is what the microphone hears: from
+  its beginning each time the guest starts recording (selects the streaming interface), then
+  silence; silence without it.
+
+The descriptors follow the cheap "USB PnP Audio Device" dongles (Solid State System's SSS1629 and
+C-Media's CM108 have this shape): an AudioControl interface with USB streaming → feature unit →
+speaker and microphone → feature unit → USB streaming, then one AudioStreaming interface each way,
+alternate setting 0 empty and 1 streaming; the speaker endpoint is adaptive, the microphone's
+asynchronous, both every 1 ms frame. The dongles' HID buttons and microphone monitor mixer are left
+out. The strings are those of the dongle on Waveshare's UGV Rover, which their `audio_ctrl.py`
+names in its PulseAudio sink (`alsa_output.usb-Solid_State_System_Co._Ltd._USB_PnP_Audio_Device_000000000000-00.analog-stereo`);
+ALSA calls the card `Device`. The vendor and product IDs are sbc-emu's (`1209:0007`), so no
+vendor quirk in `snd-usb-audio` applies.
+
+Isochronous transfers are the xHCI core's (`peripherals/src/xhci.rs`): an isochronous endpoint
+runs one TD per service interval of guest time from its first doorbell (Start Isoch ASAP), each
+with its transfer event, so the guest plays and records in real (guest) time. A ring that runs
+dry stops the endpoint's schedule until the next doorbell. Other endpoints work as before.
+
+**The ALSA card number.** Waveshare's `ugv_jetson/asound.conf` makes card 3 the default
+(`pcm.!default {type hw card 3}`). The image's saved mixer state (`/var/lib/alsa/asound.state`,
+from a robot) has four cards: `HDA` (the Orin's HDMI/DP audio) and `APE` (its audio processing
+engine), which NVIDIA's device tree gives every Orin Nano, and two USB ones, `Camera` (the
+webcam's microphone) and `Device` (the dongle, with the controls modelled here). The dongle being
+card 3 fits HDA and APE taking 0 and 1 and the webcam 2. The emulated Orin has neither the HDA nor the APE (NVIDIA's device tree nodes and
+their drivers are not modelled) and the webcam has no microphone, so the dongle is card 0. To
+give it the robot's number without changing the image, add `snd_usb_audio.index=3` to `--append`
+(`snd-usb-audio` is built into the kernel, so the module option is a kernel parameter).
+
+```sh
+target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --threads multi --uart-driver tegra \
+  --usb-drive UGV_Rover_jetson_ros2.img --kernel Image \
+  --append "... root=PARTUUID=... net.ifnames=0 snd_usb_audio.index=3" \
+  --camera --usb-audio --audio-out out.wav --audio-in mic.wav
+```
+
+On Waveshare's image (`UGV_Rover_jetson_ros2.img`, unmodified) this gives:
+
+- `aplay -l` and `arecord -l`: `card 3: Device [USB PnP Audio Device], device 0: USB Audio`.
+- PulseAudio's default sink is the one `audio_ctrl.py` sets,
+  `alsa_output.usb-Solid_State_System_Co._Ltd._USB_PnP_Audio_Device_000000000000-00.analog-stereo`,
+  with the profile `output:analog-stereo+input:mono-fallback`.
+- Their `app.py`, started from cron, plays its `robot_started` sound into `out.wav`; so does a
+  plain `aplay x.wav` (through PulseAudio, which holds the card: `aplay -D plughw:3` reports it busy
+  while PulseAudio plays).
+- `arecord -D plughw:3,0 -f S16_LE -r 48000 -c 1 -d 3 y.wav` records `mic.wav`.
+- Their camera code (`cv2.VideoCapture(-1)` at 640x480) gets YUYV frames; `app.py`'s
+  `/video_feed` streams them. With `app.py` stopped, `gst-device-monitor-1.0 Video/Source` lists
+  the modes above, `gst-launch-1.0 v4l2src ! image/jpeg,width=1280,height=720 ! ...` and OpenCV
+  with `CAP_PROP_FOURCC` `MJPG` grab 1280x720 JPEG frames. The image has neither `v4l2-ctl` nor
+  `ffmpeg`.
 
 ### Booting a full JetPack image from the drive
 
