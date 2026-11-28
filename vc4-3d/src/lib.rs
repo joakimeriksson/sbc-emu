@@ -532,7 +532,9 @@ impl V3d {
     pub fn save_state(&self, w: &mut emu_core::snap::W) {
         // jobs the GPU thread finished but nobody collected yet count as finished: wait for it,
         // then fold their results into what is written (saving takes the device by reference)
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let (mut regs, mut intctl, mut sem) = (self.regs.clone(), self.intctl, self.sem);
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut bin_done: Option<(u32, bin::BinOutput, u64)> = None;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(wk) = self.worker.as_ref() {

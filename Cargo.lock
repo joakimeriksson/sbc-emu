@@ -55,6 +55,7 @@ dependencies = [
  "emu-core",
  "miniz_oxide",
  "peripherals",
+ "vc4-3d",
 ]
 
 [[package]]
