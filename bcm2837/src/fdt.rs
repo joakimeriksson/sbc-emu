@@ -321,7 +321,7 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     }
     f.end();
 
-    // the SD card's host, PIO (no DMA channel given: the driver falls back to PIO)
+    // the SD card's host: PIO for single blocks, DMA for more
     f.begin(&format!("mmc@{}", node(m::SDHOST)));
     f.str("compatible", "brcm,bcm2835-sdhost");
     f.cells("reg", &[bus(m::SDHOST), 0x100]);
@@ -330,6 +330,9 @@ pub fn tree(b: &BootInfo) -> Vec<u8> {
     f.cells("bus-width", &[4]);
     f.cells("brcm,overclock-50", &[0]);
     f.cells("brcm,pio-limit", &[1]);
+    // DMA on DREQ 13 (with the vendor tree's flags) for transfers of more than one block
+    f.cells("dmas", &[dma, 0x2000_0000 | crate::sdhost::DREQ]);
+    f.str("dma-names", "rx-tx");
     f.cells("firmware", &[firmware]);
     f.str("pinctrl-names", "default");
     f.cells("pinctrl-0", &[pins_sdhost]);

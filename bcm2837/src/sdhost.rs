@@ -8,22 +8,25 @@
 //! the data state machine and the FIFO's fill level, the host configuration (interrupt enables),
 //! the block size and count, and the 16-word data FIFO.
 //!
-//! Data moves through the FIFO: by PIO through SDDATA (what this machine's driver uses: the
-//! device tree gives it no DMA channel), or by the DMA controller on DREQ 13 through the same
-//! `fifo_read`/`fifo_write` and `dreq`. Transfers are instant: a read's blocks are in the FIFO
-//! as soon as the command is sent, a written block reaches the card when its last word arrives.
+//! Data moves through the FIFO: by the DMA controller on DREQ 13 (`dreq`; the driver uses DMA for
+//! transfers of more than one block, `brcm,pio-limit`), or by PIO through SDDATA for single
+//! blocks and the last words of a multi-block read, which the driver drains itself. Transfers are
+//! instant: a read's blocks are in the FIFO as soon as the command is sent, a written block
+//! reaches the card when its last word arrives.
 //! Interrupts as the driver expects them: the data flag (FIFO ready) while a transfer runs, a
-//! block interrupt after each written block, a busy interrupt when an R1b command's busy ends.
+//! block interrupt after each written block (while enabled), a busy interrupt when an R1b
+//! command's busy ends.
 //!
 //! The card is the SDHCI model's (`bcm2711::sdhci`: same CID, CSD and command set): SDHC, block
 //! addressed, 3.3 V, 4-bit, high speed via CMD6; its SCR also offers CMD23 (SET_BLOCK_COUNT), which
 //! the driver then sends before multi-block transfers instead of a CMD12 after them. SDIO and MMC
 //! probes (CMD5, CMD52, CMD1) time out.
 //!
-//! PIO costs the guest one interrupt per 512-byte block (the driver reads a block per data
-//! interrupt): about 500 k during Raspberry Pi OS's boot. The vendor tree's DMA channel removes
-//! them once the DMA controller is modelled.
+//! PIO alone (a tree without `dmas`) works too, at the cost of one guest interrupt per block.
 use bcm2711::sdhci::Disk;
+
+/// The DMA request line the DMA controller's channels name in TI.PERMAP.
+pub const DREQ: u32 = 13;
 
 const SDCMD: u64 = 0x00;
 const SDARG: u64 = 0x04;
@@ -345,7 +348,9 @@ impl Sdhost {
         let lba = self.lba;
         if let Some(d) = self.disk.as_mut() { if lba < d.sectors() { d.write(lba, &block); } }
         self.writes += 1;
-        self.hsts |= HSTS_BLOCK_IRPT;
+        // latched only while enabled: the driver enables it for PIO writes; with DMA it learns
+        // of the end from the DMA channel, and a block bit left set would reach its busy handler
+        if self.hcfg & HCFG_BLOCK_IRPT_EN != 0 { self.hsts |= HSTS_BLOCK_IRPT; }
         if self.left == 0 {
             self.abort();
         } else {

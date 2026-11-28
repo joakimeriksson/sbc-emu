@@ -57,7 +57,7 @@ wait-serial 2 received, 0% packet loss
 # Wi-Fi; powered on, an LE scan
 serial ls /sys/class/bluetooth; ls /dev/ttyAMA* 2>&1 | head -1; sudo rfkill unblock bluetooth; sleep 2; bluetoothctl power on\r
 wait-serial Changing power on succeeded
-serial timeout 8 bluetoothctl scan le > /dev/null; bluetoothctl devices | grep sensor\r
+serial bluetoothctl --timeout 8 scan le > /dev/null; bluetoothctl devices | grep sensor\r
 wait-serial Device C2:5B:BC:E0:00:01 sbc-emu sensor
 serial echo BT_DONE$((6 * 7))\r
 wait-serial BT_DONE42

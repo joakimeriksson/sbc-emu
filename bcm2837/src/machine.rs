@@ -218,7 +218,7 @@ impl Soc {
 
     /// `size`-byte write of `v` at `a` (unshifted value, any alignment within the word).
     fn mmio_write(&mut self, a: u64, v: u32, size: u32) -> Result<(), Fault> {
-        if (SDHOST..=0x3f20_20ff).contains(&a) { self.sdhost_access(|sd| sd.write(a & !3 & 0xff, v)); return Ok(()); }
+        if (SDHOST..=0x3f20_20ff).contains(&a) { self.sdhost_access(|sd| sd.write(a & !3 & 0xff, v)); self.sdhost_dma(); return Ok(()); }
         self.dirty = true;
         if (SDHCI..=0x3f30_00ff).contains(&a) { self.sdhci.write(a - SDHCI, v, size, &mut self.ram); return Ok(()); }
         let a = a & !3;
@@ -325,6 +325,18 @@ impl Soc {
         let paced = dma.run(n, self);
         self.dma = dma;
         if paced { self.pace_next = Some(0); }
+        self.sdhost_dma();
+    }
+
+    /// sdhost's DMA (DREQ 13): while its FIFO has data (a read) or room (a write), a channel
+    /// waiting for it moves the words now. Transfers take no time, so a request's blocks are in
+    /// memory (or on the card) as soon as both the command and the channel are under way.
+    fn sdhost_dma(&mut self) {
+        use crate::sdhost::DREQ;
+        if !self.sd.dreq() || !self.dma.ch.iter().any(|c| c.cs & bcm2711::dma::ACTIVE != 0 && bcm2711::dma::paced(c.ti) == Some(DREQ)) { return; }
+        let mut dma = std::mem::take(&mut self.dma);
+        if dma.serve(DREQ, self) { self.dirty = true; }
+        self.dma = dma;
     }
 
     /// Plug the monitor in or out: its EDID on the DDC bus, the HDMI block's hot-plug status,
@@ -462,6 +474,7 @@ pub(crate) fn dma_phys(a: u32) -> u64 {
 
 impl bcm2711::dma::DmaBus for Soc {
     fn phys(&self, bus: u32) -> u64 { dma_phys(bus) }
+    fn dreq(&self, dreq: u32) -> bool { dreq == crate::sdhost::DREQ && self.sd.dreq() }
 }
 
 impl Bus for Soc {
