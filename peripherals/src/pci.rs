@@ -131,6 +131,11 @@ pub trait Master {
     fn now(&self) -> u64 {
         0
     }
+    /// Guest RAM directly, for a function that works on descriptors in place (None: only
+    /// `read` and `write`).
+    fn ram(&mut self) -> Option<crate::dma::Dma<'_>> {
+        None
+    }
 }
 
 /// A PCI Express function (device 0 on the bus below a root port).

@@ -1,6 +1,7 @@
 //! Tegra234 direct-boot machine for early Linux bring-up.
 pub mod boot;
 mod bpmp;
+mod eth;
 pub mod gpu;
 mod host1x;
 mod hsp;
@@ -74,6 +75,8 @@ struct Soc {
     wifi_net: Option<sbc_net::net::VirtualNet>,
     wifi_next: u64,
     wifi_joined: bool,
+    /// PCIe controller C8 with the carrier's RTL8111 and its network (`eth.rs`)
+    eth: Option<eth::Ethernet>,
     now: u64,
     interrupts_changed: bool,
 }
@@ -195,9 +198,10 @@ impl Soc {
         }
         self.pump_network(now);
         self.pump_wifi(now);
+        self.pump_ethernet(now);
         if let Some(pcie) = self.pcie.as_mut() {
             pcie.tick(now, &mut self.ram);
-            self.gic.set_line((pcie::MSI_SPI + 32) as usize, pcie.msi_irq());
+            self.gic.set_line((pcie::C1.msi_spi + 32) as usize, pcie.msi_irq());
         }
         if let Some(xhci) = self.xhci.as_mut() {
             let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
@@ -227,6 +231,7 @@ impl Soc {
             .chain((self.net.is_some() && self.usb.net.as_ref().is_some_and(|n| n.up())).then_some(self.net_next))
             .chain((self.wifi_net.is_some() && self.wifi_joined()).then_some(self.wifi_next))
             .chain(self.pcie.as_ref().and_then(|p| p.next_event()))
+            .chain(self.ethernet_next_event())
             .min()
     }
 
@@ -289,9 +294,13 @@ impl Soc {
         } else if let Some(offset) = Self::sram_offset(addr, N) {
             let firmware = self.firmware.as_ref().ok_or(Fault::Unmapped)?;
             bytes.copy_from_slice(&firmware.bpmp.sram[offset..offset + N]);
-        } else if let Some(pcie) = self.pcie.as_mut().filter(|_| pcie::Pcie::contains(addr)) {
-            pcie.powered = self.firmware.as_ref().is_some_and(|f| f.bpmp.pcie_available());
+        } else if let Some(pcie) = self.pcie.as_mut().filter(|p| p.contains(addr)) {
+            pcie.powered = self.firmware.as_ref().is_some_and(|f| f.bpmp.pcie_available(pcie::C1.controller));
             pcie.now = self.now;
+            let value = pcie.read(addr, N, &mut self.ram);
+            bytes.copy_from_slice(&value.to_le_bytes()[..N]);
+            self.interrupts_changed = true;
+        } else if let Some(pcie) = eth::controller(&mut self.eth, &self.firmware, self.now, addr) {
             let value = pcie.read(addr, N, &mut self.ram);
             bytes.copy_from_slice(&value.to_le_bytes()[..N]);
             self.interrupts_changed = true;
@@ -314,9 +323,14 @@ impl Soc {
         } else if let Some(offset) = Self::sram_offset(addr, N) {
             let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
             firmware.bpmp.sram[offset..offset + N].copy_from_slice(&bytes);
-        } else if let Some(pcie) = self.pcie.as_mut().filter(|_| pcie::Pcie::contains(addr)) {
-            pcie.powered = self.firmware.as_ref().is_some_and(|f| f.bpmp.pcie_available());
+        } else if let Some(pcie) = self.pcie.as_mut().filter(|p| p.contains(addr)) {
+            pcie.powered = self.firmware.as_ref().is_some_and(|f| f.bpmp.pcie_available(pcie::C1.controller));
             pcie.now = self.now;
+            let mut value = [0; 8];
+            value[..N].copy_from_slice(&bytes);
+            pcie.write(addr, u64::from_le_bytes(value), N, &mut self.ram);
+            self.interrupts_changed = true;
+        } else if let Some(pcie) = eth::controller(&mut self.eth, &self.firmware, self.now, addr) {
             let mut value = [0; 8];
             value[..N].copy_from_slice(&bytes);
             pcie.write(addr, u64::from_le_bytes(value), N, &mut self.ram);
@@ -439,6 +453,7 @@ impl Machine {
             wifi_net: None,
             wifi_next: 0,
             wifi_joined: false,
+            eth: None,
             now: 0,
             interrupts_changed: true,
         };
@@ -537,7 +552,7 @@ impl Machine {
         self.enable_bpmp();
         let mut card = peripherals::bcm4350::Bcm4350::new([0x02, 0x90, 0x4c, 0x43, 0x50, 0x01]);
         card.set_networks(networks);
-        self.soc.pcie = Some(pcie::Pcie::new(Some(Box::new(card))));
+        self.soc.pcie = Some(pcie::Pcie::new(&pcie::C1, Some(Box::new(card))));
         #[allow(unused_mut)]
         let mut net = sbc_net::net::VirtualNet::new(log);
         #[cfg(not(target_arch = "wasm32"))]
@@ -552,12 +567,18 @@ impl Machine {
         self.soc.pcie.is_some()
     }
 
-    /// Forward a host TCP address to a guest port (needs `connect_usb_network` with NAT).
+    /// Forward a host TCP address to a guest port (needs a network with NAT: the onboard
+    /// Ethernet's, else the USB adapter's, else the Wi-Fi's).
     pub fn forward_tcp(&mut self, host: std::net::SocketAddr, guest_port: u16) -> Result<(), String> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // the USB Ethernet's network, or else the Wi-Fi's
-            let net = if self.soc.net.is_some() { self.soc.net.as_mut() } else { self.soc.wifi_net.as_mut() };
+            let net = if self.soc.eth.is_some() {
+                self.ethernet_net()
+            } else if self.soc.net.is_some() {
+                self.soc.net.as_mut()
+            } else {
+                self.soc.wifi_net.as_mut()
+            };
             let nat = net.and_then(|n| n.nat.as_mut()).ok_or("port forwarding needs a network with NAT")?;
             nat.add_forward(host, guest_port).map_err(|e| format!("{host}: {e}"))
         }

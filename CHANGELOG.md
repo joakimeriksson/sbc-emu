@@ -12,6 +12,13 @@ in an earlier repository whose history was rewritten; it is summarised here with
 
 ### Added
 
+- Jetson Orin Nano: the developer kit's onboard Ethernet with `--net nat|local`. The carrier's
+  Realtek RTL8111H behind the Orin's PCIe controller C8 (`0008:01:00.0`, as in NVIDIA's device
+  tree), driven by JetPack's `r8168.ko` (Realtek's vendor driver: PHY state and patch handshake,
+  eFuse MAC backup, the TCTR/TimeInt0 timer interrupt, MSI-X), on sbc-net's network; `--hostfwd`
+  reaches it. The USB Ethernet adapter that `--net` used to plug in is now `--usb-net`. The NIC
+  model moved from `tegra210` to `peripherals/src/rtl8168.rs`, shared with the Jetson Nano
+  (docs/jetson-orin-nano.md, "Network").
 - Jetson Orin Nano: Wi-Fi with `--wifi SSID[:PASSPHRASE]`. A Broadcom BCM4350 card in the M.2
   Key E slot behind the Orin's own PCIe controller C1 (Tegra234 DesignWare with BPMP bring-up,
   iATU, MSIs), driven by the image's `pcie-tegra194` and `brcmfmac` (msgbuf, an emulated dongle

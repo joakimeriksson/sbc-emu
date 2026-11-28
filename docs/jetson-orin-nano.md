@@ -96,26 +96,56 @@ the disk, so sbc-emu presents the drive at the size the GPT gives. The extra sec
 
 ## Network
 
-The Orin Nano's own Ethernet port is not modelled. `--net nat` plugs a USB Ethernet adapter into
-the board instead: a CDC-ECM device, which Linux's `cdc_ether` driver runs without a vendor
-driver. It is the same virtual network as on the other boards (sbc-net: DHCP, DNS, ICMP), and
-`nat` relays the guest's TCP and UDP through the host's sockets. `--net local` keeps the network
-isolated. Without `--net` no adapter is plugged in.
+`--net nat` plugs the developer kit's own Ethernet port into the virtual network: the carrier
+board's (P3768) Realtek RTL8111H Gigabit controller behind the Orin's PCIe controller C8
+(`pcie@140a0000`, PCI domain 8, its x2 port on the GbE UPHY's lanes), as in NVIDIA's device tree
+for the board. The guest's unmodified drivers bind it as on the robot: `pcie-tegra194` brings C8
+up through the BPMP (power domain `pcie_x4ca`, core clock, APB and core resets, the UPHY's
+controller state) and its two P2U PHYs (`phy@3f40000`, `phy@3f50000`), trains the link and
+enumerates `0008:01:00.0` (`10ec:8168` rev 15); JetPack's `r8168.ko` (NVIDIA's build of
+Realtek's vendor driver 8.051.02) takes it as `eth0`, with MSI-X through the DesignWare MSI
+controller. Mainline's `r8169` drives the same model. Behind the cable is the same virtual
+network as on the other boards (sbc-net: DHCP, DNS, ICMP), and `nat` relays the guest's TCP and
+UDP through the host's sockets. `--net local` keeps the network isolated. Without `--net` the
+cable is unplugged: the controller is not in the device tree. `--net` turns the BPMP on.
 
 `--hostfwd tcp:[HOSTADDR]:HOSTPORT-[GUESTADDR]:GUESTPORT` (QEMU's syntax, repeatable) forwards a
-host TCP port to the guest. It needs `--net nat`.
-
-The adapter's MAC address is universally administered, so Linux names it `eth0` with
-`net.ifnames=0`, or `enx001de15b0e01` with predictable names. The kernel needs `cdc_ether`; the
-JetPack kernels build it as a module, which a full root filesystem loads by itself.
+host TCP port to the guest. It needs a network with NAT: `--net nat` (or `--usb-net nat`, or
+`--wifi`, below). The forward goes to the onboard port's network when `--net` is given, else to
+the USB adapter's, else to the Wi-Fi's.
 
 ```sh
 target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver tegra \
   --usb-drive JETPACK.img --kernel Image --append "... root=PARTUUID=... net.ifnames=0" \
-  --net nat --hostfwd tcp::5000-:5000
+  --net nat --hostfwd tcp::6050-:5000
 ```
 
-A web server listening on the guest's port 5000 then answers at `http://127.0.0.1:5000/` on the host.
+A web server listening on the guest's port 5000 then answers at `http://127.0.0.1:6050/` on the
+host. On Waveshare's UGV Rover image, NetworkManager brings "Wired connection 1" up on `eth0` with
+the DHCP address, and their app (`ugv_jetson/app.py`, port 5000) shows it on the OLED as
+`E:<address>`.
+
+The NIC model (`peripherals/src/rtl8168.rs`, shared with the Jetson Nano) has the chip's
+registers and indirect spaces (PHY and MAC OCP, ERI, CSI, EPHY), the PHY's state machine and
+microcontroller patch handshake (the drivers load the PHY RAM code; it is kept, not run), the
+eFuse MAC address (`02:53:42:4f:52:4e`, locally administered) and its ERI backup, the rings with
+checksum and segmentation offload, and the timer interrupt (TCTR/TimeInt0, 125 MHz) that
+`r8168` runs its receive and transmit work off. What differs from the robot: the MAC address
+(the robot's is NVIDIA's, from the chip's eFuse); the controller has no SMMU (device addresses
+are physical), no memory-bandwidth interconnect, dummy regulators (`vpcie3v3` is a GPIO-switched
+supply on the board), and it reports 8 inbound iATU regions where the robot's reports 2; the
+link is always a Gigabit full-duplex partner; wake-on-LAN, VLAN offload, jumbo frames, flow
+control, ASPM's power states and the chip's VPD and extended capabilities are not modelled.
+Set `SBC_NET_LOG=1` to trace the network and `SBC_PCIE_LOG=1` for unrouted PCIe accesses.
+
+### USB Ethernet adapter
+
+`--usb-net nat|local` plugs a USB Ethernet adapter in, on a network of its own: a CDC-ECM
+device, which Linux's `cdc_ether` driver runs without a vendor driver (before the onboard port
+was modelled, `--net` meant this adapter). The adapter's MAC address is universally
+administered, so Linux names it `eth0` (or `eth1` next to the onboard port) with
+`net.ifnames=0`, or `enx001de15b0e01` with predictable names. The kernel needs `cdc_ether`; the
+JetPack kernels build it as a module, which a full root filesystem loads by itself.
 
 ## Wi-Fi
 
@@ -134,8 +164,8 @@ serves the control, receive-post and flow rings in guest memory, and interrupts 
 the DesignWare core's MSI controller. It sees one access point, SSID, on channel 6: WPA2-PSK
 with a passphrase (8 to 63 characters), open without one. Behind it is the same virtual network
 as `--net` (sbc-net: DHCP, DNS, ICMP, with NAT unless `--net local`), a network of its own,
-separate from the USB Ethernet adapter's. `--hostfwd` goes to the USB network when `--net` is
-given, to the Wi-Fi's otherwise. `--wifi` turns the BPMP on.
+separate from the onboard port's and the USB Ethernet adapter's. `--hostfwd` goes to the Wi-Fi's
+network when neither `--net` nor `--usb-net` is given. `--wifi` turns the BPMP on.
 
 ```sh
 target/release/sbc-emu run --board jetson-orin-nano-4gb --bpmp on --uart-driver tegra \
@@ -155,8 +185,8 @@ What differs from the robot: the robot's card is a Realtek RTL8822CE with NVIDIA
 (`rtl8822ce.ko`, a SoftMAC driver whose firmware, PHY and RF programming are far larger), so the
 chip, driver and MAC address differ (`lspci` shows a Broadcom BCM4350, `ethtool -i wlan0` says
 `brcmfmac`). The controller has no SMMU (`iommu-map` is left out of the device tree, so device
-addresses are physical), no memory-bandwidth interconnect and a dummy regulator; the other PCIe
-controllers (the NVMe slot, the Ethernet chip) are not modelled. The air is not modelled: signal
+addresses are physical), no memory-bandwidth interconnect and a dummy regulator; of the other
+PCIe controllers only C8 (the Ethernet chip, `--net`) is modelled, not the NVMe slots. The air is not modelled: signal
 strength and rates are fixed, a scan takes 1.5 s and finds the single access point, and the
 soft AP has no clients.
 Set `SBC_BRCM_LOG=1` to trace the dongle's ioctls and `SBC_PCIE_LOG=1` for unrouted PCIe accesses.

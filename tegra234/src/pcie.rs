@@ -1,12 +1,16 @@
-//! Tegra234 PCIe controller C1 (`pcie@14100000`, PCI domain 1): the Synopsys DesignWare core
-//! with NVIDIA's application layer, as Linux's `pcie-tegra194` driver (in its Tegra234 form)
-//! and the DesignWare host library drive it. On the Orin Nano developer kit this x1 port is
-//! the M.2 Key E slot, where the Wi-Fi card sits.
+//! Tegra234 PCIe controllers: the Synopsys DesignWare core with NVIDIA's application layer, as
+//! Linux's `pcie-tegra194` driver (in its Tegra234 form) and the DesignWare host library drive
+//! it. Two instances of the Orin Nano developer kit (carrier board P3768) are modelled, each
+//! with the addresses, interrupts and BPMP IDs of the module's own device tree
+//! (`tegra234-p3768-0000+p3767-0004-nv.dtb`):
+//! - [`C1`] (`pcie@14100000`, PCI domain 1, x1): the M.2 Key E slot, where the Wi-Fi card sits;
+//! - [`C8`] (`pcie@140a0000`, PCI domain 8, x2 on the GbE UPHY lanes): the carrier's
+//!   Realtek RTL8111 Gigabit Ethernet controller (`0008:01:00.0`).
 //!
 //! Modelled:
 //! - APPL (the application layer): pin mux (PERST#), LTSSM enable, the link status and LTSSM
 //!   state the driver reads back, the interrupt registers (nothing raises them here).
-//! - DBI: the root port's configuration space (NVIDIA 10de:229e, a PCI bridge with the PM,
+//! - DBI: the root port's configuration space (NVIDIA 10de:229e on C1, 10de:229c on C8, a PCI bridge with the PM,
 //!   MSI and PCIe capabilities and the extended capabilities the driver looks up), the port
 //!   logic registers, and the integrated MSI controller (eight banks of 32 vectors; an MSI is
 //!   a device's write to the address in `PCIE_MSI_ADDR_LO/HI`, it raises the "msi" SPI).
@@ -14,7 +18,7 @@
 //!   CPU accesses to the config, I/O and memory windows go through the outbound regions
 //!   (CFG0 to the card below the port, MEM to its BARs), as on the chip. Inbound, device
 //!   addresses are physical addresses (no SMMU here).
-//! - The P2U PHY brick of the lane (`phy@3e30000`, phy-tegra194-p2u): registers only.
+//! - The P2U PHY bricks of the lanes (phy-tegra194-p2u): registers only.
 //!
 //! The link trains as soon as the driver enables the LTSSM with PERST# released and a card is
 //! in the slot. The controller's power, clock, resets and UPHY go through the BPMP
@@ -23,30 +27,113 @@
 use peripherals::pci::{Config, Function, Master};
 use std::collections::HashMap;
 
-pub const APPL: u64 = 0x1410_0000;
 pub const APPL_SIZE: u64 = 0x2_0000;
-pub const CONFIG: u64 = 0x3000_0000;
 pub const CONFIG_SIZE: u64 = 0x4_0000;
-pub const ATU_DMA: u64 = 0x3004_0000;
 pub const ATU_DMA_SIZE: u64 = 0x4_0000;
-pub const DBI: u64 = 0x3008_0000;
 pub const DBI_SIZE: u64 = 0x4_0000;
-pub const IO: u64 = 0x3010_0000;
 pub const IO_SIZE: u64 = 0x10_0000;
-/// 64-bit prefetchable window (bus address = CPU address)
-pub const PREF: u64 = 0x20_8000_0000;
-pub const PREF_SIZE: u64 = 0x2800_0000;
-/// 32-bit window at bus address 0x40000000
-pub const MEM: u64 = 0x20_a800_0000;
+pub const P2U_SIZE: u64 = 0x1_0000;
+/// The 32-bit window's bus address
 pub const MEM_BUS: u64 = 0x4000_0000;
 pub const MEM_SIZE: u64 = 0x0800_0000;
-pub const P2U: u64 = 0x03e3_0000;
-pub const P2U_SIZE: u64 = 0x1_0000;
-/// "intr" and "msi"
-pub const INTR_SPI: u32 = 45;
-pub const MSI_SPI: u32 = 46;
-/// BPMP controller ID of C1
-pub const CONTROLLER: u32 = 1;
+
+/// One controller instance: where it is, its interrupts, its BPMP IDs, and its root port.
+pub struct Instance {
+    /// the device tree node's unit address (its "appl" region)
+    pub appl: u64,
+    pub config: u64,
+    pub atu_dma: u64,
+    pub dbi: u64,
+    /// the I/O window (bus address = CPU address)
+    pub io: u64,
+    /// the 64-bit prefetchable window (bus address = CPU address)
+    pub pref: u64,
+    pub pref_size: u64,
+    /// the 32-bit window, at bus address `MEM_BUS`
+    pub mem: u64,
+    /// the lanes' P2U PHY bricks
+    pub p2u: &'static [u64],
+    /// "intr" and "msi"
+    pub intr_spi: u32,
+    pub msi_spi: u32,
+    /// the BPMP's controller ID, and the PCI domain (`linux,pci-domain`)
+    pub controller: u32,
+    pub domain: u32,
+    pub lanes: u32,
+    /// BPMP clock, resets (APB, core) and power domain, with the domain's name
+    pub clock: u32,
+    pub apb_reset: u32,
+    pub core_reset: u32,
+    pub power_domain: u32,
+    pub power_name: &'static str,
+    /// the root port's device ID
+    pub device: u16,
+}
+
+/// C1: the M.2 Key E slot (x1).
+pub const C1: Instance = Instance {
+    appl: 0x1410_0000,
+    config: 0x3000_0000,
+    atu_dma: 0x3004_0000,
+    dbi: 0x3008_0000,
+    io: 0x3010_0000,
+    pref: 0x20_8000_0000,
+    pref_size: 0x2800_0000,
+    mem: 0x20_a800_0000,
+    p2u: &[0x03e3_0000],
+    intr_spi: 45,
+    msi_spi: 46,
+    controller: 1,
+    domain: 1,
+    lanes: 1,
+    clock: 0xdd,
+    apb_reset: 0x7a,
+    core_reset: 0x75,
+    power_domain: 9,
+    power_name: "pcie_x1a",
+    device: 0x229e,
+};
+
+/// C8: the carrier's RTL8111 (x2, on the GbE UPHY's lanes 2 and 3).
+pub const C8: Instance = Instance {
+    appl: 0x140a_0000,
+    config: 0x2a00_0000,
+    atu_dma: 0x2a04_0000,
+    dbi: 0x2a08_0000,
+    io: 0x2a10_0000,
+    pref: 0x32_4000_0000,
+    pref_size: 0x2_e800_0000,
+    mem: 0x35_2800_0000,
+    p2u: &[0x03f4_0000, 0x03f5_0000],
+    intr_spi: 356,
+    msi_spi: 357,
+    controller: 8,
+    domain: 8,
+    lanes: 2,
+    clock: 0xac,
+    apb_reset: 0x1a,
+    core_reset: 0x19,
+    power_domain: 13,
+    power_name: "pcie_x4ca",
+    device: 0x229c,
+};
+
+impl Instance {
+    /// (base, size) of each region the controller decodes.
+    fn regions(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        [
+            (self.appl, APPL_SIZE),
+            (self.config, CONFIG_SIZE),
+            (self.atu_dma, ATU_DMA_SIZE),
+            (self.dbi, DBI_SIZE),
+            (self.io, IO_SIZE),
+            (self.pref, self.pref_size),
+            (self.mem, MEM_SIZE),
+        ]
+        .into_iter()
+        .chain(self.p2u.iter().map(|&b| (b, P2U_SIZE)))
+    }
+}
 
 const APPL_PINMUX: u32 = 0x0;
 const APPL_PINMUX_PEX_RST: u32 = 1 << 0;
@@ -124,6 +211,10 @@ impl Master for Port<'_> {
         self.now
     }
 
+    fn ram(&mut self) -> Option<peripherals::dma::Dma<'_>> {
+        Some(peripherals::dma::Dma { ram: &mut *self.ram, base: crate::RAM_BASE })
+    }
+
     fn write(&mut self, addr: u64, data: &[u8]) -> bool {
         if addr == self.msi.addr && self.msi.addr != 0 {
             let vector = data.first().copied().unwrap_or(0) as usize;
@@ -149,6 +240,7 @@ impl Master for Port<'_> {
 }
 
 pub struct Pcie {
+    pub inst: &'static Instance,
     appl: Vec<u32>,
     /// the root port's configuration space and port logic (DBI 0..4 KiB)
     rp: Config,
@@ -157,7 +249,10 @@ pub struct Pcie {
     msi: Msi,
     /// iATU regions: outbound then inbound, 0x200 bytes apart, the inbound ones at +0x100
     atu: Vec<u32>,
-    p2u: HashMap<u32, u32>,
+    /// the P2U bricks' registers by address
+    p2u: HashMap<u64, u32>,
+    /// LNKSTA's speed and width once the link is up: the lower of the port's and the card's
+    link: u16,
     card: Option<Box<dyn Function>>,
     /// the BPMP has the controller powered, out of reset and its UPHY on
     pub powered: bool,
@@ -167,10 +262,10 @@ pub struct Pcie {
 }
 
 impl Pcie {
-    pub fn new(card: Option<Box<dyn Function>>) -> Self {
+    pub fn new(inst: &'static Instance, mut card: Option<Box<dyn Function>>) -> Self {
         let mut rp = Config::new();
         rp.set16(0x00, 0x10de);
-        rp.set16(0x02, 0x229e);
+        rp.set16(0x02, inst.device);
         rp.set32(0x08, 0x0604_00a1);
         rp.set8(0x0e, 0x01); // type 1 header
         rp.set16(0x06, 0x0010);
@@ -205,7 +300,7 @@ impl Pcie {
         rp.set32(PCIE_CAP + 4, 0x0000_8002);
         rp.writable(PCIE_CAP + 8, 2, 0x7fff);
         rp.clearable(PCIE_CAP + 10, 2, 0x000f);
-        rp.set32(PCIE_CAP + 0x0c, 0x0010_0c14); // LNKCAP: 16 GT/s, x1, ASPM, DLLLA reporting
+        rp.set32(PCIE_CAP + 0x0c, 0x0010_0c04 | inst.lanes << 4); // LNKCAP: 16 GT/s, ASPM, DLLLA reporting
         rp.writable(PCIE_CAP + 0x0c, 4, 0xffff_ffff);
         rp.writable(PCIE_CAP + 0x10, 2, 0x0fff);
         rp.writable(PCIE_CAP + 0x1c, 2, 0x001f); // root control
@@ -228,7 +323,15 @@ impl Pcie {
             }
         }
         rp.set32(0x194, 0x0000_001f); // L1SS capabilities
+        let link = card.as_mut().map_or(0, |c| {
+            let lnkcap = card_lnkcap(c.config()).unwrap_or(0x11);
+            let speed = (lnkcap & 0xf).min(4);
+            let width = (lnkcap >> 4 & 0x3f).min(inst.lanes);
+            (speed | width << 4) as u16
+        });
         Self {
+            inst,
+            link,
             appl: vec![0; (APPL_SIZE / 4) as usize],
             rp,
             dbi: HashMap::new(),
@@ -242,10 +345,12 @@ impl Pcie {
         }
     }
 
-    pub fn contains(addr: u64) -> bool {
-        [(APPL, APPL_SIZE), (CONFIG, CONFIG_SIZE), (ATU_DMA, ATU_DMA_SIZE), (DBI, DBI_SIZE), (IO, IO_SIZE), (PREF, PREF_SIZE), (MEM, MEM_SIZE), (P2U, P2U_SIZE)]
-            .iter()
-            .any(|&(base, size)| (base..base + size).contains(&addr))
+    pub fn contains(&self, addr: u64) -> bool {
+        self.inst.regions().any(|(base, size)| (base..base + size).contains(&addr))
+    }
+
+    fn p2u_register(&self, addr: u64) -> Option<u64> {
+        self.inst.p2u.iter().any(|&b| (b..b + P2U_SIZE).contains(&addr)).then_some(addr & !3)
     }
 
     /// Run `f` on the card with its bus-master port onto `ram`.
@@ -282,15 +387,16 @@ impl Pcie {
     }
 
     pub fn read(&mut self, addr: u64, len: usize, ram: &mut [u8]) -> u64 {
-        let v = if (APPL..APPL + APPL_SIZE).contains(&addr) {
-            self.appl_read((addr - APPL) as u32 & !3) as u64
-        } else if (DBI..DBI + DBI_SIZE).contains(&addr) {
-            self.dbi_read((addr - DBI) as usize & !3) as u64
-        } else if (ATU_DMA..ATU_DMA + ATU_DMA_SIZE).contains(&addr) {
-            let o = (addr - ATU_DMA) as usize & !3;
+        let i = self.inst;
+        let v = if (i.appl..i.appl + APPL_SIZE).contains(&addr) {
+            self.appl_read((addr - i.appl) as u32 & !3) as u64
+        } else if (i.dbi..i.dbi + DBI_SIZE).contains(&addr) {
+            self.dbi_read((addr - i.dbi) as usize & !3) as u64
+        } else if (i.atu_dma..i.atu_dma + ATU_DMA_SIZE).contains(&addr) {
+            let o = (addr - i.atu_dma) as usize & !3;
             self.atu.get(o / 4).copied().unwrap_or(0) as u64
-        } else if (P2U..P2U + P2U_SIZE).contains(&addr) {
-            self.p2u.get(&((addr - P2U) as u32 & !3)).copied().unwrap_or(0) as u64
+        } else if let Some(r) = self.p2u_register(addr) {
+            self.p2u.get(&r).copied().unwrap_or(0) as u64
         } else {
             return self.window_read(addr, len, ram);
         };
@@ -300,21 +406,21 @@ impl Pcie {
     }
 
     pub fn write(&mut self, addr: u64, value: u64, len: usize, ram: &mut [u8]) {
-        if (APPL..APPL + APPL_SIZE).contains(&addr) {
-            let o = (addr - APPL) as u32 & !3;
+        let i = self.inst;
+        if (i.appl..i.appl + APPL_SIZE).contains(&addr) {
+            let o = (addr - i.appl) as u32 & !3;
             let v = merge(self.appl_read(o), addr, value, len);
             self.appl[(o / 4) as usize] = v;
-        } else if (DBI..DBI + DBI_SIZE).contains(&addr) {
-            self.dbi_write((addr - DBI) as usize, value as u32, len.min(4));
-        } else if (ATU_DMA..ATU_DMA + ATU_DMA_SIZE).contains(&addr) {
-            let o = (addr - ATU_DMA) as usize & !3;
+        } else if (i.dbi..i.dbi + DBI_SIZE).contains(&addr) {
+            self.dbi_write((addr - i.dbi) as usize, value as u32, len.min(4));
+        } else if (i.atu_dma..i.atu_dma + ATU_DMA_SIZE).contains(&addr) {
+            let o = (addr - i.atu_dma) as usize & !3;
             if let Some(w) = self.atu.get_mut(o / 4) {
                 *w = merge(*w, addr, value, len);
             }
-        } else if (P2U..P2U + P2U_SIZE).contains(&addr) {
-            let o = (addr - P2U) as u32 & !3;
-            let old = self.p2u.get(&o).copied().unwrap_or(0);
-            self.p2u.insert(o, merge(old, addr, value, len));
+        } else if let Some(r) = self.p2u_register(addr) {
+            let old = self.p2u.get(&r).copied().unwrap_or(0);
+            self.p2u.insert(r, merge(old, addr, value, len));
         } else {
             self.window_write(addr, value, len, ram);
         }
@@ -335,8 +441,9 @@ impl Pcie {
         let up = self.link_up();
         match o {
             _ if o == PCIE_CAP + 0x10 => {
-                // LNKSTA: 5 GT/s x1 (what the card trains at), common clock, DLL active
-                let sta = if up { 0x3012 } else { 0x1000 };
+                // LNKSTA: what the link trained at (the card's speed and width, at most the
+                // port's), common clock, DLL active
+                let sta = if up { 0x3000 | self.link as u32 } else { 0x1000 };
                 self.rp.get16(o) as u32 | sta << 16
             }
             PORT_DEBUG0 if up => LTSSM_L0,
@@ -465,6 +572,21 @@ impl Pcie {
     }
 }
 
+/// A function's LNKCAP, from the PCI Express capability in its list.
+fn card_lnkcap(c: &mut Config) -> Option<u32> {
+    let mut at = c.get8(0x34) as usize & !3;
+    for _ in 0..48 {
+        if at < 0x40 {
+            return None;
+        }
+        if c.get8(at) == 0x10 {
+            return Some(c.get32(at + 0x0c));
+        }
+        at = c.get8(at + 1) as usize & !3;
+    }
+    None
+}
+
 /// `value` (`len` bytes at `addr`) merged into the 32-bit register `old`.
 fn merge(old: u32, addr: u64, value: u64, len: usize) -> u32 {
     if len >= 4 {
@@ -480,12 +602,18 @@ mod tests {
     use super::*;
     use peripherals::bcm4350::Bcm4350;
 
+    const APPL: u64 = C1.appl;
+    const CONFIG: u64 = C1.config;
+    const ATU_DMA: u64 = C1.atu_dma;
+    const DBI: u64 = C1.dbi;
+    const MEM: u64 = C1.mem;
+
     fn rc() -> (Pcie, Vec<u8>) {
-        (Pcie::new(Some(Box::new(Bcm4350::new([2, 0, 0, 0, 0, 1])))), vec![0; 1 << 20])
+        (Pcie::new(&C1, Some(Box::new(Bcm4350::new([2, 0, 0, 0, 0, 1])))), vec![0; 1 << 20])
     }
 
     fn atu(p: &mut Pcie, ram: &mut [u8], i: u64, kind: u32, cpu: u64, size: u64, target: u64) {
-        let r = ATU_DMA + i * 0x200;
+        let r = p.inst.atu_dma + i * 0x200;
         let limit = cpu + size - 1;
         for (o, v) in [
             (ATU_LOWER_BASE, cpu as u32),
@@ -531,6 +659,51 @@ mod tests {
         // the BAR0 window starts on chipcommon: the chip ID
         assert_eq!(p.read(MEM, 4, &mut ram) & 0xffff, 0x4350);
     }
+
+    #[test]
+    fn c8_enumerates_the_rtl8111_and_its_msix_reaches_the_msi_controller() {
+        use peripherals::rtl8168::Rtl8111;
+        let mut p = Pcie::new(&C8, Some(Box::new(Rtl8111::new([2, 0, 0, 0, 0, 1]))));
+        // RAM_BASE..+1 MiB stands for the guest's memory
+        let mut ram = vec![0; 1 << 20];
+        let (dbi, config, mem) = (C8.dbi, C8.config, C8.mem);
+        assert!(p.contains(C8.appl) && p.contains(0x03f5_0000) && !p.contains(C1.appl));
+        assert_eq!(p.read(dbi, 4, &mut ram), 0x229c_10de);
+        assert_eq!(p.read(dbi + PCIE_CAP as u64 + 0x0c, 4, &mut ram) >> 4 & 0x3f, 2, "x2 port");
+        p.write(C8.appl + APPL_CTRL as u64, APPL_CTRL_LTSSM_EN as u64, 4, &mut ram);
+        p.write(C8.appl + APPL_PINMUX as u64, APPL_PINMUX_PEX_RST as u64, 4, &mut ram);
+        // trained at the card's 2.5 GT/s x1
+        assert_eq!(p.read(dbi + PCIE_CAP as u64 + 0x12, 2, &mut ram), 0x3011);
+        p.write(dbi + 0x18, 0x00ff_0100, 4, &mut ram);
+        atu(&mut p, &mut ram, 0, ATU_TYPE_CFG0, config, CONFIG_SIZE, 1 << 24);
+        assert_eq!(p.read(config, 4, &mut ram), 0x8168_10ec);
+        assert_eq!(p.read(config + 8, 4, &mut ram), 0x0200_0015);
+        // BAR2 (registers) and BAR4 (MSI-X) in the 32-bit window
+        p.write(config + 0x18, MEM_BUS, 4, &mut ram);
+        p.write(config + 0x20, MEM_BUS + 0x4000, 4, &mut ram);
+        p.write(config + 0x04, 0x6, 2, &mut ram);
+        atu(&mut p, &mut ram, 1, ATU_TYPE_MEM, mem, MEM_SIZE, MEM_BUS);
+        assert_eq!(p.read(mem + 0x40, 4, &mut ram) >> 20 & 0xfcf, 0x541, "TxConfig: RTL8168H");
+        assert_eq!(p.read(mem, 4, &mut ram), 0x0000_0002, "MAC0..3");
+        // MSI-X vector 0 to the DesignWare MSI controller's address, vector 5
+        let msi = RAM_BASE_FOR_TEST + 0x8000;
+        p.write(dbi + MSI_ADDR_LO as u64, msi, 4, &mut ram);
+        p.write(dbi + MSI_CTRL0 as u64, 1 << 5, 4, &mut ram);
+        p.write(mem + 0x4000, msi, 4, &mut ram);
+        p.write(mem + 0x4008, 5, 4, &mut ram);
+        p.write(mem + 0x400c, 0, 4, &mut ram);
+        p.write(config + 0xb2, 0x8000, 2, &mut ram);
+        // a link change, unmasked: the message arrives
+        p.write(mem + 0x3c, 0x20, 2, &mut ram);
+        p.with_card(&mut ram, |c: &mut Rtl8111, port| {
+            c.nic.set_link(false);
+            c.nic.set_link(true);
+            c.service(port);
+        });
+        assert!(p.msi_irq());
+    }
+
+    const RAM_BASE_FOR_TEST: u64 = crate::RAM_BASE;
 
     #[test]
     fn msi_write_sets_status_and_the_line() {
