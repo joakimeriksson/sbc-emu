@@ -656,6 +656,30 @@ pub extern "C" fn sbc_qpu_jit_check(seed: f64, cases: u32) -> u32 {
     r
 }
 
+/// Replays captured VideoCore IV jobs (`SBC_VC4_CAPTURE`'s jobs.bin, `len` bytes at `ptr`) with
+/// the QPU JIT on (1) or off (0), as `vc4-replay` does natively (tools/wasm-vc4-replay.mjs times
+/// it): a checksum of the frames the jobs rendered.
+#[no_mangle]
+pub extern "C" fn sbc_vc4_replay(ptr: *const u8, len: usize, jit: u32) -> u32 {
+    // SAFETY: the caller passes a buffer it allocated with `sbc_alloc`, `len` bytes long
+    let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let Ok(jobs) = vc4_3d::capture::parse(data) else { return 0 };
+    let top = jobs.iter().flat_map(|j| j.pages.iter().map(|p| p.0 as usize + 4096)).max().unwrap_or(0);
+    let mut ram = vec![0u8; top + (16 << 20)];
+    vc4_3d::jit::set_enabled(jit != 0);
+    let (frames, _) = vc4_3d::capture::replay_counted(&jobs, &mut ram);
+    vc4_3d::jit::set_enabled(true);
+    let mut h = 0x811c_9dc5u32;
+    for f in &frames {
+        let a = (f.addr & 0x3fff_ffff) as usize;
+        let n = (f.width * f.height * if f.format == 1 { 4 } else { 2 }) as usize;
+        for &b in ram.get(a..a + n).unwrap_or(&[]) {
+            h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
 /// Turn the block JIT on (1) or off (0); returns whether it is active.
 #[no_mangle]
 pub extern "C" fn sbc_jit(on: u32) -> u32 {

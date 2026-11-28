@@ -43,18 +43,29 @@ fn vector(r: &mut Rng) -> V {
 }
 
 /// An environment whose every answer is the next of a sequence (so answers in the wrong order
-/// show), with a VPM.
+/// show), with a VPM. As in the fragment shaders' environment, the tile buffer and the lanes'
+/// coverage (which the TLB and multisample writes change: `tile`) are one sequence, the
+/// varyings another.
 struct SeqEnv {
     seed: u64,
     n: u64,
+    tile: u64,
+    host: u64,
     vpm: Vec<u32>,
 }
 
 impl SeqEnv {
+    fn gen(seed: u64, n: u64) -> V {
+        let mut r = Rng(seed ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        vector(&mut r)
+    }
     fn next(&mut self) -> V {
         self.n += 1;
-        let mut r = Rng(self.seed ^ self.n.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        vector(&mut r)
+        Self::gen(self.seed, self.n)
+    }
+    fn next_tile(&mut self) -> V {
+        self.tile = self.tile.wrapping_add(1);
+        Self::gen(self.seed ^ 0x5555, self.tile)
     }
 }
 
@@ -69,22 +80,50 @@ impl Env for SeqEnv {
         (std::array::from_fn(|i| i as u32 * 3), std::array::from_fn(|i| 100 - i as u32))
     }
     fn ms_flags(&self) -> V {
-        std::array::from_fn(|i| (i as u32 * 5) & 15)
+        Self::gen(self.seed ^ 0xaaaa, self.tile).map(|x| x & 15)
     }
     fn rev_flag(&self) -> V {
         [1; 16]
     }
     fn color_load(&mut self) -> V {
-        self.next()
+        self.next_tile()
     }
     fn coverage_load(&mut self) -> V {
-        self.next()
+        self.next_tile()
     }
     fn alpha_mask_load(&mut self) -> V {
-        self.next()
+        self.next_tile()
     }
     fn tlb_z(&mut self, v: &V, mask: u16) {
-        self.n = self.n.wrapping_add(v[0] as u64 ^ mask as u64);
+        self.mix(1, v, mask);
+    }
+    fn tlb_color(&mut self, v: &V, mask: u16, all: bool) {
+        self.mix(2 + all as u64, v, mask);
+    }
+    fn tlb_stencil(&mut self, v: u32) {
+        self.mix(4, &[v; 16], 1);
+    }
+    fn tlb_alpha_mask(&mut self, v: &V, mask: u16) {
+        self.mix(5, v, mask);
+    }
+    fn set_ms_flags(&mut self, v: &V, mask: u16) {
+        self.mix(6, v, mask);
+    }
+    fn host_int(&mut self) {
+        self.host += 1;
+    }
+}
+
+impl SeqEnv {
+    /// A write folded into the sequence: what comes after depends on every write and its order.
+    fn mix(&mut self, kind: u64, v: &V, mask: u16) {
+        let mut h = self.tile ^ kind << 56 ^ mask as u64;
+        for (i, &x) in v.iter().enumerate() {
+            if mask >> i & 1 != 0 {
+                h = (h ^ x as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        self.tile = h;
     }
 }
 
@@ -102,13 +141,18 @@ fn random_inst(r: &mut Rng) -> u64 {
             5 | 6 => 32 + r.below(4),
             7 => waddr::NOP as u64,
             8 => 52 + r.below(4),
-            _ => r.pick(&[waddr::TMU_NOSWAP, waddr::QUAD_XY, waddr::MS_FLAGS, waddr::R0]) as u64,
+            _ => match r.below(3) {
+                0 => r.pick(&[waddr::TMU_NOSWAP, waddr::QUAD_XY, waddr::MS_FLAGS, waddr::R0]) as u64,
+                // writes the block leaves to the interpreter's `write`, after it
+                1 => r.pick(&[waddr::TMU0_S, waddr::TMU0_T, waddr::TMU0_B, waddr::TMU1_S, 61, 62, waddr::TMU1_B]) as u64,
+                _ => r.pick(&[waddr::TLB_Z, waddr::TLB_COLOR_ALL, waddr::TLB_COLOR_MS, waddr::TLB_STENCIL, waddr::TLB_ALPHA_MASK, waddr::VPM, waddr::VPM_SETUP, waddr::HOST_INT, waddr::UNIFORMS_ADDRESS, waddr::MUTEX_RELEASE]) as u64,
+            },
         }
     };
     let raddrs = |r: &mut Rng| -> u64 {
         match r.below(10) {
             0..=5 => r.below(32),
-            _ => r.pick(&[raddr::UNIF, raddr::VARY, raddr::ELEM_QPU, raddr::NOP, raddr::XY_PIXEL, raddr::MS_REV, raddr::VPM_BUSY, 36]) as u64,
+            _ => r.pick(&[raddr::UNIF, raddr::VARY, raddr::ELEM_QPU, raddr::NOP, raddr::XY_PIXEL, raddr::MS_REV, raddr::VPM_BUSY, raddr::VPM, 36]) as u64,
         }
     };
     loop {
@@ -163,6 +207,7 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
     let mut r = Rng(seed | 1);
     let mut ops = BTreeMap::new();
     let mut ram = vec![0u8; 0x2_0000];
+    let mut with_blocks = 0;
     for case in 0..cases {
         let mut prog: Vec<I> = Vec::new();
         for k in 0..1 + r.below(4) {
@@ -192,6 +237,10 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
         }
         (q0.z, q0.n, q0.c, q0.num) = (r.next() as u16, r.next() as u16, r.next() as u16, r.below(12) as u32);
         q0.start(0x1000, 0x8000);
+        // a VPM read setup (any size, stride, direction, address), 16 reads
+        let setup = r.next() as u32 & 0x000f_ffff;
+        q0.vrd = crate::qpu::VpmGen { setup, addr: setup & 0xff, left: 16 };
+        let vpm: Vec<u32> = (0..128 * 16).map(|_| word(&mut r)).collect();
         for t in 0..2 {
             for _ in 0..r.below(4) {
                 q0.tmu[t].fifo.push_back(vector(&mut r));
@@ -202,18 +251,22 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
         for on in [true, false] {
             crate::jit::set_enabled(on);
             let mut q = q0.clone();
-            let mut env = SeqEnv { seed: env_seed, n: 0, vpm: vec![0; 128 * 16] };
+            let mut env = SeqEnv { seed: env_seed, n: 0, tile: 0, host: 0, vpm: vpm.clone() };
             let mut code = Code::default();
+            let mut ram = ram.clone();
             let mut m = Mem::new(&mut ram);
             let stop = q.run(&mut code, &mut m, &mut env, 100_000);
-            if on && simd_jit::available() && code.jit.runs() == 0 {
-                return Err(format!("case {case}: no block ran"));
+            if on && code.jit.runs() > 0 {
+                with_blocks += 1;
             }
             code.jit.clear();
-            out.push((q, env.n, stop));
+            let tmu = format!("{:?}", q.tmu);
+            let vpm = (env.vpm.clone(), format!("{:?} {:?}", q.vrd, q.vwr));
+            drop(m);
+            out.push((q, (env.n, env.tile, env.host), stop, tmu, vpm, ram));
         }
         crate::jit::set_enabled(was);
-        let ((a, na, sa), (b, nb, sb)) = (&out[0], &out[1]);
+        let ((a, na, sa, ta, va, ma), (b, nb, sb, tb, vb, mb)) = (&out[0], &out[1]);
         let text = || prog.iter().map(|i| format!("{:016x} {}", i.0, crate::disasm::disasm(i.0))).collect::<Vec<_>>().join("\n");
         if *sa != Stop::End || *sb != Stop::End {
             return Err(format!("case {case}: stopped {sa:?} / {sb:?}\n{}", text()));
@@ -236,6 +289,13 @@ pub fn check(seed: u64, cases: usize) -> Result<BTreeMap<String, usize>, String>
         if (a.unif, a.insns, a.pc, na, a.tmu[0].fifo.len(), a.tmu[1].fifo.len()) != (b.unif, b.insns, b.pc, nb, b.tmu[0].fifo.len(), b.tmu[1].fifo.len()) {
             return Err(format!("case {case}: uniforms, instructions, pc, fetches or TMU results differ\n{}", text()));
         }
+        if ta != tb || va != vb || ma != mb {
+            return Err(format!("case {case}: the TMU's state, the VPM or memory differ\n{}", text()));
+        }
+    }
+    // (a write outside the QPU followed by a fetch splits a run: some programs have no block)
+    if simd_jit::available() && with_blocks < cases * 3 / 4 {
+        return Err(format!("blocks ran in only {with_blocks} of {cases} programs"));
     }
     Ok(ops)
 }

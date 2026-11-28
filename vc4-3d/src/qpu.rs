@@ -631,7 +631,7 @@ impl Qpu {
         }
     }
 
-    fn vpm_read(&mut self, env: &mut dyn Env) -> V {
+    pub(crate) fn vpm_read(&mut self, env: &mut dyn Env) -> V {
         let mut out = ZERO;
         if self.vrd.left == 0 { crate::log_first("vc4: VPM read with no read setup left"); return out; }
         let g = self.vrd;
@@ -712,7 +712,7 @@ impl Qpu {
     }
 
     /// A write to `w` on the A side (`a`) or B side, lanes in `mask`.
-    fn write(&mut self, w: u8, a: bool, v: &V, mask: u16, mem: &mut Mem, env: &mut dyn Env) {
+    pub(crate) fn write(&mut self, w: u8, a: bool, v: &V, mask: u16, mem: &mut Mem, env: &mut dyn Env) {
         if mask == 0 && w != waddr::NOP { return; }
         let first = mask.trailing_zeros() as usize;
         match w {
@@ -1023,9 +1023,13 @@ impl Qpu {
         let jit = crate::jit::enabled() && crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) <= 0;
         loop {
             // a block of compiled instructions where one starts, outside delay slots
-            if jit && self.br.is_none() && self.end == 0 && code.jit.run(self, mem, env, budget - (self.insns - start)) > 0 {
-                if self.insns - start >= budget { return Stop::Budget; }
-                continue;
+            if jit && self.br.is_none() && self.end == 0 {
+                let (ran, ended) = code.jit.run(self, mem, env, budget - (self.insns - start));
+                if ended { return Stop::End; }
+                if ran > 0 {
+                    if self.insns - start >= budget { return Stop::Budget; }
+                    continue;
+                }
             }
             if let Some(s) = self.step(code, mem, env) { return s; }
             if self.insns - start >= budget { return Stop::Budget; }

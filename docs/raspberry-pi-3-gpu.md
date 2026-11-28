@@ -45,7 +45,7 @@ The VideoCore IV's twelve QPUs shade several tiles at once, and the binning job 
 written every tile's list, so the tiles of a rendering job are independent. The model renders them
 on several host threads, as the [Pi 4's V3D model](gpu.md#parallel-rendering) does
 (`vc4-3d/src/par.rs`; `SBC_VC4_THREADS`, default the host's cores minus two, at most 16; the
-browser build stays on one thread). The QPUs stay interpreted.
+browser build stays on one thread). The QPUs run through the [JIT](#qpu-jit).
 
 - **Tiles:** the rendering list the kernel builds is walked first: each tile's packets (its
   loads, tile coordinates, the branch into its list, its stores) up to the store that clears the
@@ -87,6 +87,41 @@ addresses and layouts) are cached per host thread by their configuration words (
 keeps no texture state in memory, so an entry never goes stale), the shaded-vertex cache hashes
 with a multiplicative hash instead of SipHash, and the T and LT addressing uses shifts.
 
+### QPU JIT
+
+Runs of QPU instructions become native code (AArch64 with NEON, on 64-bit ARM macOS and Linux)
+or WebAssembly with 128-bit SIMD in the browser, through `simd-jit/`, a JIT crate shared with the
+Pi 4's V3D 4.2 (adapted from the Jetson Nano's shader JIT, `maxwell-shader/src/jit`).
+`vc4-3d/src/jit.rs` lowers each instruction to the crate's IR exactly as `Qpu::alu` runs it:
+both pipes' operations with the QPU's denormal flushing and NaN rules, unpack and pack (16-bit
+float and integer halves, bytes, saturation, colour packs), small immediates and the multiply
+pipe's rotation by a constant, conditions, flags from either pipe (carries included), the SFU
+into r4, per-element load immediates. A block's registers are read once and written once at its
+end, flags likewise, and equal values are made once; a flush of a value that cannot be denormal
+is dropped (before that, flushes were half of a fragment shader's IR).
+
+A block takes ALU instructions and load immediates whose reads and writes stay in the QPU, plus
+what the hardware hands over in order, which is fetched just before the block runs, in the order
+the interpreter would fetch it: uniforms, varyings (their C coefficients into r5), pixel
+coordinates and multisample flags, TMU results and colour, coverage and alpha-mask loads into r4.
+It ends before a branch, a semaphore, the program end, a VPM or mutex read, a write to r5, the
+TMU, the TLB, the VPM, the uniforms address or the host interrupt; those, branch delay slots and
+the instructions after a program end run in the interpreter. Fragment shaders run mostly in
+blocks (glmark2's phong shader: 92% of its instructions, 35 a block; effect2d's texture-heavy
+one: 67%, 7 a block). Blocks are compiled once per run of instruction words (a global cache) and
+found by address in each worker's cache, which keeps them from job to job and compares their
+words with memory again once per job. `SBC_VC4_JIT=0` turns it off.
+
+**Checks:** `cargo test -p simd-jit` (random IR blocks, natively compiled, against the IR's
+evaluation; every half both ways), `cargo test -p vc4-3d jit` (random QPU programs of every
+operation, pack, unpack, signal, condition and fetch the JIT takes, with instructions it does not
+take between them, run with the JIT and with the interpreter from the same random state: every
+register, accumulator, flag, the uniform pointer, the TMU queues and the order of the
+environment's answers must match; code changed between jobs is not run again),
+`node tools/wasm-qpu-jit-check.mjs` (both, in the browser build), and the replays below:
+every frame and every job's statistics are the same with the JIT and without, on 1 and 16
+threads.
+
 ## Tests
 
 `cargo test -p vc4-3d` (59 tests) and `cargo test -p bcm2837` (`v3d_on_the_bus`):
@@ -124,6 +159,8 @@ with a multiplicative hash instead of SipHash, and the T and LT addressing uses 
 - `SBC_VC4_DUMP=dir`: each finished frame as a PPM.
 - `SBC_VC4_THREADS=N`: host threads for a job's tiles and vertices (default: cores − 2, at most 16).
 - `SBC_VC4_QPU_FAST=0`: every QPU instruction on the general interpreter path.
+- `SBC_VC4_JIT=0`: the QPUs interpreted (no JIT); `SBC_VC4_JIT_DUMP=1`: each block the JIT
+  compiles, its instructions and the size of its IR and code.
 - `SBC_VC4_CAPTURE=dir`: every job with the RAM pages it touches (as they were before it ran) in
   `dir/jobs.bin`; `vc4-replay dir/jobs.bin [first] [count]` (`cargo run --release -p vc4-3d
   --bin vc4-replay`) runs them again on the host in milliseconds, with the options above. This is

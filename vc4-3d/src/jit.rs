@@ -8,15 +8,19 @@
 //! QPU: the register files, r0..r4 (the SFU's results into r4), and what the hardware hands
 //! over in order, fetched just before the block runs, in the order the interpreter would
 //! fetch it: uniforms, varyings (and their C coefficients into r5), the pixel coordinates and
-//! multisample flags, TMU results and colour, coverage and alpha-mask loads into r4. It ends
-//! before a branch, a semaphore, the program end, a read of the VPM or the mutex, a write to
-//! r5 or to anything outside the QPU (TMU, TLB, VPM, uniforms address, host interrupt), and a
-//! rotation by r5. Those run in the interpreter, and so does every instruction in a branch's
-//! delay slots or after a program end.
+//! multisample flags, VPM reads, TMU results and colour, coverage and alpha-mask loads into r4.
+//! Writes outside the QPU (TMU, TLB, VPM and its setups, uniforms address, host interrupt, mutex)
+//! are outputs of the block that the interpreter's `write` does after it, in order; after such a
+//! write a block takes no fetch the write may change (a TMU write: uniforms and TMU results; a
+//! VPM write: VPM reads; a TLB write: tile buffer and coverage loads). A block
+//! ends before a branch, a semaphore, the program end, a read of the mutex, a write to r5 (its
+//! replication moves data between lanes) and a rotation by r5. Those run in the interpreter, and
+//! so does every instruction in a branch's delay slots or after a program end.
 //!
 //! Blocks are compiled once per distinct run of instruction words (a global cache) and looked
-//! up by address in each worker's [`Code`] (cleared with it, per job). `SBC_VC4_JIT=0` turns
-//! the JIT off.
+//! up by address in each worker's [`Code`]; at the start of a job each slot is checked against
+//! memory again (its words compared) the first time it is used. `SBC_VC4_JIT=0` turns the JIT
+//! off.
 
 use crate::mem::Mem;
 use crate::qpu::{add_float_in, add_float_out, decode, op, raddr, sig, small_imm, waddr, Env, Inst, Kind, Qpu, V, ZERO};
@@ -54,6 +58,8 @@ pub enum Fetch {
     ColorLoad,
     CoverageLoad,
     AlphaMaskLoad,
+    /// a generic VPM read (as its read setup says)
+    Vpm,
 }
 
 /// A compiled run of instructions.
@@ -63,6 +69,11 @@ pub struct Block {
     /// instructions
     pub len: u32,
     pub fetch: Vec<Fetch>,
+    /// the instruction words it was compiled from
+    pub words: Vec<u64>,
+    pub effects: Vec<Effect>,
+    /// it has the program end and its delay slots: the program ends with it
+    pub ends: bool,
 }
 
 /// Whether the JIT is on: where `simd-jit` has a backend, unless `SBC_VC4_JIT=0` (or turned off
@@ -110,7 +121,7 @@ pub fn blocks() -> u64 {
 }
 
 /// Blocks run so far (each worker adds its count when its cache is next cleared, at the start
-/// of a job).
+/// of a job, or dropped).
 pub fn runs() -> u64 {
     RUNS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -123,21 +134,77 @@ struct Lower {
     nargs: u16,
     ninputs: u16,
     qpu_num: Option<u16>,
+    /// writes outside the QPU, done after the block in this order (their values and masks are
+    /// outputs)
+    effects: Vec<Effect>,
+    /// what those writes may change (`C_*`): the block takes no more fetches of that
+    blocked: u8,
+}
+
+/// What a write outside the QPU may change and a fetch reads: the uniform stream (and memory),
+/// the TMU's results, the VPM, the tile buffer and the lanes' coverage.
+const C_UNIF: u8 = 1;
+const C_TMU: u8 = 2;
+const C_VPM: u8 = 4;
+const C_TILE: u8 = 8;
+
+impl Fetch {
+    fn class(self) -> u8 {
+        match self {
+            Fetch::Unif => C_UNIF,
+            Fetch::Tmu(_) => C_TMU,
+            Fetch::Vpm => C_VPM,
+            Fetch::MsFlags | Fetch::ColorLoad | Fetch::CoverageLoad | Fetch::AlphaMaskLoad => C_TILE,
+            // (the varyings' order, the pixel coordinates, the face, the QPU's number: no write
+            // changes them)
+            Fetch::QpuNum | Fetch::Vary | Fetch::PixelX | Fetch::PixelY | Fetch::RevFlag => 0,
+        }
+    }
+}
+
+/// What a write to `w` outside the QPU may change.
+fn changes(w: u8) -> u8 {
+    match w {
+        waddr::TMU0_S..=waddr::TMU1_B => C_UNIF | C_TMU,
+        waddr::UNIFORMS_ADDRESS => C_UNIF,
+        waddr::VPM | waddr::VPM_SETUP => C_VPM,
+        // DMA: memory (the uniforms are there) and the VPM
+        waddr::VPM_ADDR => C_UNIF | C_VPM,
+        waddr::TLB_STENCIL..=waddr::TLB_ALPHA_MASK | waddr::MS_FLAGS => C_TILE,
+        _ => 0,
+    }
+}
+
+/// A write outside the QPU that a block leaves to the interpreter's `write`, after it: the
+/// destination, its side, and the outputs with the value and the lanes (all ones where written).
+#[derive(Clone, Copy, Debug)]
+pub struct Effect {
+    pub w: u8,
+    pub file_a: bool,
+    pub out: u16,
 }
 
 impl Lower {
     fn new() -> Self {
-        Lower { b: Builder::new(), fetch: Vec::new(), nargs: 0, ninputs: 0, qpu_num: None }
+        Lower { b: Builder::new(), fetch: Vec::new(), nargs: 0, ninputs: 0, qpu_num: None, effects: Vec::new(), blocked: 0 }
     }
-    fn arg(&mut self, f: Fetch) -> Id {
+    /// A fetch: none after a write outside the QPU that may change what it fetches (it is
+    /// fetched before the block runs, the write done after).
+    fn arg(&mut self, f: Fetch) -> Option<Id> {
+        if self.blocked & f.class() != 0 {
+            return None;
+        }
         self.fetch.push(f);
         self.nargs += 1;
-        self.b.arg(self.nargs - 1)
+        Some(self.b.arg(self.nargs - 1))
     }
-    fn input(&mut self, f: Fetch) -> Id {
+    fn input(&mut self, f: Fetch) -> Option<Id> {
+        if self.blocked & f.class() != 0 {
+            return None;
+        }
         self.fetch.push(f);
         self.ninputs += 1;
-        self.b.input(self.ninputs - 1)
+        Some(self.b.input(self.ninputs - 1))
     }
     fn ftz(&mut self, x: Id) -> Id {
         self.b.un(Un::Ftz, x)
@@ -187,9 +254,9 @@ impl Lower {
     fn read(&mut self, r: u8, b: bool) -> Option<(Id, Option<Id>)> {
         Some(match r {
             0..=31 => (self.b.reg(if b { RB } else { RA } + r as u16), None),
-            raddr::UNIF => (self.arg(Fetch::Unif), None),
+            raddr::UNIF => (self.arg(Fetch::Unif)?, None),
             raddr::VARY => {
-                let v = self.input(Fetch::Vary);
+                let v = self.input(Fetch::Vary)?;
                 self.ninputs += 1;
                 let c = self.b.input(self.ninputs - 1);
                 (v, Some(c))
@@ -207,10 +274,11 @@ impl Lower {
                 (self.b.arg(k), None)
             }
             raddr::ELEM_QPU => (self.b.lane(), None),
-            raddr::XY_PIXEL => (self.input(if b { Fetch::PixelY } else { Fetch::PixelX }), None),
-            raddr::MS_REV => (self.input(if b { Fetch::RevFlag } else { Fetch::MsFlags }), None),
+            raddr::XY_PIXEL => (self.input(if b { Fetch::PixelY } else { Fetch::PixelX })?, None),
+            raddr::MS_REV => (self.input(if b { Fetch::RevFlag } else { Fetch::MsFlags })?, None),
+            raddr::VPM => (self.input(Fetch::Vpm)?, None),
             // (the interpreter's `read` gives zero for the rest)
-            raddr::VPM | raddr::MUTEX => return None,
+            raddr::MUTEX => return None,
             _ => (self.b.imm(0), None),
         })
     }
@@ -407,7 +475,18 @@ impl Lower {
                 let y = self.ftz(y);
                 self.b.store(ACC + 4, y, mask);
             }
-            _ => return None,
+            // r5's replication moves data between lanes: not in blocks
+            waddr::R5 => return None,
+            // the rest (TMU, TLB, VPM, uniforms address, host interrupt, mutex, multisample
+            // flags) after the block, in order
+            _ => {
+                let out = self.effects.len() as u16 * 2;
+                self.b.out(out, v);
+                let m = self.b.expand(mask);
+                self.b.out(out + 1, m);
+                self.effects.push(Effect { w, file_a, out });
+                self.blocked |= changes(w);
+            }
         }
         Some(())
     }
@@ -563,13 +642,22 @@ impl Lower {
     }
 
     /// One instruction, or None (and nothing of it) if blocks cannot have it.
+    fn mark(&self) -> LMark {
+        (self.b.mark(), self.fetch.len(), self.nargs, self.ninputs, self.qpu_num, self.effects.len(), self.blocked)
+    }
+    fn reset(&mut self, m: LMark) {
+        let (mark, nf, na, ni, q, ne, bl) = m;
+        self.b.reset(mark);
+        self.fetch.truncate(nf);
+        self.effects.truncate(ne);
+        (self.nargs, self.ninputs, self.qpu_num, self.blocked) = (na, ni, q, bl);
+    }
+
     fn inst(&mut self, i: &Inst) -> Option<()> {
-        let (mark, nf, na, ni, q) = (self.b.mark(), self.fetch.len(), self.nargs, self.ninputs, self.qpu_num);
+        let m = self.mark();
         let r = self.inst_inner(i);
         if r.is_none() {
-            self.b.reset(mark);
-            self.fetch.truncate(nf);
-            (self.nargs, self.ninputs, self.qpu_num) = (na, ni, q);
+            self.reset(m);
         }
         r
     }
@@ -594,12 +682,14 @@ impl Lower {
                 | sig::COLOR_LOAD
                 | sig::COVERAGE_LOAD
                 | sig::ALPHA_MASK_LOAD
+                | sig::PROG_END
+                | sig::COLOR_LOAD_END
         ) {
             return None;
         }
         self.alu(i)?;
         let r4 = match i.sig {
-            sig::COLOR_LOAD => Some(Fetch::ColorLoad),
+            sig::COLOR_LOAD | sig::COLOR_LOAD_END => Some(Fetch::ColorLoad),
             sig::LOAD_TMU0 => Some(Fetch::Tmu(0)),
             sig::LOAD_TMU1 => Some(Fetch::Tmu(1)),
             sig::COVERAGE_LOAD => Some(Fetch::CoverageLoad),
@@ -607,7 +697,7 @@ impl Lower {
             _ => None,
         };
         if let Some(f) = r4 {
-            let v = self.input(f);
+            let v = self.input(f)?;
             self.b.store_all(ACC + 4, v);
         }
         Some(())
@@ -617,12 +707,43 @@ impl Lower {
 /// The IR of the longest run of instructions from the start of `words` that blocks can have
 /// (at most `MAX_INSNS`), and how many those are.
 pub fn lower(words: &[u64]) -> (usize, simd_jit::Block, Vec<Fetch>) {
+    let (l, n, _) = run_of(|k| words.get(k as usize).copied());
+    (n, l.b.finish(), l.fetch)
+}
+
+type LMark = (simd_jit::Mark, usize, u16, u16, Option<u16>, usize, u8);
+
+/// The lowering of the longest run of instructions blocks can have (`word(k)`: the k-th from
+/// the start), at most `MAX_INSNS`: how many, and whether the program ends with them. A program
+/// end is in a block only with its two delay slots, which then end the block; else the block
+/// ends before it.
+fn run_of(mut word: impl FnMut(u32) -> Option<u64>) -> (Lower, usize, bool) {
     let mut l = Lower::new();
     let mut n = 0;
-    while n < words.len().min(MAX_INSNS) && l.b.len() < simd_jit::ir::MAX_NODES - 600 && l.inst(&decode(words[n])).is_some() {
+    // the program end in the run, and where the lowering was before it
+    let mut end: Option<(usize, LMark)> = None;
+    while n < MAX_INSNS && l.b.len() < simd_jit::ir::MAX_NODES - 600 {
+        let Some(w) = word(n as u32) else { break };
+        let i = decode(w);
+        let ends = matches!(i.kind, Kind::Alu) && (i.sig == sig::PROG_END || i.sig == sig::COLOR_LOAD_END);
+        let m = l.mark();
+        if (ends && end.is_some()) || l.inst(&i).is_none() {
+            break;
+        }
+        if ends {
+            end = Some((n, m));
+        }
         n += 1;
+        if end.is_some_and(|(k, _)| n == k + 3) {
+            return (l, n, true);
+        }
     }
-    (n, l.b.finish(), l.fetch)
+    if let Some((k, m)) = end {
+        // (the delay slots could not follow it into the block)
+        l.reset(m);
+        n = k;
+    }
+    (l, n, false)
 }
 
 /// Compiled blocks by their instruction words (shared by all workers and jobs).
@@ -636,16 +757,13 @@ const CACHE_MAX: usize = 1 << 14;
 fn block_at(pc: u32, mem: &mut Mem) -> Option<Arc<Block>> {
     let mut words = Vec::with_capacity(32);
     // the run's length first (lowering is cheap next to compiling)
-    let mut l = Lower::new();
-    let mut a = pc;
-    while words.len() < MAX_INSNS && l.b.len() < simd_jit::ir::MAX_NODES - 600 {
+    let (l, n, ends) = run_of(|k| {
+        let a = pc.wrapping_add(8 * k);
         let w = mem.r32(a) as u64 | (mem.r32(a.wrapping_add(4)) as u64) << 32;
-        if l.inst(&decode(w)).is_none() {
-            break;
-        }
         words.push(w);
-        a = a.wrapping_add(8);
-    }
+        Some(w)
+    });
+    words.truncate(n);
     if words.len() < MIN_INSNS {
         return None;
     }
@@ -670,10 +788,12 @@ fn block_at(pc: u32, mem: &mut Mem) -> Option<Arc<Block>> {
             };
             *kinds.entry(k).or_default() += 1;
         }
-        eprintln!("vc4 jit: block at {pc:#x}, {} instructions, {} nodes, {} bytes of code\n{}\n  {kinds:?}", words.len(), code.block.ir.len(), code.code_bytes(),
-                  words.iter().map(|&w| format!("  {}", crate::disasm::disasm(w))).collect::<Vec<_>>().join("\n"));
+        let a = pc.wrapping_add(8 * words.len() as u32);
+        let next = mem.r32(a) as u64 | (mem.r32(a.wrapping_add(4)) as u64) << 32;
+        eprintln!("vc4 jit: block at {pc:#x}, {} instructions, {} nodes, {} bytes of code\n{}\n  {kinds:?}\n  then: {}", words.len(), code.block.ir.len(), code.code_bytes(),
+                  words.iter().map(|&w| format!("  {}", crate::disasm::disasm(w))).collect::<Vec<_>>().join("\n"), if ends { "the program's end".into() } else { crate::disasm::disasm(next) });
     }
-    let b = code.compiled().then(|| Arc::new(Block { code, len: words.len() as u32, fetch: l.fetch }));
+    let b = code.compiled().then(|| Arc::new(Block { code, len: words.len() as u32, fetch: l.fetch, words: words.clone(), effects: l.effects, ends }));
     BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     map.insert(words, b.clone());
     b
@@ -681,14 +801,26 @@ fn block_at(pc: u32, mem: &mut Mem) -> Option<Arc<Block>> {
 
 // ---------------------------------------------------------------------------- running
 
+/// Whether memory at `pc` still holds the block's instructions.
+fn same_words(b: &Block, pc: u32, mem: &mut Mem) -> bool {
+    b.words.iter().enumerate().all(|(k, &w)| {
+        let a = pc.wrapping_add(8 * k as u32);
+        (mem.r32(a) as u64 | (mem.r32(a.wrapping_add(4)) as u64) << 32) == w
+    })
+}
+
 /// A worker's blocks by address (direct-mapped, as its decoded instructions), and the buffers
 /// a block's fetches go into.
 #[derive(Default)]
 pub struct Cache {
     tags: Vec<u32>,
     slots: Vec<Option<Arc<Block>>>,
+    /// slots to check against memory before they are used (memory may have changed between
+    /// jobs: a block is kept if its instruction words are still there)
+    stale: Vec<bool>,
     args: Vec<u32>,
     inputs: Vec<V>,
+    outputs: Vec<V>,
     /// blocks run and their instructions (added to the global counts when the cache is cleared)
     runs: u64,
     insns: u64,
@@ -696,35 +828,48 @@ pub struct Cache {
 
 const SLOTS: usize = 4096;
 
+impl Drop for Cache {
+    fn drop(&mut self) {
+        self.count();
+    }
+}
+
 impl Cache {
     /// Blocks this cache ran since it was last cleared.
     pub fn runs(&self) -> u64 {
         self.runs
     }
 
+    /// A new job: every slot is checked against memory again before it is used.
     pub fn clear(&mut self) {
-        self.tags.iter_mut().for_each(|t| *t = u32::MAX);
-        self.slots.iter_mut().for_each(|s| *s = None);
+        self.stale.iter_mut().for_each(|s| *s = true);
+        self.count();
+    }
+
+    /// This cache's counts into the global ones.
+    fn count(&mut self) {
         RUNS.fetch_add(std::mem::take(&mut self.runs), std::sync::atomic::Ordering::Relaxed);
         INSNS.fetch_add(std::mem::take(&mut self.insns), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Runs the block at the QPU's instruction if there is one of at most `left` instructions:
-    /// how many it ran (0: none, the interpreter goes on).
+    /// how many it ran (0: none, the interpreter goes on), and whether the program ended.
     #[inline]
-    pub fn run(&mut self, q: &mut Qpu, mem: &mut Mem, env: &mut dyn Env, left: u64) -> u32 {
+    pub fn run(&mut self, q: &mut Qpu, mem: &mut Mem, env: &mut dyn Env, left: u64) -> (u32, bool) {
         if self.tags.is_empty() {
             self.tags = vec![u32::MAX; SLOTS];
             self.slots = vec![None; SLOTS];
+            self.stale = vec![false; SLOTS];
         }
         let k = (q.pc >> 3) as usize & (SLOTS - 1);
-        if self.tags[k] != q.pc {
+        if self.tags[k] != q.pc || (self.stale[k] && !self.slots[k].as_ref().is_some_and(|b| same_words(b, q.pc, mem))) {
             self.tags[k] = q.pc;
             self.slots[k] = block_at(q.pc, mem);
         }
-        let Some(b) = &self.slots[k] else { return 0 };
+        self.stale[k] = false;
+        let Some(b) = &self.slots[k] else { return (0, false) };
         if b.len as u64 > left {
-            return 0;
+            return (0, false);
         }
         self.args.clear();
         self.inputs.clear();
@@ -751,15 +896,25 @@ impl Cache {
                 Fetch::ColorLoad => self.inputs.push(env.color_load()),
                 Fetch::CoverageLoad => self.inputs.push(env.coverage_load()),
                 Fetch::AlphaMaskLoad => self.inputs.push(env.alpha_mask_load()),
+                Fetch::Vpm => {
+                    let v = q.vpm_read(env);
+                    self.inputs.push(v);
+                }
             }
         }
         let mut flags = [q.z as u32, q.n as u32, q.c as u32];
-        b.code.run(q.regs_mut(), &mut flags, &self.args, &self.inputs, &mut []);
+        self.outputs.resize(2 * b.effects.len(), ZERO);
+        b.code.run(q.regs_mut(), &mut flags, &self.args, &self.inputs, &mut self.outputs);
         (q.z, q.n, q.c) = (flags[0] as u16, flags[1] as u16, flags[2] as u16);
+        for e in &b.effects {
+            let m = &self.outputs[e.out as usize + 1];
+            let mask = (0..16).fold(0u16, |a, i| a | ((m[i] != 0) as u16) << i);
+            q.write(e.w, e.file_a, &self.outputs[e.out as usize], mask, mem, env);
+        }
         q.pc = q.pc.wrapping_add(8 * b.len);
         q.insns += b.len as u64;
         self.runs += 1;
         self.insns += b.len as u64;
-        b.len
+        (b.len, b.ends)
     }
 }
