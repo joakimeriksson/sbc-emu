@@ -172,10 +172,10 @@ pub fn etc1_pixel(b: &[u8; 8], x: u32, y: u32) -> [u8; 4] {
     let (r, g, bb) = if diff {
         let base = |sh: u32| (hi >> sh >> 3) & 31;
         let delta = |sh: u32| { let d = (hi >> sh) & 7; (d << 29) as i32 >> 29 };
+        // base + delta in 8 bits, then expanded: out-of-range sums wrap (as Mesa's decoder does)
         let c5 = |sh: u32| -> u32 {
-            let v = base(sh) as i32 + if sub == 1 { delta(sh) } else { 0 };
-            let v = v.clamp(0, 31) as u32;
-            (v << 3) | (v >> 2)
+            let v = if sub == 1 { (base(sh) as i32 + delta(sh)) as u8 } else { base(sh) as u8 };
+            (v.wrapping_shl(3) | (v >> 2)) as u32
         };
         (c5(24), c5(16), c5(8))
     } else {

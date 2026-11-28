@@ -802,7 +802,7 @@ impl Qpu {
                 let (ma, mm) = (self.cond_mask(i.cond_add), self.cond_mask(i.cond_mul));
                 self.write_result(i.waddr_add, !i.ws, &v, ma, &i, false, true, None, mem, env);
                 self.write_result(i.waddr_mul, i.ws, &v, mm, &i, false, false, None, mem, env);
-                if i.sf { self.set_flags(&v, false, None); }
+                if i.sf { self.set_flags(&v, false, None, ma); }
             }
             _ => self.alu(&i, mem, env),
         }
@@ -842,7 +842,9 @@ impl Qpu {
         None
     }
 
-    fn set_flags(&mut self, r: &V, float: bool, carry: Option<&V>) {
+    /// Set the flags from `r` in the lanes of `mask` (the condition of the operation they come
+    /// from: a conditional instruction sets flags only where it executes).
+    fn set_flags(&mut self, r: &V, float: bool, carry: Option<&V>, mask: u16) {
         let (mut z, mut n, mut c) = (0u16, 0u16, 0u16);
         for i in 0..16 {
             let b = 1 << i;
@@ -857,9 +859,9 @@ impl Qpu {
                 if let Some(cv) = carry { if cv[i] != 0 { c |= b; } }
             }
         }
-        self.z = z;
-        self.n = n;
-        self.c = c;
+        self.z = (self.z & !mask) | (z & mask);
+        self.n = (self.n & !mask) | (n & mask);
+        self.c = (self.c & !mask) | (c & mask);
     }
 
     /// Write an ALU (or load-immediate) result: packing, then the destination.
@@ -941,8 +943,8 @@ impl Qpu {
         }
         if let Some(c) = r5_vary { self.acc[5] = c; }
         if i.sf {
-            if let Some((r, carry, _)) = &add_res { self.set_flags(r, add_float_out(i.op_add), carry.as_ref()); }
-            else if let Some(r) = &mul_res { self.set_flags(r, i.op_mul == op::FMUL, None); }
+            if let Some((r, carry, _)) = &add_res { self.set_flags(r, add_float_out(i.op_add), carry.as_ref(), self.cond_mask(i.cond_add)); }
+            else if let Some(r) = &mul_res { self.set_flags(r, i.op_mul == op::FMUL, None, self.cond_mask(i.cond_mul)); }
         }
     }
 
