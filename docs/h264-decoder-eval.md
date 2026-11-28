@@ -20,13 +20,13 @@ off by default ([Raspberry Pi 3](raspberry-pi-3.md#video-decode)).
 | Dependencies | rusty_h264-common, -accel, rusty_alloc, safe_arch, wide (a build script that sets cfgs) | none | rayon, yscv-tensor (a build script that links Accelerate on macOS), yscv-cpu, bytes, … |
 | Output | I420 frames, display order (`decode_stream`) or decode order | 8/10-bit 4:2:0, 4:2:2 planes, display order (`OrderedDecoder`) with per-picture metadata | RGB; YUV only through a conformance switch (`dump_yuv`) |
 | `wasm32-unknown-unknown` build | yes | yes | yes |
-| Runs as WebAssembly (Node 22) | yes, same output as native | yes, same output as native | **no pictures** (it spawns threads) |
+| Runs as WebAssembly (Node 26) | yes, same output as native | yes, same output as native | **no pictures** (it spawns threads) |
 | Conformance, 8-bit 4:2:0 progressive (103 streams) | 84 | **103** | 38 |
 | Conformance, interlaced: field, PAFF, MBAFF (73 streams) | 0 (refused) | **73** | 0 |
 | High profile, CABAC and 8×8 transforms (24 FRExt streams) | 16 | **24** | 0 |
 | Our libx264 streams (8, see below) | 7 (not the interlaced one) | **8** | 4 |
 | 1080p, one core (x264 High, CABAC, B-frames, 8 Mbit/s) | 117 fps | 85 fps | 96 fps on 1.3 cores |
-| 1080p as WebAssembly (Node 22, same stream) | 57 fps | 45 fps | — |
+| 1080p as WebAssembly (Node 26, same stream) | 57 fps | 45 fps | — |
 
 FFmpeg 8.1's own decoder (`-threads 1`) does 126 fps on the same stream and machine (Apple
 silicon, shared with other work). At 85 fps natively and 45 fps in the browser, rust_h264 keeps
@@ -59,7 +59,7 @@ no pictures as WebAssembly.
   (`yuv420p10le`, `yuv422p`), where rust_h264 matches FFmpeg exactly.
 - **Speed**: decode time of the whole stream, one thread (`/usr/bin/time` user time), best of three.
 - **WebAssembly**: each crate built for `wasm32-unknown-unknown` as a `cdylib` with one export that
-  decodes a buffer, run under Node 22, the output's checksum compared with the native build's.
+  decodes a buffer, run under Node 26, the output's checksum compared with the native build's.
 - **Pi OS's own encoders**: not available in the guest (no camera, and the firmware's encoder is
   not modelled); FFmpeg and GStreamer are not on Pi OS Lite. Files from libx264 stand in for them.
 
