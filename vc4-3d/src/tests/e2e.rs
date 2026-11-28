@@ -778,3 +778,59 @@ fn gpu_thread_jobs() {
     assert_eq!(s.pixel(50, 50), BLUE);
     assert_eq!(s.pixel(5, 50), s.clear);
 }
+
+/// Mip level selection from the quads' derivatives: a 64x64 texture drawn into 32x32 pixels
+/// samples level 1 everywhere, also along the triangles' shared diagonal (quads there are only
+/// partly covered).
+#[test]
+fn texture_mip_selection() {
+    let (w, h) = (64, 64);
+    let mut s = Scene::new(w, h);
+    let l1 = tiling::Layout::new(tiling::T, 4, 32);
+    let l0 = tiling::Layout::new(tiling::T, 4, 64);
+    let size1 = tiling::size(32, 32, 4, tiling::T);
+    let base = TEX + size1; // level 1 sits below level 0
+    for y in 0..32 { for x in 0..32 { put32(&mut s.ram, TEX + l1.offset(x, y), &[GREEN]); } }
+    for y in 0..64 { for x in 0..64 { put32(&mut s.ram, base + l0.offset(x, y), &[RED]); } }
+    s.begin(ALL_FACES);
+    let v = |x, y, u: f32, t: f32| Vx { p: px(w, h, x, y, 0.5), a: [u, t, 0.0, 0.0] };
+    let quad = [v(8.0, 8.0, 0.0, 0.0), v(40.0, 8.0, 1.0, 0.0), v(40.0, 40.0, 1.0, 1.0), v(8.0, 8.0, 0.0, 0.0), v(40.0, 40.0, 1.0, 1.0), v(8.0, 40.0, 0.0, 1.0)];
+    let p0 = base | BUS | 1; // one mip level below level 0
+    let p1 = 64 << 20 | 64 << 8 | 1 << 7 | 2 << 4; // nearest, near-mip-near, repeat
+    s.draw(&quad, 2, &texture_fs(), &[p0, p1], cl::PRIM_TRIANGLES, None);
+    s.run();
+    for y in 8..40 { for x in 8..40 { assert_eq!(s.pixel(x, y), GREEN, "{x},{y}"); } }
+}
+
+/// dFdx as Mesa computes it (`ntq_fddx`: rotate by 1 and 15, pick by the element's x parity)
+/// of a varying that grows by 1/64 per pixel: 1.0 after scaling by 64, on every covered pixel,
+/// also where a quad is only partly inside the triangle (its helper pixels must be
+/// interpolated, not left over from another quad).
+#[test]
+fn derivatives_on_partly_covered_quads() {
+    let (w, h) = (64, 64);
+    let mut s = Scene::new(w, h);
+    s.begin(ALL_FACES);
+    let v = |x: f32, y: f32| Vx { p: px(w, h, x, y, 0.5), a: [x / 64.0, 0.0, 0.0, 0.0] };
+    let fs = fs_end(vec![
+        nop().mul(op::FMUL, waddr::R0, A, B).ra(15).rb(raddr::VARY),
+        nop().add(op::FADD, waddr::R2, R0, R5),
+        nop().add(op::AND, waddr::NOP, A, B).ra(raddr::ELEM_QPU).small(1).sf(),
+        nop().mul(op::V8MIN, waddr::R3, R2, R2).small(49),           // from the left (i - 1)
+        nop().mul(op::V8MIN, waddr::R0, R2, R2).small(63),           // from the right (i + 1)
+        nop().add(op::FSUB, waddr::R1, R2, R3).cond_add(COND_ZC),    // odd x: src - left
+        nop().add(op::FSUB, waddr::R1, R0, R2).cond_add(COND_ZS),    // even x: right - src
+        nop().mul(op::FMUL, waddr::R1, R1, B).small(38),             // * 64.0
+        nop().mul(op::V8MIN, waddr::TLB_COLOR_ALL, R1, R1).pm().pack(3),
+    ]);
+    s.draw(&[v(0.0, 0.0), v(64.0, 64.0), v(0.0, 64.0)], 4, &fs, &[], cl::PRIM_TRIANGLES, None);
+    s.run();
+    let mut n = 0;
+    for y in 0..64 { for x in 0..64 {
+        let p = s.pixel(x, y);
+        if p == s.clear { continue; }
+        n += 1;
+        assert!(p & 0xff >= 0xfd, "dFdx at {x},{y}: {p:#x}");
+    } }
+    assert!(n > 2000, "{n} pixels drawn");
+}

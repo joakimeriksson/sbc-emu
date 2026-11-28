@@ -408,34 +408,40 @@ impl<'a, 'm> Render<'a, 'm> {
         while qy <= maxy {
             let mut qx = x0;
             while qx <= maxx {
-                let mut any = false;
+                // coverage of the quad's pixels; then interpolants for all four (helper pixels too:
+                // texture LODs and derivatives use the whole quad)
+                let mut covers = [0u8; 4];
+                let mut es = [[0i64; 3]; 4];
                 for k in 0..4 {
                     let (px, py) = (qx + (k & 1) as i32, qy + (k >> 1) as i32);
-                    let lane = &mut lanes[nl + k];
-                    lane.x = (px - ox as i32).max(0) as u32;
-                    lane.y = (py - oy as i32).max(0) as u32;
-                    lane.cover = 0;
-                    if px < minx || px > maxx || py < miny || py > maxy { continue; }
                     let (cx, cy) = ((px * 16 + 8) as i64, (py * 16 + 8) as i64);
                     let e = [ea[0] * cx + eb[0] * cy + ec[0], ea[1] * cx + eb[1] * cy + ec[1], ea[2] * cx + eb[2] * cy + ec[2]];
-                    let mut cover = 0u8;
+                    es[k] = e;
+                    if px < minx || px > maxx || py < miny || py > maxy { continue; }
                     for (s_, o) in soff.iter().enumerate() {
-                        if e[0] + o[0] >= 0 && e[1] + o[1] >= 0 && e[2] + o[2] >= 0 { cover |= 1 << s_; }
+                        if e[0] + o[0] >= 0 && e[1] + o[1] >= 0 && e[2] + o[2] >= 0 { covers[k] |= 1 << s_; }
                     }
-                    if cover == 0 { continue; }
-                    let l = [e[0] as f64 * inv_area, e[1] as f64 * inv_area, e[2] as f64 * inv_area];
-                    let iw = l[0] * viw[0] + l[1] * viw[1] + l[2] * viw[2];
-                    let z = l[0] * vz[0] + l[1] * vz[1] + l[2] * vz[2] + zoff;
-                    lane.cover = cover;
-                    // barycentrics by original vertex
-                    for k2 in 0..3 {
-                        lane.l[map[k2]] = l[k2] as f32;
-                        lane.q[map[k2]] = (l[k2] * viw[k2]) as f32;
+                }
+                let any = covers != [0; 4];
+                if any {
+                    for k in 0..4 {
+                        let (px, py) = (qx + (k & 1) as i32, qy + (k >> 1) as i32);
+                        let lane = &mut lanes[nl + k];
+                        lane.x = (px - ox as i32).clamp(0, ts as i32 - 1) as u32;
+                        lane.y = (py - oy as i32).clamp(0, ts as i32 - 1) as u32;
+                        lane.cover = covers[k];
+                        let e = es[k];
+                        let l = [e[0] as f64 * inv_area, e[1] as f64 * inv_area, e[2] as f64 * inv_area];
+                        let iw = l[0] * viw[0] + l[1] * viw[1] + l[2] * viw[2];
+                        let z = l[0] * vz[0] + l[1] * vz[1] + l[2] * vz[2] + zoff;
+                        for k2 in 0..3 {
+                            lane.l[map[k2]] = l[k2] as f32;
+                            lane.q[map[k2]] = (l[k2] * viw[k2]) as f32;
+                        }
+                        lane.w = (1.0 / iw) as f32;
+                        lane.z24 = (z.clamp(0.0, 1.0) * 16_777_215.0).round() as u32;
+                        if covers[k] != 0 { active |= 1 << (nl + k); }
                     }
-                    lane.w = (1.0 / iw) as f32;
-                    lane.z24 = (z.clamp(0.0, 1.0) * 16_777_215.0).round() as u32;
-                    active |= 1 << (nl + k);
-                    any = true;
                 }
                 if any { nl += 4; }
                 if nl == 16 {
