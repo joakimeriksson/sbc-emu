@@ -18,7 +18,7 @@
 //! Interrupts reach the host on the out-of-band line (the `host-wake` GPIO, configured
 //! through the Broadcom CCCR register SEPINT) or in band (SDIO DAT1).
 
-mod dongle;
+pub(crate) mod dongle;
 
 use crate::sdio::SdioFunctions;
 use dongle::Dongle;

@@ -8,6 +8,12 @@
 //! four-way handshake runs here (the host's supplicant runs the other half, as with the
 //! real firmware when brcmfmac does not use its firmware supplicant). The protocol
 //! follows the Raspberry Pi 4 model of the same chip (`bcm2711/src/wifi.rs`).
+//!
+//! The same dongle serves the PCIe chips (`bcm4350`): there the bus protocol is msgbuf, and
+//! the ioctls, events and data frames reach it through [`Dongle::ioctl_request`],
+//! [`Dongle::host_data`] and [`Dongle::take_messages`] instead of SDPCM frames. It can also
+//! be a soft access point (`WLC_SET_AP`, as NetworkManager's hotspot asks): the BSS comes up
+//! with no stations, since nothing else is on the air.
 
 use sbc_net::crypto;
 use std::collections::{HashMap, VecDeque};
@@ -67,6 +73,8 @@ const C_GET_REVINFO: u32 = 98;
 const C_GET_RSSI: u32 = 127;
 const C_GET_BSS_INFO: u32 = 136;
 const C_GET_BANDLIST: u32 = 140;
+const C_GET_AP: u32 = 117;
+const C_SET_AP: u32 = 118;
 const C_GET_PHYLIST: u32 = 180;
 const C_GET_VALID_CHANNELS: u32 = 217;
 const C_GET_VAR: u32 = 262;
@@ -102,8 +110,38 @@ enum Wpa {
     Installed,
 }
 
-pub(super) struct Dongle {
+/// What the dongle reports as itself in `WLC_GET_REVINFO` and `ver`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Identity {
+    /// PCI device ID (the SDIO parts report the PCI ID of their family)
+    pub device: u32,
+    pub chip: u32,
+    pub chiprev: u32,
+    /// 1 SDIO, 2 PCIe
+    pub bus: u32,
+    pub ver: &'static str,
+}
+
+impl Identity {
+    pub const BCM43455: Identity = Identity {
+        device: 0x43ab,
+        chip: 0x4345,
+        chiprev: 6,
+        bus: 1,
+        ver: "wl0: Nov 18 2026 00:00:00 version 7.45.241 (sbc-emu dongle) FWID 01-00000000\n",
+    };
+}
+
+/// A message for the host (msgbuf): a firmware event or a data frame, both Ethernet frames.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToHost {
+    Event(Vec<u8>),
+    Data(Vec<u8>),
+}
+
+pub(crate) struct Dongle {
     mac: [u8; 6],
+    id: Identity,
     log: bool,
     /// Sequence number of our next frame to the host.
     seq: u8,
@@ -122,6 +160,9 @@ pub(super) struct Dongle {
     pmk: [u8; 32],
     anonce: [u8; 32],
     replay: u64,
+    /// soft access point mode (`WLC_SET_AP`) and the SSID of its BSS once started
+    ap: bool,
+    ap_ssid: Option<Vec<u8>>,
 }
 
 impl Dongle {
@@ -141,6 +182,70 @@ impl Dongle {
             pmk: [0; 32],
             anonce: [0; 32],
             replay: 0,
+            ap: false,
+            ap_ssid: None,
+            id: Identity::BCM43455,
+        }
+    }
+
+    pub fn with_identity(mut self, id: Identity) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// The SSID of the soft access point's BSS, when one is up.
+    pub fn ap_ssid(&self) -> Option<&[u8]> {
+        self.ap_ssid.as_deref()
+    }
+
+    /// A msgbuf ioctl (`MSGBUF_TYPE_IOCTLPTR_REQ`): msgbuf has no set flag, so the command
+    /// number says which way it goes. Returns the BCME status and the answer (`outlen`
+    /// bytes at most); the events it raises are queued after it.
+    pub fn ioctl_request(&mut self, cmd: u32, data: &[u8], outlen: usize) -> (i32, Vec<u8>) {
+        let set = is_set(cmd);
+        let mut buf = data.to_vec();
+        buf.resize(outlen.max(data.len()), 0);
+        let mut events = Vec::new();
+        let status = self.ioctl(cmd, set, &mut buf, &mut events);
+        if self.log {
+            let name = if cmd == C_GET_VAR || cmd == C_SET_VAR { iovar_name(data) } else { String::new() };
+            eprintln!("[brcm] ioctl {cmd} {} {name} len {outlen} -> {status}", if set { "set" } else { "get" });
+        }
+        buf.truncate(if set { 0 } else { outlen });
+        self.run(events);
+        (status, buf)
+    }
+
+    /// An Ethernet frame the host transmits (msgbuf `TX_POST`).
+    pub fn host_data(&mut self, eth: &[u8]) {
+        self.data(eth);
+    }
+
+    /// The events and data frames queued for the host, without their BDC headers.
+    pub fn take_messages(&mut self) -> Vec<ToHost> {
+        let mut v = Vec::new();
+        while let Some((channel, mut payload)) = self.out.pop_front() {
+            if payload.len() <= BDC_HEADER.len() {
+                continue; // an empty credit frame (SDPCM only)
+            }
+            payload.drain(..BDC_HEADER.len());
+            match channel {
+                EVENT => v.push(ToHost::Event(payload)),
+                DATA => v.push(ToHost::Data(payload)),
+                _ => {}
+            }
+        }
+        v
+    }
+
+    fn run(&mut self, events: Vec<Action>) {
+        for action in events {
+            match action {
+                Action::Scan(sync) => self.scan_results(sync),
+                Action::Join(ssid) => self.join(&ssid),
+                Action::Leave => self.leave(),
+                Action::StartAp(ssid) => self.start_ap(ssid),
+            }
         }
     }
 
@@ -218,13 +323,7 @@ impl Dongle {
         msg.extend_from_slice(&(status as u32).to_le_bytes());
         msg.extend_from_slice(&buf);
         self.out.push_back((CONTROL, msg));
-        for action in events {
-            match action {
-                Action::Scan(sync) => self.scan_results(sync),
-                Action::Join(ssid) => self.join(&ssid),
-                Action::Leave => self.leave(),
-            }
-        }
+        self.run(events);
     }
 
     /// An ioctl: `buf` holds the input and receives the output. Returns a BCME status.
@@ -257,12 +356,32 @@ impl Dongle {
             }
             C_DOWN => {
                 self.up = false;
+                self.ap_ssid = None;
                 then.push(Action::Leave);
                 0
             }
-            // join: brcmf_ssid_le { u32 len; u8 ssid[32] }, possibly with parameters after
+            // join: brcmf_ssid_le { u32 len; u8 ssid[32] }, possibly with parameters after;
+            // in AP mode it starts the soft AP's BSS (an empty SSID stops it)
+            C_SET_SSID if self.ap => {
+                then.push(Action::StartAp(ssid_of(buf)));
+                0
+            }
             C_SET_SSID => {
                 then.push(Action::Join(ssid_of(buf)));
+                0
+            }
+            C_SET_AP => {
+                let on = buf.get(..4).is_some_and(|b| b != [0; 4]);
+                if !on {
+                    self.ap_ssid = None;
+                } else {
+                    then.push(Action::Leave);
+                }
+                self.ap = on;
+                0
+            }
+            C_GET_AP => {
+                put(buf, &word(u32::from(self.ap)));
                 0
             }
             C_DISASSOC => {
@@ -280,7 +399,8 @@ impl Dongle {
                 // vendor, device, radio rev, chip rev, core rev, board id, board vendor,
                 // board rev, driver rev, ucode rev, bus (SDIO), chip, phy type (AC), phy
                 // rev, ana rev, chip package, NVRAM rev
-                for x in [0x14e4, 0x43ab, 0, 6, 46, 0, 0x14e4, 0x1101, 0x0700_2d00, 0x4b0, 1, 0x4345, 11, 1, 0, 2, 0] {
+                let id = self.id;
+                for x in [0x14e4, id.device, 0, id.chiprev, 46, 0, 0x14e4, 0x1101, 0x0700_2d00, 0x4b0, id.bus, id.chip, 11, 1, 0, 2, 0] {
                     v.extend_from_slice(&word(x));
                 }
                 put(buf, &v);
@@ -362,9 +482,9 @@ impl Dongle {
         let params = buf.get(full + 1..).unwrap_or(&[]);
         Some(match name {
             "cur_etheraddr" => self.mac.to_vec(),
-            "ver" => b"wl0: Nov 18 2026 00:00:00 version 7.45.241 (sbc-emu dongle) FWID 01-00000000\n\0".to_vec(),
+            "ver" => [self.id.ver.as_bytes(), b"\0"].concat(),
             "clmver" => b"API: 18.2 Data: sbc-emu Compiler: none\0".to_vec(),
-            "cap" => b"sta wme 802.11d 802.11h rm cac dualband ampdu ampdu_tx ampdu_rx amsdurx mfp\0".to_vec(),
+            "cap" => b"ap sta wme 802.11d 802.11h rm cac dualband ampdu ampdu_tx ampdu_rx amsdurx mfp\0".to_vec(),
             "chanspecs" => {
                 // the parameter is a chanspec filter: only its bandwidth matters here
                 let filter = params.get(..2).map_or(0, |p| u16::from_le_bytes([p[0], p[1]]) as u32);
@@ -383,6 +503,19 @@ impl Dongle {
             "vhtmode" | "ldpc_cap" | "stbc_rx" | "stbc_tx" | "txbf_bfe_cap" | "txbf_bfr_cap" | "per_chan_info" => word(0),
             // transmit power in quarter dBm: 20 dBm
             "qtxpower" => word(80),
+            // the ARP offload's host IP table (brcmf_inetaddr_changed reads it back): the
+            // addresses set, zero-filled to its eight entries
+            "arp_hostip" => {
+                let mut v = self.vars.get("arp_hostip").cloned().unwrap_or_default();
+                v.resize(8 * 4, 0);
+                v
+            }
+            "dtim_assoc" => word(1),
+            // Bluetooth coexistence parameters (brcmf_btcoex reads number 27): none active
+            "btc_params" => word(0),
+            // the access point's station record, as `brcmf_cfg80211_get_station` reads it
+            // (version 4, associated and authorized, with per-station statistics)
+            "sta_info" => return self.sta_info(params),
             // the event mask (read before it is changed): none enabled at first
             "event_msgs" => self.vars.get(name).cloned().unwrap_or_default(),
             // no association request/response IEs recorded
@@ -398,6 +531,32 @@ impl Dongle {
             // the firmware has the feature (`sup_wpa` would hand it the handshake)
             n => return self.vars.get(n).cloned(),
         })
+    }
+
+    /// `brcmf_sta_info_le` for the access point joined, when `params` (its MAC address)
+    /// names it.
+    fn sta_info(&self, params: &[u8]) -> Option<Vec<u8>> {
+        let i = self.joined?;
+        if params.get(..6) != Some(&self.networks[i].bssid[..]) {
+            return None;
+        }
+        const AUTHE: u32 = 0x08;
+        const ASSOC: u32 = 0x10;
+        const AUTHO: u32 = 0x20;
+        const SCBSTATS: u32 = 0x4000;
+        let mut v = vec![0u8; 0x100];
+        let put32 = |v: &mut Vec<u8>, o: usize, x: u32| v[o..o + 4].copy_from_slice(&x.to_le_bytes());
+        v[0..2].copy_from_slice(&4u16.to_le_bytes());
+        v[2..4].copy_from_slice(&0x100u16.to_le_bytes());
+        put32(&mut v, 8, AUTHE | ASSOC | AUTHO | SCBSTATS);
+        v[16..22].copy_from_slice(&self.networks[i].bssid);
+        put32(&mut v, 52, 1); // tx packets
+        put32(&mut v, 60, 1); // rx unicast packets
+        put32(&mut v, 68, 54_000); // tx and rx rate (kbit/s)
+        put32(&mut v, 72, 54_000);
+        v[144] = RSSI as i8 as u8; // average RSSI, antenna 0
+        v[168] = RSSI as i8 as u8; // last packet's RSSI, antenna 0
+        Some(v)
     }
 
     fn set_var(&mut self, name: &str, value: Vec<u8>, then: &mut Vec<Action>) -> i32 {
@@ -416,6 +575,17 @@ impl Dongle {
             // brcmf_ext_join_params_le: starts with brcmf_ssid_le
             "join" => {
                 then.push(Action::Join(ssid_of(&value)));
+                0
+            }
+            "arp_hostip" => {
+                let table = self.vars.entry(name.to_string()).or_default();
+                if table.len() < 8 * 4 {
+                    table.extend_from_slice(&value[..value.len().min(4)]);
+                }
+                0
+            }
+            "arp_hostip_clear" => {
+                self.vars.remove("arp_hostip");
                 0
             }
             _ => {
@@ -551,6 +721,18 @@ impl Dongle {
         }
     }
 
+    /// The soft AP's BSS is up (or down for an empty SSID): there is no air, so no station
+    /// ever associates; the host sees its own beaconing BSS only.
+    fn start_ap(&mut self, ssid: Vec<u8>) {
+        if self.log {
+            eprintln!("[brcm] soft AP '{}' {}", String::from_utf8_lossy(&ssid), if ssid.is_empty() { "stopped" } else { "started" });
+        }
+        self.ap_ssid = (!ssid.is_empty()).then_some(ssid);
+        if self.ap_ssid.is_some() {
+            self.event(E_SET_SSID, E_STATUS_SUCCESS, 0, &[]);
+        }
+    }
+
     fn leave(&mut self) {
         if self.joined.is_some() {
             self.event(E_LINK, E_STATUS_SUCCESS, 0, &[]);
@@ -679,6 +861,15 @@ enum Action {
     Scan(u16),
     Join(Vec<u8>),
     Leave,
+    StartAp(Vec<u8>),
+}
+
+/// The ioctls that set something (brcmfmac's `fwil.h`): msgbuf requests carry no direction.
+fn is_set(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        C_UP | C_DOWN | 10 | 20 | 22 | C_SET_SSID | 28 | 30 | 32 | 34 | 38 | 45 | 47 | 49 | 50 | C_DISASSOC | 53 | 55 | 57 | 76 | 78 | 84 | 86 | 108 | C_SET_AP | 121 | 122 | 134 | 158 | 185 | 187 | 201 | 205 | 219 | 236 | 258 | C_SET_VAR | 268
+    )
 }
 
 /// The SSID of a `brcmf_ssid_le` at the start of a buffer.
