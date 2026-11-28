@@ -296,6 +296,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-jit"
+version = "0.1.0"
+
+[[package]]
 name = "starfive-jh7110"
 version = "0.1.0"
 dependencies = [

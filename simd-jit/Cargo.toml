@@ -1,0 +1,8 @@
+[package]
+name = "simd-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A JIT for 16-lane SIMD shader processors (the VideoCore IV's and V3D 4.2's QPUs): an IR of per-lane vectors and lane masks, its reference evaluator, and AArch64 NEON and WebAssembly SIMD backends"
+
+[dependencies]
