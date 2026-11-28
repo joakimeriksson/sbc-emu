@@ -208,6 +208,58 @@ The kernel reports `tegra-bpmp bpmp: firmware: sbc-emu-tegra234` and registers
 `ttyTHS1`. The script verifies the short and burst byte comparisons through
 that device at 115200 baud.
 
+## Thermal sensors, power monitor, fan and CPU frequency
+
+With `--bpmp on`, the module's thermal, power, fan and CPU-clock hardware is there too
+(`tegra234/src/power.rs`), in the places NVIDIA's device tree for the module
+(`tegra234-p3768-0000+p3767-0004`) has it, so the L4T 5.15 kernel's own drivers bind and
+NVIDIA's services find the sysfs files they read, unmodified, on Waveshare's UGV Rover image
+(`nvpower` and `nvfancontrol` run; for `nvpmodel` and jtop, see the differences below):
+
+| Hardware | Linux driver | What the guest sees |
+|---|---|---|
+| BPMP thermal sensors (`MRQ_THERMAL`) | `tegra-bpmp-thermal` | `cpu-thermal`, `gpu-thermal`, `cv0-2-thermal`, `soc0-2-thermal`, `tj-thermal` |
+| CPU complex (`ccplex@e000000`: NDIV registers, activity counters; `MRQ_CPU_NDIV_LIMITS`) | `tegra194-cpufreq` | `cpufreq` for cores 0-3 and 4-5, 115.2-1510.4 MHz in 76.8 MHz steps |
+| I²C2 (`i2c@c240000`, PIO) with an INA3221 at 0x40 | `i2c-tegra`, `ina3221` | hwmon `ina3221` on `1-0040`: `VDD_IN`, `VDD_CPU_GPU_CV`, `VDD_SOC` |
+| PWM3 (`pwm@32a0000`) and the fan | `pwm-tegra`, `pwm-fan` | hwmon `pwmfan` (`pwm1`) at `/sys/devices/platform/pwm-fan` |
+| Fan tachometer (`tachometer@39c0000`) | `pwm-tegra-tachometer` | hwmon `pwm_tach` (`rpm`) |
+| EMC clock cap (`nvpmodel` node, `MRQ_BWMGR_INT`) | `nvpmodel-clk-cap` | `/sys/kernel/nvpmodel_clk_cap/emc` |
+
+The readings come from one model of the module. The cores that are not asleep in WFI, at
+the clocks cpufreq chose, set the CPU rail's power; the rails add up to the module's 5 V input
+(about 3 W idle, 6 W with all six cores busy); that heats the heatsink (a 40 s time constant,
+28 °C air inside the rover), and the fan, spinning at up to 6000 rpm with the PWM's duty
+cycle, cools it. The CPU zone rises over the heatsink with the CPU rail, so it warms within
+seconds under load. The CV zones' sensors (the DLA and PVA, absent on the Orin Nano) fail
+as power-gated, as on the module: jtop shows them offline. The GA10B's clocks get the
+4GB module's rates (306-624.75 MHz), the table nvgpu walks for its devfreq device on silicon.
+
+Differences from the module:
+
+- The firmware offers no thermal trip points (it cannot message the CPUs), so Linux polls
+  the zones once a second; the passive trips have no cooling maps (no CPU or GPU
+  throttling). The TJ zone's active trips drive the fan when nvfancontrol does not.
+- The I²C controller has no GPC DMA (`i2c-tegra` falls back to PIO, and says so).
+- cpufreq uses the BPMP's table without the DT's OPP tables, so the EMC does not scale with
+  the CPUs; a core's clock counts in WFI too.
+- No cpuidle states, no soctherm over-current events, no BPMP debugfs (`/sys/kernel/debug/bpmp`
+  is empty, so `jetson_clocks --show` has no EMC rate).
+- On Waveshare's image (`--bpmp on --gpu on`), `nvpower` and `nvfancontrol` run (nvfancontrol
+  in open-loop control: the image's saved `/var/lib/nvfancontrol/status` says so, as on their
+  robot). `nvpmodel -q` answers `10W`, but `nvpmodel.service` fails: setting a mode reads the
+  GPU's devfreq limits, which are missing (next item); the CPU limits are applied.
+- jtop's service does not start yet: at start it runs `jetson_clocks --show`, which needs the
+  iGPU's devfreq device (and nvpmodel's GPU clock limits need it too). nvgpu registers that
+  device only on silicon (`tegra_platform_is_silicon()`), and the GPU model reports NVIDIA's QT
+  pre-silicon chip ID (see "JetPack CUDA driver"). On silicon, nvgpu boots the GPU securely:
+  the ACR on the GSP (`acr-gsp.*.encrypt.bin.prod`), FECS and GPCCS as light-secure falcons
+  (`*_encrypt_prod.bin`) and the PMU's RISC-V RTOS (`gpmu_ucode_next_prod_image.bin`, which
+  nvgpu then drives through its command and message queues: ELPG, perfmon, golden-image
+  state). That firmware is encrypted or signed and is not run here, so the silicon path needs
+  those falcons modelled at the level of their protocols first. Without `--gpu`,
+  `jetson_clocks` stops at "Unknown GPU Type". The hardware jtop reads (thermal zones, cpufreq,
+  the INA3221, the fan) is all there.
+
 ## Ampere GPU bring-up
 
 `--gpu on` enables BPMP and exposes the GA10B node derived from NVIDIA's
