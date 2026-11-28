@@ -213,8 +213,8 @@ that device at 115200 baud.
 With `--bpmp on`, the module's thermal, power, fan and CPU-clock hardware is there too
 (`tegra234/src/power.rs`), in the places NVIDIA's device tree for the module
 (`tegra234-p3768-0000+p3767-0004`) has it, so the L4T 5.15 kernel's own drivers bind and
-NVIDIA's services (`nvpower`, `nvpmodel`, `nvfancontrol`) and jtop (jetson-stats) run
-unmodified, as on Waveshare's UGV Rover image:
+NVIDIA's services find the sysfs files they read, unmodified, on Waveshare's UGV Rover image
+(`nvpower` and `nvfancontrol` run; for `nvpmodel` and jtop, see the differences below):
 
 | Hardware | Linux driver | What the guest sees |
 |---|---|---|
@@ -232,8 +232,7 @@ the clocks cpufreq chose, set the CPU rail's power; the rails add up to the modu
 cycle, cools it. The CPU zone rises over the heatsink with the CPU rail, so it warms within
 seconds under load. The CV zones' sensors (the DLA and PVA, absent on the Orin Nano) fail
 as power-gated, as on the module: jtop shows them offline. The GA10B's clocks get the
-4GB module's rates (306-624.75 MHz), which nvgpu walks to register its devfreq device
-(which `jetson_clocks` and jtop need, with `--gpu on`).
+4GB module's rates (306-624.75 MHz), the table nvgpu walks for its devfreq device on silicon.
 
 Differences from the module:
 
@@ -245,8 +244,21 @@ Differences from the module:
   the CPUs; a core's clock counts in WFI too.
 - No cpuidle states, no soctherm over-current events, no BPMP debugfs (`/sys/kernel/debug/bpmp`
   is empty, so `jetson_clocks --show` has no EMC rate).
-- jtop needs `--gpu on`: `jetson_clocks --show`, which jtop's service runs at start, fails
-  without an iGPU.
+- On Waveshare's image (`--bpmp on --gpu on`), `nvpower` and `nvfancontrol` run (nvfancontrol
+  in open-loop control: the image's saved `/var/lib/nvfancontrol/status` says so, as on their
+  robot). `nvpmodel -q` answers `10W`, but `nvpmodel.service` fails: setting a mode reads the
+  GPU's devfreq limits, which are missing (next item); the CPU limits are applied.
+- jtop's service does not start yet: at start it runs `jetson_clocks --show`, which needs the
+  iGPU's devfreq device (and nvpmodel's GPU clock limits need it too). nvgpu registers that
+  device only on silicon (`tegra_platform_is_silicon()`), and the GPU model reports NVIDIA's QT
+  pre-silicon chip ID (see "JetPack CUDA driver"). On silicon, nvgpu boots the GPU securely:
+  the ACR on the GSP (`acr-gsp.*.encrypt.bin.prod`), FECS and GPCCS as light-secure falcons
+  (`*_encrypt_prod.bin`) and the PMU's RISC-V RTOS (`gpmu_ucode_next_prod_image.bin`, which
+  nvgpu then drives through its command and message queues: ELPG, perfmon, golden-image
+  state). That firmware is encrypted or signed and is not run here, so the silicon path needs
+  those falcons modelled at the level of their protocols first. Without `--gpu`,
+  `jetson_clocks` stops at "Unknown GPU Type". The hardware jtop reads (thermal zones, cpufreq,
+  the INA3221, the fan) is all there.
 
 ## Ampere GPU bring-up
 

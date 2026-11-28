@@ -85,7 +85,7 @@ impl Soc {
         } else if (GICR..GICR + GICR_SIZE).contains(&addr) {
             self.gic.redist_read(addr - GICR)
         } else if addr == APB_MISC + 4 {
-            if self.gpu_node && std::env::var_os("SBC_ORIN_SILICON").is_none() {
+            if self.gpu_node {
                 CHIP_ID_A01_QT
             } else {
                 CHIP_ID_A01
