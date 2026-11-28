@@ -163,6 +163,8 @@ Each ends with something a script checks, as on the other boards.
    Pi 4's, snapshot round trip, the browser smoke test.
 7. **VideoCore IV 3D**, in steps: control lists and the tile buffer (clears and stores), then the
    binner and a flat-shaded triangle, the QPU interpreter, textures, the rest of the GLES 2 state.
+   (2026-11-28: the GPU core is in `vc4-3d/`, tested on the host and on the machine's bus,
+   [raspberry-pi-3-gpu.md](raspberry-pi-3-gpu.md); the guest checks wait for milestone 4.)
    *Check:* Mesa reports `V3D 2.1`; `kmscube`; the GLES 2 scenes of the Pi 4's GL suite against
    llvmpipe; all `glmark2-es2-drm` scenes; the desktop (Pi OS with desktop, labwc) on the GPU.
 8. **Composite video** (VEC). *Check:* `modetest` lists `Composite-1`, a PAL picture over VNC.

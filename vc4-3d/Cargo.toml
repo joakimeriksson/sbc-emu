@@ -1,0 +1,9 @@
+[package]
+name = "vc4-3d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Broadcom VideoCore IV 3D (V3D 2.1) GPU model: control lists, binner, rasterizer, tile buffer, QPU shader cores, TMU, VPM"
+
+[dependencies]
+emu-core = { path = "../emu-core" }

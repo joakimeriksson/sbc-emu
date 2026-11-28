@@ -162,8 +162,8 @@ transfers, `SBC_NET_LOG=1` the virtual network, `SBC_TRACE_VC4=1` the display re
 - Ethernet: the statistics counters (`ethtool -S`) read zero, wake-on-LAN and EEE do nothing,
   the receive filters (perfect, hash, VLAN) are not applied: every frame from the network is
   delivered.
-- No VideoCore IV 3D (the device tree's V3D node waits for its model), no composite output (VEC),
-  no DSI or DPI displays, no video decode.
+- No composite output (VEC), no DSI or DPI displays, no video decode. The VideoCore IV 3D GPU:
+  [raspberry-pi-3-gpu.md](raspberry-pi-3-gpu.md).
 - No Wi-Fi or Bluetooth (the PL011 is a plain serial port), no `sdhost`.
 - No I²C on the header, no SPI, PCM/I²S or system timer in the device tree; the GPIO block has no
   pull-up/down state (`GPPUD`) and nothing on the header pins.

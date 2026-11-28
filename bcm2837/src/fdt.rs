@@ -456,5 +456,7 @@ mod tests {
         assert_eq!(bus(crate::machine::USB), 0x7e98_0000);
         assert!(blob.windows(b"usb424,7800".len()).any(|w| w == b"usb424,7800"));
         assert!(blob.windows(6).any(|w| w == crate::machine::ETH_MAC));
+        assert_eq!(bus(crate::machine::V3D), 0x7ec0_0000);
+        assert_eq!(gpu(crate::machine::GPU_V3D as u32), [1, 10]);
     }
 }
