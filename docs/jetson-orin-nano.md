@@ -208,6 +208,46 @@ The kernel reports `tegra-bpmp bpmp: firmware: sbc-emu-tegra234` and registers
 `ttyTHS1`. The script verifies the short and burst byte comparisons through
 that device at 115200 baud.
 
+## Thermal sensors, power monitor, fan and CPU frequency
+
+With `--bpmp on`, the module's thermal, power, fan and CPU-clock hardware is there too
+(`tegra234/src/power.rs`), in the places NVIDIA's device tree for the module
+(`tegra234-p3768-0000+p3767-0004`) has it, so the L4T 5.15 kernel's own drivers bind and
+NVIDIA's services (`nvpower`, `nvpmodel`, `nvfancontrol`) and jtop (jetson-stats) run
+unmodified, as on Waveshare's UGV Rover image:
+
+| Hardware | Linux driver | What the guest sees |
+|---|---|---|
+| BPMP thermal sensors (`MRQ_THERMAL`) | `tegra-bpmp-thermal` | `cpu-thermal`, `gpu-thermal`, `cv0-2-thermal`, `soc0-2-thermal`, `tj-thermal` |
+| CPU complex (`ccplex@e000000`: NDIV registers, activity counters; `MRQ_CPU_NDIV_LIMITS`) | `tegra194-cpufreq` | `cpufreq` for cores 0-3 and 4-5, 115.2-1510.4 MHz in 76.8 MHz steps |
+| I²C2 (`i2c@c240000`, PIO) with an INA3221 at 0x40 | `i2c-tegra`, `ina3221` | hwmon `ina3221` on `1-0040`: `VDD_IN`, `VDD_CPU_GPU_CV`, `VDD_SOC` |
+| PWM3 (`pwm@32a0000`) and the fan | `pwm-tegra`, `pwm-fan` | hwmon `pwmfan` (`pwm1`) at `/sys/devices/platform/pwm-fan` |
+| Fan tachometer (`tachometer@39c0000`) | `pwm-tegra-tachometer` | hwmon `pwm_tach` (`rpm`) |
+| EMC clock cap (`nvpmodel` node, `MRQ_BWMGR_INT`) | `nvpmodel-clk-cap` | `/sys/kernel/nvpmodel_clk_cap/emc` |
+
+The readings come from one model of the module. The cores that are not asleep in WFI, at
+the clocks cpufreq chose, set the CPU rail's power; the rails add up to the module's 5 V input
+(about 3 W idle, 6 W with all six cores busy); that heats the heatsink (a 40 s time constant,
+28 °C air inside the rover), and the fan, spinning at up to 6000 rpm with the PWM's duty
+cycle, cools it. The CPU zone rises over the heatsink with the CPU rail, so it warms within
+seconds under load. The CV zones' sensors (the DLA and PVA, absent on the Orin Nano) fail
+as power-gated, as on the module: jtop shows them offline. The GA10B's clocks get the
+4GB module's rates (306-624.75 MHz), which nvgpu walks to register its devfreq device
+(which `jetson_clocks` and jtop need, with `--gpu on`).
+
+Differences from the module:
+
+- The firmware offers no thermal trip points (it cannot message the CPUs), so Linux polls
+  the zones once a second; the passive trips have no cooling maps (no CPU or GPU
+  throttling). The TJ zone's active trips drive the fan when nvfancontrol does not.
+- The I²C controller has no GPC DMA (`i2c-tegra` falls back to PIO, and says so).
+- cpufreq uses the BPMP's table without the DT's OPP tables, so the EMC does not scale with
+  the CPUs; a core's clock counts in WFI too.
+- No cpuidle states, no soctherm over-current events, no BPMP debugfs (`/sys/kernel/debug/bpmp`
+  is empty, so `jetson_clocks --show` has no EMC rate).
+- jtop needs `--gpu on`: `jetson_clocks --show`, which jtop's service runs at start, fails
+  without an iGPU.
+
 ## Ampere GPU bring-up
 
 `--gpu on` enables BPMP and exposes the GA10B node derived from NVIDIA's

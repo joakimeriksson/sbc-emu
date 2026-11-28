@@ -37,6 +37,10 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
     dt.begin("aliases");
     dt.str("serial0", "/serial@31d0000");
     dt.str("serial1", "/serial@3100000");
+    if bpmp {
+        // the INA3221's bus is i2c-1, as on the module ("1-0040")
+        dt.str("i2c1", "/bus@0/i2c@c240000");
+    }
     dt.end();
 
     dt.begin("chosen");
@@ -162,6 +166,7 @@ fn device_tree(machine: &Machine, cmdline: &str, initrd: Option<(u64, u64)>) -> 
 
     if bpmp {
         bpmp_nodes(&mut dt);
+        power_nodes(&mut dt);
     }
     if machine.soc.gpu_node {
         dt.begin("tegra-carveouts");
@@ -287,6 +292,158 @@ fn bpmp_nodes(dt: &mut Fdt) {
     dt.cells("#reset-cells", &[1]);
     dt.cells("#power-domain-cells", &[1]);
     dt.cells("phandle", &[BPMP_HANDLE]);
+    // the firmware's temperature sensors (tegra-bpmp-thermal)
+    dt.begin("thermal");
+    dt.str("compatible", "nvidia,tegra186-bpmp-thermal");
+    dt.cells("#thermal-sensor-cells", &[1]);
+    dt.cells("phandle", &[BPMP_THERMAL_HANDLE]);
+    dt.end();
+    dt.end();
+}
+
+const BPMP_THERMAL_HANDLE: u32 = 30;
+const PWM3_HANDLE: u32 = 31;
+const FAN_HANDLE: u32 = 32;
+const TJ_ACTIVE_HANDLES: [u32; 3] = [33, 34, 35];
+
+/// The thermal, power, fan and CPU-frequency hardware (`power.rs`), as NVIDIA's device tree
+/// for the module (tegra234-p3768-0000+p3767-0004) has it: the I²C bus, PWM, tachometer and
+/// CPU complex in `bus@0` (L4T's libjetsonpower finds the tachometer at
+/// `/sys/devices/platform/bus@0/39c0000.tachometer`), the fan at `/sys/devices/platform/pwm-fan`,
+/// and the BPMP's thermal zones. Left out: the I²C controller's GPC DMA (it falls back to PIO),
+/// the CPU OPP tables and interconnects (cpufreq uses the BPMP's table and does not scale the
+/// EMC with the CPUs), and the passive trips' cooling maps (CPU and GPU throttling).
+fn power_nodes(dt: &mut Fdt) {
+    use crate::{bpmp, ccplex, fan, power};
+
+    dt.begin("bus@0");
+    dt.str("compatible", "simple-bus");
+    dt.cells("#address-cells", &[2]);
+    dt.cells("#size-cells", &[2]);
+    dt.empty("ranges");
+
+    dt.begin(&format!("pwm@{:x}", fan::PWM_BASE));
+    dt.strs("compatible", &["nvidia,tegra234-pwm", "nvidia,tegra194-pwm"]);
+    dt.cells("reg", &range(fan::PWM_BASE, fan::PWM_SIZE));
+    dt.cells("clocks", &[BPMP_HANDLE, bpmp::CLK_PWM3]);
+    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_PWM3]);
+    dt.str("reset-names", "pwm");
+    dt.cells("#pwm-cells", &[2]);
+    dt.cells("phandle", &[PWM3_HANDLE]);
+    dt.end();
+
+    dt.begin(&format!("tachometer@{:x}", fan::TACH_BASE));
+    dt.str("compatible", "nvidia,pwm-tegra234-tachometer");
+    dt.cells("reg", &range(fan::TACH_BASE, fan::TACH_SIZE));
+    dt.cells("#pwm-cells", &[2]);
+    dt.cells("clocks", &[BPMP_HANDLE, bpmp::CLK_TACH0]);
+    dt.str("clock-names", "tach");
+    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_TACH0]);
+    dt.str("reset-names", "tach");
+    dt.cells("pulse-per-rev", &[fan::PULSES_PER_REV]);
+    dt.cells("capture-window-length", &[2]);
+    dt.empty("disable-clk-gate");
+    dt.cells("upper-threshold", &[0xfffff]);
+    dt.cells("lower-threshold", &[0]);
+    dt.end();
+
+    dt.begin(&format!("i2c@{:x}", power::I2C2));
+    dt.str("compatible", "nvidia,tegra194-i2c");
+    dt.cells("reg", &range(power::I2C2, peripherals::tegra_i2c::SIZE));
+    dt.cells("interrupts", &[0, power::I2C2_SPI, 4]);
+    dt.cells("#address-cells", &[1]);
+    dt.cells("#size-cells", &[0]);
+    dt.cells("clock-frequency", &[100_000]);
+    dt.cells(
+        "clocks",
+        &[BPMP_HANDLE, bpmp::CLK_I2C2, BPMP_HANDLE, bpmp::CLK_PLLP_OUT0],
+    );
+    dt.strs("clock-names", &["div-clk", "parent"]);
+    dt.cells("resets", &[BPMP_HANDLE, bpmp::RESET_I2C2]);
+    dt.str("reset-names", "i2c");
+    dt.begin(&format!("ina3221@{:x}", power::INA3221_ADDRESS));
+    dt.str("compatible", "ti,ina3221");
+    dt.cells("reg", &[u32::from(power::INA3221_ADDRESS)]);
+    dt.cells("#address-cells", &[1]);
+    dt.cells("#size-cells", &[0]);
+    for (ch, label) in ["VDD_IN", "VDD_CPU_GPU_CV", "VDD_SOC"].iter().enumerate() {
+        dt.begin(&format!("channel@{ch}"));
+        dt.cells("reg", &[ch as u32]);
+        dt.str("label", label);
+        dt.cells("shunt-resistor-micro-ohms", &[power::SHUNT_UOHM]);
+        dt.end();
+    }
+    dt.end();
+    dt.end();
+
+    dt.begin(&format!("ccplex@{:x}", ccplex::BASE));
+    dt.str("compatible", "nvidia,tegra234-ccplex-cluster");
+    dt.cells("reg", &range(ccplex::BASE, ccplex::SIZE));
+    dt.cells("nvidia,bpmp", &[BPMP_HANDLE]);
+    dt.end();
+    dt.end();
+
+    dt.begin("pwm-fan");
+    dt.str("compatible", "pwm-fan");
+    // 22 kHz
+    dt.cells("pwms", &[PWM3_HANDLE, 0, 45334]);
+    dt.cells("#cooling-cells", &[2]);
+    dt.cells("cooling-levels", &[0, 88, 187, 255]);
+    dt.cells("phandle", &[FAN_HANDLE]);
+    dt.end();
+
+    // nvpmodel's EMC cap (/sys/kernel/nvpmodel_clk_cap/emc)
+    dt.begin("nvpmodel");
+    dt.str("compatible", "nvidia,nvpmodel");
+    dt.cells("nvidia,bpmp", &[BPMP_HANDLE]);
+    dt.cells("clocks", &[BPMP_HANDLE, bpmp::CLK_EMC]);
+    dt.str("clock-names", "emc");
+    dt.end();
+
+    dt.begin("thermal-zones");
+    for (index, zone) in ["cpu", "gpu", "cv0", "cv1", "cv2", "soc0", "soc1", "soc2", "tj"]
+        .iter()
+        .enumerate()
+    {
+        dt.begin(&format!("{zone}-thermal"));
+        dt.cells("thermal-sensors", &[BPMP_THERMAL_HANDLE, index as u32]);
+        dt.cells("polling-delay", &[1000]);
+        dt.cells("polling-delay-passive", &[1000]);
+        dt.begin("trips");
+        let trip = |dt: &mut Fdt, name: &str, temp: u32, hyst: u32, kind: &str, handle: Option<u32>| {
+            dt.begin(name);
+            dt.cells("temperature", &[temp]);
+            dt.cells("hysteresis", &[hyst]);
+            dt.str("type", kind);
+            if let Some(handle) = handle {
+                dt.cells("phandle", &[handle]);
+            }
+            dt.end();
+        };
+        if *zone == "tj" {
+            // the fan's steps
+            for (step, temp) in [35_000, 74_000, 95_000].into_iter().enumerate() {
+                trip(dt, &format!("active-{step}"), temp, 4000, "active", Some(TJ_ACTIVE_HANDLES[step]));
+            }
+            trip(dt, "tj-sw-shutdown", 104_500, 0, "critical", None);
+        } else {
+            trip(dt, &format!("{zone}-sw-slowdown"), 99_000, 0, "passive", None);
+            trip(dt, &format!("{zone}-sw-shutdown"), 104_500, 0, "critical", None);
+            trip(dt, "hot-surface", 70_000, 8000, "passive", None);
+        }
+        dt.end();
+        if *zone == "tj" {
+            dt.begin("cooling-maps");
+            for (step, handle) in TJ_ACTIVE_HANDLES.iter().enumerate() {
+                dt.begin(&format!("map-active-{step}"));
+                dt.cells("cooling-device", &[FAN_HANDLE, step as u32, step as u32 + 1]);
+                dt.cells("trip", &[*handle]);
+                dt.end();
+            }
+            dt.end();
+        }
+        dt.end();
+    }
     dt.end();
 }
 

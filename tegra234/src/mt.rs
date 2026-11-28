@@ -112,6 +112,10 @@ impl Shared {
     fn service(&self, soc: &mut Soc) {
         let now = self.now();
         soc.now = soc.now.max(now);
+        if let Some(power) = soc.power.as_mut() {
+            let busy = self.state.iter().enumerate().filter(|(_, s)| s.load(Relaxed) == RUN);
+            power.set_busy(busy.fold(0, |mask, (core, _)| mask | 1 << core));
+        }
         soc.service(now);
         soc.interrupts_changed = false;
         self.publish(soc);

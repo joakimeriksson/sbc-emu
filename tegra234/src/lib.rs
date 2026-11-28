@@ -1,6 +1,8 @@
 //! Tegra234 direct-boot machine for early Linux bring-up.
 pub mod boot;
 mod bpmp;
+mod ccplex;
+mod fan;
 pub mod gpu;
 mod host1x;
 mod hsp;
@@ -8,6 +10,7 @@ mod mc;
 mod mss_nvlink;
 #[cfg(not(target_arch = "wasm32"))]
 mod mt;
+mod power;
 mod uart;
 
 use arm_a64::{Cpu, CpuProfile};
@@ -59,6 +62,8 @@ struct Soc {
     mss_nvlink: mss_nvlink::MssNvlink,
     gpu_node: bool,
     firmware: Option<Firmware>,
+    /// thermal sensors, power monitor, fan and CPU clocks (with the BPMP; `power.rs`)
+    power: Option<power::Power>,
     xhci: Option<peripherals::xhci::Xhci>,
     usb: emu_core::usb::Devices,
     /// the network behind the USB Ethernet adapter, and when it is next polled
@@ -80,7 +85,7 @@ impl Soc {
         } else if (GICR..GICR + GICR_SIZE).contains(&addr) {
             self.gic.redist_read(addr - GICR)
         } else if addr == APB_MISC + 4 {
-            if self.gpu_node {
+            if self.gpu_node && std::env::var_os("SBC_ORIN_SILICON").is_none() {
                 CHIP_ID_A01_QT
             } else {
                 CHIP_ID_A01
@@ -94,6 +99,9 @@ impl Soc {
             value
         } else if let Some(value) = self.mss_nvlink.read(addr) {
             value
+        } else if let Some(power) = self.power.as_mut().filter(|_| power::Power::contains(addr)) {
+            self.interrupts_changed = true;
+            power.read(addr, self.now)
         } else if let Some(xhci) = self.xhci.as_mut().filter(|_| (XHCI..XHCI + XHCI_SIZE).contains(&addr)) {
             self.interrupts_changed = true;
             xhci.read(addr - XHCI)
@@ -141,8 +149,15 @@ impl Soc {
         } else if addr == uart::FIXTURE_RESET && self.uarta.high_speed() && self.firmware.is_none()
         {
             self.uarta.set_reset(value & 1 != 0);
+        } else if let Some(power) = self.power.as_mut().filter(|_| power::Power::contains(addr)) {
+            power.write(addr, value, self.now);
         } else if (hsp::BASE..hsp::BASE + hsp::SIZE).contains(&addr) {
             let firmware = self.firmware.as_mut().ok_or(Fault::Unmapped)?;
+            if let Some(power) = self.power.as_mut() {
+                // the firmware reads its sensors
+                power.advance(self.now);
+                firmware.bpmp.temps = power.temps();
+            }
             if firmware.hsp.write(addr - hsp::BASE, value)
                 && firmware.bpmp.service(&mut self.uarta, &mut self.gpu)
             {
@@ -184,6 +199,10 @@ impl Soc {
             self.gic.set_line((hsp::SPI + 32) as usize, firmware.hsp.irq());
         }
         self.pump_network(now);
+        if let Some(power) = self.power.as_mut() {
+            power.advance(now);
+            self.gic.set_line((power::I2C2_SPI + 32) as usize, power.i2c_irq());
+        }
         if let Some(xhci) = self.xhci.as_mut() {
             let mut dma = peripherals::dma::Dma { ram: &mut self.ram, base: RAM_BASE };
             xhci.tick(now, &mut dma, &mut self.usb);
@@ -368,6 +387,7 @@ impl Machine {
             mss_nvlink: Default::default(),
             gpu_node: false,
             firmware: None,
+            power: None,
             xhci: None,
             usb: Default::default(),
             net: None,
@@ -411,6 +431,8 @@ impl Machine {
 
     pub fn enable_bpmp(&mut self) {
         self.soc.firmware.get_or_insert_with(Firmware::default);
+        let cores = self.cpus.len();
+        self.soc.power.get_or_insert_with(|| power::Power::new(cores));
     }
 
     pub fn enable_gpu(&mut self) {
@@ -602,6 +624,10 @@ impl Machine {
     }
 
     fn update_interrupts(&mut self) {
+        if let Some(power) = self.soc.power.as_mut() {
+            let busy = self.state.iter().enumerate().filter(|(_, s)| **s == CoreState::Running);
+            power.set_busy(busy.fold(0, |mask, (core, _)| mask | 1 << core));
+        }
         self.soc.service(self.now);
         for (core, (cpu, state)) in self.cpus.iter_mut().zip(&mut self.state).enumerate() {
             if *state == CoreState::Off {
