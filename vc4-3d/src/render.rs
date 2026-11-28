@@ -504,6 +504,7 @@ impl<'a, 'm> Render<'a, 'm> {
             self.mem.read(pc, p);
             let p: Vec<u8> = p.to_vec();
             let next = pc.wrapping_add(n);
+            if crate::cl_log_enabled() { eprintln!("\rvc4 render {pc:#010x}: {} {:02x?}\r", cl::name(op), &p[1..]); }
             match op {
                 cl::HALT => break,
                 cl::NOP | cl::FLUSH | cl::FLUSH_ALL | cl::START_TILE_BINNING | cl::INCREMENT_SEMAPHORE | cl::PRIMITIVE_LIST_FORMAT => {}

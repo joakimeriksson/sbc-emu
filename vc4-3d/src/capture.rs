@@ -100,3 +100,19 @@ pub fn replay(jobs: &[Captured], ram: &mut [u8]) -> Vec<crate::tlb::Frame> {
     }
     frames
 }
+
+/// A frame (as `TILE_RENDERING_MODE_CONFIG` describes it) as a binary PPM.
+pub fn ppm(f: &crate::tlb::Frame, mem: &mut crate::mem::Mem) -> Vec<u8> {
+    let (w, h) = (f.width.max(1), f.height.max(1));
+    let rgba = f.format == 1;
+    let lay = crate::tiling::Layout::new(f.tiling, if rgba { 4 } else { 2 }, w);
+    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+    for y in 0..h {
+        for x in 0..w {
+            let a = f.addr.wrapping_add(lay.offset(x, y));
+            let c = if rgba { mem.r32(a) } else { crate::tlb::from565(mem.r16(a)) }.to_le_bytes();
+            out.extend_from_slice(&c[..3]);
+        }
+    }
+    out
+}

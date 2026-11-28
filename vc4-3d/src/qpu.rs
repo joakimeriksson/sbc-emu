@@ -774,6 +774,9 @@ impl Qpu {
         let pc = self.pc;
         self.pc = pc.wrapping_add(8);
         self.insns += 1;
+        if crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0 && crate::TRACE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+            eprintln!("\rqpu{} {pc:#010x}: {}\r", self.num, crate::disasm::disasm(i.raw));
+        }
         match i.kind {
             Kind::Branch => {
                 if self.branch_taken(i.bcond) {

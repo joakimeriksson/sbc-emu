@@ -251,6 +251,7 @@ pub fn run(start: u32, end: u32, mem: &mut Mem, code: &mut Code, insns: &mut u64
         let mut p = [0u8; 16];
         mem.read(pc, &mut p[..n as usize]);
         let next = pc.wrapping_add(n);
+        if crate::cl_log_enabled() { eprintln!("\rvc4 bin {pc:#010x}: {} {:02x?}\r", cl::name(op), &p[1..n as usize]); }
         match op {
             cl::HALT => break,
             cl::NOP | cl::WAIT_ON_SEMAPHORE | cl::START_TILE_BINNING => {

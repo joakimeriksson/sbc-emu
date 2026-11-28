@@ -19,6 +19,7 @@ pub mod asm;
 pub mod bin;
 pub mod capture;
 pub mod cl;
+pub mod disasm;
 pub mod mem;
 pub mod qpu;
 pub mod render;
@@ -32,6 +33,11 @@ use mem::Mem;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static LOG_ON: AtomicBool = AtomicBool::new(false);
+/// `SBC_VC4_CL=1`: every control-list packet the threads execute
+static CL_ON: AtomicBool = AtomicBool::new(false);
+/// QPU instructions still to trace (`SBC_VC4_TRACE=N`)
+pub static TRACE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub fn cl_log_enabled() -> bool { CL_ON.load(Ordering::Relaxed) }
 thread_local! { static SEEN: std::cell::RefCell<std::collections::HashSet<String>> = Default::default(); }
 
 /// Diagnostics on stderr (`SBC_VC4_LOG=1`).
@@ -155,6 +161,9 @@ pub struct Exec {
     pub capture: Option<String>,
     /// replay: the pages jobs write
     pub track: Option<std::collections::BTreeSet<u32>>,
+    /// `SBC_VC4_DUMP=dir`: each finished frame as a PPM
+    pub dump: Option<String>,
+    frames: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +182,8 @@ pub enum Done {
 impl Exec {
     fn new() -> Exec {
         Exec { code: qpu::Code::default(), tb: tlb::TileBuffer::new(), insns: 0, jobs: [0; 2], host_ns: [0; 2], fragments: 0, prims: 0,
-               capture: std::env::var("SBC_VC4_CAPTURE").ok().filter(|s| !s.is_empty()), track: None }
+               capture: std::env::var("SBC_VC4_CAPTURE").ok().filter(|s| !s.is_empty()), track: None,
+               dump: std::env::var("SBC_VC4_DUMP").ok().filter(|s| !s.is_empty()), frames: 0 }
     }
 
     /// Run a job on guest RAM. `sem`: the control-list semaphore as the job starts.
@@ -198,6 +208,12 @@ impl Exec {
                 let mut r = render::Render::new(&mut self.tb, &mut m, &mut self.code, &mut self.insns);
                 r.run(start, end, &mut s);
                 let out = r.out;
+                let frame = r.frame;
+                if let (Some(dir), true) = (self.dump.as_ref(), out.eof) {
+                    let path = format!("{dir}/frame-{:05}.ppm", self.frames);
+                    if let Err(e) = std::fs::write(&path, capture::ppm(&frame, &mut m)) { log_first(&format!("vc4: {path}: {e}")); }
+                }
+                if out.eof { self.frames += 1; }
                 self.jobs[1] += 1;
                 self.fragments += out.fragments;
                 let ns = t0.ns();
@@ -259,6 +275,8 @@ impl Default for V3d { fn default() -> Self { V3d::new() } }
 impl V3d {
     pub fn new() -> V3d {
         LOG_ON.store(std::env::var_os("SBC_VC4_LOG").is_some(), Ordering::Relaxed);
+        CL_ON.store(std::env::var("SBC_VC4_CL").is_ok_and(|v| v != "0"), Ordering::Relaxed);
+        if let Some(n) = std::env::var("SBC_VC4_TRACE").ok().and_then(|s| s.parse().ok()) { TRACE.store(n, Ordering::Relaxed); }
         V3d {
             regs: vec![0; SIZE as usize / 4], intctl: 0, intena: 0, exec: std::sync::Arc::new(std::sync::Mutex::new(Exec::new())),
             sem: 0, pending_bin: None, running: [false; 2], pending: Vec::new(), user: user::Sched::new(), now: 0,
