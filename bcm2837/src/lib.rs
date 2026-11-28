@@ -1,8 +1,9 @@
 //! Raspberry Pi 3 (BCM2837) machine: four Cortex-A53 cores, RAM below the VideoCore's share of
 //! 1 GiB, the BCM2836-style per-core interrupt controller with the BCM2835 ARM-side controller
 //! chained into it, and the peripherals at 0x3f00_0000. Blocks the BCM2837 shares with the
-//! BCM2711 (mailbox, SD host, mini UART, PL011, watchdog) come from the `bcm2711` crate with
-//! this SoC's addresses and interrupt numbers; only what the reduced device tree (`fdt.rs`)
+//! BCM2711 (mailbox, Arasan SD host, GPIO, mini UART, PL011, watchdog, USB host, the CYW43455's
+//! Wi-Fi and Bluetooth) come from the `bcm2711` crate with this SoC's addresses and interrupt
+//! numbers; the SD card's `sdhost` is here. Only what the reduced device tree (`fdt.rs`)
 //! describes is modelled, the rest of the peripheral window reads as zero and is logged once.
 pub mod boot;
 pub mod fdt;
@@ -11,12 +12,12 @@ pub mod machine;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod mt;
 pub mod periph;
+pub mod sdhost;
 
 pub use machine::{CoreState, Machine, Stop};
 
-/// The members of the family (`--model`): what the firmware reports and the device tree says.
-/// The board-level differences beyond RAM (USB topology, Ethernet, Wi-Fi chip) are not modelled
-/// yet; the 3 Model B+ is the one tested.
+/// The members of the family (`--model`): what the firmware reports and the device tree says,
+/// the RAM, the USB tree, the wireless chip. The 3 Model B+ is the one tested.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Model {
     #[default]
@@ -61,6 +62,10 @@ impl Model {
     }
     /// The VideoCore's share of RAM, as the firmware's default `gpu_mem` gives it.
     pub fn gpu_mb(self) -> usize { if self.ram_mb() >= 1024 { 76 } else { 64 } }
+    /// The board carries the CYW43455 (Wi-Fi on SDIO, Bluetooth on UART0). The 3B's BCM43438
+    /// and the Zero 2 W's CYW43436 (a Cortex-M3 chip with another firmware layout) are not
+    /// modelled: those boards come up without wireless.
+    pub fn wireless(self) -> bool { matches!(self, Model::B3Plus | Model::A3Plus) }
     /// The firmware's model filters in `config.txt` for this board.
     pub fn config_sections(self) -> &'static [&'static str] {
         match self {

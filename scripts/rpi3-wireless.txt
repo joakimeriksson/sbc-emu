@@ -1,0 +1,64 @@
+# Raspberry Pi 3 Model B+ (milestone 5 of docs/rpi3-plan.md): the SD card on sdhost, the
+# CYW43455's Wi-Fi on the Arasan SDHCI (SDIO, brcmfmac with the image's own firmware) and its
+# Bluetooth on UART0 (hci_bcm over serdev, the image's patch RAM), both chips powered through the
+# firmware's GPIO expander (WL_ON, BT_ON). Raspberry Pi OS Lite's first-boot wizard on tty1 with
+# the USB keyboard, then on the serial console: NetworkManager joins the virtual access point
+# `sbc-emu` (open) and then `sbc-emu-wpa2` (WPA2-PSK), DHCP and ping over Wi-Fi with the Ethernet
+# disconnected; bluetoothctl powers the controller on and an LE scan finds "sbc-emu sensor".
+#   sbc-emu run --board pi3b --sd cache/os/raspios-lite.img --script scripts/rpi3-wireless.txt --timeout 900
+wait-serial raspberrypi login:
+sleep 8
+type \n
+sleep 6
+type pi\n
+sleep 6
+type raspberry\n
+sleep 6
+type raspberry\n
+sleep 8
+type \n
+sleep 10
+serial \r
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+# logged in: a snapshot to resume from (--restore out/rpi3-wireless.snap)
+save out/rpi3-wireless.snap
+# the hosts and what bound to them: the card on sdhost (mmc0), the Wi-Fi chip on the Arasan (mmc1)
+# (grep without colours, whose escape codes would split the lines waited for)
+serial unalias grep; echo $(cat /sys/bus/mmc/devices/mmc0:*/type /sys/bus/mmc/devices/mmc1:*/type /sys/bus/mmc/devices/mmc1:*/mmc1:*:1/device) HOSTS\r
+wait-serial SD SDIO 0xa9bf HOSTS
+# the drivers with the image's firmware files: brcmfmac's download, hci_bcm's patch RAM (sudo
+# runs commands on a pty of its own and swallows what is typed meanwhile: each step waits for
+# the previous one's output)
+serial echo raspberry | sudo -S true; sudo dmesg | grep -E 'brcmfmac: .*Firmware|Bluetooth: hci0: BCM' | cut -c 16- | head -6\r
+wait-serial raspberrypi,3-model-b-plus.hcd' Patch
+# the expander: WL_ON as the firmware left it, BT_ON raised by hci_bcm
+serial sudo grep -E 'BT_ON|WL_ON' /sys/kernel/debug/gpio | tr -s ' '; echo EXPANDER$((1))\r
+wait-serial EXPANDER1
+# Wi-Fi: rfkill-blocked until the country is set (raspi-config), as on a real board
+serial sudo rfkill unblock wifi; sudo nmcli radio wifi on; sleep 6; sudo nmcli dev disconnect eth0 > /dev/null; sleep 2; nmcli -t dev | grep -E 'wlan0|eth0'\r
+wait-serial wlan0:wifi:disconnected
+serial sudo nmcli dev wifi rescan; sleep 4; nmcli -f SSID,CHAN,SECURITY dev wifi list | grep sbc-emu | sort\r
+wait-serial sbc-emu-wpa2
+serial sudo nmcli dev wifi connect sbc-emu ifname wlan0 && sleep 4 && ip -4 -o addr show wlan0 | awk '{ print $2, $4 }'\r
+wait-serial successfully activated
+wait-serial wlan0 10.0.2.15/24
+serial ping -c 3 -W 2 -I wlan0 10.0.2.2 | tail -2 | head -1\r
+wait-serial 3 received, 0% packet loss
+serial echo $(cat /sys/class/net/wlan0/address) $(iw dev wlan0 info | grep -o 'ssid .*') WIFI_OK$((6 * 7))\r
+wait-serial 02:5b:c0:00:03:02 ssid sbc-emu WIFI_OK42
+# WPA2-PSK: the four-way handshake with the emulated firmware's authenticator
+serial sudo nmcli dev wifi connect sbc-emu-wpa2 password raspberry-pi ifname wlan0 && sleep 4 && ping -c 2 -W 2 -I wlan0 10.0.2.2 | tail -2 | head -1\r
+wait-serial 2 received, 0% packet loss
+# Bluetooth: hci0 on UART0 (serdev, no tty of its own); rfkill-blocked on a first boot like the
+# Wi-Fi; powered on, an LE scan
+serial ls /sys/class/bluetooth; ls /dev/ttyAMA* 2>&1 | head -1; sudo rfkill unblock bluetooth; sleep 2; bluetoothctl power on\r
+wait-serial Changing power on succeeded
+serial timeout 8 bluetoothctl scan le > /dev/null; bluetoothctl devices | grep sensor\r
+wait-serial Device C2:5B:BC:E0:00:01 sbc-emu sensor
+serial echo BT_DONE$((6 * 7))\r
+wait-serial BT_DONE42
+quit
