@@ -37,6 +37,8 @@ pub const PERIPH: u64 = 0x3f00_0000;
 pub const ASB: u64 = 0x3f00_a000;
 pub const ARMCTRL: u64 = 0x3f00_b200;
 pub const MBOX: u64 = 0x3f00_b880;
+/// VCHIQ's doorbells (`brcm,bcm2835-vchiq`)
+pub const VCHIQ: u64 = 0x3f00_b840;
 pub const PM: u64 = 0x3f10_0000;
 pub const RNG: u64 = 0x3f10_4000;
 pub const UART0: u64 = 0x3f20_1000;
@@ -66,6 +68,8 @@ pub const V3D: u64 = 0x3fc0_0000;
 pub const LOCAL: u64 = 0x4000_0000;
 /// ARM-side interrupt numbers (bank 0)
 pub const ARM_MAILBOX: usize = 1;
+/// the ARM's doorbell 0: VCHIQ
+pub const ARM_DOORBELL0: usize = 2;
 /// GPU interrupt numbers (banks 1 and 2 of the ARM-side controller)
 pub const GPU_USB: usize = 9;
 pub const GPU_V3D: usize = 10;
@@ -156,6 +160,10 @@ pub struct Soc {
     pub audio: Vec<i16>,
     pub audio_rate: u32,
     pub capture_audio: bool,
+    /// the VideoCore firmware's side of VCHIQ: its media components and audio service
+    pub vchiq: crate::vchiq::Vchiq,
+    /// virtual time of the last device update (ns): what the VideoCore's services see
+    pub now: u64,
     pub unknown: Vec<u64>,
     /// a device register was touched: interrupt lines must be re-derived
     pub dirty: bool,
@@ -174,6 +182,7 @@ impl Soc {
             UART0..=0x3f20_1fff => self.uart.read(a - UART0),
             AUX..=0x3f21_50ff => self.aux.read(a - AUX),
             MBOX..=0x3f00_b8bf => self.mbox.read(a - MBOX),
+            VCHIQ..=0x3f00_b87f => self.vchiq.read(a - VCHIQ),
             ARMCTRL..=0x3f00_b3ff => self.armctrl.read(a - ARMCTRL),
             SDHCI..=0x3f30_00ff => self.sd.read(a - SDHCI),
             USB..=0x3f98_ffff => self.usb.read(a - USB),
@@ -207,7 +216,11 @@ impl Soc {
         match a {
             UART0..=0x3f20_1fff => self.uart.write(a - UART0, v),
             AUX..=0x3f21_50ff => self.aux.write(a - AUX, v),
-            MBOX..=0x3f00_b8bf => self.mbox.write(a - MBOX, v, &mut self.ram),
+            MBOX..=0x3f00_b8bf => {
+                self.mbox.write(a - MBOX, v, &mut self.ram);
+                if let Some(base) = self.mbox.vchiq_init.take() { self.vchiq.init(&mut self.ram, base); }
+            }
+            VCHIQ..=0x3f00_b87f => self.vchiq.write(a - VCHIQ, v, &mut self.ram, self.now),
             ARMCTRL..=0x3f00_b3ff => self.armctrl.write(a - ARMCTRL, v),
             USB..=0x3f98_ffff => self.usb.write_bus(a - USB, v, &mut self.ram, &mut TreeBus { tree: &mut self.tree, devs: &mut self.devs }),
             RNG..=0x3f10_400f => self.rng.write(a - RNG, v),
@@ -239,6 +252,14 @@ impl Soc {
         self.armctrl.set_gpu(GPU_SDHCI, self.sd.irq());
         self.armctrl.set_gpu(GPU_USB, self.usb.irq());
         self.armctrl.set_arm(ARM_MAILBOX, self.mbox.irq());
+        self.now = self.now.max(now);
+        self.vchiq.tick(&mut self.ram, now);
+        if !self.vchiq.audio.out.is_empty() {
+            // the headphone jack's audio goes where HDMI's does (`--audio-out`)
+            let a = &mut self.vchiq.audio;
+            if self.capture_audio { self.audio_rate = a.rate; self.audio.extend(a.out.drain(..)); } else { a.out.clear(); }
+        }
+        self.armctrl.set_arm(ARM_DOORBELL0, self.vchiq.irq());
         if self.pace_next.is_some_and(|t| now >= t) { self.dma_pace(now); }
         for n in 0..11 { self.armctrl.set_gpu(GPU_DMA0 + n, self.dma.irq(n)); }
         self.armctrl.set_gpu(GPU_DMA0 + 11, (11..15).any(|k| self.dma.irq(k)));
@@ -268,7 +289,7 @@ impl Soc {
     /// The next device deadline.
     pub(crate) fn next_event(&self) -> Option<u64> {
         let vc4 = self.vc4.as_ref().and_then(|v| v.next_event());
-        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4].into_iter().flatten().min()
+        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4, self.vchiq.next_event()].into_iter().flatten().min()
     }
 
     /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns): the HDMI
@@ -484,7 +505,7 @@ impl Machine {
             usb: { let mut d = Dwc2::new(); d.port = None; d }, devs: Devices::default(), tree: UsbTree::new(), net: None, asb: [0; 12],
             gpio: bcm2711::gpio::Gpio::new(), dma: bcm2711::dma::Dma::new(), pace_next: None, ddc: bcm2711::i2c::I2c::with_devices(Vec::new()), vc4: None,
             outputs: Default::default(),
-            audio: Vec::new(), audio_rate: 0, capture_audio: false,
+            audio: Vec::new(), audio_rate: 0, capture_audio: false, vchiq: crate::vchiq::Vchiq::new(), now: 0,
             unknown: Vec::new(), dirty: true,
         };
         let mut m = Machine { model, cpus: Vec::new(), state: vec![CoreState::Off; ncpu], soc, now: 0, exceptions: 0, irqs: 0, cur: 0, next_check: 0,
@@ -496,6 +517,7 @@ impl Machine {
         // state machine), VEC (composite, 108 MHz)
         m.soc.mbox.clocks = &[3, 4, 5, 9, 13, 15];
         m.soc.mbox.rates[3] = model.arm_mhz() * 1_000_000;
+        m.soc.mbox.vchiq = true;
         // nothing on HDMI's hot-plug line until a monitor is plugged in (`enable_kms`)
         m.soc.gpio.set_input(28, Some(true));
         m.soc.mbox.exp_gpio_in = 1 << 4;
@@ -958,7 +980,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Result<Vec<u8>, String> {
         let mut w = emu_core::snap::W::default();
-        w.tag("pi3-machine-v3");
+        w.tag("pi3-machine-v4");
         w.u8(self.model as u8);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -982,6 +1004,8 @@ impl Machine {
         self.soc.dma.save_state(&mut w);
         w.bool(self.soc.vc4.is_some());
         if let Some(v) = self.soc.vc4.as_ref() { v.save_state(&mut w); }
+        // v4: VCHIQ and the VideoCore's services
+        self.soc.vchiq.save_state(&mut w);
         emu_core::snap::save_ram(&mut w, &self.soc.ram);
         let mut out = SNAP_MAGIC.to_vec();
         out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&w.0, 1));
@@ -994,7 +1018,12 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("the snapshot is damaged ({:?})", e.status))?;
         let e = |e: emu_core::snap::SnapError| e.0;
         let mut r = emu_core::snap::R::new(&raw);
-        let v3 = match r.bytes().map_err(e)? { b"pi3-machine-v3" => true, b"pi3-machine-v2" => false, _ => return Err("snapshot layout mismatch: not a Raspberry Pi 3 machine state".into()) };
+        let (v3, v4) = match r.bytes().map_err(e)? {
+            b"pi3-machine-v4" => (true, true),
+            b"pi3-machine-v3" => (true, false),
+            b"pi3-machine-v2" => (false, false),
+            _ => return Err("snapshot layout mismatch: not a Raspberry Pi 3 machine state".into()),
+        };
         let model = r.u8().map_err(e)?;
         if model != self.model as u8 { return Err(format!("the snapshot is of another model (this machine: --model {})", self.model.id())); }
         let (now, exceptions, irqs) = (r.u64().map_err(e)?, r.u64().map_err(e)?, r.u64().map_err(e)?);
@@ -1037,6 +1066,8 @@ impl Machine {
             if let Some(on) = self.soc.vc4.as_ref().map(|v| v.connected) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
             self.soc.pace_next = Some(0);
         }
+        self.soc.vchiq = crate::vchiq::Vchiq::new();
+        if v4 { self.soc.vchiq.load_state(&mut r).map_err(e)?; }
         emu_core::snap::load_ram(&mut r, &mut self.soc.ram).map_err(e)?;
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }
         self.next_check = 0;

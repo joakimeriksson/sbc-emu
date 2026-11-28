@@ -4,13 +4,19 @@
 //! BCM2711 (mailbox, SD host, mini UART, PL011, watchdog) come from the `bcm2711` crate with
 //! this SoC's addresses and interrupt numbers; only what the reduced device tree (`fdt.rs`)
 //! describes is modelled, the rest of the peripheral window reads as zero and is logged once.
+//! The VideoCore firmware's services reached through VCHIQ (`vchiq.rs`: MMAL media components,
+//! shared memory, audio) are modelled on the host side of that queue.
 pub mod boot;
 pub mod fdt;
 pub mod intc;
 pub mod machine;
+pub mod mmal;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod mt;
 pub mod periph;
+pub mod vcaudio;
+pub mod vchiq;
+pub mod video;
 
 pub use machine::{CoreState, Machine, Stop};
 
@@ -77,6 +83,6 @@ impl Model {
     /// How this board's firmware reads `config.txt` and `cmdline.txt`: serial0 is the mini
     /// UART (the PL011 is wired to Bluetooth on every member), 32-bit kernels by default.
     pub fn firmware(self) -> bcm2711::boot::Firmware<'static> {
-        bcm2711::boot::Firmware { sections: self.config_sections(), arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true }
+        bcm2711::boot::Firmware { sections: self.config_sections(), arm64_default: false, serial0: "ttyS0", serial1: "ttyAMA0", kms: true, composite: true, audio: true }
     }
 }
