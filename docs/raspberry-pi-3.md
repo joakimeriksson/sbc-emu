@@ -48,9 +48,11 @@ card.
 
 The VideoCore IV model renders a job's tiles, and runs its vertex and coordinate shaders, on
 several host threads (`SBC_VC4_THREADS`, default the host's cores minus two, at most 16; the
-browser stays on one), as the Pi 4's V3D model does; the QPUs are interpreted, with a fast path
-for plain ALU instructions ([details](raspberry-pi-3-gpu.md#parallel-rendering)). Images are
-byte-identical with 1 and 16 threads and with `--threads multi`.
+browser stays on one), as the Pi 4's V3D model does ([details](raspberry-pi-3-gpu.md#parallel-rendering)),
+and its QPU programs run as native code or WebAssembly through the
+[QPU JIT](raspberry-pi-3-gpu.md#qpu-jit) (`simd-jit/`, shared with the Pi 4; `SBC_VC4_JIT=0`
+interprets them). Images are byte-identical with 1 and 16 threads, with `--threads multi`, and
+with the JIT and without.
 
 glmark2-es2-drm at 1920×1080 (`scripts/rpi3-glmark2-scenes.txt`: the Pi 4's scenes, 5 s each,
 from the snapshot of `scripts/rpi3-v3d.txt`, `--threads multi` so the guest's clock is the host's;
@@ -72,11 +74,32 @@ same in two rounds within 1–3 fps):
 | Score | 10 | 15 | 76 |
 
 ("before" is the first build of this work with the parallel rendering on one thread, before the QPU
-fast path, texture setup cache and faster tile stores, at load 13–16.) **What limits it now**, on
-every worker: the interpreted QPUs (35–63% of a frame's host time), the TMU in textured scenes
-(27–53%), and the binning after the coordinate shader, which stays on one thread and keeps the
-light scenes (build, bump, shadow) from scaling further. A QPU JIT would be worth 1.2–1.9x per
-frame by [this estimate](raspberry-pi-3-gpu.md#would-a-qpu-jit-be-next).
+fast path, texture setup cache and faster tile stores, at load 13–16.)
+
+**With the QPU JIT** (the same scenes and snapshot, `SBC_VC4_JIT=0` against the default; the host
+loaded by other sessions to 17–34 during these runs, so the frame rates are lower than in the table
+above, which was taken at load 5–15):
+
+| Scene | 1 thread, interpreted | 1 thread, JIT | 16 threads, interpreted | 16 threads, JIT |
+|---|---|---|---|---|
+| build | 54 fps | 63 fps | 171 fps | 198 fps |
+| texture (linear) | 27 fps | 34 fps | 152 fps | 189 fps |
+| shading (phong) | 17 fps | 29 fps | 77 fps | 104 fps |
+| bump (high-poly) | 14 fps | 13 fps | 42 fps | 35 fps |
+| effect2d (3×3 kernel) | 4 fps | 5 fps | 30 fps | 44 fps |
+| desktop (shadow) | 4 fps | 5 fps | 25 fps | 32 fps |
+| jellyfish | 5 fps | 7 fps | 29 fps | 42 fps |
+| shadow | 13 fps | 18 fps | 56 fps | 66 fps |
+| refract | 580 ms/frame | 352 ms/frame | 107 ms/frame | 93 ms/frame |
+| terrain | 3031 ms/frame | 2198 ms/frame | 442 ms/frame | 325 ms/frame |
+| Score | 13 | 16 | 58 | 71 |
+
+A second round at load 20–32 gave scores of 11 and 15 (1 thread) and 35 and 52 (16 threads); single
+scenes move by a few fps between rounds (bump: 14 and 13 fps in the first, 12 and 16 in the second).
+Per frame the JIT gains what the replays show ([details](raspberry-pi-3-gpu.md#what-the-qpu-jit-gained)):
+1.6–1.7x in the shading-bound scenes on one thread, less where binning, the TMU and the tile stores
+are most of a frame. **What limits it now** is the rasterizer and the TMU on every worker, and the
+binning after the coordinate shader, which stays on one thread.
 
 ## The emulated hardware
 

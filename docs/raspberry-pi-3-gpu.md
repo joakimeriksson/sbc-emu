@@ -100,27 +100,33 @@ into r4, per-element load immediates. A block's registers are read once and writ
 end, flags likewise, and equal values are made once; a flush of a value that cannot be denormal
 is dropped (before that, flushes were half of a fragment shader's IR).
 
-A block takes ALU instructions and load immediates whose reads and writes stay in the QPU, plus
-what the hardware hands over in order, which is fetched just before the block runs, in the order
-the interpreter would fetch it: uniforms, varyings (their C coefficients into r5), pixel
-coordinates and multisample flags, TMU results and colour, coverage and alpha-mask loads into r4.
-It ends before a branch, a semaphore, the program end, a VPM or mutex read, a write to r5, the
-TMU, the TLB, the VPM, the uniforms address or the host interrupt; those, branch delay slots and
-the instructions after a program end run in the interpreter. Fragment shaders run mostly in
-blocks (glmark2's phong shader: 92% of its instructions, 35 a block; effect2d's texture-heavy
-one: 67%, 7 a block). Blocks are compiled once per run of instruction words (a global cache) and
-found by address in each worker's cache, which keeps them from job to job and compares their
-words with memory again once per job. `SBC_VC4_JIT=0` turns it off.
+A block takes ALU instructions and load immediates, including what the hardware hands over in
+order. That is fetched just before the block runs, in the order the interpreter would fetch it:
+uniforms, varyings (their C coefficients into r5), pixel coordinates and multisample flags, VPM
+reads, TMU results and colour, coverage and alpha-mask loads into r4. Writes outside the QPU
+(TMU, TLB, VPM and its setups, the uniforms address, the host interrupt, the mutex) are outputs
+of the block, which the interpreter's `write` performs after it, in order. After such a write a
+block takes no fetch that the write may change: after a TMU write no uniform or TMU result, after
+a VPM write no VPM read, after a TLB write no tile-buffer or coverage load. A program end is in a
+block only together with its two delay slots, and the program stops with that block. A block ends
+before a branch, a semaphore, a mutex read, a write to r5 (its replication moves data between
+lanes) or a rotation by r5. Those, and branch delay slots, run in the interpreter. In glmark2's
+scenes 99–100% of the QPU instructions run in blocks (phong: 82 a block; effect2d's
+texture-heavy shader: 9; terrain: 15). Blocks are compiled once per run of instruction words (a
+global cache) and found by address in each worker's cache. A worker keeps its blocks from job to
+job and compares their words with memory again once per job. `SBC_VC4_JIT=0` turns it off.
 
-**Checks:** `cargo test -p simd-jit` (random IR blocks, natively compiled, against the IR's
-evaluation; every half both ways), `cargo test -p vc4-3d jit` (random QPU programs of every
-operation, pack, unpack, signal, condition and fetch the JIT takes, with instructions it does not
-take between them, run with the JIT and with the interpreter from the same random state: every
-register, accumulator, flag, the uniform pointer, the TMU queues and the order of the
-environment's answers must match; code changed between jobs is not run again),
-`node tools/wasm-qpu-jit-check.mjs` (both, in the browser build), and the replays below:
-every frame and every job's statistics are the same with the JIT and without, on 1 and 16
-threads.
+**Checks:** `cargo test -p simd-jit` (random IR blocks, compiled natively, against the IR's
+evaluation; every half both ways; the host's FPCR ignored), `cargo test -p vc4-3d jit` (random
+QPU programs of every operation, pack, unpack, signal, condition, fetch and write outside the QPU
+that the JIT takes, with instructions it leaves to the interpreter between them, run with the
+JIT and with the interpreter from the same random state; every register, accumulator and flag,
+the uniform pointer, the TMU's queues, the VPM and its setups, memory and the environment's
+sequences must match. The environment's answers follow a sequence that every TLB write changes,
+so a write or a fetch out of order shows. Code changed between jobs is not run again.)
+`node tools/wasm-qpu-jit-check.mjs` runs both in the browser build. In the replays below, every
+frame and every job's statistics are the same with the JIT and without, on 1 and 16 threads and
+in the browser build.
 
 ## Tests
 
@@ -210,24 +216,44 @@ for starting the workers. A 1080p rendering job alone scales 8–10x (terrain's 
 from 706 to 478 ms on one thread.) The fast path takes 63% (effect2d) to 96% (phong) of the ALU
 instructions; the rest are colour packs and texture-result unpacks on the general path.
 
-### Would a QPU JIT be next?
+### What the QPU JIT gained
 
-The QPUs are still interpreted, on every worker. A shader JIT like the Jetson Nano's
-(`maxwell-shader/`: AArch64 and WebAssembly backends) would compile each QPU program once per job
-(Mesa's are tens to a few hundred instructions), keep
-each 16-lane register in four NEON registers, and resolve operands, conditions, flags and
-packs at compile time. Of the QPU time above, a third to a half is the lane arithmetic itself;
-the rest is dispatch, operand copies and the general path's packing. Estimate: QPU time 2.5–4x
-lower, so frames on one thread about **1.6–1.9x faster in ALU-bound scenes** (phong), **1.4–1.55x** in
-texture-heavy ones (effect2d, jellyfish), **1.2–1.4x** in terrain and build, where the TMU and the tile stores remain. With 16 threads the rendering
-jobs gain about as much, the frame rate a little less (binning stays serial): roughly a
-glmark2 score of 90–110 instead of 70. In the browser, which renders on one thread, the
-WebAssembly backend matters more than the native one.
+The same replays with the JIT (`SBC_VC4_JIT=0` against the default; best of two, alternating,
+host load 10–13; `vc4-replay` of this build). Every frame and every job's statistics are the same
+in all four runs of each scene:
 
-So the JIT is the largest single step left, but the TMU (texel addressing, format decoding,
-filtering per lane: up to half of a frame in texture-heavy scenes) is a cheaper one of a similar
-size there: fetch paths per format and layout and integer bilinear filtering would take a good
-part of it without a code generator.
+| Scene | 1 thread, interpreted | 1 thread, JIT | | 16 threads, interpreted | 16 threads, JIT | |
+|---|---|---|---|---|---|---|
+| build | 647 ms | 571 ms | 1.13x | 262 ms | 250 ms | 1.05x |
+| texture (linear) | 676 ms | 537 ms | 1.26x | 156 ms | 144 ms | 1.09x |
+| shading (phong) | 687 ms | 422 ms | 1.63x | 167 ms | 129 ms | 1.29x |
+| bump (high-poly) | 746 ms | 554 ms | 1.35x | 251 ms | 260 ms | 0.96x |
+| effect2d (3×3 kernel) | 1284 ms | 753 ms | 1.71x | 134 ms | 104 ms | 1.30x |
+| desktop (shadow) | 1152 ms | 864 ms | 1.33x | 192 ms | 159 ms | 1.21x |
+| jellyfish | 967 ms | 631 ms | 1.53x | 162 ms | 115 ms | 1.40x |
+| shadow | 649 ms | 507 ms | 1.28x | 216 ms | 195 ms | 1.11x |
+| refract | 793 ms | 573 ms | 1.38x | 199 ms | 176 ms | 1.13x |
+| terrain | 4028 ms | 2978 ms | 1.35x | 523 ms | 398 ms | 1.31x |
+
+On one thread this is what the estimate expected for the ALU-bound and texture-heavy scenes
+(1.6–1.7x for phong and effect2d), and in the scenes with little shading the binning, the tile
+stores and the rasterizer were and remain most of a frame. With 16 threads the serial parts
+(binning, the tile stores between jobs, starting the workers) weigh more. The browser build, in
+Node (V8, as Chrome), one thread, `tools/wasm-vc4-replay.mjs` on the same captures (frames
+identical):
+
+| Scene | interpreted | JIT | |
+|---|---|---|---|
+| build | 868 ms | 758 ms | 1.15x |
+| texture (linear) | 969 ms | 811 ms | 1.20x |
+| shading (phong) | 841 ms | 449 ms | 1.87x |
+| bump (high-poly) | 938 ms | 620 ms | 1.51x |
+| effect2d (3×3 kernel) | 1727 ms | 1223 ms | 1.41x |
+| desktop (shadow) | 3122 ms | 2303 ms | 1.36x (run again on its own: the first round overlapped a build) |
+| jellyfish | 1527 ms | 1046 ms | 1.46x |
+| shadow | 1007 ms | 802 ms | 1.25x |
+| refract | 1155 ms | 798 ms | 1.45x |
+| terrain | 6494 ms | 5068 ms | 1.28x |
 
 ## Results in the guest
 
@@ -289,5 +315,8 @@ caps a job's time: the table in [raspberry-pi-3.md](raspberry-pi-3.md#3d-gpu-spe
 ## Remaining
 
 - The desktop (Pi OS with desktop, labwc) on the GPU.
-- A QPU JIT (AArch64 and WebAssembly): 1.2–1.9x per frame by the [estimate](#would-a-qpu-jit-be-next); faster TMU paths.
+- Faster TMU paths (texel addressing, format decoding and filtering per lane: now the largest
+  part of a frame in the textured scenes).
+- The QPU JIT: blocks across branches (loops stay in the interpreter), and the AArch64 backend
+  on x86-64 hosts (there the QPUs are interpreted).
 - Binning after the coordinate shader is serial.
