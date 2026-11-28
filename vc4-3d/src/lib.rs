@@ -265,6 +265,8 @@ pub struct V3d {
     pub time_scale: f64,
     /// cores on host threads: jobs run on the GPU thread
     pub wall_clock: bool,
+    /// replay: record the pages jobs write (`Exec::track`)
+    pub tracking: bool,
     gen: u64,
     #[cfg(not(target_arch = "wasm32"))]
     worker: Option<Worker>,
@@ -280,7 +282,7 @@ impl V3d {
         V3d {
             regs: vec![0; SIZE as usize / 4], intctl: 0, intena: 0, exec: std::sync::Arc::new(std::sync::Mutex::new(Exec::new())),
             sem: 0, pending_bin: None, running: [false; 2], pending: Vec::new(), user: user::Sched::new(), now: 0,
-            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false, gen: 0,
+            time_scale: std::env::var("SBC_GPU_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0), wall_clock: false, tracking: false, gen: 0,
             #[cfg(not(target_arch = "wasm32"))] worker: None,
         }
     }
@@ -372,8 +374,7 @@ impl V3d {
                 let unif = self.regs[SRQUA / 4];
                 self.user.push(v, unif);
                 let mut m = Mem::new(ram);
-                let mut e = self.exec.lock().unwrap_or_else(|e| e.into_inner());
-                self.user.run(&mut m, &mut e.code);
+                self.user.run(&mut m);
             }
             SRQCS => {
                 if v & 1 << 7 != 0 { self.user.error = false; }
@@ -449,10 +450,10 @@ impl V3d {
         let Some(mut p) = self.pending_bin.take() else { return };
         let mut bpo = (self.regs[BPOA / 4], self.regs[BPOS / 4]);
         let mut m = Mem::new(ram);
-        let track = self.exec().track.take();
-        m.written = track;
+        // (replay only: the exec lock is free then; a GPU thread may hold it otherwise)
+        if self.tracking { m.written = self.exec().track.take(); }
         let r = p.w.write(&p.out, &mut bpo, &mut m);
-        self.exec().track = m.written.take();
+        if self.tracking { self.exec().track = m.written.take(); }
         self.regs[BPOA / 4] = bpo.0;
         self.regs[BPOS / 4] = bpo.1;
         if p.w.spilled { self.intctl |= INT_SPILLUSE; }

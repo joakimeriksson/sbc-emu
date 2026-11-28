@@ -740,3 +740,41 @@ fn bench_full_hd() {
     let el = t.elapsed();
     eprintln!("1080p frame: {:.1} ms; {}", el.as_secs_f64() * 1e3 / reps as f64, v.stats());
 }
+
+/// With the cores on host threads, jobs run on the GPU thread: the register write returns at
+/// once, the binning job's lists are laid out when its result is collected, and the done
+/// interrupts come when the jobs have finished.
+#[test]
+fn gpu_thread_jobs() {
+    let (w, h) = (128, 128);
+    let mut s = Scene::new(w, h);
+    s.begin(ALL_FACES);
+    s.draw(&rect(w, h, 10.0, 10.0, 100.0, 100.0, 0.0), 0, &flat_fs(false), &[BLUE], cl::PRIM_TRIANGLES, None);
+    s.bcl.u8(cl::INCREMENT_SEMAPHORE).u8(cl::FLUSH);
+    let bcl = std::mem::take(&mut s.bcl).0;
+    put(&mut s.ram, BCL, &bcl);
+    let rcl = s.rcl(true);
+    put(&mut s.ram, RCL, &rcl);
+    let mut v = V3d::new();
+    v.wall_clock = true;
+    let wait = |v: &mut V3d, ram: &mut Vec<u8>, bit: u32| {
+        let t0 = std::time::Instant::now();
+        while v.read(INTCTL as u64) & bit == 0 {
+            v.tick(0, ram);
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "no interrupt {bit:#x}");
+            std::thread::yield_now();
+        }
+    };
+    v.write(BPOA as u64, OVERFLOW | BUS, &mut s.ram);
+    v.write(BPOS as u64, 0x8_0000, &mut s.ram);
+    v.write(CT0CA as u64, BCL | BUS, &mut s.ram);
+    v.write(CT0EA as u64, (BCL + bcl.len() as u32) | BUS, &mut s.ram);
+    wait(&mut v, &mut s.ram, INT_FLDONE);
+    assert_eq!(v.read(CT0CA as u64), (BCL + bcl.len() as u32) | BUS);
+    v.write(CT1CA as u64, RCL | BUS, &mut s.ram);
+    v.write(CT1EA as u64, (RCL + rcl.len() as u32) | BUS, &mut s.ram);
+    wait(&mut v, &mut s.ram, INT_FRDONE);
+    assert!(!v.busy());
+    assert_eq!(s.pixel(50, 50), BLUE);
+    assert_eq!(s.pixel(5, 50), s.clear);
+}

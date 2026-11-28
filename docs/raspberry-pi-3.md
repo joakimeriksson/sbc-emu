@@ -87,7 +87,10 @@ code, model string and `config.txt` sections so far, and are untested), `--smp N
 - No USB: the DWC2 host, the LAN7515 hub and Ethernet (milestone 3), so no keyboard and no network.
   Pi OS logs in only on the serial console, and the image's first-boot user setup has no
   keyboard to run on: there is no account to log in with yet.
-- No HDMI or KMS (`dtoverlay=vc4-kms-v3d` is ignored), no VideoCore IV 3D, no video decode.
+- No HDMI or KMS (`dtoverlay=vc4-kms-v3d` is ignored), no video decode. The VideoCore IV 3D GPU
+  is modelled and tested on the host ([raspberry-pi-3-gpu.md](raspberry-pi-3-gpu.md)), but Linux's
+  `vc4` can use it only together with the display pipeline: its device-tree node stays disabled
+  until then.
 - No Wi-Fi or Bluetooth (the PL011 is a plain serial port), no `sdhost`.
 - No GPIO, I²C, SPI, PCM/I²S, DMA controller or system timer in the device tree.
 - 32-bit kernels (`kernel7.img`, `arm_64bit=0`) are not supported.

@@ -65,6 +65,7 @@ pub fn replay(jobs: &[Captured], ram: &mut [u8]) -> Vec<crate::tlb::Frame> {
     let mut v = V3d::new();
     v.time_scale = 0.0;
     v.exec().track = Some(Default::default());
+    v.tracking = true;
     let mut frames = Vec::new();
     let overflow = (ram.len() as u32).saturating_sub(8 << 20);
     let mut next = overflow;

@@ -57,6 +57,7 @@ sbc-net/        virtual network: DHCP/ARP/ICMP/DNS/NTP, user-mode NAT, 802.11 AP
 bcm2711/        the Pi 4 machine: GIC, PL011, mailbox, SDHCI, DWC2, PCIe + xHCI, USB devices, I²S, Bluetooth, Wi-Fi,
                 GENET, HDMI, device tree, boot, FAT
 v3d/            the V3D 4.2 3D GPU (packets generated from Mesa's v3d_packet.xml by tools/gen_v3d_packets.py)
+vc4-3d/         the VideoCore IV 3D GPU (V3D 2.1) of the Pi 3: control lists, binner, rasterizer, tile buffer, QPU, TMU, VPM; vc4-replay for captured jobs
 rk3588/         the Orange Pi 5 machine (RK3588S): GICv3, UART2, timer, SD (DW MMC), GMAC, USB 3.0 xHCI, PCIe + NVMe, VOP2 + HDMI QP, I²S + ES8388 audio, SCMI, and the Mali-G610 GPU (gpu*.rs)
 allwinner-h3/   the Orange Pi One machine (H3): four cores, GIC-400, UART0, CCU, timers, SD/MMC, HDMI (DE2 mixer, TCON, DW-HDMI), USB (OHCI with keyboard and tablet, EHCI), Ethernet (EMAC, internal PHY), host PSCI, U-Boot-style DTB patching
 mali400/        the Mali-400 MP2 GPU (Utgard): GP vertex shader and PLBU, PP fragment shader, tiles, MMUs, as Linux's and Mesa's lima drivers use it

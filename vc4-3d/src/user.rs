@@ -13,7 +13,6 @@ pub const QPUS: usize = 12;
 /// VPM size: 12 KiB, 192 rows of 16 words.
 pub const VPM_WORDS: usize = 12 * 1024 / 4;
 
-#[derive(Clone)]
 pub struct Sched {
     pub queue: VecDeque<(u32, u32)>,
     pub running: Vec<Option<Qpu>>,
@@ -27,6 +26,8 @@ pub struct Sched {
     /// QPU host interrupts raised (bit per QPU)
     pub host_int: u32,
     pub insns: u64,
+    /// decoded programs (separate from the GL jobs' cache, which a GPU thread may hold)
+    code: Code,
 }
 
 impl Default for Sched { fn default() -> Self { Sched::new() } }
@@ -59,7 +60,7 @@ impl Env for UserEnv<'_> {
 
 impl Sched {
     pub fn new() -> Sched {
-        Sched { queue: VecDeque::new(), running: vec![None; QPUS], sem: [0; 16], mutex: None, vpm: vec![0; VPM_WORDS], made: 0, completed: 0, error: false, host_int: 0, insns: 0 }
+        Sched { queue: VecDeque::new(), running: vec![None; QPUS], sem: [0; 16], mutex: None, vpm: vec![0; VPM_WORDS], made: 0, completed: 0, error: false, host_int: 0, insns: 0, code: Code::default() }
     }
 
     pub fn reset(&mut self) { *self = Sched::new(); }
@@ -74,7 +75,8 @@ impl Sched {
 
     /// Run queued and waiting programs until each has ended or waits with nothing left that
     /// could wake it.
-    pub fn run(&mut self, mem: &mut Mem, code: &mut Code) {
+    pub fn run(&mut self, mem: &mut Mem) {
+        self.code.clear();
         const SLICE: u64 = 4096;
         let mut budget: u64 = 200_000_000;
         loop {
@@ -94,7 +96,7 @@ impl Sched {
                 let Some(mut q) = self.running[k].take() else { continue };
                 let before = q.insns;
                 let mut env = UserEnv { me: k, vpm: &mut self.vpm, sem: &mut self.sem, mutex: &mut self.mutex, host_int: &mut self.host_int };
-                let stop = q.run(code, mem, &mut env, SLICE);
+                let stop = q.run(&mut self.code, mem, &mut env, SLICE);
                 let ran = q.insns - before;
                 self.insns += ran;
                 crate::progress(ran);
