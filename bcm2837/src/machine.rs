@@ -169,6 +169,8 @@ pub struct Soc {
     pub tree: UsbTree,
     /// the network behind the Ethernet port (`connect_network`)
     pub net: Option<sbc_net::net::VirtualNet>,
+    /// the VideoCore IV 3D GPU (`vc4-3d`)
+    pub v3d: vc4_3d::V3d,
     /// AXI bridge (ASB) control registers
     asb: [u32; 12],
     pub gpio: bcm2711::gpio::Gpio,
@@ -216,6 +218,7 @@ impl Soc {
             RNG..=0x3f10_400f => self.rng.read(a - RNG),
             THERMAL..=0x3f21_2007 => self.thermal.read(a - THERMAL),
             PM..=0x3f10_0113 => self.pm.read(a - PM),
+            V3D..=0x3fc0_0fff => self.v3d.read(a - V3D),
             // AXI bridges (ASB): the ID register; a stop request (bit 0) is acknowledged (bit 1) at once
             GPIO..=0x3f20_00b3 => self.gpio.read(a - GPIO),
             DMA..=0x3f00_7fff => self.dma.read(a - DMA),
@@ -255,6 +258,7 @@ impl Soc {
             RNG..=0x3f10_400f => self.rng.write(a - RNG, v),
             THERMAL..=0x3f21_2007 => self.thermal.write(a - THERMAL, v),
             PM..=0x3f10_0113 => self.pm.write(a - PM, v),
+            V3D..=0x3fc0_0fff => self.v3d.write(a - V3D, v, &mut self.ram),
             ASB..=0x3f00_a02f => self.asb[((a & 0xff) / 4) as usize % 12] = v & 0x00ff_ffff,
             GPIO..=0x3f20_00b3 => self.gpio.write(a - GPIO, v),
             DMA..=0x3f00_7fff => if let Some(n) = self.dma.write(a - DMA, v) { self.dma_run(n) },
@@ -320,6 +324,8 @@ impl Soc {
             self.armctrl.set_gpu(GPU_HVS, v.irq_hvs());
             self.armctrl.set_gpu(GPU_HDMI0, v.irq_hdmi());
         }
+        self.v3d.tick(now, &mut self.ram);
+        self.armctrl.set_gpu(GPU_V3D, self.v3d.irq());
         self.pm.now = now;
         // nothing reads a spare UART0's output: keep it from growing without bound
         if self.uart.out.len() > 1 << 16 { self.uart.out.clear(); }
@@ -331,7 +337,7 @@ impl Soc {
     pub(crate) fn next_event(&self) -> Option<u64> {
         let vc4 = self.vc4.as_ref().and_then(|v| v.next_event());
         let bt = self.bt.as_ref().and_then(|b| b.next_event());
-        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4, bt, self.vchiq.next_event()].into_iter().flatten().min()
+        [self.pm.next_event(), self.usb.next_event(), self.pace_next, vc4, bt, self.vchiq.next_event(), self.v3d.next_event()].into_iter().flatten().min()
     }
 
     /// Feed DREQ-paced DMA channels what their peripherals asked for up to `now` (ns): the HDMI
@@ -607,7 +613,7 @@ impl Machine {
         let soc = Soc {
             ram: vec![0; ram_arm_visible], arm_ram, cur: 0, local: LocalIntc::new(), armctrl: ArmCtrl::new(), uart: Pl011::new(), aux: AuxUart::new(),
             mbox, sd: Sdhost::new(None), sdhci: Sdhci::new(None), wireless: model.wireless(), wifi_trace: false, wifi_net: None, bt: None,
-            rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(),
+            rng: crate::periph::Rng::new(), thermal: crate::periph::Thermal::new(), pm: Pm::new(), v3d: vc4_3d::V3d::new(),
             usb: { let mut d = Dwc2::new(); d.port = None; d }, devs: Devices::default(), tree: UsbTree::new(), net: None, asb: [0; 12],
             gpio: bcm2711::gpio::Gpio::new(), dma: bcm2711::dma::Dma::new(), pace_next: None, ddc: bcm2711::i2c::I2c::with_devices(Vec::new()), vc4: None,
             outputs: Default::default(),
@@ -642,9 +648,9 @@ impl Machine {
         self.soc.set_hdmi_connected(self.model, true);
     }
 
-    /// The VideoCore IV 3D block is modelled (the device tree then lists it next to the display
-    /// pipeline). Not yet: the `vc4-3d` crate hooks in here.
-    pub fn has_v3d(&self) -> bool { false }
+    /// The VideoCore IV 3D block is modelled (`vc4-3d`): the device tree lists it next to the
+    /// display pipeline, for vc4's DRM device to bind as one of its components.
+    pub fn has_v3d(&self) -> bool { true }
 
     /// Plug the HDMI monitor in or out (the driver polls the hot-plug line).
     pub fn set_hdmi_connected(&mut self, on: bool) { let m = self.model; self.soc.set_hdmi_connected(m, on); }
@@ -1101,7 +1107,7 @@ impl Machine {
     /// Serialize the whole machine (deflate-compressed; RAM keeps only non-zero pages).
     pub fn save(&self) -> Result<Vec<u8>, String> {
         let mut w = emu_core::snap::W::default();
-        w.tag("pi3-machine-v5");
+        w.tag("pi3-machine-v6");
         w.u8(self.model as u8);
         w.u64(self.now); w.u64(self.exceptions); w.u64(self.irqs);
         w.u32(self.cpus.len() as u32);
@@ -1131,8 +1137,9 @@ impl Machine {
         self.soc.dma.save_state(&mut w);
         w.bool(self.soc.vc4.is_some());
         if let Some(v) = self.soc.vc4.as_ref() { v.save_state(&mut w); }
-        // VCHIQ and the VideoCore's services
+        // VCHIQ and the VideoCore's services, the 3D GPU
         self.soc.vchiq.save_state(&mut w);
+        self.soc.v3d.save_state(&mut w);
         emu_core::snap::save_ram(&mut w, &self.soc.ram);
         let mut out = SNAP_MAGIC.to_vec();
         out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&w.0, 1));
@@ -1145,9 +1152,9 @@ impl Machine {
         let raw = miniz_oxide::inflate::decompress_to_vec(&snap[8..]).map_err(|e| format!("the snapshot is damaged ({:?})", e.status))?;
         let e = |e: emu_core::snap::SnapError| e.0;
         let mut r = emu_core::snap::R::new(&raw);
-        // v5: the card on sdhost, the wireless chips, VCHIQ and the VideoCore's services (older
-        // layouts had the card on the Arasan, or no VCHIQ)
-        r.tag("pi3-machine-v5").map_err(e)?;
+        // v6: the card on sdhost, the wireless chips, VCHIQ and the VideoCore's services, the 3D
+        // GPU (older layouts had the card on the Arasan, no VCHIQ or no V3D)
+        r.tag("pi3-machine-v6").map_err(e)?;
         let model = r.u8().map_err(e)?;
         if model != self.model as u8 { return Err(format!("the snapshot is of another model (this machine: --model {})", self.model.id())); }
         let (now, exceptions, irqs) = (r.u64().map_err(e)?, r.u64().map_err(e)?, r.u64().map_err(e)?);
@@ -1204,6 +1211,7 @@ impl Machine {
         self.soc.pace_next = Some(0);
         self.soc.vchiq = crate::vchiq::Vchiq::new();
         self.soc.vchiq.load_state(&mut r).map_err(e)?;
+        self.soc.v3d.load_state(&mut r).map_err(e)?;
         emu_core::snap::load_ram(&mut r, &mut self.soc.ram).map_err(e)?;
         for c in self.cpus.iter_mut() { c.ram = self.soc.ram.as_mut_ptr(); c.ram_len = self.soc.ram.len() as u64; }
         self.next_check = 0;

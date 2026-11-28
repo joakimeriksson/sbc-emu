@@ -561,5 +561,7 @@ mod tests {
         assert_eq!(sdhost.prop("compatible").unwrap(), b"brcm,bcm2835-sdhost\0");
         assert!(child(&child(&soc, "serial@7e201000").unwrap(), "bluetooth").is_some());
         assert!(child(&child(&soc, "mmc@7e300000").unwrap(), "wifi@1").is_some());
+        assert_eq!(bus(crate::machine::V3D), 0x7ec0_0000);
+        assert_eq!(gpu(crate::machine::GPU_V3D as u32), [1, 10]);
     }
 }

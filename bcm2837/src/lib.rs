@@ -19,6 +19,8 @@ pub mod sdhost;
 pub mod vcaudio;
 pub mod vchiq;
 pub mod video;
+#[cfg(test)]
+mod v3d_tests;
 
 pub use machine::{CoreState, Machine, Stop};
 

@@ -5,11 +5,12 @@ SD-card image**, the same image the [Raspberry Pi 4](raspberry-pi-4.md) boots, o
 cores: its first-boot wizard runs on the framebuffer console with the USB keyboard, the
 network works over the LAN7515's USB Ethernet and over Wi-Fi, Bluetooth finds a virtual LE
 sensor, and HDMI and composite video run on the stock `vc4` KMS driver the image's `config.txt`
-asks for. **Experimental**: milestones 1–5 and 8 of the [plan](rpi3-plan.md) are done (serial
-shell, Pi OS from the SD card, USB and Ethernet, HDMI, Wi-Fi and Bluetooth, composite video),
-and of milestone 9 everything but the H.264 decoder: VCHIQ, the firmware's MMAL media components
-behind `bcm2835-codec` and `bcm2835-isp`, and its audio service behind the headphone card. The
-3D GPU is not modelled yet.
+asks for, with the VideoCore IV 3D GPU behind Mesa's `vc4` driver ([its page](raspberry-pi-3-gpu.md)).
+**Experimental**: milestones 1–5, 7 and 8 of the [plan](rpi3-plan.md) are done (serial shell,
+Pi OS from the SD card, USB and Ethernet, HDMI, Wi-Fi and Bluetooth, the 3D GPU, composite
+video), and of milestone 9 everything but the H.264 decoder: VCHIQ, the firmware's MMAL media
+components behind `bcm2835-codec` and `bcm2835-isp`, and its audio service behind the headphone
+card.
 
 ## What runs today
 
@@ -226,7 +227,7 @@ messages, `SBC_MMAL_TRACE=1` the MMAL calls.
 - Ethernet: the statistics counters (`ethtool -S`) read zero, wake-on-LAN and EEE do nothing,
   the receive filters (perfect, hash, VLAN) are not applied: every frame from the network is
   delivered.
-- No VideoCore IV 3D (the device tree's V3D node waits for its model), no DSI or DPI displays.
+- No DSI or DPI displays. The VideoCore IV 3D GPU: [raspberry-pi-3-gpu.md](raspberry-pi-3-gpu.md).
 - No H.264 decoder yet (the stand-in emits test pictures), no video or JPEG encoder, no
   camera, no `vcgencmd`.
 - Wireless only on the 3B+ and 3A+ (CYW43455). The 3B's BCM43438 and the Zero 2 W's CYW43436

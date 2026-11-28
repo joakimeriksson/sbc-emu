@@ -1,0 +1,28 @@
+# Raspberry Pi 3 Model B+ with its VideoCore IV 3D GPU (vc4-3d, milestone 7 of docs/rpi3-plan.md):
+# the GPU image (Pi OS Lite with Mesa, kmscube, glmark2 and gcc: scripts/raspios-gpu-setup.txt;
+# copy-on-write here) on HDMI through vc4 KMS. The V3D binds as a component of vc4's DRM device,
+# Mesa reports V3D 2.1, then kmscube on HDMI (screenshots in out/). Saves out/rpi3-v3d.snap after
+# logging in, for scripts/rpi3-gles2test.txt and scripts/rpi3-glmark2.txt.
+#   sbc-emu run --board pi3b --sd cache/os/raspios-gpu.img --script scripts/rpi3-v3d.txt --timeout 1800
+wait-serial raspberrypi login:
+serial pi\r
+wait-serial Password:
+serial raspberry\r
+wait-serial pi@raspberrypi
+serial echo raspberry | sudo -S true; echo SUDO_$((1))\r
+wait-serial SUDO_1
+save out/rpi3-v3d.snap
+serial sudo dmesg | grep --color=never -E 'bound 3fc00000.v3d'; echo DMESG_$((2))\r
+wait-serial bound 3fc00000.v3d (ops vc4_v3d_ops
+serial eglinfo -B -p gbm 2>&1 | grep --color=never 'OpenGL ES profile' | head -3; echo EGL_$((3))\r
+wait-serial OpenGL ES profile renderer: VC4 V3D 2.1
+wait-serial EGL_3
+serial (kmscube -D /dev/dri/card0 -c 600 > /tmp/k.log 2>&1; echo KMS-""DONE) &\r
+sleep 3
+screenshot out/rpi3-kmscube-1.png
+sleep 2
+screenshot out/rpi3-kmscube-2.png
+wait-serial KMS-DONE
+serial tail -1 /tmp/k.log\r
+wait-serial fps)
+quit
